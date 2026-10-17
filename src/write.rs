@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-pub use crate::text::{first_word, ident, object};
+pub use crate::text::{first_word, head, ident, object};
 
 // ---------------------------------------------------------------- tables
 
@@ -804,12 +804,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         _ => return None,
     })
-}
-
-/// The statement's first word, lowercased (`create` for `CREATE TABLE …`, past comments): what a
-/// statement's own regexes are looked at for, so a query compiles none of them.
-pub fn head(sql: &str) -> String {
-    first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
 }
 
 /// A column type as DataFusion plans it: bytes by any of their names (`BYTEA`), and JSON kept as

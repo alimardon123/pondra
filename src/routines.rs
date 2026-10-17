@@ -34,6 +34,7 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock, Mutex};
 pub use crate::text::sql;
 pub(crate) use crate::text::text;
+pub use crate::text::args;
 
 pub fn key(name: &str) -> String { format!("r/{name}") }
 
@@ -1546,34 +1547,6 @@ impl VisitorMut for Expander<'_> {
         *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
         ControlFlow::Continue(())
     }
-}
-
-/// A call's arguments as written: those by position, then those by name (`day => …`, or `day := …`),
-/// each name once. Every procedure and table function of Pondra's own reads its arguments through
-/// this, so `=>` means one thing everywhere.
-pub struct Args<'a> {
-    pub given: Vec<&'a Expr>,
-    pub named: Vec<(String, &'a Expr)>,
-}
-
-/// `what` names the call in errors (`run`, `read_csv`, …).
-pub fn args<'a>(what: &str, args: &'a [FunctionArg]) -> Result<Args<'a>> {
-    let mut out = Args { given: vec![], named: vec![] };
-    for a in args {
-        match a {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                ensure!(out.named.is_empty(), "{what}: arguments by position come before those by name");
-                out.given.push(e);
-            }
-            FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } | FunctionArg::ExprNamed { name: Expr::Identifier(name), arg: FunctionArgExpr::Expr(e), .. } => {
-                let n = ident(name);
-                ensure!(!out.named.iter().any(|(m, _)| *m == n), "{what}: {n} given twice");
-                out.named.push((n, e));
-            }
-            _ => bail!("{what}: an argument is an expression, or name => expression"),
-        }
-    }
-    Ok(out)
 }
 
 /// Each parameter's argument: by position, then by name (`rate := 0.3`, `rate => 0.3`), then its

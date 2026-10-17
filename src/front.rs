@@ -47,7 +47,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
         Own::Go(sql) => sql,
     };
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
-    let sql = &crate::branch::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
+    let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)

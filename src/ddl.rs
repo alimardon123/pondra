@@ -18,7 +18,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::sync::Arc;
-pub use crate::text::{join, mentions, split, PUBLIC};
+pub use crate::text::{join, local_in, mentions, split, PUBLIC};
 
 pub fn schema_key(s: &str) -> String { format!("ns/{s}") }
 /// A stored view (`CREATE VIEW`): a query with a name, run where it is used.
@@ -176,16 +176,6 @@ pub async fn database(lake: &Lake, name: &str) -> Result<Option<Arc<Lake>>> {
 /// A table of this lake by its name inside it, from a name as SQL wrote it (`write::object`):
 /// None for another lake's. (A two-part name may yet be an attached lake's: no table has it here.)
 pub fn local(lake: &Lake, name: &str) -> Option<String> { local_in(&lake_name(lake), name) }
-
-/// `local` by the lake's name (the front has no `Lake`).
-pub fn local_in(lake: &str, name: &str) -> Option<String> {
-    match name.split('.').collect::<Vec<_>>()[..] {
-        [t] => Some(t.to_string()),
-        [s, t] => Some(join(s, t)),
-        [l, s, t] if l == lake => Some(join(s, t)),
-        _ => None,
-    }
-}
 
 /// A name for something new in this lake: its schema exists and its parts are fine. `public.t`
 /// is `t`.
