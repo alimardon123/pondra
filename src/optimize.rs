@@ -74,6 +74,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(0, Arc::new(crate::frugal::WholePartition));
     #[cfg(feature = "server")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
+    rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
@@ -228,6 +229,99 @@ pub(crate) fn whole(v: &ScalarValue) -> Option<ScalarValue> {
     } else {
         ScalarValue::Decimal256(scaled, precision as u8, 0)
     })
+}
+
+/// A DECIMAL literal added to or subtracted from a DECIMAL column takes the column's scale here, once,
+/// not at every row. Arrow's decimal arithmetic rescales both sides to the larger scale for each row
+/// (two checked i128 multiplies) when the scales differ, and only adds or subtracts when they match.
+/// In TPC-H q1, `1 - l_discount` (a DECIMAL(15, 2) column) was a third of the query's time on the page,
+/// where i128 multiplies are software; written as `1.00 - l_discount`, q1 went from 941 to 665 ms with
+/// the same answers. The column's type and every answer stay as they were: a result that would have
+/// another type is left as it was.
+#[derive(Debug)]
+struct ScaledLiterals;
+
+impl OptimizerRule for ScaledLiterals {
+    fn name(&self) -> &str {
+        "pondra_scaled_literals"
+    }
+
+    fn apply_order(&self) -> Option<ApplyOrder> {
+        Some(ApplyOrder::BottomUp)
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        if matches!(plan, LogicalPlan::TableScan(_)) {
+            return Ok(Transformed::no(plan)); // (a scan's own filters have no input to read the types from)
+        }
+        let mut has = false;
+        plan.apply_expressions(|e| {
+            has |= e.exists(|e| Ok(scalable(e)))?;
+            Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        })?;
+        if !has {
+            return Ok(Transformed::no(plan)); // (nearly every step: no sum or difference with a decimal literal in it)
+        }
+        let schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs()); // (each column's type, from the inputs)
+        let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+        let t = plan.map_expressions(|e| {
+            let name = names.save(&e);
+            Ok(e.transform_up(|e| match at_scale(&e, &schema) {
+                Some(new) => Ok(Transformed::yes(new)),
+                None => Ok(Transformed::no(e)),
+            })?
+            .update_data(|e| name.restore(e)))
+        })?;
+        if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
+    }
+}
+
+/// A sum or difference with a DECIMAL literal on one side: the only expressions `ScaledLiterals` looks at.
+fn scalable(e: &Expr) -> bool {
+    let Expr::BinaryExpr(b) = e else { return false };
+    matches!(b.op, Operator::Plus | Operator::Minus) && is_decimal_literal(&b.left) != is_decimal_literal(&b.right)
+}
+
+fn is_decimal_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Literal(ScalarValue::Decimal128(..), _))
+}
+
+/// `e` with its DECIMAL literal written at the other side's scale: when the literal's scale is below
+/// the column's and the result still fits 38 digits. `None` for anything else, and for a result whose
+/// type would change.
+fn at_scale(e: &Expr, schema: &DFSchema) -> Option<Expr> {
+    let Expr::BinaryExpr(b) = e else { return None };
+    if !matches!(b.op, Operator::Plus | Operator::Minus) {
+        return None;
+    }
+    let (literal, other, literal_left) = if is_decimal_literal(&b.left) {
+        (&b.left, &b.right, true)
+    } else if is_decimal_literal(&b.right) {
+        (&b.right, &b.left, false)
+    } else {
+        return None;
+    };
+    if is_decimal_literal(other) {
+        return None; // (two literals: the simplifier folds them)
+    }
+    let Expr::Literal(ScalarValue::Decimal128(v, p, s), meta) = literal.as_ref() else { return None };
+    let DataType::Decimal128(_, s2) = other.get_type(schema).ok()? else { return None };
+    // (the places the literal gains: its value times 10^gain, at the column's scale, and still 38 digits at most)
+    let gain = i32::from(s2) - i32::from(*s);
+    let precision = i32::from(*p) + gain;
+    if gain <= 0 || precision > 38 {
+        return None;
+    }
+    let factor = 10i128.checked_pow(gain as u32)?;
+    let v = match v {
+        Some(v) => Some(v.checked_mul(factor)?),
+        None => None,
+    };
+    let scaled = Box::new(Expr::Literal(ScalarValue::Decimal128(v, precision as u8, s2), meta.clone()));
+    let (left, right) = if literal_left { (scaled, other.clone()) } else { (other.clone(), scaled) };
+    let new = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(left, b.op, right));
+    // (checked, not assumed: a result of another type is left as it was)
+    (new.get_type(schema).ok()? == e.get_type(schema).ok()?).then_some(new)
 }
 
 /// A DOUBLE (or REAL) that meets a DECIMAL makes both DOUBLEs, as Postgres and DuckDB do: `price >
@@ -2327,12 +2421,17 @@ mod tests {
 
     /// A session with Pondra's config and this file's analyzer and logical rules (no lake: a literal's types need none).
     fn session() -> datafusion::prelude::SessionContext {
+        session_without(None)
+    }
+
+    /// `session()` without the optimizer rule named, to compare an answer with and without that rule.
+    fn session_without(rule: Option<&str>) -> datafusion::prelude::SessionContext {
         use datafusion::execution::SessionStateBuilder;
         let state = SessionStateBuilder::new()
             .with_config(config(SessionConfig::new()))
             .with_default_features()
             .with_analyzer_rules(analyzer_rules())
-            .with_optimizer_rules(rules())
+            .with_optimizer_rules(rules().into_iter().filter(|r| Some(r.name()) != rule).collect())
             .build();
         datafusion::prelude::SessionContext::new_with_state(state)
     }
@@ -2341,6 +2440,80 @@ mod tests {
     async fn first(ctx: &datafusion::prelude::SessionContext, sql: &str) -> String {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         datafusion::arrow::util::display::array_value_to_string(batches[0].column(0), 0).unwrap()
+    }
+
+    /// A query's answer: its columns' names and types, then its rows as text (None for NULL).
+    async fn answer(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        use datafusion::arrow::array::Array;
+        use datafusion::arrow::util::display::array_value_to_string;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let types = batches[0].schema().fields().iter().map(|f| format!("{}: {}", f.name(), f.data_type())).collect();
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for r in 0..batch.num_rows() {
+                rows.push(batch.columns().iter().map(|c| (!c.is_null(r)).then(|| array_value_to_string(c, r).unwrap())).collect());
+            }
+        }
+        (types, rows)
+    }
+
+    /// The plan `EXPLAIN` shows for a query, as text.
+    async fn plan_of(ctx: &datafusion::prelude::SessionContext, sql: &str) -> String {
+        let batches = ctx.sql(&format!("EXPLAIN {sql}")).await.unwrap().collect().await.unwrap();
+        let mut text = String::new();
+        for batch in &batches {
+            for r in 0..batch.num_rows() {
+                text += &datafusion::arrow::util::display::array_value_to_string(batch.column(1), r).unwrap();
+                text.push('\n');
+            }
+        }
+        text
+    }
+
+    /// A DECIMAL literal takes its column's scale (`ScaledLiterals`): every answer, type and output name
+    /// is the one the session without the rule gives, and the plan writes the literal at the column's
+    /// scale where it can (`1 - d`, `2.5 - d`) and as written where it can't (1.005 has more places than
+    /// the column's 2; CAST(1 AS DECIMAL(37, 0)) would make 39 digits).
+    #[tokio::test]
+    async fn a_decimal_literal_takes_its_columns_scale() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let column: ArrayRef = Arc::new(Decimal128Array::from(vec![Some(5i128), Some(-125), None]).with_precision_and_scale(15, 2).unwrap());
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Decimal128(15, 2), true)]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+        let (ctx, plain) = (session(), session_without(Some("pondra_scaled_literals")));
+        ctx.register_batch("li", batch.clone()).unwrap();
+        plain.register_batch("li", batch).unwrap();
+        // (a plan shows a literal as its Debug form: `Decimal128(1,20,0)`, its value and then its precision and scale)
+        assert!(plan_of(&plain, "SELECT 1 - d FROM li").await.contains("Decimal128(1,20,0)"), "the literal's type, without the rule");
+        let cases: [(&str, [Option<&str>; 3]); 7] = [
+            ("SELECT 1 - d FROM li", [Some("0.95"), Some("2.25"), None]),
+            ("SELECT 1 + d FROM li", [Some("1.05"), Some("-0.25"), None]),
+            ("SELECT d - 1 FROM li", [Some("-0.95"), Some("-2.25"), None]),
+            ("SELECT 2.5 - d FROM li", [Some("2.45"), Some("3.75"), None]),
+            ("SELECT d + 100 FROM li", [Some("100.05"), Some("98.75"), None]),
+            ("SELECT 1.005 - d FROM li", [Some("0.955"), Some("2.255"), None]),
+            ("SELECT CAST(1 AS DECIMAL(37, 0)) - d FROM li", [Some("0.95"), Some("2.25"), None]),
+        ];
+        for (sql, want) in cases {
+            let (got_types, got) = answer(&ctx, sql).await;
+            assert_eq!((got_types, got.clone()), answer(&plain, sql).await, "{sql}: the types, names and answers without the rule");
+            assert_eq!(got.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(), want, "{sql}");
+        }
+        let sum = "SELECT sum(d * (1 - d)) FROM li";
+        let (_, got) = answer(&ctx, sum).await;
+        assert_eq!(got, answer(&plain, sum).await.1, "{sum}");
+        let total: f64 = got[0][0].as_deref().unwrap().parse().unwrap();
+        assert!((total + 2.765).abs() < 1e-9, "0.05 * 0.95 - 1.25 * 2.25 is -2.765, got {total}");
+        for (sql, text) in [
+            ("SELECT 1 - d FROM li", "Decimal128(1.00,22,2)"),
+            ("SELECT 2.5 - d FROM li", "Decimal128(2.50,3,2)"),
+            ("SELECT 1.005 - d FROM li", "Decimal128(1.005,4,3)"),
+            ("SELECT CAST(1 AS DECIMAL(37, 0)) - d FROM li", "Decimal128(1,37,0)"),
+        ] {
+            let plan = plan_of(&ctx, sql).await;
+            assert!(plan.contains(text), "{sql}: {text} in the plan:\n{plan}");
+        }
     }
 
     /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is
