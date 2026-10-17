@@ -3,6 +3,7 @@
 //! between `HeldInExec` (counts each batch going in) and `HeldOutExec` (lets go of each batch as its rows come out), which
 //! share one reservation per partition. Still uncounted: what DataFusion keeps inside a window beyond those rows (the
 //! strings a long partition's views point into, a frame's rows behind those given out, `WindowAggExec`'s concatenation).
+//! `LeanExec` is the other operator here: a sort's output of strings holds only its own rows' strings (`LeanSorts`).
 use crate::store::memory_limit;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::DataType;
@@ -14,6 +15,7 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{replace_children_if_necessary, CardinalityEffect};
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::windows::{BoundedWindowAggExec, WindowAggExec};
 use datafusion::physical_plan::{ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties, StatisticsArgs};
@@ -127,7 +129,7 @@ impl DisplayAs for HeldInExec {
 fn one_input(mut children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
     match children.len() {
         1 => Ok(children.swap_remove(0)),
-        n => Err(DataFusionError::Internal(format!("a window's counting operator has one input, not {n}"))),
+        n => Err(DataFusionError::Internal(format!("this operator has one input, not {n}"))),
     }
 }
 
@@ -258,17 +260,120 @@ impl ExecutionPlan for HeldInExec {
     }
 }
 
+/// Hands up each batch with only its own rows' strings (`query::compact`). A sort reads a string column as views into
+/// its input's buffers, and `take` and the merge's `interleave` copy the views but keep those buffers: a batch of
+/// 8,192 rows then points into every batch of the runs it merges. The merge above counts each batch's buffers whole,
+/// so 4 partitions of a 10 M-row sort of md5 strings counted 66 MB for about 2 MB of rows, and a 256 MB pool refused
+/// it (`SortPreservingMergeExec`). Passing the batches through `compact` costs a copy only where they are wasteful.
+#[derive(Debug)]
+pub struct LeanExec {
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl DisplayAs for LeanExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "LeanExec")
+    }
+}
+
+impl ExecutionPlan for LeanExec {
+    fn name(&self) -> &str {
+        "LeanExec"
+    }
+
+    // (no properties of its own: it hands up what its input does, in the same order and partitions)
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(LeanExec { input: one_input(children)? }))
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    // (the rows are the input's, so its statistics are too: `guard` and the history read them above a sort)
+    fn statistics_from_inputs(&self, input_stats: &[Arc<Statistics>], _: &StatisticsArgs) -> Result<Arc<Statistics>> {
+        Ok(input_stats[0].clone())
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn execute(&self, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        let s = self.input.execute(p, ctx)?;
+        let schema = s.schema();
+        let out = s.map(|item| item.map(crate::query::compact));
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, out)))
+    }
+}
+
+/// Puts a `LeanExec` above each sort that keeps all its rows and sorts strings (why: `LeanExec`). A top-N keeps a few
+/// rows, so it is left alone. A second run wraps nothing again: a `LeanExec` over a `LeanExec` becomes the inner one.
+#[derive(Debug)]
+pub struct LeanSorts;
+
+impl PhysicalOptimizerRule for LeanSorts {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|node| {
+            if let Some(lean) = node.downcast_ref::<LeanExec>() {
+                if lean.input.is::<LeanExec>() {
+                    return Ok(Transformed::yes(lean.input.clone()));
+                }
+                return Ok(Transformed::no(node));
+            }
+            let all_rows = node.downcast_ref::<SortExec>().is_some_and(|s| s.fetch().is_none());
+            let strings = node.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Utf8View | DataType::BinaryView));
+            if all_rows && strings {
+                let lean: Arc<dyn ExecutionPlan> = Arc::new(LeanExec { input: node });
+                return Ok(Transformed::yes(lean));
+            }
+            Ok(Transformed::no(node))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "lean_sorts"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyhow::Result as AnyResult;
-    use datafusion::arrow::array::StringViewArray;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringViewArray};
     use datafusion::arrow::compute::cast;
     use datafusion::arrow::datatypes::{Field, Int64Type, Schema};
+    use datafusion::datasource::MemTable;
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use datafusion::execution::runtime_env::RuntimeEnvBuilder;
     use datafusion::execution::SessionStateBuilder;
     use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+    use datafusion::physical_plan::displayable;
     use datafusion::prelude::{SessionConfig, SessionContext};
 
     fn small_session() -> AnyResult<SessionContext> {
@@ -340,5 +445,126 @@ mod tests {
     #[test]
     fn the_window_rule_is_the_last_physical_rule() {
         assert_eq!(crate::optimize::physical_rules().last().unwrap().name(), "held_windows");
+    }
+
+    /// DataFusion's own physical rules, plus `LeanSorts` when `lean`, and `Windows` last as `physical_rules` ends
+    /// with it. No small pool: these tests are about what a sort hands up, not about refusals.
+    fn session(partitions: usize, lean: bool) -> SessionContext {
+        let mut rules = PhysicalOptimizer::new().rules;
+        if lean {
+            rules.push(Arc::new(LeanSorts));
+        }
+        rules.push(Arc::new(Windows));
+        let config = SessionConfig::new().with_target_partitions(partitions).with_batch_size(1024);
+        SessionContext::new_with_state(SessionStateBuilder::new().with_config(config).with_default_features().with_physical_optimizer_rules(rules).build())
+    }
+
+    /// `n` strings of 20 to 40 letters from a fixed seed, so every run sorts the same ones.
+    fn letters(n: usize) -> Vec<String> {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D; // (xorshift: the seed)
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let len = 20 + (next() % 21) as usize;
+                (0..len).map(|_| char::from(b'a' + (next() % 26) as u8)).collect()
+            })
+            .collect()
+    }
+
+    /// A table of `n` rows (`id`, `k`), `k` a string column of type `kind`, in batches of 1,000 dealt over `partitions`.
+    fn table(partitions: usize, n: usize, kind: DataType) -> AnyResult<MemTable> {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false), Field::new("k", kind.clone(), false)]));
+        let mut parts = vec![vec![]; partitions];
+        for (b, strings) in letters(n).chunks(1000).enumerate() {
+            let ids = Int64Array::from_iter_values((b * 1000) as i64..(b * 1000 + strings.len()) as i64);
+            let k = cast(&StringViewArray::from(strings.to_vec()), &kind)?;
+            parts[b % partitions].push(RecordBatch::try_new(schema.clone(), vec![Arc::new(ids) as ArrayRef, k])?);
+        }
+        Ok(MemTable::try_new(schema, parts)?)
+    }
+
+    /// The (string, id) rows of an answer to `SELECT k, id`, in order.
+    fn rows(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let (k, id) = (b.column(0).as_string_view(), b.column(1).as_primitive::<Int64Type>());
+                (0..b.num_rows()).map(|i| (k.value(i).to_string(), id.value(i))).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether a batch's string buffers hold no more than its views use, as `compact` judges (twice, plus 8 KB).
+    fn lean_batch(b: &RecordBatch) -> bool {
+        let k = b.column(0).as_string_view(); // (`SELECT k, id`: k first)
+        let held: usize = k.data_buffers().iter().map(|buf| buf.len()).sum();
+        held <= 2 * k.total_buffer_bytes_used() + (8 << 10)
+    }
+
+    /// The physical plan of `sql`, as indented text.
+    async fn planned(ctx: &SessionContext, sql: &str) -> AnyResult<String> {
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        Ok(text)
+    }
+
+    #[tokio::test]
+    async fn a_sort_of_strings_gets_a_lean_exec_above_it() -> AnyResult<()> {
+        let ctx = session(1, true);
+        ctx.register_table("t", Arc::new(table(1, 2000, DataType::Utf8View)?))?;
+        ctx.register_table("u", Arc::new(table(1, 2000, DataType::Utf8)?))?;
+        let sorted = planned(&ctx, "SELECT k FROM t ORDER BY k").await?;
+        assert!(sorted.find("LeanExec").is_some_and(|l| sorted.find("SortExec").is_some_and(|s| l < s)), "{sorted}");
+        let plain = planned(&ctx, "SELECT k FROM u ORDER BY k").await?;
+        assert!(!plain.contains("LeanExec"), "{plain}"); // (strings as Utf8 hold no views)
+        let top = planned(&ctx, "SELECT k FROM t ORDER BY k LIMIT 5").await?;
+        assert!(!top.contains("LeanExec"), "{top}"); // (a top-N keeps few rows)
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_run_wraps_nothing_again() -> AnyResult<()> {
+        let ctx = session(4, true);
+        ctx.register_table("t", Arc::new(table(4, 20_000, DataType::Utf8View)?))?;
+        let plan = ctx.sql("SELECT k FROM t ORDER BY k").await?.create_physical_plan().await?;
+        let twice = LeanSorts.optimize(plan, &ConfigOptions::new())?;
+        let text = displayable(twice.as_ref()).indent(true).to_string();
+        assert_eq!(text.matches("LeanExec").count(), 1, "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_sort_of_strings_answers_the_same_with_or_without_it() -> AnyResult<()> {
+        let (lean, plain) = (session(4, true), session(4, false));
+        for ctx in [&lean, &plain] {
+            ctx.register_table("t", Arc::new(table(4, 20_000, DataType::Utf8View)?))?;
+        }
+        for (sql, descending) in [("SELECT k, id FROM t ORDER BY k", false), ("SELECT k, id FROM t ORDER BY k DESC, id", true)] {
+            let (a, b) = (rows(&answer(&lean, sql).await?), rows(&answer(&plain, sql).await?));
+            assert_eq!(a.len(), 20_000, "{sql}");
+            assert_eq!(a, b, "{sql}");
+            let in_order = a.windows(2).all(|w| if descending { w[0].0 >= w[1].0 } else { w[0].0 <= w[1].0 });
+            assert!(in_order, "{sql}: sorted by k");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_sort_on_one_partition_hands_up_its_own_strings() -> AnyResult<()> {
+        let sql = "SELECT k, id FROM t ORDER BY k";
+        let lean = session(1, true);
+        lean.register_table("t", Arc::new(table(1, 20_000, DataType::Utf8View)?))?;
+        let batches = answer(&lean, sql).await?;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 20_000);
+        assert!(batches.iter().all(lean_batch), "a batch points into other batches' strings");
+        let plain = session(1, false); // (without the rule, the test bites: some batch points into many)
+        plain.register_table("t", Arc::new(table(1, 20_000, DataType::Utf8View)?))?;
+        assert!(answer(&plain, sql).await?.iter().any(|b| !lean_batch(b)), "the test would not catch the buffers");
+        Ok(())
     }
 }

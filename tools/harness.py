@@ -3510,9 +3510,30 @@ def scale():
         and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
     shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
     node.kill()
+    # A sort of 10 M md5 strings under a 256 MB query pool, on four cores: each partition's sort hands up views into its
+    # input's buffers, and the merge above counted those batches whole (66 MB for about 2 MB of rows, so the pool was
+    # refused: `held::LeanExec`). Each answer is checked against the least and greatest md5 of 1..10,000,000 (worked
+    # out in Python). A sort that fails is kept for the report, and the other two still run.
+    sorter = Node(lake, port, memory_gb=0.25, env={"PONDRA_CORES": "4"}).start()
+    sort_errors = []
+    def sort_into(statement):
+        try:
+            call(port, "POST", "/sql", statement.encode(), timeout=600)  # (a 10 M-row sort takes longer than the default 30 s)
+            return True
+        except (RuntimeError, OSError) as e:
+            sort_errors.append(str(e)[:400])
+            return False
+    sort_into("CREATE TABLE ss AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, 10000000)")
+    sorts_answered = [sort_into(f"CREATE TABLE ss_{i} AS SELECT * FROM ss ORDER BY k") for i in (1, 2, 3)]
+    checks["a sort of 10M strings under a 256 MB query memory answers every time (its merge counts only its rows' strings)"] = (
+        all(sorts_answered)
+        and sql(port, "SELECT count(*) AS n, min(k) AS lo, max(k) AS hi FROM ss_3") == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}])
+    for t in ("ss_3", "ss_2", "ss_1", "ss"):
+        sql(port, f"DROP TABLE IF EXISTS {t}")
+    sorter.kill()
     ok = all(checks.values())
     shown = {q: ("same" if same else "DIFFERENT") + (", by ranges" if r else "") + (", shuffled" if sh else ", gathered" if sp else ", one node") for q, (same, sh, sp, r) in shuffles.items()}
-    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "window_refusals": window_refusals, "ok": ok}, indent=1))
+    print(json.dumps({"scale": checks, "shuffles": shown, "rows": n_rows, "days": len(days), "files": {"inline": inline, "sealed": sealed, "parquet_objects": len(files), "one_day_scanned": scanned}, "outside_readers": theirs, "write_errors": write_errors, "sort_errors": sort_errors, "window_refusals": window_refusals, "ok": ok}, indent=1))
     if not ok:
         print("mixed:", mixed[:3], "per_day diff:", {d: (per_day.get(d), n) for d, n in days.items() if per_day.get(d) != n})
         sys.exit(1)
