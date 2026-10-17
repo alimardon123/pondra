@@ -303,12 +303,7 @@ async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), S
 async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
     let session = txn.map(in_txn).transpose()?;
     let failing = session.clone();
-    let f = crate::auth::carried(async move {
-        match session {
-            Some(s) => crate::temp::SESSION.scope(Some(s), f).await,
-            None => f.await,
-        }
-    });
+    let f = crate::auth::carried(in_session(session, f));
     match crate::panics::work(true, f).await {
         Ok(out) => out,
         Err(m) => {
@@ -375,11 +370,13 @@ fn in_txn(id: &[u8]) -> Result<String, Status> {
 /// transaction's snapshot and its own writes, as a POST /sql statement sent with its session does.
 /// Without a transaction id, `f` runs as it always has.
 async fn within<T>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>>) -> Result<T, Status> {
-    match txn {
-        Some(id) => {
-            let session = in_txn(id)?;
-            crate::temp::SESSION.scope(Some(session), f).await
-        }
+    in_session(txn.map(in_txn).transpose()?, f).await
+}
+
+/// `f` in a transaction's session, when there is one (`within` and `worked` both).
+async fn in_session<F: std::future::Future>(session: Option<String>, f: F) -> F::Output {
+    match session {
+        Some(s) => crate::temp::SESSION.scope(Some(s), f).await,
         None => f.await,
     }
 }

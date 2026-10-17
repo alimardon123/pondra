@@ -3838,8 +3838,7 @@ def _flight_memory_stop(fport, aggregate, stopped, settle):
         after = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT 1 AS one"}))).read_all().to_pylist()
     except Exception:
         after = None
-    return {"a query the pool doesn't see grow (array_agg over 30M rows) is stopped at the node's memory line (53200), not the node, and over Flight: stopped for memory (resource exhausted, out of memory), the node answering after":
-            stopped_here and counted and after == [{"one": 1}]}
+    return {"…and over Flight: stopped for memory (resource exhausted, out of memory), counted, the node answering after": stopped_here and counted and after == [{"one": 1}]}
 
 
 def flight():
