@@ -252,8 +252,8 @@ impl Disk {
 }
 
 /// A folder of this process's own under the user's spill folder for one kind of spill (a lake held in
-/// memory's, a query's: `spill_parent`), with its lock file held. The folders of processes that ended are
-/// swept first (`sweep`); dropping this one removes it.
+/// memory's, or a query's and a shuffle's: `store::spill_folder`), with its lock file held. The folders of
+/// processes that ended are swept first (`sweep`); dropping this one removes it.
 #[derive(Debug)]
 pub(crate) struct Folder {
     pub(crate) path: PathBuf,
@@ -263,7 +263,7 @@ pub(crate) struct Folder {
 impl Folder {
     /// A folder of this process's for `kind`, with its lock file held.
     pub(crate) fn make(kind: &str) -> std::io::Result<Folder> {
-        let parent = spill_parent(kind)?;
+        let parent = own_dir(&spill_base(), &format!("pondra-{kind}"))?;
         sweep(&parent);
         let path = parent.join(format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&path)?;
@@ -313,19 +313,18 @@ fn held_in_ram(dir: &FsPath) -> bool {
     unsafe { libc::statfs(path.as_ptr(), &mut fs) == 0 && matches!(fs.f_type as u32, 0x0102_1994 | 0x8584_58f6) } // (TMPFS_MAGIC, RAMFS_MAGIC)
 }
 
-/// The folder the spill folders of `kind` go in (`memory` for a lake held in memory, `spill` for a query's
-/// spills): this user's, in `spill_base`, made 0700 and used only while it is ours alone (as the cluster's
-/// lock folder is), so no other user can take a lock away or read a lake's files. One user's folder per
-/// kind, so a machine's users never share one.
-fn spill_parent(kind: &str) -> std::io::Result<PathBuf> {
+/// A folder named `name` in `base` that is this user's alone: `{name}-{uid}` on Unix (where /tmp is shared),
+/// made 0700 and used only while it is ours alone, so no other user can read what is in it or take a lock
+/// away; `name` elsewhere, where the temporary folder is the user's own. `base` is made first, parents and all
+/// (a PONDRA_SPILL_DIR not made yet). Refused (PermissionDenied) when it is someone else's or open to others.
+pub(crate) fn own_dir(base: &FsPath, name: &str) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
         let uid = unsafe { libc::getuid() };
-        let base = spill_base();
-        let _ = std::fs::create_dir_all(&base); // (a PONDRA_SPILL_DIR not made yet: made, parents and all)
-        let dir = base.join(format!("pondra-{kind}-{uid}"));
-        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+        std::fs::create_dir_all(base)?;
+        let dir = base.join(format!("{name}-{uid}"));
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir); // (it may be there already)
         let m = std::fs::symlink_metadata(&dir)?;
         if m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0 {
             return Ok(dir);
@@ -334,7 +333,7 @@ fn spill_parent(kind: &str) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        let dir = spill_base().join(format!("pondra-{kind}"));
+        let dir = base.join(name);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -803,5 +802,23 @@ mod tests {
         assert!(parent.join("new").exists(), "a folder made just now is kept");
         drop(alive);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_dir_is_this_users_alone_and_refused_once_others_can_open_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("pondra-own-{}", uuid::Uuid::new_v4().simple()));
+        let base = root.join("a").join("b"); // not made yet: `own_dir` makes it, parents and all
+        let uid = unsafe { libc::getuid() };
+        let dir = own_dir(&base, "x").unwrap();
+        assert_eq!(dir, base.join(format!("x-{uid}")));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(own_dir(&base, "x").unwrap(), dir, "called again, it gives the same folder");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = own_dir(&base, "x").unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

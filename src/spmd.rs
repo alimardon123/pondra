@@ -424,7 +424,7 @@ pub async fn stage(lake: &Lake, s: &Slice) -> Result<(String, Vec<Spill>)> {
 /// memory while it is small and on this node's disk beyond, so a stage's result isn't bounded by
 /// memory (`spill.rs`).
 async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, name: &str) -> Result<Vec<Spill>> {
-    let dir = crate::spill::dir(job);
+    let dir = crate::spill::dir(job)?;
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
         let (plan, ctx, dir) = (plan.clone(), ctx.clone(), dir.clone());
         let name = format!("{name}-{p}");
@@ -459,7 +459,7 @@ async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
 async fn read_reply(res: reqwest::Response, job: &str, name: &str) -> Result<(String, Vec<Spill>)> {
     let mut frames = crate::spill::Frames::new(res.bytes_stream());
     let shape = String::from_utf8(frames.next().await?.context("an empty reply")?)?;
-    let (dir, mut parts) = (crate::spill::dir(job), vec![]);
+    let (dir, mut parts) = (crate::spill::dir(job)?, vec![]);
     for p in 0..frames.count().await? {
         let pieces = frames.count().await?;
         parts.push(Spill::take(dir.clone(), format!("{name}-{p}"), &mut frames, pieces).await?);
@@ -784,7 +784,6 @@ crate::per_node!(static DROPPED: Mutex<HashMap<String, std::time::Instant>> = De
 /// so a node that took part in a shuffle frees its scratch without being asked.
 pub fn gc() {
     JOBS.lock().unwrap().retain(|_, j| !j.stale());
-    crate::spill::sweep();
 }
 
 impl Job {
@@ -1220,7 +1219,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
         Partitioning::Hash(exprs, parts) => scatter(&top, job.ctx.task_ctx(), &sh.id, sh.step, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
         _ => {
             // An all-gather (`everywhere`): every node is sent all of what this one has.
-            let mut all = Spill::new(crate::spill::dir(&sh.id), format!("{}-gathered", sh.step));
+            let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{}-gathered", sh.step));
             for part in drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{}-all", sh.step)).await? {
                 all.absorb(part)?;
             }
@@ -1287,7 +1286,7 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
 /// the same order.
 async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, step: usize, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>) -> Result<Vec<Vec<Spill>>> {
     use datafusion::physical_plan::repartition::BatchPartitioner;
-    let (dir, n) = (crate::spill::dir(job), nodes * parts);
+    let (dir, n) = (crate::spill::dir(job)?, nodes * parts);
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
         let (plan, ctx, dir, exprs) = (plan.clone(), ctx.clone(), dir.clone(), exprs.clone());
         async move {

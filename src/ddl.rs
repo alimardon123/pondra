@@ -1210,8 +1210,19 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
         return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
     }
+    // Postgres's codes for a column a view uses: a drop is 2BP01, a type change or a rename 0A000.
+    let code = match change {
+        Change::Drop { .. } => "2BP01",
+        _ => "0A000",
+    };
     let readers = readers(lake, &name).await?;
-    ensure!(readers.is_empty(), "{name} is used by {}, which name its columns: drop them first", readers.join(", "));
+    if !readers.is_empty() {
+        let words = match readers.as_slice() {
+            [one] => format!("{name} is used by {one}, which names its columns: drop it first"),
+            _ => format!("{name} is used by {}, which name its columns: drop them first", readers.join(", ")),
+        };
+        return Err(crate::codes::coded(code, words));
+    }
     let Some(stored) = m.stored(column).map(str::to_string) else {
         ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
         return Ok(j!({"table": name, "unchanged": true}));

@@ -471,10 +471,26 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
     space(dir).map(|(free, total)| (free, lake_keeps(total))).filter(|(free, keep)| free < keep)
 }
 
-/// The folder DataFusion's spills go to: a `memory::Folder` of this process's own, made by the first query
-/// that spills and held until the process ends. A static is never dropped, so the folder (with its lock
-/// file, and nothing else once the spills are gone) is left for the next process on the machine to sweep.
-static SPILLS: std::sync::OnceLock<Option<crate::memory::Folder>> = std::sync::OnceLock::new();
+/// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
+/// this process's own, made by the first spill that needs one and held until the process ends. A static is
+/// never dropped, so the folder (with its lock file, and nothing else once the spills are gone) is left for
+/// the next process on the machine to sweep. A folder that can't be made is remembered as the reason why.
+static SPILLS: std::sync::OnceLock<Result<crate::memory::Folder, String>> = std::sync::OnceLock::new();
+
+/// The folder of this process's spills (`SPILLS`), made on first use. Its error when there is none: DataFusion's
+/// spills then go to the OS temp folder, and a shuffle fails with the reason.
+pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
+    let folder = SPILLS.get_or_init(|| {
+        crate::memory::Folder::make("spill").map_err(|e| {
+            eprintln!("no spill folder of this process's ({e}): queries spill to the temporary folder, shuffles fail");
+            e.to_string()
+        })
+    });
+    match folder {
+        Ok(folder) => Ok(&folder.path),
+        Err(why) => Err(std::io::Error::other(why.clone())),
+    }
+}
 
 /// Where DataFusion's spills go, and how much of the disk they may take (`PONDRA_SPILL_GB`). Not the
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
@@ -487,20 +503,19 @@ fn spill_disk() -> DiskManagerBuilder {
     if gb == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
-    let folder = SPILLS.get_or_init(|| match crate::memory::Folder::make("spill") {
-        Ok(folder) => Some(folder),
-        Err(e) => {
-            eprintln!("spills go to the temporary folder: {e}");
-            None
-        }
-    });
+    let folder = spill_folder().ok();
     let builder = match folder {
-        Some(folder) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.path.clone()])),
+        Some(path) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![path.to_path_buf()])),
         None => DiskManagerBuilder::default(), // (no folder: the OS temp folder, as before)
     };
+    // (a merge of spilled runs takes at most an eighth of its partition's share, about 4 MB a run read at once: unlimited,
+    // as DataFusion has it, each partition's merge took the whole pool and a window over its rows was refused)
+    // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
+    let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
+    let builder = builder.with_max_spill_merge_fan_in(fan_in);
     let cap = match gb {
         Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
-        None => folder.as_ref().and_then(|f| space(&f.path)).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+        None => folder.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
     };
     match cap {
         Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)

@@ -418,7 +418,7 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
-        ready((INVALID_RECORD, -1, Some(format!("{e:#}"))))
+        ready((INVALID_RECORD, -1, Some(crate::ext::said(&e))))
     };
     let Some(log) = app.log.clone() else {
         return ready((POLICY_VIOLATION, -1, Some("read-only node".into())));
@@ -445,7 +445,7 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
         }
         if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), &rows)) {
-            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(e.to_string()))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
+            return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e)))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
             true => {
@@ -493,7 +493,7 @@ fn failed(e: &anyhow::Error) -> Outcome {
         "42P01" => UNKNOWN_TOPIC,
         _ => REQUEST_TIMED_OUT,
     };
-    (error, -1, Some(format!("{e:#}")))
+    (error, -1, Some(crate::ext::said(e)))
 }
 
 struct Rec {

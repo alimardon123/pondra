@@ -727,7 +727,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         let kind = c[2].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
         return Some(match comment_of(&c[3]) {
             Ok((name, text)) => Stmt::Ddl(vec![Ddl::Object(Op::Comment { kind, name, text, if_exists: c.get(1).is_some() })]),
-            Err(e) => Stmt::Invalid(format!("COMMENT ON {} name IS 'text' | NULL: {e:#}", kind.to_uppercase())),
+            Err(e) => Stmt::Invalid(format!("COMMENT ON {} name IS 'text' | NULL: {}", kind.to_uppercase(), crate::ext::said(&e))),
         });
     }
     let c = OR_ALTER.captures(first)?;

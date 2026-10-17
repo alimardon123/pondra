@@ -731,8 +731,8 @@ pub(crate) async fn plan(lake: &Lake, p: &Project, prune: bool, branch: bool) ->
             match table_change(lake, d, cur.meta.as_ref().expect("a table's meta")).await {
                 Ok(sql) if sql.is_empty() => {}
                 Ok(sql) => steps.push(step("~", &sql.iter().map(|s| s.splitn(4, ' ').nth(3).unwrap_or_default()).collect::<Vec<_>>().join("; "), sql)), // (ALTER TABLE t ADD COLUMN c: ADD COLUMN c)
-                Err(e) if !pending.is_empty() => steps.push(step("!", &format!("{e:#} (checked again after the migrations)"), vec![])),
-                Err(e) => refused.push(format!("table {} ({}): {e:#}", d.name, d.file)),
+                Err(e) if !pending.is_empty() => steps.push(step("!", &format!("{} (checked again after the migrations)", crate::ext::said(&e)), vec![])),
+                Err(e) => refused.push(format!("table {} ({}): {}", d.name, d.file, crate::ext::said(&e))),
             }
             continue;
         }
