@@ -299,6 +299,96 @@ file (`read_csv(…) f`), name the columns in `json_build_object` instead. `DIST
 value is refused, as Postgres refuses it (`42883`); a `JSONB` value is fine.
 </Aside>
 
+### Changing a document
+
+A function that changes a `JSONB` document answers the changed one. The table keeps the document it
+had until an `UPDATE` stores the answer. The functions and their operators are Postgres's:
+
+| Change | Function | Operator |
+|---|---|---|
+| Set the value at a path, or add it | `jsonb_set(doc, path, value)` | |
+| Insert a value before or after a place in an array | `jsonb_insert(doc, path, value, after)` | |
+| Merge two documents: the second one's keys win | `jsonb_concat(a, b)` | |
+| Remove a key, an array element or a list of keys | `jsonb_delete(doc, key)` | `doc - key` |
+| Remove the value at a path | `jsonb_delete_path(doc, path)` | `doc #- path` |
+| Remove the null members | `jsonb_strip_nulls(doc)`, or `json_strip_nulls` for `JSON` text | |
+| Write a document out indented | `jsonb_pretty(doc)` | |
+
+A path is a text array such as `'{plan,tier}'`, or `ARRAY['plan', 'tier']`. A step is a key of an object,
+or a position in an array, where a negative position counts from the end.
+
+```sql
+CREATE TABLE profiles (id BIGINT, doc JSONB);
+INSERT INTO profiles VALUES
+  (1, '{"name": "ann", "tags": ["a", "b"], "plan": {"tier": "free", "seats": null}}'),
+  (2, '{"name": "bo", "tags": [], "plan": null}');
+
+UPDATE profiles SET doc = jsonb_set(doc, '{plan,tier}', '"pro"') WHERE id = 1;
+UPDATE profiles SET doc = jsonb_concat(doc, '{"seen": true}');
+
+SELECT id, doc FROM profiles ORDER BY id;
+```
+
+```text
+id  doc
+1   {"name": "ann", "plan": {"tier": "pro", "seats": null}, "seen": true, "tags": ["a", "b"]}
+2   {"name": "bo", "plan": null, "seen": true, "tags": []}
+```
+
+Keys come out in the order `jsonb` keeps them: shorter keys first, then by their bytes. Then remove a key
+and a path, and drop the nulls:
+
+```sql
+UPDATE profiles SET doc = doc - 'tags' WHERE id = 1;
+UPDATE profiles SET doc = doc #- '{plan,seats}' WHERE id = 1;
+
+SELECT id, jsonb_strip_nulls(doc) AS without_nulls FROM profiles ORDER BY id;
+```
+
+```text
+id  without_nulls
+1   {"name": "ann", "plan": {"tier": "pro"}, "seen": true}
+2   {"name": "bo", "seen": true, "tags": []}
+```
+
+The same functions on a document written in the query:
+
+```sql
+SELECT jsonb_insert('{"tags": ["a", "b"]}', '{tags,1}', '"x"', true)::text AS inserted,
+       jsonb_delete_path('{"plan": {"tier": "free", "seats": 2}}', '{plan,seats}')::text AS removed,
+       jsonb_delete('{"a": 1, "b": 2}', 'b')::text AS deleted;
+```
+
+```text
+inserted                   removed                       deleted
+{"tags": ["a", "b", "x"]}  {"plan": {"tier": "free"}}    {"a": 1}
+```
+
+`jsonb_pretty` writes a document one member to a line, indented by four spaces:
+
+```sql
+SELECT jsonb_pretty(doc) AS indented FROM profiles WHERE id = 2;
+```
+
+```text
+indented
+{
+    "name": "bo",
+    "plan": null,
+    "seen": true,
+    "tags": [
+    ]
+}
+```
+
+<Aside type="caution">
+`||` joins text in Pondra, as it does for any text: `doc || '{"seen": true}'` makes a string that isn't
+one document. Postgres merges two documents with `||`. Here use `jsonb_concat`.
+
+The planner doesn't yet know a column is `JSON` when it plans `-` and `#-`, so on a `JSON` column they
+answer a change where Postgres refuses it (`42883`). Keep the documents you change in a `JSONB` column.
+</Aside>
+
 ## Vectors
 
 A vector is a `FLOAT[]` column. The distance functions take two vectors of the same length and
