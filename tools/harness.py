@@ -14566,7 +14566,7 @@ def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
         ("bare name: jsonb_array_elements_text's bare name compared in a WHERE of a column's array", "SELECT count(*) FROM docs d, jsonb_array_elements_text(d.doc) x WHERE d.id = 4 AND x = 'x'",
          ['count'], [20],
          [[1]]),
-        ("bare name: a column named e beats a JSON call's bare name e, as Postgres resolves it", "SELECT e FROM (SELECT 7 AS e) s, jsonb_array_elements('[1]') e",
+        ("bare name: a column named e beats a JSON call's bare name e, as Postgres resolves it", "SELECT e FROM (SELECT 7::int AS e) s, jsonb_array_elements('[1]') e",
          ['e'], [23],
          [[7]]),
     ]
@@ -14590,10 +14590,11 @@ def jsonfns():
     expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
     rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
     words. A function in FROM that reads a column of the same query is LATERAL, as Postgres takes it (implicitly, CROSS
-    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). Not taken yet, refused by name where
-    Postgres takes them: a LEFT JOIN LATERAL over an expanding function whose outputs are expressions of its rows (a padded
-    row needs each output NULL, which lateral.rs can't show for an expression), WITH ORDINALITY, and an expanding function
-    in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). WITH ORDINALITY numbers each
+    row's elements from 1, as Postgres does; over a record's columns Postgres refuses it (ROWS FROM() is not taken), and so
+    does this. Not taken yet, refused by name where Postgres takes them: a LEFT JOIN LATERAL over an expanding function
+    whose outputs are expressions of its rows (a padded row needs each output NULL, which lateral.rs can't show for an
+    expression), and an expanding function in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
     import psycopg
     from psycopg.types.json import JsonbLoader, JsonLoader
     from psycopg.types.string import TextLoader
@@ -14705,6 +14706,36 @@ def jsonfns():
         ('expands: jsonb_to_record of NULL has no rows', 'SELECT count(*) FROM jsonb_to_record(NULL) AS x(a INT)',
          ['count'], [20],
          [[1]]),
+        ("WITH ORDINALITY: jsonb_array_elements of a column, each element's position from 1 in its own document", "SELECT d.id, e.value, e.ordinality FROM docs d, jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ORDER BY d.id, e.ordinality",
+         ['id', 'value', 'ordinality'], [23, 3802, 20],
+         [[1, '{"qty": 2, "sku": "A1"}', 1], [1, '{"qty": 1, "sku": "B7"}', 2]]),
+        ("WITH ORDINALITY: jsonb_each of a column's object, the keys in jsonb's order and each one's position", "SELECT d.id, kv.key, kv.value, kv.ordinality FROM docs d CROSS JOIN LATERAL jsonb_each(d.doc -> 'tags') WITH ORDINALITY AS kv ORDER BY d.id, kv.ordinality",
+         ['id', 'key', 'value', 'ordinality'], [23, 25, 3802, 20],
+         [[1, 'a', '3', 1], [1, 'b', '1', 2]]),
+        ('WITH ORDINALITY: json_each_text with a column list, the keys as written', "SELECT * FROM json_each_text('{\"b\": 1, \"a\": {\"x\": 2}, \"c\": null}') WITH ORDINALITY AS e(k, v, n)",
+         ['k', 'v', 'n'], [25, 25, 20],
+         [['b', '1', 1], ['a', '{"x": 2}', 2], ['c', None, 3]]),
+        ('WITH ORDINALITY: jsonb_array_elements_text in FROM, a JSON null is a NULL with its position', "SELECT * FROM jsonb_array_elements_text('[\"a\", null]') WITH ORDINALITY",
+         ['value', 'ordinality'], [25, 20],
+         [['a', 1], [None, 2]]),
+        ('WITH ORDINALITY: jsonb_object_keys with a column list names the key and its position', "SELECT * FROM jsonb_object_keys('{\"a\":1,\"b\":2}') WITH ORDINALITY AS k(x, n)",
+         ['x', 'n'], [25, 20],
+         [['a', 1], ['b', 2]]),
+        ('WITH ORDINALITY: jsonb_each in FROM, its value as jsonb', "SELECT * FROM jsonb_each('{\"b\": 1, \"a\": {\"x\": 2}}') WITH ORDINALITY AS kv(k, v, n)",
+         ['k', 'v', 'n'], [25, 3802, 20],
+         [['a', '{"x": 2}', 1], ['b', '1', 2]]),
+        ('WITH ORDINALITY: jsonb_array_elements of a literal, one row with its position', "SELECT * FROM jsonb_array_elements('[5]') WITH ORDINALITY AS e",
+         ['value', 'ordinality'], [3802, 20],
+         [['5', 1]]),
+        ('WITH ORDINALITY without an alias: the function\'s name and ordinality', "SELECT * FROM jsonb_object_keys('{\"a\":1,\"b\":2}') WITH ORDINALITY",
+         ['jsonb_object_keys', 'ordinality'], [25, 20],
+         [['a', 1], ['b', 2]]),
+        ('WITH ORDINALITY: a WHERE on the position picks the second element of each document', "SELECT d.id, e.value FROM docs d, jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e WHERE e.ordinality = 2",
+         ['id', 'value'], [23, 3802],
+         [[1, '{"qty": 1, "sku": "B7"}']]),
+        ("a JSON operator over the rows of a FROM call that reads a column (e.value ->> 'sku')", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7']]),
     ]
     # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
     ERRORS = [
@@ -14719,6 +14750,8 @@ def jsonfns():
         ('refused: jsonb_to_recordset with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') AS x(a, b)', '42601', 'a column definition list is required for functions returning "record"'),
         ('refused: jsonb_to_record in a SELECT list, no row type (0A000)', 'SELECT jsonb_to_record(\'{"a":1}\')', '0A000', 'could not determine row type for result of jsonb_to_record'),
         ('refused: jsonb_to_record of an array (22023)', "SELECT * FROM jsonb_to_record('[1]') AS x(a int)", '22023', 'cannot call populate_composite on an array'),
+        ('refused: WITH ORDINALITY over a record with no column list (42601)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') WITH ORDINALITY AS x', '42601', 'a column definition list is required for functions returning "record"'),
+        ('refused: WITH ORDINALITY over a record with a column list (42601, ROWS FROM() is Postgres\'s way)', 'SELECT * FROM jsonb_to_recordset(\'[{"a":1}]\') WITH ORDINALITY AS x(a int)', '42601', 'WITH ORDINALITY cannot be used with a column definition list'),
         ('refused: an expanding function in WHERE (0A000)', 'SELECT 1 FROM docs WHERE jsonb_array_elements(doc) IS NULL', '0A000', 'set-returning functions are not allowed in WHERE'),
         ('refused: an expanding function in CASE (0A000)', "SELECT CASE WHEN true THEN jsonb_array_elements('[1]') END", '0A000', 'set-returning functions are not allowed in CASE'),
         ('refused: an expanding function in an aggregate (0A000)', "SELECT count(jsonb_array_elements('[1]'))", '0A000', 'aggregate function calls cannot contain set-returning function calls'),
@@ -14731,7 +14764,7 @@ def jsonfns():
     NOT_YET = [
         ("a LEFT JOIN LATERAL over an expanding function whose outputs are expressions, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
         ("a LEFT JOIN LATERAL over jsonb_each, not taken yet (Postgres takes it)", "SELECT d.id, kv.key FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true", "0A000", "LEFT JOIN LATERAL over kv is not supported yet"),
-        ("WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT * FROM jsonb_array_elements('[1,2]') WITH ORDINALITY AS e", "0A000", "WITH ORDINALITY isn't taken yet"),
+        ("a LEFT JOIN LATERAL over an expanding function with WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
         ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
         ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
         ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),
@@ -18497,9 +18530,11 @@ def lateral():
     `FROM t, unnest(t.xs) AS u(x)`, `FROM t, generate_series(1, t.n) AS g`, `CROSS JOIN LATERAL`, `LEFT JOIN
     LATERAL … ON true` (padded with NULL when the list is NULL or empty), two laterals chained, a lateral in a
     subquery, a WHERE, GROUP BY and ORDER BY over the lateral's columns, `SELECT *`, a column of the left side
-    named like the function's, `JOIN LATERAL … ON`, `random()` read once, and a lateral the rule leaves to
-    DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
-    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`; ORDER BY exactly), DuckDB's where DuckDB takes the query, and
+    named like the function's, `JOIN LATERAL … ON`, `random()` read once, `WITH ORDINALITY` over a column, a constant
+    and an unnest with no alias (each row's elements numbered from 1, as Postgres numbers them), and a lateral the rule
+    leaves to DataFusion (an aggregate) answering as before. Each answer equals Postgres 16's (PONDRA_PG16 names it,
+    default the local one under /tmp/pg16-l3, or, with none, its answers recorded in tools/pg16/lateral.json (`Pg16`;
+    ORDER BY exactly), DuckDB's where DuckDB takes the query, and
     the same answer on three nodes with `?spread=1`; the Postgres port answers the same rows; and what is
     refused is refused by name with SQLSTATE 0A000.
 
@@ -18542,6 +18577,13 @@ def lateral():
         ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
         ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
          "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
+        ("WITH ORDINALITY over a column: the positions restart for each row", "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)", None, False),
+        ("WITH ORDINALITY over a column's list: NULL and empty lists give no rows", "SELECT t.id, u.x, u.o FROM t, unnest(t.xs) WITH ORDINALITY AS u(x, o)", None, False),
+        ("WITH ORDINALITY with no alias: unnest, ordinality", "SELECT t.id, ordinality FROM t, unnest(t.xs) WITH ORDINALITY", None, False),
+        ("WITH ORDINALITY of a constant generate_series", "SELECT t.id, g.v, g.o FROM t, generate_series(5, 7) WITH ORDINALITY AS g(v, o) WHERE t.id <= 2", None, False),
+        ("WITH ORDINALITY of a constant unnest", "SELECT t.id, u.x, u.o FROM t, unnest([5, 6]) WITH ORDINALITY AS u(x, o) WHERE t.id <= 2",
+         "SELECT t.id, u.x, u.o FROM t, unnest(ARRAY[5, 6]) WITH ORDINALITY AS u(x, o) WHERE t.id <= 2", False),
+        ("LEFT JOIN LATERAL … WITH ORDINALITY ON true: a NULL or empty list padded with NULL", "SELECT t.id, g.v, g.o FROM t LEFT JOIN LATERAL generate_series(1, t.n) WITH ORDINALITY AS g(v, o) ON true", None, False),
     ]
     # (DuckDB returns a set function's alias as a struct column: its values are the column named after the function)
     duck_text = {
@@ -18552,7 +18594,7 @@ def lateral():
     refused = {  # (Pondra's text, SQLSTATE, words the error must have)
         "LEFT JOIN LATERAL with a condition": ("SELECT t.id, u.x FROM t LEFT JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", "0A000", ["LEFT JOIN LATERAL", "not supported"]),
         "RIGHT JOIN LATERAL": ("SELECT t.id, u.x FROM t RIGHT JOIN LATERAL unnest(t.xs) AS u(x) ON true", "0A000", ["not supported"]),
-        "WITH ORDINALITY over a column": ("SELECT t.id, g FROM t, generate_series(1, t.n) WITH ORDINALITY AS g(v, o)", "0A000", ["WITH ORDINALITY is not supported yet"]),
+        "WITH ORDINALITY over a two-argument unnest": ("SELECT t.id, u.x FROM t, unnest(t.xs, t.xs) WITH ORDINALITY AS u(x, y, o)", "0A000", ["WITH ORDINALITY over unnest("]),
     }
     random_text = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, [1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"
     random_pg = "SELECT count(DISTINCT s.r) AS d, count(*) AS n FROM (SELECT random() AS r, ARRAY[1, 2, 3] AS xs) s, unnest(s.xs) AS u(x)"

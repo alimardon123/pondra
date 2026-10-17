@@ -309,11 +309,6 @@ fn call_of(e: &Expr) -> Option<(&'static Set, Vec<Expr>)> {
 
 fn is_column(e: &Expr) -> bool { matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) }
 
-/// A call as SQL writes it, for a message: `name(arg, arg)`.
-fn call_text(name: &ast::ObjectName, args: &[FunctionArg]) -> String {
-    format!("{name}({})", args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
-}
-
 /// The first call `wanted` names in `node`, as SQL writes it. A query inside `node` is its own (its calls are allowed
 /// where it stands), so the walk skips it: `depth` counts the queries it is in.
 struct Look<F> {
@@ -495,8 +490,8 @@ impl Scan {
         self.from(s)
     }
 
-    /// The FROM calls: a record's columns must be named (42601), and WITH ORDINALITY isn't taken yet. A call that reads a
-    /// column of the FROM is written as a LATERAL subquery by `Rewrite::table`, as Postgres takes it.
+    /// The FROM calls: a record's columns must be named (42601). A call that reads a column of the FROM is written as a
+    /// LATERAL subquery by `Rewrite::table`, as Postgres takes it.
     fn from(&mut self, s: &Select) -> anyhow::Result<()> {
         for twj in &s.from {
             for factor in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
@@ -507,18 +502,18 @@ impl Scan {
     }
 
     fn factor(&mut self, factor: &TableFactor) -> anyhow::Result<()> {
-        let (name, args, alias, with_ordinality) = match factor {
-            TableFactor::Table { name, args: Some(args), alias, with_ordinality, .. } => (name, &args.args, alias, *with_ordinality),
-            TableFactor::Function { name, args, alias, with_ordinality, .. } => (name, args, alias, *with_ordinality),
+        let (name, alias, with_ordinality) = match factor {
+            TableFactor::Table { name, args: Some(_), alias, with_ordinality, .. } | TableFactor::Function { name, alias, with_ordinality, .. } => (name, alias, *with_ordinality),
             _ => return Ok(()),
         };
         let Some(set) = set_of(name) else { return Ok(()) };
         self.found = true;
-        if with_ordinality {
-            return Err(coded("0A000", format!("WITH ORDINALITY isn't taken yet: {}", call_text(name, args))));
-        }
         if set.records() {
             record_columns(alias.as_ref())?;
+            // Postgres 16 takes WITH ORDINALITY over a record's columns only in ROWS FROM(), which isn't here.
+            if with_ordinality && alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
+                return Err(coded("42601", "WITH ORDINALITY cannot be used with a column definition list"));
+            }
         }
         Ok(())
     }
@@ -577,8 +572,8 @@ impl ast::VisitorMut for Rewrite {
 impl Rewrite {
     fn table(&mut self, factor: &mut TableFactor) {
         let made = match &*factor {
-            TableFactor::Table { name, args: Some(args), alias, .. } => set_of(name).map(|set| derived(set, &args.args, alias.as_ref(), reads(&args.args))),
-            TableFactor::Function { name, args, alias, .. } => set_of(name).map(|set| derived(set, args, alias.as_ref(), reads(args))),
+            TableFactor::Table { name, args: Some(args), alias, with_ordinality, .. } => set_of(name).map(|set| derived(set, &args.args, alias.as_ref(), reads(&args.args), *with_ordinality)),
+            TableFactor::Function { name, args, alias, with_ordinality, .. } => set_of(name).map(|set| derived(set, args, alias.as_ref(), reads(args), *with_ordinality)),
             _ => None,
         };
         match made {
@@ -600,19 +595,30 @@ fn reads(args: &Vec<FunctionArg>) -> bool { look(args, is_column).is_some() }
 /// alias's name for the keys (or the function's), `key` and `value` for each member, and a record's columns named by
 /// the alias's column definitions. The derived table takes the alias, and its column list when a non-record has one.
 /// `reads`: the arguments read a column, so the table is LATERAL (the rows are made from each row of the FROM before it).
-fn derived(set: &Set, args: &[FunctionArg], alias: Option<&TableAlias>, reads: bool) -> anyhow::Result<TableFactor> {
+/// `ordinality`: WITH ORDINALITY, so the table's last column is each row's position in the list (named `ordinality`; the
+/// alias's column list may rename it). A record's columns take none (`Scan::factor` refuses that).
+fn derived(set: &Set, args: &[FunctionArg], alias: Option<&TableAlias>, reads: bool, ordinality: bool) -> anyhow::Result<TableFactor> {
     let list = format!("{}({})", set.list, args.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
     let name = alias.map_or_else(|| ast::Ident::new(set.name), |a| a.name.clone());
+    // Under WITH ORDINALITY the list is computed once, in a FROM of its own, and each row's position in it is unnested beside
+    // its elements (`random()` in the list is read once). Without it the bodies are as they were.
+    let (elems, from, pos) = match ordinality {
+        true => ("l", format!(" FROM (SELECT {list} AS l) AS __l"), crate::lateral::positions("l")),
+        false => (list.as_str(), String::new(), String::new()),
+    };
+    let here = if ordinality { format!(", {pos} AS ordinality") } else { String::new() };
+    let nested = if ordinality { format!(", {pos} AS o") } else { String::new() };
+    let outer = if ordinality { ", o AS ordinality" } else { "" };
     let body = match set.how {
-        How::Elements => format!("SELECT {} AS value", as_json(set, &format!("unnest({list})"))),
-        How::ElementsText => format!("SELECT unnest({list}) AS value"),
-        How::ObjectKeys => format!("SELECT unnest({list}) AS {name}"),
+        How::Elements => format!("SELECT {} AS value{here}{from}", as_json(set, &format!("unnest({elems})"))),
+        How::ElementsText => format!("SELECT unnest({elems}) AS value{here}{from}"),
+        How::ObjectKeys => format!("SELECT unnest({elems}) AS {name}{here}{from}"),
         How::Each | How::EachText => {
             let value = match set.how {
                 How::Each => as_json(set, "get_field(s, 'value')"),
                 _ => "get_field(s, 'value')".to_string(),
             };
-            format!("SELECT get_field(s, 'key') AS key, {value} AS value FROM (SELECT unnest({list}) AS s) AS u")
+            format!("SELECT get_field(s, 'key') AS key, {value} AS value{outer} FROM (SELECT unnest({elems}) AS s{nested}{from}) AS u")
         }
         How::ToRecordset | How::ToRecord => format!("SELECT {} FROM (SELECT unnest({list}) AS e) AS s", record_columns(alias)?),
     };
@@ -673,10 +679,14 @@ fn parse(sql: &str) -> anyhow::Result<Box<Query>> {
 /// rows are a column called `value`, so a bare use of the name in its SELECT is `name.value`. An alias with a column list
 /// renames that column, so it has no such name (a bare use stays as it is).
 fn value_alias(factor: &TableFactor) -> Option<String> {
-    let (name, alias) = match factor {
-        TableFactor::Table { name, args: Some(_), alias, .. } | TableFactor::Function { name, alias, .. } => (name, alias),
+    let (name, alias, ordinality) = match factor {
+        TableFactor::Table { name, args: Some(_), alias, with_ordinality, .. } | TableFactor::Function { name, alias, with_ordinality, .. } => (name, alias, *with_ordinality),
         _ => return None,
     };
+    // Under WITH ORDINALITY the bare name is the whole row (value and ordinality), as Postgres has it: not a value.
+    if ordinality {
+        return None;
+    }
     let set = set_of(name).filter(|set| matches!(set.how, How::Elements | How::ElementsText))?;
     match alias {
         None => Some(set.name.to_string()),
@@ -942,11 +952,26 @@ mod tests {
 
     #[test]
     fn lateral_and_record_errors() {
-        assert!(refusal("SELECT * FROM jsonb_array_elements('[1]') WITH ORDINALITY AS e").contains("WITH ORDINALITY isn't taken yet"));
         let record = refusal("SELECT * FROM jsonb_to_recordset('[{\"a\":1}]') AS x(a, b)");
         assert!(record.contains("a column definition list is required"), "{record}");
         assert!(refusal("SELECT * FROM jsonb_to_record('{}')").contains("a column definition list is required"));
         assert!(refusal("SELECT jsonb_to_record('{\"a\":1}')").contains("could not determine row type for result of jsonb_to_record"));
+    }
+
+    /// WITH ORDINALITY numbers each list's elements beside them, the list computed once in the FROM of the body; a
+    /// record's columns take none, as Postgres 16 has it (ROWS FROM() isn't here), and a bare alias is the whole row.
+    #[test]
+    fn with_ordinality_numbers_the_list_beside_its_elements() {
+        let elements = rewritten("SELECT * FROM jsonb_array_elements('[1,2]') WITH ORDINALITY AS e").unwrap();
+        assert!(elements.contains("AS ordinality FROM (SELECT pondra_jsonb_array_elements('[1,2]') AS l) AS __l"), "{elements}");
+        assert!(elements.contains("unnest(generate_series(1, CAST(cardinality(l) AS BIGINT))) AS ordinality"), "{elements}");
+        let each = rewritten("SELECT * FROM jsonb_each('{\"a\":1}') WITH ORDINALITY AS kv(k, v, n)").unwrap();
+        assert!(each.contains(", o AS ordinality FROM (SELECT unnest(l) AS s, unnest(generate_series(1, CAST(cardinality(l) AS BIGINT))) AS o FROM"), "{each}");
+        let record = refusal("SELECT * FROM jsonb_to_recordset('[]') WITH ORDINALITY AS x(a int)");
+        assert!(record.contains("WITH ORDINALITY cannot be used with a column definition list"), "{record}");
+        assert!(refusal("SELECT * FROM jsonb_to_recordset('[]') WITH ORDINALITY AS x").contains("a column definition list is required"));
+        let whole_row = rewritten("SELECT e FROM jsonb_array_elements('[1]') WITH ORDINALITY AS e").unwrap();
+        assert!(!whole_row.contains("e.value"), "{whole_row}");
     }
 
     #[test]

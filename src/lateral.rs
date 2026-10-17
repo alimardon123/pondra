@@ -264,7 +264,8 @@ const SET_FUNCTIONS: &[&str] = &["generate_series", "range", "unnest"];
 /// `FROM t, generate_series(1, t.n) AS g` becomes `LATERAL (SELECT unnest(generate_series(1, t.n)) AS
 /// "g") AS "g"`, and `unnest(t.xs) AS u(x)` becomes `LATERAL (SELECT unnest(t.xs) AS "x") AS "u"`. The
 /// name of the column is as Postgres names it: the alias's column, else the alias's name, else the
-/// function's. Whether anything changed. (A function with constant arguments stays DataFusion's.)
+/// function's. Whether anything changed. (A function with constant arguments stays DataFusion's, unless it is
+/// `WITH ORDINALITY`: then it is a derived table of its own, with the positions beside its elements.)
 pub fn functions(stmt: &mut Statement) -> anyhow::Result<bool> {
     struct Functions {
         changed: bool,
@@ -314,32 +315,46 @@ fn call_of(f: &ast::TableFactor) -> Option<Call> {
     Some(Call { name, args, alias: alias.clone(), ordinality })
 }
 
-/// The LATERAL subquery a FROM item becomes, when it's one of the set functions over a column.
+/// Each element's position in its list, from 1 (`WITH ORDINALITY`): a second unnest zipped beside the list's own, over `generate_series` since `range` types the count DECIMAL.
+pub fn positions(list: &str) -> String { format!("unnest(generate_series(1, CAST(cardinality({list}) AS BIGINT)))") }
+
+/// The derived table a FROM item becomes, when it's one of the set functions: a LATERAL one when it reads a column, and
+/// one of its own under `WITH ORDINALITY` (which numbers each row's position in the call's list). A call this doesn't take
+/// is refused by name under `WITH ORDINALITY` (DataFusion would drop the flag); otherwise `None`, DataFusion's.
 fn written(f: &ast::TableFactor) -> anyhow::Result<Option<ast::TableFactor>> {
     let Some(call) = call_of(f) else { return Ok(None) };
     let lower = call.name.value.to_lowercase();
-    if !SET_FUNCTIONS.contains(&lower.as_str()) || !call.args.iter().any(reads_column) {
-        return Ok(None);
-    }
-    if call.ordinality {
-        return Err(crate::codes::coded("0A000", "WITH ORDINALITY is not supported yet"));
-    }
     let set = match (lower.as_str(), call.args.as_slice()) {
-        ("unnest", [arg]) => arg.to_string(),
-        ("unnest", _) => return Ok(None),
-        _ => format!("{}({})", call.name, call.args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", ")),
+        ("unnest", [arg]) => Some(arg.to_string()),
+        ("unnest", _) => None,
+        _ if SET_FUNCTIONS.contains(&lower.as_str()) => Some(format!("{}({})", call.name, call.args.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(", "))),
+        _ => None,
+    };
+    let reads = call.args.iter().any(reads_column);
+    let Some(set) = set.filter(|_| call.ordinality || reads) else {
+        if call.ordinality {
+            return Err(crate::codes::coded("0A000", format!("WITH ORDINALITY over {}(…) is not supported yet", call.name)));
+        }
+        return Ok(None);
     };
     let col = match &call.alias {
         Some(a) => a.columns.first().map_or_else(|| a.name.clone(), |c| c.name.clone()),
         None => call.name.clone(),
     };
+    // The list is computed once, in the FROM of the body, so its elements and their positions come from the same list.
+    let body = if call.ordinality {
+        let ord = call.alias.as_ref().and_then(|a| a.columns.get(1)).map_or_else(|| ast::Ident::new("ordinality"), |c| c.name.clone());
+        format!("SELECT unnest(l) AS {col}, {} AS {ord} FROM (SELECT {set} AS l) AS __l", positions("l"))
+    } else {
+        format!("SELECT unnest({set}) AS {col}")
+    };
     let alias = match call.alias {
         Some(a) => ast::TableAlias { explicit: a.explicit, name: a.name, columns: vec![], at: None },
         None => ast::TableAlias { explicit: false, name: call.name.clone(), columns: vec![], at: None },
     };
-    let mut stmts = Parser::parse_sql(&GenericDialect {}, &format!("SELECT unnest({set}) AS {col}"))?;
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, &body)?;
     let Some(Statement::Query(subquery)) = stmts.pop() else { return Ok(None) };
-    Ok(Some(ast::TableFactor::Derived { lateral: true, subquery, alias: Some(alias), sample: None }))
+    Ok(Some(ast::TableFactor::Derived { lateral: reads, subquery, alias: Some(alias), sample: None }))
 }
 
 fn last(name: &ast::ObjectName) -> Option<ast::Ident> { name.0.last().and_then(|p| p.as_ident()).cloned() }
@@ -498,10 +513,38 @@ mod tests {
         assert_eq!(got, rows(&["1,", "2,1", "3,"]));
     }
 
+    /// `WITH ORDINALITY` numbers each row's own list from 1: the positions restart for each row of the FROM.
+    #[tokio::test]
+    async fn with_ordinality_restarts_its_positions_for_each_row() {
+        let ctx = session().await.expect("a session");
+        let got = run(&ctx, "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)").await.expect("ordinality over a column");
+        assert_eq!(got, rows(&["1,2,1", "1,3,2", "2,1,1", "2,2,2", "3,3,1", "3,4,2"]));
+        let got = run(&ctx, "SELECT t.id, ordinality FROM t, unnest(t.xs) WITH ORDINALITY").await.expect("unnest with no alias");
+        assert_eq!(got, rows(&["1,1", "1,2", "1,3"]));
+    }
+
+    /// A constant call is a table of its own; a NULL or an empty list gives no rows.
+    #[tokio::test]
+    async fn with_ordinality_over_a_constant_and_an_empty_list() {
+        let ctx = session().await.expect("a session");
+        let got = run(&ctx, "SELECT g.v, g.o FROM generate_series(5, 7) WITH ORDINALITY AS g(v, o)").await.expect("a constant");
+        assert_eq!(got, rows(&["5,1", "6,2", "7,3"]));
+        let got = run(&ctx, "SELECT u.x, u.o FROM unnest(make_array(9, 8)) WITH ORDINALITY AS u(x, o)").await.expect("unnest of a constant");
+        assert_eq!(got, rows(&["8,2", "9,1"]));
+        let got = run(&ctx, "SELECT t.id, u.x, u.o FROM t, unnest(t.xs) WITH ORDINALITY AS u(x, o)").await.expect("NULL and empty lists");
+        assert_eq!(got, rows(&["1,1,1", "1,2,2", "1,3,3"]));
+    }
+
+    /// What this rewrite doesn't take under `WITH ORDINALITY` is refused by name, since DataFusion would drop the flag.
     #[test]
-    fn with_ordinality_is_refused() {
-        let mut stmt = Parser::parse_sql(&GenericDialect {}, "SELECT * FROM t, generate_series(1, t.n) WITH ORDINALITY AS g(v, o)").expect("parses").pop().expect("one");
-        let err = functions(&mut stmt).expect_err("refused");
-        assert!(err.to_string().contains("WITH ORDINALITY is not supported yet"));
+    fn with_ordinality_refused_by_name_where_not_taken() {
+        for (sql, call) in [
+            ("SELECT * FROM t, unnest(t.xs, t.xs) WITH ORDINALITY AS u(x, y, o)", "unnest(…)"),
+            ("SELECT * FROM t, my_function(t.n) WITH ORDINALITY", "my_function(…)"),
+        ] {
+            let mut stmt = Parser::parse_sql(&GenericDialect {}, sql).expect("parses").pop().expect("one");
+            let err = functions(&mut stmt).expect_err(sql);
+            assert!(err.to_string().contains(&format!("WITH ORDINALITY over {call} is not supported yet")), "{sql}: {err}");
+        }
     }
 }
