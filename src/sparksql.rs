@@ -29,7 +29,7 @@ pub fn inline(sql: &str) -> Result<String> {
         return Err(e);
     }
     Ok(match found.0 {
-        true => stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"),
+        true => stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"),
         false => sql.to_string(),
     })
 }
@@ -76,7 +76,7 @@ impl VisitorMut for Found {
 /// The query of a `spark_sql('…')` in a FROM (None: another table).
 fn spark_text(t: &TableFactor) -> Option<Result<String>> {
     let TableFactor::Table { name, args: Some(args), .. } = t else { return None };
-    if crate::write::object(name) != "spark_sql" {
+    if crate::text::object(name) != "spark_sql" {
         return None;
     }
     Some(match &args.args[..] {
@@ -140,7 +140,7 @@ impl VisitorMut for Turn<'_> {
                 }
                 let name = match &*e {
                     Expr::Value(v) => v.value.clone().into_string().unwrap_or(was), // (a literal: named its value, as Spark names it)
-                    Expr::Function(f) if ["explode", "explode_outer"].contains(&crate::write::object(&f.name).as_str()) => "col".into(),
+                    Expr::Function(f) if ["explode", "explode_outer"].contains(&crate::text::object(&f.name).as_str()) => "col".into(),
                     _ => was,
                 };
                 *item = SelectItem::ExprWithAlias { expr: now, alias: ast::Ident::with_quote('"', name) };
@@ -189,7 +189,7 @@ fn turn(e: &mut Expr, names: &HashMap<String, String>) -> Result<Option<Expr>> {
         Expr::Floor { expr: x, field: ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime) } => spark("floor").map(|f| expr(&format!("{f}({x})"))).transpose()?,
         Expr::Ceil { expr: x, field: ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime) } => spark("ceil").map(|f| expr(&format!("{f}({x})"))).transpose()?,
         Expr::Function(f) if f.name.0.len() == 1 => {
-            let name = crate::write::object(&f.name);
+            let name = crate::text::object(&f.name);
             let args = match &f.args {
                 FunctionArguments::List(l) => l.args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 _ => vec![],
@@ -243,7 +243,7 @@ fn lateral(s: &mut ast::Select, views: &mut HashMap<String, String>) -> Result<(
     };
     for v in std::mem::take(&mut s.lateral_views) {
         let Expr::Function(f) = &v.lateral_view else { bail!("LATERAL VIEW {}: a generator function, explode(…)", v.lateral_view) };
-        let name = crate::write::object(&f.name);
+        let name = crate::text::object(&f.name);
         ensure!(name == "explode" || name == "explode_outer", "LATERAL VIEW {name}: Pondra takes explode and explode_outer of an array");
         let [col] = &v.lateral_col_alias[..] else { bail!("LATERAL VIEW {} {} AS …: one column (a map's key and value: not yet)", v.lateral_view, v.lateral_view_name) };
         views.insert(v.lateral_view_name.to_string().to_lowercase(), alias.value.clone());

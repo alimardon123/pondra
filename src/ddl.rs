@@ -18,8 +18,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::sync::Arc;
-
-pub const PUBLIC: &str = "public";
+pub use crate::text::{join, local_in, mentions, split, PUBLIC};
 
 pub fn schema_key(s: &str) -> String { format!("ns/{s}") }
 /// A stored view (`CREATE VIEW`): a query with a name, run where it is used.
@@ -51,14 +50,6 @@ pub struct Attachment {
     pub read_only: bool, // (a lake on another server, read with a read-only key: ADR-058)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>, // (its server's URL, where its leader is asked for a pin)
-}
-
-/// A table's schema, and its name within it.
-pub fn split(name: &str) -> (&str, &str) { name.split_once('.').unwrap_or((PUBLIC, name)) }
-
-/// The name a table of `schema` has inside the lake.
-pub fn join(schema: &str, table: &str) -> String {
-    if schema == PUBLIC { table.to_string() } else { format!("{schema}.{table}") }
 }
 
 /// What a schema, table or view may be called: letters, digits, `_` and `-`. A dot separates the
@@ -185,16 +176,6 @@ pub async fn database(lake: &Lake, name: &str) -> Result<Option<Arc<Lake>>> {
 /// A table of this lake by its name inside it, from a name as SQL wrote it (`write::object`):
 /// None for another lake's. (A two-part name may yet be an attached lake's: no table has it here.)
 pub fn local(lake: &Lake, name: &str) -> Option<String> { local_in(&lake_name(lake), name) }
-
-/// `local` by the lake's name (the front has no `Lake`).
-pub fn local_in(lake: &str, name: &str) -> Option<String> {
-    match name.split('.').collect::<Vec<_>>()[..] {
-        [t] => Some(t.to_string()),
-        [s, t] => Some(join(s, t)),
-        [l, s, t] if l == lake => Some(join(s, t)),
-        _ => None,
-    }
-}
 
 /// A name for something new in this lake: its schema exists and its parts are fine. `public.t`
 /// is `t`.
@@ -1406,11 +1387,4 @@ fn reads(lake: &Lake, sql: &str, t: &str) -> bool {
         Some(names) => names.iter().any(|n| local(lake, n).as_deref() == Some(t)),
         None => mentions(sql, t),
     }
-}
-
-/// Might `sql` name table `t`? A word match on its last part (a session registers the tables that
-/// might be read: one too many costs nothing).
-pub fn mentions(sql: &str, t: &str) -> bool {
-    let last = split(t).1.to_lowercase();
-    sql.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-')).any(|w| w == last)
 }

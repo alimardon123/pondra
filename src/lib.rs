@@ -14,7 +14,26 @@ pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
+pub mod text;
+pub mod ext_names;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod asof;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod sparksql;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod past;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod diff;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod expander;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod front;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod codes;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod friendly;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod measures;
 mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
@@ -33,7 +52,6 @@ mod optimize;
 #[cfg(feature = "server")] mod cache;
 #[cfg(feature = "server")] mod catalogs;
 #[cfg(feature = "server")] mod change;
-#[cfg(feature = "server")] mod codes;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
@@ -49,7 +67,6 @@ mod optimize;
 #[cfg(feature = "server")] mod feeds;
 #[cfg(feature = "server")] mod files;
 #[cfg(feature = "server")] mod format;
-#[cfg(feature = "server")] mod friendly;
 #[cfg(feature = "server")] mod flight;
 #[cfg(feature = "server")] mod fresh;
 #[cfg(feature = "server")] mod find;
@@ -78,7 +95,6 @@ mod optimize;
 #[cfg(feature = "server")] mod drain;
 #[cfg(feature = "server")] mod log;
 #[cfg(feature = "server")] mod manifest;
-#[cfg(feature = "server")] mod measures;
 #[cfg(feature = "server")] pub mod memory;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod oom;
@@ -88,7 +104,6 @@ mod optimize;
 #[cfg(feature = "server")] pub mod library;
 #[cfg(feature = "server")] mod pages;
 #[cfg(feature = "server")] mod panics;
-#[cfg(feature = "server")] mod past;
 #[cfg(feature = "server")] mod tls;
 #[cfg(feature = "server")] mod txn;
 #[cfg(feature = "server")] mod returning;
@@ -118,7 +133,6 @@ mod optimize;
 #[cfg(feature = "server")] mod skew;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
-#[cfg(feature = "server")] mod front;
 #[cfg(feature = "server")] mod host;
 #[cfg(feature = "server")] mod scan;
 #[cfg(feature = "server")] mod script;
@@ -126,7 +140,6 @@ mod optimize;
 #[cfg(feature = "server")] mod server;
 #[cfg(feature = "server")] mod service;
 #[cfg(feature = "server")] mod spill;
-#[cfg(feature = "server")] mod sparksql;
 #[cfg(feature = "server")] mod spmd;
 #[cfg(feature = "server")] mod status;
 #[cfg(feature = "server")] mod store;

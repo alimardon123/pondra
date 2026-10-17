@@ -8,17 +8,18 @@
 //! takes it), then a table of its own, `"at:<base64url JSON>"` (`table_factor`), which every
 //! session reading it registers (`table`), as files anywhere are (`ext.rs`).
 
-use crate::store::{table_key, Lake, TableMeta};
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
-use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit};
-use datafusion::catalog::TableProvider;
-use datafusion::common::{JoinType, ScalarValue};
-use datafusion::prelude::*;
 use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, keywords::{Keyword, RESERVED_FOR_TABLE_ALIAS}, tokenizer::{Location, Token, Tokenizer}};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::sync::Arc;
+#[cfg(feature = "server")] use crate::store::{table_key, Lake, TableMeta};
+#[cfg(feature = "server")] use anyhow::Context;
+#[cfg(feature = "server")] use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit};
+#[cfg(feature = "server")] use datafusion::catalog::TableProvider;
+#[cfg(feature = "server")] use datafusion::common::{JoinType, ScalarValue};
+#[cfg(feature = "server")] use datafusion::prelude::*;
+#[cfg(feature = "server")] use std::sync::Arc;
 
 /// What a query asked for: a table, and when.
 #[derive(Serialize, Deserialize)]
@@ -28,6 +29,7 @@ struct Spec {
     expr: String, // as written: worked out when the query runs (`now()` is then)
 }
 
+#[cfg(feature = "server")]
 enum At {
     Version(i64),
     Time(i64), // microseconds since 1970, UTC
@@ -165,17 +167,17 @@ fn as_of(sql: &str) -> Cow<'_, str> {
 /// not one.
 pub fn table_factor(lake: &str, t: &mut ast::TableFactor) -> Result<bool> {
     let ast::TableFactor::Table { name, args: Some(args), .. } = t else { return Ok(false) };
-    if crate::write::object(name) != "pondra_at" {
+    if crate::text::object(name) != "pondra_at" {
         return Ok(false);
     }
     let shape = "t AT (VERSION => n), AT (TIMESTAMP => t) or AT (OFFSET => -seconds)";
-    let a = crate::routines::args("AT", &args.args).map_err(|_| anyhow!("{shape}"))?;
+    let a = crate::text::args("AT", &args.args).map_err(|_| anyhow!("{shape}"))?;
     let table = match a.given.first() {
-        Some(ast::Expr::Identifier(i)) => crate::write::ident(i),
-        Some(ast::Expr::CompoundIdentifier(parts)) => parts.iter().map(crate::write::ident).collect::<Vec<_>>().join("."),
+        Some(ast::Expr::Identifier(i)) => crate::text::ident(i),
+        Some(ast::Expr::CompoundIdentifier(parts)) => parts.iter().map(crate::text::ident).collect::<Vec<_>>().join("."),
         _ => bail!("{shape}: after a table's name"),
     };
-    let table = crate::ddl::local_in(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
+    let table = crate::text::local_in(lake, &table).ok_or_else(|| anyhow!("{table} AT (…): only this lake's tables are read as they were (ask a node of that lake)"))?;
     ensure!(a.given.len() == 1 && a.named.len() == 1 && ["version", "timestamp", "offset"].contains(&a.named[0].0.as_str()), "{shape}");
     let (at, expr) = (a.named[0].0.clone(), a.named[0].1.to_string());
     let spec = B64.encode(serde_json::to_vec(&Spec { table, at, expr })?);
@@ -210,6 +212,7 @@ pub fn names(sql: &str) -> Vec<String> {
 /// versions of rows changed since that were there at `n` (`{t}$deleted`: `_old_version <= n <
 /// _version`). As of a time, the rows made by then, and, of a row changed since, the version its
 /// first change after then replaced, if the row was made by then.
+#[cfg(feature = "server")]
 pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>)> {
     use crate::sys::{with_sys, CREATED, ROW_ID, UPDATED, VERSION};
     let spec: Spec = serde_json::from_slice(&B64.decode(name.trim_start_matches("at:"))?)?;
@@ -278,6 +281,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
 /// The version (and time, in ms) before which `meta`'s past is no longer whole: a purge has let
 /// old versions go (`TableMeta::past_from`). A table changed before this was kept (legacy) is whole
 /// from its oldest purge kept on.
+#[cfg(feature = "server")]
 pub(crate) fn kept_since(meta: &TableMeta) -> Option<(u64, u64)> {
     match meta.past_from {
         Some(b) => Some(b).filter(|b| *b != (0, 0)),
@@ -286,6 +290,7 @@ pub(crate) fn kept_since(meta: &TableMeta) -> Option<(u64, u64)> {
 }
 
 /// When the query asked for: a version, or a time (TIMESTAMP, or OFFSET seconds from now).
+#[cfg(feature = "server")]
 async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
     use datafusion::arrow::array::AsArray;
     let (sql, ty) = match spec.at.as_str() {
@@ -311,7 +316,7 @@ static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
 /// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
 /// the parser doesn't read a RESTORE). None: not a RESTORE.
 pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
-    if crate::write::head(sql) != "restore" {
+    if crate::text::head(sql) != "restore" {
         return None;
     }
     let moment = RESTORE.captures(sql)?.get(3)?;
@@ -322,6 +327,7 @@ pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
 /// were then, by one MERGE from `t AT (…)`. A row changed since gets its old values back (its
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
 /// change like any, so it can be undone the same way. None: not a RESTORE.
+#[cfg(feature = "server")]
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
     if crate::write::head(sql) != "restore" {
         return Ok(None);

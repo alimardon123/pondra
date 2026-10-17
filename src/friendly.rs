@@ -16,7 +16,7 @@
 //! What needs the data (a PIVOT's values, a FROM's columns) is asked with a query of its own, as
 //! the caller, before the tree is rewritten: a first pass collects the questions, a second takes
 //! the answers in the same order (`Asks`).
-use crate::store::{Lake, TableMeta};
+#[cfg(feature = "server")] use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::{Token, Tokenizer}};
@@ -433,6 +433,7 @@ struct Level {
 
 /// `stmts` with every friendly form in them rewritten, asking the lake what they need to know;
 /// whether any was.
+#[cfg(feature = "server")]
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
     // (dbt's `AS (SELECT …)`: a materialized view's query is read as `first_table` reads it, a SELECT
@@ -474,12 +475,14 @@ tokio::task_local! {
 /// The answer to an ask, from a query run as the caller (itself expanded: it may hold friendly
 /// SQL too). Asks inside asks stop 8 deep: a probe that asked itself again overflowed the stack
 /// and took the node down.
+#[cfg(feature = "server")]
 async fn answer(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
     let depth = ASKING.try_with(|d| *d).unwrap_or(0);
     ensure!(depth < 8, "a query that needs its own columns to know its own columns (asked 8 deep)");
     ASKING.scope(depth + 1, answered(lake, ask)).await
 }
 
+#[cfg(feature = "server")]
 async fn answered(lake: &Lake, ask: Ask) -> Result<Vec<Column>> {
     let (sql, values) = match ask {
         Ask::Values(q) => (q, true),
@@ -1016,6 +1019,7 @@ fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
 /// `INSERT INTO t DEFAULT VALUES` as `INSERT INTO t VALUES (DEFAULT, …)`, one DEFAULT per column, so
 /// defaults and identity columns fill the row as they do for any INSERT. Only a lake table; a
 /// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
+#[cfg(feature = "server")]
 async fn default_values(lake: &Lake, s: &mut Statement) -> Result<()> {
     let Statement::Insert(ins) = s else { return Ok(()) };
     if ins.source.is_some() || !ins.assignments.is_empty() {
@@ -1580,6 +1584,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
 /// DuckDB's `SUMMARIZE t` (or `SUMMARIZE SELECT …`): a row per column (its type, least and
 /// greatest value, distinct values about, mean, standard deviation, quartiles, count and share
 /// of NULLs), from one pass over the rows.
+#[cfg(feature = "server")]
 pub async fn summarize(lake: &Lake, sql: &str) -> Result<Option<String>> {
     static SUMMARIZE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*summarize\s+(.+?)\s*;?\s*$").expect("a regex"));
     let Some(m) = SUMMARIZE.captures(sql) else { return Ok(None) };

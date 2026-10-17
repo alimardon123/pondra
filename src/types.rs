@@ -45,6 +45,7 @@ use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
+pub use crate::text::{function, is_uuid};
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -331,12 +332,6 @@ fn too_long(v: &str, n: usize) -> bool {
     v.len() > n && v.trim_end_matches(' ').chars().count() > n
 }
 
-/// `s` is a uuid as Postgres writes one, the only way a uuid column holds it: 36 characters, lower
-/// case, hyphens after the 8th, 12th, 16th and 20th digits.
-pub fn is_uuid(s: &str) -> bool {
-    s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) })
-}
-
 /// Any spelling of a uuid Postgres takes (upper case, braces, no hyphens), written the one way;
 /// refused as Postgres refuses it (22P02).
 pub fn uuid_of(s: &str) -> Result<String> {
@@ -407,21 +402,6 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         }
     }
     Ok(())
-}
-
-/// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
-/// it parsed for one: the built-in types' names are left alone.)
-pub fn wanted(sql: &str) -> bool {
-    static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
-    const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
-        "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
-        "datetime", "interval", "json", "jsonb", "uuid", "bytea", "blob", "binary", "varbinary", "bytes", "regclass", "regtype", "regproc", "regnamespace", "oid", "name", "variant", "bit"];
-    NAMED.captures_iter(sql).any(|c| match (c.get(1), c.get(2)) {
-        _ if c.get(3).is_some() => c.get(3).is_some_and(|s| !is_uuid(s.as_str())), // (`'A0EE…'`: read as a uuid where one is compared with it or written into one)
-        (None, _) => true, // (enum_range(…), pg_typeof(…))
-        (Some(_), Some(_)) => true,
-        (Some(n), None) => n.as_str().eq_ignore_ascii_case("uuid") || !BUILT_IN.contains(&n.as_str().to_lowercase().as_str()), // (a cast to uuid: written as text)
-    })
 }
 
 /// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
@@ -566,24 +546,6 @@ impl VisitorMut for Casts {
         }
         ControlFlow::Continue(())
     }
-}
-
-/// `name(args…)` as SQL's tree has a call.
-pub fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
-    ast::Expr::Function(ast::Function {
-        name: ast::ObjectName::from(vec![ast::Ident::new(name)]),
-        uses_odbc_syntax: false,
-        parameters: ast::FunctionArguments::None,
-        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-            duplicate_treatment: None,
-            args: args.into_iter().map(|a| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(a))).collect(),
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
 }
 
 /// The functions every session has for these types: `gen_random_uuid()` and `uuidv4()` (DataFusion's

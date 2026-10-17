@@ -31,7 +31,6 @@ use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec, Partiti
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties, InputDistributionRequirements, PlanProperties};
 use futures::{StreamExt, TryStreamExt};
-#[cfg(feature = "server")]
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -53,7 +52,6 @@ pub fn rewrite(sql: &str) -> anyhow::Result<Cow<'_, str>> {
 }
 
 /// `rewrite`, leaving `*` as it is (for a query `sys::hide` couldn't place its EXCLUDE in).
-#[cfg(feature = "server")]
 pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
     use datafusion::sql::sqlparser::{ast::*, dialect::GenericDialect, parser::Parser};
     use std::ops::ControlFlow;
@@ -172,7 +170,7 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
         return Err(e);
     }
     Ok(match v.0 {
-        true => Cow::Owned(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n")),
+        true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")),
         false => Cow::Borrowed(sql),
     })
 }
