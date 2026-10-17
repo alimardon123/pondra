@@ -21,12 +21,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit,
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::sync::Arc;
-
-pub const ROW_ID: &str = "_row_id";
-pub const VERSION: &str = "_version";
-pub const CREATED: &str = "_created_at";
-pub const UPDATED: &str = "_updated_at";
-pub const NAMES: [&str; 4] = [ROW_ID, VERSION, CREATED, UPDATED];
+pub use crate::text::{CREATED, NAMES, ROW_ID, UPDATED, VERSION};
 
 pub fn time() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 

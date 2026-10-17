@@ -2,13 +2,15 @@
 //! FROM first, files by name, …), generic over what it asks of where it runs (`Host`). A node is a host
 //! (`host.rs`); a page will be one (designs/l2-b4-front-and-web.md). Each pass runs once a statement or once a name.
 
-use crate::ext::Attached;
-use crate::routines::{Expander, Kind, Routine};
+use crate::ext_names::Attached;
+use crate::expander::Routine;
+#[cfg(feature = "server")] use crate::expander::{Expander, Kind};
 use anyhow::Result;
-use datafusion::sql::sqlparser::{ast::{self, Statement, VisitMut}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::ast::Statement;
+#[cfg(feature = "server")] use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::ops::ControlFlow;
+#[cfg(feature = "server")] use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch.
@@ -41,6 +43,7 @@ pub enum Own {
 }
 
 /// The front (`routines::expand_with` before):
+#[cfg(feature = "server")]
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),

@@ -24,6 +24,10 @@ mod sparksql;
 mod past;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod diff;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod expander;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod front;
 mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
@@ -124,7 +128,6 @@ mod optimize;
 #[cfg(feature = "server")] mod skew;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
-#[cfg(feature = "server")] mod front;
 #[cfg(feature = "server")] mod host;
 #[cfg(feature = "server")] mod scan;
 #[cfg(feature = "server")] mod script;

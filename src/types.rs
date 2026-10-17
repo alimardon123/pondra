@@ -45,6 +45,7 @@ use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
+pub use crate::text::function;
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -566,24 +567,6 @@ impl VisitorMut for Casts {
         }
         ControlFlow::Continue(())
     }
-}
-
-/// `name(args…)` as SQL's tree has a call.
-pub fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
-    ast::Expr::Function(ast::Function {
-        name: ast::ObjectName::from(vec![ast::Ident::new(name)]),
-        uses_odbc_syntax: false,
-        parameters: ast::FunctionArguments::None,
-        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-            duplicate_treatment: None,
-            args: args.into_iter().map(|a| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(a))).collect(),
-            clauses: vec![],
-        }),
-        filter: None,
-        null_treatment: None,
-        over: None,
-        within_group: vec![],
-    })
 }
 
 /// The functions every session has for these types: `gen_random_uuid()` and `uuidv4()` (DataFusion's
