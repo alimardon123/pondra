@@ -32,11 +32,11 @@ pub trait Host: Sync {
     /// The columns of these tables of the lake (names inside it, as `text::local_in` gives them), system columns last;
     /// a name with no table is left out.
     fn columns(&self, tables: BTreeSet<String>) -> impl Future<Output = Result<HashMap<String, Vec<String>>>> + Send;
-    /// Whether `sql` reads a view with measures or names a measure (`measures::wanted`).
+    /// Whether `sql` reads a view with measures or names a measure (a node's, from the lake's views: `host.rs`).
     fn measured(&self, _sql: &str) -> impl Future<Output = Result<bool>> + Send {
         async { Ok(false) }
     }
-    /// Measures worked out at the query's own grain (`measures::rewrite`): whether it changed anything.
+    /// Measures worked out at the query's own grain (`measures::rewrite_with`): whether it changed anything.
     fn measures(&self, _sql: &str, _stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send {
         async { Ok(false) }
     }
@@ -66,7 +66,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     let sql = &crate::sparksql::inline(sql)?; // (`spark_sql('…')`: Spark SQL as Pondra's, then expanded as any)
     let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
-    let sql = &crate::past::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
+    let sql = &crate::past_names::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;

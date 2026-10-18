@@ -2373,6 +2373,11 @@ mod tests {
         assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
     }
 
+    #[test]
+    fn catching_up_is_cannot_connect_now() {
+        assert_eq!(crate::codes::of(&anyhow::anyhow!("{}", CATCHING_UP)), "57P03");
+    }
+
     /// What a read never sees is quiet, and anything else in the same commit makes it loud
     /// (invariant 224): `harness.py remembered` asks around the audit log's line and a new lake's keys.
     #[test]

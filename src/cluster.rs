@@ -749,3 +749,13 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
         Err(e) => panic!("restart failed: {e}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cut_off_is_cannot_connect_now() {
+        assert_eq!(crate::codes::of(&anyhow::anyhow!("{}", CUT_OFF_SAYS)), "57P03");
+    }
+}

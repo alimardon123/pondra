@@ -446,7 +446,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         return Ok(format!("{head}{moment}"));
     }
     let sql = &crate::sparksql::inline(sql)?; // (a parameter of Spark SQL's is in its text: bound once it is Pondra's)
-    let sql = &crate::past::syntax(sql); // (`t AT (VERSION => $v)`)
+    let sql = &crate::past_names::syntax(sql); // (`t AT (VERSION => $v)`)
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
     let values = params.iter().map(|(k, v)| Ok((k.clone(), literal(v)?))).collect::<Result<HashMap<_, _>>>()?;
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
@@ -856,7 +856,7 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
         return Ok(Outcome::Rows(rows)); // (a key lookup in a transaction: no planning)
     }
     Ok(Outcome::Rows(match who.files {
-        true => app.query_as(&crate::asof::rewrite(sql)?, Some("0"), true).await?, // (a file here: this node only)
+        true => app.query_as(&crate::sys::planned(sql)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(sql, None).await?,
     }))
 }

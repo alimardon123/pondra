@@ -623,7 +623,7 @@ async fn run() -> anyhow::Result<()> {
             match write::parse(&query) {
                 Some(stmt) => println!("{}", ext::scope(true, write::from_cli(&dir, stmt)).await?), // (its user's own machine: its files, its credentials)
                 None => {
-                    let planned = asof::rewrite(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
+                    let planned = sys::planned(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
                     let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&planned).await?.collect().await?) };
                     let batches = ext::scope(true, auth::WHO.scope(auth::Principal::token(auth::Role::Admin), run)).await?; // (and its storage: attached lakes too)
                     println!("{}", pretty_format_batches(&batches)?);

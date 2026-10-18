@@ -1256,7 +1256,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
         let before = views.len();
         let mut left = vec![];
         for (name, sql) in views {
-            match self::sql(ctx, &crate::asof::rewrite(&sql)?).await {
+            match self::sql(ctx, &crate::sys::planned(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
                     let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
@@ -1285,7 +1285,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 /// other table it mentions is read from the lake as usual.
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
-    let sql = crate::asof::rewrite(sql)?;
+    let sql = crate::sys::planned(sql)?;
     let (out, batches) = crate::fresh::run(lake, source, schema(&meta.columns)?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
     Ok(datafusion::arrow::compute::concat_batches(&out, &batches)?)
 }

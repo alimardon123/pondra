@@ -919,7 +919,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
             let read = format!("SELECT * FROM {k}");
             let ctx = crate::query::session(query, &read, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
-            let batches = ctx.sql(&crate::asof::rewrite(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
+            let batches = ctx.sql(&crate::sys::planned(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
             let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)
             let as_sent = format!("__sent_{}", sent.len() + 1);
             kept.insert(k, (as_sent.clone(), alias));

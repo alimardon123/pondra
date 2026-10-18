@@ -811,7 +811,7 @@ impl App {
 
     /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
     pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
-        match self.query_as(&crate::asof::rewrite(query)?, spread, false).await {
+        match self.query_as(&crate::sys::planned(query)?, spread, false).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
             Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await, // (an answer half sent is never run again)
@@ -819,7 +819,7 @@ impl App {
         }
     }
 
-    /// Run a query as rewritten (`asof::rewrite`: ASOF JOIN as DataFusion can plan it); `files`:
+    /// Run a query as rewritten (`sys::planned`: ASOF JOIN as DataFusion can plan it); `files`:
     /// it may read files on this machine (`owner`). Its work — over 100 KB of it, planning and
     /// running a query — is made on the heap, here: a caller waiting for it holds a pointer, so
     /// procedures calling procedures 16 deep don't run out of stack.
@@ -1579,7 +1579,7 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
     let _armed = (crate::answer::streams(p.format.as_deref()) && !explained).then(|| crate::query::arm(p.format.as_deref()));
     let batches = match files {
-        true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
+        true => app.query_as(&crate::sys::planned(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
     if crate::query::handed().is_some() {
@@ -1814,7 +1814,8 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let (status, code, told) = crate::codes::answer(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4; `codes::answer`, every door's)
+        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
+        let (status, told) = (crate::codes::http(code), crate::ext::said(&self.0)); // (the words its caller may see)
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, [("x-pondra-sqlstate", code)], told).into_response()
     }

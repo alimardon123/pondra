@@ -94,11 +94,28 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
 
 const SIGN_IN: &str = "sign in: a token, or a user's name and password (handshake)";
 
+/// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
+fn grpc(code: &str) -> tonic::Code {
+    match code {
+        "40001" => tonic::Code::Aborted,
+        "42501" => tonic::Code::PermissionDenied,
+        "28P01" | "28000" => tonic::Code::Unauthenticated,
+        "42P01" | "42703" | "42883" | "3F000" => tonic::Code::NotFound,
+        "42P07" | "23505" => tonic::Code::AlreadyExists,
+        "57014" => tonic::Code::DeadlineExceeded,
+        "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
+        "0A000" => tonic::Code::Unimplemented,
+        "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
+        c if c.starts_with("42") || c.starts_with("22") || c.starts_with("21") => tonic::Code::InvalidArgument,
+        _ => tonic::Code::Internal,
+    }
+}
+
 /// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`.
 fn status(e: impl Into<anyhow::Error>) -> Status {
     let e = e.into();
     let code = crate::codes::of(&e);
-    let mut s = Status::new(crate::codes::grpc(code), crate::ext::said(&e));
+    let mut s = Status::new(grpc(code), crate::ext::said(&e));
     s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
     s
 }
@@ -273,7 +290,7 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(a
 
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
-    let df = crate::engine::sql(&ctx, &crate::asof::rewrite(sql)?).await?;
+    let df = crate::engine::sql(&ctx, &crate::sys::planned(sql)?).await?;
     Ok(announced(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
 }
 

@@ -829,9 +829,9 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
     ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
-    crate::measures::check(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
+    crate::facts::measures_checked(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
-    let planned = crate::asof::rewrite(&expanded)?;
+    let planned = crate::sys::planned(&expanded)?;
     let df = crate::engine::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
     lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external, facts }))], &[]).await?;

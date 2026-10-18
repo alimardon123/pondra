@@ -88,7 +88,7 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           table with another company)), xlsx.rs (a download as an Excel workbook); round 32 fresh.rs (a view's plan kept from one write to
           the next); round 33 format.rs (the lake's format, ADR-039), drain.rs (stopping without
           dropping work), service.rs (`pondra service`: systemd, launchd, a Windows service;
-          ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043) and history.rs (every
+          ADR-041), past.rs (a table's past: `AT (…)`, `RESTORE`, ADR-043), past_names.rs (its syntax, in every build) and history.rs (every
           statement a row of `pondra.history`, slow ones with plans and traces, ADR-048); round 34
           friendly.rs (DuckDB's spellings, rewritten where SQL comes in: invariant 225), objects.rs
           (one registry of every kind of object: ADR-049, invariant 227), find.rs (`pondra.parts` and
@@ -2438,7 +2438,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
    "never a remembered answer…".
 346. **A measure is worked out at the query's own grain, from the view's base rows, never from its default
-   form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming a measure
+   form's** (`measures::rewrite_with`, first in `routines::expand_with`'s tree stage): a query naming a measure
    reads the view's FROM and WHERE with the dimensions it uses and each column its measures read, and each
    measure is its expression over those, grouped by the query's GROUP BY; the base is then written in place
    (`measures::flattened`) unless that could change a name's meaning. Everything after it sees a plain
@@ -2446,7 +2446,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is a measure call (`measures::measure_call`): Spark's and DuckDB's `aggregate(list, …)` go to the
    planner. `harness.py measures`: "MEASURE() at the query's own grain…", "every way of naming a
    measure…", "spread over three nodes == one node"; `dialects`' XX000 count.
-347. **A view with measures joins only onto keys, so no row is counted twice** (`measures::check`, in
+347. **A view with measures joins only onto keys, so no row is counted twice** (`facts::measures_checked`, in
    `ddl::create_view`): each JOIN or LEFT JOIN's equalities cover a PRIMARY KEY or UNIQUE of the table or
    view it joins (NOT ENFORCED is enough); a query that joins the view to anything else is refused.
    `harness.py measures`: "refused by name, and nothing made" ('not on a key', 'has no key', 'inside the
@@ -2586,7 +2586,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and grant) asks it. Anyone else sees a routine's name, parameters and result, enough to call it; a CALL
    still runs as its caller (invariant 84), and its errors quote no code: a stored procedure runs for such a
    caller inside `script::unshown` (a statement by its number, a condition as `…`), and a Python routine's
-   `  line 3: <the line>` is cut to `  line 3` (`python::unquoted`) in `python::ask` and in `ext::said`, where
+   `  line 3: <the line>` is cut to `  line 3` (`codes::unquoted`; `codes::of` reads every error without those lines) in `python::ask` and in `ext::said`, where
    every door words an error (a function's batches may run where no caller is known). A user granted some tables saw every table's name and every
    routine's code before. `harness.py users`: "a user is shown only the tables it may read (GET /objects)
    and no routine's code…", "S27, beyond the listings…" (both fail on the build before),

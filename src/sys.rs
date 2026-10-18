@@ -52,6 +52,15 @@ pub fn mentioned(sql: &str) -> bool {
     sql.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| NAMES.contains(&w))
 }
 
+/// SQL as a node plans it: each ASOF JOIN as the LEFT JOIN that carries its marker (`asof::as_of`), and `*` without the
+/// system columns (`hide`).
+pub fn planned(sql: &str) -> anyhow::Result<Cow<'_, str>> {
+    Ok(match crate::asof::as_of(sql)? {
+        Cow::Borrowed(s) => hide(s), // (and `*` without the system columns)
+        Cow::Owned(s) => Cow::Owned(hide(&s).into_owned()),
+    })
+}
+
 /// `*` without the system columns, in a query that names one (so they are in its tables):
 /// `SELECT *, _row_id FROM t` shows the table's columns and `_row_id` once. Only a SELECT from one
 /// table is rewritten; over a join, `*` shows each table's system columns too.

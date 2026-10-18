@@ -16,13 +16,12 @@
 //! What needs the data (a PIVOT's values, a FROM's columns) is asked with a query of its own, as
 //! the caller, before the tree is rewritten: a first pass collects the questions, a second takes
 //! the answers in the same order (`Asks`).
-#[cfg(feature = "server")] use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::{Token, Tokenizer}};
 use regex::Regex;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
@@ -436,6 +435,9 @@ struct Level {
 /// whether any was.
 pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
     let before = stmts.to_vec();
+    for s in stmts.iter_mut() {
+        default_values(host, s).await?;
+    }
     // (dbt's `AS (SELECT …)`: a materialized view's query is read as `first_table` reads it, a SELECT
     // of its own; done here, not in the visitor, which doesn't reach a view's query)
     for s in stmts.iter_mut() {
@@ -1009,31 +1011,20 @@ fn backslash_pattern(pattern: &str, esc: Option<char>) -> Result<String> {
 }
 
 /// `INSERT INTO t DEFAULT VALUES` as `INSERT INTO t VALUES (DEFAULT, …)`, one DEFAULT per column, so
-/// defaults and identity columns fill the row as they do for any INSERT. Only a lake table; a
+/// defaults and identity columns fill the row as they do for any INSERT. Only a table the host has; a
 /// temporary table's INSERT is its own path (`temp.rs`), so it is left as it is.
-#[cfg(feature = "server")]
-async fn default_values(lake: &Lake, s: &mut Statement) -> Result<bool> {
+async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> Result<bool> {
     let Statement::Insert(ins) = s else { return Ok(false) };
     if ins.source.is_some() || !ins.assignments.is_empty() {
         return Ok(false);
     }
     let TableObject::TableName(name) = &ins.table else { return Ok(false) };
-    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::text::object(name))).await? else { return Ok(false) };
-    let columns = meta.logical_columns().iter().filter(|(c, _)| c != "_deleted").count();
+    let table = crate::text::object(name);
+    let Some(names) = host.columns(BTreeSet::from([table.clone()])).await?.remove(&table) else { return Ok(false) };
+    let columns = names.iter().filter(|c| !crate::text::NAMES.contains(&c.as_str()) && c.as_str() != "_deleted").count();
     let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, &format!("VALUES ({})", vec!["DEFAULT"; columns].join(", ")))?.remove(0) else { return Ok(false) };
     ins.source = Some(query);
     Ok(true)
-}
-
-/// `INSERT INTO t DEFAULT VALUES` filled from each table's columns (`default_values`): the part of `rewrite` that reads
-/// the lake's catalog, which the node runs before it. Whether it changed any statement.
-#[cfg(feature = "server")]
-pub async fn defaults(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
-    let mut changed = false;
-    for s in stmts.iter_mut() {
-        changed |= default_values(lake, s).await?;
-    }
-    Ok(changed)
 }
 
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.

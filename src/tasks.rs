@@ -93,7 +93,7 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
         bail!("shard_by is required with shards > 1");
     }
     let ctx = session(lake, &task.sql, "").await?;
-    let df = crate::engine::sql(&ctx, &crate::asof::rewrite(&task.sql)?).await?;
+    let df = crate::engine::sql(&ctx, &crate::sys::planned(&task.sql)?).await?;
     let out = crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone(); // (the types as the query runs, not as the planner first typed them: the table takes them)
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {

@@ -3,8 +3,9 @@
 //! A view keeps its measures as aliases `AS "pondra_measure:name"`, so its stored SQL is still SQL and an older reader sees
 //! plain columns. A plain read gives the dimensions and measures worked out, grouped by the dimensions (`default_form`). A
 //! query naming a measure (`MEASURE(name)`, `AGG(name)`, `sum(name)` or the bare name) aggregates the view's base rows, so a
-//! measure means the same wherever it is used. `check` checks the view's own joins where it is made (each onto a key of the
-//! joined table); a query joining a view to anything else is refused by name in the rewrite, with no key check.
+//! measure means the same wherever it is used. `facts::measures_checked` checks the view's own joins where it is made
+//! (each onto a key of the joined table); a query joining a view to anything else is refused by name in the rewrite, with
+//! no key check.
 
 use anyhow::{anyhow, bail, ensure, Result};
 use datafusion::sql::sqlparser::{
@@ -16,10 +17,8 @@ use datafusion::sql::sqlparser::{
     tokenizer::{Location, Token, TokenWithSpan, Tokenizer},
 };
 use std::{borrow::Cow, collections::{HashMap, HashSet}, ops::ControlFlow, sync::{Arc, LazyLock}};
-#[cfg(feature = "server")] use std::sync::Mutex;
 
 use crate::text;
-#[cfg(feature = "server")] use crate::{constraints::Kind, ddl, routines, store::{self, Lake}};
 
 /// The alias a measure is stored under: `sum(x) AS MEASURE m` is kept as `sum(x) AS "pondra_measure:m"`.
 pub const MARK: &str = "pondra_measure:";
@@ -47,7 +46,7 @@ static BARE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^[a-z
 static STORED: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(&format!(r#""{}((?:[^"]|"")*)""#, regex::escape(MARK))).expect("a regex"));
 /// A `MEASURE(`, `AGG(` or `AGGREGATE(` call in a text, looked for before any view is read.
-static CALL_TEXT: LazyLock<regex::Regex> =
+pub(crate) static CALL_TEXT: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:measure|agg|aggregate)\s*\(").expect("a regex"));
 
 // The text: `AS MEASURE name` is stored as `AS "pondra_measure:name"`, and back again for display.
@@ -994,132 +993,6 @@ fn column_of(e: &Expr, rel: &str) -> Option<String> {
         },
         _ => None,
     }
-}
-
-// The lake: the views with measures it holds, and the checks that need its tables.
-
-/// The views with measures a lake holds, by local name (`sales`, or `crm.sales`). Read again only after a commit, as
-/// `routines::listed` is: every query asks.
-#[cfg(feature = "server")]
-async fn own_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>> {
-    type Seen = Mutex<HashMap<String, (u64, Arc<HashMap<String, Arc<Definition>>>)>>;
-    crate::per_node!(static SEEN: Seen = Default::default());
-    let version = lake.cat.version();
-    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap().get(&lake.url)) {
-        if *at == v {
-            return Ok(all.clone());
-        }
-    }
-    let mut out = HashMap::new();
-    for (key, view) in lake.cat.scan::<ddl::StoredView>("q/", "q0").await? {
-        let Some(local) = key.strip_prefix("q/") else { continue };
-        // A stored view that won't parse can't be read either way: it is skipped, not a failure of every query.
-        if let Ok(Some(d)) = Definition::parse(&view.sql) {
-            out.insert(local.to_string(), Arc::new(d));
-        }
-    }
-    let all = Arc::new(out);
-    if let Some(v) = version {
-        SEEN.lock().unwrap().insert(lake.url.clone(), (v, all.clone()));
-    }
-    Ok(all)
-}
-
-/// The views with measures a lake can read: its own by local name, and those of the lakes attached to it (`lake.sales`).
-#[cfg(feature = "server")]
-async fn views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>>> {
-    let mut out: HashMap<String, Arc<Definition>> = own_views(lake).await?.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
-    // (another lake's only when the statement names it: its catalog has no version to keep them by, so each look reads it)
-    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
-    for (name, other) in attached {
-        for (local, d) in own_views(&other).await?.iter() {
-            if !local.contains('.') {
-                out.insert(format!("{name}.public.{local}"), d.clone());
-            }
-            out.insert(format!("{name}.{local}"), d.clone());
-        }
-    }
-    Ok(out)
-}
-
-/// Whether a statement may need the rewrite: it names a measure, or may read a view with measures. The words come first,
-/// then this lake's views as kept, then an attached lake's only when the statement names it (every statement asks: no copy).
-#[cfg(feature = "server")]
-pub async fn wanted(lake: &Lake, sql: &str) -> Result<bool> {
-    if sql.contains(MARK) || CALL_TEXT.is_match(sql) {
-        return Ok(true);
-    }
-    if own_views(lake).await?.keys().any(|name| crate::text::mentions(sql, name)) {
-        return Ok(true);
-    }
-    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
-    for (name, other) in attached {
-        if own_views(&other).await?.keys().any(|local| crate::text::mentions(sql, &format!("{name}.{local}")) || crate::text::mentions(sql, &format!("{name}.public.{local}"))) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Rewrites statements against the views with measures of `lake`, and the functions it has (see `rewrite_with`).
-#[cfg(feature = "server")]
-pub async fn rewrite(lake: &Lake, sql: &str, stmts: &mut [Statement]) -> Result<bool> {
-    let views = views(lake, sql).await?;
-    let routines = routines::listed(lake).await?;
-    let me = format!("{}.", ddl::lake_name(lake));
-    let view = |name: &ObjectName| -> Option<Arc<Definition>> { candidates(&text::object(name), &me).iter().find_map(|c| views.get(c).cloned()) };
-    rewrite_with(stmts, &view, &|name: &str| routines.contains_key(name))
-}
-
-/// The names a view may be found under for a name a statement gives: with `public.` and this lake's own name optional.
-fn candidates(full: &str, me: &str) -> Vec<String> {
-    let inner = full.strip_prefix(me).unwrap_or(full);
-    let mut out = vec![full.to_string(), inner.to_string()];
-    if let Some(rest) = inner.strip_prefix("public.") {
-        out.push(rest.to_string());
-    }
-    out
-}
-
-/// Checks a view with measures where it is made: `sql` is its SELECT as stored. Its shape is checked, and each join of its FROM
-/// must be onto a key of the table it joins.
-#[cfg(feature = "server")]
-pub async fn check(lake: &Lake, sql: &str) -> Result<()> {
-    if !sql.contains(MARK) {
-        return Ok(());
-    }
-    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
-    let [Statement::Query(query)] = stmts.as_slice() else { bail!("a view with measures is one SELECT") };
-    let Some(d) = Definition::of(query)? else { return Ok(()) };
-    shape(&d, query)?;
-    let keys = join_keys(lake, query).await?;
-    joins_checked(&d, &|name: &ObjectName| keys.get(&text::object(name)).cloned())
-}
-
-/// The keys of each table a SELECT joins, by the name the query gives it.
-#[cfg(feature = "server")]
-async fn join_keys(lake: &Lake, query: &ast::Query) -> Result<HashMap<String, Vec<Vec<String>>>> {
-    let mut keys = HashMap::new();
-    let SetExpr::Select(select) = &*query.body else { return Ok(keys) };
-    for join in select.from.iter().flat_map(|item| item.joins.iter()) {
-        let TableFactor::Table { name, .. } = &join.relation else { continue };
-        let full = text::object(name);
-        let (other, local) = ddl::resolve(lake, &full).await?;
-        let owner: &Lake = other.as_deref().unwrap_or(lake);
-        let mut found = Vec::new();
-        if let Some(meta) = owner.cat.get::<store::TableMeta>(&store::table_key(&local)).await? {
-            let meta = meta.logical();
-            if !meta.key.is_empty() {
-                found.push(meta.key.clone());
-            }
-            found.extend(meta.constraints.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone()));
-        }
-        if let Some(view) = owner.cat.get::<ddl::StoredView>(&ddl::query_key(&local)).await? {
-            found.extend(view.facts.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone())); // (a view's key facts: ADR-065 §2)
-        }
-        keys.insert(full, found);
-    }
-    Ok(keys)
 }
 
 // Tests: the text, the default form, the rewrite, the refusals, the shape and the joins.

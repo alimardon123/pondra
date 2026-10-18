@@ -1285,7 +1285,7 @@ pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str)
         }
         false => ctx,
     };
-    let batches = crate::engine::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
+    let batches = crate::engine::sql(ctx, &crate::sys::planned(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(None) };
     Ok(Some(concat_batches(&first.schema(), &batches)?))
 }
@@ -1448,7 +1448,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
             crate::query::frugal(ctx);
         }
         in_order(ctx);
-        let df = crate::engine::sql(ctx, &crate::asof::rewrite(query)?).await?;
+        let df = crate::engine::sql(ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, ctx, table, df, stamp).await
     }).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
@@ -2026,7 +2026,7 @@ fn attached_as(stmt: &Stmt) -> String { stmt.table().split('.').next().unwrap_or
 /// table not made yet). A spread that fails leaves what it wrote to the orphan sweep (no entry
 /// names those files), and this node writes it all.
 async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>, to: &crate::log::To, here: bool) -> Result<Option<Option<Files>>> {
-    let query = crate::asof::rewrite(query)?;
+    let query = crate::sys::planned(query)?;
     if here || app.here_only(&query).await {
         return Ok(crate::spmd::refused("it reads what only this node has"));
     }

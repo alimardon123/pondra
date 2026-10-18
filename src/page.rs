@@ -75,10 +75,11 @@ impl Answer {
     }
 }
 
-/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::answer`).
+/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::of`, `codes::http`; a page's
+/// caller sees all the words: `codes::words`).
 fn failed(e: anyhow::Error) -> Answer {
-    let (status, code, words) = crate::codes::answer(&e);
-    Answer { status, headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: words.into() }
+    let code = crate::codes::of(&e);
+    Answer { status: crate::codes::http(code), headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: crate::codes::words(&e).into() }
 }
 
 /// A file refused (409, 412, 404): the node's status and words, with no SQLSTATE.
@@ -612,6 +613,14 @@ mod tests {
         assert_eq!(page.request("DELETE", "/files/orders.csv", &[], bytes::Bytes::new()).await.status, 404);
         assert_eq!(page.request("POST", "/sql", &[], "DROP TABLE t".into()).await.status, 200);
         assert_eq!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_pages_front_fills_default_values() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE d (a INT, b TEXT)".into()).await.status, 200);
+        let front = crate::front::expand(&PageHost(&page), "INSERT INTO d DEFAULT VALUES", &HashMap::new()).await.unwrap();
+        assert!(front.contains("VALUES (DEFAULT, DEFAULT)"), "{front}");
     }
 
     #[tokio::test]

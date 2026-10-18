@@ -419,7 +419,7 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         if let Some(i) = (0..text.len()).find(|&i| text.is_valid(i) && !labels.contains(text.value(i)) && !marker(i)) {
             let what = e.of.clone().unwrap_or_else(|| format!("column {}", meta.name_of(stored)));
             let message = format!("invalid input value for enum {what}: \"{}\" (its labels: {})", text.value(i), quoted(&e.labels));
-            return Err(anyhow::Error::new(crate::views::Violation(message, "22P02")));
+            return Err(anyhow::Error::new(crate::codes::Violation(message, "22P02")));
         }
     }
     for (stored, t) in &meta.sql_types {
@@ -432,7 +432,7 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         let column = meta.name_of(stored);
         let first = (0..text.len()).filter(|&i| text.is_valid(i) && !marker(i)).find_map(|i| refusal(t, column, text.value(i)));
         if let Some((message, code)) = first {
-            return Err(anyhow::Error::new(crate::views::Violation(message, code)));
+            return Err(anyhow::Error::new(crate::codes::Violation(message, code)));
         }
     }
     Ok(())

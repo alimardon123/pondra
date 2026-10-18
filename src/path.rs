@@ -308,7 +308,7 @@ async fn schema_in(lake: &Lake, db: &str, s: &str) -> Result<()> {
 
 /// `sql` read as statements, with the past's and DuckDB's forms first (as `front::expand` reads them).
 fn parse_text(sql: &str) -> Option<Vec<Statement>> {
-    let sql = crate::past::syntax(sql);
+    let sql = crate::past_names::syntax(sql);
     let sql = crate::friendly::text(&sql).ok()?;
     Parser::parse_sql(&GenericDialect {}, &sql).ok()
 }
@@ -591,7 +591,7 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// `pondra_at(t, version => …)` (`past::syntax`'s form of `t AT (…)`): `t` is the first argument.
+    /// `pondra_at(t, version => …)` (`past_names::syntax`'s form of `t AT (…)`): `t` is the first argument.
     fn at(&mut self, a: &mut ast::TableFunctionArgs) {
         let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) = a.args.first_mut() else { return };
         let mut name = match e {

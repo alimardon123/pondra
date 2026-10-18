@@ -214,7 +214,7 @@ pub fn said(e: &anyhow::Error) -> String {
     let out = crate::codes::words(e);
     match crate::auth::shows_code() {
         true => out,
-        false => crate::python::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
+        false => crate::codes::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
     }
 }
 

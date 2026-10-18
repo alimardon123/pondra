@@ -35,7 +35,7 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
         for (name, c) in &meta.checks {
             let bad = breaking(&all, c)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
-                return Err(anyhow::Error::new(crate::views::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
+                return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
             }
         }
     }

@@ -805,7 +805,7 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
     if !joins.is_empty() {
         // (windows over a join: each table's changed rows' columns equal to the keys, as the keys' types)
-        let plan = crate::engine::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+        let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
         let (by, input) = window(&plan).and_then(partitioned).context("a view kept by key over a join is windows within keys")?;
         let tables = joined(input, &by).context("its windows' join is no longer on the columns they partition by: make it again")?;
         let mut keys: Option<DataFrame> = None;
@@ -822,7 +822,7 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     }
     ctx.deregister_table(table_ref(&v.source))?;
     ctx.register_table(table_ref(&v.source), changed(lake, &v.source, done, now).await?.into_view())?;
-    let plan = crate::engine::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+    let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     let (by, input) = grouping(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
     let keys: Vec<Expr> = by.iter().enumerate().map(|(i, g)| g.clone().unalias().alias(format!("__k{i}"))).collect();
     let p = LogicalPlanBuilder::from(input.clone()).project(keys)?.distinct()?.build()?;
@@ -883,7 +883,7 @@ fn key(i: usize) -> Expr { Expr::Column(Column::new(Some(TOUCHED), format!("__k{
 /// the `GROUP BY` or the windows), or of every key.
 async fn worked_out(lake: &Lake, v: &View, now: u64, touched: Option<&Touched>) -> Result<Vec<RecordBatch>> {
     let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
-    let plan = crate::engine::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+    let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     let plan = match touched {
         Some(t) => {
             kept_as_written(&ctx);

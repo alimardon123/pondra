@@ -19,21 +19,15 @@ pub mod text;
 pub mod ext_names;
 pub mod lake_files;
 pub mod sketch;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod asof;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod sparksql;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
-mod past;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+mod past_names;
 mod diff;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod expander;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod front;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod friendly;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the set functions' rewrite: a node's door calls it)
 mod lateral;
@@ -116,6 +110,7 @@ mod optimize;
 #[cfg(feature = "server")] mod returning;
 #[cfg(feature = "server")] mod mcp;
 #[cfg(feature = "server")] mod pg;
+#[cfg(feature = "server")] mod past;
 #[cfg(feature = "server")] mod path;
 #[cfg(feature = "server")] mod pg_catalog;
 #[cfg(feature = "server")] mod pg_formats;

@@ -384,7 +384,7 @@ impl Backend {
             }
         }
         let sql = crate::routines::expand(&self.app.lake, sql).await.map_err(user_error)?; // (macros: ADR-023)
-        let sql = crate::asof::rewrite(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
+        let sql = crate::sys::planned(&pg_dialect(&self.app.lake, &sql, user)).map_err(user_error)?.into_owned();
         if crate::env::is_set("PONDRA_DEBUG_PG") {
             eprintln!("pg {user}: {sql}");
         }
@@ -671,7 +671,7 @@ impl Backend {
 
     /// A query's result columns, without running it.
     async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
-        let sql = crate::asof::rewrite(sql).map_err(user_error)?;
+        let sql = crate::sys::planned(sql).map_err(user_error)?;
         let ctx = self.session(&sql, user).await?;
         let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
         Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
@@ -1479,7 +1479,7 @@ impl Backend {
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
-                crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::asof::rewrite(&sql).ok()?).await.ok()
+                crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::sys::planned(&sql).ok()?).await.ok()
             }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {
