@@ -2198,8 +2198,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is 2, 3.5 is 4); Arrow's cast drops it. `casts::Rounds`, an analyzer rule after type coercion,
    puts `pondra_whole` in every `CAST`, `::`, `TRY_CAST` and `arrow_cast` of a decimal with places
    or a float to an integer type, the casts coercion adds included, so every node, view and door
-   plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
-   an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
+   plans it alike; a value written into an integer column is rounded the same way (`casts::into`, through
+   `query::strict`: an UPDATE's and a MERGE's rows too, `change::part`, a folded constant and `setval`; JSON rows
+   at `/append` and from a topic, `json_rows`, exact past 2^53), so a key an `ON CONFLICT` or a MERGE checks is
    the key written. Spark's and Polars' names cut it toward zero, as those tools do: a session in Spark's
    dialect (`Rounds` puts `pondra_truncate` there instead), `spark_sql('…')`'s casts and `DIV` (`sparksql`),
    and the frames' casts to an integer (`_cast_sql`, `castSql`: Python's and JavaScript's write the same
@@ -2840,7 +2841,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
    (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
    raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
-   the frugal retry doesn't run it again (`query::exhausted` leaves 53100 out: a frugal run spills to the same cap). `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
+   the frugal retry doesn't run it again (`query::exhausted` leaves 53100 out: a frugal run spills to the same cap).
+   The cap is looked at again as queries start, every 500 ms at most (`store::spill_room`), so a node started on a
+   full disk spills once room is freed. A shuffle's piece asks for its room before it is written (`store::spill_fits`;
+   under the setting, shuffles and spills together), and a step refused for room (any 53) is not run again on that
+   node: the query runs on the coordinator. `shuffle_spill.py --cap-gb`: "the shuffle's pieces on disk stayed within
+   the setting while it ran" (fails on the build before). `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
    cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
    PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
    `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
