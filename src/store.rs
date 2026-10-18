@@ -545,13 +545,13 @@ static SPILLERS: Mutex<Vec<Weak<DiskManager>>> = Mutex::new(Vec::new());
 /// Adds a lake's disk manager to `SPILLERS`. A disabled one has no cap to set, so it is left out.
 fn register_spiller(disk: &Arc<DiskManager>) {
     if spill_gb() != Some(0.0) {
-        SPILLERS.lock().unwrap().push(Arc::downgrade(disk));
+        SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::downgrade(disk));
     }
 }
 
 /// The disk managers still alive, the dead ones dropped from `SPILLERS`.
 fn live_spillers() -> Vec<Arc<DiskManager>> {
-    let mut spillers = SPILLERS.lock().unwrap();
+    let mut spillers = SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     spillers.retain(|w| w.strong_count() > 0);
     spillers.iter().filter_map(Weak::upgrade).collect()
 }
