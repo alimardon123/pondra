@@ -4,8 +4,6 @@
 //! mean, through ADR-061's request contract. DuckDB's forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) and
 //! ASOF JOIN answer as on a node. `web/` wraps it for a browser.
 
-use crate::expander::Routine;
-use crate::ext_names::Attached;
 use crate::front::{Host, Own};
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use async_trait::async_trait;
@@ -449,6 +447,7 @@ impl SchemaProvider for Overlay {
 /// of those answers "none"; the columns are its tables' own.
 struct PageHost<'a>(&'a Page);
 
+// (a page keeps no routines, attached catalogs, views with measures or types of its own: the trait's defaults say so)
 impl Host for PageHost<'_> {
     fn name(&self) -> String {
         "page".to_string()
@@ -461,14 +460,6 @@ impl Host for PageHost<'_> {
         }
     }
 
-    async fn routines(&self) -> anyhow::Result<Arc<HashMap<String, Routine>>> {
-        Ok(Arc::default())
-    }
-
-    async fn attached(&self) -> anyhow::Result<Vec<(String, Attached)>> {
-        Ok(vec![])
-    }
-
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for name in tables {
@@ -477,18 +468,6 @@ impl Host for PageHost<'_> {
             }
         }
         Ok(out)
-    }
-
-    async fn measured(&self, _sql: &str) -> anyhow::Result<bool> {
-        Ok(false) // (a page keeps no views, so none with measures)
-    }
-
-    async fn measures(&self, _sql: &str, _stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        Ok(false) // (nor measures)
-    }
-
-    async fn types(&self, _stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        Ok(false) // (nor types of its own)
     }
 
     async fn friendly(&self, stmts: &mut [Statement]) -> anyhow::Result<bool> {

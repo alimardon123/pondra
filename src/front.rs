@@ -1,10 +1,9 @@
 //! The SQL front: what a statement goes through before anything plans it (macros, DuckDB's and Spark's spellings,
 //! FROM first, files by name, …), generic over what it asks of where it runs (`Host`). A node is a host
-//! (`host.rs`); a page will be one (designs/l2-b4-front-and-web.md). Each pass runs once a statement or once a name.
+//! (`host.rs`), and so is a browser page (`page.rs`). Each pass runs once a statement or once a name.
 
 use crate::ext_names::Attached;
-use crate::expander::Routine;
-use crate::expander::{Expander, Kind};
+use crate::expander::{Expander, Kind, Routine};
 use anyhow::Result;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -14,25 +13,37 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-/// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch.
+/// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch. A host answers
+/// only what it has: what it keeps none of (routines, attached catalogs, measures, types of its own) answers nothing
+/// by default.
 pub trait Host: Sync {
     /// The lake's name, the first part of a three-part name (`text::local_in`).
     fn name(&self) -> String;
     /// The node's own statements, asked before anything else (`SHOW CREATE`, `pondra.find`, `SUMMARIZE`, …).
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send;
     /// The lake's macros, functions and procedures, by name (`routines::listed`).
-    fn routines(&self) -> impl Future<Output = Result<Arc<HashMap<String, Routine>>>> + Send;
+    fn routines(&self) -> impl Future<Output = Result<Arc<HashMap<String, Routine>>>> + Send {
+        async { Ok(Arc::default()) }
+    }
     /// Other engines' catalogs attached (`ext::attached`).
-    fn attached(&self) -> impl Future<Output = Result<Vec<(String, Attached)>>> + Send;
+    fn attached(&self) -> impl Future<Output = Result<Vec<(String, Attached)>>> + Send {
+        async { Ok(vec![]) }
+    }
     /// The columns of these tables of the lake (names inside it, as `text::local_in` gives them), system columns last;
     /// a name with no table is left out.
     fn columns(&self, tables: BTreeSet<String>) -> impl Future<Output = Result<HashMap<String, Vec<String>>>> + Send;
     /// Whether `sql` reads a view with measures or names a measure (`measures::wanted`).
-    fn measured(&self, sql: &str) -> impl Future<Output = Result<bool>> + Send;
+    fn measured(&self, _sql: &str) -> impl Future<Output = Result<bool>> + Send {
+        async { Ok(false) }
+    }
     /// Measures worked out at the query's own grain (`measures::rewrite`): whether it changed anything.
-    fn measures(&self, sql: &str, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
+    fn measures(&self, _sql: &str, _stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send {
+        async { Ok(false) }
+    }
     /// An enum's casts as text (`types::rewrite`): whether it changed anything.
-    fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
+    fn types(&self, _stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send {
+        async { Ok(false) }
+    }
     /// DuckDB's and Snowflake's forms that ask the data (`friendly::rewrite`): whether it changed anything.
     fn friendly(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
     /// A query the front's passes ask before they can write theirs (`friendly`: a `PIVOT`'s values, the columns
