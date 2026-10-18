@@ -1356,7 +1356,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`temp::of_script`, `#` in its id: no client can name it), ended with the script.
 189. **SQL's CREATE TABLE refuses a table that is there** (`write::there`, 42P07), unless `IF NOT
    EXISTS` (left as it is: no rows added) or `OR REPLACE` (dropped first). Only `POST
-   /tables/{name}` may be sent again (it may add columns at the end).
+   /tables/{name}` may be sent again (it may add columns at the end). A statement's definition carries its job
+   (`TableMeta::made_by`), so two statements making one name at once, on two nodes, never share a table: the leader
+   refuses the second 42P07 (`IF NOT EXISTS` takes it for the table that is there: `write::raced`), and only that
+   statement's own retry is let through. Before, the second's rows went into the first's table.
 190. **Spark's functions never change DataFusion's answers by default** (`store::spark`): only
    names DataFusion doesn't have are registered. Spark's versions of shared names come only with
    `datafusion.sql_parser.dialect = 'spark' | 'databricks'` (`settings::apply`), or under names of
@@ -2188,9 +2191,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    or a float to an integer type, the casts coercion adds included, so every node, view and door
    plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
    an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
-   the key written. Spark's `DIV` drops the fraction before its cast (`sparksql`). `harness.py found`:
-   "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that compares a key in another
-   type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003).
+   the key written. Spark's and Polars' names cut it toward zero, as those tools do: a session in Spark's
+   dialect (`Rounds` puts `pondra_truncate` there instead), `spark_sql('…')`'s casts and `DIV` (`sparksql`),
+   and the frames' casts to an integer (`_cast_sql`, `castSql`: Python's and JavaScript's write the same
+   text). `harness.py found`: "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that
+   compares a key in another type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003); `sparksql`: the
+   casts that cut; `frames_check.py`: a frame's casts == Polars.
 294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
    their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
    round, and each ends when what it holds is gone. The writes' sender is the lake's own
@@ -2769,7 +2775,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    views, an empty answer) takes the analyzed schema through `run_schema`, never the planner's
    `df.schema()`: the analyzer's rules change types the rows then have. `harness.py found`: "a number with
    an exponent is a whole decimal…" and the bulk door, task, Delta and topic-view checks; `flight`: "the
-   FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0)".
+   FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0)". An expression planned with no analyzer of its own goes
+   through the same helper (`optimize::whole_literals`: a DEFAULT, a CHECK, a Python table function's arguments, a
+   bucket's expression), and so do the paths that fold a literal without planning it (`literals::fold`, the fast
+   INSERT path; `vars::folded`, `DECLARE`, runs the analyzer); a VALUES list is typed again once its literals change
+   (`optimize::settled`). `harness.py found`: "INSERT … VALUES (1e15) and INSERT … SELECT 1e15 store the same…",
+   "DECLARE $x = 1e15…", "…a keyed table's DOUBLE to 1e15…", "a column DEFAULT 1e15…".
 416. **A sort of strings hands up only its own rows' strings** (`held::LeanExec`, `LeanSorts`): a sort that keeps
    all its rows and has a `Utf8View` or `BinaryView` column passes its output through `query::compact`
    (invariant 202). Its `take` and its merge's `interleave` copy views but keep the buffers they point into, so a
@@ -2808,7 +2819,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
    (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
    raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
-   the frugal retry doesn't run it again. `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
+   the frugal retry doesn't run it again (`query::exhausted` leaves 53100 out: a frugal run spills to the same cap). `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
    cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
    PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
    `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
@@ -2818,8 +2829,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
    statement answers, and the answer stays the statement's own error. A request stopped before the INSERT answers
    (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
-   user's next try of the fixed statement was refused 42P07. `harness.py objects`: "a CREATE TABLE … AS SELECT that
-   fails leaves no table…" (the old build kept it after a cast's 22P02 and after the watch's stop).
+   user's next try of the fixed statement was refused 42P07. It drops only its own table (`write::drop_made`: the
+   name's `made_by` is its job), never one another statement made under the name meanwhile. `harness.py objects`: "a
+   CREATE TABLE … AS SELECT that fails leaves no table…" (the old build kept it after a cast's 22P02 and after the
+   watch's stop), "two CREATE TABLE of one name at once, on two nodes…".
 421. **A big answer goes from its plan as the plan makes it, and a cut one never looks whole** (`query::collect_or_send`,
    `send_rest`, `PIECES`; `server::sql`, `pieces`). The query an HTTP request sends (`run_query`'s `top`: the one that
    took the request's turn), in a format that streams and not `EXPLAIN`ed, is armed (`query::arm`); once its batches
@@ -3042,12 +3055,19 @@ packages (a minute or two). `cluster-bench.yml`'s default binary (`ci`) is that 
 A pull request's push runs CI only when the pull request is labelled: `ci` builds linux-x64 with
 the suite and the tests after it, and a pull request merges once that passes (the owner,
 2026-10-16); `full-ci` adds the other platforms but macOS Intel, for a change that wants them
-first. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
+first. `train` is for a pull request whose touched checks passed in its lane's sandbox: the merge
+train (`tools/train.py`, `train.yml`) merges up to six of them onto the branch `train`, runs CI once
+for all, and moves main to its tip when that is green (merge commits); a red train runs its failed
+jobs again, then is halved until the pull request that broke it is sent back with a comment. One
+that changes `.github/workflows/` or the version takes `ci`. A pull request's linux-x64 is built in
+the release profile (packages `pr-linux-x64`), its unit tests also compile the crate without
+`server` as the page builds it, and what ships is built on main. Main builds every platform but macOS Intel on its newest commit (a push waits while a run goes,
 and drops one that waited before it; macOS Intel on a version commit, which a release tags, or by
 hand), with deploy.yml when what it tries changes; a platform that
 fails there is commented on the pull request it came from, and that lane fixes it at once. Never
-turn on auto-merge before its run starts. Two pull requests' runs go at once (ci-slots.yml; the
-account's runners are shared with the owner's other work, 2026-10-16), and a run does only what its
+turn on auto-merge before its run starts. Three pull requests' runs go at once (ci-slots.yml; the
+account's runners are shared with the owner's other work, 2026-10-16; three on GitHub Pro, 2026-10-17;
+the repository variable `CI_SLOTS` changes it), and a run does only what its
 change touches (build.yml's `plan`: a change no check reads runs nothing; one that leaves the crate
 alone skips its unit tests).
 

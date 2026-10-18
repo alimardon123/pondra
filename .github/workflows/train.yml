@@ -1,0 +1,69 @@
+name: train
+
+# The merge train (tools/train.py; reviews/faster-lanes.md in the project's files): many pull requests land on main
+# with one CI run. A lane labels its pull request `train` once its own checks passed. tools/train.py merges the
+# queued ones (oldest first, six at most) onto main in the branch `train`, runs build.yml on it once (planned as a
+# pull request's `ci` run: build.yml's `mode`), and when that run is green moves main to the train's tip, a
+# fast-forward: main is then exactly the tree CI tested, and GitHub marks each pull request merged. A red run is run
+# again once; then, unless main fails the same way or moved since, the train is halved and its first half tested
+# alone, so one pull request can't hold the others for long. A pull request whose workflows aren't main's can't ride
+# (the workflow's token may not push a workflow): it takes `ci` as before.
+#
+# Each run does the one next thing and ends: on a `train` label, at the end of every build run, every 15 minutes (a
+# run's end may not reach here: GitHub stops chains of workflow_run), and by hand. One at a time. Main's copy runs,
+# on a checkout of main: a pull request's code is merged, never run. The repository variable TRAIN = off stops it.
+# A pull request that changes the conductor runs its tests (tools/train_test.py) instead.
+on:
+  pull_request_target:
+    types: [labeled]
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+  pull_request:
+    paths: [tools/train.py, tools/train_test.py, .github/workflows/train.yml]
+
+permissions: {}
+
+jobs:
+  step:
+    if: >-
+      vars.TRAIN != 'off' && github.event_name != 'pull_request' &&
+      (github.event_name != 'pull_request_target' || github.event.label.name == 'train')
+    # (one step at a time: two would cut two trains; one waiting does the next thing when it runs. On the job, so a
+    # label that isn't `train` never takes the waiting place)
+    concurrency:
+      group: train
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write # (starting build.yml on the train and on main, re-running a red train's failed jobs)
+      contents: write # (the branch `train`, and main moved to its tip)
+      issues: write # (labels and comments)
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0 # (merges need history; the files are fetched as merges need them)
+          filter: blob:none
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SLOTS: ${{ vars.CI_SLOTS || 3 }} # (ci-slots.yml says why)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 tools/train.py step
+
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 tools/train_test.py

@@ -1580,12 +1580,19 @@ def layout_checks(browser, port, show):
     light = until(lambda: json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/console/settings").read()).get("theme"), "light")
     checks["Settings are kept on the machine: another browser opens with the dark theme and the background picked; light is the first theme"] = \
         kept_json == "dark" and there == ("dark", "#203040") and light == "light"
-    p.fill("#filter", "lx")
+    # Typed while the left pane redraws, as it does when a module loaded later registers something: the
+    # filter keeps its focus. (A redraw between Playwright's focus and its typing lost the text on CI.)
+    p.focus("#filter")
+    p.evaluate("pondra.register.key({ keys: 'Ctrl Alt 9', group: 'Test', title: 'a key the check registers', run() {} })")
+    p.evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+    p.keyboard.insert_text("lx")
     seen = lambda: p.locator("#data .row:visible .nm").all_inner_texts()
     only = until(lambda: "lx" in seen() and "ly" not in seen(), True)
+    typed = p.input_value("#filter")
     p.press("#filter", "Escape")
     cleared = until(lambda: "ly" in seen(), True)
-    checks["the filter narrows the trees to the names that hold it (and what they are in); Esc clears it"] = only is True and cleared is True
+    checks["the filter narrows the trees to the names that hold it (and what they are in), typed while the pane redraws; Esc clears it"] = only is True and cleared is True and typed == "lx"
+    filtered = {"typed": typed, "only": only, "cleared": cleared, "seen": seen()}
     p.locator("#docs").click()
     p.keyboard.press("Control+b")
     hid = p.locator("#left").is_hidden()
@@ -1646,7 +1653,7 @@ def layout_checks(browser, port, show):
     checks["axe finds nothing (WCAG 2.1 AA, contrast included, and its best practice), light and dark: a notebook, a SQL file, a data file"] = \
         bool(axe) and len(found) == 6 and not any(found.values())
     checks["layout: no page errors"] = pg.errors == []
-    info = {"moved": moved, "back": back, "widths": [w0, wide, again, reset], "axe": found if axe else "axe-core not found: AXE_JS, or npm install --prefix tools axe-core", "errors": pg.errors}
+    info = {"moved": moved, "back": back, "filter": filtered, "widths": [w0, wide, again, reset], "axe": found if axe else "axe-core not found: AXE_JS, or npm install --prefix tools axe-core", "errors": pg.errors}
     pg.ctx.close()
     return checks, info
 
@@ -1938,7 +1945,7 @@ def main():
     # (the console's settings, kept by the node for its machine: this run's own, never the machine's)
     os.environ["PONDRA_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pondra-config-")
     node = Node(lake, A.port, env={"PYTHONPATH": os.path.join(HERE, "..", "python"), "PONDRA_SLOW_MS": "300"}, python=sys.executable).start()
-    results, said = {}, {}
+    results, said, failed = {}, {}, []
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch()
@@ -1956,6 +1963,8 @@ def main():
                 results.update(checks)
                 if info:
                     said[part] = info
+                if not all(checks.values()):
+                    failed.append(part)
                 print(json.dumps({part: checks}, indent=1), flush=True)
             browser.close()
     finally:
@@ -1963,7 +1972,8 @@ def main():
         shutil.rmtree(lake, ignore_errors=True)
     ok = all(results.values())
     if not ok or os.environ.get("CONSOLE_CHECK_SAY"):
-        print(json.dumps(said, indent=1, default=str)[:12000])
+        # (the parts that failed first: what they saw is what a red run needs, and the rest is cut at 12,000 characters)
+        print(json.dumps({**{k: said[k] for k in failed if k in said}, **said}, indent=1, default=str)[:12000])
     print(json.dumps({"checks": len(results), "passed": sum(results.values()), "ok": ok}))
     sys.exit(0 if ok else 1)
 

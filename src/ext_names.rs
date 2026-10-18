@@ -2,7 +2,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
-use datafusion::arrow::datatypes::{FieldRef, SchemaRef};
+use datafusion::arrow::datatypes::{FieldRef, Schema, SchemaRef};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::SessionState;
 use datafusion::object_store::{ObjectMeta, ObjectStore};
@@ -232,11 +232,14 @@ pub fn endpoint(a: &Attached) -> Option<String> {
 }
 
 /// How a Spec's format and options read its files (CSV's options are CSV_OPTIONS, DuckDB's names), on a node and in a page.
-pub(crate) fn file_format(spec: &Spec) -> Result<Arc<dyn FileFormat>> {
+/// Parquet is read with the session's Parquet options (`PONDRA_SQL_OPTIONS`, a page's plain strings), so they reach every
+/// file read this way: `ParquetFormat::default()` ignored them. `default_table_options()`, not `table_options()`: the
+/// latter is fixed when the session is built, and a later `SET` never reaches it.
+pub(crate) fn file_format(spec: &Spec, state: &dyn datafusion::catalog::Session) -> Result<Arc<dyn FileFormat>> {
     let o = |k: &str| spec.options.get(k).map(String::as_str);
     let byte = |k: &str, v: &str| -> Result<u8> { v.bytes().next().filter(|_| v.len() == 1).with_context(|| format!("{k} is one character, not {v:?}")) };
     Ok(match spec.format.as_str() {
-        "parquet" => Arc::new(ParquetFormat::default()),
+        "parquet" => Arc::new(ParquetFormat::default().with_options(state.default_table_options().parquet)),
         "json" => Arc::new(JsonFormat::default()),
         "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
         "csv" => {
@@ -280,7 +283,13 @@ impl Found {
         let root = self.url.object_store();
         format!("{}/{}", root.as_str().strip_suffix('/').unwrap_or(root.as_str()), self.object.location)
     }
+
+    /// The file's folders as text (`part_of`).
+    pub fn part(&self) -> String { part_of(&folders(&self.url, &self.object)) }
 }
+
+/// Folders as text, `k=v/…`, as `DataFile::part` holds them and `read_files` reads them.
+pub fn part_of(folders: &[(String, String)]) -> String { folders.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("/") }
 
 /// The files a spec names, listed as every form lists them: a glob, `**` or a glob over folders reaches into
 /// folders, and a folder (`…/`) gives its files of the spec's format. Sorted by name, so every node lists them in
@@ -310,7 +319,7 @@ pub async fn listed(state: &SessionState, spec: &Spec, none: impl Fn(&str) -> Op
 /// The schema of a listing's files: every Parquet file's (else the first 16), with the files whose notes differ
 /// merged without them (`inferred`).
 pub async fn schema_of(state: &SessionState, spec: &Spec, found: &[Found]) -> Result<SchemaRef> {
-    let format = file_format(spec)?;
+    let format = file_format(spec, state)?;
     let store = found.first().context("no files")?.store.clone();
     let first: Vec<ObjectMeta> = found.iter().take(if spec.format == "parquet" { usize::MAX } else { 16 }).map(|f| f.object.clone()).collect();
     inferred(format.as_ref(), state, &store, &first).await.with_context(|| format!("reading {}", spec.urls.join(", ")))
@@ -318,16 +327,57 @@ pub async fn schema_of(state: &SessionState, spec: &Spec, found: &[Found]) -> Re
 
 /// The files' columns; files whose notes differ (pandas' metadata, each file's own) merged without them.
 pub async fn inferred(format: &dyn FileFormat, state: &dyn datafusion::catalog::Session, store: &Arc<dyn ObjectStore>, files: &[ObjectMeta]) -> Result<SchemaRef> {
+    let mut each = vec![];
+    if format.get_ext() == "arrow" {
+        for f in files {
+            each.push(match arrow_file_schema(store, f).await? {
+                Some(schema) => schema,
+                None => format.infer_schema(state, store, std::slice::from_ref(f)).await?.as_ref().clone(), // (a stream)
+            });
+        }
+        return merged(each);
+    }
     match format.infer_schema(state, store, files).await {
         Err(e) if e.to_string().contains("conflicting metadata") => {
-            let mut each = vec![];
             for f in files {
-                each.push(format.infer_schema(state, store, std::slice::from_ref(f)).await?.as_ref().clone().with_metadata(Default::default()));
+                each.push(format.infer_schema(state, store, std::slice::from_ref(f)).await?.as_ref().clone());
             }
-            Ok(Arc::new(datafusion::arrow::datatypes::Schema::try_merge(each)?))
+            merged(each)
         }
         r => Ok(r?),
     }
+}
+
+/// Schemas merged; when their notes differ, merged without them.
+fn merged(each: Vec<Schema>) -> Result<SchemaRef> {
+    match Schema::try_merge(each.clone()) {
+        Err(e) if e.to_string().contains("conflicting metadata") => {
+            Ok(Arc::new(Schema::try_merge(each.into_iter().map(|s| s.with_metadata(Default::default())))?))
+        }
+        r => Ok(Arc::new(r?)),
+    }
+}
+
+/// An Arrow IPC file's schema, from its footer (two small reads), or None for a stream. DataFusion reads a file
+/// fetched as a stream as if it were one, taking the 64-byte padding arrow-rs writes after the magic for the
+/// schema's length ("Unable to read IPC message schema"), on a page and on a bucket alike.
+async fn arrow_file_schema(store: &Arc<dyn ObjectStore>, f: &ObjectMeta) -> Result<Option<Schema>> {
+    use datafusion::arrow::ipc;
+    use datafusion::object_store::ObjectStoreExt;
+    const MAGIC: &[u8] = b"ARROW1";
+    if f.size < 18 {
+        return Ok(None); // (the magic and its padding, the footer's length, the magic again)
+    }
+    let tail = store.get_range(&f.location, f.size - 10..f.size).await?;
+    if &tail[4..] != MAGIC {
+        return Ok(None);
+    }
+    let length = ipc::reader::read_footer_length(tail[..].try_into()?)? as u64;
+    ensure!(length + 10 <= f.size, "{} is not an Arrow file: its footer is longer than it", f.location);
+    let footer = store.get_range(&f.location, f.size - 10 - length..f.size - 10).await?;
+    let footer = ipc::root_as_footer(&footer).map_err(|e| anyhow::anyhow!("{} is not an Arrow file: {e}", f.location))?;
+    let schema = footer.schema().with_context(|| format!("{} is an Arrow file with no schema", f.location))?;
+    Ok(Some(ipc::convert::fb_to_schema(schema)))
 }
 
 /// A NULL's folder, as Hive, Spark, pyarrow and Polars name it.
@@ -405,21 +455,27 @@ pub async fn read_files(ctx: &SessionContext, files: &[(&str, &str)], schema: &S
     let in_files = if spec.format == "parquet" { Arc::new(datafusion::arrow::datatypes::Schema::new(fields)) } else { stored };
     let mut by_folder: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     files.iter().for_each(|&(path, part)| by_folder.entry(part).or_default().push(path));
+    let state = ctx.state();
+    let format = file_format(spec, &state)?;
     let mut out: Option<DataFrame> = None;
     for (part, paths) in by_folder {
         let urls = paths.iter().map(|p| ListingTableUrl::parse(p)).collect::<datafusion::error::Result<Vec<_>>>()?;
-        let options = ListingOptions::new(file_format(spec)?).with_file_extension("");
-        let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options);
-        let config = match spec.format.as_str() {
+        let held = match spec.format.as_str() {
             "arrow" => {
                 // (as each file holds its columns: Arrow's reader doesn't cast them, the select below
                 // does; the files' notes left out, as the table's columns have none)
-                let mut c = config.infer_schema(&ctx.state()).await?;
-                c.file_schema = c.file_schema.map(|s| Arc::new(s.as_ref().clone().with_metadata(Default::default())));
-                c
+                use datafusion::object_store::ObjectStoreExt;
+                let store = state.runtime_env().object_store(&urls[0])?;
+                let mut metas = Vec::with_capacity(urls.len());
+                for u in &urls {
+                    metas.push(store.head(u.prefix()).await?);
+                }
+                Arc::new(inferred(format.as_ref(), &state, &store, &metas).await?.as_ref().clone().with_metadata(Default::default()))
             }
-            _ => config.with_schema(in_files.clone()),
+            _ => in_files.clone(),
         };
+        let options = ListingOptions::new(format.clone()).with_file_extension("");
+        let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(held);
         let table = ListingTable::try_new(config)?;
         let mut df = ctx.read_table(Arc::new(table))?;
         for (k, v) in part_keys(part) {
@@ -478,5 +534,62 @@ mod tests {
         let nope = Spec { urls: vec!["mem:///nope/*.csv".to_string()], ..spec.clone() };
         let err = listed(&state, &nope, |u| Some(anyhow::anyhow!("no files at {u}"))).await.err();
         assert_eq!(err.map(|e| e.to_string()), Some("no files at mem:///nope/*.csv".to_string()));
+    }
+
+    /// A Parquet file's strings are read as the session's Parquet options say, including a `SET` made after the session
+    /// is built: views by default, plain once the session says so (`file_format` takes the state's default options).
+    #[tokio::test]
+    async fn parquet_strings_follow_the_sessions_options() {
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::parquet::arrow::ArrowWriter;
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), None).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a", "b"]))]).unwrap()).unwrap();
+        writer.close().unwrap();
+        store.put(&Path::from("p/s.parquet"), PutPayload::from(bytes::Bytes::from(body))).await.unwrap();
+        ctx.register_object_store(&url::Url::parse("mem://").unwrap(), store);
+        let spec = Spec { urls: vec!["mem:///p/*.parquet".to_string()], format: "parquet".to_string(), options: BTreeMap::new() };
+        let found = listed(&ctx.state(), &spec, |_| None).await.unwrap();
+        let first = schema_of(&ctx.state(), &spec, &found).await.unwrap();
+        assert_eq!(first.field(0).data_type(), &DataType::Utf8View);
+        ctx.sql("SET datafusion.execution.parquet.schema_force_view_types = false").await.unwrap().collect().await.unwrap();
+        let plain = schema_of(&ctx.state(), &spec, &found).await.unwrap();
+        assert_eq!(plain.field(0).data_type(), &DataType::Utf8);
+    }
+
+    /// An Arrow IPC file as arrow-rs writes it (64-byte padding after its magic) and a stream, from a store that
+    /// answers with a stream as a bucket does, are read as one table: the file's schema from its footer.
+    #[tokio::test]
+    async fn arrow_files_and_streams_from_a_store_are_one_table() {
+        use datafusion::arrow::ipc::writer::{FileWriter, StreamWriter};
+        use datafusion::arrow::record_batch::RecordBatch;
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        for (i, file) in [(0i64, true), (1, false)] {
+            let note = [("a".to_string(), i.to_string())];
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]).with_metadata(note.into()));
+            let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![i]))]).unwrap();
+            let mut body = Vec::new();
+            if file {
+                let mut w = FileWriter::try_new(&mut body, &schema).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            } else {
+                let mut w = StreamWriter::try_new(&mut body, &schema).unwrap();
+                w.write(&batch).unwrap();
+                w.finish().unwrap();
+            }
+            store.put(&Path::from(format!("p/{i}.arrow")), PutPayload::from(bytes::Bytes::from(body))).await.unwrap();
+        }
+        ctx.register_object_store(&url::Url::parse("mem://").unwrap(), store);
+        let spec = Spec { urls: vec!["mem:///p/*.arrow".to_string()], format: "arrow".to_string(), options: BTreeMap::new() };
+        let found = listed(&ctx.state(), &spec, |_| None).await.unwrap();
+        let schema = schema_of(&ctx.state(), &spec, &found).await.unwrap();
+        assert_eq!((schema.fields().len(), schema.field(0).data_type()), (1, &DataType::Int64));
+        assert!(schema.metadata().is_empty());
     }
 }

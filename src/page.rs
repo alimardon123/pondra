@@ -10,8 +10,6 @@ use crate::front::{Host, Own};
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider, TableProvider};
-use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::datasource::MemTable;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::object_store::ObjectStoreUrl;
@@ -20,7 +18,6 @@ use datafusion::logical_expr::{DdlStatement, LogicalPlan};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::sqlparser::ast::Statement;
-use futures::TryStreamExt;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -111,7 +108,7 @@ impl Page {
     pub fn open(options: &Options) -> Page {
         let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1));
         // A page's Parquet strings are plain, as the files hold them: views were no faster in a page and held 230 MB
-        // more at SF1 (measured in web-4g). The session's Parquet options are the ones a file read takes (`register`).
+        // more at SF1 (measured in web-4g). The session's Parquet options are the ones a file read takes (`ext_names::file_format`).
         config.options_mut().execution.parquet.schema_force_view_types = false;
         let runtime = RuntimeEnvBuilder::new()
             .with_cache_manager(CacheManagerConfig::default().with_list_files_cache_limit(0)) // (a file put again is listed again)
@@ -199,35 +196,33 @@ impl Page {
         Ok(())
     }
 
-    /// One file a statement names, as a table of its own copy under its `ext:` name: refused unless a page reads it
-    /// (its format, its options, its place) and a file of that path was put, and given to the statement only once its
-    /// columns are known.
+    /// One file a statement names, as a table of its own copy under its `ext:` name, read as a node reads it
+    /// (`ext_names`): Hive-style folders are columns, `**` reaches into folders, the files' notes are merged and the types
+    /// are a node's. Refused unless a page reads it (its format, its options, its place) and every URL has a file that
+    /// was put; given to the statement only once its columns are known.
     async fn register(&self, overlay: &Overlay, name: &str, spec: &crate::ext_names::Spec) -> anyhow::Result<()> {
         use crate::ext_names::CSV_OPTIONS;
         if !["parquet", "csv", "json", "arrow"].contains(&spec.format.as_str()) {
             return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files given to it, not {} tables", spec.format)));
         }
-        if let Some(k) = spec.options.keys().find(|k| !(spec.format == "csv" && CSV_OPTIONS.contains(&k.as_str()))) {
+        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k));
+        if let Some(k) = spec.options.keys().find(|k| !takes(k)) {
             return Err(crate::codes::coded("0A000", format!("a page doesn't take {k} yet")));
         }
         let state = self.ctx.state();
-        let mut urls: Vec<ListingTableUrl> = vec![];
-        for url in &spec.urls {
-            let listed = crate::ext_names::listing_url(&located(url)?)?;
-            // (every URL must find a file before the table is made: its schema is read from the first, and a missing one is a plan error)
-            if listed.list_all_files(&state, self.files.as_ref(), "").await?.try_next().await?.is_none() {
-                return Err(crate::codes::coded("42P01", format!("no file {url} was given to this page (PUT /files/{{path}})")));
-            }
-            urls.push(listed);
-        }
-        // A page's Parquet is read with the session's Parquet options (plain strings), not the format's default (views).
-        let format: Arc<dyn FileFormat> = match spec.format.as_str() {
-            "parquet" => Arc::new(ParquetFormat::default().with_options(state.table_options().parquet.clone())),
-            _ => crate::ext_names::file_format(spec)?,
-        };
-        let options = ListingOptions::new(format).with_file_extension("");
-        let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).infer_schema(&state).await?;
-        overlay.own(name.to_string(), Arc::new(ListingTable::try_new(config)?)); // (a name is one table: the statement's own map)
+        let urls = spec.urls.iter().map(|u| located(u)).collect::<anyhow::Result<Vec<_>>>()?;
+        let given = crate::ext_names::Spec { urls, ..spec.clone() };
+        // (a file not put is named as SQL wrote it: the URL at the same place in `spec.urls`, not the store's form)
+        let written = |u: &str| given.urls.iter().position(|g| g == u).map_or(u.to_string(), |i| spec.urls[i].clone());
+        let found = crate::ext_names::listed(&state, &given, |u| Some(crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))).await?;
+        let files = crate::ext_names::schema_of(&state, &given, &found).await?;
+        let columns: Vec<(String, String)> = files.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+        let keys = crate::ext_names::keys(&found, &given, &[], &columns)?;
+        let schema = crate::answer::schema(&[columns, keys.clone()].concat())?;
+        let pairs: Vec<(String, String)> = found.iter().map(|f| (f.full(), if keys.is_empty() { String::new() } else { f.part() })).collect();
+        let refs: Vec<(&str, &str)> = pairs.iter().map(|(file, part)| (file.as_str(), part.as_str())).collect();
+        let df = crate::ext_names::read_files(&self.ctx, &refs, &schema, &given).await?;
+        overlay.own(name.to_string(), df.into_view()); // (a name is one table: the statement's own map)
         Ok(())
     }
 
@@ -830,6 +825,50 @@ mod tests {
         assert_eq!(put(&page, "x.tsv", "a\tb\n1\t2\n").await.status, 200);
         let got = page.request("POST", "/sql?format=csv", &[], "SELECT * FROM 'x.tsv'".into()).await;
         assert_eq!(got.body, "a,b\n1,2\n");
+    }
+
+    /// Hive-style folders are columns, as a node reads them: `d/day=1/a.csv` and `d/day=2/b.csv` are one table whose `day`
+    /// is each folder's value, `**` reaches into folders, and `hive_partitioning => false` leaves the column out.
+    #[tokio::test]
+    async fn folders_are_columns_and_double_stars_reach_into_them() {
+        let page = Page::open(&Options::default());
+        assert_eq!(put(&page, "d/day=1/a.csv", "id,qty\n1,5\n2,7\n").await.status, 200);
+        assert_eq!(put(&page, "d/day=2/b.csv", "id,qty\n3,9\n").await.status, 200);
+        let deep = "SELECT day, count(*) AS n FROM 'd/**/*.csv' GROUP BY day ORDER BY day";
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], deep.into()).await.body, "day,n\n1,2\n2,1\n");
+        let flat = "SELECT * FROM read_csv('d/**/*.csv', hive_partitioning => false) ORDER BY id";
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], flat.into()).await.body, "id,qty\n1,5\n2,7\n3,9\n");
+    }
+
+    /// Two Arrow files whose notes differ (each file's own) are one table, as a node reads them.
+    #[tokio::test]
+    async fn arrow_files_with_their_own_notes_are_one_table() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::FileWriter;
+        let page = Page::open(&Options::default());
+        for i in 0..2i64 {
+            let note = [("a".to_string(), i.to_string())];
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]).with_metadata(note.into()));
+            let mut body = Vec::new();
+            let mut writer = FileWriter::try_new(&mut body, &schema).unwrap();
+            writer.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![i * 10, i * 10 + 1]))]).unwrap()).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(put(&page, &format!("p/{i}.arrow"), body).await.status, 200);
+        }
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n, sum(x) AS s FROM 'p/*.arrow'".into()).await;
+        assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+        assert_eq!(got.body, "n,s\n4,22\n");
+    }
+
+    /// A file not put is 42P01, and its words name the file as SQL wrote it, never the store's own form.
+    #[tokio::test]
+    async fn a_file_not_put_is_named_as_sql_wrote_it() {
+        let page = Page::open(&Options::default());
+        let got = page.request("POST", "/sql", &[], "SELECT * FROM 'nope.csv'".into()).await;
+        let body = std::str::from_utf8(&got.body).unwrap();
+        assert_eq!(got.header("x-pondra-sqlstate"), Some("42P01"));
+        assert!(body.contains("no file nope.csv was given to this page") && !body.contains("mem:///"), "{body}");
     }
 
     #[tokio::test]

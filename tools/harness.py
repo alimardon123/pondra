@@ -743,6 +743,13 @@ def outside():
     lines = got("out/eu.csv").decode().splitlines()
     checks["…CSV with a header and a delimiter, JSON lines"] = (lines[0].split(";")[:3] == ["id", "region", "amount"] and len(lines) == 1 + len(eu) + sum(1 for r in eu if r["id"] < 100)
         and [json.loads(l) for l in got("out/events.json").decode().splitlines()] == [{"k": "a", "v": 1}, {"k": "b", "v": 2}, {"k": "a", "v": 3}])
+    # (Arrow's file format as arrow-rs writes it pads its magic to 64 bytes, which DataFusion's reading of a file a bucket
+    # sends as a stream took for the schema's length: `ext_names::arrow_file_schema` reads the footer)
+    q("COPY eu TO 's3://ext/out/eu.arrow' (FORMAT arrow)")
+    eu_rows = q("SELECT count(*) AS n FROM eu", 1)[0]["n"]
+    checks["…an Arrow file, read back from the bucket by Pondra and by pyarrow"] = (
+        q("SELECT count(*) AS n FROM read_arrow('s3://ext/out/eu.arrow')", 1) == [{"n": eu_rows}]
+        and pa.ipc.open_file(io.BytesIO(got("out/eu.arrow"))).read_all().num_rows == eu_rows)
     q("COPY (SELECT 1 AS a) TO 's3://ext/out/eu.parquet'")
     checks["…a file there already is replaced"] = pq.read_table(io.BytesIO(got("out/eu.parquet"))).to_pylist() == [{"a": 1}]
     mine = tempfile.mkdtemp(prefix="pondra-copy-")
@@ -1453,7 +1460,7 @@ def tails():
             body = json.loads(r.read())
             with pair_lock:
                 pair_reads[0] += 1
-            if r.status != 200 or not body or not (body[0]["a"] == body[0]["b"] == body[0]["a2"]):  # (NULL equals NULL)
+            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2")):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
                 with pair_lock:
                     pair_wrong.append(body)
 
@@ -8002,6 +8009,31 @@ def found():
     want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 2}]
     seen["exps_fed"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_fed")), want, 30)
     checks["a view fed by a topic with 1e15 fills with 1000000000000000 (two records)"] = seen["exps_fed"] == want
+    # 1e15 is the whole number on every path that reads a literal (`optimize::whole_literals`, invariant 415): the fast INSERT of
+    # VALUES (`literals.rs`), a session's DECLARE (`vars.rs`), a DEFAULT and a one-key UPDATE's value (`defaults.rs`, `txn.rs`).
+    # (Each step is `_try`: on a build without the fix a step fails, and its check is false, not the harness.)
+    _try(lambda: q("CREATE TABLE e (d DOUBLE, n DECIMAL(20, 0), b BIGINT)"))
+    _try(lambda: q("INSERT INTO e VALUES (1e15, 1e15, 1e15)"))
+    _try(lambda: q("INSERT INTO e SELECT 1e15, 1e15, 1e15"))
+    seen["e_rows"] = _try(lambda: q("SELECT d, n, b, d = 1000000000000000.0 AS exact FROM e ORDER BY b"))
+    checks["INSERT … VALUES (1e15) and INSERT … SELECT 1e15 store the same whole number: a DOUBLE exactly 1e15, a DECIMAL and a BIGINT too"] = \
+        seen["e_rows"] == [{"d": 1e15, "n": 1000000000000000, "b": 1000000000000000, "exact": True}] * 2
+    found_s = {"x-pondra-session": "harness-found-1e15"}
+    qs = lambda t: call(port, "POST", "/sql", t.encode(), headers=found_s)
+    _try(lambda: qs("DECLARE $x = 1e15"))
+    _try(lambda: qs("CREATE TABLE e2 AS SELECT $x AS x"))
+    seen["e2"] = _try(lambda: qs("SELECT x = 1e15 AS same FROM e2"))
+    checks["DECLARE $x = 1e15, then CREATE TABLE e2 AS SELECT $x AS x writes (no Parquet error), and x = 1e15 is true"] = \
+        seen["e2"] == [{"same": True}]
+    _try(lambda: q("CREATE TABLE ek (k BIGINT PRIMARY KEY, d DOUBLE)"))
+    _try(lambda: q("INSERT INTO ek VALUES (1, 2.5)"))
+    _try(lambda: q("UPDATE ek SET d = 1e15 WHERE k = 1"))
+    seen["ek"] = _try(lambda: q("SELECT d FROM ek"))
+    checks["UPDATE of a keyed table's DOUBLE to 1e15 by its key reads exactly 1e15"] = seen["ek"] == [{"d": 1e15}]
+    _try(lambda: q("CREATE TABLE ed (id BIGINT, d DOUBLE DEFAULT 1e15)"))
+    _try(lambda: q("INSERT INTO ed (id) VALUES (1)"))
+    seen["ed"] = _try(lambda: q("SELECT d FROM ed"))
+    checks["a column DEFAULT 1e15 on a DOUBLE reads exactly 1e15"] = seen["ed"] == [{"d": 1e15}]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
@@ -13313,6 +13345,96 @@ def objects():
         ctas_bad[1] == "22P02" and ctas_read[1] == "42P01" and ctas_fixed[0] == 200 and ctas_rows == [{"a": 1}] \
         and cli_bad.returncode != 0 and cli_fixed.returncode == 0 and "42P07" not in cli_fixed.stdout + cli_fixed.stderr and cli_read.returncode == 0 and "| 1 |" in cli_read.stdout \
         and stopped[1] == "53200" and gone is not None and big_after == [{"one": 1}]
+    # Two CREATE TABLE of one name at once, on a leader and a follower of one lake (A.port + 8 and + 9: + 6 is the big
+    # node's above). The race: 20 rounds of a CTAS on each node, released together (one answers 200, the other 42P07,
+    # and the table holds one winner's rows); 5 rounds with IF NOT EXISTS (both 200, exactly one says exists); 5 plain
+    # CREATE TABLEs (one 200, one 42P07). The drop: the follower's CTAS fails 2 s or more after its table is there, and
+    # meanwhile the leader drops that table and makes another under the name; the failure must leave that table
+    # (`write.rs`, `drop_made`).
+    race_env = {"PONDRA_SECRET_KEY": "objects-key"}
+    race_lake = new_lake()
+    lead = Node(race_lake, A.port + 8, env=race_env).start()
+    follow = Node(race_lake, A.port + 9, env=race_env).start()
+    def post_on(port, body):  # (status, SQLSTATE, answer) of one statement sent to a node over HTTP
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode(errors="replace"))
+    def read_on(port, body):  # the answer, or its status when it isn't one
+        status, _, answer = post_on(port, body)
+        return answer if status == 200 else status
+    def together(stmts):  # stmts[0] to the leader and stmts[1] to the follower, sent at the same moment
+        gate, answers = threading.Barrier(2), [None, None]
+        def send(k):
+            gate.wait()
+            try:
+                answers[k] = post_on((lead.port, follow.port)[k], stmts[k])
+            except Exception as e:
+                answers[k] = (0, None, str(e))
+        ts = [threading.Thread(target=send, args=(k,)) for k in (0, 1)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return answers
+    raced, race_ok = 0, 0
+    for i in range(20):
+        got = together([f"CREATE TABLE race_{i} AS SELECT {n} AS who, value AS v FROM generate_series(1, 50000)" for n in (1, 2)])
+        raced += [a[0] for a in got] == [200, 200]
+        won = [k for k in (0, 1) if got[k][0] == 200]
+        if len(won) == 1 and got[1 - won[0]][:2] == (409, "42P07") and \
+                read_on(lead.port, f"SELECT count(*) AS n, count(DISTINCT who) AS w, min(who) AS first FROM race_{i}") == [{"n": 50000, "w": 1, "first": won[0] + 1}]:
+            race_ok += 1
+    ine_ok = 0
+    for i in range(5):
+        got = together([f"CREATE TABLE IF NOT EXISTS race_ine_{i} AS SELECT {n} AS who, value AS v FROM generate_series(1, 50000)" for n in (1, 2)])
+        said = [isinstance(a[2], dict) and a[2].get("exists") is True for a in got]
+        if [a[0] for a in got] == [200, 200] and sum(said) == 1 and \
+                read_on(lead.port, f"SELECT count(*) AS n, count(DISTINCT who) AS w FROM race_ine_{i}") == [{"n": 50000, "w": 1}]:
+            ine_ok += 1
+    plain_ok = 0
+    for i in range(5):
+        got = together([f"CREATE TABLE race_p_{i} (v INT)"] * 2)
+        if sorted(a[0] for a in got) == [200, 409] and [a[1] for a in got if a[0] == 409] == ["42P07"] and \
+                read_on(lead.port, f"SELECT count(*) AS n FROM race_p_{i}") == [{"n": 0}]:
+            plain_ok += 1
+    g_sql = "CREATE TABLE g AS SELECT 1 / (value - 60000000) AS v FROM generate_series(1, 60000000)"  # (its last row divides by zero, a second or more after g is there at 60M rows; made_at < failed_at says the drop came first)
+    failing, seen_at = {}, None
+    def fail_late():
+        try:
+            failing["answer"] = post_on(follow.port, g_sql)
+        except Exception as e:
+            failing["answer"] = (0, None, str(e))
+        failing["done"] = time.time()
+    failer = threading.Thread(target=fail_late)
+    failer.start()
+    deadline = time.time() + 120
+    while seen_at is None and time.time() < deadline:  # (poll until g is there, from the leader)
+        if post_on(lead.port, "SELECT 1 FROM g LIMIT 1")[0] == 200:
+            seen_at = time.time()
+        else:
+            time.sleep(0.05)
+    dropped = post_on(lead.port, "DROP TABLE g")
+    made = post_on(lead.port, "CREATE TABLE g AS SELECT 7 AS v")
+    made_at = time.time()
+    failer.join(timeout=900)
+    a = failing.get("answer", (0, None, "no answer"))
+    failed_at = failing.get("done")
+    g_lead, g_follow = read_on(lead.port, "SELECT v FROM g"), read_on(follow.port, "SELECT v FROM g")
+    drop_ok = seen_at is not None and dropped[0] == 200 and made[0] == 200 and a[0] != 200 and failed_at is not None \
+        and made_at < failed_at and g_lead == [{"v": 7}] and g_follow == [{"v": 7}]
+    info["race"] = {"rounds": 20, "both_200": raced, "one_200_and_42P07_one_winner": race_ok,
+                    "if_not_exists_rounds": ine_ok, "plain_rounds": plain_ok}
+    info["drop"] = {"seen_to_failure_s": round(failed_at - seen_at, 1) if failed_at and seen_at else None,
+                    "failure": [a[0], a[1], str(a[2])[:200]], "dropped_and_made_first": made_at < (failed_at or 0),
+                    "leader_drop_and_make": [dropped[0], made[0]], "after": [g_lead, g_follow]}
+    lead.kill()
+    follow.kill()
+    if not race_lake.startswith("s3://"):
+        shutil.rmtree(race_lake, ignore_errors=True)  # (its nodes are stopped: its lake goes now)
+    checks["two CREATE TABLE of one name at once, on two nodes: one makes it, the other is refused 42P07 (IF NOT EXISTS: one table), and a CREATE TABLE … AS SELECT that fails drops no other statement's table"] = \
+        race_ok == 20 and ine_ok == 5 and plain_ok == 5 and drop_ok
     # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
     # with the ways it has (0A000), not with the parser's words.
     exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")
@@ -18493,6 +18615,12 @@ def sparksql():
     q("CREATE TABLE people AS SELECT id, name, xs, CAST(d AS DOUBLE) AS d FROM (VALUES (1, 'ann', make_array(1, 2, 3), 2.5), (2, 'bob', make_array(4), -2.5), "
       "(3, 'cy', CAST(make_array() AS BIGINT[]), 0.5), (4, 'dee', CAST(NULL AS BIGINT[]), 7.5)) AS v(id, name, xs, d)")  # (Spark's floor of a DOUBLE is a BIGINT; 2.5 is a DECIMAL, whose floor has scale 0)
     rows = lambda df: [r.asDict() for r in df.collect()]
+    def tried(f):
+        # A binary without the feature answers with an error: the check fails by name, the run goes on.
+        try:
+            return f()
+        except Exception as e:
+            return f"error: {e}"
     got = {
         "text": rows(spark.sql('SELECT "hi" AS s, `name` FROM people WHERE name = "ann"')),
         "floor": rows(spark.sql("SELECT id, floor(d) AS f, ceil(d) AS c FROM people ORDER BY id")),
@@ -18509,7 +18637,16 @@ def sparksql():
         "args": [r["id"] for r in rows(spark.sql("SELECT id FROM people WHERE id > :m ORDER BY id", args={"m": 2}))],
         "frame": rows(spark.sql("SELECT count(*) AS n FROM {d} WHERE `name` <> \"bob\"", d=spark.table("people"))),
         "door": q("SELECT f, arrow_typeof(f) AS t FROM spark_sql('SELECT floor(CAST(2.5 AS DOUBLE)) AS f')"),
+        # Casts to an integer: Spark's cut the fraction toward zero, Pondra's SQL rounds it (invariant 293).
+        "spark cast": q("SELECT * FROM spark_sql('SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b, CAST(9007199254740993 AS BIGINT) AS c, 7 DIV 2 AS d')"),
+        "plain cast": q("SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b"),
+        "frame cast": tried(lambda: [(r["i"], r["b"]) for r in sorted(rows(spark.createDataFrame([{"x": 2.7}, {"x": -2.7}]).select("x", F.col("x").cast("int").alias("i"),
+            F.col("x").cast("bigint").alias("b"))), key=lambda r: r["x"])]),
     }
+    # A session in Spark's dialect (SET names it, as a client's does) cuts a cast; the session beside it rounds.
+    dialect = {"x-pondra-session": "harness-sparksql-dialect"}
+    call(A.port, "POST", "/sql", b"SET datafusion.sql_parser.dialect = 'spark'", headers=dialect)
+    got["dialect cast"] = call(A.port, "POST", "/sql", b"SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b", headers=dialect)
     q("CREATE VIEW floors AS SELECT * FROM spark_sql('SELECT id, floor(d) AS f FROM people')")
     got["view"] = q("SELECT sum(f) AS s FROM floors")
     refused = {
@@ -18537,6 +18674,9 @@ def sparksql():
     checks["spark_sql('…') from any door, and a view over it"] = got["door"] == [{"f": 2, "t": "Int64"}] and got["view"] == [{"s": 6}]
     checks["refused by name: " + ", ".join(refused)] = "takes a query" in refused["a statement that isn't a query"] and "posexplode" in refused["posexplode"] \
         and "over a join" in refused["a lateral view over a join"]
+    checks["a cast to an integer cuts the fraction toward zero in Spark's dialect (spark_sql, a session's SET, the frames' cast; 2.7 is 2, -2.7 is -2), and rounds in Pondra's SQL (3, -3)"] = \
+        [(str(r["c"]), r["d"]) for r in got["spark cast"]] == [("9007199254740993", 3)] and [(r["a"], r["b"]) for r in got["spark cast"]] == [(2, -2)] \
+        and got["plain cast"] == [{"a": 3, "b": -3}] and got["dialect cast"] == [{"a": 2, "b": -2}] and got["frame cast"] == [(-2, -2), (2, 2)]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"sparksql": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -22635,6 +22775,21 @@ def memorylake():
         status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
         checks["a folder holding other things is refused, and no part of the lake is written there"] = (
             status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+        # A place a move didn't finish (its _moving mark is there, written first) is refused by name, by SET LOCATION
+        # and by a node opening it: a copy that stopped half way never looks like a lake.
+        torn_place = new_lake()
+        put_object(torn_place, "_moving", b'{"from": "memory://torn", "pid": 1, "started_ms": 0}')
+        put_object(torn_place, "catalog/x", b"half a copy")
+        status, hdrs, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{torn_place}'".encode())
+        torn_node = Node(torn_place, P + 6)
+        try:
+            torn_node.start(tries=1)
+        except RuntimeError:
+            pass  # (it stopped at once: a node opening a torn place says why and exits)
+        torn_log = open(torn_node.log).read() if os.path.exists(torn_node.log) else ""
+        checks["a place where a move didn't finish (its _moving mark) is refused by name, by SET LOCATION and by a node opening it"] = (
+            status != 200 and hdrs.get("x-pondra-sqlstate") == "55000" and "_moving" in text
+            and torn_node.p is not None and not torn_node.alive() and "_moving" in torn_log)
 
         # The move, under writes.
         wt = threading.Thread(target=writer, daemon=True)
@@ -22667,7 +22822,7 @@ def memorylake():
         checks["a task keeps ticking after the move"] = more(lambda: sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"], ticks_before)
         checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
             bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
-            and bool(lake_objects(target, "files/notes/")))
+            and bool(lake_objects(target, "files/notes/")) and not os.path.exists(os.path.join(target, "_moving")))
         status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
         checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
         # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
@@ -22708,7 +22863,7 @@ def memorylake():
 
         # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
         # whole, says why in /stats, and the target is left empty; db.save says so too.
-        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        bad = Node(":memory:", P + 4, pg=f"127.0.0.1:{P + 14}", env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
         nodes.append(bad)
         sql(P + 4, "CREATE TABLE kept (v BIGINT)")
         sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
@@ -22726,7 +22881,13 @@ def memorylake():
         bad_stats = {"move_failed": why}
         checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
             back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
-            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/") and not os.path.exists(os.path.join(bad_target, "_moving")))
+        # pondra.databases.move_failed says why at every door (M12): the same text over HTTP and over Postgres.
+        import psycopg
+        over_http = [r["move_failed"] for r in sql(P + 4, f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'")]
+        with psycopg.connect(f"host=127.0.0.1 port={P + 14} user=admin dbname=lake", autocommit=True) as c:  # (an open node: no password)
+            over_pg = [r[0] for r in c.execute(f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'").fetchall()]
+        checks["a failed move: pondra.databases.move_failed says the same over HTTP and Postgres"] = over_http == [why] and over_pg == [why]
         said = ""
         try:
             _client(P + 4).save(new_lake())
@@ -22789,6 +22950,45 @@ def memorylake():
                 isinstance(inproc, list) and [str(v) for v in inproc] == ["1", "2", "3"] and bool(lake_objects(t5, "catalog/")))
             if ran.returncode != 0:
                 print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+        # A shell on :memory: that spilled leaves no spill folder once it ends (`memory::leave`: a process's statics
+        # run no destructor, so the program's end removes what it made). The node is the shell's child: never by pid.
+        shell_dir, spill_dir = tempfile.mkdtemp(prefix="pondra-shell-"), tempfile.mkdtemp(prefix="pondra-spill-")
+        with open(os.path.join(shell_dir, "shell.out"), "w") as out:
+            shell = subprocess.Popen([BIN, ":memory:"], cwd=shell_dir, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                     env={**os.environ, **env, "PONDRA_SPILL_DIR": spill_dir})
+            shell.stdin.write(b"CREATE TABLE t AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(20000);\n")
+            shell.stdin.flush()
+            spilled = False
+            for _ in range(300):  # (30 s: the table's files are past the 10 KB budget, so they go to a folder)
+                if glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")):
+                    spilled = True
+                    break
+                time.sleep(0.1)
+            try:
+                shell.stdin.close()
+                shell.wait(30)
+            except (OSError, subprocess.TimeoutExpired):
+                shell.kill()
+                shell.wait()
+        left = glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")) + glob_.glob(os.path.join(spill_dir, "pondra-spill-*", "*"))
+        checks["a shell on :memory: that spilled leaves no spill folder once it ends"] = spilled and not left
+        shutil.rmtree(shell_dir, ignore_errors=True)
+        shutil.rmtree(spill_dir, ignore_errors=True)
+        # Past its spill cap (PONDRA_SPILL_GB=2 MB) a lake in memory refuses a load by name (53100: the disk takes what
+        # it may and no more), leaves no table behind (invariant 420), and answers after.
+        capped_dir = new_lake()
+        capped = Node(":memory:", P + 5, env={**env, "PONDRA_SPILL_GB": "0.002", "PONDRA_SPILL_DIR": capped_dir}).start()
+        nodes.append(capped)
+        status, hdrs, text = reply(P + 5, "POST", "/sql", b"CREATE TABLE big AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(400000)")
+        refused = status != 200 and hdrs.get("x-pondra-sqlstate") == "53100" and "PONDRA_SPILL_GB" in text
+        gone = reply(P + 5, "POST", "/sql", b"SELECT count(*) AS n FROM big")[1].get("x-pondra-sqlstate") == "42P01"
+        answers = sql(P + 5, "SELECT 1 AS one") == [{"one": 1}]
+        sql(P + 5, "CREATE TABLE small (n INT)")
+        sql(P + 5, "INSERT INTO small VALUES (1)")
+        small = [r["n"] for r in sql(P + 5, "SELECT n FROM small")] == [1]
+        checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"] = refused and gone and answers and small
+        if not checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"]:
+            print(f"memorylake: the capped load answered {status}: {text[:300]}", file=sys.stderr)
         if not all(checks.values()):
             return False  # (its checks are printed on the way out)
         return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"

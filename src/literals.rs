@@ -106,7 +106,9 @@ fn plan(planner: &SqlToRel<'_, Literals<'_>>, value: ast::Expr, ctx: &SimplifyCo
 /// else (another function, a column, a CASE, TRY_CAST, arithmetic) is None.
 fn fold(e: &Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
     match e {
-        Expr::Literal(v, _) => Some(v.clone()),
+        // (a number with an exponent is the whole number it stands for, as `WholeLiterals` makes it in a planned query:
+        // the planner's decimal of a negative scale casts to a float a little short of 1e15 (invariant 415))
+        Expr::Literal(v, _) => Some(crate::optimize::whole(v).unwrap_or_else(|| v.clone())),
         // (a function called by an alias, `CURRENT_TIMESTAMP` for `now`, is planned under the alias's name; a
         // VALUES row can't name its own, so the wrapper is only that)
         Expr::Alias(a) => fold(&a.expr, ctx),
@@ -301,6 +303,15 @@ mod tests {
             agree(&float, sql).await;
         }
         agree(&[("v", "Float32")], "VALUES (3.4e39)").await;
+    }
+
+    #[tokio::test]
+    async fn whole_numbers_with_an_exponent_are_as_planned() {
+        // (`1e15` is the whole number on both paths: the planner's decimal of a negative scale is no value to cast)
+        agree(&[("v", "Float64")], "VALUES (1e15)").await;
+        agree(&[("v", "Float64")], "VALUES (CAST(1e15 AS DOUBLE))").await;
+        agree(&[("v", "Decimal128(20, 0)")], "VALUES (1e15)").await;
+        agree(&[("v", "Int64")], "VALUES (1e15)").await;
     }
 
     #[tokio::test]

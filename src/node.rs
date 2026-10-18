@@ -122,6 +122,9 @@ impl Node {
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
     pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
         let Options { dir, listen, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth } = o;
+        // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
+        // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
+        std::thread::spawn(crate::memory::sweep_all);
         crate::served::checked(&dir, reader, auth.admin_set(), crate::env::flag("PONDRA_SERVE_STORE"))?; // (who may serve or open a store: `served.rs`)
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
@@ -149,8 +152,9 @@ impl Node {
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
         let lake = match store::Lake::open(&dir, leader, streamed).await {
-            // (a lake a newer Pondra wrote: this binary must not lead or serve it, nor hold the term)
-            Err(e) if e.downcast_ref::<format::Newer>().is_some() => {
+            // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
+            // nor hold the term; and a restart would find the same place again)
+            Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory::torn(&e) => {
                 if leader {
                     cluster::release(&store, cluster.leader.n).await;
                 }

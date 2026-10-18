@@ -218,6 +218,7 @@ pub fn watch(lake: Arc<Lake>) {
                         return crate::library::failed(format!("{e:#}"));
                     }
                     eprintln!("stopping: {e}");
+                    crate::memory::leave();
                     std::process::exit(1);
                 }
             }

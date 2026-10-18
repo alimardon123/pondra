@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 pub use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 pub(crate) use crate::ext_names::{format_of, quoted, scheme, NULL_FOLDER};
-use crate::ext_names::{file_format, folders, hive_value, listed, read_files, schema_of};
+use crate::ext_names::{file_format, folders, hive_value, listed, part_of, read_files, schema_of};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -371,7 +371,8 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         _ => {}
     }
     let ctx = lake.session();
-    let format = file_format(spec)?;
+    let state = ctx.state();
+    let format = file_format(spec, &state)?;
     // Columns declared (`columns => {'id': 'BIGINT', …}`, CREATE EXTERNAL TABLE's): the table's.
     let declared = match spec.options.get("columns") {
         Some(c) => Some(crate::write::declared(c).await?),
@@ -386,7 +387,6 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     for u in &spec.urls {
         register(lake, u).await?;
     }
-    let state = ctx.state();
     let found = listed(&state, spec, |u| declared.is_none().then(|| anyhow!("no files at {u}"))).await?; // (declared: none yet is an empty table)
     let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
     if found.is_empty() {
@@ -423,7 +423,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
             if missing {
                 f.nulls = None; // (a column declared that the files don't hold is all NULL)
             }
-            f.part = part.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("/");
+            f.part = part_of(&part);
             if parquet && hived {
                 let values = part.iter().map(|(k, v)| (k.clone(), hive_value(v))).collect();
                 f.outside = Some(Box::new(crate::scan::Outside { values, ..Default::default() })); // (its folders' values, as `scan::read` takes them)

@@ -728,6 +728,8 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     let named = |url: &str| all.iter().find(|(_, l)| l.url == url).map_or(url.to_string(), |(n, _)| n.clone());
     let mut rows = vec![];
     let mut lifts = vec![]; // (protected, lifted_at in µs, lifted_by), per row: a lifted protection shows until it is set again
+    // (why this lake's last move out of memory failed, as it stayed in memory; NULL otherwise)
+    let failed = crate::memory::MOVE_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     for (name, l) in &all {
         let b = l.cat.get::<Bases>(BASES).await.ok().flatten();
         let branches = l.cat.scan::<Pin>("pn/", "pn0").await.map(|p| p.len()).unwrap_or(0);
@@ -750,6 +752,8 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
         ("protected", Arc::new(lifts.iter().map(|l| Some(l.0)).collect::<BooleanArray>()) as ArrayRef),
         ("lifted_at", Arc::new(lifts.iter().map(|l| l.1).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
         ("lifted_by", Arc::new(lifts.iter().map(|l| l.2.clone()).collect::<StringArray>()) as ArrayRef),
+        // (row 0 is this lake, the only one a move out of memory is about)
+        ("move_failed", Arc::new(std::iter::once(failed).chain(std::iter::repeat(None)).take(rows.len()).collect::<StringArray>()) as ArrayRef),
     ])?)
 }
 

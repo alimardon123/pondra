@@ -472,7 +472,7 @@ impl TableProvider for Files {
     }
 
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, _: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        let format = ParquetFormat::default().with_options(state.table_options().parquet.clone());
+        let format = ParquetFormat::default().with_options(state.default_table_options().parquet);
         let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);
         // Files dealt to the partitions by size, each partition a run of them.
