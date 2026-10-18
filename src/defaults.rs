@@ -65,7 +65,7 @@ fn copy() -> SessionContext { SessionContext::new_with_state(BASE.state()) }
 pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
     use datafusion::common::DFSchema;
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let Ok(e) = BASE.parse_sql_expr(expr, &schema) else { return Ok(None) };
+    let Ok(e) = BASE.parse_sql_expr(expr, &schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
     let Ok(phys) = BASE.create_physical_expr(e, &schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
 }
@@ -75,7 +75,7 @@ pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
 pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     use datafusion::common::DFSchema;
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let expr = BASE.parse_sql_expr(check, &schema)?;
+    let expr = BASE.parse_sql_expr(check, &schema).and_then(crate::optimize::whole_literals)?;
     let value = BASE.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
     let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())

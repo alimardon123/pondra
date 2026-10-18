@@ -64,7 +64,22 @@ enum TableSpec {
         enums: BTreeMap<String, crate::types::Enum>, // enum columns: the labels each takes (`types.rs`)
         #[serde(default)]
         sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid", "json", "jsonb", "varchar(n)" (`types.rs`)
+        #[serde(default)]
+        made_by: Option<String>, // the job of the CREATE TABLE that sends it (`made_by_job`); none: sent again freely
     },
+}
+
+/// A CREATE TABLE of a table that's there, refused as Postgres refuses it (42P07).
+fn already(name: &str) -> anyhow::Error {
+    crate::codes::coded("42P07", format!("table {name} already exists (CREATE TABLE IF NOT EXISTS leaves it as it is; CREATE OR REPLACE TABLE makes it anew)"))
+}
+
+/// A table's definition, marked with the job of the CREATE TABLE that sends it: a `CREATE TABLE … AS SELECT` (or a
+/// plain one) sends its definition under its own job only, so another statement's is refused while the table is there.
+fn made_by_job(spec: String, job: &str) -> Result<String> {
+    let mut spec: Value = serde_json::from_str(&spec)?; // (create_spec's: always an object)
+    spec["made_by"] = job.into();
+    Ok(spec.to_string())
 }
 
 /// A table's definition refused: invalid_table_definition (42P16) unless the error says its own
@@ -81,9 +96,9 @@ fn definition(e: anyhow::Error) -> anyhow::Error {
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
     let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new()),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by),
     };
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
@@ -156,9 +171,14 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
-            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
+            TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), made_by, ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
         Some(mut m) => {
+            // (a CREATE TABLE … AS SELECT's definition is sent again only under the job that made the table: the same
+            // statement's re-send falls through to the logic below, another's is refused while the table is there)
+            if made_by.is_some() && m.made_by != made_by {
+                return Err(already(name));
+            }
             defaulted = false;
             // (the spec names columns as SQL does; the table keeps its stored names: ADR-022)
             let l = m.logical();
@@ -1438,7 +1458,9 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
     if lake.cat.get::<TableMeta>(&table_key(&table)).await?.is_none() {
         return Ok(None);
     }
-    ensure!(c.if_not_exists || c.or_replace, "table {name} already exists (CREATE TABLE IF NOT EXISTS leaves it as it is; CREATE OR REPLACE TABLE makes it anew)");
+    if !(c.if_not_exists || c.or_replace) {
+        return Err(already(&name));
+    }
     Ok(Some(c.if_not_exists))
 }
 
@@ -1493,17 +1515,42 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
     let _ = other.refresh().await;
 }
 
+/// The drop after a `CREATE TABLE … AS SELECT`'s INSERT failed or stopped: the table it made, purged. Not when another
+/// statement's table is there under the name now (its `made_by` isn't `job`: a race, or a drop and a new table
+/// through another statement), which is that statement's rows. Read from this node's own catalog; with no table seen,
+/// the drop does nothing (IF EXISTS).
+async fn drop_made(lake: &Lake, name: &str, job: &str) -> Option<Stmt> {
+    let seen = async {
+        let (other, table) = crate::ddl::resolve(lake, name).await?;
+        let lake = other.unwrap_or_else(|| lake.arc());
+        lake.cat.get::<TableMeta>(&table_key(&table)).await
+    };
+    match seen.await {
+        Ok(Some(m)) if m.made_by.as_deref() != Some(job) => None,
+        _ => Some(Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.into(), if_exists: true, purge: true }])),
+    }
+}
+
+/// A `CREATE TABLE … IF NOT EXISTS` that another statement made first, between its check and its definition (refused
+/// 42P07 by the definition), is the table that's there: answered as `existing` answers it. Any other answer stands.
+fn raced(if_not_exists: bool, name: &str, out: Result<Value>) -> Result<Value> {
+    match out {
+        Err(e) if if_not_exists && crate::codes::of(&e) == "42P07" => Ok(j!({"table": name, "exists": true})),
+        out => out,
+    }
+}
+
 /// The table a `CREATE TABLE … AS SELECT` made, dropped if its request ends before the INSERT answers: the
 /// memory watch stops a request by dropping its future (`oom.rs`), so the code after the INSERT never runs.
-struct Undo(Option<(crate::server::App, String)>);
+struct Undo(Option<(crate::server::App, String, String)>); // (app, table, job)
 
 impl Drop for Undo {
     fn drop(&mut self) {
-        let Some((app, name)) = self.0.take() else { return };
+        let Some((app, name, job)) = self.0.take() else { return };
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
         crate::panics::task(crate::auth::carried(async move {
-            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]);
+            let Some(drop) = drop_made(&app.lake, &name, &job).await else { return };
             if let Err(e) = Box::pin(on_node_as(&app, drop, None, false)).await {
                 eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that stopped before it answered: {e:#}");
             }
@@ -1590,15 +1637,21 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         if let Some(q) = &c.query {
             let (name, query) = (object(&c.name), q.to_string());
-            Box::pin(on_node_as(app, Stmt::Define(name.clone(), create_spec(c, lake, files).await?), Some(job.clone()), files)).await?;
-            let mut undo = Undo(Some((app.clone(), name.clone()))); // (a request stopped before the INSERT answers drops the table too)
-            let out = Box::pin(on_node_as(app, Stmt::Insert(name.clone(), query), Some(job), files)).await;
+            let spec = made_by_job(create_spec(c, lake, files).await?, &job)?; // (the table is this statement's: its `made_by`)
+            let defined = Box::pin(on_node_as(app, Stmt::Define(name.clone(), spec), Some(job.clone()), files)).await;
+            if defined.is_err() {
+                return raced(c.if_not_exists, &name, defined); // (nothing was made here: no table to drop)
+            }
+            let mut undo = Undo(Some((app.clone(), name.clone(), job.clone()))); // (a request stopped before the INSERT answers drops the table too)
+            let out = Box::pin(on_node_as(app, Stmt::Insert(name.clone(), query), Some(job.clone()), files)).await;
             undo.0 = None; // (answered: the drop below is this request's own, and its answer comes once the table is gone)
             if out.is_err() {
                 // Refused or failed (a cast, a query the memory watch stops, a key the table can't take): nothing lands, so the
                 // table goes too, purged: it never held a row the statement answered for, so it isn't kept for UNDROP.
-                if let Err(e) = Box::pin(on_node_as(app, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]), None, false)).await {
-                    eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}"); // (the answer stays the statement's own error)
+                if let Some(drop) = drop_made(lake, &name, &job).await {
+                    if let Err(e) = Box::pin(on_node_as(app, drop, None, false)).await {
+                        eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}"); // (the answer stays the statement's own error)
+                    }
                 }
             }
             return out;
@@ -1649,13 +1702,21 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             Some(Request::Table(name, _)) => Some(table_key(name)),
             _ => None,
         };
-        let out = deliver(&other.url, Some(req), &stmt, &job, false).await?;
-        seen_there(&other, mark).await;
-        return Ok(out);
+        let out = deliver(&other.url, Some(req), &stmt, &job, false).await;
+        if out.is_ok() {
+            seen_there(&other, mark).await;
+        }
+        return match &stmt {
+            Stmt::Create(c) => raced(c.if_not_exists, &object(&c.name), out),
+            _ => out,
+        };
     }
     let stmt = stmt.on(table.clone());
     match &stmt {
-        Stmt::Create(c) => return define(app, &table, &create_spec(c, lake, files).await?).await,
+        Stmt::Create(c) => {
+            let spec = made_by_job(create_spec(c, lake, files).await?, &job)?; // (a plain CREATE TABLE is its statement's too)
+            return raced(c.if_not_exists, &object(&c.name), define(app, &table, &spec).await);
+        }
         Stmt::Define(_, spec) => return define(app, &table, spec).await,
         Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => {
             return match alter_spec(lake, &stmt).await? {
@@ -1907,15 +1968,25 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         Stmt::Create(c) if c.query.is_some() => {
             let lake = Lake::open(dir, false, false).await?;
             let (name, query) = (object(&c.name), c.query.as_ref().expect("a query").to_string());
-            Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), create_spec(&c, &lake, true).await?))).await?;
+            let spec = made_by_job(create_spec(&c, &lake, true).await?, job())?; // (this shell's job: the one its INSERT records under)
+            let defined = Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), spec))).await;
+            if defined.is_err() {
+                return raced(c.if_not_exists, &name, defined); // (nothing was made here: no table to drop)
+            }
             let out = Box::pin(one_from_cli(dir, Stmt::Insert(name.clone(), query))).await;
             if out.is_err() {
                 // (refused or failed: nothing lands, nor the table; purged: never kept for UNDROP. The answer stays the statement's own error)
-                if let Err(e) = Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.clone(), if_exists: true, purge: true }]))).await {
-                    eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}");
+                if let Some(drop) = drop_made(&lake, &name, job()).await {
+                    if let Err(e) = Box::pin(one_from_cli(dir, drop)).await {
+                        eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}");
+                    }
                 }
             }
             out
+        }
+        Stmt::Create(c) => {
+            let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
+            raced(if_not_exists, &name, one_from_cli(dir, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the shell's job)
         }
         Stmt::Ddl(ddls) => {
             let mut out = j!({});
@@ -2067,7 +2138,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
     match stmt {
-        Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), create_spec(c, query, files).await?))),
+        Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), made_by_job(create_spec(c, query, files).await?, job)?))),
         Stmt::Define(_, spec) => return Ok(Some(Request::Table(table.into(), spec.clone()))),
         Stmt::Ddl(d) => return Ok(Some(Request::Ddl(d.first().cloned().ok_or_else(|| anyhow::anyhow!("nothing to do"))?))),
         _ => {}

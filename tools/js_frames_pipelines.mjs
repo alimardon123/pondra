@@ -19,7 +19,15 @@
 import { readFileSync } from "node:fs";
 import { binary, col, concat, connect, len, lit, local, Pondra, when } from "../js/index.js";
 
-// [name, build(orders, users, quotes), ordered]: frames_check.py's pipelines, in its order.
+// A node a Python check started belongs to that program: its key (PONDRA_OWNER, from the check) goes with each
+// request, as the node asks (`x-pondra-owner`; without it a request gets a 401).
+const owned = (db) => {
+  db.owner = process.env.PONDRA_OWNER || undefined;
+  return db;
+};
+const link = (url) => owned(connect(url, { onNotice: null }));
+
+// [name, build(orders, users, quotes, times), ordered]: frames_check.py's pipelines, in its order.
 const PIPELINES = [
   ["filter + select", (o) => o.filter(col("qty").gt(3)).select("id", "user", "qty")],
   ["with_columns: new and replaced", (o) => o.withColumns(col("qty").mul(col("price")).alias("total"), col("price").mul(2).alias("price"))],
@@ -69,19 +77,23 @@ const PIPELINES = [
     col("price").sqrt().alias("s"), col("price").clip(5, 30).alias("c"))],
   ["SQL snippets inside frame methods", (o) => o.filter("qty > 2 AND item LIKE 't%'").withColumns("qty * price AS total")
     .groupBy("item").agg("sum(total) AS revenue", "count(*) AS n")],
+  ["casts to integers cut a fraction toward zero, as Polars does (2.5 is 2, -2.5 is -2)", (o) => o.filter(col("qty").isNotNull()).select("id", col("qty").sub(5).div(2).alias("h"), col("price").sub(20).alias("p"))
+    .select("id", col("h").cast("Int64").alias("h64"), col("h").cast("Int32").alias("h32"), col("p").cast("Int64").alias("p64"), col("p").cast("Int32").alias("p32"))],
+  ["dt.epoch in s, ms and us: fractions, and before 1970 (floored)", (o, u, q, t) => t.select("id", col("ts").dt.epoch("s").alias("s"),
+    col("ts").dt.epoch("ms").alias("ms"), col("ts").dt.epoch("us").alias("us"))],
 ];
 
 const oneLine = (e) => `${e.name}: ${String(e.message).slice(0, 400)}`;
 
 /** Every pipeline: its SQL text, its rows (the node's JSON: a null is left out) and its column names. */
 async function pipelines(url) {
-  const db = connect(url, { onNotice: null });
-  const [o, u, q] = [db.table("orders"), db.table("users"), db.table("quotes")];
+  const db = link(url);
+  const [o, u, q, t] = [db.table("orders"), db.table("users"), db.table("quotes"), db.table("times")];
   const out = [];
   for (const [name, build, ordered = false] of PIPELINES) {
     const row = { name, ordered };
     try {
-      const frame = build(o, u, q);
+      const frame = build(o, u, q, t);
       row.sql = await frame.sql();
       row.rows = await frame.rows();
       row.columns = await frame.columns();
@@ -169,7 +181,7 @@ async function client(url, tlsUrl, dir) {
       out[name] = { error: e?.message ?? String(e), code: e?.code ?? null, cause: e?.cause?.code ?? null, sqlstate: e?.sqlstate ?? null };
     }
   };
-  const db = connect(url, { onNotice: null });
+  const db = link(url);
   const count = async (table) => Number((await db.sql(`SELECT count(*) AS n FROM ${table}`))[0].n);
 
   await check("lookup", () => db.lookup("kt", key));
@@ -212,7 +224,7 @@ async function client(url, tlsUrl, dir) {
   await check("viewTemporary", async () => {
     const answer = await db.view("js_tv", "SELECT 7 AS x", { temporary: true }); // (the node's answer for the CREATE)
     const mine = await db.table("js_tv").rows(); // (the view, read as a table)
-    const otherError = await connect(url, { onNotice: null }).sql("SELECT x FROM js_tv").then(() => null, (e) => e.message);
+    const otherError = await link(url).sql("SELECT x FROM js_tv").then(() => null, (e) => e.message);
     return { answer, mine, otherError };
   });
 
@@ -248,17 +260,17 @@ async function client(url, tlsUrl, dir) {
   await check("caMissingFile", () => new Pondra(url, { ca: `${dir}/absent.pem`, onNotice: null }).sql("SELECT 1 AS x"));
   await check("tlsWithoutCa", () => new Pondra(tlsUrl, { onNotice: null }).sql("SELECT 1 AS x"));
   await check("tlsWithCa", () => new Pondra(tlsUrl, { ca: `${dir}/ca.pem`, onNotice: null }).sql("SELECT 1 AS x"));
-  await check("caOnPlainNode", () => new Pondra(url, { ca: `${dir}/ca.pem`, onNotice: null }).sql("SELECT 1 AS x"));
+  await check("caOnPlainNode", () => owned(new Pondra(url, { ca: `${dir}/ca.pem`, onNotice: null })).sql("SELECT 1 AS x"));
 
   await check("fetchOption", async () => {
     const asked = [];
-    const rows = await new Pondra(url, { onNotice: null, fetch: (u, o) => (asked.push(u), fetch(u, o)) }).sql("SELECT 1 AS x");
+    const rows = await owned(new Pondra(url, { onNotice: null, fetch: (u, o) => (asked.push(u), fetch(u, o)) })).sql("SELECT 1 AS x");
     return { rows, asked: asked.length };
   });
 
   // The SQL text of the CREATEs, as they are sent: Python's must be the same for the same arguments.
   const sent = [];
-  const recorder = connect(url, { onNotice: null });
+  const recorder = link(url);
   const sendSql = recorder.sql.bind(recorder);
   recorder.sql = (query, params) => (sent.push(query), sendSql(query, params));
   // timeout: 0 is sent (the text keeps it); the node refuses it, by name, and each side reports that refusal.
@@ -299,7 +311,7 @@ async function starting(dir) {
 
 // db.start(name, n): a procedure started without waiting; its run's id comes back.
 async function start(url, name, n) {
-  const db = connect(url, { onNotice: null });
+  const db = link(url);
   const id = await db.start(name, Number(n));
   console.log(JSON.stringify({ id: id ?? null }));
   await db.close();

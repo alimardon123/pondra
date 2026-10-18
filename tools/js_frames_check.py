@@ -46,6 +46,13 @@ DEFAULT_BIN = os.environ.get("PONDRA_BIN", os.path.join(HERE, "..", "target", "r
 
 # ---------------------------------------------------------------- the tables (frames_check.py's data())
 
+# Times with fractions, before and after 1970 (frames_check.py's TIMES): `epoch` floors them as Polars does.
+TIMES = pa.table({"id": list(range(6)), "ts": pa.array([
+    dt.datetime(2024, 1, 1, 0, 0, 0, 700000), dt.datetime(2024, 1, 1, 0, 0, 0, 500),
+    dt.datetime(1969, 12, 31, 23, 59, 59, 300000), dt.datetime(1969, 12, 31, 23, 59, 59, 999500),
+    dt.datetime(1969, 12, 31, 12, 0, 0, 1), dt.datetime(1970, 1, 1)], pa.timestamp("us"))})
+
+
 def data(n=3000, seed=11):
     """Orders, users and quotes, with nulls in places, as Arrow."""
     r = random.Random(seed)
@@ -64,7 +71,7 @@ def data(n=3000, seed=11):
     quotes = pa.table({"item": [r.choice(["tea", "cake", "coffee"]) for _ in range(400)],
                        "at": sorted(t0 + dt.timedelta(seconds=r.randrange(30 * 86400)) for _ in range(400)),
                        "px": [round(r.uniform(1, 9), 2) for _ in range(400)]})
-    return {"orders": orders, "users": users, "quotes": quotes}
+    return {"orders": orders, "users": users, "quotes": quotes, "times": TIMES}
 
 
 SQL_TYPES = {"int64": "BIGINT", "string": "VARCHAR", "double": "DOUBLE", "timestamp[us]": "TIMESTAMP", "date32[day]": "DATE"}
@@ -129,6 +136,10 @@ PIPELINES = [
         col("price").sqrt().alias("s"), col("price").clip(5, 30).alias("c")), False),
     ("SQL snippets inside frame methods", lambda c, o, u, q: o.filter("qty > 2 AND item LIKE 't%'").with_columns("qty * price AS total")
         .group_by("item").agg("sum(total) AS revenue", "count(*) AS n"), False),
+    ("casts to integers cut a fraction toward zero, as Polars does (2.5 is 2, -2.5 is -2)", lambda c, o, u, q: o.filter(col("qty").is_not_null()).select("id", ((col("qty") - 5) / 2).alias("h"), (col("price") - 20).alias("p")).select(
+        "id", col("h").cast("Int64").alias("h64"), col("h").cast("Int32").alias("h32"), col("p").cast("Int64").alias("p64"), col("p").cast("Int32").alias("p32")), False),
+    ("dt.epoch in s, ms and us: fractions, and before 1970 (floored)", lambda c, o, u, q: c.table("times").select("id", col("ts").dt.epoch("s").alias("s"),
+        col("ts").dt.epoch("ms").alias("ms"), col("ts").dt.epoch("us").alias("us")), False),
 ]
 
 
@@ -170,9 +181,11 @@ def compare_rows(ours, theirs, ordered):
 
 # ---------------------------------------------------------------- running
 
-def run_node(args, timeout):
-    """tools/js_frames_pipelines.mjs's answer (its JSON on stdout)."""
-    done = subprocess.run(["node", JS, *args], capture_output=True, text=True, timeout=timeout)
+def run_node(args, timeout, owner=None):
+    """tools/js_frames_pipelines.mjs's answer (its JSON on stdout). `owner`: the key of the Python node it talks to
+    (its `con.owner`), which the node asks of every request."""
+    env = {**os.environ, "PONDRA_OWNER": owner} if owner else None
+    done = subprocess.run(["node", JS, *args], capture_output=True, text=True, timeout=timeout, env=env)
     if done.returncode != 0:
         raise RuntimeError(f"node {args[0]}: {done.stderr.strip()[-800:]}")
     return json.loads(done.stdout)
@@ -212,7 +225,7 @@ def pipelines_check(port, report, tmp):
             except Exception as e:  # noqa: BLE001 (reported as a failed check)
                 row["error"] = f"{type(e).__name__}: {str(e)[:400]}"
             ours.append(row)
-        theirs = run_node(["pipelines", f"http://127.0.0.1:{port}"], timeout=900)["pipelines"]
+        theirs = run_node(["pipelines", f"http://127.0.0.1:{port}"], timeout=900, owner=con.owner)["pipelines"]
     finally:
         con.close()
     if len(theirs) != len(ours):
@@ -363,7 +376,7 @@ def client_check(port, report, tmp):
                 except Exception as e:  # noqa: BLE001 (a refusal is compared with JavaScript's, below)
                     refused.append(str(e))
         tls = start_tls(d, port + 1, cert, key)
-        got = run_node(["client", f"http://127.0.0.1:{port}", f"https://127.0.0.1:{port + 1}", d], timeout=600)
+        got = run_node(["client", f"http://127.0.0.1:{port}", f"https://127.0.0.1:{port + 1}", d], timeout=600, owner=con.owner)
     finally:
         if tls is not None:
             tls.stdin.close()
@@ -488,7 +501,7 @@ def start_check(port, report, tmp):
     try:
         con.sql("CREATE TABLE started (n INT)")
         con.create_procedure("add_started", params={"n": "INT"}, language="sql", body="INSERT INTO started VALUES ($n)")
-        js = run_node(["start", f"http://127.0.0.1:{port}", "add_started", "1"], timeout=300)
+        js = run_node(["start", f"http://127.0.0.1:{port}", "add_started", "1"], timeout=300, owner=con.owner)
         py_run = con.call("add_started", 2, wait=False)
         js_row = run_row(con, js.get("id"))
         py_row = run_row(con, py_run.id)

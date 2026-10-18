@@ -162,6 +162,10 @@ top.explain()            # Pondra's plan, and whether it would spread
 | Sets | `pondra.concat([a, b])`, `union`, `intersect`, `except_` | `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT` |
 | Time | `con.table(name, at=commit)` | **not built yet** (see "As built" below): it would read the table as of that commit |
 
+A frame's `cast` to an integer type drops the fraction toward zero, as Polars and PySpark do (2.7 is 2, -2.7 is -2).
+SQL's `CAST` rounds it, as Postgres and DuckDB do (2.7 is 3). Spark's dialect (`datafusion.sql_parser.dialect = 'spark'`)
+and `spark_sql('…')` truncate too, as Spark does (`casts.rs`).
+
 Writes and streams are the same verbs SQL has, so they keep SQL's guarantees (the leader
 records them; a job id makes a retry a no-op):
 

@@ -5,9 +5,10 @@
 //! `a DIV b`, `<=>`, `!`, `RLIKE`, `LATERAL VIEW [OUTER] explode(…)` and `explode` itself, and the
 //! functions both have with Spark's answers (`floor` a BIGINT, `substring`, `round`, …): Spark's
 //! own, registered in every session as `spark_floor`, … (`engine::spark`), so DataFusion's answers
-//! never change outside it (invariant 190). Backticks are names in Pondra's SQL too.
+//! never change outside it (invariant 190). A cast to an integer cuts its fraction toward zero, as Spark
+//! does (`pondra_truncate`: Pondra's own casts round it). Backticks are names in Pondra's SQL too.
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitMut, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, SparkSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -174,7 +175,15 @@ fn turn(e: &mut Expr, names: &HashMap<String, String>) -> Result<Option<Expr>> {
             *op = UnaryOperator::Not;
             None
         }
-        Expr::BinaryOp { left, op: BinaryOperator::MyIntegerDivide, right } => Some(expr(&format!("CAST(({left}) / ({right}) - ({left}) / ({right}) % 1 AS BIGINT)"))?), // (DIV: a whole number, toward zero; a cast rounds, so the fraction goes first)
+        Expr::BinaryOp { left, op: BinaryOperator::MyIntegerDivide, right } => Some(expr(&format!("CAST(pondra_truncate(({left}) / ({right})) AS BIGINT)"))?), // (DIV: a whole number, toward zero: the cut first, as Pondra's cast would round)
+        // (Spark's cast to an integer cuts a fraction toward zero; Pondra's would round it, so the cut goes in first)
+        Expr::Cast { kind, expr: x, data_type, array: false, format: None } if whole_number(data_type) => {
+            let cast = match kind {
+                CastKind::TryCast | CastKind::SafeCast => "TRY_CAST",
+                _ => "CAST",
+            };
+            Some(expr(&format!("{cast}(pondra_truncate({x}) AS {data_type})"))?)
+        }
         Expr::BinaryOp { left, op: BinaryOperator::Spaceship, right } => Some(expr(&format!("({left}) IS NOT DISTINCT FROM ({right})"))?),
         Expr::RLike { negated, expr: x, pattern, .. } => Some(expr(&format!("{}regexp_like({x}, {pattern})", if *negated { "NOT " } else { "" }))?),
         Expr::Substring { expr: x, substring_from, substring_for, .. } => match spark("substring") {
@@ -212,6 +221,15 @@ fn turn(e: &mut Expr, names: &HashMap<String, String>) -> Result<Option<Expr>> {
 
 fn expr(sql: &str) -> Result<Expr> {
     Ok(Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_expr()?)
+}
+
+/// Spark's integer types, the unsigned forms too (sqlparser reads them): what a cast to an integer names.
+fn whole_number(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::TinyInt(_) | DataType::TinyIntUnsigned(_) | DataType::UTinyInt | DataType::SmallInt(_) | DataType::SmallIntUnsigned(_) | DataType::USmallInt
+            | DataType::Int(_) | DataType::IntUnsigned(_) | DataType::Integer(_) | DataType::IntegerUnsigned(_) | DataType::BigInt(_) | DataType::BigIntUnsigned(_) | DataType::UBigInt
+    )
 }
 
 /// Each SELECT of a query's body (through UNION and the like, not into subqueries).
@@ -279,7 +297,9 @@ mod tests {
         let q = |s: &str| super::query(s).unwrap().to_string();
         assert_eq!(q(r#"SELECT "a", `b c` FROM t WHERE !x AND y <=> 1"#), r#"SELECT 'a' AS "a", `b c` FROM t WHERE NOT x AND (y) IS NOT DISTINCT FROM (1)"#);
         assert_eq!(q("SELECT explode(xs) FROM t"), r#"SELECT unnest(xs) AS "col" FROM t"#);
-        assert_eq!(q("SELECT a DIV 2 AS h FROM t"), "SELECT CAST((a) / (2) - (a) / (2) % 1 AS BIGINT) AS h FROM t");
+        assert_eq!(q("SELECT a DIV 2 AS h FROM t"), "SELECT CAST(pondra_truncate((a) / (2)) AS BIGINT) AS h FROM t");
+        assert_eq!(q("SELECT CAST(a AS INT) AS i, a::BIGINT AS j, TRY_CAST(a AS SMALLINT) AS k, CAST(a AS DOUBLE) AS d, CAST(a AS STRING) AS s FROM t"),
+            "SELECT CAST(pondra_truncate(a) AS INT) AS i, CAST(pondra_truncate(a) AS BIGINT) AS j, TRY_CAST(pondra_truncate(a) AS SMALLINT) AS k, CAST(a AS DOUBLE) AS d, CAST(a AS STRING) AS s FROM t");
         assert_eq!(q("SELECT floor(d) AS f, CEIL(d) FROM t"), r#"SELECT spark_floor(d) AS f, spark_ceil(d) AS "CEIL(d)" FROM t"#);
         assert_eq!(q("SELECT id, x FROM t LATERAL VIEW explode(xs) v AS x"), "SELECT id, x FROM (SELECT t.*, unnest(xs) AS x FROM t) AS t");
         assert_eq!(q("SELECT a.id, v.x FROM t a LATERAL VIEW OUTER explode(a.xs) v AS x"),
