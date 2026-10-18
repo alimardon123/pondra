@@ -327,6 +327,25 @@ impl Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("App") }
 }
 
+/// A COPY line the reader refused, as Postgres words it: a line of another width is 22P04 (`extra data after last expected
+/// column`, `missing data for column "c"`), a value its column's type can't read 22P02, each with the reader's words after.
+/// Anything else is as the reader says it.
+fn copy_refused(given: &[String], e: datafusion::arrow::error::ArrowError) -> anyhow::Error {
+    static FIELDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"incorrect number of fields for line \d+, expected (\d+) got (\d+)").expect("a pattern"));
+    let said = e.to_string();
+    if let Some((want, got)) = FIELDS.captures(&said).and_then(|c| Some((c[1].parse::<usize>().ok()?, c[2].parse::<usize>().ok()?))) {
+        let what = match given.get(got) {
+            Some(c) if got < want => format!("missing data for column \"{c}\""),
+            _ => "extra data after last expected column".into(),
+        };
+        return crate::codes::coded("22P04", format!("{what} ({said})"));
+    }
+    match said.contains("Error while parsing value") {
+        true => crate::codes::coded("22P02", said),
+        false => e.into(),
+    }
+}
+
 fn user_error(e: anyhow::Error) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), crate::codes::of(&e).into(), crate::ext::said(&e))))
 }
@@ -611,7 +630,7 @@ impl Backend {
         if !csv {
             reader = reader.with_quote(0); // (text format quotes nothing)
         }
-        let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(e.into()))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?;
+        let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
         for b in batches {
             // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();

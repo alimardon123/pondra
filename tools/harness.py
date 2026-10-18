@@ -4680,6 +4680,16 @@ def copies():
         with cur.copy("COPY ev FROM STDIN WITH (FORMAT csv, HEADER true)") as cp:
             cp.write(csv)
         csv_in = cur.rowcount
+        # a line of another width, or a value its column can't read, is refused as Postgres refuses it, writing nothing
+        refused = {}
+        for name, line in [("one field too many", "1\tx\t1.5\t9\n"), ("one field short", "1\tx\n"), ("not a number", "one\tx\t1.5\n")]:
+            try:
+                with cur.copy("COPY ev FROM STDIN") as cp:
+                    cp.write(line)
+                refused[name] = "accepted"
+            except psycopg.Error as e:
+                refused[name] = e.sqlstate
+        kept = c.execute("SELECT count(*) FROM ev").fetchone()[0]
         got = {}
         for fmt in ("text", "binary"):
             with cur.copy(f"COPY (SELECT id, name, amount FROM ev ORDER BY id) TO STDOUT WITH (FORMAT {fmt})") as cp:
@@ -4699,6 +4709,8 @@ def copies():
         arrow = cur.fetch_arrow_table()
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
+              "COPY FROM a line of another width (22P04) or a value that isn't its type (22P02): refused, nothing written":
+                  refused == {"one field too many": "22P04", "one field short": "22P04", "not a number": "22P02"} and kept == 2000,
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
               "DECIMAL as NUMERIC, text and binary": numeric_ok}
