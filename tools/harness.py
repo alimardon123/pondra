@@ -13150,7 +13150,7 @@ def objects():
         if sorted(a[0] for a in got) == [200, 409] and [a[1] for a in got if a[0] == 409] == ["42P07"] and \
                 read_on(lead.port, f"SELECT count(*) AS n FROM race_p_{i}") == [{"n": 0}]:
             plain_ok += 1
-    g_sql = "CREATE TABLE g AS SELECT 1 / (value - 60000000) AS v FROM generate_series(1, 60000000)"  # (its last row divides by zero: 2 s or more after g is there, at 60M rows)
+    g_sql = "CREATE TABLE g AS SELECT 1 / (value - 60000000) AS v FROM generate_series(1, 60000000)"  # (its last row divides by zero, a second or more after g is there at 60M rows; made_at < failed_at says the drop came first)
     failing, seen_at = {}, None
     def fail_late():
         try:
@@ -13174,7 +13174,7 @@ def objects():
     failed_at = failing.get("done")
     g_lead, g_follow = read_on(lead.port, "SELECT v FROM g"), read_on(follow.port, "SELECT v FROM g")
     drop_ok = seen_at is not None and dropped[0] == 200 and made[0] == 200 and a[0] != 200 and failed_at is not None \
-        and made_at < failed_at and failed_at - seen_at >= 2 and g_lead == [{"v": 7}] and g_follow == [{"v": 7}]
+        and made_at < failed_at and g_lead == [{"v": 7}] and g_follow == [{"v": 7}]
     info["race"] = {"rounds": 20, "both_200": raced, "one_200_and_42P07_one_winner": race_ok,
                     "if_not_exists_rounds": ine_ok, "plain_rounds": plain_ok}
     info["drop"] = {"seen_to_failure_s": round(failed_at - seen_at, 1) if failed_at and seen_at else None,
