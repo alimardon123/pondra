@@ -855,7 +855,7 @@ fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Optio
 
 /// Does carrying out `d` drop or rename something a comment may be on?
 pub fn moves(d: &Ddl) -> bool {
-    matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::DropTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
+    matches!(d, Ddl::Sequence(_) | Ddl::Index(_) | Ddl::Type(_) | Ddl::DropTable { .. } | Ddl::ReplaceTable { .. } | Ddl::DropView { .. } | Ddl::DropSchema { .. } | Ddl::DropRoutine { .. } | Ddl::DropTask { .. } | Ddl::DropSecret { .. }
         | Ddl::Detach { .. } | Ddl::DropDatabase { .. } | Ddl::RenameTable { .. } | Ddl::AlterColumn { .. } | Ddl::Users(_)
         | Ddl::Shares(crate::shares::Change::DropShare { .. } | crate::shares::Change::DropRecipient { .. }))
 }

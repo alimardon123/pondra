@@ -64,7 +64,8 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     // A table whose metadata is as last published is skipped without loading its manifests.
     crate::per_node!(static SEEN: std::sync::Mutex<std::collections::HashMap<String, u64>> = Default::default());
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
-    let tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    // (a staged table of a CREATE OR REPLACE TABLE is published once it has taken the old table's place: `ddl::replace`)
+    let tables: Vec<_> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(key, _)| crate::sys::staged_for(&key[2..]).is_none()).collect();
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
     // Each table's formats publish at once (Delta's PUTs must not add to Iceberg's freshness every
     // round: `freshness.py --s3`), and the table's puts extend together only if all its formats

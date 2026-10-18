@@ -94,7 +94,8 @@ pub(crate) fn definition(e: anyhow::Error) -> anyhow::Error {
 /// Leader: create a table (sent again for an existing one, `publish` changes). The caller holds
 /// the lock that serialises table rewrites.
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
-    let name = &crate::ddl::new_name(lake, name).await?; // (its schema exists; `public.t` is `t`)
+    let name = &new_table(lake, name).await?; // (its schema exists; `public.t` is `t`; a staged name is checked by its table)
+    let owner = crate::sys::staged_for(name.as_str()).unwrap_or(name.as_str()); // (a staged table takes its folder and sequences' names from the table it replaces)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
     let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by) = match serde_json::from_str(spec)? {
         TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None),
@@ -157,13 +158,14 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
         // in segments that aren't expired yet.)
         None => {
-            crate::ddl::unclaimed(lake, name).await?;
-            let folder = crate::ddl::free_folder(lake, name).await?; // (a renamed table may still have this name's folder)
+            crate::ddl::unclaimed(lake, owner).await?;
+            // (a renamed table may still have this name's folder; a staged table's folder is its table's name, unless taken)
+            let folder = crate::ddl::free_folder(lake, owner).await?.or_else(|| (owner != name.as_str()).then(|| owner.to_string()));
             let mut identity = identity;
             for (c, i) in identity.iter_mut() {
                 let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
                 let as_type = match t.as_str() { "Int16" => "smallint", "Int32" => "integer", _ => "bigint" };
-                i.sequence = crate::seq::owned(lake, name, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
+                i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
                 defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
             }
             TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), made_by, ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
@@ -1568,27 +1570,156 @@ pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, fil
     })
 }
 
-/// SQL's CREATE TABLE of a table that's there, as Postgres has it: refused (42P07), left as it is
-/// with IF NOT EXISTS, dropped first with OR REPLACE. (`POST /tables/{name}`, which may only add
-/// columns, is the call that may be sent again.)
-async fn existing(app: &crate::server::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Option<Value>> {
+/// SQL's CREATE TABLE of a table that's there, as Postgres has it: refused (42P07), left as it is with IF NOT EXISTS. With
+/// OR REPLACE it is replaced by `create_as`: the old table stays until the new one takes its place.
+async fn existing(app: &crate::server::App, c: &ast::CreateTable) -> Result<Option<Value>> {
     let mut found = there(&app.lake, c).await;
     if !matches!(found, Ok(None)) {
-        seen_here(app).await; // (a table just dropped through another node: this one holds the drop once it holds what its leader had)
+        seen_here(app).await; // (a table just made or dropped through another node: this one holds it once it holds what its leader had)
         found = there(&app.lake, c).await;
     }
-    match found? {
-        Some(true) => Ok(Some(j!({"table": object(&c.name), "exists": true}))),
-        Some(false) => {
-            let drop = Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true, purge: false }]);
-            Box::pin(on_node_as(app, drop, Some(format!("{job}:replaced")), files)).await.map(|_| None)
+    Ok(match found? {
+        Some(true) => Some(j!({"table": object(&c.name), "exists": true})),
+        _ => None,
+    })
+}
+
+/// A name a CREATE TABLE is made under: `ddl::new_name`'s, and a staged name's (`sys::staged`, which only a replace makes),
+/// checked by the table it is for.
+async fn new_table(lake: &Lake, name: &str) -> Result<String> {
+    match crate::sys::staged_for(name) {
+        Some(table) => {
+            crate::ddl::new_name(lake, table).await?;
+            Ok(name.to_string())
         }
-        None => Ok(None),
+        None => crate::ddl::new_name(lake, name).await,
     }
 }
 
+/// The steps of a CREATE TABLE with a query, or OR REPLACE: `run` sends each statement where its door sends it (a node's
+/// writer, or `pondra sql`'s leader), so both doors take the same steps. `armed` hears the name of the table a stopped
+/// statement must drop (a node's memory watch: `Undo`).
+async fn create_as<F>(run: F, lake: &Lake, c: &ast::CreateTable, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send)) -> Result<Value>
+where
+    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
+{
+    let name = object(&c.name);
+    if c.or_replace {
+        replacing(&run, lake, c, &name, job, files, armed).await
+    } else {
+        ctas(&run, lake, c, &name, job, files, armed).await
+    }
+}
+
+/// CREATE TABLE (with a query): the table, with the query's columns, then its rows. A step that fails or stops drops the table
+/// it made (`undo_made`): nothing lands, so the table goes too.
+async fn ctas<F>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send)) -> Result<Value>
+where
+    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
+{
+    let spec = made_by_job(create_spec(c, lake, files).await?, job)?; // (the table is this statement's: its `made_by`)
+    let defined = run(Stmt::Define(name.to_string(), spec)).await;
+    if defined.is_err() {
+        return raced(c.if_not_exists, name, defined); // (nothing was made here: no table to drop)
+    }
+    armed(name);
+    let Some(q) = &c.query else { return defined };
+    let out = run(Stmt::Insert(name.to_string(), q.to_string())).await;
+    if out.is_err() {
+        undo_made(run, lake, name, job).await;
+    }
+    out
+}
+
+/// CREATE OR REPLACE TABLE: the new table is made under a staged name (`sys::staged`), its rows go in, and the leader puts it
+/// in `name`'s place in one commit (`Ddl::ReplaceTable`). Until then `name` is as it was, so a failed or stopped statement
+/// leaves it so. A retry whose replace went through answers as a duplicate; a retry whose rows went into a table that was let
+/// go is refused by name (its job's rows are recorded, so they would not be written again).
+async fn replacing<F>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send)) -> Result<Value>
+where
+    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
+{
+    if crate::ddl::resolve(lake, name).await?.0.is_some() {
+        return Err(crate::codes::coded("0A000", format!("CREATE OR REPLACE TABLE {name}: another database's table is replaced from a node of that database")));
+    }
+    if lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some_and(|m| m.made_by.as_deref() == Some(job)) {
+        return Ok(j!({"table": name, "duplicate": true})); // (a retry: the replace this job sent went through)
+    }
+    crate::ddl::replaceable(lake, name).await?; // (refused before any query runs)
+    let staged = crate::sys::staged(name, job);
+    let existed = lake.cat.get::<TableMeta>(&table_key(&staged)).await?.is_some(); // (a node left this job's staged table: its rows are in it)
+    let spec = made_by_job(create_spec(c, lake, files).await?, job)?;
+    let mut out = run(Stmt::Define(staged.clone(), spec)).await.map_err(|e| named(e, &staged, name))?;
+    armed(&staged);
+    if let Some(q) = &c.query {
+        let inserted = run(Stmt::Insert(staged.clone(), q.to_string())).await.map_err(|e| named(e, &staged, name));
+        let rows = match inserted {
+            Ok(v) if v["duplicate"] == true && !existed => {
+                Err(anyhow::anyhow!("{name}: this statement's rows were written before, into a table that was let go, so they can't be written again: run the statement again with a new job"))
+            }
+            other => other,
+        };
+        out = match rows {
+            Ok(v) => v,
+            Err(e) => {
+                undo_made(run, lake, &staged, job).await; // (nothing replaced: `name` is as it was)
+                return Err(e);
+            }
+        };
+    }
+    let replace = crate::ddl::Ddl::ReplaceTable { name: name.to_string(), staged: staged.clone() };
+    if let Err(e) = run(Stmt::Ddl(vec![replace])).await {
+        undo_made(run, lake, &staged, job).await;
+        return Err(named(e, &staged, name));
+    }
+    if let Some(t) = out.get_mut("table") {
+        *t = Value::from(name); // (the staged table's answer names the table it replaced)
+    }
+    Ok(out)
+}
+
+/// Drops the table a statement made under `name` after it failed or stopped: purged, as `drop_made` says (never another
+/// statement's table). The statement's own error stays its answer.
+async fn undo_made<F>(run: &F, lake: &Lake, name: &str, job: &str)
+where
+    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
+{
+    if let Some(drop) = drop_made(lake, name, job).await {
+        if let Err(e) = run(drop).await {
+            eprintln!("dropping {name}, a CREATE TABLE that failed: {e:#}");
+        }
+    }
+}
+
+/// An error of a replace's steps, said of the table the statement named: the staged name (`t$new-…`) becomes `t`, and its code
+/// stays. An error that doesn't name the staged table goes on as it is.
+fn named(e: anyhow::Error, staged: &str, name: &str) -> anyhow::Error {
+    if !format!("{e:#}").contains(staged) {
+        return e;
+    }
+    let text = format!("{e:#}").replace(staged, name);
+    match crate::codes::of(&e) {
+        "XX000" => anyhow::anyhow!(text),
+        code => crate::codes::coded(code, text),
+    }
+}
+
+/// `create_as` on a node: each of its statements runs here, as the caller (`on_node_as`). A request stopped before its steps
+/// answer drops the table it made (`Undo`: the memory watch stops a request by dropping its future, `oom.rs`).
+async fn create_on_node(app: &crate::server::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Value> {
+    let (app_run, job_run) = (app.clone(), job.to_string());
+    let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
+        let (app, job) = (app_run.clone(), job_run.clone());
+        Box::pin(async move { on_node_as(&app, s, Some(job), files).await })
+    };
+    let mut undo = Undo(None);
+    let out = create_as(run, &app.lake, c, job, files, &mut |table: &str| undo.0 = Some((app.clone(), table.to_string(), job.to_string()))).await;
+    undo.0 = None; // (answered, or refused: whatever it made is dropped by now, or is the statement's answer)
+    out
+}
+
 /// Is the table a CREATE TABLE names there? None: no; Some(true): leave it (IF NOT EXISTS);
-/// Some(false): drop it first (OR REPLACE); otherwise refused.
+/// Some(false): replace it (OR REPLACE); otherwise refused.
 async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
     let name = object(&c.name);
     ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE TABLE … IF NOT EXISTS: one or the other");
@@ -1769,31 +1900,13 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         return Ok(out);
     }
-    // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
+    // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, on this node.
     if let Stmt::Create(c) = &stmt {
-        if let Some(out) = Box::pin(existing(app, c, &job, files)).await? {
+        if let Some(out) = Box::pin(existing(app, c)).await? {
             return Ok(out);
         }
-        if let Some(q) = &c.query {
-            let (name, query) = (object(&c.name), q.to_string());
-            let spec = made_by_job(create_spec(c, lake, files).await?, &job)?; // (the table is this statement's: its `made_by`)
-            let defined = Box::pin(on_node_as(app, Stmt::Define(name.clone(), spec), Some(job.clone()), files)).await;
-            if defined.is_err() {
-                return raced(c.if_not_exists, &name, defined); // (nothing was made here: no table to drop)
-            }
-            let mut undo = Undo(Some((app.clone(), name.clone(), job.clone()))); // (a request stopped before the INSERT answers drops the table too)
-            let out = Box::pin(on_node_as(app, Stmt::Insert(name.clone(), query), Some(job.clone()), files)).await;
-            undo.0 = None; // (answered: the drop below is this request's own, and its answer comes once the table is gone)
-            if out.is_err() {
-                // Refused or failed (a cast, a query the memory watch stops, a key the table can't take): nothing lands, so the
-                // table goes too, purged: it never held a row the statement answered for, so it isn't kept for UNDROP.
-                if let Some(drop) = drop_made(lake, &name, &job).await {
-                    if let Err(e) = Box::pin(on_node_as(app, drop, None, false)).await {
-                        eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}"); // (the answer stays the statement's own error)
-                    }
-                }
-            }
-            return out;
+        if c.query.is_some() || c.or_replace {
+            return Box::pin(create_on_node(app, c, &job, files)).await;
         }
     }
     // Another engine's table, attached (`ATTACH … (TYPE delta | iceberg)`): its next version,
@@ -2103,25 +2216,15 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
             let lake = Lake::open(dir, false, false).await?;
             crate::ext::scope(true, async move { crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await }).await // (its user's own machine)
         }
-        // CREATE TABLE … AS SELECT: the table, with the query's columns, then its rows.
-        Stmt::Create(c) if c.query.is_some() => {
+        // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, one statement at a time from this shell.
+        Stmt::Create(c) if c.query.is_some() || c.or_replace => {
             let lake = Lake::open(dir, false, false).await?;
-            let (name, query) = (object(&c.name), c.query.as_ref().expect("a query").to_string());
-            let spec = made_by_job(create_spec(&c, &lake, true).await?, job())?; // (this shell's job: the one its INSERT records under)
-            let defined = Box::pin(one_from_cli(dir, Stmt::Define(name.clone(), spec))).await;
-            if defined.is_err() {
-                return raced(c.if_not_exists, &name, defined); // (nothing was made here: no table to drop)
-            }
-            let out = Box::pin(one_from_cli(dir, Stmt::Insert(name.clone(), query))).await;
-            if out.is_err() {
-                // (refused or failed: nothing lands, nor the table; purged: never kept for UNDROP. The answer stays the statement's own error)
-                if let Some(drop) = drop_made(&lake, &name, job()).await {
-                    if let Err(e) = Box::pin(one_from_cli(dir, drop)).await {
-                        eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that failed: {e:#}");
-                    }
-                }
-            }
-            out
+            let dir = dir.to_string();
+            let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
+                let dir = dir.clone();
+                Box::pin(async move { one_from_cli(&dir, s).await })
+            };
+            create_as(run, &lake, &c, job(), true, &mut |_: &str| {}).await
         }
         Stmt::Create(c) => {
             let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
@@ -2138,15 +2241,11 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     }
 }
 
-/// The shell's CREATE TABLE of a table that's there: Some (left, IF NOT EXISTS), None (made
-/// next: OR REPLACE dropped it), or refused.
+/// The shell's CREATE TABLE of a table that's there: Some (left, IF NOT EXISTS); None goes on (OR REPLACE is `create_as`'s,
+/// and a table not there is made next). Refused otherwise.
 async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
     let lake = Lake::open(dir, false, false).await?;
-    match there(&lake, c).await? {
-        Some(true) => Ok(Some(())),
-        Some(false) => Box::pin(one_from_cli(dir, Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: object(&c.name), if_exists: true, purge: false }]))).await.map(|_| None),
-        None => Ok(None),
-    }
+    Ok(there(&lake, c).await?.filter(|left| *left).map(|_| ()))
 }
 
 /// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving

@@ -89,31 +89,9 @@ impl Hot {
         (s.used, self.max, s.busy.len())
     }
 
-    /// Give memory back when the process is using most of the machine's. Queries, the Parquet
-    /// decoding under them and the batches in flight are not all counted anywhere, so the cache
-    /// watches the process itself rather than only its own budget, and drops the columns nobody
-    /// has read lately until the node is under the line again.
-    pub fn watch(self: &Arc<Self>) {
-        let (hot, Some(ram)) = (Arc::downgrade(self), crate::store::ram()) else { return }; // (weak: it ends with its lake)
-        if !self.on() {
-            return;
-        }
-        crate::panics::spawn(async move {
-            let line = ram / 5 * 3; // three fifths of the machine
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                let Some(hot) = hot.upgrade() else { return };
-                if let Some(rss) = crate::store::resident() {
-                    if rss > line {
-                        hot.trim(rss - line);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Drop the least recently read columns until `bytes` are freed.
-    fn trim(&self, bytes: usize) {
+    /// Drop the least recently read columns until `bytes` are freed, and say how many were (the one
+    /// watch, `oom::start`, asks for it when the node's memory passes its trim line).
+    pub(crate) fn trim(&self, bytes: usize) -> usize {
         let mut s = self.state.lock().unwrap();
         let mut oldest: Vec<(Instant, (String, String))> = s.cols.iter().map(|(k, c)| (c.read, k.clone())).collect();
         oldest.sort();
@@ -129,6 +107,7 @@ impl Hot {
                 }
             }
         }
+        freed
     }
 
     /// Let go of the files a table's commit replaced (`TableMeta::garbage`): no query plans them
@@ -211,13 +190,22 @@ impl Hot {
                 s.used += bytes;
                 s.cols.insert((key.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
             }
+            drop(s);
+            crate::oom::wake(); // (the columns are in: the watch may need to give some back)
         });
     }
 
-    /// The most the cache may hold now: its budget, less what queries hold.
+    /// The most the cache may hold now: its budget, less what queries hold; and past the node's trim line
+    /// (`oom::trim_line`), no more than the room the node has under it. So the cache loads only while the
+    /// node is under the line, rather than loading what the watch would trim and decoding it again.
+    /// Called outside the state's lock (it takes the lock itself).
     pub fn room_for(&self, lake: &Lake) -> usize {
         let (reserved, limit) = lake.memory();
-        self.max.min(limit.saturating_sub(reserved))
+        let room = self.max.min(limit.saturating_sub(reserved));
+        match crate::oom::trim_line() {
+            Some(trim) => room.min(self.usage().0 + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
+            None => room,
+        }
     }
 
     /// The columns of `schema` (by name) that the table's files under `folder` are held with here,
@@ -275,6 +263,8 @@ impl Hot {
             s.used += bytes;
             s.cols.insert((path.to_string(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
         }
+        drop(s);
+        crate::oom::wake(); // (the columns are in: the watch may need to give some back)
     }
 }
 

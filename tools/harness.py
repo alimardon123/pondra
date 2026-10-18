@@ -66,6 +66,36 @@ def sql(port, q):
     return call(port, "POST", "/sql", q.encode())
 
 
+def files_settled(lake, folder, quiet=20, cap=150):
+    """Wait until a table's files stop changing, and say how many there are. A fresh bulk load's small files
+    are merged by the leader's first tiering rounds, and a merge forgets the decoded columns of the files it
+    replaces (`hot.forget`): warm reads before that would be lost to it."""
+    last, since, deadline = None, time.time(), time.time() + cap
+    while time.time() < deadline:
+        now = len(lake_objects(lake, folder))
+        if now != last:
+            last, since = now, time.time()
+        elif time.time() - since >= quiet:
+            return now
+        time.sleep(2)
+    raise AssertionError(f"{folder} still changing {cap} s after its node started")
+
+
+def resident_settled(pid, quiet=3, cap=60):
+    """Wait until a node's resident memory stops falling (within 2% for `quiet` seconds). The memory a cache
+    let go, and the decoding's own, goes back to the OS over about ten seconds (the allocator's decay): read
+    before then, the cache would look over-full and the next query would take all of it (`hot_under_line`)."""
+    last, still, deadline = None, 0, time.time() + cap
+    while time.time() < deadline:
+        now = int(open(f"/proc/{pid}/statm").read().split()[1])
+        still = still + 1 if last is not None and abs(now - last) * 50 <= last else 0
+        if still >= quiet:
+            return now
+        last = now
+        time.sleep(1)
+    raise AssertionError(f"node {pid}'s resident memory still falling {cap} s after its columns settled")
+
+
 def hot_settled(port):
     """Wait until the node's hot columns (hot.rs) stop loading: none being decoded and the bytes held
     the same twice running (a file's columns load in the background after its second read)."""
@@ -6899,6 +6929,68 @@ def across():
 
 # ---------------------------------------------------------------- round 26 (ADR-030)
 
+HOT_LINE_ROWS = 8_000_000  # the values array_agg holds in hot_under_line's query (calibrated on pondra-whole: see its docstring)
+HOT_LINE_FILES = 20  # the bulk INSERTs of hot_under_line's table: a file of its own each (about 32 MB decoded each)
+
+
+def hot_under_line():
+    """Under a memory line below three fifths of RAM, the decoded columns are let go before a query is stopped
+    (`oom.rs`, the one watch: past seven tenths of the line it gives the cache back, past the line it stops a query).
+    A node with PONDRA_MEMORY_MAX_GB=1 and a 2 GB cache holds a table's four BIGINT columns (twenty bulk INSERTs of a
+    million rows, a file each, about 32 MB decoded each), then a query that grows the node outside the query pool
+    (array_agg over HOT_LINE_ROWS values in three groups, as `scale`'s memory-line check) must answer with the model's
+    counts, stop nothing (`pondra_queries_stopped_for_memory_total` 0 or absent), and find the columns trimmed: fewer
+    bytes than before the query, all of them when the query needs it (CI's runner held 288 MB, and the query took all
+    of it on its way to a 1,075 MB peak). Read with status-returning calls throughout. On a build before the
+    watch (PONDRA_BIN), the query is stopped (53200) and the check fails there.
+    Calibrated on pondra-whole (round 33's build) with 20 files: 8,000,000 rows, 640 MB held and the query stopped
+    (1,375 MB resident before it, 1,712 peak); with the same node and no cache (PONDRA_HOT_GB=0) it answers at a 629 MB
+    peak. Two waits make the cache read the same way on every run: the table's files stop changing (the leader's first
+    tiering rounds merge the small files, and a merge forgets their decoded columns, `hot.forget`), and resident memory
+    stops falling (the decoding's memory goes back to the OS over about ten seconds)."""
+    import re
+    lake = new_lake()
+    # The table is made by `pondra sql` in its own processes (as `scale` makes its tables), so the node starts with
+    # nothing decoded in memory: a node that made it through its own INSERTs kept the writes' memory, over the line.
+    for statement in ["CREATE TABLE hl (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [
+            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)]:
+        subprocess.run([BIN, "sql", "--dir", lake, statement], check=True, capture_output=True, timeout=900)  # (a bulk INSERT is a file of its own)
+    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    q = lambda s: sql(A.port, s)
+    def answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it (`scale`'s `answer`)
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=600)
+        c.request("POST", "/sql", s.encode())
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode(errors="replace")
+    def resident_of(pid):  # resident memory, in bytes: statm counts pages of the size the OS says
+        return int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+    checks, seen = {}, {}
+    try:
+        seen["files once the leader's first tiering rounds are done"] = files_settled(lake, "data/hl/")
+        for run in range(2):  # (a file's columns load on its second read)
+            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM hl -- warm {run}")
+        hot_settled(A.port)
+        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
+        held_before, rss_before = hot_bytes(), resident_of(node.p.pid)
+        n = HOT_LINE_ROWS
+        status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
+        held_after = hot_bytes()
+        peak = vm_hwm(node.p.pid)
+        stopped = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        want = [{"g": 0, "n": n // 3}, {"g": 1, "n": (n + 2) // 3}, {"g": 2, "n": (n + 1) // 3}]
+        got = sorted(json.loads(body), key=lambda r: r["g"]) if status == 200 else None
+        seen["a memory line of 1 GB: the columns held, the query's answer, resident memory (MB)"] = {
+            "rows": n, "held before": held_before, "resident before": rss_before >> 20, "status": [status, sqlstate],
+            "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped}
+        checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
+            held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
+    finally:
+        node.kill()
+        clean_up()
+    return checks, seen
+
+
 def hot():
     """Hot columns skip the batches a filter rules out by their ranges, and only those (round 32):
     a table whose rows came in time order, held in memory, asked for a range of its time, a top-N of
@@ -7022,6 +7114,10 @@ def hot():
     finally:
         cold.kill()
         clean_up()
+    # Under a memory line, the decoded columns are let go before a query is stopped (`oom.rs`): see hot_under_line.
+    line_checks, line_seen = hot_under_line()
+    checks.update(line_checks)
+    seen.update(line_seen)
     ok = all(checks.values())
     print(json.dumps({"hot": checks, "seen": seen, "ok": ok}, indent=1))
     if not ok:
@@ -13295,6 +13391,94 @@ def objects():
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
+    # CREATE OR REPLACE TABLE puts the new table in the old one's place in one commit, the old one kept for UNDROP
+    # (`ddl::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
+    # leaves t as it was; the same job sent again writes its rows once. Each check has tables of its own, and the
+    # replaces and their follow-ups answer their status rather than raise, so every check gets its answer on a build
+    # that gets one wrong.
+    def read(s):
+        try:
+            return q(s)
+        except RuntimeError as e:
+            return f"ERR {e}"[:200]
+
+    def sent(body, job=None):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql" + (f"?job={job}" if job else ""), body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode(errors="replace"))
+
+    # self-read: t AS SELECT … FROM t
+    q("CREATE TABLE rs (a BIGINT)")
+    q("INSERT INTO rs VALUES (1), (2), (3)")
+    http("CREATE OR REPLACE TABLE rs AS SELECT a * 10 AS a FROM rs")
+    self_read = read("SELECT a FROM rs ORDER BY a")
+    # a failing replace (a cast failing as it runs, after the staged table is made), by HTTP and by pondra sql
+    q("CREATE TABLE rf (a BIGINT)")
+    q("INSERT INTO rf VALUES (10), (20), (30)")
+    q("CREATE TABLE rf_bad (s VARCHAR)")
+    q("INSERT INTO rf_bad VALUES ('x')")
+    failed = http("CREATE OR REPLACE TABLE rf AS SELECT CAST(s AS INT) AS a FROM rf_bad")
+    after_fail = read("SELECT a FROM rf ORDER BY a")
+    cli_failed = subprocess.run([BIN, "sql", "--dir", lake, "CREATE OR REPLACE TABLE rf AS SELECT CAST(s AS INT) AS a FROM rf_bad"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_after = subprocess.run([BIN, "sql", "--dir", lake, "SELECT a FROM rf ORDER BY a"], capture_output=True, text=True, timeout=120, env=node.env)
+    # a replace a materialized view follows is refused before it runs
+    mv_made = http("CREATE MATERIALIZED VIEW rf_mv AS SELECT a FROM rf")[0] == 200
+    followed = http("CREATE OR REPLACE TABLE rf AS SELECT 5 AS a")
+    after_followed = read("SELECT a FROM rf ORDER BY a")
+    http("DROP MATERIALIZED VIEW rf_mv")
+    # a stored view reads the new t by name
+    q("CREATE TABLE rv (a BIGINT)")
+    q("INSERT INTO rv VALUES (10), (20), (30)")
+    view_made = http("CREATE VIEW rv_v AS SELECT a FROM rv")[0] == 200
+    http("CREATE OR REPLACE TABLE rv AS SELECT 5 AS a")
+    through_view = read("SELECT a FROM rv_v")
+    # the table a replace took the place of is kept: UNDROP after a rename brings it back, the new one keeps its name
+    q("CREATE TABLE ru (a BIGINT)")
+    q("INSERT INTO ru VALUES (10), (20), (30)")
+    http("CREATE OR REPLACE TABLE ru AS SELECT 5 AS a")
+    renamed_ok = http("ALTER TABLE ru RENAME TO ru_now")[0] == 200
+    undrop = http("UNDROP TABLE ru")
+    undone = read("SELECT a FROM ru ORDER BY a")
+    renamed = read("SELECT a FROM ru_now")
+    # a PRIMARY KEY and a UNIQUE table of 2,000 rows replaced by a statement that carries 2,000 rows
+    q("CREATE TABLE rp (id BIGINT PRIMARY KEY, v BIGINT)")
+    q("INSERT INTO rp SELECT value, value * 2 FROM range(0, 2000)")
+    http("CREATE OR REPLACE TABLE rp (id BIGINT PRIMARY KEY, v BIGINT) AS SELECT value AS id, value * 3 AS v FROM range(0, 2000)")
+    pk = read("SELECT count(*) AS n, sum(v) AS s FROM rp")
+    pk_dup = http("INSERT INTO rp VALUES (5, 0)")  # (the key still holds in the replaced table)
+    q("CREATE TABLE rq (k BIGINT UNIQUE, v BIGINT)")
+    q("INSERT INTO rq SELECT value, value FROM range(0, 2000)")
+    http("CREATE OR REPLACE TABLE rq (k BIGINT UNIQUE, v BIGINT) AS SELECT value AS k, value * 3 AS v FROM range(0, 2000)")
+    uq = read("SELECT count(*) AS n, sum(v) AS s FROM rq")
+    uq_dup = http("INSERT INTO rq VALUES (5, 0)")
+    # an identity column: the replaced table counts from 1 again
+    q("CREATE TABLE ri (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
+    q("INSERT INTO ri (v) VALUES ('a'), ('b')")
+    http("CREATE OR REPLACE TABLE ri (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
+    http("INSERT INTO ri (v) VALUES ('c')")
+    ids = read("SELECT id, v FROM ri ORDER BY id")
+    # the same job sent again: its rows once
+    first = sent("CREATE OR REPLACE TABLE rj AS SELECT value AS a FROM range(0, 3)", "rep-job-1")
+    again = sent("CREATE OR REPLACE TABLE rj AS SELECT value AS a FROM range(0, 3)", "rep-job-1")
+    job_rows = read("SELECT count(*) AS n FROM rj")
+    info["replace"] = {"self": self_read, "failed": [failed[0], str(failed[2])[:200]], "cli": [cli_failed.returncode, (cli_failed.stdout + cli_failed.stderr)[-200:]],
+                       "followed": [followed[0], str(followed[2])[:200]], "undrop": undrop[:2], "undone": undone, "renamed": renamed, "pk": [pk, pk_dup[:2]], "uq": [uq, uq_dup[:2]],
+                       "ids": ids, "job": [first[0], again[0], job_rows]}
+    checks["CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t"] = self_read == [{"a": 10}, {"a": 20}, {"a": 30}]
+    checks["a CREATE OR REPLACE TABLE that fails leaves the old table as it was: a cast failing as it runs, and a replace a materialized view follows (refused by name)"] = \
+        failed[0] != 200 and after_fail == [{"a": 10}, {"a": 20}, {"a": 30}] and mv_made and followed[0] != 200 and "follow" in str(followed[2]) and after_followed == [{"a": 10}, {"a": 20}, {"a": 30}]
+    checks["pondra sql: a CREATE OR REPLACE TABLE that fails leaves the old table"] = \
+        cli_failed.returncode != 0 and cli_after.returncode == 0 and "| 10 |" in cli_after.stdout and "| 30 |" in cli_after.stdout
+    checks["a PRIMARY KEY table of 2,000 rows and a UNIQUE one replaced: both read back, and their keys still hold in the new ones"] = \
+        pk == [{"n": 2000, "s": 5997000}] and pk_dup[1] == "23505" and uq == [{"n": 2000, "s": 5997000}] and uq_dup[1] == "23505"
+    checks["a replaced table with an identity column takes values again from 1"] = ids == [{"id": 1, "v": "c"}]
+    checks["a view over t reads the new t after a replace"] = view_made and through_view == [{"a": 5}]
+    checks["the table a replace took the place of is kept: UNDROP brings it back once t is renamed, and the new t is under the renamed name"] = \
+        renamed_ok and undrop[0] == 200 and undone == [{"a": 10}, {"a": 20}, {"a": 30}] and renamed == [{"a": 5}]
+    checks["a CREATE OR REPLACE TABLE sent again with its job answers duplicate, its rows once"] = \
+        first[0] == 200 and again[0] == 200 and isinstance(again[2], dict) and again[2].get("duplicate") is True and job_rows == [{"n": 3}]
     # An INSERT into a name no table has is refused (42P01, as Postgres and DuckDB refuse it), over
     # HTTP and pondra sql, and nothing is made; the bulk door (POST /insert/{t}) still makes one.
     nope = http("INSERT INTO nope VALUES (1, 'a')")
@@ -13640,6 +13824,26 @@ def objects():
     checks["a notebook's %%sql df << cell is a frame in its Python; a SQL cell reads a Python table by name"] = ran == [{"eu": 3}] \
         and joined == [{"region": "eu", "n": 3, "target": 3}, {"region": "us", "n": 2, "target": 1}]
     info.update({"ran": ran, "joined": joined})
+    # A user's CREATE of a `$` name is refused by name: those tables are Pondra's (a replace's staged table among them,
+    # and invariant 373's rule: no caller writes a `$` table). A superuser and a plain user, on a node of its own.
+    import base64
+    own = Node(new_lake(), A.port + 15, env={"PONDRA_SECRET_KEY": "objects-key-2"}).start()
+    boss_h = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+    ann_h = {"Authorization": "Basic " + base64.b64encode(b"ann:ann-password-1").decode()}
+    call(A.port + 15, "POST", "/sql", b"CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    call(A.port + 15, "POST", "/sql", b"CREATE USER ann PASSWORD 'ann-password-1'", headers=boss_h)
+    def refused_as(headers, s):
+        try:
+            call(A.port + 15, "POST", "/sql", s.encode(), headers=headers)
+            return ""
+        except RuntimeError as e:
+            return str(e)
+    dollar_boss = refused_as(boss_h, 'CREATE TABLE "a$b" (x INT)')
+    dollar_ann = refused_as(ann_h, 'CREATE TABLE "a$b" (x INT)')
+    info["dollar"] = [dollar_boss[:200], dollar_ann[:200]]
+    checks["a user's CREATE TABLE \"a$b\" (x INT) is refused by name (a superuser's by name, a plain user's by its role)"] = \
+        "a$b" in dollar_boss and "Pondra alone" in dollar_boss and dollar_ann != ""
+    own.kill()
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"objects": checks, "ok": ok, "info": info}, indent=1, default=str))
@@ -19028,6 +19232,9 @@ def lateral():
         ("a column of t named like the function's", "SELECT t.x, u.x AS y FROM tx t, unnest(t.xs) AS u(x)", None, False),
         ("generate_series with a step", "SELECT r.id, g FROM r, generate_series(r.a, r.b, 2) AS g", None, False),
         ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
+        # (an array literal of the row's own columns: its elements are planned with the FROM's columns, `friendly::arrays`)
+        ("unnest of ARRAY[the row's columns]", "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b]) AS u(v)", None, False),
+        ("unnest of [the row's columns]", "SELECT r.id, u.v FROM r, unnest([r.a, r.b * 10]) AS u(v)", "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b * 10]) AS u(v)", False),
         ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
          "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
         ("WITH ORDINALITY over a column: the positions restart for each row", "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)", None, False),
@@ -21262,7 +21469,9 @@ def friendly():
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
     columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
-    list, a CASE and an aggregate, NULLs and all."""
+    list, a CASE and an aggregate, NULLs and all; array literals reading the outer query's columns
+    and the CTEs around them (`ANY([z.n])`, a CTE in an element), which DataFusion planned without
+    them (`friendly.rs`: an array literal is make_array)."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -21281,7 +21490,9 @@ def friendly():
              "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6)),
              # (doubles past 10^15 beside decimals: DataFusion made both a DECIMAL(30, 15), and failed)
              "CREATE TABLE big (x DOUBLE, r REAL, d DECIMAL(38, 2))",
-             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)"]
+             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)",
+             "CREATE TABLE z (n INT)",
+             "INSERT INTO z VALUES (1), (2), (5)"]
     for s_ in setup:
         sql(A.port, s_)
         duck.execute(s_)
@@ -21320,6 +21531,7 @@ def friendly():
         "COLUMNS('regex')": ("SELECT COLUMNS('^(id|x)$') FROM t", True, False),
         "min(COLUMNS(*))": ("SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)", True, False),
         "COLUMNS([…]) in a WHERE": ("SELECT id FROM t WHERE COLUMNS(['id', 'x']) > 1000", False, False),
+        "COLUMNS([…]) in a SELECT list, its columns named as they are": ("SELECT COLUMNS(['id', 'x']) FROM t WHERE id < 3 ORDER BY id", True, True),
         "* EXCLUDE … RENAME …": ("SELECT * EXCLUDE (l, j) RENAME (g AS grp) FROM t", True, False),
         "ORDER BY ALL": ("SELECT g, k, id FROM t ORDER BY ALL", True, True),
         "ORDER BY ALL DESC over *": ("SELECT * FROM (SELECT g, id FROM t) ORDER BY ALL DESC", True, True),
@@ -21349,6 +21561,14 @@ def friendly():
         "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
         "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
         "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
+        # (an array literal reads the outer query's columns and the CTEs around it: the planner plans its
+        # elements with neither, so `[z.n]` in an EXISTS failed with "No field named z.n". Not checked here:
+        # a correlated scalar subquery whose SELECT list reads an outer column, and a lateral unnest of an
+        # outer column; DataFusion 55 can't plan either, with or without an array literal)
+        "ANY([z.n]) in an EXISTS": ("SELECT n FROM z WHERE EXISTS (SELECT 1 WHERE 5 = ANY([z.n])) ORDER BY n", True, True),
+        "a CTE inside an array element": ("WITH c AS (SELECT 7 AS x) SELECT [(SELECT x FROM c)] AS a", True, False),
+        "nested array literals": ("SELECT [[z.n], [0]] AS a FROM z WHERE n = 2", True, False),
+        "a subscript is still a subscript": ("SELECT [10, 20, 30][2] AS a", True, False),
         # (IN and EXISTS outside a WHERE couldn't be planned: `optimize::SubqueriesMarked`)
         "x IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
         "x NOT IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x NOT IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
@@ -21386,7 +21606,8 @@ def friendly():
     spread = ["PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", "SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)",
               "SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT g, max_by(id, x), arg_min(id, x) FROM t GROUP BY g",
               "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val",
-              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t"]
+              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t",
+              "SELECT id, [k, id % 3] AS a FROM t WHERE id < 500"]
     apart = {q: (sorted(ours(q, spread=1)[1], key=repr), sorted(ours(q, spread=0)[1], key=repr)) for q in spread}
     checks["spread over three nodes == one node"] = all(a == b for a, b in apart.values())
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:  # (described, then run)
@@ -21394,6 +21615,14 @@ def friendly():
             "SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t WHERE id >= %s", "SELECT g, max_by(id, x) FROM t WHERE k >= %s GROUP BY g")]
     want = [sorted(theirs(q)[1]) for q in ("SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t", "SELECT g, max_by(id, x) FROM t GROUP BY g")]
     checks["over Postgres (a lambda, max_by) == DuckDB's"] = door == want
+    array_qs = ("SELECT n FROM z WHERE EXISTS (SELECT 1 WHERE 5 = ANY([z.n])) ORDER BY n", "WITH c AS (SELECT 7 AS x) SELECT [(SELECT x FROM c)] AS a")
+    try:  # (a query that fails is a failed check, as in the loop above)
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+            arrays = [sorted(norm(tuple(r)) for r in pg.execute(q).fetchall()) for q in array_qs]
+        arrays_ok = arrays == [sorted(theirs(q)[1]) for q in array_qs]
+    except Exception:
+        arrays_ok = False
+    checks["over Postgres: array literals read the outer query's columns (ANY) and the CTEs around them == DuckDB's"] = arrays_ok
     sql(A.port, "CREATE VIEW best AS SELECT g, max_by(id, x) AS best, [y + 1 FOR y IN list(k)] AS ks FROM t GROUP BY g")
     call(A.port, "POST", "/views/plus", b"SELECT id, list_transform(l, y -> y + 1) AS a FROM t")
     sql(A.port, "INSERT INTO t VALUES (5000, 1, 'a', 9999.5, NULL, [7, 8], TIMESTAMP '2026-02-01 00:00:00', '{}')")

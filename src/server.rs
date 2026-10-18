@@ -181,7 +181,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
-        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone())) // (a lake's store, for nodes on other machines: ADR-072 §8)
+        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), app.cluster.serves_store)) // (a lake's store, for nodes on other machines: ADR-072 §8)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
@@ -1087,6 +1087,9 @@ impl App {
 /// Body: a table's definition (see `write::TableSpec`): `[["user","Utf8"],…]`, or
 /// `{"columns": [...], "key": ["user"], "merge": {...}, "publish": [...], "cluster_by": [...]}`.
 async fn create_table(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap, body: String) -> Result<Json<Value>, E> {
+    if crate::sys::hidden(&name) {
+        return Err(E(anyhow::anyhow!("{name} is written by Pondra alone"))); // (a replace's staged table is the leader's own: `write::create_as`)
+    }
     if !cluster_call(&app, &headers) {
         crate::protect::check_table(&app.lake, &name).await?; // (it may add columns to a project's table)
     }

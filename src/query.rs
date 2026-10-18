@@ -1068,7 +1068,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let upto = upto.or_else(|| Some(lake.visible())); // (one end for every table it reads, fixed once their entries are read: a table read twice, or two a transaction wrote, read one commit)
     for (key, raw) in entries {
         let name = &key[2..];
-        if name != except && !crate::sys::hidden(name) && (listing || mentions(&text, name)) {
+        // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
+        let staged = crate::sys::staged_for(name).is_some() && text.contains(&format!("\"{name}\""));
+        if name != except && (staged || !crate::sys::hidden(name) && (listing || mentions(&text, name))) {
             let meta: TableMeta = serde_json::from_slice(&raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
             let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(meta.clone()) }, upto).await?;

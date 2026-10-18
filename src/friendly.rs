@@ -41,9 +41,10 @@ pub fn wanted(sql: &str) -> bool {
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a
     // bytea's hex form, `(a, b) IN (SELECT …)`, a DELETE or UPDATE with an alias, a character type's
-    // Postgres name, DEFAULT VALUES, LIKE … ESCAPE)
+    // Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal `[…]` or `ARRAY[…]` (a `[` straight
+    // after a word, `)`, `]` or `"` is a subscript, `arr[1]`))
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|'\\x|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'"#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|'\\x|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
     });
     WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || alias_in_where(sql)
 }
@@ -688,6 +689,7 @@ impl VisitorMut for Friendly {
         if self.collecting() {
             return ControlFlow::Continue(());
         }
+        arrays(s); // (after the select's COLUMNS are expanded: `COLUMNS([…])` reads its list as written)
         match s {
             Statement::CreateTable(c) => {
                 for col in c.columns.iter_mut() {
@@ -1149,6 +1151,37 @@ fn expression(e: &mut Expr) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Every array literal in `s` as the call it stands for: `[…]` and `ARRAY[…]` are `make_array(…)`. Run
+/// once the statement's COLUMNS lists are expanded (`expand_columns` reads a list as it is written, and
+/// a select's names keep its text). DataFusion plans a literal's elements with no outer columns, CTEs or
+/// parameter types (`sql_array_literal`); a call with them is planned with the query's own, as any call is.
+fn arrays(s: &mut Statement) {
+    let _ = visit_expressions_mut(s, |e| {
+        if let Expr::Array(Array { elem, .. }) = e {
+            *e = make_array(std::mem::take(elem)); // (post-order: a nested literal is already a call)
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// `make_array(elem, …)`: the call an array literal stands for (`make_array()` when it is empty).
+fn make_array(elem: Vec<Expr>) -> Expr {
+    Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new("make_array")]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: elem.into_iter().map(|e| FunctionArg::Unnamed(FunctionArgExpr::Expr(e))).collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    })
 }
 
 /// A JSON path (`$.a.b[0]`, `$."a b"`, or a pointer `/a/0`) as json_get's keys.
@@ -1745,6 +1778,21 @@ mod tests {
         assert_eq!(json_path("/a/1").unwrap(), ["'a'", "1"]);
         assert_eq!(json_path("$").unwrap(), Vec::<String>::new());
         assert!(json_path("$.a[*]").is_err());
+    }
+
+    #[test]
+    fn array_literals_are_make_array() {
+        // (where SQL comes in, an array literal is the `make_array` call it stands for, nested ones too;
+        // a subscript is still a subscript)
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, "SELECT [1, [z.n]], ARRAY[z.n], [], arr[1], [10, 20, 30][2] FROM z").unwrap();
+        arrays(&mut stmts[0]);
+        assert_eq!(stmts[0].to_string(), "SELECT make_array(1, make_array(z.n)), make_array(z.n), make_array(), arr[1], make_array(10, 20, 30)[2] FROM z");
+        // (a COLUMNS list is read as written, before the statement's arrays are rewritten)
+        let stmts = Parser::parse_sql(&GenericDialect {}, "SELECT COLUMNS(['a', b]) FROM t").unwrap();
+        let Statement::Query(q) = &stmts[0] else { panic!("a query") };
+        let SetExpr::Select(s) = &*q.body else { panic!("a select") };
+        let SelectItem::UnnamedExpr(e) = &s.projection[0] else { panic!("an item") };
+        assert!(matches!(columns_call(e), Some(Pattern::Names(n)) if n == ["a", "b"]));
     }
 
     #[test]

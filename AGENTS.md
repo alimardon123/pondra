@@ -554,9 +554,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
    caught when the id wasn't there.
 31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
-   a step that has to be run again reads the same rows. Everything a job spilled goes when the job
-   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its spill folder (invariant 419). A gather's
-   spill is freed by the guard its response stream holds instead, since nothing retries it.
+   a step that has to be run again reads the same rows. A step run again runs fresh operators
+   (`Shuffle::again`: `reset_plan_states` in `received`), under piece names of its own (`r`):
+   DataFusion's scans hand out their files from a queue their first run empties, so a second try on
+   the same plan read no rows and answered as if that node's share were empty (since before 0.34). A
+   bucket a node doesn't hold is an error (`kept`), never an empty one. Everything a job spilled
+   goes when the job ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its
+   spill folder (invariant 419). A gather's spill is freed by the guard its response stream holds
+   instead, since nothing retries it. `shuffle_spill.py`: "a step that fails once on a follower
+   answers on its second try with the same rows as one node" (a quarter of the keys missing
+   without it), and `PONDRA_DEBUG_FAIL_STEP` with `spread_tpch.py` (22 of 22).
 32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
    once, each into buckets of its own, and joins them in partition order at the end; the hash is
    DataFusion's `BatchPartitioner` over the exchange's own expressions. Anything that made the
@@ -1355,7 +1362,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `datafusion.runtime.*` is refused. A script sent without a session gets one of its own
    (`temp::of_script`, `#` in its id: no client can name it), ended with the script.
 189. **SQL's CREATE TABLE refuses a table that is there** (`write::there`, 42P07), unless `IF NOT
-   EXISTS` (left as it is: no rows added) or `OR REPLACE` (dropped first). Only `POST
+   EXISTS` (left as it is: no rows added) or `OR REPLACE` (invariant 425). Only `POST
    /tables/{name}` may be sent again (it may add columns at the end). A statement's definition carries its job
    (`TableMeta::made_by`), so two statements making one name at once, on two nodes, never share a table: the leader
    refuses the second 42P07 (`IF NOT EXISTS` takes it for the table that is there: `write::raced`), and only that
@@ -2197,9 +2204,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    text). `harness.py found`: "a cast of a decimal to an integer rounds…"; `pkey`: "a MERGE that
    compares a key in another type…" (a MERGE wrote 7002.5 as 7002, an INSERT as 7003); `sparksql`: the
    casts that cut; `frames_check.py`: a frame's casts == Polars.
-294. **A loop a lake starts holds it weakly** (`Lake::commits`, `Hot::watch`): the catalog's writes and
-   their durability upgrade a `Weak<Lake>` for each write, the hot columns' watch a `Weak<Hot>` each
-   round, and each ends when what it holds is gone. The writes' sender is the lake's own
+294. **A loop a lake starts holds it weakly** (`Lake::commits`, `oom::gives_back`): the catalog's writes and
+   their durability upgrade a `Weak<Lake>` for each write, the memory watch each lake's `Weak<Hot>` at each
+   look, and each ends when what it holds is gone. The writes' sender is the lake's own
    (`Catalog::writes`), so a loop holding the lake strongly kept a lake a process opened to write (a
    backup taken in it: `backup::take_here`) for the process's life, its catalog never closed.
    `cargo test --lib store::tests::a_lake_opened_to_write_goes`.
@@ -2798,7 +2805,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
-   below half the line and stopping only after a second, CI's runner reached 1.75 GB).
+   below half the line and stopping only after a second, CI's runner reached 1.75 GB). The same one watch gives the
+   hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
+   there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
+   decoded again and a query can't. A request takes the watch's last reading as it starts (`oom::seen`), never reads
+   the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the hot columns are let go
+   before a query is stopped".
 418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
    cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
    counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
@@ -2883,6 +2895,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the plan it replaces, which couldn't answer. A query that fits plans as before (TPC-H SF1: the same answers, B/A
    wall 0.98). `harness.py scale`: "a median of 12M values in 3 groups past the memory limit answers…" (3.9 s on a
    0.05 GB node; refused before, 53200); `frugal::tests::medians_…`.
+425. **`CREATE OR REPLACE TABLE` keeps the old table until the new one takes its place, in one commit** (`write::replacing`,
+   `ddl::replace`). The new table is made and filled under a staged name of its job (`sys::staged`: `t$new-…`, hidden,
+   never published), so its query may read the old `t`, and a statement that fails or stops leaves `t` as it was; the
+   leader then sets the old table's entries aside as a drop sets them (UNDROP brings it back) and moves the staged ones
+   under `t`, every entry at the largest `tiered` mark (as a swap, invariant 281), with `t`'s appends held meanwhile
+   (283). A table a materialized view or a task follows is refused before any query runs; a stored view reads the new
+   `t`. A retry of a replace that went through answers duplicate; a staged table a node left behind goes after
+   `PONDRA_STAGED_SECS`, in `tier::expire`'s own scan. A node or `pondra sql` take the same steps (`write::create_as`).
+   Before, the old table was dropped first: a failed statement lost it, and `… AS SELECT … FROM t` read nothing.
+   `harness.py objects`: "CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t", "a CREATE OR REPLACE TABLE
+   that fails leaves the old table as it was…", "…sent again with its job answers duplicate…"; `history_check.py`: "a
+   follower reading t while the leader replaces it 20 times…: never 'no table t'".
 ## Tests: run these before and after any change
 
 ```bash
