@@ -21,7 +21,7 @@ const USAGE: &str = "run('etl/orders.sql', day => DATE '2026-09-29'): the file, 
 
 /// The file's path and its parameters' values (one row), worked out once, as the caller.
 pub async fn arguments(app: &App, args: &[FunctionArg]) -> Result<(String, RecordBatch)> {
-    let a = crate::routines::args("run", args)?;
+    let a = crate::text::args("run", args)?;
     let [file] = &a.given[..] else { bail!(USAGE) };
     let mut select = vec![format!("CAST(({file}) AS VARCHAR) AS \"file to run\"")];
     select.extend(a.named.iter().map(|(n, e)| format!("({e}) AS \"{}\"", n.replace('"', "\"\""))));
@@ -189,7 +189,7 @@ async fn python_tables(session: &str, sql: &str) -> bool {
     let Ok(v) = crate::python::variables(session).await else { return false };
     v["variables"].as_array().into_iter().flatten().any(|v| {
         let (name, kind) = (v["name"].as_str().unwrap_or_default(), v["type"].as_str().unwrap_or_default());
-        ["pandas.", "polars.", "pyarrow.", "pondra.frame."].iter().any(|p| kind.starts_with(p)) && crate::ddl::mentions(sql, name)
+        ["pandas.", "polars.", "pyarrow.", "pondra.frame."].iter().any(|p| kind.starts_with(p)) && crate::text::mentions(sql, name)
     })
 }
 
@@ -201,7 +201,7 @@ async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, s
     let lease = crate::auth::lend(who.role, who.files);
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
     let head = j!({"op": "cell", "session": session, "name": name, "body": code, "url": url, "token": lease.0, "depth": who.depth, "job": job, "vars": vars.is_some()});
-    let parts = vec![crate::query::ipc(&[vars.cloned().unwrap_or_else(|| RecordBatch::new_empty(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty())))])?];
+    let parts = vec![crate::answer::ipc(&[vars.cloned().unwrap_or_else(|| RecordBatch::new_empty(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty())))])?];
     let mut notice = |n: String| {
         let n = lease.redact(&n);
         crate::routines::heard(&n);

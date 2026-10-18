@@ -304,7 +304,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             let (t, mut meta) = shareable(lake, &table).await?;
             let (schema, as_table) = match &as_name {
                 Some(a) => a.split_once('.').map(|(s, t)| (s.to_string(), t.to_string())).filter(|(_, t)| !t.contains('.')).with_context(|| format!("AS {a}: the name a recipient sees is schema.table"))?,
-                None => { let (s, n) = crate::ddl::split(&t); (s.to_string(), n.to_string()) }
+                None => { let (s, n) = crate::text::split(&t); (s.to_string(), n.to_string()) }
             };
             crate::ddl::check(&schema)?;
             crate::ddl::check(&as_table)?;

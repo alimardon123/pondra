@@ -305,7 +305,7 @@ fn to_point(words: &[String]) -> bool {
 /// (`SET TRANSACTION` is `settings.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
     // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
-    let words: Vec<String> = crate::write::first_word(sql).trim_end_matches(';').split_whitespace().take(3).map(|w| w.to_uppercase()).collect();
+    let words: Vec<String> = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().take(3).map(|w| w.to_uppercase()).collect();
     let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
     match words.first().map(String::as_str) {
         Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
@@ -676,7 +676,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
 
 /// The words Postgres names a write by in 25006: None for a statement that reads. (Its text, before the parse.)
 fn write_word(sql: &str) -> Option<String> {
-    let words: Vec<String> = crate::write::first_word(sql).trim_end_matches(';').split_whitespace().take(2).map(|w| w.to_uppercase()).collect();
+    let words: Vec<String> = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().take(2).map(|w| w.to_uppercase()).collect();
     let first = words.first()?.as_str();
     match first {
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" => Some(first.to_string()),
@@ -704,7 +704,7 @@ fn with_write(sql: &str) -> Option<String> {
 
 /// Statements that set or show something rather than run a query: they don't make a transaction one that has run.
 fn is_setting(sql: &str) -> bool {
-    let word = crate::write::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_uppercase();
+    let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_uppercase();
     matches!(word.as_str(), "SET" | "RESET" | "SHOW" | "DISCARD" | "DEALLOCATE" | "PREPARE" | "CLOSE")
 }
 
@@ -828,7 +828,7 @@ fn pending(c: &Changes) -> bool { !c.new.is_empty() || !c.old.is_empty() }
 /// The tables a DDL statement names: the ones it changes the shape of, drops or renames.
 fn ddl_tables(stmt: &Stmt) -> Vec<String> {
     match stmt {
-        Stmt::Create(c) => vec![crate::write::object(&c.name)],
+        Stmt::Create(c) => vec![crate::text::object(&c.name)],
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => vec![t.clone()],
         Stmt::Ddl(ds) => ds.iter().flat_map(ddl_names).collect(),
         _ => vec![],
@@ -932,7 +932,7 @@ async fn change(l: &Locks<'_>, stored: &TableMeta, stmt: &Stmt, snapshot: u64) -
 /// The answer of a write: the rows it replaced and added, as SQL's counts say them.
 fn tally(old: &[RecordBatch], new: &[RecordBatch]) -> Value {
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
-    let inserted: usize = new.iter().map(|b| b.column_by_name(crate::sys::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
+    let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
     let (replaced, added) = (count(old), count(new));
     j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted})
 }
@@ -1140,8 +1140,8 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
     let mut by = (!key.is_empty()).then(|| t.by_key.entry(table.to_string()).or_insert_with(|| ByKey { key: key.to_vec(), ..Default::default() }));
     let mut mine = HashSet::new(); // (rows of its own it replaces: no `_version`)
     for b in old.iter().filter(|b| b.num_rows() > 0) {
-        let ids = b.column_by_name(crate::sys::ROW_ID).context("old rows' ids")?.as_primitive::<Int64Type>();
-        let versions = b.column_by_name(crate::sys::VERSION).context("old rows' versions")?;
+        let ids = b.column_by_name(crate::text::ROW_ID).context("old rows' ids")?.as_primitive::<Int64Type>();
+        let versions = b.column_by_name(crate::text::VERSION).context("old rows' versions")?;
         let theirs = BooleanArray::from((0..b.num_rows()).map(|i| Some(versions.is_valid(i))).collect::<Vec<_>>());
         mine.extend((0..b.num_rows()).filter(|&i| !versions.is_valid(i)).map(|i| ids.value(i)));
         let taken = datafusion::arrow::compute::filter_record_batch(b, &theirs)?;
@@ -1153,13 +1153,13 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
     }
     if !mine.is_empty() {
         for b in c.new.iter_mut() {
-            let ids = b.column_by_name(crate::sys::ROW_ID).context("new rows' ids")?.as_primitive::<Int64Type>().clone();
+            let ids = b.column_by_name(crate::text::ROW_ID).context("new rows' ids")?.as_primitive::<Int64Type>().clone();
             let keep = BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| mine.contains(&i)))).collect::<Vec<_>>());
             *b = datafusion::arrow::compute::filter_record_batch(b, &keep)?;
         }
     }
     for b in new.into_iter().filter(|b| b.num_rows() > 0) {
-        let given = b.column_by_name(crate::sys::ROW_ID).map(|c| datafusion::arrow::compute::cast(c, &DataType::Int64)).transpose()?;
+        let given = b.column_by_name(crate::text::ROW_ID).map(|c| datafusion::arrow::compute::cast(c, &DataType::Int64)).transpose()?;
         let mut ids = Vec::with_capacity(b.num_rows());
         for i in 0..b.num_rows() {
             ids.push(match &given {
@@ -1170,7 +1170,7 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
                 }
             });
         }
-        let kept = set(&b, crate::sys::ROW_ID, Arc::new(Int64Array::from(ids)))?;
+        let kept = set(&b, crate::text::ROW_ID, Arc::new(Int64Array::from(ids)))?;
         if let Some(by) = by.as_mut() {
             by.added(&kept)?;
         }
@@ -1227,8 +1227,8 @@ fn fresh(new: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
     new.into_iter()
         .filter(|b| b.num_rows() > 0)
         .map(|b| {
-            let ids = b.column_by_name(crate::sys::ROW_ID).context("ids")?.as_primitive::<Int64Type>().clone();
-            set(&b, crate::sys::ROW_ID, Arc::new(ids.iter().map(|i| i.filter(|i| *i >= 0)).collect::<Int64Array>()))
+            let ids = b.column_by_name(crate::text::ROW_ID).context("ids")?.as_primitive::<Int64Type>().clone();
+            set(&b, crate::text::ROW_ID, Arc::new(ids.iter().map(|i| i.filter(|i| *i >= 0)).collect::<Int64Array>()))
         })
         .collect()
 }
@@ -1242,9 +1242,9 @@ pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[S
     let Some((c, keys)) = with_txn(|t| t.tables.get(table).map(|c| (c.clone(), kept(t)))).flatten() else { return Ok(base) };
     let schema = base.schema();
     let mut df = ctx.read_table(base)?;
-    let ids: Vec<Expr> = c.old.iter().chain(&c.new).filter_map(|b| b.column_by_name(crate::sys::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().filter(|i| *i >= 0).collect::<Vec<_>>()).map(lit).collect();
+    let ids: Vec<Expr> = c.old.iter().chain(&c.new).filter_map(|b| b.column_by_name(crate::text::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().filter(|i| *i >= 0).collect::<Vec<_>>()).map(lit).collect();
     if !ids.is_empty() {
-        df = df.filter(not(col(crate::sys::ROW_ID).in_list(ids, false)))?;
+        df = df.filter(not(col(crate::text::ROW_ID).in_list(ids, false)))?;
     }
     if !key.is_empty() {
         // (a keyed table's row is its key's: an INSERT of a key there replaces it. One IN list over the key as text, not an
@@ -1264,7 +1264,7 @@ pub fn overlaid(ctx: &datafusion::prelude::SessionContext, table: &str, key: &[S
         df = df.union(ctx.read_table(Arc::new(datafusion::datasource::MemTable::try_new(schema.clone(), vec![rows])?))?)?;
     }
     if !sys {
-        let shown: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).filter(|n| !crate::sys::NAMES.contains(&n.as_str())).collect();
+        let shown: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).filter(|n| !crate::text::NAMES.contains(&n.as_str())).collect();
         df = df.select_columns(&shown.iter().map(String::as_str).collect::<Vec<_>>())?;
     }
     Ok(df.into_view())
@@ -1347,7 +1347,7 @@ async fn lock_select(app: &crate::server::App, (level, ro, snapshot): (Level, bo
             return Err(crate::codes::coded("0A000", format!("FOR UPDATE OF {of} names a table this SELECT doesn't read")));
         }
     }
-    let (other, name) = crate::ddl::resolve(lake, &crate::write::object(&table)).await?;
+    let (other, name) = crate::ddl::resolve(lake, &crate::text::object(&table)).await?;
     if other.is_some() {
         return Err(crate::codes::coded("0A000", "FOR UPDATE on an attached lake's table isn't taken here: lock its rows on the lake that holds it"));
     }
@@ -1364,9 +1364,9 @@ async fn lock_select(app: &crate::server::App, (level, ro, snapshot): (Level, bo
     ensure!(meta.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
     crate::auth::may_lock(&name)?; // (the right to UPDATE it: Postgres asks that of FOR UPDATE)
     let append = meta.key.is_empty();
-    let cols = if append { vec![crate::sys::ROW_ID.to_string()] } else { meta.key.clone() };
+    let cols = if append { vec![crate::text::ROW_ID.to_string()] } else { meta.key.clone() };
     let (n, table_name) = (cols.len(), name.as_str());
-    let text = crate::routines::sql(&Statement::Query(Box::new(with_keys(q, &cols))));
+    let text = crate::text::sql(&Statement::Query(Box::new(with_keys(q, &cols))));
     let id = with_txn(|t| t.id.clone()).context(NO_SESSION)?;
     let nowait = matches!(lock.nonblock, Some(NonBlock::Nowait));
     let wait = if nowait { Some(Duration::ZERO) } else { lock_wait() };
@@ -1407,7 +1407,7 @@ fn with_keys(q: &Query, cols: &[String]) -> Query {
 /// empty answer keeps them: `split_keys`).
 async fn run_at(lake: &Lake, text: &str, at: u64) -> Result<(Schema, Vec<RecordBatch>)> {
     let ctx = crate::query::session_at(lake, text, "", Some(at)).await?;
-    let df = crate::query::sql(&ctx, &crate::asof::as_of(text)?).await?;
+    let df = crate::engine::sql(&ctx, &crate::asof::as_of(text)?).await?;
     let rows = crate::engine::collect(df).await?; // (never empty: an answer with no rows keeps its columns as they run)
     Ok((rows[0].schema().as_ref().clone(), rows))
 }
@@ -1504,7 +1504,7 @@ fn ipc(b: &[RecordBatch]) -> Result<String> {
         return Ok(String::new());
     }
     let bytes: usize = b.iter().map(|b| b.get_array_memory_size()).sum();
-    let encoded = if bytes < 1 << 20 { crate::query::ipc(&b)? } else { crate::log::encode_ipc(&b)? };
+    let encoded = if bytes < 1 << 20 { crate::answer::ipc(&b)? } else { crate::log::encode_ipc(&b)? };
     Ok(base64::engine::general_purpose::STANDARD.encode(encoded))
 }
 
@@ -1648,7 +1648,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
 fn write_keys(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Keys> {
     let mut keys: Keys = vec![];
     if meta.key.is_empty() {
-        for ids in old.iter().filter_map(|b| b.column_by_name(crate::sys::ROW_ID)) {
+        for ids in old.iter().filter_map(|b| b.column_by_name(crate::text::ROW_ID)) {
             keys.extend(ids.as_primitive::<Int64Type>().iter().flatten().filter(|i| *i >= 0).map(|i| vec![i.to_string()]));
         }
     } else {
@@ -1730,7 +1730,7 @@ pub(crate) async fn conflicts(lake: &Lake, table: &str, meta: &TableMeta, reads:
 /// (`_version`, as `at_commit` gives it).
 fn commits(b: &RecordBatch, version: bool) -> Result<Vec<u64>> {
     Ok(if version {
-        b.column_by_name(crate::sys::VERSION).context("versions")?.as_primitive::<Int64Type>().iter().map(|v| v.unwrap_or(0) as u64).collect()
+        b.column_by_name(crate::text::VERSION).context("versions")?.as_primitive::<Int64Type>().iter().map(|v| v.unwrap_or(0) as u64).collect()
     } else {
         b.column_by_name("_ord").context("log positions")?.as_primitive::<UInt64Type>().iter().map(|o| o.unwrap_or(0) >> crate::log::ORD_BITS).collect()
     })
@@ -1738,7 +1738,7 @@ fn commits(b: &RecordBatch, version: bool) -> Result<Vec<u64>> {
 
 /// Each row of an append table's changes, as its `_row_id` and the commit that changed it.
 fn ids_of(b: &RecordBatch, version: bool) -> Result<Vec<(Vec<String>, u64)>> {
-    let ids = b.column_by_name(crate::sys::ROW_ID).context("row ids")?.as_primitive::<Int64Type>();
+    let ids = b.column_by_name(crate::text::ROW_ID).context("row ids")?.as_primitive::<Int64Type>();
     Ok(ids.iter().zip(commits(b, version)?).filter_map(|(id, n)| id.map(|id| (vec![id.to_string()], n))).collect())
 }
 
@@ -1754,10 +1754,10 @@ enum Current {
 /// A row has the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version` (null: the transaction's own).
 async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>) -> Result<Current> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
-    let mut fields: Vec<Arc<Field>> = crate::query::schema(&meta.columns)?.fields().to_vec();
-    fields.push(Arc::new(Field::new(crate::sys::ROW_ID, DataType::Int64, true)));
-    fields.push(Arc::new(Field::new(crate::sys::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
-    fields.push(Arc::new(Field::new(crate::sys::VERSION, DataType::Int64, true)));
+    let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns)?.fields().to_vec();
+    fields.push(Arc::new(Field::new(crate::text::ROW_ID, DataType::Int64, true)));
+    fields.push(Arc::new(Field::new(crate::text::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
+    fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
     let target = Arc::new(Schema::new(fields));
     if snapshot.is_some() {
         if let Some(c) = with_txn(|t| t.tables.get(table).cloned()).flatten() {
@@ -1776,9 +1776,9 @@ async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], sna
     if snapshot.is_some_and(|s| version > s) {
         return Ok(Current::Changed);
     }
-    let r = set(&r, crate::sys::VERSION, Arc::new(Int64Array::from(vec![version as i64])))?;
+    let r = set(&r, crate::text::VERSION, Arc::new(Int64Array::from(vec![version as i64])))?;
     let at: ArrayRef = Arc::new(datafusion::arrow::array::TimestampMicrosecondArray::from(vec![created]).with_timezone("UTC"));
-    let r = set(&r, crate::sys::CREATED, at)?;
+    let r = set(&r, crate::text::CREATED, at)?;
     Ok(Current::Row(crate::query::conform(&r, &target)?))
 }
 
@@ -1795,7 +1795,7 @@ pub async fn point_change(lake: &Lake, name: &str, stored: &TableMeta, snapshot:
 async fn point_key(lake: &Lake, name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Result<Option<Vec<String>>> {
     let meta = stored.logical();
     if meta.key.is_empty() || !meta.merge.is_empty() || meta.order.is_some() || stored.mapped() || name.contains('.') || name.contains('"')
-        || set_to.iter().any(|(c, _)| meta.key.contains(c) || c == "_deleted" || crate::sys::NAMES.contains(&c.as_str()) || !meta.columns.iter().any(|(n, _)| n == c))
+        || set_to.iter().any(|(c, _)| meta.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !meta.columns.iter().any(|(n, _)| n == c))
     {
         return Ok(None);
     }
@@ -1812,7 +1812,7 @@ fn key_text(meta: &TableMeta, key: &[String]) -> Result<Vec<String>> {
         .zip(key)
         .map(|(c, v)| {
             let (_, ty) = meta.columns.iter().find(|(n, _)| n == c).with_context(|| format!("no key column {c}"))?;
-            let typed = datafusion::arrow::compute::cast(&datafusion::arrow::array::StringArray::from(vec![v.as_str()]), &crate::query::dtype(ty)?)?;
+            let typed = datafusion::arrow::compute::cast(&datafusion::arrow::array::StringArray::from(vec![v.as_str()]), &crate::answer::dtype(ty)?)?;
             let text = datafusion::arrow::compute::cast(&typed, &DataType::Utf8)?;
             Ok(text.as_string::<i32>().value(0).to_string())
         })
@@ -1835,7 +1835,7 @@ async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], s
         let t = new.schema().field_with_name(c)?.data_type().clone();
         new = set(&new, c, crate::query::strict(&v, &t)?)?;
     }
-    let keep: Vec<usize> = (0..new.num_columns()).filter(|&i| new.schema().field(i).name() != crate::sys::VERSION).collect();
+    let keep: Vec<usize> = (0..new.num_columns()).filter(|&i| new.schema().field(i).name() != crate::text::VERSION).collect();
     Ok(Some((vec![row], vec![new.project(&keep)?])))
 }
 

@@ -37,7 +37,7 @@ struct Line {
 
 fn columns() -> Vec<(String, String)> {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
-    let ts = crate::query::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let ts = crate::answer::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let text = |n: &str| (n.to_string(), "Utf8".to_string());
     vec![("at".into(), ts), text("user"), text("door"), text("from"), text("class"), text("statement"), text("outcome"), text("message"), ("ms".into(), "Int64".into()), text("node")]
 }
@@ -294,7 +294,7 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         Arc::new(lines.iter().map(|l| l.ms).collect::<Int64Array>()) as ArrayRef,
         text(&|_| Some(node.clone())),
     ];
-    Ok(RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?)
+    Ok(RecordBatch::try_new(crate::answer::schema(&columns())?, arrays)?)
 }
 
 /// Is `sql` about the audit log, and may the caller read it (a superuser)?

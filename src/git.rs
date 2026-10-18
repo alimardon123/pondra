@@ -472,7 +472,7 @@ fn named_by(verb: &str) -> &'static [&'static str] {
 pub async fn call(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Result<Outcome> {
     let lower = name.to_ascii_lowercase();
     let verb = lower.rsplit('.').next().unwrap_or_default();
-    let a = crate::routines::args(name, args)?;
+    let a = crate::text::args(name, args)?;
     let given = &a.given;
     let message_second = verb == "git_commit";
     ensure!(given.len() == 1 || (message_second && given.len() == 2), "{name}('sales'{}): the folder by position, the rest by name", if message_second { ", 'message'" } else { "" });

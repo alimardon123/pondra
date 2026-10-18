@@ -31,11 +31,11 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
                 RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), rows.columns().to_vec())?
             }
         };
-        let all = crate::query::conform(&named, &crate::query::schema(&meta.logical_columns())?)?;
+        let all = crate::query::conform(&named, &crate::answer::schema(&meta.logical_columns())?)?;
         for (name, c) in &meta.checks {
             let bad = breaking(&all, c)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
-                return Err(anyhow::Error::new(crate::views::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
+                return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
             }
         }
     }
@@ -89,7 +89,7 @@ pub async fn definition(columns: &[(String, String)], defaults: &std::collection
         let t = &columns.iter().find(|(n, _)| n == c).with_context(|| format!("column \"{c}\" does not exist"))?.1;
         validate(c, t, expr).await?;
     }
-    let empty = RecordBatch::new_empty(crate::query::schema(columns)?);
+    let empty = RecordBatch::new_empty(crate::answer::schema(columns)?);
     for (n, c) in checks {
         breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?;
     }
@@ -124,7 +124,7 @@ pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n
     let batches = ctx.sql(&format!("SELECT {expr} AS v FROM range({n})")).await?.collect().await?;
     let rows: Vec<ArrayRef> = batches.iter().map(|b| b.column(0).clone()).collect();
     let all = datafusion::arrow::compute::concat(&rows.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
-    Ok(Some(crate::query::strict(&all, &crate::query::dtype(t)?)?))
+    Ok(Some(crate::query::strict(&all, &crate::answer::dtype(t)?)?))
 }
 
 /// A default's expression checked when the table is made: it gives one value of the column's type.
@@ -140,7 +140,7 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
     };
     match batches {
         Ok(b) if b.iter().map(|b| b.num_rows()).sum::<usize>() == 1 => {
-            crate::query::strict(b[0].column(0), &crate::query::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {e}"))
+            crate::query::strict(b[0].column(0), &crate::answer::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {e}"))
         }
         Ok(_) => bail!("{column} DEFAULT {expr}: a default is one value, not a query's rows (DEFAULT 0, DEFAULT now(), DEFAULT nextval('s'))"),
         Err(e) => bail!("{column} DEFAULT {expr}: {e} (a default is an expression of constants and built-in functions, such as now() or uuid())"),
@@ -273,7 +273,7 @@ async fn set_not_null(lake: &Lake, table: &str, column: &str, stored: &str, mut 
 async fn count_nulls(lake: &Lake, table: &str, column: &str) -> Result<i64> {
     let sql = format!("SELECT count(*) AS n FROM {} WHERE \"{}\" IS NULL", crate::write::sql_name(table), column.replace('"', "\"\""));
     let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
-    let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
+    let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.first().and_then(|b| b.column(0).as_any().downcast_ref::<Int64Array>()).map_or(0, |a| a.value(0)))
 }
 

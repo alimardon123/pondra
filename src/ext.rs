@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-pub use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
-pub(crate) use crate::ext_names::{format_of, quoted, scheme, NULL_FOLDER};
+use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
+use crate::ext_names::{quoted, scheme};
 use crate::ext_names::{file_format, folders, hive_value, listed, part_of, read_files, schema_of};
 
 tokio::task_local! {
@@ -63,7 +63,7 @@ pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 /// the same files; a folder is its files of that format.
 pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crate::ddl::Ddl> {
     use datafusion::sql::sqlparser::ast::Value as V;
-    let name = crate::write::object(&c.name);
+    let name = crate::text::object(&c.name);
     ensure!(!c.temporary, "CREATE TEMPORARY EXTERNAL TABLE: make a temporary view of the files (CREATE TEMP VIEW {name} AS SELECT * FROM read_parquet('…'))");
     let (format, function) = match c.file_type.to_lowercase().as_str() {
         "parquet" => ("parquet", "read_parquet"),
@@ -102,8 +102,8 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
     let urls = c.locations.iter().map(|l| located(l)).collect::<Result<Vec<_>>>()?;
     ensure!(!urls.is_empty(), "CREATE EXTERNAL TABLE {name}: where are its files? (LOCATION '…')");
     let parts: Vec<String> = c.table_partition_cols.iter().map(|p| p.trim_matches('"').to_string()).collect();
-    let own = |col: &&datafusion::sql::sqlparser::ast::ColumnDef| !parts.contains(&crate::write::ident(&col.name));
-    let typed = |cols: Vec<&datafusion::sql::sqlparser::ast::ColumnDef>| cols.iter().map(|col| format!("{}: {}", text(&crate::write::ident(&col.name)), text(&crate::write::sql_type(&col.data_type)))).collect::<Vec<_>>().join(", ");
+    let own = |col: &&datafusion::sql::sqlparser::ast::ColumnDef| !parts.contains(&crate::text::ident(&col.name));
+    let typed = |cols: Vec<&datafusion::sql::sqlparser::ast::ColumnDef>| cols.iter().map(|col| format!("{}: {}", text(&crate::text::ident(&col.name)), text(&crate::write::sql_type(&col.data_type)))).collect::<Vec<_>>().join(", ");
     let (in_files, keys): (Vec<_>, Vec<_>) = c.columns.iter().partition(own);
     if !in_files.is_empty() {
         args.push(format!("columns => {{{}}}", typed(in_files)));
@@ -115,7 +115,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
     }
     let select = match c.columns.is_empty() {
         true => "*".to_string(),
-        false => c.columns.iter().map(|col| quoted(&crate::write::ident(&col.name))).collect::<Vec<_>>().join(", "),
+        false => c.columns.iter().map(|col| quoted(&crate::text::ident(&col.name))).collect::<Vec<_>>().join(", "),
     };
     let files = match &urls[..] {
         [u] => text(u),
@@ -214,7 +214,7 @@ pub fn said(e: &anyhow::Error) -> String {
     let out = crate::codes::words(e);
     match crate::auth::shows_code() {
         true => out,
-        false => crate::python::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
+        false => crate::codes::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
     }
 }
 
@@ -388,7 +388,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         register(lake, u).await?;
     }
     let found = listed(&state, spec, |u| declared.is_none().then(|| anyhow!("no files at {u}"))).await?; // (declared: none yet is an empty table)
-    let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect() };
+    let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() };
     if found.is_empty() {
         let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
         return Ok(TableMeta { columns, ext: Some(spec.clone()), ..Default::default() });
@@ -1034,7 +1034,7 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
             options.insert("format".to_string(), f.value.to_lowercase());
         } else if p.parse_keywords(&[Keyword::PARTITIONED, Keyword::BY]) {
             match p.expect_token(&Token::LParen).and_then(|_| p.parse_comma_separated(|p| p.parse_identifier())).and_then(|l| p.expect_token(&Token::RParen).map(|_| l)) {
-                Ok(l) => _ = options.insert("partition_by".to_string(), l.iter().map(crate::write::ident).collect::<Vec<_>>().join(",")),
+                Ok(l) => _ = options.insert("partition_by".to_string(), l.iter().map(crate::text::ident).collect::<Vec<_>>().join(",")),
                 Err(e) => return invalid(e.to_string()),
             }
         } else if p.parse_keyword(Keyword::OPTIONS) {
@@ -1105,7 +1105,7 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
     let usage = "COPY INTO t FROM 's3://b/x/*.csv' (FORMAT csv, HEADER true), or FROM (SELECT … FROM 's3://b/x/*.csv')";
     let invalid = |e: String| Some(crate::write::Stmt::Invalid(format!("{usage}: {e}")));
     let table = match p.parse_object_name(false) {
-        Ok(t) => crate::write::object(&t),
+        Ok(t) => crate::text::object(&t),
         Err(e) => return invalid(e.to_string()),
     };
     if !p.parse_keyword(Keyword::FROM) {

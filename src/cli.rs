@@ -389,7 +389,7 @@ async fn run() -> anyhow::Result<()> {
     store::inherit(); // (a lake led for a moment, reached as the process that asked reaches it)
     let Some(cmd) = cli.cmd else {
         let given = cli.lake.is_some();
-        let lake = store::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
+        let lake = crate::memory::place(&cli.lake.unwrap_or_else(|| "lake".into())); // (`pondra :memory:`: a lake in the node's memory)
         opened(&lake, given).await?;
         return shell::run(&lake).await;
     };
@@ -401,7 +401,7 @@ async fn run() -> anyhow::Result<()> {
                 .into_iter().filter_map(|(var, flag)| Some((var, flag?))).collect();
             let token = |flag: Option<String>, var: &str| flag.or_else(|| env::get(var)).filter(|t| !t.is_empty());
             // A lake, or a folder of lakes (each a database: `dbserver.rs`), by what the path holds.
-            let (path, dir) = (path.map(|p| store::place(&p)), dir.map(|d| store::place(&d))); // (`:memory:`: in this process's memory)
+            let (path, dir) = (path.map(|p| crate::memory::place(&p)), dir.map(|d| crate::memory::place(&d))); // (`:memory:`: in this process's memory)
             // (a node that serves its lake's store: checked before anything is opened; a folder of lakes is never
             // served that way, and `--lakes` names none: `served.rs`)
             let serving = serve_store || env::flag("PONDRA_SERVE_STORE");
@@ -435,7 +435,7 @@ async fn run() -> anyhow::Result<()> {
                     let lake = dbserver::is_lake(&p).await?; // (one being made too: nodes started at once)
                     anyhow::ensure!(given || many || lake, "no lake in this folder, and no lakes in its folders: `pondra serve lake` makes one at ./lake (or name yours: pondra serve <folder>)");
                     let empty = std::fs::read_dir(&p).map_or(true, |mut d| d.next().is_none());
-                    anyhow::ensure!(many || lake || empty || ext::scheme(&p).is_some_and(|s| s != "file"), "{p} holds other things than lakes: serve a lake in it (pondra serve {p}/lake), or make one there anyway with --lake {p}");
+                    anyhow::ensure!(many || lake || empty || crate::ext_names::scheme(&p).is_some_and(|s| s != "file"), "{p} holds other things than lakes: serve a lake in it (pondra serve {p}/lake), or make one there anyway with --lake {p}");
                     (p, many)
                 }
             };
@@ -623,7 +623,7 @@ async fn run() -> anyhow::Result<()> {
             match write::parse(&query) {
                 Some(stmt) => println!("{}", ext::scope(true, write::from_cli(&dir, stmt)).await?), // (its user's own machine: its files, its credentials)
                 None => {
-                    let planned = asof::rewrite(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
+                    let planned = sys::planned(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
                     let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&planned).await?.collect().await?) };
                     let batches = ext::scope(true, auth::WHO.scope(auth::Principal::token(auth::Role::Admin), run)).await?; // (and its storage: attached lakes too)
                     println!("{}", pretty_format_batches(&batches)?);

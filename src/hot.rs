@@ -161,7 +161,7 @@ impl Hot {
         // keeps its memory for them (both are bounded by `--memory-gb`).
         let room = self.room_for(&lake);
         let key = key(&file, deletes);
-        let memory = crate::store::in_memory(&lake.url);
+        let memory = crate::memory::in_memory(&lake.url);
         let fields: Vec<FieldRef> = {
             let mut s = self.state.lock().unwrap();
             let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(key.clone(), f.name().clone()))).collect();
@@ -488,9 +488,9 @@ fn ranges(arrays: &[ArrayRef]) -> Option<Ranges> {
 fn column(batch: &RecordBatch, f: &FieldRef, lineage: Option<Lineage>, at: u64) -> ArrayRef {
     let n = batch.num_rows();
     match (lineage, f.name().as_str()) {
-        (Some(l), crate::sys::ROW_ID) => Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| l.first + at as i64 + i))),
-        (Some(l), crate::sys::VERSION) => Arc::new(Int64Array::from_value(l.version as i64, n)),
-        (Some(l), crate::sys::CREATED | crate::sys::UPDATED) => Arc::new(TimestampMicrosecondArray::from_value(l.ms as i64 * 1000, n).with_timezone("UTC")),
+        (Some(l), crate::text::ROW_ID) => Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| l.first + at as i64 + i))),
+        (Some(l), crate::text::VERSION) => Arc::new(Int64Array::from_value(l.version as i64, n)),
+        (Some(l), crate::text::CREATED | crate::text::UPDATED) => Arc::new(TimestampMicrosecondArray::from_value(l.ms as i64 * 1000, n).with_timezone("UTC")),
         _ => batch.column_by_name(f.name()).cloned().unwrap_or_else(|| new_null_array(f.data_type(), n)),
     }
 }

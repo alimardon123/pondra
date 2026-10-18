@@ -179,8 +179,8 @@ impl Opened {
     /// Opens a node in this process, once it serves (or has failed to, saying why). One at a time: a
     /// second open while one is open is refused by name.
     pub fn open(mut options: Options) -> anyhow::Result<Opened> {
-        options.dir = crate::store::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
-        let memory = crate::store::in_memory(&options.dir).then(|| options.dir.clone());
+        options.dir = crate::memory::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
+        let memory = crate::memory::in_memory(&options.dir).then(|| options.dir.clone());
         let (events, rx) = mpsc::unbounded_channel();
         {
             let mut s = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner);
@@ -221,7 +221,7 @@ impl Opened {
             SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take();
         }
         if let Some(lake) = &self.memory {
-            crate::store::forget_memory(lake);
+            crate::memory::forget_memory(lake);
         }
     }
 

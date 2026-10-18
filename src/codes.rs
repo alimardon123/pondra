@@ -7,18 +7,14 @@
 
 /// The SQLSTATE of an error.
 pub fn of(e: &anyhow::Error) -> &'static str {
-    #[cfg(feature = "server")]
-    if let Some(v) = e.chain().find_map(|c| c.downcast_ref::<crate::views::Violation>()) {
+    if let Some(v) = e.chain().find_map(|c| c.downcast_ref::<Violation>()) {
         return v.1; // check_violation (a table's CHECK, a view's expectation), or an enum's invalid_text_representation
     }
     if let Some(c) = e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
         return c.0;
     }
-    #[cfg(feature = "server")]
-    let text = crate::ext::said(e); // (the node's words: files by their SQL names, a Python routine's lines cut)
-    #[cfg(not(feature = "server"))]
-    let text = words(e);
-    by_words(&text)
+    // (without the lines a Python routine's error quotes, for every caller: they are its code, not what went wrong, so they never pick the code)
+    by_words(&unquoted(&words(e)))
 }
 
 /// An error in words: its causes after it, each said once, DataFusion's and Arrow's labels taken off, and the files it
@@ -51,6 +47,18 @@ const SPILL_SAYS: &[(&str, &str)] = &[
     ("(DiskManager is disabled)", "(PONDRA_SPILL_GB is 0: nothing spills)"),
 ];
 
+/// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
+/// with `  line 3: <the line>` for each place in the body, which become `  line 3`. Here for a procedure (and its
+/// run's log) and in `ext::said` for every door, since a function's batches may run where no caller is known, and in
+/// `codes::of`, so no quoted line picks an error's code.
+pub fn unquoted(error: &str) -> String {
+    let line = |l: &str| match l.strip_prefix("  line ").and_then(|r| r.split_once(": ")) {
+        Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => format!("  line {n}"),
+        _ => l.to_string(),
+    };
+    error.lines().map(line).collect::<Vec<_>>().join("\n")
+}
+
 /// An error that says its own SQLSTATE.
 #[derive(Debug)]
 pub struct Coded(pub &'static str, pub String);
@@ -63,6 +71,17 @@ impl std::error::Error for Coded {}
 
 /// `code`: an error with that SQLSTATE.
 pub fn coded(code: &'static str, message: impl Into<String>) -> anyhow::Error { anyhow::Error::new(Coded(code, message.into())) }
+
+/// A row an expectation or a table's CHECK refuses (Postgres's `check_violation`, 23514), or a value
+/// its column's enum doesn't list (22P02): its words, and its SQLSTATE.
+#[derive(Debug)]
+pub struct Violation(pub String, pub &'static str);
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Violation {}
 
 /// A code another node answered with (`x-pondra-sqlstate`), as one of this node's: five digits or
 /// capital letters, each kept once (a code is `&'static`). XX000 says nothing, so it is none.
@@ -160,35 +179,6 @@ pub fn http(code: &str) -> u16 {
     }
 }
 
-/// An error as every door answers it: the HTTP status its SQLSTATE takes, the SQLSTATE, and its words (a node's
-/// leave out what its caller may not see: `ext::said`).
-pub fn answer(e: &anyhow::Error) -> (u16, &'static str, String) {
-    let code = of(e);
-    #[cfg(feature = "server")]
-    let told = crate::ext::said(e);
-    #[cfg(not(feature = "server"))]
-    let told = words(e);
-    (http(code), code, told)
-}
-
-/// The gRPC status nearest a SQLSTATE (Flight SQL's errors).
-#[cfg(feature = "server")]
-pub fn grpc(code: &str) -> tonic::Code {
-    match code {
-        "40001" => tonic::Code::Aborted,
-        "42501" => tonic::Code::PermissionDenied,
-        "28P01" | "28000" => tonic::Code::Unauthenticated,
-        "42P01" | "42703" | "42883" | "3F000" => tonic::Code::NotFound,
-        "42P07" | "23505" => tonic::Code::AlreadyExists,
-        "57014" => tonic::Code::DeadlineExceeded,
-        "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
-        "0A000" => tonic::Code::Unimplemented,
-        "23514" | "23502" | "25006" | "25P01" | "25P02" | "25P03" => tonic::Code::FailedPrecondition, // (a transaction that isn't open, failed, or idle-ended)
-        c if c.starts_with("42") || c.starts_with("22") || c.starts_with("21") => tonic::Code::InvalidArgument,
-        _ => tonic::Code::Internal,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -215,10 +205,6 @@ mod tests {
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
-        #[cfg(feature = "server")]
-        assert_eq!(of(crate::cluster::CUT_OFF_SAYS), "57P03");
-        #[cfg(feature = "server")]
-        assert_eq!(of(crate::store::CATCHING_UP), "57P03");
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
         assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");
@@ -228,10 +214,8 @@ mod tests {
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)
         assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));
-        #[cfg(feature = "server")]
-        assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
-        #[cfg(feature = "server")]
-        assert_eq!(super::of(&anyhow::Error::new(crate::views::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
+        assert_eq!(super::of(&anyhow::Error::new(super::Violation("new row for relation \"t\" violates check constraint \"c\"".into(), "23514"))), "23514");
+        assert_eq!(super::of(&anyhow::Error::new(super::Violation("invalid input value for enum mood: \"x\"".into(), "22P02"))), "22P02");
         // (a lock refusal a follower reads back as words keeps its code: "canceling statement" is a cancel, 57014, otherwise)
         assert_eq!(of("the leader at http://10.0.0.1:8080: canceling statement due to lock timeout"), "55P03");
         assert_eq!(of("deadlock detected: this write waits for a row another transaction holds"), "40P01");
@@ -283,9 +267,9 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_is_its_status_code_and_words() {
-        // (what every door sends for one error: `http` of its code, the code, its words)
-        assert_eq!(super::answer(&super::coded("23505", "x")), (409, "23505", "x".to_string()));
-        assert_eq!(super::answer(&super::coded("42P01", "no file here")), (404, "42P01", "no file here".to_string()));
+    fn an_error_shown_without_its_code_keeps_its_lines_numbers() {
+        let said = "ZeroDivisionError: division by zero\n  line 2: total = secret_rate / 0\n  line 5: return helper(x)";
+        assert_eq!(super::unquoted(said), "ZeroDivisionError: division by zero\n  line 2\n  line 5");
+        assert_eq!(super::unquoted("ValueError: a line: with a colon"), "ValueError: a line: with a colon");
     }
 }

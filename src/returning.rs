@@ -70,11 +70,11 @@ pub fn of(sql: &str) -> Option<Returning> {
         return None; // (nearly every statement: not parsed here)
     }
     let mut statement = crate::pg_types::one(sql)?; // (read as the port's traces read it: Postgres's JSON operators too)
-    let alias = |a: &Option<ast::TableAlias>| a.as_ref().map(|a| vec![crate::write::ident(&a.name)]);
+    let alias = |a: &Option<ast::TableAlias>| a.as_ref().map(|a| vec![crate::text::ident(&a.name)]);
     let (kind, items, name, alias) = match &mut statement {
         Statement::Insert(i) => {
             let ast::TableObject::TableName(n) = &i.table else { return None };
-            let alias = i.table_alias.as_ref().map(|a| vec![crate::write::ident(&a.alias)]);
+            let alias = i.table_alias.as_ref().map(|a| vec![crate::text::ident(&a.alias)]);
             (Kind::Insert, i.returning.take()?, n.clone(), alias)
         }
         Statement::Update(u) => {
@@ -88,10 +88,10 @@ pub fn of(sql: &str) -> Option<Returning> {
         }
         _ => return None,
     };
-    let parts: Vec<String> = crate::write::object(&name).split('.').map(String::from).collect();
+    let parts: Vec<String> = crate::text::object(&name).split('.').map(String::from).collect();
     let mut names: Vec<Vec<String>> = (0..parts.len()).map(|i| parts[i..].to_vec()).collect();
     names.extend(alias);
-    Some(Returning { write: crate::routines::sql(&statement), items, names, kind })
+    Some(Returning { write: crate::text::sql(&statement), items, names, kind })
 }
 
 impl Returning {
@@ -115,7 +115,7 @@ impl Returning {
     /// The items, with every column the table's name (or alias) qualifies read from the rows instead: `t.id` is
     /// `__returning.id`, `t.*` is `*`. A subquery naming the table reads the table.
     fn items(&self) -> Vec<SelectItem> {
-        let ours = |q: &[ast::Ident]| self.names.iter().any(|n| n.len() == q.len() && n.iter().zip(q).all(|(a, b)| *a == crate::write::ident(b)));
+        let ours = |q: &[ast::Ident]| self.names.iter().any(|n| n.len() == q.len() && n.iter().zip(q).all(|(a, b)| *a == crate::text::ident(b)));
         let mut items = self.items.clone();
         for item in &mut items {
             let star = match item {
@@ -216,7 +216,7 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
         return Err(crate::codes::coded("42P01", format!("no table {table} (RETURNING answers for this database's own tables)")));
     };
     let columns: Vec<(String, String)> = meta.logical_columns().into_iter().filter(|(c, _)| c != "_deleted").collect();
-    Ok((name, crate::query::schema(&columns)?))
+    Ok((name, crate::answer::schema(&columns)?))
 }
 
 /// RETURNING reads the rows it wrote, so a user granted some tables needs SELECT on this one, as Postgres asks.
@@ -255,12 +255,12 @@ fn picks(items: &[SelectItem], shown: &Schema) -> Option<Vec<(usize, String)>> {
                 continue;
             }
             SelectItem::UnnamedExpr(e) => (e, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(crate::write::ident(alias))),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(crate::text::ident(alias))),
             _ => return None,
         };
         let column = match e {
-            Expr::Identifier(i) => crate::write::ident(i),
-            Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value == ROWS => crate::write::ident(&p[1]),
+            Expr::Identifier(i) => crate::text::ident(i),
+            Expr::CompoundIdentifier(p) if p.len() == 2 && p[0].value == ROWS => crate::text::ident(&p[1]),
             _ => return None,
         };
         let i = shown.index_of(&column).ok()?; // (not a column: `current_date`, say, which a query answers or refuses)

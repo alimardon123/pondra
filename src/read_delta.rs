@@ -78,7 +78,7 @@ pub fn table<'a>(root: &str, protocol: &Value, metadata: &Value, adds: impl Iter
     let mut files: Vec<DataFile> = adds.map(|add| file(root, add, &partitions, &types)).collect::<Result<_>>()?;
     files.sort_by(|a, b| a.path.cmp(&b.path)); // (every node lists them in one order)
     Ok(TableMeta {
-        columns: columns.iter().map(|(p, _, t)| (p.clone(), crate::query::type_name(t))).collect(),
+        columns: columns.iter().map(|(p, _, t)| (p.clone(), crate::answer::type_name(t))).collect(),
         names: columns.iter().filter(|(p, l, _)| mapped && p != l).map(|(p, l, _)| (p.clone(), l.clone())).collect(),
         files,
         ..Default::default()

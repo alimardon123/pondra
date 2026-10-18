@@ -120,7 +120,7 @@ fn fold(e: &Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
         Expr::Cast(c) => {
             let v = fold(&c.expr, ctx)?;
             // (what the optimizer's `Seconds` rule does before a text is cast to a time: `'… 10:30'` has seconds first)
-            let v = match (c.field.data_type(), text(&v).and_then(crate::query::seconds)) {
+            let v = match (c.field.data_type(), text(&v).and_then(crate::optimize::seconds)) {
                 (DataType::Timestamp(..), Some(s)) => ScalarValue::Utf8(Some(s)),
                 _ => v,
             };
@@ -234,7 +234,7 @@ mod tests {
     /// `write::rows` for these tests' tables, which have no DEFAULTs: their rows are planned and fit, with no lake to
     /// take a default's values from.
     async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> anyhow::Result<RecordBatch> {
-        let target = crate::query::schema(&meta.columns)?;
+        let target = crate::answer::schema(&meta.columns)?;
         match planned(ctx, &target, sql).await? {
             Some(all) => fit(&target, &all),
             None => Ok(RecordBatch::new_empty(target)),
@@ -249,7 +249,7 @@ mod tests {
     /// None when the literal path is not taken.
     async fn both(columns: &[(&str, &str)], sql: &str) -> Option<(anyhow::Result<RecordBatch>, anyhow::Result<RecordBatch>)> {
         let meta = meta(columns);
-        let target = crate::query::schema(&meta.columns).unwrap();
+        let target = crate::answer::schema(&meta.columns).unwrap();
         let literal = literal_rows(sql, &target)?;
         Some((rows(&session(), &meta, sql).await, fit(&target, &literal)))
     }
@@ -402,7 +402,7 @@ mod tests {
     /// wraps past midnight between the two.
     async fn statement_time_case(columns: &[(&str, &str)], sql: &str) {
         let meta = meta(columns);
-        let target = crate::query::schema(&meta.columns).unwrap();
+        let target = crate::answer::schema(&meta.columns).unwrap();
         let before = Utc::now();
         let literal = literal_rows(sql, &target).unwrap_or_else(|| panic!("not taken as a literal: {sql}"));
         let after = Utc::now();
@@ -492,7 +492,7 @@ mod tests {
             "VALUES (INTERVAL '1 day' + INTERVAL '1 hour')",
         ];
         for sql in not_literal {
-            assert!(literal_rows(sql, &crate::query::schema(&meta(&int).columns).unwrap()).is_none(), "{sql}");
+            assert!(literal_rows(sql, &crate::answer::schema(&meta(&int).columns).unwrap()).is_none(), "{sql}");
         }
     }
 
@@ -500,7 +500,7 @@ mod tests {
     async fn a_cast_that_fails_is_planned_and_fails_there() {
         // (99,999,999,999 has more digits than DECIMAL(10, 2) holds: the planned path reports it)
         let decimal = [("v", "Decimal128(10, 2)")];
-        assert!(literal_rows("VALUES (99999999999)", &crate::query::schema(&meta(&decimal).columns).unwrap()).is_none());
+        assert!(literal_rows("VALUES (99999999999)", &crate::answer::schema(&meta(&decimal).columns).unwrap()).is_none());
         assert!(rows(&session(), &meta(&decimal), "VALUES (99999999999)").await.is_err());
     }
 }

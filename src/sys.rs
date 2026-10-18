@@ -21,13 +21,13 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit,
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::sync::Arc;
-pub use crate::text::{CREATED, NAMES, ROW_ID, UPDATED, VERSION};
+use crate::text::{CREATED, NAMES, ROW_ID, UPDATED, VERSION};
 
 pub fn time() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 
 /// The system columns, as a table's columns list them (name, type).
 pub fn columns() -> Vec<(String, String)> {
-    let ts = crate::query::type_name(&time());
+    let ts = crate::answer::type_name(&time());
     vec![(ROW_ID.into(), "Int64".into()), (VERSION.into(), "Int64".into()), (CREATED.into(), ts.clone()), (UPDATED.into(), ts)]
 }
 
@@ -50,6 +50,15 @@ pub fn with_sys(meta: &TableMeta) -> TableMeta {
 /// Does `sql` name a system column? (A word match: one too many costs a few columns read.)
 pub fn mentioned(sql: &str) -> bool {
     sql.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| NAMES.contains(&w))
+}
+
+/// SQL as a node plans it: each ASOF JOIN as the LEFT JOIN that carries its marker (`asof::as_of`), and `*` without the
+/// system columns (`hide`).
+pub fn planned(sql: &str) -> anyhow::Result<Cow<'_, str>> {
+    Ok(match crate::asof::as_of(sql)? {
+        Cow::Borrowed(s) => hide(s), // (and `*` without the system columns)
+        Cow::Owned(s) => Cow::Owned(hide(&s).into_owned()),
+    })
 }
 
 /// `*` without the system columns, in a query that names one (so they are in its tables):
@@ -94,7 +103,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
     let mut v = Hide { ctes: vec![], changed: false, names };
     let _ = VisitMut::visit(&mut stmts, &mut v);
     match v.changed {
-        true => Cow::Owned(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; ")),
+        true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")),
         false => Cow::Borrowed(sql),
     }
 }
@@ -195,7 +204,7 @@ pub fn stamp_new(b: &RecordBatch, first: i64, crate::log::Reserved { version: n,
 pub fn stamp_stream(rows: datafusion::execution::SendableRecordBatchStream, next: Arc<std::sync::atomic::AtomicU64>, reserved: crate::log::Reserved) -> Result<datafusion::execution::SendableRecordBatchStream> {
     use futures::StreamExt;
     let mut fields = rows.schema().fields().to_vec();
-    fields.extend(columns().iter().map(|(n, t)| Arc::new(Field::new(n, crate::query::dtype(t).expect("a type"), true))));
+    fields.extend(columns().iter().map(|(n, t)| Arc::new(Field::new(n, crate::answer::dtype(t).expect("a type"), true))));
     let schema = Arc::new(Schema::new(fields));
     let stamped = rows.map(move |b| {
         let b = b?;

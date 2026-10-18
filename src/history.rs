@@ -330,7 +330,7 @@ crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender
 
 fn columns() -> Vec<(String, String)> {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
-    let ts = crate::query::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let ts = crate::answer::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let text = |n: &str| (n.to_string(), "Utf8".to_string());
     let int = |n: &str| (n.to_string(), "Int64".to_string());
     // (stored columns only grow, at the end: a lake's history made before keeps its rows, `create_log`)
@@ -388,7 +388,7 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         serde_json::to_string(&facts).unwrap_or_default()
     }));
     let arrays = [arrays, vec![reads, Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef, writes, learned]].concat();
-    Ok(RecordBatch::try_new(crate::query::schema(&columns())?, arrays)?)
+    Ok(RecordBatch::try_new(crate::answer::schema(&columns())?, arrays)?)
 }
 
 /// The tables and views each statement read, and the tables it changed, as this lake names them

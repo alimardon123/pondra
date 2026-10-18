@@ -153,7 +153,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     static ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+SEQUENCE\s+(IF\s+EXISTS\s+)?([\w."$-]+)(.*?)\s*;?\s*$"#).expect("a regex"));
     static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*DROP\s+SEQUENCE\b").expect("a regex"));
     static RENAME: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*RENAME\s+TO\s+([\w."$-]+)\s*$"#).expect("a regex"));
-    let first = crate::write::first_word(sql);
+    let first = crate::text::first_word(sql);
     let invalid = |e: anyhow::Error| Stmt::Invalid(format!("{e:#}"));
     if let Some(c) = CREATE.captures(first) {
         if c.get(2).is_some() {
@@ -183,7 +183,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).map(|mut s| s.pop());
         return Some(match parsed {
             Ok(Some(ast::Statement::Drop { object_type: ast::ObjectType::Sequence, names, if_exists, .. })) => {
-                Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Drop { names: names.iter().map(crate::write::object).collect(), if_exists })])
+                Stmt::Ddl(vec![crate::ddl::Ddl::Sequence(Change::Drop { names: names.iter().map(crate::text::object).collect(), if_exists })])
             }
             _ => Stmt::Invalid("DROP SEQUENCE [IF EXISTS] name [, …]".into()),
         });
@@ -195,7 +195,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
 pub fn object_of(name: &str) -> String {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
-    parsed.map(|n| crate::write::object(&n)).unwrap_or_else(|_| name.to_lowercase())
+    parsed.map(|n| crate::text::object(&n)).unwrap_or_else(|_| name.to_lowercase())
 }
 
 /// A sequence's options as Postgres takes them, in any order (`START 10 INCREMENT 5`, `INCREMENT BY
@@ -398,8 +398,8 @@ pub async fn check_current(lake: &Lake, name: &str) -> Result<()> {
 /// An identity column's sequence, made with its table (leader): `{table}_{column}_seq`, or the
 /// first `…_seq1`, `…_seq2` no relation or sequence has. Its name, for the column's default.
 pub async fn owned(lake: &Lake, table: &str, column: &str, declared: Vec<Opt>) -> Result<String> {
-    let (schema, t) = crate::ddl::split(table);
-    let base = crate::ddl::join(schema, &format!("{t}_{column}_seq"));
+    let (schema, t) = crate::text::split(table);
+    let base = crate::text::join(schema, &format!("{t}_{column}_seq"));
     for i in 0.. {
         let name = if i == 0 { base.clone() } else { format!("{base}{i}") };
         if !relation(lake, &name).await? && lake.cat.get::<Sequence>(&key(&name)).await?.is_none() {

@@ -139,7 +139,7 @@ pub struct TableMeta {
     pub sql_types: BTreeMap<String, String>,
     /// Not the lake's: files outside it a query reads as a table (`ext.rs`), never in the catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<crate::ext::Spec>,
+    pub ext: Option<crate::ext_names::Spec>,
     /// Another engine's table (`scan.rs`): what matches its files' columns to its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<crate::scan::Table>,
@@ -766,7 +766,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
 
 // Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
 // spills their files to disk past a budget.
-pub use crate::memory::{forget_memory, held_in_memory, in_memory, memory_held, place};
+use crate::memory::in_memory;
 
 /// Is `url` a lake served by the node that holds it (`pondra://host:port`, ADR-072 §8)?
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
@@ -1127,7 +1127,7 @@ impl Lake {
         if !self.attached.read().unwrap().is_empty() {
             crate::query::stored_views(self, sql, false).await.ok()?.iter().for_each(|(_, v)| text.push_str(&format!(" {v}")));
         }
-        for (name, other) in self.attached.read().unwrap().iter().filter(|(n, _)| crate::ddl::mentions(&text, n)) {
+        for (name, other) in self.attached.read().unwrap().iter().filter(|(n, _)| crate::text::mentions(&text, n)) {
             (name, other.cat.version()?, crate::auth::operator()).hash(&mut h); // (whoever runs the nodes may read what a user may not: `users::across`)
         }
         Some(h.finish())
@@ -1180,7 +1180,7 @@ impl Lake {
     /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
     /// the node's own functions.
     fn made(&self, partitions: usize) -> SessionContext {
-        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::ddl::PUBLIC);
+        let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
         functions(config, self.rt.clone())
     }
 
@@ -1427,7 +1427,7 @@ impl Lake {
     pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::query::schema(&meta.columns)?;
+        let schema = crate::answer::schema(&meta.columns)?;
         let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
         for f in if removed { &filed.removed } else { &filed.added } {
             let (lo, hi) = (at.max(from), (at + f.rows).min(end));
@@ -1447,7 +1447,7 @@ impl Lake {
     pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
         let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
-        let schema = crate::query::schema(&meta.columns)?;
+        let schema = crate::answer::schema(&meta.columns)?;
         let mut out = vec![];
         for (f, deletes) in &filed.deleted {
             out.extend(crate::adopt::rows_deleted(self, &meta, f, deletes, &schema).await?);
@@ -2371,6 +2371,11 @@ mod tests {
         let kb: usize = status.lines().find_map(|l| l.strip_prefix("VmRSS:")?.trim().strip_suffix("kB")?.trim().parse().ok()).expect("VmRSS");
         let theirs = kb << 10;
         assert!(ours.abs_diff(theirs) * 4 <= theirs, "resident {ours} bytes, VmRSS {theirs} bytes");
+    }
+
+    #[test]
+    fn catching_up_is_cannot_connect_now() {
+        assert_eq!(crate::codes::of(&anyhow::anyhow!("{}", CATCHING_UP)), "57P03");
     }
 
     /// What a read never sees is quiet, and anything else in the same commit makes it loud

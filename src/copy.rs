@@ -2,7 +2,8 @@
 //! Hive-style folders by `PARTITION_BY`, or a Kafka topic. A folder written from a big table is
 //! written by every node at once, each its own share's files (`spmd::copy`): nothing crosses
 //! between the nodes but how many rows each wrote.
-use crate::ext::{covering, format_of, list, owner, register, scheme, uncovered, NULL_FOLDER};
+use crate::ext::{covering, list, owner, register, uncovered};
+use crate::ext_names::{format_of, scheme, NULL_FOLDER};
 use crate::log::{forget_producers, now_ms};
 use crate::server::App;
 use crate::store::{json, producer_key, table_key, Lake, TableMeta, QUIET};
@@ -57,7 +58,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
-        let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
+        let df = crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
         return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's)
     }
     ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
@@ -68,7 +69,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     if format == "delta" || format == "iceberg" {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
         let ctx = crate::query::session(lake, &query, "").await?;
-        let df = crate::query::sql(&ctx, &query).await?;
+        let df = crate::engine::sql(&ctx, &query).await?;
         return crate::write_outside::copy_table(lake, &ctx, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
     }
     ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
@@ -114,7 +115,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
             if frugal {
                 crate::query::frugal(&ctx);
             }
-            write(crate::query::sql(&ctx, query).await?, target).await
+            write(crate::engine::sql(&ctx, query).await?, target).await
         }
     }).await?;
     Ok(serde_json::json!({"copied": rows, "to": to}))
@@ -337,14 +338,14 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
             };
             reader.extend(options.iter().filter(|(k, _)| !matches!(k.as_str(), "format" | "force")).map(|(k, v)| (k.clone(), v.clone())));
             let query_of = (format.clone(), reader.clone());
-            (p.clone(), crate::ext::Spec { urls: vec![p], format, options: reader }, Some(query_of))
+            (p.clone(), crate::ext_names::Spec { urls: vec![p], format, options: reader }, Some(query_of))
         }
         Source::Query(q) => {
             ensure!(options.keys().all(|k| k == "force"), "COPY INTO (SELECT …): the reader's options go in the query: read_csv('…', header => true)");
             let expanded = crate::routines::expand(lake, q).await?;
-            let names = crate::ext::names(&expanded);
+            let names = crate::ext_names::names(&expanded);
             ensure!(names.len() == 1, "COPY INTO (SELECT …) names {} files: one outside source (FROM 'path'), loaded file by file", names.len());
-            let spec = crate::ext::spec(&names[0]).context("COPY INTO (SELECT …): its FROM is a file")?;
+            let spec = crate::ext_names::spec(&names[0]).context("COPY INTO (SELECT …): its FROM is a file")?;
             (spec.urls[0].clone(), spec, None)
         }
     };
@@ -381,7 +382,7 @@ fn reader_query(format: &str, file: &str, reader: &BTreeMap<String, String>) -> 
 /// The columns a file's query gives, as the table's names they load into: by name, or by position
 /// for a headerless CSV. Refused by name: a column the table lacks, with both ways out.
 async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String], table: &str, url: &str) -> Result<Vec<String>> {
-    let df = crate::query::sql(&crate::query::session(lake, query, "").await?, query).await?;
+    let df = crate::engine::sql(&crate::query::session(lake, query, "").await?, query).await?;
     let given: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
     if positional {
         ensure!(given.len() <= cols.len(), "{url} has {} columns, {table} has {}", given.len(), cols.len());
@@ -457,14 +458,14 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
     for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let name = key[2..].to_string();
         let folder = m.folder(&name).to_string();
-        let (schema, table) = crate::ddl::split(&name);
+        let (schema, table) = crate::text::split(&name);
         by_folder.entry(folder).or_default().push((schema.to_string(), table.to_string()));
     }
     let (mut schema, mut table, mut file, mut version, mut rows, mut at) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     for (key, e) in lake.cat.scan::<Entry>("ld/", "ld0").await? {
         let folder = key[3..].rsplit_once('/').map_or("", |(f, _)| f);
         for (s, t) in by_folder.get(folder).into_iter().flatten() {
-            if !crate::auth::current().is_none_or(|p| p.may("select", &crate::ddl::join(s, t))) {
+            if !crate::auth::current().is_none_or(|p| p.may("select", &crate::text::join(s, t))) {
                 continue;
             }
             schema.push(s.clone());

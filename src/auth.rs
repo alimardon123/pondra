@@ -402,7 +402,7 @@ pub fn needs(stmt: &Stmt) -> (String, Vec<&'static str>) {
         Stmt::Merge(m) => (catalog_name(&m.target), m.privileges()),
         // (a `$` table is Pondra's: a user's CREATE or definition of one is refused as a row write to it is. A replace's staged
         // table is defined by the leader's own steps, which no door checks: `write::create_as`)
-        Stmt::Create(c) => (catalog_name(&crate::write::object(&c.name)), vec![]),
+        Stmt::Create(c) => (catalog_name(&crate::text::object(&c.name)), vec![]),
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => (catalog_name(t), vec![]),
         _ => (String::new(), vec![]),
     }
@@ -426,7 +426,7 @@ struct Lent {
 /// A table as the catalog names it (`t` for `public.t`, `s.t`; another lake's `l.s.t` stays).
 pub fn catalog_name(t: &str) -> String {
     match t.split('.').collect::<Vec<_>>()[..] {
-        [s, t] if s == crate::ddl::PUBLIC => t.to_string(),
+        [s, t] if s == crate::text::PUBLIC => t.to_string(),
         _ => t.to_string(),
     }
 }

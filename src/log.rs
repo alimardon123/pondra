@@ -828,7 +828,7 @@ pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     let opts = IpcWriteOptions::default().try_with_compression((values >= 1024).then_some(CompressionType::ZSTD))?;
     let mut w = StreamWriter::try_new_with_options(&mut buf, &batches[0].schema(), opts)?;
     for b in batches {
-        w.write(&crate::query::compact(b.clone()))?;
+        w.write(&crate::answer::compact(b.clone()))?;
     }
     w.finish()?;
     drop(w);
@@ -856,7 +856,7 @@ mod tests {
             let b = rows(n);
             let ipc = encode_ipc(std::slice::from_ref(&b)).unwrap();
             assert_eq!(decode(&ipc).unwrap(), vec![b.clone()]);
-            assert_eq!(ipc.len() == crate::query::ipc(std::slice::from_ref(&b)).unwrap().len(), plain, "{n} rows");
+            assert_eq!(ipc.len() == crate::answer::ipc(std::slice::from_ref(&b)).unwrap().len(), plain, "{n} rows");
         }
         let one = rows(1);
         let zstd = || {

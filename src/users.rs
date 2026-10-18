@@ -659,7 +659,7 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
         let parts: Vec<&str> = n.split('.').collect();
         let parts = if parts.len() == 3 && parts[0] == here { &parts[1..] } else { &parts[..] };
         match parts {
-            [s, t] if *s == crate::ddl::PUBLIC => t.to_string(),
+            [s, t] if *s == crate::text::PUBLIC => t.to_string(),
             p => p.join("."),
         }
     };
@@ -1065,7 +1065,7 @@ impl Access {
     /// The columns of `table` (as the catalog names it) it may use for `privilege`: None, none;
     /// Some(None), every column; Some(Some(these)).
     pub fn columns(&self, privilege: &str, table: &str) -> Option<Option<HashSet<String>>> {
-        let schema = crate::ddl::split(table).0;
+        let schema = crate::text::split(table).0;
         let mut some: Option<HashSet<String>> = None;
         for g in self.grants.iter().filter(|g| g.privilege == privilege) {
             match &g.on {

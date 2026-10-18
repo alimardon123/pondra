@@ -3,7 +3,7 @@
 //! `pondra.kinds` by name, comment and definition. Both read the registry (`objects.rs`), so a kind
 //! added there is found as soon as its lister yields it.
 
-use crate::ddl::{join, PUBLIC};
+use crate::text::{join, PUBLIC};
 use crate::objects::{expect_sql, ident, kind, lakes, list, list_sql, name_sql, sql_type, Object, KINDS, PARTS, PATTERNS};
 use crate::store::{table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
@@ -201,13 +201,13 @@ fn session_for<'a>(lake: &'a Lake, views: &'a [String]) -> BoxFuture<'a, Option<
 /// A relation's columns, as a query in `ctx` names and types them. Planned, not run (`LIMIT 0`).
 fn columns_in<'a>(ctx: &'a SessionContext, named: &'a str) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
     Box::pin(async move {
-        let df = crate::query::sql(ctx, &format!("SELECT * FROM {named} LIMIT 0")).await?;
+        let df = crate::engine::sql(ctx, &format!("SELECT * FROM {named} LIMIT 0")).await?;
         Ok(crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), sql_type(&f.data_type().to_string()))).collect())
     })
 }
 
 /// A routine's parameters, each with its type and its default.
-fn routine_parts(all: &HashMap<String, crate::routines::Routine>, o: &Object) -> Vec<PartRow> {
+fn routine_parts(all: &HashMap<String, crate::expander::Routine>, o: &Object) -> Vec<PartRow> {
     let Some(r) = all.get(&o.local()) else { return vec![] };
     r.params.iter().map(|p| part(o, "parameter", p.name.clone(), p.ty.clone(), None, p.default.as_ref().map(|d| format!("DEFAULT {d}")))).collect()
 }

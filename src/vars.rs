@@ -79,7 +79,7 @@ pub fn change(sql: &str) -> Option<Change> {
     static TYPED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(.*?)\s*(?::=|=|\bdefault\b)\s*(.*)$").expect("a regex"));
     static SET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+\$|set\s+variable\s+\$?)([a-z_]\w*)\s*(?::=|=|\bto\b)\s*(.*?)\s*;?\s*$").expect("a regex"));
     static RESET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^reset\s+(?:\$|variable\s+\$?)([a-z_]\w*)\s*;?\s*$").expect("a regex"));
-    let s = crate::write::first_word(sql);
+    let s = crate::text::first_word(sql);
     if !s.starts_with(['$', 'd', 'D', 's', 'S', 'r', 'R']) {
         return None;
     }
@@ -499,7 +499,7 @@ fn after(next: Option<&String>) -> Option<String> {
 
 /// The comment lines just above a statement's code (`-- …`), as one line.
 fn above(stmt: &str) -> Option<String> {
-    let lead = &stmt[..stmt.len() - crate::write::first_word(stmt).len()];
+    let lead = &stmt[..stmt.len() - crate::text::first_word(stmt).len()];
     let lines: Vec<&str> = lead.lines().map(str::trim).rev().skip_while(|l| l.is_empty()).take_while(|l| l.starts_with("--")).collect();
     let text = lines.iter().rev().map(|l| l.trim_start_matches('-').trim()).collect::<Vec<_>>().join(" ");
     Some(text).filter(|t| !t.is_empty() && !t.starts_with('$'))

@@ -2,7 +2,8 @@
 //! writes (tables, views, tasks, bulk inserts, tiering) go to the leader (followers forward them).
 use crate::cluster::Cluster;
 use crate::log::{decode_flush, Ack, Log, Sequencer, Src};
-use crate::query::{latest_sql, raw, schema, session, tail};
+use crate::query::{latest_sql, raw, session, tail};
+use crate::answer::schema;
 use crate::store::*;
 use crate::tasks::Task;
 use crate::tier::{expire, tier_table};
@@ -200,7 +201,7 @@ pub fn router(app: App) -> Router {
 async fn create_function(State(app): State<App>, Path(name): Path<String>, body: Bytes) -> Result<Json<Value>, E> {
     let udf: crate::udf::Udf = serde_json::from_slice(&body).map_err(|e| E(anyhow::anyhow!("{e}: {{\"flight\": \"http://host:port\", \"args\": [\"Binary\"], \"returns\": \"Utf8\"}}")))?;
     for t in udf.args.iter().chain([&udf.returns]) {
-        crate::query::dtype(t)?;
+        crate::answer::dtype(t)?;
     }
     app.lake.cat.commit(vec![(crate::udf::key(&name), serde_json::to_vec(&udf)?)], &[]).await?;
     crate::udf::forget(&app.lake);
@@ -810,7 +811,7 @@ impl App {
 
     /// Run a query: across the cluster when the tables are big (`spread`: "1" always, "0" never).
     pub async fn query(&self, query: &str, spread: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
-        match self.query_as(&crate::asof::rewrite(query)?, spread, false).await {
+        match self.query_as(&crate::sys::planned(query)?, spread, false).await {
             // (`*` left as it is when `sys::hide`'s EXCLUDE names a column its table lacks: a
             // stored view's, say)
             Err(e) if crate::query::handed().is_none() && [crate::sys::mentioned, crate::query::names_deleted].iter().any(|m| m(query) && m(&format!("{e:#}"))) => self.query_as(&crate::asof::as_of(query)?, spread, false).await, // (an answer half sent is never run again)
@@ -818,7 +819,7 @@ impl App {
         }
     }
 
-    /// Run a query as rewritten (`asof::rewrite`: ASOF JOIN as DataFusion can plan it); `files`:
+    /// Run a query as rewritten (`sys::planned`: ASOF JOIN as DataFusion can plan it); `files`:
     /// it may read files on this machine (`owner`). Its work — over 100 KB of it, planning and
     /// running a query — is made on the heap, here: a caller waiting for it holds a pointer, so
     /// procedures calling procedures 16 deep don't run out of stack.
@@ -856,7 +857,7 @@ impl App {
         }
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
-        let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+        let explained = crate::text::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         let run = async {
             let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
@@ -884,7 +885,7 @@ impl App {
                 if frugal {
                     crate::query::frugal(&ctx);
                 }
-                let df = crate::query::sql(&ctx, query).await?;
+                let df = crate::engine::sql(&ctx, query).await?;
                 let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
@@ -921,7 +922,7 @@ impl App {
                 }
                 add(&SPREAD, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
-                Ok(batches.into_iter().map(crate::query::compact).collect()) // (an answer kept or sent holds only its own strings)
+                Ok(batches.into_iter().map(crate::answer::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
                 add(&QUERY_ERRORS, 1);
@@ -1265,7 +1266,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
-        let shown = crate::query::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
+        let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
         let row = row.map(|r| meta.to_logical(&r)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
@@ -1510,7 +1511,7 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past::spelled(text));
             let q = text.to_lowercase();
-            OFFSET.is_match(text) || !crate::ext::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+            OFFSET.is_match(text) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         };
         let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
@@ -1574,11 +1575,11 @@ impl App {
 
 /// Run a query (across the cluster if it's worth it) and format the result.
 async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
-    let explained = crate::write::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+    let explained = crate::text::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
     // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
     let _armed = (crate::answer::streams(p.format.as_deref()) && !explained).then(|| crate::query::arm(p.format.as_deref()));
     let batches = match files {
-        true => app.query_as(&crate::asof::rewrite(query)?, Some("0"), true).await?, // (a file here: this node only)
+        true => app.query_as(&crate::sys::planned(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
     };
     if crate::query::handed().is_some() {
@@ -1813,7 +1814,8 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let (status, code, told) = crate::codes::answer(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4; `codes::answer`, every door's)
+        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
+        let (status, told) = (crate::codes::http(code), crate::ext::said(&self.0)); // (the words its caller may see)
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, [("x-pondra-sqlstate", code)], told).into_response()
     }

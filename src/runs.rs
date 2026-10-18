@@ -19,7 +19,8 @@
 //! - **`pondra.routines`, `pondra.tasks`**: the catalog's functions, procedures and tasks, as
 //!   tables (`SHOW FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` read them).
 use crate::auth::Role;
-use crate::routines::{Kind, Outcome, Routine, Who};
+use crate::routines::{Outcome, Who};
+use crate::expander::{Kind, Routine};
 use crate::server::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
@@ -40,7 +41,7 @@ pub fn new_id() -> String { uuid::Uuid::new_v4().simple().to_string() }
 /// The run log's columns (a keyed table: a run's newest row is its row).
 fn columns() -> Vec<(String, String)> {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
-    let ts = crate::query::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
+    let ts = crate::answer::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
     let text = |n: &str| (n.to_string(), "Utf8".to_string());
     vec![text("id"), text("routine"), text("caller"), text("node"), text("job"), text("args"), ("started".into(), ts.clone()), ("ended".into(), ts), text("status"), text("notices"), text("error"), ("_deleted".into(), "Boolean".into())]
 }
@@ -232,7 +233,7 @@ async fn append(app: &App, producer: &str, seq: u64, lines: &[Line], made: &mut 
         crate::write::on_node_as(app, crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::RunLog]), None, false).await?;
     }
     *made = true;
-    let schema = crate::query::schema(&columns())?;
+    let schema = crate::answer::schema(&columns())?;
     let text = |f: &dyn Fn(&Line) -> Option<String>| Arc::new(lines.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let time = |f: &dyn Fn(&Line) -> Option<u64>| Arc::new(lines.iter().map(|l| f(l).map(|ms| ms as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef;
     let columns = vec![
@@ -424,7 +425,7 @@ pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 min
 /// a, b`, `WHEN cond`, `WITH (…)` and `AS` what it runs, as written (a script too).
 pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     let _ = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-    let name = crate::write::object(&p.parse_object_name(false)?);
+    let name = crate::text::object(&p.parse_object_name(false)?);
     let mut task = Task::default();
     if crate::routines::word(p, "schedule") {
         let _ = p.consume_token(&Token::Eq);
@@ -433,7 +434,7 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
         ensure!(next_after(&e, now_ms()) != u64::MAX, "{:?} never comes: no day in the next 25 years has it", task.schedule);
     } else if crate::routines::word(p, "after") {
         loop {
-            task.after.push(crate::write::object(&p.parse_object_name(false)?));
+            task.after.push(crate::text::object(&p.parse_object_name(false)?));
             if !p.consume_token(&Token::Comma) {
                 break;
             }
@@ -505,13 +506,13 @@ fn task_options(p: &mut Parser) -> Result<TaskOptions> {
 /// `EXECUTE TASK name [(day => value, …)]`: its name and the values' SQL, if `sql` is one.
 pub fn execute_of(sql: &str) -> Option<(String, Vec<(String, String)>)> {
     static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*execute\s+task\b").expect("a regex"));
-    if !HEAD.is_match(crate::write::first_word(sql)) {
+    if !HEAD.is_match(crate::text::first_word(sql)) {
         return None;
     }
-    let mut p = Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(crate::write::first_word(sql)).ok()?;
+    let mut p = Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(crate::text::first_word(sql)).ok()?;
     p.next_token();
     p.next_token();
-    let name = crate::write::object(&p.parse_object_name(false).ok()?);
+    let name = crate::text::object(&p.parse_object_name(false).ok()?);
     let mut args = vec![];
     if p.consume_token(&Token::LParen) && !p.consume_token(&Token::RParen) {
         loop {

@@ -13,7 +13,8 @@
 //! that list's options (`partition_by`, `cluster_by`, `order_by`, `ttl`, `merge`), so everything
 //! after the parser knows one form, and the options as strings keep working.
 
-use crate::write::{cluster_names, ident, partition_text};
+use crate::write::{cluster_names, partition_text};
+use crate::text::ident;
 use anyhow::{bail, ensure, Result};
 use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Token, TokenWithSpan, Tokenizer}};
 use std::borrow::Cow;

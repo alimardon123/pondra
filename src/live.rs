@@ -166,8 +166,8 @@ async fn reads(app: &App, sql: &str) -> anyhow::Result<(Vec<String>, Vec<String>
     let temps = crate::temp::views(sql).into_iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
     let views = crate::query::stored_views(&app.lake, &temps, false).await?;
     let text = views.iter().fold(temps, |t, (_, s)| format!("{t} {s}"));
-    let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| crate::ddl::mentions(&text, t)).collect();
-    let others = app.lake.attached.read().unwrap().iter().map(|(n, _)| n.clone()).filter(|n| crate::ddl::mentions(&text, n)).collect();
+    let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| crate::text::mentions(&text, t)).collect();
+    let others = app.lake.attached.read().unwrap().iter().map(|(n, _)| n.clone()).filter(|n| crate::text::mentions(&text, n)).collect();
     Ok((tables, others))
 }
 

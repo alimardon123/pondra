@@ -319,7 +319,7 @@ pub async fn insert_share(lake: &Lake, s: &Slice, table: &str, stamp: Option<cra
                     crate::query::frugal(ctx);
                 }
                 crate::write::in_order(ctx); // (planned again, its partitions writing in the order rows come)
-                let df = crate::query::sql(ctx, &s.sql).await?;
+                let df = crate::engine::sql(ctx, &s.sql).await?;
                 crate::write::write_rows(lake, ctx, table, df, stamp).await
             }
         }).await
@@ -549,7 +549,7 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         ctx.register_table(table_ref(&p.table), table)?;
     }
     crate::query::register_views(&ctx, crate::query::stored_views(lake, &s.sql, false).await?, true, false).await?; // (over the shares)
-    let df = crate::query::sql(&ctx, &s.sql).await?;
+    let df = crate::engine::sql(&ctx, &s.sql).await?;
     Ok((ctx, df))
 }
 
