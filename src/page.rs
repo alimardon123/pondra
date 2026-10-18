@@ -9,19 +9,22 @@ use crate::ext_names::Attached;
 use crate::front::{Host, Own};
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use async_trait::async_trait;
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, SchemaProvider, TableProvider};
-use datafusion::datasource::MemTable;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, MemoryCatalogProvider, MemoryCatalogProviderList, Session, SchemaProvider, TableProvider};
+use datafusion::common::{Constraints, Statistics};
+use datafusion::datasource::{MemTable, TableType};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::{DdlStatement, LogicalPlan};
+use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::sqlparser::ast::Statement;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, OnceLock, PoisonError};
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
@@ -313,6 +316,7 @@ fn located(url: &str) -> anyhow::Result<String> {
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for
 /// another provider, whose size is not known here.
 async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
+    let table = table.downcast_ref::<Counted>().map_or(table, |c| &c.rows);
     let memory = table.downcast_ref::<MemTable>()?;
     let mut sizes = (0, 0);
     for partition in &memory.batches {
@@ -321,6 +325,63 @@ async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
         }
     }
     Some(sizes)
+}
+
+/// A page's table: its rows a `MemTable`, and what the join order needs to know of them, worked out the first time it
+/// asks (as `query::Pruned::stats` is). The rule asks only when three or more inputs are joined, so a table never joined
+/// so costs its load nothing. Nothing else is passed on: a page refuses DML (`may`), and a table changed under them would
+/// make the statistics stale.
+#[derive(Debug)]
+struct Counted {
+    rows: Arc<dyn TableProvider>,
+    stats: OnceLock<Statistics>,
+}
+
+impl Counted {
+    /// `table` with its statistics when it is a memory table (a page's own tables are); anything else as it is.
+    fn over(table: Arc<dyn TableProvider>) -> Arc<dyn TableProvider> {
+        match table.is::<MemTable>() {
+            true => Arc::new(Counted { rows: table, stats: OnceLock::new() }),
+            false => table,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for Counted {
+    fn schema(&self) -> SchemaRef {
+        self.rows.schema()
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.rows.constraints()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.rows.table_type()
+    }
+
+    fn get_column_default(&self, column: &str) -> Option<&Expr> {
+        self.rows.get_column_default(column)
+    }
+
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.scan(state, projection, filters, limit).await
+    }
+
+    /// The statistics once worked out; else worked out now from the rows, if no write holds them (a page's tables are
+    /// only ever read, so the lock is free). Anything that fails answers None and keeps nothing.
+    fn statistics(&self) -> Option<Statistics> {
+        if let Some(known) = self.stats.get() {
+            return Some(known.clone());
+        }
+        let memory = self.rows.downcast_ref::<MemTable>()?;
+        let mut batches = vec![];
+        for partition in &memory.batches {
+            batches.extend(partition.try_read().ok()?.iter().cloned());
+        }
+        Some(self.stats.get_or_init(|| crate::sketch::statistics(&self.schema(), &batches)).clone())
+    }
 }
 
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
@@ -371,7 +432,7 @@ impl SchemaProvider for Overlay {
     }
 
     fn register_table(&self, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        self.page.register_table(name, table)
+        self.page.register_table(name, Counted::over(table))
     }
 
     fn deregister_table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
@@ -495,6 +556,25 @@ mod tests {
         let made = page.request("POST", "/sql", &[], "CREATE TABLE orders AS FROM 'orders.csv'".into()).await;
         assert_eq!(made.status, 200);
         assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
+    }
+
+    /// `EXPLAIN ANALYZE` answers in a page, which has no tokio runtime. DataFusion's own would spawn its input's tasks
+    /// on one and panic, so this runs under `block_on` alone: a `#[tokio::test]` would have a runtime and hide that.
+    #[test]
+    fn explain_analyze_runs_where_the_page_is() {
+        futures::executor::block_on(async {
+            let page = page_with_tables().await;
+            let plain = page.request("POST", "/sql?format=csv", &[], "EXPLAIN ANALYZE SELECT count(*) FROM orders".into()).await;
+            assert_eq!(plain.status, 200, "{:?}", plain.body);
+            let text = String::from_utf8_lossy(&plain.body).into_owned();
+            assert!(text.contains("Plan with Metrics") && text.contains("output_rows="), "{text}");
+            let verbose = page.request("POST", "/sql?format=csv", &[], "EXPLAIN ANALYZE VERBOSE SELECT count(*) FROM orders".into()).await;
+            assert_eq!(verbose.status, 200, "{:?}", verbose.body);
+            let text = String::from_utf8_lossy(&verbose.body).into_owned();
+            assert!(text.contains("Output Rows") && text.contains("Duration"), "{text}");
+            // The page's tables are still there after it.
+            assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
+        });
     }
 
     #[tokio::test]
@@ -897,5 +977,46 @@ mod tests {
         assert_eq!(page.request("POST", "/sql?format=csv", &[], asof.into()).await.body, "t,p\n3,100\n7,200\n");
         // Asking and reading files make no table: only the two made by SQL are listed.
         assert_eq!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["names", "orders"]);
+    }
+
+    /// A page's table tells the join order what it holds, as a node's does: rows, each column's least and greatest value,
+    /// NULLs and distinct values (`sketch::statistics`).
+    #[tokio::test]
+    async fn a_page_table_says_what_it_holds() {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::ScalarValue;
+        let page = Page::open(&Options::default());
+        let made = page.request("POST", "/sql", &[], "CREATE TABLE t AS VALUES (1, 'a'), (2, 'b'), (3, 'a'), (NULL, 'c')".into()).await;
+        assert_eq!(made.status, 200);
+        let (_, _, schema) = page.default_schema().unwrap();
+        let table = schema.table("t").await.unwrap().unwrap();
+        let stats = table.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Inexact(4));
+        let (ids, names) = (&stats.column_statistics[0], &stats.column_statistics[1]);
+        assert_eq!(ids.min_value, Precision::Inexact(ScalarValue::Int64(Some(1))));
+        assert_eq!(ids.max_value, Precision::Inexact(ScalarValue::Int64(Some(3))));
+        assert_eq!((ids.null_count, ids.distinct_count), (Precision::Inexact(1), Precision::Inexact(3)));
+        assert_eq!(names.distinct_count, Precision::Inexact(3));
+    }
+
+    /// Three tables written in a bad order: as written, the outermost join is `mid.c = tiny.column1`, after all of `big`
+    /// met `mid`. With what the tables hold, the join order meets `tiny` first and `big` last, so the outermost join (the
+    /// plan's first `Join` line) is on `big.k`.
+    #[tokio::test]
+    async fn a_page_joins_by_what_its_tables_hold() {
+        let page = Page::open(&Options::default());
+        for sql in [
+            "CREATE TABLE big AS SELECT value AS k FROM generate_series(1, 200000)",
+            "CREATE TABLE mid AS SELECT value AS k, value % 10 AS c FROM generate_series(1, 20000)",
+            "CREATE TABLE tiny AS VALUES (3)",
+        ] {
+            assert_eq!(page.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
+        }
+        let explained = "EXPLAIN SELECT count(*) FROM big JOIN mid ON big.k = mid.k JOIN tiny ON mid.c = tiny.column1";
+        let answer = page.request("POST", "/sql", &[], explained.into()).await;
+        let rows: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        let logical = rows.as_array().unwrap().iter().find(|r| r["plan_type"] == "logical_plan").unwrap()["plan"].as_str().unwrap();
+        let first_join = logical.lines().find(|l| l.contains("Join")).unwrap();
+        assert!(first_join.contains("big.k"), "{logical}");
     }
 }

@@ -1,11 +1,13 @@
 //! The session every query starts from, in every build: DataFusion's, with Pondra's rules, planners and the
 //! functions that need no lake (Spark's, JSON's, `sum` over DOUBLE, …). A node adds its own (`Lake::made`); a page
 //! uses it as it is, so both plan a query alike (designs/l2-b4-front-and-web.md).
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, StringArray, UnionArray};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, StringArray, StringBuilder, UnionArray};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::{exec_err, Result};
+use datafusion::common::format::{ExplainFormat, MetricCategory, MetricType};
+use datafusion::common::instant::Instant;
+use datafusion::common::{exec_err, internal_err, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
@@ -13,9 +15,13 @@ use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::simplify::{ExprSimplifyResult, SimplifyContext};
 use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::analyze::AnalyzeExec;
+use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::{create_udf, SessionConfig, SessionContext};
+use futures::StreamExt;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
 /// that need no lake. `Lake::made` adds the node's own.
@@ -328,11 +334,78 @@ pub fn kept(rows: Vec<RecordBatch>, plan: &Arc<dyn ExecutionPlan>) -> Vec<Record
     rows
 }
 
-/// A frame's rows, as `kept` gives them.
+/// A frame's rows, as `kept` gives them. An `EXPLAIN ANALYZE` runs its plan in this task (`analyzed`).
 pub async fn collect(df: datafusion::dataframe::DataFrame) -> anyhow::Result<Vec<RecordBatch>> {
+    if let LogicalPlan::Analyze(a) = df.logical_plan() {
+        let level = a.analyze_level;
+        return analyzed(df, level).await;
+    }
     let task = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
     Ok(kept(datafusion::physical_plan::collect(plan.clone(), task).await?, &plan))
+}
+
+/// `EXPLAIN ANALYZE` run in this task. DataFusion's `AnalyzeExec` runs each input partition on a tokio task, and a
+/// page has no tokio runtime to spawn one on: it panics there and takes every table of the page with it. So the
+/// input runs here, one partition after another, and the answer is built as DataFusion builds it.
+async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType>) -> anyhow::Result<Vec<RecordBatch>> {
+    let task = Arc::new(df.task_ctx());
+    let plan = df.create_physical_plan().await?;
+    let Some(exec) = plan.downcast_ref::<AnalyzeExec>() else {
+        return Ok(kept(datafusion::physical_plan::collect(plan.clone(), task).await?, &plan));
+    };
+    let input = exec.input().clone();
+    let start = Instant::now();
+    let mut rows = 0;
+    for partition in 0..input.output_partitioning().partition_count() {
+        let mut stream = input.execute(partition, task.clone())?;
+        while let Some(batch) = stream.next().await.transpose()? {
+            rows += batch.num_rows();
+        }
+    }
+    let duration = Instant::now() - start;
+    // (The planner works the metric types out from the statement's level or the session's; `AnalyzeExec` keeps
+    // the result but doesn't expose it, so it is worked out here the same way.)
+    let level = level.unwrap_or(task.session_config().options().explain.analyze_level);
+    Ok(vec![analyze_output(exec, &plan.schema(), rows, duration, &level.included_types())?])
+}
+
+/// The answer of an `EXPLAIN ANALYZE` as one batch of (plan type, plan) rows. This is DataFusion's
+/// `create_output_batch` (`physical-plan/src/analyze.rs`), which is private, so its text is kept the same: a page's
+/// answer is a node's.
+fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration: Duration, types: &[MetricType]) -> Result<RecordBatch> {
+    let (input, verbose) = (exec.input().as_ref(), exec.verbose());
+    let categories = exec.metric_categories().map(<[MetricCategory]>::to_vec);
+    let mut kinds = StringBuilder::new();
+    let mut plans = StringBuilder::new();
+    match exec.format() {
+        ExplainFormat::Indent => {
+            kinds.append_value("Plan with Metrics");
+            let plan = DisplayableExecutionPlan::with_metrics(input).set_metric_types(types.to_vec()).set_metric_categories(categories.clone()).set_show_statistics(exec.show_statistics());
+            plans.append_value(plan.indent(verbose).to_string());
+            if verbose {
+                kinds.append_value("Plan with Full Metrics");
+                let full = DisplayableExecutionPlan::with_full_metrics(input).set_metric_types(types.to_vec()).set_metric_categories(categories).set_show_statistics(exec.show_statistics());
+                plans.append_value(full.indent(verbose).to_string());
+                kinds.append_value("Output Rows");
+                plans.append_value(rows.to_string());
+                kinds.append_value("Duration");
+                plans.append_value(format!("{duration:?}"));
+            }
+        }
+        ExplainFormat::PostgresJSON => {
+            // (As DataFusion has it: the JSON renderer prints no statistics, so none are asked for here.)
+            kinds.append_value("Plan with Metrics");
+            let plan = if verbose { DisplayableExecutionPlan::with_full_metrics(input) } else { DisplayableExecutionPlan::with_metrics(input) };
+            let mut plan = plan.set_metric_types(types.to_vec()).set_metric_categories(categories);
+            if verbose {
+                plan = plan.set_summary(Some(rows), Some(duration));
+            }
+            plans.append_value(plan.pgjson(verbose).to_string());
+        }
+        other => return internal_err!("AnalyzeExec does not support {other} output format"),
+    }
+    Ok(RecordBatch::try_new(schema.clone(), vec![Arc::new(kinds.finish()), Arc::new(plans.finish())])?)
 }
 
 #[cfg(test)]

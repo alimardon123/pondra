@@ -630,9 +630,8 @@ impl Pruned {
             // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range
             // could hold, nor than its rows.
             let sketched = self.meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
-            let spanned = range.as_ref().and_then(|(lo, hi)| crate::manifest::span(lo, hi));
-            if let Some(n) = [sketched, spanned].into_iter().flatten().min() {
-                stats.column_statistics[i].distinct_count = Precision::Inexact((n as usize).min(rows as usize).max(1));
+            if let Some(n) = crate::sketch::distinct(sketched, range.as_ref().map(|(lo, hi)| (lo, hi)), rows) {
+                stats.column_statistics[i].distinct_count = Precision::Inexact(n);
             }
             if let Some((lo, hi)) = range {
                 (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));

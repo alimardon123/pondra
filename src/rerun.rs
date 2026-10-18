@@ -872,7 +872,7 @@ struct Touched {
 fn scan(rows: Vec<RecordBatch>) -> Result<Touched> {
     let rows = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
     let exact = |c: &ArrayRef| c.null_count() == 0 && crate::manifest::orderable(c.data_type()) && !c.data_type().is_floating();
-    let ranges = rows.columns().iter().map(|c| exact(c).then(|| crate::manifest::min_max(std::slice::from_ref(c))).flatten()).collect();
+    let ranges = rows.columns().iter().map(|c| exact(c).then(|| crate::sketch::min_max(std::slice::from_ref(c))).flatten()).collect();
     let t = datafusion::datasource::MemTable::try_new(rows.schema(), vec![vec![rows]])?;
     Ok(Touched { plan: LogicalPlanBuilder::scan(TOUCHED, datafusion::datasource::provider_as_source(Arc::new(t)), None)?.build()?, ranges })
 }
