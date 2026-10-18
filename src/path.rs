@@ -5,7 +5,8 @@
 //! needs no session. A stored view is written and read apart: one made under `USE crm` keeps
 //! `crm.t`, and one made without a path reads `t` as public, whoever reads it (`routines::expand_stored`).
 //! Names already full, and this lake's own `public`, come out as they went in.
-use crate::ddl::{self, join, lake_name, PUBLIC};
+use crate::ddl::{self, lake_name};
+use crate::text::{join, PUBLIC};
 use crate::codes::coded;
 use crate::store::{table_key, Lake};
 use anyhow::{Context, Result};
@@ -96,7 +97,7 @@ pub fn schemas_here(lake: &Lake) -> Vec<String> {
 /// Is `sql` a `USE`? The session's to set (`settings.rs` checks for one first).
 pub fn is_use(sql: &str) -> bool {
     static USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^use\s").expect("a regex"));
-    USE.is_match(crate::write::first_word(sql))
+    USE.is_match(crate::text::first_word(sql))
 }
 
 /// `USE crm`, `USE dev`, `USE dev.sales`, `USE DATABASE dev`, `USE CATALOG dev`, `USE SCHEMA sales`
@@ -178,7 +179,7 @@ pub async fn door(lake: &Lake, sql: &str, skip: &HashSet<String>) -> Result<Stri
     if !apply(&path, skip, &w, &mut stmts) {
         return Ok(sql.to_string());
     }
-    Ok(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"))
+    Ok(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"))
 }
 
 /// Stored SQL (a view's query) with its `current_*` as the reader's session has them: its path, else
@@ -201,7 +202,7 @@ fn currents_of(path: &Path, sql: &str) -> String {
         let _ = s.visit(&mut walk);
     }
     match walk.changed {
-        true => stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n"),
+        true => stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"),
         false => sql.to_string(),
     }
 }
@@ -240,7 +241,7 @@ async fn stored_current(lake: &Lake, sql: &str) -> Result<bool> {
         let mut found = false;
         for (k, raw) in &stored {
             let name = &k[2..];
-            if seen.contains(name) || !ddl::mentions(&text, name) {
+            if seen.contains(name) || !crate::text::mentions(&text, name) {
                 continue;
             }
             let v: ddl::StoredView = serde_json::from_slice(raw)?;
@@ -548,7 +549,7 @@ impl<'a> Walk<'a> {
         if name.0.iter().any(|p| p.as_ident().is_some_and(|i| i.quote_style == Some('\''))) {
             return false; // ('data/x.csv': a file, as DuckDB reads it: `ext.rs`)
         }
-        let Some(parts) = name.0.iter().map(|p| p.as_ident().map(crate::write::ident)).collect::<Option<Vec<String>>>() else { return false };
+        let Some(parts) = name.0.iter().map(|p| p.as_ident().map(crate::text::ident)).collect::<Option<Vec<String>>>() else { return false };
         if self.free(&parts, fam) {
             return false;
         }
@@ -639,7 +640,7 @@ impl VisitorMut for Walk<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
-        let names = q.with.as_ref().map(|w| w.cte_tables.iter().map(|c| crate::write::ident(&c.alias.name)).collect()).unwrap_or_default();
+        let names = q.with.as_ref().map(|w| w.cte_tables.iter().map(|c| crate::text::ident(&c.alias.name)).collect()).unwrap_or_default();
         self.ctes.push(names);
         ControlFlow::Continue(())
     }
@@ -656,7 +657,7 @@ impl VisitorMut for Walk<'_> {
                 None => {
                     self.name(name, Fam::Relation, false);
                 }
-                Some(a) if name.0.len() == 1 && crate::write::object(name) == "pondra_at" => self.at(a),
+                Some(a) if name.0.len() == 1 && crate::text::object(name) == "pondra_at" => self.at(a),
                 Some(_) => {}
             }
         }
@@ -813,7 +814,7 @@ impl VisitorMut for Walk<'_> {
 /// A function's name, when it has one part (the lower-case word).
 fn one_part(name: &ObjectName) -> Option<String> {
     match name.0.as_slice() {
-        [p] => p.as_ident().map(crate::write::ident),
+        [p] => p.as_ident().map(crate::text::ident),
         _ => None,
     }
 }
@@ -849,7 +850,7 @@ mod tests {
     fn rewrite(path: &Path, w: &World, sql: &str) -> String {
         let mut stmts = parse_text(sql).expect("the statement parses");
         apply(path, &HashSet::new(), w, &mut stmts);
-        stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n")
+        stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n")
     }
 
     #[test]

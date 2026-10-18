@@ -521,7 +521,7 @@ pub async fn latest(store: &Store) -> Result<Option<Term>> {
 /// empty for a `pondra sql` INSERT recording its files: nothing to follow, just wait for it.)
 pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     // (its id goes into the record: a process here can tell when we're gone; none reaches a lake in our memory)
-    let lock = if crate::store::held_in_memory(store) { None } else { new_lock() };
+    let lock = if crate::memory::held_in_memory(store) { None } else { new_lock() };
     let term = Term { n, addr: addr.into(), lock: lock.as_ref().map(|(id, ..)| id.clone()).unwrap_or_default() };
     let lock = lock.map(|(_, path, f)| (path, f));
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };

@@ -21,7 +21,7 @@
 //! nodes by the address they start from. Not supported: transactions.
 use crate::auth::Role;
 use crate::log::{Ack, Src};
-use crate::query::schema;
+use crate::answer::schema;
 use crate::reset::Once;
 use crate::server::App;
 use crate::store::{seg_key, table_key, Segment, TableMeta};

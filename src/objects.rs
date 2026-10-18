@@ -9,7 +9,8 @@
 //! editing for it to be listed, described and shown. Comments are kept apart (`cm/{family}/{name}`,
 //! `cm/column/{table}/{stored column}`, a view's column by its name), and follow a rename or go with a drop (`follow`, from
 //! `ddl::apply`).
-use crate::ddl::{join, split, Ddl, PUBLIC};
+use crate::ddl::Ddl;
+use crate::text::{join, split, PUBLIC};
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
@@ -277,7 +278,7 @@ fn indexes(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                 }
                 let meta = l.cat.get::<TableMeta>(&table_key(&i.table)).await?;
                 let lake_part = if name == here { String::new() } else { format!("{}.", ident(&name)) };
-                let def = crate::index::create_sql(&ident(crate::ddl::split(&k[3..]).1), &format!("{lake_part}{}", name_sql(&i.table)), &i, meta.as_ref());
+                let def = crate::index::create_sql(&ident(crate::text::split(&k[3..]).1), &format!("{lake_part}{}", name_sql(&i.table)), &i, meta.as_ref());
                 all.push(Object::new("index", &name, &k[3..], Some(def)));
             }
         }
@@ -302,7 +303,7 @@ fn types(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
 
 fn routines(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
     Box::pin(async move {
-        use crate::routines::Kind as R;
+        use crate::expander::Kind as R;
         let here = crate::ddl::lake_name(lake);
         let mut out = vec![];
         for (name, l) in lakes(lake).await {
@@ -511,7 +512,7 @@ pub(crate) fn sql_type(t: &str) -> String {
             d => d.to_string(),
         }
     }
-    crate::query::dtype(t).map_or_else(|_| t.to_string(), |d| of(&d))
+    crate::answer::dtype(t).map_or_else(|_| t.to_string(), |d| of(&d))
 }
 
 /// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows.
@@ -603,8 +604,8 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.
-pub(crate) fn routine_sql(name: &str, r: &crate::routines::Routine) -> String {
-    use crate::routines::Kind as R;
+pub(crate) fn routine_sql(name: &str, r: &crate::expander::Routine) -> String {
+    use crate::expander::Kind as R;
     let macro_ = r.what() == "macro";
     let params = r.params.iter().map(|p| {
         let named = Some(p.name.as_str()).filter(|n| !n.chars().all(|c| c.is_ascii_digit())).map(ident);
@@ -722,7 +723,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
     use crate::write::Stmt;
     static COMMENT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(&format!(r"(?is)^\s*comment\s+(if\s+exists\s+)?on\s+({})\s+(.*)$", *KIND_WORDS)).expect("a regex"));
     static OR_ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*create\s+)or\s+alter\s+(\w+(?:\s+view)?)\b").expect("a regex"));
-    let first = crate::write::first_word(sql);
+    let first = crate::text::first_word(sql);
     if let Some(c) = COMMENT.captures(first) {
         let kind = c[2].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
         return Some(match comment_of(&c[3]) {
@@ -737,7 +738,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
         "VIEW" => crate::write::parse(&plain.replacen(&c[1], &format!("{}OR REPLACE ", &c[1]), 1)), // (a view holds nothing to keep)
         "TABLE" => Some(match crate::write::parse(&plain) {
             Some(Stmt::Create(t)) if t.query.is_none() && t.like.is_none() && !t.or_replace && !t.if_not_exists && !t.temporary => {
-                Stmt::Ddl(vec![Ddl::Object(Op::OrAlterTable { name: crate::write::object(&t.name), sql: plain })])
+                Stmt::Ddl(vec![Ddl::Object(Op::OrAlterTable { name: crate::text::object(&t.name), sql: plain })])
             }
             Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
             _ => Stmt::Invalid("CREATE OR ALTER TABLE takes the table's columns (… AS SELECT makes it anew: CREATE OR REPLACE TABLE)".into()),
@@ -749,7 +750,7 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
 /// `name IS 'text' | NULL`: the name as SQL resolves it, and the text (None: no comment).
 fn comment_of(rest: &str) -> Result<(String, Option<String>)> {
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(rest)?;
-    let name = crate::write::object(&p.parse_object_name(false)?);
+    let name = crate::text::object(&p.parse_object_name(false)?);
     p.expect_keyword_is(Keyword::IS)?;
     let text = match p.next_token().token {
         Token::Word(w) if w.keyword == Keyword::NULL => None,
@@ -848,7 +849,7 @@ fn view_columns<'a>(lake: &'a Lake, view: &'a str) -> BoxFuture<'a, Result<Optio
             return Ok(None);
         }
         let sql = format!("SELECT * FROM {} LIMIT 0", name_sql(view));
-        let df = crate::query::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
+        let df = crate::engine::sql(&crate::query::session(lake, &sql, "").await?, &sql).await?;
         Ok(Some(df.schema().fields().iter().map(|f| f.name().clone()).collect()))
     })
 }
@@ -958,7 +959,7 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     // check rows that were never checked (a uuid, a length); a uuid made text, a length grown.
     let mut changed = vec![];
     for ((c, t), (_, new)) in was.iter().zip(&columns) {
-        if crate::query::dtype(t).ok() != crate::query::dtype(new).ok() || sql_types.get(c) != old.sql_types.get(c) {
+        if crate::answer::dtype(t).ok() != crate::answer::dtype(new).ok() || sql_types.get(c) != old.sql_types.get(c) {
             let written = create.columns.iter().find(|d| d.name.value == *c || d.name.value.to_lowercase() == *c).map_or_else(|| sql_type(new), |d| d.data_type.to_string());
             Box::pin(crate::ddl::apply(lake, Ddl::AlterColumn { table: table.clone(), column: c.clone(), change: crate::ddl::Change::Type(written) })).await?;
             changed.push(format!("{c} {}", sql_type(new)));
@@ -1010,7 +1011,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
     let word = c[1].split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase();
     let name = {
         let mut p = Parser::new(&GenericDialect {}).try_with_sql(&c[2])?;
-        let n = crate::write::object(&p.parse_object_name(false)?);
+        let n = crate::text::object(&p.parse_object_name(false)?);
         ensure!(p.peek_token().token == Token::EOF, "SHOW CREATE {} name", word.to_uppercase());
         n
     };

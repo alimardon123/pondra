@@ -67,7 +67,7 @@ impl Point {
     /// Its answer's columns.
     pub fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> {
         let types: HashMap<&str, &str> = self.meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
-        crate::query::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
+        crate::answer::schema(&self.names.iter().map(|n| (n.clone(), types[n.as_str()].to_string())).collect::<Vec<_>>())
     }
 
     /// Which types its columns are (`pg_types`: a uuid, json or jsonb): its table's own, by name.
@@ -81,7 +81,7 @@ impl Point {
         for (k, v) in self.meta.key.iter().zip(&self.key) {
             if v.is_none() {
                 if let Some(i) = self.params.get(k).copied().filter(|i| (1..=n).contains(i)) {
-                    out[i - 1] = crate::query::dtype(types[k.as_str()]).unwrap_or(datafusion::arrow::datatypes::DataType::Utf8);
+                    out[i - 1] = crate::answer::dtype(types[k.as_str()]).unwrap_or(datafusion::arrow::datatypes::DataType::Utf8);
                 }
             }
         }
@@ -301,7 +301,7 @@ pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key).map(|(c, v)| Ok((c.as_str(), ScalarValue::try_from_string(v.to_string(), &types[c.as_str()].parse()?)?))).collect::<Result<_>>()?;
     anyhow::ensure!(keys.len() == meta.key.len(), "the key of {table} has {} parts", meta.key.len());
     let created = |r: &RecordBatch| -> Result<Option<i64>> {
-        let Some(c) = r.column_by_name(crate::sys::CREATED).filter(|c| c.is_valid(0)) else { return Ok(None) };
+        let Some(c) = r.column_by_name(crate::text::CREATED).filter(|c| c.is_valid(0)) else { return Ok(None) };
         Ok(Some(cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))?.as_primitive::<TimestampMicrosecondType>().value(0)))
     };
     let deleted = |r: &RecordBatch| r.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<BooleanArray>().map(|b| b.is_valid(0) && b.value(0))) == Some(true);
@@ -310,7 +310,7 @@ pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &
         return Ok((!deleted(&r)).then_some((r, n, Some(at))));
     }
     let Some(r) = newest_in_files(lake, meta, &keys).await? else { return Ok(None) };
-    let Some(v) = r.column_by_name(crate::sys::VERSION).filter(|c| c.is_valid(0)).map(|c| cast(c, &DataType::Int64)).transpose()? else { return Ok(None) };
+    let Some(v) = r.column_by_name(crate::text::VERSION).filter(|c| c.is_valid(0)).map(|c| cast(c, &DataType::Int64)).transpose()? else { return Ok(None) };
     let v = v.as_primitive::<Int64Type>().value(0) as u64;
     let at = created(&r)?;
     Ok((!deleted(&r)).then_some((r, v, at)))

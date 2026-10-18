@@ -42,13 +42,13 @@ async fn footer(lake: &Lake, ctx: &datafusion::prelude::SessionContext, table: &
     let schema = datafusion::parquet::arrow::parquet_to_arrow_schema(md.file_metadata().schema_descr(), md.file_metadata().key_value_metadata())?;
     let (mut stats, mut nulls) = (crate::manifest::Stats::new(), vec![]);
     for (i, (stored, t)) in meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c)) {
-        let (name, want) = (meta.name_of(stored), crate::query::dtype(t)?);
+        let (name, want) = (meta.name_of(stored), crate::answer::dtype(t)?);
         let Some(field) = in_file(&schema, i as i64 + 1, name) else {
             ensure!(!meta.not_null.contains(stored), "{}: it has no column {name}, which is NOT NULL in {table}", f.path);
             nulls.push(stored.clone());
             continue;
         };
-        ensure!(same(field.data_type(), &want), "{}: its column {name} is {}, {table}'s is {}", f.path, field.data_type(), crate::query::type_name(&want));
+        ensure!(same(field.data_type(), &want), "{}: its column {name} is {}, {table}'s is {}", f.path, field.data_type(), crate::answer::type_name(&want));
         let c = StatisticsConverter::try_new(field.name(), &schema, md.file_metadata().schema_descr())?;
         let counts = c.row_group_null_counts(md.row_groups().iter())?;
         let (known, held) = (counts.null_count() == 0, counts.iter().flatten().sum::<u64>());
@@ -77,7 +77,7 @@ async fn partition(md: &datafusion::parquet::file::metadata::ParquetMetaData, sc
     use datafusion::parquet::arrow::arrow_reader::statistics::StatisticsConverter;
     let col = spec.split_once('(').map_or(spec, |(_, c)| c.trim_end_matches(')')).trim();
     let i = meta.columns.iter().position(|(c, _)| c == col).context("the partition's column")?;
-    let (name, t) = (meta.name_of(col), crate::query::dtype(&meta.columns[i].1)?);
+    let (name, t) = (meta.name_of(col), crate::answer::dtype(&meta.columns[i].1)?);
     let field = in_file(schema, i as i64 + 1, name).with_context(|| format!("{path}: it has no column {name}, which {spec} partitions by"))?;
     let c = StatisticsConverter::try_new(field.name(), schema, md.file_metadata().schema_descr())?;
     let nulls: u64 = c.row_group_null_counts(md.row_groups().iter())?.iter().flatten().sum();
@@ -175,7 +175,7 @@ pub async fn file(lake: &Lake, seq: &crate::log::Sequencer, commits: &[FileCommi
                 }
             }
             let src = Src { producer: format!("job:{}", c.job), seq: 1, prev: None }; // (the job, once)
-            let none = RecordBatch::new_empty(crate::query::schema(&meta.logical_columns())?);
+            let none = RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?);
             marks.push(Append { table: c.table.clone(), src, batch: none, ack: tokio::sync::oneshot::channel().0 });
             // (a COPY INTO file's record and the job mark of the version it replaces: in this commit, so the file's rows and its record land together)
             let (record, lost) = match crate::copy::load_of(&c.job) {
@@ -233,8 +233,8 @@ pub async fn upserts(lake: &Lake, seq: &crate::log::Sequencer, table: &str, rows
 fn sys_schema(meta: &TableMeta, old: bool) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     let sys = crate::sys::columns();
     let mut columns = meta.columns.clone();
-    columns.extend(sys.iter().filter(|(c, _)| c == crate::sys::ROW_ID || (old && (c == crate::sys::CREATED || c == crate::sys::VERSION))).cloned());
-    crate::query::schema(&columns)
+    columns.extend(sys.iter().filter(|(c, _)| c == crate::text::ROW_ID || (old && (c == crate::text::CREATED || c == crate::text::VERSION))).cloned());
+    crate::answer::schema(&columns)
 }
 
 /// A file commit's rows as the views that follow its table take them: under the names SQL knows,
@@ -297,7 +297,7 @@ async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Re
     }
     ids.sort_unstable();
     ids.dedup();
-    let range = |f: &DataFile| f.stats.get(crate::sys::ROW_ID).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
+    let range = |f: &DataFile| f.stats.get(crate::text::ROW_ID).and_then(|(lo, hi)| Some((lo.parse::<i64>().ok()?, hi.parse::<i64>().ok()?)));
     let mut found = 0;
     for f in live.iter().filter(|f| range(f).is_none_or(|(lo, hi)| lo <= ids[ids.len() - 1] && ids[0] <= hi)) {
         let gone: std::collections::HashSet<u64> = deleted_rows(lake, f).await?.into_iter().collect();
@@ -423,9 +423,9 @@ pub fn system_stats(l: &Lineage, rows: u64) -> Vec<(String, (String, String))> {
     let (at, version) = (text(&at), l.version.to_string());
     let last = l.first + rows.saturating_sub(1) as i64;
     vec![
-        (crate::sys::ROW_ID.into(), (l.first.to_string(), last.to_string())),
-        (crate::sys::VERSION.into(), (version.clone(), version)),
-        (crate::sys::CREATED.into(), (at.clone(), at.clone())),
-        (crate::sys::UPDATED.into(), (at.clone(), at)),
+        (crate::text::ROW_ID.into(), (l.first.to_string(), last.to_string())),
+        (crate::text::VERSION.into(), (version.clone(), version)),
+        (crate::text::CREATED.into(), (at.clone(), at.clone())),
+        (crate::text::UPDATED.into(), (at.clone(), at)),
     ]
 }

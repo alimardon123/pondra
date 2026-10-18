@@ -11,7 +11,7 @@
 use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::sql::sqlparser::ast::{self, AccessExpr, Expr, ObjectName, Query, SelectItem, SetExpr, Statement, TrimWhereField};
 
-use crate::write::ident;
+use crate::text::ident;
 
 /// The field metadata that holds a column's Postgres name (`shown` reads it; `pg_types::typed` sets it).
 pub const KEY: &str = "pg_name";

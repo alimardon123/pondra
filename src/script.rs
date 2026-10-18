@@ -359,7 +359,7 @@ static OPENER: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// Is `sql` a statement only a script has (a block, a branch, a loop, `PRINT`, `RAISE`, …), or one
 /// naming something by `IDENTIFIER(…)`? Then `run` takes it.
 pub fn is(sql: &str) -> bool {
-    let s = crate::write::first_word(sql);
+    let s = crate::text::first_word(sql);
     // (one that doesn't read is the runner's too: it says why)
     OPENER.is_match(s) && parse(s).map_or(true, |all| !(all.len() == 1 && all[0].1.plain().is_some())) || names_identifier(s)
 }

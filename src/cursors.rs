@@ -59,7 +59,7 @@ const NO_SESSION: &str = "a cursor is a session's: a Postgres connection's, or a
 /// The cursor statement `sql` is, if it is one (`Some(Err)`: a form this door doesn't take, or a
 /// syntax error). `DECLARE $day …` is a variable's, not a cursor's.
 pub fn of(sql: &str) -> Option<Result<Cmd>> {
-    let s = crate::write::first_word(sql).trim_end_matches(';').trim_end(); // (past a comment before it, as dbt's)
+    let s = crate::text::first_word(sql).trim_end_matches(';').trim_end(); // (past a comment before it, as dbt's)
     let verb = s.split_whitespace().next()?.to_uppercase();
     let words = || s.split_whitespace().skip(1).collect::<Vec<&str>>();
     match verb.as_str() {
@@ -85,7 +85,7 @@ fn declare(s: &str) -> Option<Result<Cmd>> {
     }
     let Some(f) = FOR.captures(&c[3]) else { return Some(Err(syntax(&c[3]))) };
     let query = f[2].trim().to_string();
-    let first = crate::write::first_word(&query).split_whitespace().next().unwrap_or_default().to_uppercase();
+    let first = crate::text::first_word(&query).split_whitespace().next().unwrap_or_default().to_uppercase();
     if !(["SELECT", "WITH", "VALUES", "TABLE"].contains(&first.as_str()) || query.starts_with('(')) {
         return Some(Err(coded("42601", "DECLARE … FOR takes a query: SELECT, WITH, VALUES or TABLE")));
     }
@@ -216,7 +216,7 @@ fn refused(held: usize, needs: usize) -> anyhow::Error {
 async fn planned(app: &App, query: &str) -> Result<SchemaRef> {
     let sql = crate::asof::rewrite(query)?.into_owned();
     let ctx = crate::query::session(&app.lake, &sql, "").await?;
-    let df = crate::query::sql(&ctx, &sql).await?;
+    let df = crate::engine::sql(&ctx, &sql).await?;
     Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone()))
 }
 

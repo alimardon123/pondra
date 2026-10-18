@@ -200,7 +200,7 @@ fn caller<T>(req: &Request<T>) -> crate::auth::Principal {
 
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
 fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
-    let stream = futures::stream::iter(batches.into_iter().map(|b| Ok(crate::query::compact(b))));
+    let stream = futures::stream::iter(batches.into_iter().map(|b| Ok(crate::answer::compact(b))));
     Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(Status::from))
 }
 
@@ -208,7 +208,7 @@ fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
 /// it (`sent_field`), and every column nullable. The plan's nullability and the run's differ where the
 /// optimizer folds an expression (`upper('x')` becomes a literal, never NULL), and where the plan says NOT
 /// NULL the run gives NULL (a scalar subquery takes its inner field's nullability: `SELECT (SELECT 1 WHERE
-/// false)`); table scans are nullable anyway (`query::schema`). Clients compare the two, so both say this.
+/// false)`); table scans are nullable anyway (`answer::schema`). Clients compare the two, so both say this.
 fn announced(schema: &Schema) -> Schema {
     let fields = schema.fields().iter().map(|f| sent_field(f).with_nullable(true)).collect::<Vec<_>>();
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -273,7 +273,7 @@ async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(a
 
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
-    let df = crate::query::sql(&ctx, &crate::asof::rewrite(sql)?).await?;
+    let df = crate::engine::sql(&ctx, &crate::asof::rewrite(sql)?).await?;
     Ok(announced(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
 }
 
@@ -414,7 +414,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
         let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
-        let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::query::schema(&m.logical_columns()).ok()?))) else { // (SQL's names: ADR-022)
+        let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::answer::schema(&m.logical_columns()).ok()?))) else { // (SQL's names: ADR-022)
             let _ = acks_tx.send(Err(Status::not_found(format!("no table {table}")))).await;
             return;
         };
@@ -497,7 +497,7 @@ impl Json {
 /// a message with `{"after": N}`.
 async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool) -> Result<Out<FlightData>, Status> {
     let meta: TableMeta = app.lake.cat.get(&table_key(&table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
-    let full = crate::query::schema(&meta.logical_columns()).map_err(status)?;
+    let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
     let pick: Vec<usize> = match &columns {
         Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| Status::invalid_argument(format!("no column {c}")))).collect::<Result<_, _>>()?,
         None => (0..full.fields().len()).collect(),
@@ -522,7 +522,7 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
                         continue;
                     }
                     let chunk = rows.and_then(|rows| {
-                        let rows = rows.iter().map(|b| b.project(&pick).map(crate::query::compact)).collect::<Result<Vec<_>, _>>().map_err(status)?;
+                        let rows = rows.iter().map(|b| b.project(&pick).map(crate::answer::compact)).collect::<Result<Vec<_>, _>>().map_err(status)?;
                         let mut data: Vec<Result<FlightData, Status>> = arrow_flight::utils::batches_to_flight_data(&schema, rows).map_err(status)?.into_iter().skip(1).map(Ok).collect(); // (the schema went first)
                         data.push(Ok(FlightData { app_metadata: format!("{{\"after\":{now}}}").into_bytes().into(), ..Default::default() }));
                         Ok(data)
@@ -676,7 +676,7 @@ impl FlightSqlService for Sql {
             return Err(status(crate::codes::coded("0A000", "an ingest inside a transaction isn't taken yet: ingest outside it, or INSERT the rows in it")));
         }
         let table = match cmd.schema.as_deref() {
-            Some(schema) if !schema.is_empty() => crate::ddl::join(schema, &cmd.table), // (ADBC's db_schema_name)
+            Some(schema) if !schema.is_empty() => crate::text::join(schema, &cmd.table), // (ADBC's db_schema_name)
             _ => cmd.table.clone(),
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
@@ -707,7 +707,7 @@ impl FlightSqlService for Sql {
                 Some(Ok(b)) => b.schema(),
                 _ => return Err(Status::invalid_argument("no rows to take the table's columns from")),
             };
-            let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+            let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
             crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(status)?;
         }
         let mut acks = append(&self.0, table, String::new(), 0, batches)?;
@@ -787,12 +787,12 @@ impl FlightSqlService for Sql {
         allowed(&self.0, &req, Role::Read)?;
         let (mut b, lake) = (q.into_builder(), &self.0.lake);
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
-            let (schema, table) = crate::ddl::split(&key[2..]);
-            let columns = crate::query::schema(&meta.logical_columns()).map_err(status)?;
+            let (schema, table) = crate::text::split(&key[2..]);
+            let columns = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
             b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
         }
         for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
-            let (schema, view) = crate::ddl::split(&key[2..]);
+            let (schema, view) = crate::text::split(&key[2..]);
             if let Ok(columns) = plan_schema(&self.0, &format!("SELECT * FROM {}", crate::write::sql_name(&key[2..]))).await {
                 b.append(crate::ddl::lake_name(lake), schema, view, "VIEW", &columns).map_err(status)?;
             }
@@ -855,7 +855,7 @@ impl FlightService for Door {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
                     crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
                     let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
-                    let full = crate::query::schema(&meta.logical_columns()).map_err(status)?;
+                    let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
                     let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
                     if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
                 }

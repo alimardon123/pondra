@@ -187,7 +187,7 @@ async fn procedures(app: &App) -> Vec<Value> {
         "BOOLEAN" | "BOOL" => "boolean",
         _ => "string",
     };
-    let mut out: Vec<Value> = all.iter().filter(|(_, r)| r.kind == crate::routines::Kind::Procedure).map(|(name, r)| {
+    let mut out: Vec<Value> = all.iter().filter(|(_, r)| r.kind == crate::expander::Kind::Procedure).map(|(name, r)| {
         let props: serde_json::Map<String, Value> = r.params.iter().map(|p| (p.name.clone(), json!({"type": kind(p.ty.as_deref()), "description": p.ty}))).collect();
         let required: Vec<&str> = r.params.iter().filter(|p| p.default.is_none()).map(|p| p.name.as_str()).collect();
         let about = r.body.lines().map(str::trim).find(|l| !l.is_empty()).filter(|l| l.starts_with("--") || l.starts_with('#')).map(|l| l.trim_start_matches(['-', '#', ' ']).to_string());
@@ -207,7 +207,7 @@ fn tool(name: &str) -> String {
 /// The procedure a tool stands for.
 async fn procedure(app: &App, t: &str) -> Option<String> {
     let all = crate::routines::listed(&app.lake).await.ok()?;
-    all.iter().find(|(n, r)| r.kind == crate::routines::Kind::Procedure && tool(n) == t).map(|(n, _)| n.clone())
+    all.iter().find(|(n, r)| r.kind == crate::expander::Kind::Procedure && tool(n) == t).map(|(n, _)| n.clone())
 }
 
 /// This lake and the attached ones, with the prefix their tables go by.

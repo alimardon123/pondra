@@ -61,7 +61,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     static ALTER: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+INDEX\s+(IF\s+EXISTS\s+)?([\w."$-]+)\s+RENAME\s+TO\s+([\w."$-]+)\s*;?\s*$"#).expect("a regex"));
     static ALTERED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*ALTER\s+INDEX\b").expect("a regex"));
     static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*DROP\s+INDEX\b").expect("a regex"));
-    let first = crate::write::first_word(sql);
+    let first = crate::text::first_word(sql);
     let ddl = |c: Change| Some(Stmt::Ddl(vec![crate::ddl::Ddl::Index(c)]));
     if CREATE.is_match(first) {
         return Some(match Parser::parse_sql(&GenericDialect {}, sql).map(|mut s| s.pop()) {
@@ -86,7 +86,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     if DROP.is_match(first) {
         return Some(match Parser::parse_sql(&GenericDialect {}, sql).map(|mut s| s.pop()) {
             Ok(Some(ast::Statement::Drop { object_type: ast::ObjectType::Index, names, if_exists, .. })) => {
-                return ddl(Change::Drop { names: names.iter().map(crate::write::object).collect(), if_exists })
+                return ddl(Change::Drop { names: names.iter().map(crate::text::object).collect(), if_exists })
             }
             _ => Stmt::Invalid("DROP INDEX [IF EXISTS] name [, …]".into()),
         });
@@ -111,11 +111,11 @@ fn create(c: ast::CreateIndex) -> Result<Change> {
         Key { expr: k.column.expr.to_string(), rest: format!("{class}{}", k.column.options) }
     }).collect();
     Ok(Change::Create {
-        name: c.name.as_ref().map(crate::write::object),
-        table: crate::write::object(&c.table_name),
+        name: c.name.as_ref().map(crate::text::object),
+        table: crate::text::object(&c.table_name),
         keys,
         using,
-        include: c.include.iter().map(crate::write::ident).collect(),
+        include: c.include.iter().map(crate::text::ident).collect(),
         predicate: c.predicate.as_ref().map(|p| match p {
             ast::Expr::Nested(p) => p.to_string(), // (`WHERE (a IS NOT NULL)` as SHOW CREATE writes it)
             p => p.to_string(),
@@ -143,19 +143,19 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             }
             let include = include.iter().map(|c| stored(c)).collect::<Result<Vec<_>>>()?;
             let predicate = predicate.map(|p| rewrite(&p, true, &stored)).transpose()?;
-            let (schema, t) = crate::ddl::split(&table);
+            let (schema, t) = crate::text::split(&table);
             let name = match name {
                 Some(n) => match n.rsplit_once('.') {
                     Some((s, n)) => {
                         ensure!(s == schema, "an index is in its table's schema ({schema}), not {s}");
-                        crate::ddl::join(schema, n)
+                        crate::text::join(schema, n)
                     }
-                    None => crate::ddl::join(schema, &n),
+                    None => crate::text::join(schema, &n),
                 },
                 None => {
                     // (Postgres's name: the table's, its columns', `idx`; then idx1, idx2… while taken)
                     let words: Vec<String> = kept.iter().map(|k| plain(&k.expr).map_or("expr".to_string(), |c| meta.name_of(&c).to_string())).collect();
-                    let base = crate::ddl::join(schema, &format!("{t}_{}_idx", words.join("_")));
+                    let base = crate::text::join(schema, &format!("{t}_{}_idx", words.join("_")));
                     let mut i = 0;
                     loop {
                         let n = if i == 0 { base.clone() } else { format!("{base}{i}") };
@@ -181,10 +181,10 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                 return Ok(j!({"index": name, "exists": false}));
             };
             let to = match to.split('.').collect::<Vec<_>>()[..] {
-                [t] => crate::ddl::join(crate::ddl::split(&name).0, t),
+                [t] => crate::text::join(crate::text::split(&name).0, t),
                 _ => to,
             };
-            ensure!(crate::ddl::split(&to).0 == crate::ddl::split(&name).0, "an index stays in its table's schema");
+            ensure!(crate::text::split(&to).0 == crate::text::split(&name).0, "an index stays in its table's schema");
             let to = crate::ddl::new_name(lake, &to).await?;
             ensure!(!taken(lake, &to).await?, "relation \"{to}\" already exists");
             lake.cat.commit(vec![(key(&to), json(&index))], &[key(&name)]).await?;
@@ -197,7 +197,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                     Some((n, _)) => gone.push(n),
                     None => {
                         // (a unique index is its table's UNIQUE constraint: `constraints::unique_index`)
-                        let (schema, short) = crate::ddl::split(&n);
+                        let (schema, short) = crate::text::split(&n);
                         match crate::constraints::index_of(lake, schema, short).await? {
                             Some(t) => drop(crate::constraints::apply(lake, &t, crate::constraints::Change::Drop { name: short.into(), if_exists: false }).await?),
                             None => ensure!(if_exists, "index \"{n}\" does not exist"),
@@ -235,8 +235,8 @@ fn rewrite(text: &str, quoted: bool, to: &dyn Fn(&str) -> Result<String>) -> Res
     let mut failed = None;
     let _ = visit_expressions_mut(&mut e, |x| {
         let named = match x {
-            ast::Expr::Identifier(i) => Some(crate::write::ident(i)),
-            ast::Expr::CompoundIdentifier(p) => p.last().map(crate::write::ident), // (t.c is c: an index is on one table)
+            ast::Expr::Identifier(i) => Some(crate::text::ident(i)),
+            ast::Expr::CompoundIdentifier(p) => p.last().map(crate::text::ident), // (t.c is c: an index is on one table)
             _ => None,
         };
         if let Some(n) = named {

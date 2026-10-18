@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// What the front asks of where it runs. Asked once a statement, or once a name, never once a batch.
 pub trait Host: Sync {
-    /// The lake's name, the first part of a three-part name (`ddl::local_in`).
+    /// The lake's name, the first part of a three-part name (`text::local_in`).
     fn name(&self) -> String;
     /// The node's own statements, asked before anything else (`SHOW CREATE`, `pondra.find`, `SUMMARIZE`, …).
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send;
@@ -24,7 +24,7 @@ pub trait Host: Sync {
     fn routines(&self) -> impl Future<Output = Result<Arc<HashMap<String, Routine>>>> + Send;
     /// Other engines' catalogs attached (`ext::attached`).
     fn attached(&self) -> impl Future<Output = Result<Vec<(String, Attached)>>> + Send;
-    /// The columns of these tables of the lake (names inside it, as `ddl::local_in` gives them), system columns last;
+    /// The columns of these tables of the lake (names inside it, as `text::local_in` gives them), system columns last;
     /// a name with no table is left out.
     fn columns(&self, tables: BTreeSet<String>) -> impl Future<Output = Result<HashMap<String, Vec<String>>>> + Send;
     /// Whether `sql` reads a view with measures or names a measure (`measures::wanted`).

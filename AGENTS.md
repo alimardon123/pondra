@@ -583,7 +583,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 35. **A scalar subquery is answered before anything that uses it runs** (`spmd::hoist`): a shuffle
    takes the `ScalarSubqueryExec`s out of the plan, and `step()` fills their shared answer slots
    as soon as the exchanges they read are done — on every node, from the same all-gathered rows.
-   A shuffle's pieces are compacted (`query::compact`, invariant 202) before they are counted or written: a
+   A shuffle's pieces are compacted (`answer::compact`, invariant 202) before they are counted or written: a
    `Utf8View` slice otherwise carries every string of the batch it was cut from.
 36. **A key range holds its NULLs once.** The first range holds every NULL of the key: a piece
    that may hold one (`DataFile::nulls` lists the column, or doesn't say) is read by the first
@@ -1042,7 +1042,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 132. **A lake's table is a `BASE TABLE`** to `information_schema` (`query::Table`), and nothing
    else changes: it passes every call through, its plan included, so DataFusion plans it as
    before. `harness.py found`.
-133. **A time without seconds is a timestamp** (`query::seconds`): the `Seconds` optimizer rule
+133. **A time without seconds is a timestamp** (`optimize::seconds`): the `Seconds` optimizer rule
    gives a literal DataFusion would cast its `:00` before it is folded, and `query::strict` does
    the same for rows being written. `harness.py found`.
 134. **The console's answers are exact** (`server::typed`): rows as lists, so a join's repeated
@@ -1465,10 +1465,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    projections already sit between them. `join_order.py`: "past an outer join, written badly, joins
    the returns last" and "under an exists, written badly, starts from the nation" fail without
    them; `tpcds_check.py`: 99 of 99 the same as DuckDB.
-202. **An answer carries only its own rows' strings** (`query::compact`): a string or binary view
+202. **An answer carries only its own rows' strings** (`answer::compact`): a string or binary view
    points into a buffer it may share with every other row of the page or batch it came from, and
    Arrow IPC sends every buffer a view points into. So an answer (`App::query_as`), every IPC stream
-   (`query::ipc`, `log::encode_ipc`), Flight's streams and a shuffle's pieces copy out views whose
+   (`answer::ipc`, `log::encode_ipc`), Flight's streams and a shuffle's pieces copy out views whose
    buffers are mostly other rows'. Without it a `LIMIT 5` of a 50,000-row table was 3.2 MB as
    Arrow, a 10-row ClickBench answer 220 MB (and too big for the result cache).
    `harness.py found`: "a few rows of a table's, sent as Arrow (HTTP, Flight), carry only their own
@@ -1624,7 +1624,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    its own, as the caller, under the `WITH`s around it: one pass asks, the next takes the answers
    in the same order, so every node of a spread query gets the same text. A lambda stays `x -> …`
    in the text (the generic dialect reads it as JSON's arrow) and becomes one where a query is
-   planned (`query::sql`, at every planning site). A probe made inside a CTE is planned over the
+   planned (`engine::sql`, at every planning site). A probe made inside a CTE is planned over the
    CTEs before it only, and a recursive one's first term as itself (`Friendly::over`): with its own
    definition in it, the probe asked itself again until the stack overflowed and the node died (a
    plain `WITH RECURSIVE`, found by the 0.33.0 gates); asks inside asks stop 8 deep (`ASKING`).
@@ -1637,7 +1637,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (NULL)` was dropped); `ProjectionPushdown` leaves a projection on a filter that has one of its
    own where it is (`optimize::GuardedPushdown`: DataFusion swapped them as if the filter's own
    weren't there, and the columns pointed at others); a statement written back as text goes through
-   `routines::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
+   `text::sql` (sqlparser writes `- -3` as `--3`, a comment); DataFusion's aggregate schema
    check is off (its two analyses of a CASE's nullability disagree; the rows are the same).
    `harness.py friendly`'s last five checks fail without them.
 227. **Every kind of object is one registry entry, and its comments live apart from it** (`objects.rs`,
@@ -1869,7 +1869,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `environments_check.py`: "CLONE of a database next door that signs in on its own: refused
    without its own rights, and saying where it is cloned".
 257. **A table's rows are written as Parquet can hold them, and read back as the table's type**
-   (`tier::storable`, every data file and a Parquet download): Parquet has no type for Arrow's
+   (`answer::storable`, every data file and a Parquet download): Parquet has no type for Arrow's
    intervals of months, days and nanoseconds, so such a column (in a list or a struct too) is written
    as its text, which every read casts back exactly (`hot::decode` and the scans cast a file's
    columns to the table's types). Written as it was, a table with an `INTERVAL` column never left
@@ -2654,7 +2654,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 401. **An INSERT's literal rows are DataFusion's, without its planner** (`literals.rs`, from `write::rows_of`):
    a `VALUES` of literals, casts of them and the statement's time functions is built as the planner would
    build it (its own `sql_to_expr` and `simplify`, one start time a statement, the session's
-   `optimize::config`, `query::seconds`, `values_typed`'s casts, a cast to an integer rounded as
+   `optimize::config`, `optimize::seconds`, `values_typed`'s casts, a cast to an integer rounded as
    `casts::Rounds` rounds it), and anything else (another call, arithmetic, a placeholder, a cast that
    fails, two types in a column, a session's own settings) is planned. Only how the batch is made changes,
    never where it goes. `cargo test --lib literals` compares both paths value by value.
@@ -2789,7 +2789,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`optimize::settled`). `harness.py found`: "INSERT … VALUES (1e15) and INSERT … SELECT 1e15 store the same…",
    "DECLARE $x = 1e15…", "…a keyed table's DOUBLE to 1e15…", "a column DEFAULT 1e15…".
 416. **A sort of strings hands up only its own rows' strings** (`held::LeanExec`, `LeanSorts`): a sort that keeps
-   all its rows and has a `Utf8View` or `BinaryView` column passes its output through `query::compact`
+   all its rows and has a `Utf8View` or `BinaryView` column passes its output through `answer::compact`
    (invariant 202). Its `take` and its merge's `interleave` copy views but keep the buffers they point into, so a
    batch it hands up points into the current batch of every run it merges, and the `SortPreservingMergeExec`
    above counts those buffers whole: a 10M-row sort of md5 strings on 4 partitions counted 66 MB for about 2 MB of

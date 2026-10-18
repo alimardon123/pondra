@@ -115,7 +115,7 @@ impl Seen {
 
 /// Whether a file keeps column `i`'s range: the first 32 columns that have an order, and the
 /// system columns.
-fn ranged(i: usize, f: &datafusion::arrow::datatypes::Field) -> bool { (i < 32 || crate::sys::NAMES.contains(&f.name().as_str())) && orderable(f.data_type()) }
+fn ranged(i: usize, f: &datafusion::arrow::datatypes::Field) -> bool { (i < 32 || crate::text::NAMES.contains(&f.name().as_str())) && orderable(f.data_type()) }
 
 /// Column `name`'s min and max from a file's footer: over its row groups' own, when every row
 /// group that holds a value has them, exact (not cut short).
@@ -330,7 +330,7 @@ pub async fn seal(lake: &Lake, table: &str, meta: &mut TableMeta) -> Result<bool
     if !meta.key.is_empty() || meta.files.len() <= INLINE {
         return Ok(false);
     }
-    let (dir, schema) = (format!("data/{}/_manifests", meta.folder(table)), crate::query::schema(&crate::sys::with_sys(meta).columns)?);
+    let (dir, schema) = (format!("data/{}/_manifests", meta.folder(table)), crate::answer::schema(&crate::sys::with_sys(meta).columns)?);
     meta.files.sort_by_key(|f| f.ord);
     let mut sealing: Vec<DataFile> = meta.files.drain(..meta.files.len() - SEAL).collect();
     sealing.sort_by(|a, b| (&a.part, a.ord).cmp(&(&b.part, b.ord))); // (a manifest covers few partitions)

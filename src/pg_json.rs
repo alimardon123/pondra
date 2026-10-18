@@ -664,7 +664,7 @@ fn name_questions(items: &mut Vec<ast::SelectItem>) {
         .collect();
 }
 
-fn written(stmts: &[ast::Statement]) -> String { stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join(";\n") }
+fn written(stmts: &[ast::Statement]) -> String { stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n") }
 
 /// Regroups one JSON operator node in place. True when its grouping changed; the node is then nested where it was moved.
 fn regroup_at(e: &mut ast::Expr) -> bool {
@@ -831,9 +831,9 @@ fn is_question(e: &ast::Expr) -> bool { matches!(e, ast::Expr::BinaryOp { op: Bi
 /// `?`, `?|` or `?&` as the call Postgres names for it; any other expression as it is.
 fn unquestion(e: ast::Expr) -> ast::Expr {
     match e {
-        ast::Expr::BinaryOp { left, op: BinaryOperator::Question, right } => crate::types::function("jsonb_exists", vec![*left, *right]),
-        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionPipe, right } => crate::types::function("jsonb_exists_any", vec![*left, *right]),
-        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionAnd, right } => crate::types::function("jsonb_exists_all", vec![*left, *right]),
+        ast::Expr::BinaryOp { left, op: BinaryOperator::Question, right } => crate::text::function("jsonb_exists", vec![*left, *right]),
+        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionPipe, right } => crate::text::function("jsonb_exists_any", vec![*left, *right]),
+        ast::Expr::BinaryOp { left, op: BinaryOperator::QuestionAnd, right } => crate::text::function("jsonb_exists_all", vec![*left, *right]),
         other => other,
     }
 }

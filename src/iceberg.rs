@@ -103,7 +103,7 @@ impl Layout {
                 None => ("identity".to_string(), p.trim()),
             };
             let i = at(col)?;
-            let t = crate::query::dtype(&meta.columns[i].1).ok()?;
+            let t = crate::answer::dtype(&meta.columns[i].1).ok()?;
             let time = matches!(t, DataType::Date32 | DataType::Timestamp(TimeUnit::Microsecond, _));
             let fits = match transform.as_str() {
                 "identity" => time || matches!(t, DataType::Int32 | DataType::Int64 | DataType::Utf8 | DataType::Boolean),
@@ -402,7 +402,7 @@ fn metadata(lake: &Lake, folder: &str, uuid: &str, v: u64, now: u64, schema: &Va
     // The files also hold the rows' system columns (`sys.rs`), which the schema leaves out: named
     // too (ids of their own, never the schema's), so a reader that maps a file's every column by
     // name — PyIceberg — takes them, and leaves them out as the schema does.
-    names.extend(crate::sys::NAMES.iter().enumerate().map(|(i, c)| json!({"field-id": 1_000_001 + i, "names": [c]})));
+    names.extend(crate::text::NAMES.iter().enumerate().map(|(i, c)| json!({"field-id": 1_000_001 + i, "names": [c]})));
     let older = &snapshots[..snapshots.len() - 1];
     let current = &snapshots[snapshots.len() - 1].0["snapshot-id"];
     json!({
@@ -606,7 +606,8 @@ fn missing(what: &str, kind: &str) -> (axum::http::StatusCode, axum::Json<Value>
 
 /// Every namespace: its parts, its lake, and the schema in it.
 async fn spaces(app: &crate::server::App) -> Vec<(Vec<String>, std::sync::Arc<Lake>, String)> {
-    use crate::ddl::{schemas, PUBLIC};
+    use crate::ddl::schemas;
+    use crate::text::PUBLIC;
     let attached = app.lake.attached.read().unwrap().clone();
     let mut out = vec![];
     for (name, lake) in [(None, app.lake.clone())].into_iter().chain(attached.into_iter().map(|(n, l)| (Some(n), l))) {
@@ -685,15 +686,15 @@ fn quoted(n: &str) -> String {
 async fn tables(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
-    let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::ddl::split(&k[2..]).0 == schema)
-        .map(|(k, _)| json!({"namespace": parts, "name": crate::ddl::split(&k[2..]).1})).collect();
+    let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::text::split(&k[2..]).0 == schema)
+        .map(|(k, _)| json!({"namespace": parts, "name": crate::text::split(&k[2..]).1})).collect();
     Ok(axum::Json(json!({"identifiers": ids})))
 }
 
 /// A table's name as SQL says it, from its namespace (`spaces`).
 fn sql_name(app: &crate::server::App, parts: &[String], lake: &std::sync::Arc<Lake>, schema: &str, table: &str) -> String {
     let q = quoted;
-    match (std::sync::Arc::ptr_eq(lake, &app.lake), schema == crate::ddl::PUBLIC) {
+    match (std::sync::Arc::ptr_eq(lake, &app.lake), schema == crate::text::PUBLIC) {
         (true, true) => q(table),
         (true, false) => format!("{}.{}", q(schema), q(table)),
         (false, _) => format!("{}.{}.{}", q(&parts[0]), q(schema), q(table)),
@@ -726,7 +727,7 @@ async fn create(axum::extract::State(app): axum::extract::State<crate::server::A
     let table = asked["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("a table without its name".into()))?;
     let sql = create_sql(&sql_name(&app, &parts, &lake, &schema, table), &asked).map_err(|e| bad(crate::ext::said(&e)))?;
     as_caller(&app, role, &sql).await?;
-    let name = crate::ddl::join(&schema, table);
+    let name = crate::text::join(&schema, table);
     for _ in 0..600 {
         if let Ok(v) = loaded(&lake, &name).await {
             return Ok(axum::Json(v)); // (its first version: published by the leader's next round)
@@ -885,7 +886,7 @@ fn schema_sql(name: &str, meta: &Value, asked: &Value) -> Result<Vec<String>> {
 /// `purgeRequested` or not: a Pondra table's files are its own).
 async fn drop_table(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>) -> Result<axum::http::StatusCode, Refusal> {
     let (parts, lake, schema) = space(&app, &ns).await?;
-    loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
+    loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| missing(&format!("table {}.{table}", parts.join(".")), "NoSuchTableException"))?;
     as_caller(&app, role, &format!("DROP TABLE {}", sql_name(&app, &parts, &lake, &schema, &table))).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -900,7 +901,7 @@ async fn rename(axum::extract::State(app): axum::extract::State<crate::server::A
     if ns(from) != ns(to) {
         return Err(bad(format!("{name} to another namespace: a Pondra table is renamed within its schema")));
     }
-    loaded(&lake, &crate::ddl::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
+    loaded(&lake, &crate::text::join(&schema, name)).await.map_err(|_| missing(&format!("table {}.{name}", parts.join(".")), "NoSuchTableException"))?;
     let sql = format!("ALTER TABLE {} RENAME TO \"{}\"", sql_name(&app, &parts, &lake, &schema, name), new.replace('"', "\"\""));
     as_caller(&app, role, &sql).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
@@ -912,8 +913,8 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
     // metadata table `files` of `t`, as Spark does)
     let no_table = || missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException");
     let (_, lake, schema) = space(&app, &ns).await.map_err(|_| no_table())?;
-    crate::auth::check_all(&crate::ddl::join(&schema, &table)).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?; // (a user's: an engine reads the whole files)
-    Ok(axum::Json(loaded(&lake, &crate::ddl::join(&schema, &table)).await.map_err(|_| no_table())?))
+    crate::auth::check_all(&crate::text::join(&schema, &table)).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?; // (a user's: an engine reads the whole files)
+    Ok(axum::Json(loaded(&lake, &crate::text::join(&schema, &table)).await.map_err(|_| no_table())?))
 }
 
 /// A table's current version, as the catalog answers it (`metadata-location`, `metadata`).
@@ -1008,7 +1009,7 @@ fn conflict(message: String) -> Refusal { refused(409, "CommitFailedException", 
 /// snapshot id. Anything else is refused by name.
 async fn update(axum::extract::State(app): axum::extract::State<crate::server::App>, axum::Extension(role): axum::Extension<crate::auth::Role>, axum::extract::Path((ns, table)): axum::extract::Path<(String, String)>, body: bytes::Bytes) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
-    let name = crate::ddl::join(&schema, &table);
+    let name = crate::text::join(&schema, &table);
     crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
     let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.replace('\u{1f}', ".")), "NoSuchTableException"))?;
     let asked: Value = serde_json::from_slice(&body).map_err(|e| bad(format!("the commit: {e}")))?;
@@ -1054,7 +1055,7 @@ async fn transaction(axum::extract::State(app): axum::extract::State<crate::serv
             return Err(bad("a transaction over tables of two databases: each database commits its own".into()));
         }
         let table = id["name"].as_str().unwrap_or_default();
-        let name = crate::ddl::join(&schema, table);
+        let name = crate::text::join(&schema, table);
         crate::auth::check("insert", &name).map_err(|e| refused(403, "ForbiddenException", crate::ext::said(&e)))?;
         let current = loaded(&lake, &name).await.map_err(|_| missing(&format!("table {}.{table}", ns.join(".")), "NoSuchTableException"))?;
         if let Some(c) = prepare(&lake, &name, &current, change).await? {
@@ -1121,7 +1122,7 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     use datafusion::prelude::ident;
     anyhow::ensure!(meta.order.is_none() && meta.merge.is_empty(), "{name} combines each key's rows (order_by, or a view's GROUP BY): other engines' changes to it go through Pondra's SQL");
     let logical = meta.logical();
-    let schema = crate::query::schema(&logical.columns)?;
+    let schema = crate::answer::schema(&logical.columns)?;
     let names: Vec<&str> = meta.key.iter().map(|k| meta.name_of(k)).collect();
     let ids: std::collections::BTreeSet<i64> = meta.key.iter().filter_map(|k| meta.columns.iter().position(|(c, _)| c == k)).map(|i| i as i64 + 1).collect();
     let ctx = lake.session();
@@ -1132,7 +1133,7 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
         let df = ctx.read_parquet(lake.full(&f.path), Default::default()).await?;
         gone.extend(df.select(names.iter().map(|n| ident(*n)).collect::<Vec<_>>())?.collect().await?);
     }
-    let stored = crate::query::schema(&meta.columns.iter().filter(|(c, _)| meta.key.contains(c)).cloned().collect::<Vec<_>>())?;
+    let stored = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| meta.key.contains(c)).cloned().collect::<Vec<_>>())?;
     let file = |p: &str| meta.files.iter().find(|f| f.path == p).cloned().with_context(|| format!("{CONFLICT}: {p} is no longer {name}'s"));
     for (p, d, _) in &c.deleted {
         for b in crate::adopt::rows_deleted(lake, meta, &file(p)?, std::slice::from_ref(d), &stored).await? {
@@ -1163,7 +1164,7 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
     }
     let rows = datafusion::arrow::compute::concat_batches(&schema, &out)?;
     use base64::Engine;
-    (c.rows, c.marked) = (Some(base64::engine::general_purpose::STANDARD.encode(crate::query::ipc(&[rows])?)), marked as u64);
+    (c.rows, c.marked) = (Some(base64::engine::general_purpose::STANDARD.encode(crate::answer::ipc(&[rows])?)), marked as u64);
     Ok(())
 }
 
@@ -1360,7 +1361,7 @@ async fn done(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&
 /// that reads them in the table's order.
 async fn incoming(lake: &Lake, meta: &TableMeta, files: &[DataFile]) -> Result<(datafusion::prelude::SessionContext, String)> {
     let meta = meta.logical();
-    let schema = crate::query::schema(&meta.columns)?;
+    let schema = crate::answer::schema(&meta.columns)?;
     let ctx = lake.session();
     let urls: Vec<String> = files.iter().map(|f| lake.full(&f.path)).collect();
     let df = ctx.read_parquet(urls, datafusion::prelude::ParquetReadOptions::default().schema(&schema)).await?;

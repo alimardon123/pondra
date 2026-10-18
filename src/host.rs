@@ -1,8 +1,8 @@
 //! A node as the SQL front's host (`front.rs`): what the front asks, answered from the lake.
 
-use crate::ext::Attached;
+use crate::ext_names::Attached;
 use crate::front::{Host, Own};
-use crate::routines::Routine;
+use crate::expander::Routine;
 use crate::store::Lake;
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -27,7 +27,7 @@ impl Host for Lake {
         for n in tables {
             if let Some(m) = self.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&n)).await? {
                 let m = m.logical();
-                out.insert(n, m.columns.into_iter().map(|(c, _)| c).chain(crate::sys::NAMES.map(String::from)).collect());
+                out.insert(n, m.columns.into_iter().map(|(c, _)| c).chain(crate::text::NAMES.map(String::from)).collect());
             }
         }
         Ok(out)
@@ -61,7 +61,7 @@ async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame
     let sql = crate::routines::expand(lake, sql).await?;
     let sql = crate::asof::rewrite(&sql)?.into_owned();
     let ctx = crate::query::session(lake, &sql, "").await?;
-    crate::query::sql(&ctx, &sql).await
+    crate::engine::sql(&ctx, &sql).await
 }
 
 /// The node's own statements, asked before anything else (`Host::own`): the seven passes of the

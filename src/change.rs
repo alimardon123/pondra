@@ -11,7 +11,8 @@
 //! once (its job id), all or nothing, and streams like any other write.
 use crate::log::{pack, Append, Outcome, Sequencer, Src};
 use crate::store::*;
-use crate::sys::{self, ROW_ID};
+use crate::sys;
+use crate::text::ROW_ID;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{ArrayRef, BooleanArray};
 use datafusion::arrow::compute::concat_batches;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 /// `DELETE … USING` and `INSERT … ON CONFLICT` are carried out as one too (`write::parse`).
 pub struct Merge {
     pub sql: String,    // the statement as written
-    pub target: String, // as SQL names it (`write::object`)
+    pub target: String, // as SQL names it (`text::object`)
     alias: String,
     source: String, // the table or subquery, with its alias, as written
     on: String,
@@ -141,8 +142,8 @@ pub fn merge_refused(m: &ast::Merge) -> Option<String> {
 
 pub fn merge_of(m: &ast::Merge) -> Option<Merge> {
     let ast::TableFactor::Table { name, alias, .. } = &m.table else { return None };
-    let target = crate::write::object(name);
-    let alias = alias.as_ref().map(|a| crate::write::ident(&a.name)).unwrap_or_else(|| target.rsplit('.').next().unwrap_or(&target).to_string()); // (unquoted: lower case, as SQL reads it)
+    let target = crate::text::object(name);
+    let alias = alias.as_ref().map(|a| crate::text::ident(&a.name)).unwrap_or_else(|| target.rsplit('.').next().unwrap_or(&target).to_string()); // (unquoted: lower case, as SQL reads it)
     let column = |o: &ast::ObjectName| o.0.last().and_then(|p| p.as_ident()).map(|i| if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() });
     let mut clauses = vec![];
     for c in &m.clauses {
@@ -248,10 +249,10 @@ fn conjuncts<'a>(e: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
     }
 }
 
-/// `q.c` as (q, c), each read as SQL reads a name (`write::ident`); None for anything else.
+/// `q.c` as (q, c), each read as SQL reads a name (`text::ident`); None for anything else.
 fn qualified(e: &ast::Expr) -> Option<(String, String)> {
     match e {
-        ast::Expr::CompoundIdentifier(p) if p.len() == 2 => Some((crate::write::ident(&p[0]), crate::write::ident(&p[1]))),
+        ast::Expr::CompoundIdentifier(p) if p.len() == 2 => Some((crate::text::ident(&p[0]), crate::text::ident(&p[1]))),
         _ => None,
     }
 }
@@ -268,7 +269,7 @@ async fn compared_as_keys(lake: &Lake, meta: &TableMeta, sources: &[(String, (St
     let schema = crate::query::run_schema(&ctx, df.logical_plan())?; // (the types the query gives: a literal's as the analyzer types it)
     let fields = schema.fields();
     Ok(sources.iter().zip(fields.iter()).all(|((k, _), f)| {
-        let key = meta.columns.iter().find(|(c, _)| c == k).map(|(_, t)| crate::query::dtype(t));
+        let key = meta.columns.iter().find(|(c, _)| c == k).map(|(_, t)| crate::answer::dtype(t));
         matches!(key, Some(Ok(t)) if same_key_type(&t, f.data_type()))
     }))
 }
@@ -319,7 +320,7 @@ impl Upsert {
         // The conflict columns are cast to the table's types before a conflict is checked, as Postgres casts an INSERT's
         // values first: `excluded` holds the cast keys, so a DECIMAL 7003.5 for a BIGINT key is the key 7003 and conflicts
         // with it. (The other columns are cast as they are written; a list's type has no spelling `arrow_cast` reads back.)
-        let typed = |c: &String, expr: String| match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::query::dtype(t)) {
+        let typed = |c: &String, expr: String| match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::answer::dtype(t)) {
             Some(Ok(t)) if !matches!(t, DataType::List(_)) => format!("arrow_cast({expr}, '{t}')"),
             _ => expr,
         };
@@ -467,7 +468,7 @@ fn filter(cond: &Option<String>) -> String { cond.as_ref().map(|w| format!("WHER
 
 async fn update(lake: &Lake, table: &str, meta: &TableMeta, set: &[(String, String)], cond: &Option<String>, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && c != "_deleted"), "UPDATE sets the table's own columns");
-    ensure!(set.iter().all(|(c, _)| !sys::NAMES.contains(&c.as_str())), "system columns can't be set");
+    ensure!(set.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str())), "system columns can't be set");
     select(lake, table, meta, set, &format!("FROM {} {}", from(table), filter(cond)), upto).await
 }
 
@@ -484,7 +485,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     let mut items = vec![];
     if insert.is_none() {
         items.extend(cols.iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__o_{c}")))));
-        items.extend([ROW_ID, sys::CREATED, sys::VERSION].iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__s{c}"))))); // (`__s`: a column of the table named `created_at` is `__o_created_at`)
+        items.extend([ROW_ID, crate::text::CREATED, crate::text::VERSION].iter().map(|c| format!("{a}.{} AS {}", q(c), q(&format!("__s{c}"))))); // (`__s`: a column of the table named `created_at` is `__o_created_at`)
     }
     if let Some(set) = set {
         items.extend(cols.iter().map(|c| match set.iter().find(|(s, _)| s == *c) {
@@ -499,7 +500,7 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     }
     let sql = format!("SELECT {} {rest}", items.join(", "));
     let ctx = session(lake, &sql, upto).await?;
-    let batches = crate::query::sql(&ctx, &crate::asof::as_of(&sql)?).await?.collect().await?;
+    let batches = crate::engine::sql(&ctx, &crate::asof::as_of(&sql)?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok((vec![], vec![])) };
     let all = concat_batches(&first.schema(), &batches)?;
     let old = if insert.is_none() { vec![part(&all, meta, "__o_", true)?] } else { vec![] };
@@ -511,13 +512,13 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
 /// (`query::strict`: a fraction into an integer rounds, a value that won't go is an error), and (`ids`) the rows'
 /// `_row_id`, `_created_at` (and, for old versions, `_version`) after them.
 fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<RecordBatch> {
-    let target = crate::query::schema(&meta.columns)?;
+    let target = crate::answer::schema(&meta.columns)?;
     let get = |name: &str| all.column_by_name(name).cloned().with_context(|| format!("{name}?"));
     let mut fields: Vec<Arc<Field>> = target.fields().to_vec();
     let mut columns = target.fields().iter().map(|f| crate::query::strict(&get(&format!("{prefix}{}", f.name()))?, f.data_type())).collect::<Result<Vec<ArrayRef>>>()?;
     if ids {
-        let old = if prefix == "__o_" { vec![sys::VERSION] } else { vec![] };
-        for c in [ROW_ID, sys::CREATED].into_iter().chain(old) {
+        let old = if prefix == "__o_" { vec![crate::text::VERSION] } else { vec![] };
+        for c in [ROW_ID, crate::text::CREATED].into_iter().chain(old) {
             let v = get(&format!("__s{c}"))?;
             fields.push(Arc::new(Field::new(c, v.data_type().clone(), true)));
             columns.push(v);
@@ -589,7 +590,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
                 if let Some((c, _)) = set.iter().find(|(c, _)| meta.key.contains(c)) {
                     return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
                 }
-                ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !sys::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
+                ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
                 select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
             }
             (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
@@ -661,7 +662,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
             false => Ok(Some(concat_batches(&s, &b.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?)),
         }
     };
-    let ids = with_ids(&crate::query::schema(&meta.logical_columns())?);
+    let ids = with_ids(&crate::answer::schema(&meta.logical_columns())?);
     let old = match old.first().map(|f| f.schema()) {
         Some(s) => one(old, s)?,
         None => None,
@@ -713,7 +714,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
 /// `_row_id`: an UPDATE that moves a key frees the old one (its row keeps its id), and a DELETE and an INSERT of one key
 /// in one change leave the key to the new row.
 pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Option<RecordBatch>> {
-    let ids = with_ids(&crate::query::schema(&meta.logical_columns())?);
+    let ids = with_ids(&crate::answer::schema(&meta.logical_columns())?);
     let new: Vec<RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).map(|b| crate::query::conform(b, &ids)).collect::<Result<_>>()?;
     let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (the rows' SQL names)
     // (the new rows as one batch, for `absent`: an old row is replaced only by a new row of its key)
@@ -729,7 +730,7 @@ pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Re
         };
         let gone = datafusion::arrow::compute::filter_record_batch(o, &keep)?;
         if gone.num_rows() > 0 {
-            all.push(without(&mark_deleted(&gone)?, sys::VERSION)?);
+            all.push(without(&mark_deleted(&gone)?, crate::text::VERSION)?);
         }
     }
     let Some(s) = all.first().map(|b| b.schema()) else { return Ok(None) };
@@ -740,7 +741,7 @@ pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Re
 fn with_ids(s: &SchemaRef) -> SchemaRef {
     let mut f = s.fields().to_vec();
     f.push(Arc::new(Field::new(ROW_ID, DataType::Int64, true)));
-    f.push(Arc::new(Field::new(sys::CREATED, crate::query::dtype(&sys::columns()[2].1).expect("a type"), true)));
+    f.push(Arc::new(Field::new(crate::text::CREATED, crate::answer::dtype(&sys::columns()[2].1).expect("a type"), true)));
     Arc::new(Schema::new(f))
 }
 
@@ -771,7 +772,7 @@ pub async fn companion(lake: &Lake, table: &str, meta: &TableMeta) -> Result<()>
 
 /// The old rows as `{t}$deleted` holds them: `_version` renamed `_old_version`.
 pub fn as_deleted(b: &RecordBatch) -> Result<RecordBatch> {
-    let fields = b.schema().fields().iter().map(|f| match f.name() == sys::VERSION {
+    let fields = b.schema().fields().iter().map(|f| match f.name() == crate::text::VERSION {
         true => Arc::new(Field::new("_old_version", f.data_type().clone(), true)),
         false => f.clone(),
     }).collect::<Vec<_>>();
@@ -795,11 +796,11 @@ pub async fn feed(lake: &Lake, table: &str, after: u64, upto: Option<u64>) -> Re
     gone.extend(taken_out(lake, table, after, upto).await?);
     let key = |b: &RecordBatch, i: usize| {
         let col = |c: &str| b.column_by_name(c).expect("a system column").as_primitive::<Int64Type>().value(i);
-        (col(ROW_ID), col(sys::VERSION))
+        (col(ROW_ID), col(crate::text::VERSION))
     };
     let keys = |bs: &[RecordBatch]| bs.iter().flat_map(|b| (0..b.num_rows()).map(move |i| key(b, i))).collect::<HashSet<_>>();
     let (new, old) = (keys(&rows), keys(&gone));
-    let out = crate::query::schema(&sys::with_sys(&meta).columns)?;
+    let out = crate::answer::schema(&sys::with_sys(&meta).columns)?;
     let mut fields = out.fields().to_vec();
     fields.push(Arc::new(Field::new("_change_type", DataType::Utf8, false)));
     let s = Arc::new(Schema::new(fields));
@@ -892,8 +893,8 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
     let same = std::ptr::eq(query, target);
     let (mut renamed, mut sent, mut kept) = (HashMap::new(), vec![], HashMap::new());
     for (k, name, rows_of_call) in seen.tables {
-        let n = crate::write::object(&name);
-        let rows_of_call = rows_of_call || crate::ext::is(&n); // (files here, as the statement names them by now: `ext.rs`)
+        let n = crate::text::object(&name);
+        let rows_of_call = rows_of_call || crate::ext_names::is(&n); // (files here, as the statement names them by now: `ext.rs`)
         if kept.contains_key(&k) || renamed.contains_key(&k) || (!rows_of_call && seen.ctes.contains(&n)) {
             continue;
         }
@@ -922,7 +923,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
             let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)
             let as_sent = format!("__sent_{}", sent.len() + 1);
             kept.insert(k, (as_sent.clone(), alias));
-            sent.push((as_sent, B64.encode(crate::query::ipc(&batches)?)));
+            sent.push((as_sent, B64.encode(crate::answer::ipc(&batches)?)));
         }
     }
     struct Rewrite<'a> {
@@ -958,12 +959,12 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
     // lake names it, like the UPDATEs' and DELETEs' targets are (`plain` INSERTs into attached keyed tables).
     for s in stmts.iter_mut() {
         if let Statement::Insert(Insert { table: TableObject::TableName(name), .. }) = s {
-            if crate::write::object(name) == written {
+            if crate::text::object(name) == written {
                 *name = ObjectName::from(local.split('.').map(|p| Ident::with_quote('"', p)).collect::<Vec<_>>());
             }
         }
     }
-    Ok((stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; "), sent))
+    Ok((stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; "), sent))
 }
 
 /// The rows a change was sent with, as tables its queries read by name (`query::SENT`).

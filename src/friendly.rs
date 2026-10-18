@@ -1018,7 +1018,7 @@ async fn default_values(lake: &Lake, s: &mut Statement) -> Result<bool> {
         return Ok(false);
     }
     let TableObject::TableName(name) = &ins.table else { return Ok(false) };
-    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::write::object(name))).await? else { return Ok(false) };
+    let Some(meta) = lake.cat.get::<TableMeta>(&crate::store::table_key(&crate::text::object(name))).await? else { return Ok(false) };
     let columns = meta.logical_columns().iter().filter(|(c, _)| c != "_deleted").count();
     let Statement::Query(query) = Parser::parse_sql(&GenericDialect {}, &format!("VALUES ({})", vec!["DEFAULT"; columns].join(", ")))?.remove(0) else { return Ok(false) };
     ins.source = Some(query);
@@ -1660,7 +1660,7 @@ const HIGHER: &[&str] = &["array_transform", "list_transform", "array_filter", "
 
 /// A query whose text holds a higher-order function's `x -> …`, as a statement whose lambdas are
 /// lambdas. SQL's text keeps them as `->` everywhere (the generic dialect reads that as JSON's
-/// arrow, which `->` elsewhere still is), so such a query is planned from this tree (`query::sql`),
+/// arrow, which `->` elsewhere still is), so such a query is planned from this tree (`engine::sql`),
 /// the same way on every node. None for any other text.
 pub fn lambdas(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     if !sql.contains("->") {

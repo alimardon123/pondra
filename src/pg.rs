@@ -388,7 +388,7 @@ impl Backend {
         if crate::env::is_set("PONDRA_DEBUG_PG") {
             eprintln!("pg {user}: {sql}");
         }
-        let statement = crate::write::first_word(&sql); // (dbt's leading comment is no part of the statement)
+        let statement = crate::text::first_word(&sql); // (dbt's leading comment is no part of the statement)
         if let Some(word) = crate::txn::control(statement) {
             // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
             let answer = crate::txn::command(&self.app, word, statement).await;
@@ -428,7 +428,7 @@ impl Backend {
             return match crate::settings::statement(&self.app.lake, &sql).await {
                 Ok(crate::settings::Done::Said(tag)) => Ok(Response::Execution(Tag::new(tag))),
                 Ok(crate::settings::Done::Run(sql)) => Box::pin(self.run(user, &sql, format)).await,
-                Err(_) if crate::write::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(Tag::new("DEALLOCATE"))), // (a statement the protocol prepared: pgwire's)
+                Err(_) if crate::text::first_word(&sql).to_uppercase().starts_with("DEALLOCATE") => Ok(Response::Execution(Tag::new("DEALLOCATE"))), // (a statement the protocol prepared: pgwire's)
                 Err(e) => Err(user_error(e)),
             };
         }
@@ -621,7 +621,7 @@ impl Backend {
         }
         let err = |e: anyhow::Error| user_error(e);
         let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
-        let table = crate::query::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
+        let table = crate::answer::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
         let uuids = meta.logical().sql_types;
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
@@ -658,7 +658,7 @@ impl Backend {
         let run = || async {
             let batches = self.app.query(sql, None).await?;
             let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
-                true => Some(crate::query::ipc(&batches)?.into()),
+                true => Some(crate::answer::ipc(&batches)?.into()),
                 false => None, // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
@@ -673,7 +673,7 @@ impl Backend {
     async fn schema(&self, sql: &str, user: &str) -> PgWireResult<Arc<Schema>> {
         let sql = crate::asof::rewrite(sql).map_err(user_error)?;
         let ctx = self.session(&sql, user).await?;
-        let df = crate::query::sql(&ctx, &sql).await.map_err(user_error)?;
+        let df = crate::engine::sql(&ctx, &sql).await.map_err(user_error)?;
         Ok(Arc::new(crate::query::run_schema(&ctx, df.logical_plan()).map_err(user_error)?.as_arrow().clone()))
     }
 
@@ -706,7 +706,7 @@ fn pg_dialect(lake: &crate::store::Lake, sql: &str, user: &str) -> String {
 /// CREATE TABLE … AS, `CREATE VIEW`, `DROP TABLE`, `ALTER TABLE` (what clients show, and dbt logs).
 fn command_tag(sql: &str, stmt: &crate::write::Stmt) -> String {
     use crate::write::Stmt;
-    let words: Vec<String> = crate::write::first_word(sql).split_whitespace().take(6).map(|w| w.to_uppercase()).collect();
+    let words: Vec<String> = crate::text::first_word(sql).split_whitespace().take(6).map(|w| w.to_uppercase()).collect();
     match stmt {
         Stmt::Insert(..) | Stmt::InsertInto(..) => return "INSERT".into(),
         Stmt::Update(..) => return "UPDATE".into(),
@@ -741,8 +741,8 @@ fn session_command(sql: &str) -> Option<Response> {
     }
     // (past a comment: dbt's. A word that is only a no-op here is refused when a comment came before it,
     // as it was before this: a `BEGIN` answered as if it began a transaction would autocommit what follows.)
-    let commented = crate::write::first_word(sql) != sql.trim_start();
-    let first = crate::write::first_word(sql).split_whitespace().next()?.to_uppercase();
+    let commented = crate::text::first_word(sql) != sql.trim_start();
+    let first = crate::text::first_word(sql).split_whitespace().next()?.to_uppercase();
     let setting = |column: &str, v: &str| {
         let field = Arc::new(vec![FieldInfo::new(column.into(), None, None, Type::VARCHAR, FieldFormat::Text)]);
         let mut row = DataRowEncoder::new(field.clone());
@@ -774,7 +774,7 @@ fn session_command(sql: &str) -> Option<Response> {
 /// Postgres names that column after the parameter (`SHOW TRANSACTION ISOLATION LEVEL` is
 /// `transaction_isolation`), and pgjdbc and psycopg read the row by that name, so Describe must say it too.
 fn show_column(sql: &str) -> Option<(String, String)> {
-    let sql = crate::write::first_word(sql); // (from its first word: a comment before it is no part of the setting's name)
+    let sql = crate::text::first_word(sql); // (from its first word: a comment before it is no part of the setting's name)
     let first = sql.split_whitespace().next()?.to_uppercase();
     let lower = sql.to_lowercase();
     if first != "SHOW" || lower.contains("tables") || lower.contains("datafusion.") || lower.trim_end_matches(';').trim().ends_with(" all") {
@@ -1118,7 +1118,7 @@ impl Copy {
     /// `sql` as a COPY to STDOUT or from STDIN (None: not a COPY).
     fn of(sql: &str) -> Option<PgWireResult<Copy>> {
         use datafusion::sql::sqlparser::ast::{CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Statement};
-        if !crate::write::first_word(sql).get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
+        if !crate::text::first_word(sql).get(..4).is_some_and(|w| w.eq_ignore_ascii_case("copy")) {
             return None;
         }
         if matches!(crate::ext::statement(sql), Some(crate::write::Stmt::CopyTo(..))) {
@@ -1479,7 +1479,7 @@ impl Backend {
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
-                crate::query::sql(&self.session(&sql, "").await.ok()?, &crate::asof::rewrite(&sql).ok()?).await.ok()
+                crate::engine::sql(&self.session(&sql, "").await.ok()?, &crate::asof::rewrite(&sql).ok()?).await.ok()
             }.await;
             for (name, t) in plan.and_then(|df| df.logical_plan().get_parameter_types().ok()).unwrap_or_default() {
                 if let (Some(i @ 1..), Some(t)) = (name.trim_start_matches('$').parse::<usize>().ok(), t) {

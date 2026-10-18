@@ -4,7 +4,8 @@
 //! catalog write, so a crash never loses or doubles rows (an uncommitted Parquet file is just an
 //! unreferenced object). Then, separately, `maintain` keeps the file count down: small append
 //! files are merged 8 at a time, and keyed tables are compacted into one file once 8 pile up.
-use crate::query::{latest_sql, raw, schema};
+use crate::query::{latest_sql, raw};
+use crate::answer::schema;
 use datafusion::prelude::ParquetReadOptions;
 use crate::store::*;
 use anyhow::{Context, Result};
@@ -220,7 +221,8 @@ fn mostly_deleted(f: &DataFile) -> bool { f.deleted > 0 && f.deleted * 10 >= f.r
 /// A `{t}$deleted` file whose changes were all purged goes once every reader has passed that
 /// purge (`retain_ms` later: a reader with an older entry for the table still needs it).
 pub async fn purge(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64, now_anyway: bool) -> Result<bool> {
-    use crate::sys::{deleted, with_sys, VERSION};
+    use crate::sys::{deleted, with_sys};
+    use crate::text::VERSION;
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await?.filter(|m| m.changed && m.key.is_empty()) else { return Ok(false) };
     let Some(mut dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted(table))).await? else { return Ok(false) };
     let (after, upto, now) = (meta.purged(), meta.tiered.min(dmeta.tiered), crate::log::now_ms());
@@ -285,8 +287,8 @@ fn settle(meta: &mut TableMeta, dmeta: &mut TableMeta, now: u64, retain_ms: u64)
     let Some(i) = meta.purges.iter().rposition(|p| now - p.1 >= retain_ms) else { return false };
     let settled = meta.purges[i].0 as i64;
     let kept = now.saturating_sub(meta.retention_secs.map_or(crate::ddl::KEEP_MS, |s| s * 1000)) as i64 * 1000;
-    let version = |s: &crate::manifest::Stats| s.get(crate::sys::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
-    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::sys::UPDATED)?.1.clone(), &crate::sys::time()) {
+    let version = |s: &crate::manifest::Stats| s.get(crate::text::VERSION).and_then(|(_, hi)| hi.parse::<i64>().ok());
+    let newest = |s: &crate::manifest::Stats| match datafusion::common::ScalarValue::try_from_string(s.get(crate::text::UPDATED)?.1.clone(), &crate::sys::time()) {
         Ok(datafusion::common::ScalarValue::TimestampMicrosecond(Some(us), _)) => Some(us),
         _ => None,
     };
@@ -311,7 +313,7 @@ async fn positions_of(lake: &Lake, meta: &TableMeta, f: &DataFile, dead: &[(i64,
         let ids = l.first..l.first + f.rows as i64;
         return Ok(dead.iter().filter(|(id, v)| *v == l.version as i64 && ids.contains(id)).map(|(id, _)| (id - l.first) as u64).collect());
     }
-    let s = schema(&[(crate::sys::ROW_ID.into(), "Int64".into()), (crate::sys::VERSION.into(), "Int64".into())])?;
+    let s = schema(&[(crate::text::ROW_ID.into(), "Int64".into()), (crate::text::VERSION.into(), "Int64".into())])?;
     let every = DataFile { deletes: vec![], ..f.clone() };
     let (mut out, mut at) = (vec![], 0u64);
     for b in crate::query::files_once(lake, &lake.session_with(1), &[&every], meta, &s).await?.collect().await? {
@@ -333,7 +335,7 @@ pub async fn ids_of(lake: &Lake, meta: &TableMeta, f: &DataFile) -> Result<Vec<i
         return Ok((l.first..l.first + f.rows as i64).collect());
     }
     anyhow::ensure!(f.sys, "{}: its rows have no ids (written before Pondra 0.19)", f.path);
-    let (s, every) = (schema(&[(crate::sys::ROW_ID.into(), "Int64".into())])?, DataFile { deletes: vec![], ..f.clone() });
+    let (s, every) = (schema(&[(crate::text::ROW_ID.into(), "Int64".into())])?, DataFile { deletes: vec![], ..f.clone() });
     let mut out = vec![];
     for b in crate::query::files_once(lake, &lake.session_with(1), &[&every], meta, &s).await?.collect().await? {
         out.extend(b.column(0).as_primitive::<Int64Type>().values());
@@ -377,10 +379,10 @@ async fn dead_rows(lake: &Lake, gone: &[DataFile], after: u64, upto: u64) -> Res
     use datafusion::prelude::{col, lit};
     let paths: Vec<String> = gone.iter().map(|f| lake.full(&f.path)).collect();
     let ctx = lake.session();
-    let within = col(crate::sys::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
+    let within = col(crate::text::VERSION).between(lit(after as i64 + 1), lit(upto as i64));
     Ok(match paths.is_empty() {
         true => ctx.read_empty()?.select(vec![lit(0i64).alias("__id"), lit(0i64).alias("__v")])?.limit(0, Some(0))?,
-        false => ctx.read_parquet(paths, ParquetReadOptions::default()).await?.filter(within)?.select(vec![col(crate::sys::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
+        false => ctx.read_parquet(paths, ParquetReadOptions::default()).await?.filter(within)?.select(vec![col(crate::text::ROW_ID).alias("__id"), col("_old_version").alias("__v")])?,
     })
 }
 
@@ -927,9 +929,9 @@ fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> R
     // System columns: row ids count up, deltas of a few bits each; versions and times repeat per
     // commit, and plain values the codec squeezes are what costs least to write (the files come
     // out the size they were without them).
-    for c in crate::sys::NAMES.iter().filter(|c| schema.index_of(c).is_ok()) {
+    for c in crate::text::NAMES.iter().filter(|c| schema.index_of(c).is_ok()) {
         let path: datafusion::parquet::schema::types::ColumnPath = (*c).into();
-        let encoding = if *c == crate::sys::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
+        let encoding = if *c == crate::text::ROW_ID { datafusion::parquet::basic::Encoding::DELTA_BINARY_PACKED } else { datafusion::parquet::basic::Encoding::PLAIN };
         props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
     }
     Ok(ArrowWriter::try_new_with_options(vec![], schema, plain(props.build()))?)
@@ -954,7 +956,7 @@ fn codec() -> Compression {
     }
 }
 
-pub use crate::answer::storable;
+use crate::answer::storable;
 
 /// One Parquet file of these rows; with `stats`, it carries its columns' min/max (append tables).
 pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys: &[String], stats: bool) -> Result<Option<DataFile>> {
@@ -1012,7 +1014,7 @@ impl Encoding {
         let at = |f: FieldRef| Some((schema.index_of(f.name()).ok()?, f));
         let hot: Vec<(usize, FieldRef)> = hot.into_iter().map(at).collect::<Option<_>>().unwrap_or_default();
         let kept = vec![vec![]; hot.len()];
-        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::sys::ROW_ID).is_ok(), seen, hot, kept, kept_bytes: 0 })
+        Ok(Encoding { w: writer(ids.clone(), keys)?, ids, rows: 0, sys: schema.index_of(crate::text::ROW_ID).is_ok(), seen, hot, kept, kept_bytes: 0 })
     }
 
     fn write(&mut self, b: &RecordBatch) -> Result<()> {
@@ -1084,11 +1086,11 @@ fn field_ids(meta: Option<&TableMeta>, schema: &datafusion::arrow::datatypes::Sc
     // (a table an INSERT makes: its columns will be these, in this order)
     let columns: Vec<String> = match meta {
         Some(m) => m.columns.iter().map(|(c, _)| c.clone()).collect(),
-        None => schema.fields().iter().map(|f| f.name().clone()).filter(|c| !crate::sys::NAMES.contains(&c.as_str())).collect(),
+        None => schema.fields().iter().map(|f| f.name().clone()).filter(|c| !crate::text::NAMES.contains(&c.as_str())).collect(),
     };
     let id = |name: &str| match columns.iter().position(|c| c == name) {
         Some(i) => Some(i + 1),
-        None => crate::sys::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i),
+        None => crate::text::NAMES.iter().position(|c| *c == name).map(|i| 1_000_001 + i),
     };
     let fields: Vec<_> = schema.fields().iter().map(|f| match id(f.name()) {
         Some(i) => {

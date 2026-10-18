@@ -214,7 +214,8 @@ pub fn names(sql: &str) -> Vec<String> {
 /// first change after then replaced, if the row was made by then.
 #[cfg(feature = "server")]
 pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>)> {
-    use crate::sys::{with_sys, CREATED, ROW_ID, UPDATED, VERSION};
+    use crate::sys::with_sys;
+    use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
     let spec: Spec = serde_json::from_slice(&B64.decode(name.trim_start_matches("at:"))?)?;
     let t = &spec.table;
     let meta: TableMeta = lake.cat.get(&table_key(t)).await?.ok_or_else(|| anyhow!("no table {t}"))?;
@@ -329,7 +330,7 @@ pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
 /// change like any, so it can be undone the same way. None: not a RESTORE.
 #[cfg(feature = "server")]
 pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
-    if crate::write::head(sql) != "restore" {
+    if crate::text::head(sql) != "restore" {
         return Ok(None);
     }
     let Some(c) = RESTORE.captures(sql) else { return Ok(None) };

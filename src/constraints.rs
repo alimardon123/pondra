@@ -96,9 +96,9 @@ pub fn informational(c: &Option<ast::ConstraintCharacteristics>) -> bool { match
 pub fn declared(c: &ast::CreateTable, table: &str) -> Result<Vec<Constraint>> {
     let mut out: Vec<Constraint> = vec![];
     for col in &c.columns {
-        let one = vec![crate::write::ident(&col.name)];
+        let one = vec![crate::text::ident(&col.name)];
         for o in &col.options {
-            let named = |n: &Option<ast::Ident>| n.as_ref().or(o.name.as_ref()).map(crate::write::ident);
+            let named = |n: &Option<ast::Ident>| n.as_ref().or(o.name.as_ref()).map(crate::text::ident);
             match &o.option {
                 ast::ColumnOption::Unique(u) => out.push(unique(named(&u.name), one.clone(), u, table)?),
                 ast::ColumnOption::PrimaryKey(p) if informational(&p.characteristics) => out.push(fact(named(&p.name), Kind::PrimaryKey, one.clone(), None, table)),
@@ -127,14 +127,14 @@ pub fn declared(c: &ast::CreateTable, table: &str) -> Result<Vec<Constraint>> {
 /// check).
 pub fn of(k: &ast::TableConstraint, table: &str) -> Result<Option<Constraint>> {
     let cols = |c: &[ast::IndexColumn]| c.iter().map(|i| match &i.column.expr {
-        ast::Expr::Identifier(i) => Ok(crate::write::ident(i)),
+        ast::Expr::Identifier(i) => Ok(crate::text::ident(i)),
         e => bail!("{e}: a constraint is on columns"),
     }).collect::<Result<Vec<_>>>();
-    let name = |n: &Option<ast::Ident>| n.as_ref().map(crate::write::ident);
+    let name = |n: &Option<ast::Ident>| n.as_ref().map(crate::text::ident);
     Ok(match k {
         ast::TableConstraint::Unique(u) => Some(unique(name(&u.name), cols(&u.columns)?, u, table)?),
         ast::TableConstraint::PrimaryKey(p) if informational(&p.characteristics) => Some(fact(name(&p.name), Kind::PrimaryKey, cols(&p.columns)?, None, table)),
-        ast::TableConstraint::ForeignKey(f) => Some(foreign(name(&f.name), f.columns.iter().map(crate::write::ident).collect(), f, table)?),
+        ast::TableConstraint::ForeignKey(f) => Some(foreign(name(&f.name), f.columns.iter().map(crate::text::ident).collect(), f, table)?),
         _ => None,
     })
 }
@@ -153,7 +153,7 @@ fn foreign(name: Option<String>, columns: Vec<String>, f: &ast::ForeignKeyConstr
         // (a feature not taken yet, not a fault: SQLSTATE 0A000, as the other "not taken" refusals)
         return Err(crate::codes::coded("0A000", format!("{} {refs}: a reference isn't checked yet; say NOT ENFORCED to keep it as a fact about the data (BI tools and the planner read it)", columns.join(", "))));
     }
-    let to = (crate::write::object(&f.foreign_table), f.referred_columns.iter().map(crate::write::ident).collect());
+    let to = (crate::text::object(&f.foreign_table), f.referred_columns.iter().map(crate::text::ident).collect());
     Ok(fact(name, Kind::ForeignKey, columns, Some(to), table))
 }
 
@@ -304,7 +304,7 @@ pub async fn held(lake: &Lake, table: &str, meta: &TableMeta, keys: &RecordBatch
     let sql = format!("SELECT {cols} FROM {} AS t JOIN __pondra_keys AS n ON {on} LIMIT 1", crate::write::sql_name(table));
     let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
     ctx.register_batch("__pondra_keys", keys.clone())?;
-    let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
+    let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
 }
 
@@ -386,7 +386,7 @@ async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], ol
     let given = columns.iter().map(|c| format!("n.{} IS NOT NULL", q(c))).collect::<Vec<_>>().join(" AND ");
     let mut sql = format!("SELECT {} FROM {} AS t JOIN __pondra_new AS n ON {on} WHERE {given}", columns.iter().map(|c| format!("t.{}", q(c))).collect::<Vec<_>>().join(", "), crate::write::sql_name(table));
     if old.is_some_and(|o| o.num_rows() > 0) {
-        sql += &format!(" AND t.{0} NOT IN (SELECT {0} FROM __pondra_old)", crate::sys::ROW_ID); // (the rows the change replaces)
+        sql += &format!(" AND t.{0} NOT IN (SELECT {0} FROM __pondra_old)", crate::text::ROW_ID); // (the rows the change replaces)
     }
     if !meta.key.is_empty() && !plain {
         let same = meta.key.iter().map(|k| format!("w.{0} = t.{0}", q(k))).collect::<Vec<_>>().join(" AND ");
@@ -396,10 +396,10 @@ async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], ol
     let ctx = crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?;
     ctx.register_batch("__pondra_new", new.clone())?;
     if let Some(o) = old.filter(|o| o.num_rows() > 0) {
-        let ids = o.column_by_name(crate::sys::ROW_ID).cloned().ok_or_else(|| anyhow::anyhow!("the replaced rows carry no {}", crate::sys::ROW_ID))?;
-        ctx.register_batch("__pondra_old", RecordBatch::try_from_iter([(crate::sys::ROW_ID, ids)])?)?;
+        let ids = o.column_by_name(crate::text::ROW_ID).cloned().ok_or_else(|| anyhow::anyhow!("the replaced rows carry no {}", crate::text::ROW_ID))?;
+        ctx.register_batch("__pondra_old", RecordBatch::try_from_iter([(crate::text::ROW_ID, ids)])?)?;
     }
-    let found = crate::query::sql(&ctx, &sql).await?.collect().await?;
+    let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
 }
 
@@ -424,7 +424,7 @@ pub fn change(op: &ast::AlterTableOperation, table: &str) -> Option<Result<Chang
     let table = table.rsplit('.').next().unwrap_or(table);
     Some(match op {
         ast::AlterTableOperation::AddConstraint { constraint: ast::TableConstraint::Check(k), .. } => {
-            Ok(Change::AddCheck(k.name.as_ref().map(crate::write::ident).unwrap_or_else(|| format!("{table}_check")), k.expr.to_string()))
+            Ok(Change::AddCheck(k.name.as_ref().map(crate::text::ident).unwrap_or_else(|| format!("{table}_check")), k.expr.to_string()))
         }
         ast::AlterTableOperation::AddConstraint { constraint: ast::TableConstraint::PrimaryKey(p), .. } if !informational(&p.characteristics) => {
             Err(anyhow::anyhow!("ADD PRIMARY KEY: a table's key is made with it (CREATE TABLE … PRIMARY KEY), since its rows are kept by key; PRIMARY KEY (…) NOT ENFORCED adds it as a fact"))
@@ -434,7 +434,7 @@ pub fn change(op: &ast::AlterTableOperation, table: &str) -> Option<Result<Chang
             Ok(None) => Err(anyhow::anyhow!("ALTER TABLE … ADD {constraint}: tables take UNIQUE, CHECK, and PRIMARY KEY or FOREIGN KEY said NOT ENFORCED")),
             Err(e) => Err(e),
         },
-        ast::AlterTableOperation::DropConstraint { if_exists, name, .. } => Ok(Change::Drop { name: crate::write::ident(name), if_exists: *if_exists }),
+        ast::AlterTableOperation::DropConstraint { if_exists, name, .. } => Ok(Change::Drop { name: crate::text::ident(name), if_exists: *if_exists }),
         _ => return None,
     })
 }
@@ -468,7 +468,7 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
                 let cols = c.columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ");
                 let given = c.columns.iter().map(|c| format!("{} IS NOT NULL", q(c))).collect::<Vec<_>>().join(" AND ");
                 let sql = format!("SELECT {cols} FROM {} WHERE {given} GROUP BY {cols} HAVING count(*) > 1 LIMIT 1", crate::write::sql_name(table));
-                let found = async { crate::query::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await.map_err(anyhow::Error::from) }.await;
+                let found = async { crate::engine::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await.map_err(anyhow::Error::from) }.await;
                 let twice = match &found {
                     Ok(found) => found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)),
                     Err(_) => None,
@@ -485,7 +485,7 @@ pub async fn apply(lake: &Lake, table: &str, change: Change) -> Result<serde_jso
         Change::AddCheck(name, cond) => {
             ensure!(!taken(&m, &name), "constraint \"{name}\" for relation \"{table}\" already exists");
             let sql = format!("SELECT count(*) AS n FROM {} WHERE NOT ({cond})", crate::write::sql_name(table));
-            let found = crate::query::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await?;
+            let found = crate::engine::sql(&crate::query::session_at(lake, &sql, "", Some(lake.visible())).await?, &sql).await?.collect().await?;
             let n = found.first().and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0))).unwrap_or(0);
             if n > 0 {
                 return Err(anyhow::Error::new(crate::views::Violation(format!("check constraint \"{name}\" of relation \"{table}\" is violated by {n} row{}", if n == 1 { "" } else { "s" }), "23514")));
@@ -515,12 +515,12 @@ pub fn unique_index(c: &ast::CreateIndex) -> Result<crate::ddl::Ddl> {
     let using = c.using.as_ref().map(|u| u.to_string().to_lowercase());
     ensure!(c.predicate.is_none() && c.include.is_empty() && using.as_deref().is_none_or(|u| u == "btree") && c.with.is_empty() && !c.nulls_distinct.is_some_and(|d| !d), "CREATE UNIQUE INDEX: {what}");
     let columns = c.columns.iter().map(|k| match &k.column.expr {
-        ast::Expr::Identifier(i) if k.operator_class.is_none() => Ok(crate::write::ident(i)),
+        ast::Expr::Identifier(i) if k.operator_class.is_none() => Ok(crate::text::ident(i)),
         e => bail!("CREATE UNIQUE INDEX … ({e}): {what}"),
     }).collect::<Result<Vec<_>>>()?;
-    let table = crate::write::object(&c.table_name);
+    let table = crate::text::object(&c.table_name);
     let short = table.rsplit('.').next().unwrap_or(&table).to_string();
-    let name = c.name.as_ref().map(|n| crate::write::object(n).rsplit('.').next().unwrap_or_default().to_string()).unwrap_or_else(|| format!("{short}_{}_idx", columns.join("_")));
+    let name = c.name.as_ref().map(|n| crate::text::object(n).rsplit('.').next().unwrap_or_default().to_string()).unwrap_or_else(|| format!("{short}_{}_idx", columns.join("_")));
     let constraint = Constraint { name, kind: Kind::Unique, columns, references: None, enforced: true };
     Ok(crate::ddl::Ddl::Constraint { table, change: Change::Add(constraint, c.if_not_exists) })
 }
@@ -530,7 +530,7 @@ pub fn unique_index(c: &ast::CreateIndex) -> Result<crate::ddl::Ddl> {
 pub async fn index_of(lake: &Lake, schema: &str, name: &str) -> Result<Option<String>> {
     for (key, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
         let table = &key[2..];
-        if crate::ddl::split(table).0 == schema && m.constraints.iter().any(|c| c.name == name && c.kind == Kind::Unique) {
+        if crate::text::split(table).0 == schema && m.constraints.iter().any(|c| c.name == name && c.kind == Kind::Unique) {
             return Ok(Some(table.to_string()));
         }
     }
@@ -622,7 +622,7 @@ async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: Reco
     }
     // (an empty batch still moves its producer's seq: `change::appends` has nothing to append for it)
     let mut pending = match batch.num_rows() {
-        0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::query::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0 }],
+        0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0 }],
         _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "", false).await?.0, // (a loader's rows: upserts)
     };
     let table_append = pending.first_mut().ok_or_else(|| anyhow::anyhow!("no rows for {table}"))?;

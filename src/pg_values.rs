@@ -495,7 +495,7 @@ fn string_value(v: &ast::Value) -> Option<String> {
 /// `CAST(make_array(…) AS t)` for an array literal's elements: each a string, NULL where the literal has NULL.
 fn array_of(text: &str, data_type: &ast::DataType) -> anyhow::Result<ast::Expr> {
     let items = array_literal(text)?.into_iter().map(|item| ast::Expr::value(item.map_or(ast::Value::Null, ast::Value::SingleQuotedString))).collect();
-    let made = crate::types::function("make_array", items);
+    let made = crate::text::function("make_array", items);
     Ok(ast::Expr::Cast { kind: ast::CastKind::Cast, expr: Box::new(made), data_type: data_type.clone(), array: false, format: None })
 }
 
@@ -511,7 +511,7 @@ mod tests {
         let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|_| Parser::parse_sql(&PostgreSqlDialect {}, sql));
         let mut stmt = parsed.unwrap().remove(0);
         match array_literals(&mut stmt) {
-            Ok(found) => Ok((found, crate::routines::sql(&stmt))),
+            Ok(found) => Ok((found, crate::text::sql(&stmt))),
             Err(e) => Err(format!("{} {e}", crate::codes::of(&e))),
         }
     }

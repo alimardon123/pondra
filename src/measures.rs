@@ -1030,7 +1030,7 @@ async fn own_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Definition>>>>
 async fn views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>>> {
     let mut out: HashMap<String, Arc<Definition>> = own_views(lake).await?.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
     // (another lake's only when the statement names it: its catalog has no version to keep them by, so each look reads it)
-    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| ddl::mentions(sql, name)).cloned().collect();
+    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
     for (name, other) in attached {
         for (local, d) in own_views(&other).await?.iter() {
             if !local.contains('.') {
@@ -1049,12 +1049,12 @@ pub async fn wanted(lake: &Lake, sql: &str) -> Result<bool> {
     if sql.contains(MARK) || CALL_TEXT.is_match(sql) {
         return Ok(true);
     }
-    if own_views(lake).await?.keys().any(|name| ddl::mentions(sql, name)) {
+    if own_views(lake).await?.keys().any(|name| crate::text::mentions(sql, name)) {
         return Ok(true);
     }
-    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| ddl::mentions(sql, name)).cloned().collect();
+    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
     for (name, other) in attached {
-        if own_views(&other).await?.keys().any(|local| ddl::mentions(sql, &format!("{name}.{local}")) || ddl::mentions(sql, &format!("{name}.public.{local}"))) {
+        if own_views(&other).await?.keys().any(|local| crate::text::mentions(sql, &format!("{name}.{local}")) || crate::text::mentions(sql, &format!("{name}.public.{local}"))) {
             return Ok(true);
         }
     }

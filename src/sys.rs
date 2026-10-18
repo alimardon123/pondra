@@ -21,13 +21,13 @@ use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, TimeUnit,
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::sync::Arc;
-pub use crate::text::{CREATED, NAMES, ROW_ID, UPDATED, VERSION};
+use crate::text::{CREATED, NAMES, ROW_ID, UPDATED, VERSION};
 
 pub fn time() -> DataType { DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())) }
 
 /// The system columns, as a table's columns list them (name, type).
 pub fn columns() -> Vec<(String, String)> {
-    let ts = crate::query::type_name(&time());
+    let ts = crate::answer::type_name(&time());
     vec![(ROW_ID.into(), "Int64".into()), (VERSION.into(), "Int64".into()), (CREATED.into(), ts.clone()), (UPDATED.into(), ts)]
 }
 
@@ -94,7 +94,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
     let mut v = Hide { ctes: vec![], changed: false, names };
     let _ = VisitMut::visit(&mut stmts, &mut v);
     match v.changed {
-        true => Cow::Owned(stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; ")),
+        true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")),
         false => Cow::Borrowed(sql),
     }
 }
@@ -195,7 +195,7 @@ pub fn stamp_new(b: &RecordBatch, first: i64, crate::log::Reserved { version: n,
 pub fn stamp_stream(rows: datafusion::execution::SendableRecordBatchStream, next: Arc<std::sync::atomic::AtomicU64>, reserved: crate::log::Reserved) -> Result<datafusion::execution::SendableRecordBatchStream> {
     use futures::StreamExt;
     let mut fields = rows.schema().fields().to_vec();
-    fields.extend(columns().iter().map(|(n, t)| Arc::new(Field::new(n, crate::query::dtype(t).expect("a type"), true))));
+    fields.extend(columns().iter().map(|(n, t)| Arc::new(Field::new(n, crate::answer::dtype(t).expect("a type"), true))));
     let schema = Arc::new(Schema::new(fields));
     let stamped = rows.map(move |b| {
         let b = b?;

@@ -37,9 +37,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, topic: &str, options: &s
         return Ok(());
     }
     // Its columns: the query planned over the topic's (no records needed).
-    let schema = crate::query::schema(&crate::kafka_client::columns())?;
+    let schema = crate::answer::schema(&crate::kafka_client::columns())?;
     let (ctx, plan) = over(lake, &feed, datafusion::arrow::record_batch::RecordBatch::new_empty(schema)).await?;
-    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect(); // (the types as the query runs)
+    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect(); // (the types as the query runs)
     let meta = TableMeta { columns, publish: crate::store::default_publish(), ids: true, tiered: lake.visible(), ..Default::default() };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (feed_key(name), json(&feed))], &[]).await
 }
@@ -68,7 +68,7 @@ pub fn start(app: App) {
             let mut wanted = std::collections::HashSet::new();
             for (key, feed) in &feeds {
                 let view = key[3..].to_string();
-                let url = match crate::ext::spec(&feed.topic) {
+                let url = match crate::ext_names::spec(&feed.topic) {
                     Some(s) => s.urls[0].clone(),
                     None => continue,
                 };
@@ -117,11 +117,11 @@ async fn partitions(lake: &Lake, url: &str) -> Result<Vec<i32>> {
 async fn shard(app: App, view: String, p: i32) -> Result<()> {
     let lake = app.lake.clone();
     let feed: Feed = lake.cat.get(&feed_key(&view)).await?.context("the feed is gone")?;
-    let url = crate::ext::spec(&feed.topic).context("a feed's topic")?.urls[0].clone();
+    let url = crate::ext_names::spec(&feed.topic).context("a feed's topic")?.urls[0].clone();
     let (_, topic) = crate::kafka_client::parse(&url)?;
     let client = crate::kafka_client::client(&lake, &url).await?;
     let producer = format!("feed:{view}:{p}");
-    let schema = crate::query::schema(&crate::kafka_client::columns())?;
+    let schema = crate::answer::schema(&crate::kafka_client::columns())?;
     let mut leader = String::new();
     let mut at: Option<i64> = None; // (where this node reads next: past records that gave no rows)
     loop {
@@ -155,7 +155,7 @@ async fn shard(app: App, view: String, p: i32) -> Result<()> {
         // (the batches the query gives have the types it runs with, as the table's columns do)
         let out_schema = Arc::new(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone());
         let rows = datafusion::arrow::compute::concat_batches(&out_schema, &df.collect().await?)?;
-        let target = crate::query::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns)?;
+        let target = crate::answer::schema(&lake.cat.get::<TableMeta>(&table_key(&view)).await?.context("the view's table is gone")?.columns)?;
         let rows = crate::query::cast_as(&rows, &target)?;
         let src = crate::log::Src { producer: producer.clone(), seq: next as u64, prev: Some(done) }; // (the rows and the offset, if the offset is still `done`)
         let ack = app.log()?.append(view.clone(), src, rows).await?;
@@ -171,6 +171,6 @@ async fn over(lake: &Lake, feed: &Feed, batch: datafusion::arrow::record_batch::
     let sql = feed.sql.replace(&format!("\"{}\"", feed.topic), &format!("\"{HERE}\"")); // (the session never lists the topic)
     let ctx = crate::query::session(lake, &sql, "").await?;
     ctx.register_batch(HERE, batch)?;
-    let df = crate::query::sql(&ctx, &sql).await?;
+    let df = crate::engine::sql(&ctx, &sql).await?;
     Ok((ctx, df))
 }

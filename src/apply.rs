@@ -193,7 +193,7 @@ impl Project {
     pub(crate) fn holds(&self, k: &str) -> bool {
         let (word, name) = split_key(k);
         let schema = |kind: Kind, name: &str| match kind {
-            Kind::Object(k) if matches!(k.family, "relation" | "routine" | "task" | "type") => Some(name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s).to_string()),
+            Kind::Object(k) if matches!(k.family, "relation" | "routine" | "task" | "type") => Some(name.split_once('.').map_or(crate::text::PUBLIC, |(s, _)| s).to_string()),
             _ => None,
         };
         let Some(theirs) = Kind::of(word).and_then(|kind| schema(kind, name)) else { return false };
@@ -302,11 +302,11 @@ pub(crate) fn head(sql: &str) -> Result<Option<(Kind, String)>> {
         ensure!(word(last + 1) == "on", "a project names an index as CREATE INDEX name ON table (column)");
         let table = dotted(&solid, last + 2)?.0;
         ensure!(table.len() <= 2, "{}: a project names objects without their database (sales.orders), as each environment is one", table.join("."));
-        crate::ddl::join(if table.len() == 2 { table[0].as_str() } else { crate::ddl::PUBLIC }, &parts[0])
+        crate::text::join(if table.len() == 2 { table[0].as_str() } else { crate::text::PUBLIC }, &parts[0])
     } else {
         match &parts[..] {
             [t] => t.clone(),
-            [s, t] if !kind.is("schema") => crate::ddl::join(s, t),
+            [s, t] if !kind.is("schema") => crate::text::join(s, t),
             _ => bail!("{}: a project names objects without their database (sales.orders), as each environment is one", parts.join(".")),
         }
     };
@@ -379,14 +379,14 @@ fn ordered(mut all: Vec<Declared>) -> Vec<Declared> {
 
 /// Does `sql` name `name` (as a whole word, its schema too)?
 pub(crate) fn mentions(sql: &str, name: &str) -> bool {
-    let (s, t) = crate::ddl::split(name);
+    let (s, t) = crate::text::split(name);
     let lower = sql.to_lowercase();
     let whole = |n: &str| lower.match_indices(n).any(|(i, _)| {
         let before = lower[..i].chars().next_back();
         let after = lower[i + n.len()..].chars().next();
         !before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
     });
-    if s == crate::ddl::PUBLIC { whole(t) } else { whole(&format!("{s}.{t}")) }
+    if s == crate::text::PUBLIC { whole(t) } else { whole(&format!("{s}.{t}")) }
 }
 
 /// The tables and views a migration renames, as (from, to): `to` in `from`'s schema when written without
@@ -397,15 +397,15 @@ fn renames(sql: &str) -> Vec<(String, String)> {
         let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&stmt) else { continue };
         for d in ds {
             let crate::ddl::Ddl::RenameTable { name, to } = d else { continue };
-            let (schema, table) = crate::ddl::split(&name);
+            let (schema, table) = crate::text::split(&name);
             let to = match to.contains('.') {
                 true => {
-                    let (ts, tt) = crate::ddl::split(&to);
-                    crate::ddl::join(ts, tt)
+                    let (ts, tt) = crate::text::split(&to);
+                    crate::text::join(ts, tt)
                 }
-                false => crate::ddl::join(schema, &to),
+                false => crate::text::join(schema, &to),
             };
-            out.push((crate::ddl::join(schema, table), to));
+            out.push((crate::text::join(schema, table), to));
         }
     }
     out
@@ -442,7 +442,7 @@ pub(crate) async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
     let mut put = |kind: Kind, name: &str, sql: String, meta: Option<TableMeta>, shape: Option<Shape>| {
         out.insert(key(kind, name), Current { sql, meta, shape });
     };
-    for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != crate::ddl::PUBLIC) {
+    for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != crate::text::PUBLIC) {
         put(Kind::named("schema"), &s, format!("CREATE SCHEMA {}", ident(&s)), None, None);
     }
     let materialized: BTreeMap<String, crate::views::View> = lake.cat.scan::<crate::views::View>("v/", "v0").await?.into_iter().map(|(k, v)| (k[2..].to_string(), v)).collect();
@@ -464,7 +464,7 @@ pub(crate) async fn current(lake: &Lake) -> Result<BTreeMap<String, Current>> {
     }
     for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
-        let sql = crate::index::create_sql(&ident(crate::ddl::split(&k[3..]).1), &quoted(&i.table), &i, meta.as_ref());
+        let sql = crate::index::create_sql(&ident(crate::text::split(&k[3..]).1), &quoted(&i.table), &i, meta.as_ref());
         put(Kind::named("index"), &k[3..], sql, None, None);
     }
     for (k, t) in lake.cat.scan::<crate::types::Type>("ty/", "ty0").await? {
@@ -533,8 +533,8 @@ pub(crate) fn path_of(word: &str, name: &str) -> String {
         "schema" => "objects/schemas.sql".to_string(),
         "role" => "objects/access.sql".to_string(),
         _ => {
-            let (s, t) = crate::ddl::split(name);
-            if s == crate::ddl::PUBLIC { format!("objects/{t}.sql") } else { format!("objects/{s}/{t}.sql") }
+            let (s, t) = crate::text::split(name);
+            if s == crate::text::PUBLIC { format!("objects/{t}.sql") } else { format!("objects/{s}/{t}.sql") }
         }
     }
 }
@@ -928,8 +928,8 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
         true => (pairs(&spec), Value::Null),
         false => (pairs(&spec["columns"]), spec.clone()),
     };
-    let declared: Vec<(String, String, String)> = columns.iter().filter(|(n, _)| n != "_deleted").map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?), sql_type(t)))).collect::<Result<_>>()?;
-    let have: Vec<&(String, String)> = m.columns.iter().filter(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_deleted").collect();
+    let declared: Vec<(String, String, String)> = columns.iter().filter(|(n, _)| n != "_deleted").map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?), sql_type(t)))).collect::<Result<_>>()?;
+    let have: Vec<&(String, String)> = m.columns.iter().filter(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_deleted").collect();
     let names = |v: &mut dyn Iterator<Item = &String>| v.cloned().collect::<Vec<_>>().join(", ");
     // (ALTER TABLE … RENAME, DROP and ALTER COLUMN are refused while views read the table: a
     // migration drops them first, and the apply makes them again after it)
@@ -941,7 +941,7 @@ async fn table_change(lake: &Lake, d: &Declared, m: &TableMeta) -> Result<Vec<St
     let mut sql = vec![];
     for ((c, old), (_, new, written)) in have.iter().zip(&declared) {
         if old != new {
-            let widens = crate::ddl::widens(&crate::query::dtype(old)?, &crate::query::dtype(new)?);
+            let widens = crate::ddl::widens(&crate::answer::dtype(old)?, &crate::answer::dtype(new)?);
             ensure!(widens, "{c} is {} here and {written} in the project: a type only widens in place; a migration can copy it into a new column", sql_type(old));
             ensure!(readers.is_empty(), "{c} widens to {written}: a migration's (ALTER TABLE {} ALTER COLUMN {} TYPE {written}{first})", quoted(&d.name), ident(c));
             sql.push(format!("ALTER TABLE {} ALTER COLUMN {} TYPE {written}", quoted(&d.name), ident(c)));
@@ -1304,7 +1304,7 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
         _ => Verb::Plan,
     };
     let applying = verb == Verb::Apply;
-    let a = crate::routines::args(name, args)?;
+    let a = crate::text::args(name, args)?;
     ensure!(!a.given.is_empty(), "{name}: the project's folder in the workspace ('files/sales')");
     if a.given.len() > 1 || a.named.iter().any(|(n, _)| !["env", "test", "prune", "commit"].contains(&n.as_str())) {
         bail!("{name}('files/sales', env => 'prod'{}): the project's folder in the workspace, then env (and test, prune) by name", if applying { ", test => true" } else { "" });

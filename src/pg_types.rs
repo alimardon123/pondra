@@ -20,7 +20,7 @@ use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use crate::codes::coded;
 use crate::pg_names;
 use crate::store::{table_key, Lake};
-use crate::write::{ident, object};
+use crate::text::{ident, object};
 
 // The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
 // arguments changed where SQL comes in (`rewritten`): a JSON argument is marked as its type prints it, a whole row is
@@ -195,7 +195,7 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
 /// a `pg_typeof`; whether it changed anything.
 pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
-    let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::types::is_uuid(s) && crate::types::uuid_of(s).is_ok());
+    let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::types::uuid_of(s).is_ok());
     let maker = |e: &Expr| matches!(e, Expr::Function(f) if MAKERS.contains(&object(&f.name).as_str()));
     let is_concat = |e: &Expr| matches!(e, Expr::BinaryOp { op: ast::BinaryOperator::StringConcat, .. });
     // (a `||` is read as jsonb's when JSON is in its text, or when a relation it names has a json or jsonb column: plain

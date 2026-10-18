@@ -44,7 +44,7 @@ pub fn asked(sql: &str) -> bool { POSTGRES.try_with(|_| ()).is_ok() && wanted(sq
 pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatch>> {
     let ctx = crate::query::session(lake, sql, "").await?;
     register(&ctx, lake, user, sql).await?;
-    match async { crate::engine::collect(crate::query::sql(&ctx, sql).await?).await }.await { // (no rows: its columns as they run)
+    match async { crate::engine::collect(crate::engine::sql(&ctx, sql).await?).await }.await { // (no rows: its columns as they run)
         Ok(batches) => Ok(batches),
         Err(e) => match empty_answer(sql) {
             Some(names) => Ok(vec![RecordBatch::new_empty(Arc::new(Schema::new(names.into_iter().map(|n| Field::new(n, DataType::Utf8, true)).collect::<Vec<_>>())))]),
@@ -233,7 +233,7 @@ struct Lakes {
     rels: Vec<Rel>,
     sequences: Vec<SeqRel>,
     types: Vec<EnumType>,
-    routines: Vec<(u32, String, String, crate::routines::Routine)>, // oid, schema, name
+    routines: Vec<(u32, String, String, crate::expander::Routine)>, // oid, schema, name
     visible: Vec<String>, // (this lake's schemas on the session's search path: `path.rs`; public when none is set)
     members: Vec<Member>, // the users and roles the caller may see (`pg_roles`, `pg_auth_members`, the grants)
 }
@@ -367,7 +367,7 @@ async fn log_rows(lake: &Lake, metas: &[(String, TableMeta)]) -> Result<BTreeMap
 fn table_columns(l: &TableMeta) -> Vec<(String, DataType, bool, Option<String>)> {
     let shown = |c: &String| c != "_deleted" || l.key.is_empty(); // (as `SELECT *` shows it)
     l.columns.iter().filter(|(c, _)| shown(c)).map(|(c, t)| {
-        let t = crate::query::dtype(t).unwrap_or(DataType::Utf8);
+        let t = crate::answer::dtype(t).unwrap_or(DataType::Utf8);
         // (an identity column's default is its sequence: Postgres keeps no default for it in its catalog)
         let default = l.defaults.get(c).filter(|_| !l.identity.contains_key(c)).map(|d| shown_default(d, &t));
         (c.clone(), t, l.not_null.contains(c), default)
@@ -404,7 +404,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         if crate::sys::hidden(name) {
             continue;
         }
-        let (schema, table) = crate::ddl::split(name);
+        let (schema, table) = crate::text::split(name);
         let l = m.described(); // (a view that finishes its answers: those columns)
         let cols = table_columns(&l);
         let (rows, bytes) = m.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
@@ -430,7 +430,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     };
     for (k, v) in views {
         let name = &k[2..];
-        let (schema, view) = crate::ddl::split(name);
+        let (schema, view) = crate::text::split(name);
         let cols: Vec<(String, DataType, bool, Option<String>)> = match &every {
             Some(ctx) => match ctx.sql(&format!("SELECT * FROM \"{schema}\".\"{view}\" LIMIT 0")).await {
                 Ok(df) => match crate::query::run_schema(ctx, df.logical_plan()) {
@@ -449,7 +449,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
     // reader may not read, so a BI tool's table list is the user's.
     if let Some(a) = crate::auth::limited() {
-        rels.retain_mut(|r| match a.columns("select", &crate::ddl::join(&r.schema, &r.name)) {
+        rels.retain_mut(|r| match a.columns("select", &crate::text::join(&r.schema, &r.name)) {
             None => false,
             Some(None) => true,
             Some(Some(these)) => {
@@ -473,18 +473,18 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     for (k, seq) in lake.cat.scan::<crate::seq::Sequence>("sq/", "sq0").await? {
         let Ok(shape) = crate::seq::shape(&seq.declared) else { continue };
         let name = &k[3..];
-        let (schema, short) = crate::ddl::split(name);
+        let (schema, short) = crate::text::split(name);
         sequences.push(SeqRel { oid: oid("sq", name), lake_name: name.into(), schema: schema.into(), name: short.into(), shape });
     }
-    let routines = lake.cat.scan::<crate::routines::Routine>("r/", "r0").await?.into_iter().map(|(k, r)| {
-        let (s, n) = crate::ddl::split(&k[2..]);
+    let routines = lake.cat.scan::<crate::expander::Routine>("r/", "r0").await?.into_iter().map(|(k, r)| {
+        let (s, n) = crate::text::split(&k[2..]);
         (oid("p", &k[2..]), s.to_string(), n.to_string(), r)
     }).collect();
     let mut indexes = vec![];
     for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
         let Some(r) = rels.iter().find(|r| r.oid == oid("r", &i.table)) else { continue };
         let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
-        let name = crate::ddl::split(&k[3..]).1.to_string();
+        let name = crate::text::split(&k[3..]).1.to_string();
         let at = i.keys.iter().map(|key| {
             let column = key.expr.strip_prefix('"').and_then(|e| e.strip_suffix('"')).filter(|c| !c.contains('"'));
             let named = column.map(|c| meta.as_ref().map_or(c, |m| m.name_of(c)));
@@ -531,7 +531,7 @@ async fn enum_types(lake: &Lake) -> Result<Vec<EnumType>> {
     let all = lake.cat.scan::<crate::types::Type>("ty/", "ty0").await?;
     Ok(all.into_iter().map(|(k, t)| {
         let name = &k[3..]; // (the type's name as the lake has it: `schema.name`, or `name` in public)
-        let (schema, short) = crate::ddl::split(name);
+        let (schema, short) = crate::text::split(name);
         EnumType { oid: oid("ty", name), array: oid("ta", name), schema: schema.into(), name: short.into(), labels: t.labels }
     }).collect())
 }
@@ -572,7 +572,7 @@ fn at_of(r: &Rel, columns: &[String]) -> Vec<i16> { columns.iter().map(|c| r.col
 
 /// The relation a foreign key names, as the lake names tables (`schema.table`, or `table`).
 fn referred<'a>(rels: &'a [Rel], name: &str) -> Option<&'a Rel> {
-    let (schema, table) = crate::ddl::split(name);
+    let (schema, table) = crate::text::split(name);
     rels.iter().find(|r| r.kind != 'v' && r.schema == schema && r.name == table)
 }
 
@@ -798,7 +798,7 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
         ("proparallel", TEXT), ("pronargs", INT2), ("pronargdefaults", INT2), ("prorettype", OID), ("proargtypes", list(OID)), ("proallargtypes", list(OID)), ("proargmodes", list(TEXT)),
         ("proargnames", list(TEXT)), ("proargdefaults", TEXT), ("protrftypes", list(OID)), ("prosrc", TEXT), ("probin", TEXT), ("prosqlbody", TEXT), ("proconfig", list(TEXT)), ("proacl", list(TEXT))],
         l.routines.iter().map(|(oid, schema, name, r)| {
-            use crate::routines::Kind;
+            use crate::expander::Kind;
             let kind = match r.kind { Kind::Procedure => "p", _ => "f" };
             let lang = if r.language == "python" { 13_000 } else { 14 };
             let rettype = match r.kind { Kind::Procedure => 2278, Kind::Table => 2249, Kind::Macro => r.returns.as_deref().map_or(25, sql_oid) };
@@ -1008,7 +1008,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
     add!("routines", &[("specific_catalog", TEXT), ("specific_schema", TEXT), ("specific_name", TEXT), ("routine_catalog", TEXT), ("routine_schema", TEXT), ("routine_name", TEXT),
         ("routine_type", TEXT), ("data_type", TEXT), ("routine_body", TEXT), ("routine_definition", TEXT), ("external_language", TEXT), ("is_deterministic", TEXT)],
         l.routines.iter().map(|(oid, schema, name, r)| {
-            let procedure = r.kind == crate::routines::Kind::Procedure;
+            let procedure = r.kind == crate::expander::Kind::Procedure;
             vec![db(), s(schema.clone()), s(format!("{name}_{oid}")), db(), s(schema.clone()), s(name.clone()), s(if procedure { "PROCEDURE" } else { "FUNCTION" }), r.returns.clone().map_or(n(), s),
                 s(if r.language == "python" { "EXTERNAL" } else { "SQL" }), if crate::auth::shows_code() { s(r.body.clone()) } else { n() }, s(if r.language.is_empty() { "SQL".to_string() } else { r.language.to_uppercase() }), s("NO")]
         }).collect());
@@ -1031,7 +1031,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
         for g in m.grants.iter().filter(|g| ["select", "insert", "update", "delete"].contains(&g.privilege.as_str())) {
             let relations: Vec<&Rel> = match &g.on {
                 On::Table(t) => {
-                    let (schema, table) = crate::ddl::split(t);
+                    let (schema, table) = crate::text::split(t);
                     l.rels.iter().filter(|r| r.schema == schema && r.name == table).collect()
                 }
                 On::Schema(schema) => l.rels.iter().filter(|r| r.schema == *schema).collect(),
@@ -1402,7 +1402,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
     let sigs: Arc<BTreeMap<u32, (String, String)>> = Arc::new(l.routines.iter().map(|(oid, _, _, r)| {
         let args = r.params.iter().map(|p| format!("{} {}", p.name, p.ty.clone().unwrap_or_else(|| "any".into()))).collect::<Vec<_>>().join(", ");
         let result = match r.kind {
-            crate::routines::Kind::Procedure => String::new(),
+            crate::expander::Kind::Procedure => String::new(),
             _ => r.returns.clone().unwrap_or_else(|| "any".into()),
         };
         (*oid, (result, args))
@@ -1445,7 +1445,7 @@ fn register_functions(ctx: &SessionContext, l: Arc<Lakes>) {
         let ids = int_arg(&a[0])?;
         Ok(texts_out((0..n).map(|i| {
             let (_, schema, name, r) = lk.routines.iter().find(|(id, ..)| Some(*id as i64) == ids[i])?;
-            let lake_name = if schema == crate::ddl::PUBLIC { name.clone() } else { format!("{schema}.{name}") };
+            let lake_name = if schema == crate::text::PUBLIC { name.clone() } else { format!("{schema}.{name}") };
             code.then(|| crate::objects::routine_sql(&crate::objects::name_sql(&lake_name), r))
         })))
     }));
@@ -1508,7 +1508,7 @@ pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
             *t = name;
         }
     }
-    stmts.iter().map(crate::routines::sql).collect::<Vec<_>>().join("; ")
+    stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")
 }
 
 /// The table a statement makes, alters or inserts into.
@@ -2107,7 +2107,7 @@ mod tests {
 
     /// A relation of the sample lake, as `lakes()` makes one from the catalog.
     fn rel(name: &str, kind: char, rows: u64) -> Rel {
-        let (schema, table) = crate::ddl::split(name);
+        let (schema, table) = crate::text::split(name);
         Rel {
             oid: oid("r", name), schema: schema.into(), name: table.into(), kind,
             columns: vec![("id".into(), DataType::Int64, true, None), ("region".into(), DataType::Utf8, false, None)],

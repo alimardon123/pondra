@@ -8,7 +8,8 @@ use crate::codes::coded;
 use crate::constraints::{informational, Change, Constraint, Kind};
 use crate::ddl::{query_key, Ddl, StoredView};
 use crate::store::{json, table_key, Lake, TableMeta};
-use crate::write::{first_word, object, Stmt};
+use crate::write::Stmt;
+use crate::text::{first_word, object};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use datafusion::common::DFSchema;
 use datafusion::sql::sqlparser::{ast::{AlterTableOperation, Statement, TableConstraint}, dialect::GenericDialect, parser::Parser};
@@ -56,7 +57,7 @@ fn alter(s: &str) -> Option<Stmt> {
             Err(e) => Stmt::Invalid(format!("{e:#}")),
         },
         [AlterTableOperation::DropConstraint { if_exists: constraint_if_exists, name, .. }] => {
-            Stmt::Ddl(vec![Ddl::ViewFacts { view, if_exists, change: Change::Drop { name: crate::write::ident(name), if_exists: *constraint_if_exists } }])
+            Stmt::Ddl(vec![Ddl::ViewFacts { view, if_exists, change: Change::Drop { name: crate::text::ident(name), if_exists: *constraint_if_exists } }])
         }
         _ => Stmt::Invalid(WANT.into()),
     })
@@ -332,7 +333,7 @@ pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change) -> 
 async fn stored_columns(lake: &Lake, view: &str, v: &StoredView) -> Result<Vec<String>> {
     let sql = format!("SELECT * FROM {} LIMIT 0", crate::write::sql_name(view));
     let ctx = crate::query::session(lake, &sql, "").await?;
-    let df = crate::query::sql(&ctx, &sql).await?;
+    let df = crate::engine::sql(&ctx, &sql).await?;
     Ok(shown_columns(&v.sql, df.schema().fields().iter().map(|f| f.name().clone())))
 }
 
