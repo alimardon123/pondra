@@ -125,15 +125,15 @@ fn felt(resident: usize, given: &mut Vec<Given>, now: Instant) -> usize {
 }
 
 /// Starts the watch, when the process can say how much memory it holds and the hot columns can be given
-/// back (`trim_line`). The line is checked only where there is one (a node's own process). A node stopped
-/// ends it (`panics::task`), as its other loops end.
+/// back (`trim_line`). The line is checked only where there is one (a node's own process). It runs on a thread of
+/// its own (`panics::alone`), which a node stopped ends, as its other loops end.
 pub fn start() {
     let Some(trim) = trim_line() else { return };
     if crate::store::resident().is_none() {
         return;
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
-    crate::panics::task(async move {
+    crate::panics::alone(async move {
         let mut given: Vec<Given> = vec![]; // what the hot columns let go of, held by `felt` for `HOLD`
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
@@ -177,12 +177,12 @@ pub fn start() {
                     }
                 }
             }
-            // The wait: as often as the stop needs while a request runs (a plain sleep, since a wake on every
+            // The wait: as often as the trim and the stop need while a request runs (a plain sleep, since a wake on every
             // request would look on every statement); otherwise until a request starts, the cache changes, or
             // the timer ends: 2 s while the cache holds columns (Flight, Kafka and tiering grow the node outside
             // `work`, and the cache is what can answer them), else 30 s.
             match line {
-                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, line)).await,
+                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, if felt < trim { trim } else { line })).await,
                 _ => {
                     let timer = if givers().iter().any(|h| h.usage().0 > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
@@ -194,11 +194,11 @@ pub fn start() {
     });
 }
 
-/// When to look again: before memory growing at [`RATE`] could pass the line from where it is now. (Looking
-/// every second while under half the line, a query that grew from there in that second passed a 1 GB line
-/// by 0.75 GB before the watch saw it.)
-fn every(resident: usize, line: usize) -> Duration {
-    Duration::from_secs_f64(line.saturating_sub(resident) as f64 / RATE).clamp(Duration::from_millis(20), Duration::from_secs(1))
+/// When to look again: before memory growing at [`RATE`] could pass the next mark from where it is now, the trim
+/// line while under it (the cache must go before the line comes), else the line. (Looking every second while under
+/// half the line, a query that grew from there in that second passed a 1 GB line by 0.75 GB before the watch saw it.)
+fn every(resident: usize, mark: usize) -> Duration {
+    Duration::from_secs_f64(mark.saturating_sub(resident) as f64 / RATE).clamp(Duration::from_millis(20), Duration::from_secs(1))
 }
 
 /// Is a request to be stopped now: over the line, and no stop still holding.
