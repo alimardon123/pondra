@@ -518,12 +518,15 @@ pub fn calls(sql: &str) -> bool {
     WORDS.is_match(sql)
 }
 
-/// A positional `INSERT INTO t query` gives every column: refused when one is an ALWAYS identity.
-pub async fn check_every(lake: &Lake, table: &str) -> Result<()> {
+/// A positional `INSERT INTO t query` gives the columns its rows have (`width`: the rows' width, `write::rows_width`; None
+/// when the query doesn't fix it, which gives them all): refused when one of those is an ALWAYS identity.
+pub async fn check_every(lake: &Lake, table: &str, width: Option<usize>) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };
     let Some(meta) = other.as_deref().unwrap_or(lake).cat.get::<TableMeta>(&crate::store::table_key(&name)).await? else { return Ok(()) };
-    let first = always(&meta).next().map(str::to_string);
+    let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted").collect();
+    let given = crate::write::implicit(&columns, width);
+    let first = always(&meta).find(|n| given.iter().any(|c| c == n)).map(str::to_string);
     match first {
         Some(name) => bail!("cannot insert a non-DEFAULT value into column \"{name}\" of {table}: it is an identity column defined as GENERATED ALWAYS (name the columns you give, or say DEFAULT)"),
         None => Ok(()),

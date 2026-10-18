@@ -153,10 +153,8 @@ CROSS JOIN LATERAL jsonb_array_elements(carts.doc -> 'items') AS item;
 
 The alias of `jsonb_array_elements` is each element itself, so `WHERE item ->> 'sku' = 'B7'` reads the element, as Postgres does.
 
-`LEFT JOIN LATERAL … ON true` keeps a row when the call gives none, for `json_array_elements_text`,
-`jsonb_array_elements_text` and `unnest`. Over `jsonb_array_elements` or `jsonb_each` it is refused by
-name for now: their columns are computed from the rows, and this engine doesn't yet keep such a row
-with NULLs in them.
+`LEFT JOIN LATERAL … ON true` keeps a row when the call gives none, for every set function here, with
+NULL in its columns. That includes `jsonb_array_elements`, `jsonb_each` and `jsonb_to_recordset`.
 A set function over a column of an outer query, in a subquery or `EXISTS`, isn't taken yet and is refused by name: join it in
 that query's `FROM` instead (`FROM t, jsonb_array_elements(t.doc) AS e`), then filter or group there.
 

@@ -217,14 +217,17 @@ id  item
 1   30
 ```
 
-A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Pondra refuses the rest by
-name, with SQLSTATE `0A000`: a condition on it, and a `RIGHT` or `FULL` join. A function of constants
-(`generate_series(1, 3)`) is planned as it always was, and `WITH ORDINALITY` numbers each row's elements from 1, as
-Postgres does.
+A `LEFT JOIN LATERAL` takes `ON true` and one `unnest` or set function. Its columns are its own, or
+read from them by a field, a JSON operator or a cast, even inside a `LATERAL (SELECT …)`. Pondra
+refuses the rest by name, with SQLSTATE `0A000`: a condition on it, a constant or arithmetic among its
+columns (a row with no list would need a value there), and a `RIGHT` or `FULL` join. A function of
+constants (`generate_series(1, 3)`) is planned as it always was, and `WITH ORDINALITY` numbers each
+row's elements from 1, as Postgres does.
 
 <Aside type="caution">
-A `LATERAL (SELECT …)` subquery is planned by DataFusion, not by this rule. A correlated aggregate needs
-an equality between the two sides (`WHERE w.v = t.n`): with `<` DataFusion can't plan it.
+A `LATERAL (SELECT …)` over a function's rows is this rule's, as above. One over an aggregate or a scan
+is planned by DataFusion, not by this rule. A correlated aggregate needs an equality between the two
+sides (`WHERE w.v = t.n`): with `<` DataFusion can't plan it.
 </Aside>
 
 ### A table's past
@@ -437,7 +440,7 @@ SELECT name, definition FROM pondra.objects WHERE kind = 'index';
 
 | Statement | Syntax |
 |---|---|
-| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …`; on a keyed table, a key the table holds (or two rows of one key) is refused with `23505`, the whole statement |
+| Insert | `INSERT INTO t [(column, …)] VALUES (…), …` or `INSERT INTO t [(column, …)] SELECT …`; without a column list, a row gives the table's first columns in order and the rest take their `DEFAULT` (NULL if they have none); on a keyed table, a key the table holds (or two rows of one key) is refused with `23505`, the whole statement |
 | Insert, on a key that exists | `INSERT … ON CONFLICT (key) DO NOTHING`, or `… ON CONFLICT (key) DO UPDATE SET column = t.column + excluded.column` (Postgres's) |
 | The same, shorter | `INSERT OR IGNORE INTO t …` (`ON CONFLICT DO NOTHING`), `INSERT OR REPLACE INTO t …` (every column the rows give replaces the row's), as DuckDB and SQLite write them; MySQL's `INSERT IGNORE` too |
 | Update | `UPDATE t SET column = expression [, …] [FROM other o] [WHERE condition]` |
@@ -448,7 +451,7 @@ SELECT name, definition FROM pondra.objects WHERE kind = 'index';
 it applies all or nothing, and a `job` id makes a retry a no-op. A row keeps its `_row_id` through a
 change. `MERGE` answers with the rows `updated`, `deleted` and `inserted`; a target row that matches
 two source rows is an error. `UPDATE … FROM` and `DELETE … USING` join the table to another one, and
-`ON CONFLICT` answers as `MERGE` does. In `DO UPDATE SET`, `t.column` is the row that is there and
+`ON CONFLICT` answers as `MERGE` does. `SET column = DEFAULT` sets the column's default (NULL when it has none), in an `UPDATE`, a `MERGE` and `DO UPDATE SET`. In `DO UPDATE SET`, `t.column` is the row that is there and
 `excluded.column` is the row you sent. MySQL's `ON DUPLICATE KEY UPDATE` is refused by name.
 
 ```sql
@@ -1087,7 +1090,7 @@ text is the node's own, it is shown in code:
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
 | Python functions and procedures on a node started without `--python` | refused, with the flag to use |
-| `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), or a `LEFT` over more than one function | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
+| `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), a `LEFT` over more than one function, or a `LEFT` whose columns include a constant or arithmetic | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
 | `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
 | `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | taken: each row's elements are numbered from 1, as Postgres numbers them |
 | `jsonb_to_recordset(…) WITH ORDINALITY AS x(a int)`, a record's column list with `WITH ORDINALITY` | refused, SQLSTATE `42601`: `WITH ORDINALITY cannot be used with a column definition list`, as Postgres refuses it (`ROWS FROM()` isn't taken) |
