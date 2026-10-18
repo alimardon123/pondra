@@ -37,7 +37,7 @@
 //! every door refuses a longer value (`check`: 22001), but for trailing spaces, which Postgres
 //! takes and cuts (kept here). Its length only grows (`ALTER COLUMN … TYPE VARCHAR(m)`, m ≥ n, or
 //! to plain text); a column holding text gets none, since its rows were never checked against one.
-use crate::pg_json::{is_json, json_of, json_refusal};
+use crate::pg_json::{json_of, json_refusal};
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
@@ -416,8 +416,7 @@ pub fn as_held(meta: &TableMeta, rows: RecordBatch, sql_names: bool) -> Result<R
 
 /// The refusal of a jsonb value `jsonb_into` couldn't write: `refusal`'s message and SQLSTATE, as `check` words them. Where
 /// `refusal` takes no value (it is JSON, but a number past what `numeric` holds is only jsonb's), the words are JSON's and
-/// the error's own SQLSTATE stays. (`refusal` judges depth with serde's limit of 128 levels, so a deeper document is 22P02
-/// for `check` and for this, never the 54001 `jsonb_into` would raise.)
+/// the error's own SQLSTATE stays (a lone surrogate's escape is JSON, but not jsonb's).
 fn jsonb_refused(column: &str, v: &str, e: datafusion::error::DataFusionError) -> anyhow::Error {
     let code = crate::codes::of(&anyhow::Error::from(e));
     let (message, code) = refusal("jsonb", column, v).unwrap_or_else(|| (json_refusal(v), code));
@@ -437,7 +436,11 @@ fn refused_uuid(column: &str, s: &str) -> String {
 fn refusal(t: &str, column: &str, v: &str) -> Option<(String, &'static str)> {
     match t {
         "uuid" if !is_uuid(v) => Some((refused_uuid(column, v), "22P02")),
-        "json" | "jsonb" if !is_json(v) => Some((format!("{} (column {column} holds {t})", json_refusal(v)), "22P02")),
+        // (the reader the functions use decides: 22P02 for text that isn't JSON, 54001 past its levels)
+        "json" | "jsonb" => crate::pg_json_make::refused(v).map(|code| match code {
+            "54001" => (format!("stack depth limit exceeded (column {column} holds {t}: a document nested past {} levels)", crate::pg_json_make::MAX_DEPTH), code),
+            _ => (format!("{} (column {column} holds {t})", json_refusal(v)), code),
+        }),
         _ => match length(t) {
             Some(n) if too_long(v, n) => Some((format!("value too long for type character varying({n}) (column {column}: a value of {} characters)", v.chars().count()), "22001")),
             _ => None,
@@ -843,5 +846,15 @@ mod tests {
         let j = out.column_by_name("j").unwrap();
         assert_eq!(j.data_type(), &DataType::Utf8View);
         assert_eq!(j.as_string_view().value(0), r#"{"a": 1, "b": 2}"#);
+    }
+
+    #[test]
+    fn a_json_column_takes_the_levels_the_functions_read() {
+        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        assert_eq!(refusal("jsonb", "c", &nested(200)), None);
+        assert_eq!(refusal("jsonb", "c", "[1,").map(|(_, code)| code), Some("22P02"));
+        let (message, code) = refusal("json", "c", &nested(crate::pg_json_make::MAX_DEPTH + 1)).unwrap();
+        assert_eq!(code, "54001");
+        assert!(message.contains(&crate::pg_json_make::MAX_DEPTH.to_string()), "{message}");
     }
 }

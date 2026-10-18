@@ -788,6 +788,59 @@ fn read_whole(json: &str) -> Option<Node<'_>> {
     Some(node)
 }
 
+/// Why `json` isn't JSON as Postgres's `json` takes it, as Postgres's SQLSTATE: 22P02 for text that isn't JSON, 54001 past
+/// `MAX_DEPTH` levels; None when it is. Every check of a document (a write, `is_json`) asks it. serde's reader goes first:
+/// it is the faster walk, and it takes what Postgres's `json` takes, a lone surrogate's escape too (which only `jsonb`
+/// and the functions that read the text refuse, as Postgres's do). What serde refuses, the walk below judges as `read`
+/// reads: serde stops at 128 levels, and the functions read to `MAX_DEPTH`. The walk stops at the level it refuses, so
+/// a deep text costs no more than `MAX_DEPTH` levels of recursion.
+pub(crate) fn refused(json: &str) -> Option<&'static str> {
+    if serde_json::from_str::<serde::de::IgnoredAny>(json).is_ok() {
+        return None;
+    }
+    let mut jiter = Jiter::new(json.as_bytes());
+    let outcome = jiter.peek().map_err(|_| "22P02").and_then(|peek| skip(&mut jiter, peek, 1)).and_then(|()| jiter.finish().map_err(|_| "22P02"));
+    outcome.err()
+}
+
+/// Skips the value at the reader's place, whose first byte is `peek`, as `read` reads it, the value being at nesting
+/// `depth` (the outermost array or object is 1). Past `MAX_DEPTH` levels it is 54001, counted as `depth_check` counts
+/// them; anything jiter refuses is 22P02. It reads texts and keys as bytes: jiter checks their escapes as `read`'s
+/// calls do and only leaves out the check that they are UTF-8, which a `&str` already is, so it accepts exactly what
+/// `read` accepts, with nothing built or copied.
+fn skip(jiter: &mut Jiter, peek: Peek, depth: usize) -> Result<(), &'static str> {
+    let not_json = |_| "22P02";
+    if peek == Peek::Null {
+        jiter.known_null().map_err(not_json)?;
+    } else if peek == Peek::True || peek == Peek::False {
+        jiter.known_bool(peek).map_err(not_json)?;
+    } else if peek == Peek::String {
+        jiter.known_bytes().map_err(not_json)?;
+    } else if peek == Peek::Array || peek == Peek::Object {
+        if depth > MAX_DEPTH {
+            return Err("54001");
+        }
+        if peek == Peek::Array {
+            let mut next = jiter.known_array().map_err(not_json)?;
+            while let Some(peek) = next {
+                skip(jiter, peek, depth + 1)?;
+                next = jiter.array_step().map_err(not_json)?;
+            }
+        } else {
+            // (a key borrows the reader, so whether one came is kept as a flag, not the key)
+            let mut more = jiter.next_object_bytes().map_err(not_json)?.is_some();
+            while more {
+                let peek = jiter.peek().map_err(not_json)?;
+                skip(jiter, peek, depth + 1)?;
+                more = jiter.next_key_bytes().map_err(not_json)?.is_some();
+            }
+        }
+    } else {
+        jiter.known_number_bytes(peek).map_err(not_json)?;
+    }
+    Ok(())
+}
+
 /// Refuses a document nested past `MAX_DEPTH` levels, before anything is read: a bracket inside a string doesn't count,
 /// and a text's escapes are skipped. A level takes a byte, so a text of `MAX_DEPTH` bytes or fewer can't nest that deep
 /// and isn't scanned (a scan of an 80-byte document cost a fifth of reading it).
@@ -1167,10 +1220,48 @@ mod tests {
                 assert_eq!(jsonb_text(&nested(MAX_DEPTH)).unwrap(), nested(MAX_DEPTH));
                 let refused = jsonb_text(&nested(MAX_DEPTH + 1)).unwrap_err();
                 assert_eq!(crate::codes::of(&anyhow::Error::new(refused)), "54001");
+                // (a write's check takes the same levels: `skip` recurses once per level, on a node's stack too)
+                assert_eq!(super::refused(&nested(MAX_DEPTH)), None);
+                assert_eq!(super::refused(&nested(MAX_DEPTH + 1)), Some("54001"));
+                // (the walk stops at MAX_DEPTH + 1 levels, so a million open brackets never recurse a million deep)
+                assert_eq!(super::refused(&"[".repeat(1_000_000)), Some("54001"));
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn refused_says_what_parse_refuses() {
+        assert_eq!(super::refused(r#"[1, {"a": [true, null, "x\"y", -1.5e3]}]"#), None);
+        assert_eq!(super::refused(r#"{"é\u00e9\ud83d\ude00": "\n\u0041"}"#), None);
+        // (a lone surrogate's escape is JSON to Postgres's `json`, in a text or a key; only reading the text refuses it)
+        for lone in [r#""\ud800""#, r#"{"\ud800": 1}"#] {
+            assert_eq!(super::refused(lone), None, "{lone}");
+            assert!(parse(lone).is_err(), "{lone}");
+        }
+        for bad in ["[1,", r#"{"a" 1}"#, "tru", "1 2", "", r#""\q""#, r#""\u12""#, "[1]]"] {
+            assert!(parse(bad).is_err(), "{bad}");
+            assert_eq!(super::refused(bad), Some("22P02"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_document_200_levels_deep_is_read_and_is_json() {
+        let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(super::refused(&nested), None);
+        assert!(parse(&nested).is_ok());
+        assert!(crate::pg_json::is_json(&nested));
+    }
+
+    #[test]
+    fn is_json_agrees_with_refused() {
+        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        let (deep, too_deep) = (nested(200), nested(MAX_DEPTH + 1));
+        let docs: [&str; 8] = [r#"[1, {"a": [true, null, "x\"y", -1.5e3]}]"#, "[1,", r#"{"a" 1}"#, "tru", "1 2", "", &deep, &too_deep];
+        for doc in docs {
+            assert_eq!(crate::pg_json::is_json(doc), super::refused(doc).is_none(), "{}", doc.chars().take(20).collect::<String>());
+        }
     }
 
     #[tokio::test]

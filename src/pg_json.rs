@@ -82,8 +82,8 @@ fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
 /// Text in any of DataFusion's string types: what the JSON functions read as a document's text, from a column or a literal.
 pub(crate) fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
 
-/// `s` parses as JSON (`json` and `jsonb` alike): its syntax is checked, nothing is built.
-pub fn is_json(s: &str) -> bool { serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() }
+/// `s` parses as JSON (`json` and `jsonb` alike): jiter reads its syntax, as the functions do, and nothing is built.
+pub fn is_json(s: &str) -> bool { crate::pg_json_make::refused(s).is_none() }
 
 /// Postgres's words for a value that isn't JSON, which it quotes as far as 60 characters (jsonb's
 /// refusals say `type json` too).
@@ -94,9 +94,10 @@ pub(crate) fn json_refusal(s: &str) -> String {
 
 /// `s` as JSON text the lake keeps: itself when it parses as JSON, else Postgres's refusal (22P02).
 pub fn json_of(s: &str) -> anyhow::Result<String> {
-    match is_json(s) {
-        true => Ok(s.to_string()),
-        false => Err(crate::codes::coded("22P02", json_refusal(s))),
+    match crate::pg_json_make::refused(s) {
+        None => Ok(s.to_string()),
+        Some("54001") => Err(crate::codes::coded("54001", "stack depth limit exceeded")),
+        Some(code) => Err(crate::codes::coded(code, json_refusal(s))),
     }
 }
 
