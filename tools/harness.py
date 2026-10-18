@@ -7092,16 +7092,25 @@ def hot_under_line():
     try:
         seen["files once the leader's first tiering rounds are done"] = files_settled(lake, "data/hl/")
         held_before, rss_before = warm("hl")
-        n = HOT_LINE_ROWS
-        status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
-        held_after = hot_bytes()
-        peak = vm_hwm(node.p.pid)
+        # A query that never takes the node past the trim line has nothing to show: with few columns held (the merges
+        # decide how many) the node starts low, and 8,000,000 values reached 739 MB of a 717 MB trim line. So a run whose
+        # own peak stays within 100 MB of the trim line, with nothing trimmed, is run again with a quarter more values
+        # (the cache is as it was), twice at most; past that margin the node was over the line for some 50 ms, ten looks.
+        trim, n, tries = (1 << 30) // 10 * 7, HOT_LINE_ROWS, []
+        for _ in range(3):
+            reset_peak()  # (where it isn't allowed, the peak counts from the node's start, the warm-up included, so no run is taken again)
+            status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
+            held_after, peak = hot_bytes(), vm_hwm(node.p.pid)
+            tries.append({"rows": n, "peak resident": peak >> 20})
+            if status != 200 or held_after < held_before or peak > trim + (100 << 20):
+                break
+            n = n * 5 // 4
         stopped = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
         want = [{"g": 0, "n": n // 3}, {"g": 1, "n": (n + 2) // 3}, {"g": 2, "n": (n + 1) // 3}]
         got = sorted(json.loads(body), key=lambda r: r["g"]) if status == 200 else None
         seen["a memory line of 1 GB: the columns held, the query's answer, resident memory (MB)"] = {
             "rows": n, "held before": held_before, "resident before": rss_before >> 20, "status": [status, sqlstate],
-            "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped}
+            "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped, "runs": tries}
         checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
             held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
         # The second check, on a fresh node of its own: the first node is killed and a new one starts on the same lake with
