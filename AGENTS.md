@@ -2814,9 +2814,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    request that grew the node, not an older cheap one beside it…" (the cheap one was stopped by age). The same one watch gives the
    hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
    there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
-   decoded again and a query can't. A request takes the watch's last reading as it starts (`oom::seen`), never reads
-   the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the hot columns are let go
-   before a query is stopped".
+   decoded again and a query can't. After a trim it has jemalloc give its free pages back (`oom::purge`) and reads
+   resident memory again, never crediting what was freed: a query growing meanwhile takes those very pages, and with a
+   credit the node passed its line by what the cache gave back. A request takes the watch's last reading as it starts
+   (`oom::seen`), never reads the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the
+   hot columns are let go before a query is stopped", and "a query that needs more than the line is stopped near it,
+   even while the hot columns give memory back…" (with the credit: 128 MB held, a peak of 1,198 MB of a 1 GB line).
 418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
    cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
    counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
