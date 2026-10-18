@@ -83,6 +83,78 @@
    ]
   ]
  },
+ "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b * 10]) AS u(v)": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ],
+   [
+    "1",
+    "50"
+   ],
+   [
+    "2",
+    "3"
+   ],
+   [
+    "2",
+    "40"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "3",
+    "20"
+   ],
+   [
+    "4",
+    "2"
+   ],
+   [
+    "4",
+    "20"
+   ]
+  ]
+ },
+ "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b]) AS u(v)": {
+  "rows": [
+   [
+    "1",
+    "1"
+   ],
+   [
+    "1",
+    "5"
+   ],
+   [
+    "2",
+    "3"
+   ],
+   [
+    "2",
+    "4"
+   ],
+   [
+    "3",
+    ""
+   ],
+   [
+    "3",
+    "2"
+   ],
+   [
+    "4",
+    "2"
+   ],
+   [
+    "4",
+    "2"
+   ]
+  ]
+ },
  "SELECT s.id, s.x FROM (SELECT t.id, u.x FROM t, unnest(t.xs) AS u(x)) s WHERE s.x > 1": {
   "count": 18669,
   "ordered": "96694b0cdd0ac9f3b317de4a3b41b7a2722ef2947d7764b0c2f64336f455ea8e",
