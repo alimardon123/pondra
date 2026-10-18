@@ -27,7 +27,7 @@ use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::logical_expr::physical_planning_context::{ScalarSubqueryResults, SubqueryIndex};
-use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
+use datafusion::physical_plan::execution_plan::{replace_children_if_necessary, reset_plan_states};
 use datafusion::physical_plan::streaming::StreamingTableExec;
 use datafusion::physical_plan::{displayable, ExecutionPlan, ExecutionPlanProperties, Partitioning};
 use datafusion::prelude::SessionContext;
@@ -693,7 +693,13 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             let mut again = s.clone();
                             again.shuffle.as_mut().expect("a shuffle").again = true;
-                            once(&again).await.map_err(|second| Dead { node: i, why: format!("{first:#}; then {second:#}") }.into())
+                            match once(&again).await {
+                                Ok(out) => {
+                                    eprintln!("shuffle: node {i}'s step {step} failed ({first:#}); its second try answered");
+                                    Ok(out)
+                                }
+                                Err(second) => Err(Dead { node: i, why: format!("{first:#}; then {second:#}") }.into()),
+                            }
                         }
                         ok => ok,
                     }
@@ -1220,8 +1226,11 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
         },
     };
     let top = received(&job, sh, &top).await?;
+    // A second try's pieces take names of their own: a first try still finishing on this node must not
+    // write over them (the step's number with an `r` after it).
+    let tag = format!("{}{}", sh.step, if sh.again { "r" } else { "" });
     if last {
-        let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{}", sh.step)).await?;
+        let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{tag}")).await?;
         fails_once(sh)?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
@@ -1230,12 +1239,12 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     // bucket past 64 MB goes to this node's disk as it is filled, so a shuffle isn't bounded by memory.
     let x = &job.exchanges[sh.step];
     let made = match x.plan.output_partitioning().clone() {
-        _ if x.whole => vec![drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{}-all", sh.step)).await?; sh.nodes.len()], // (every node, every partition)
-        Partitioning::Hash(exprs, parts) => scatter(&top, job.ctx.task_ctx(), &sh.id, sh.step, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
+        _ if x.whole => vec![drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{tag}-all")).await?; sh.nodes.len()], // (every node, every partition)
+        Partitioning::Hash(exprs, parts) => scatter(&top, job.ctx.task_ctx(), &sh.id, &tag, exprs, sh.nodes.len(), parts, x.own.then_some(sh.me)).await?,
         _ => {
             // An all-gather (`everywhere`): every node is sent all of what this one has.
-            let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{}-gathered", sh.step));
-            for part in drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{}-all", sh.step)).await? {
+            let mut all = Spill::new(crate::spill::dir(&sh.id)?, format!("{tag}-gathered"));
+            for part in drain(&top, job.ctx.task_ctx(), &sh.id, &format!("{tag}-all")).await? {
                 all.absorb(part)?;
             }
             vec![vec![all]; sh.nodes.len()]
@@ -1257,10 +1266,11 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
     let mut inputs = vec![];
     collect_inputs(top, &job.exchanges, &mut inputs);
     let mut replaced = vec![];
+    let r = if sh.again { "r" } else { "" }; // (a second try's files take names of their own)
     for x in inputs {
         let k = job.exchanges.iter().position(|e| Arc::ptr_eq(&e.plan, &x)).context("an unknown exchange")?;
         let own = job.exchanges[k].own;
-        let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me, None));
+        let fetches = sh.nodes.iter().enumerate().filter(|(i, _)| !own || *i == sh.me).map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sh.me, None, r));
         let waited = std::time::Instant::now();
         let from = futures::future::try_join_all(fetches).await?;
         crate::metrics::add(&crate::metrics::WAIT_US, waited.elapsed().as_micros() as u64);
@@ -1275,10 +1285,10 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
                     parts[q] = from.get(sh.me).and_then(|f| f.get(q)).cloned().into_iter().collect(); // (only my share)
                     continue;
                 }
-                (true, false) => fetch(job, &sh.id, "", true, k, sp.node, Some(q)).await?,
+                (true, false) => fetch(job, &sh.id, "", true, k, sp.node, Some(q), r).await?,
                 (false, true) => continue,
                 (false, false) => {
-                    let all = sh.nodes.iter().enumerate().map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sp.node, Some(q)));
+                    let all = sh.nodes.iter().enumerate().map(|(i, node)| fetch(job, &sh.id, node, i == sh.me, k, sp.node, Some(q), r));
                     futures::future::try_join_all(all).await?.concat()
                 }
             };
@@ -1286,10 +1296,17 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
         }
         replaced.push((x.clone(), Received::new(&x, parts)?));
     }
-    Ok(top.clone().transform_down(|p| match replaced.iter().find(|(x, _)| Arc::ptr_eq(x, &p)) {
+    let top = top.clone().transform_down(|p| match replaced.iter().find(|(x, _)| Arc::ptr_eq(x, &p)) {
         Some((_, input)) => Ok(Transformed::yes(input.clone())),
         None => Ok(Transformed::no(p)),
-    })?.data)
+    })?.data;
+    // A second try runs fresh operators: a plan runs once (DataFusion's scan hands out its files from a
+    // queue its first run empties; a round-robin repartition hands out its channels once). Only a second
+    // try: a reset join drops its dynamic filter, which a first try's scans still prune by.
+    Ok(match sh.again {
+        true => reset_plan_states(top)?,
+        false => top,
+    })
 }
 
 /// Every partition of `plan` run and split by the exchange's hash into a bucket per node and
@@ -1300,13 +1317,13 @@ async fn received(job: &Job, sh: &Shuffle, top: &Arc<dyn ExecutionPlan>) -> Resu
 /// above it find each key where they expect it. The partitions run at once, each filling buckets
 /// of its own; they are joined at the end in partition order, so a bucket's rows are always in
 /// the same order.
-async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, step: usize, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>) -> Result<Vec<Vec<Spill>>> {
+async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::TaskContext>, job: &str, tag: &str, exprs: Vec<Arc<dyn datafusion::physical_plan::PhysicalExpr>>, nodes: usize, parts: usize, only: Option<usize>) -> Result<Vec<Vec<Spill>>> {
     use datafusion::physical_plan::repartition::BatchPartitioner;
     let (dir, n) = (crate::spill::dir(job)?, nodes * parts);
     let runs = (0..plan.output_partitioning().partition_count()).map(|p| {
-        let (plan, ctx, dir, exprs) = (plan.clone(), ctx.clone(), dir.clone(), exprs.clone());
+        let (plan, ctx, dir, exprs, tag) = (plan.clone(), ctx.clone(), dir.clone(), exprs.clone(), tag.to_string());
         async move {
-            let mut into: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{step}-{i}-p{p}"))).collect();
+            let mut into: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}-p{p}"))).collect();
             let (mut split, mut rows) = (BatchPartitioner::try_new(Partitioning::Hash(exprs, n), Default::default(), p, 1)?, plan.execute(p, ctx)?);
             while let Some(b) = futures::StreamExt::next(&mut rows).await {
                 let mut wrote = Ok(());
@@ -1321,7 +1338,7 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
             Ok::<_, anyhow::Error>(into)
         }
     });
-    let mut out: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{step}-{i}"))).collect();
+    let mut out: Vec<Spill> = (0..n).map(|i| Spill::new(dir.clone(), format!("{tag}-{i}"))).collect();
     for made in futures::future::try_join_all(runs).await? {
         for (i, s) in made.into_iter().enumerate() {
             out[i].absorb(s)?;
@@ -1361,17 +1378,24 @@ fn collect_inputs(p: &Arc<dyn ExecutionPlan>, exchanges: &[Exchange], out: &mut 
     }
 }
 
+/// Node `to`'s buckets of exchange `exchange`, as this node kept them. A step that ran here keeps
+/// one for every node, so a missing one means that step never ran here: an error, never an empty
+/// bucket (which would answer as if this node's share were empty).
+fn kept(job: &Job, exchange: usize, to: usize) -> Result<Vec<Spill>> {
+    job.buckets.lock().unwrap().get(&(exchange, to)).cloned().with_context(|| format!("shuffle {}: step {exchange} hasn't run on this node", job.id))
+}
+
 /// Node `from`'s bucket of exchange `k` for node `to`. A remote one is streamed onto this node's
 /// disk piece by piece, never held whole in memory. Buckets are kept until the job ends, not
-/// taken, so a step that has to be retried can read them again.
-async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize, part: Option<usize>) -> Result<Vec<Spill>> {
+/// taken, so a step that has to be retried can read them again. `r`: a second try's name mark (`received`).
+async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize, part: Option<usize>, r: &str) -> Result<Vec<Spill>> {
     if local {
-        return Ok(one(job.buckets.lock().unwrap().get(&(k, to)).cloned().unwrap_or_default(), part));
+        return Ok(one(kept(job, k, to)?, part));
     }
     let only = part.map(|q| format!("&part={q}")).unwrap_or_default();
     let res = crate::cluster::http().get(crate::tls::url(&format!("{from}/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).send().await?;
     ensure!(res.status().is_success(), "{from}: {}", res.text().await?);
-    let name = format!("in-{k}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
+    let name = format!("in-{k}{r}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
     Ok(read_reply(res, id, &name).await?.1)
 }
 
@@ -1387,8 +1411,7 @@ fn one(bucket: Vec<Spill>, part: Option<usize>) -> Vec<Spill> {
 /// piece at a time (as `reply` sends a stage's).
 pub fn bucket(id: &str, exchange: usize, to: usize, part: Option<usize>) -> Result<Vec<Spill>> {
     let job = JOBS.lock().unwrap().get(id).cloned().context("shuffle expired")?;
-    let bucket = job.buckets.lock().unwrap().get(&(exchange, to)).cloned();
-    Ok(one(bucket.unwrap_or_default(), part))
+    Ok(one(kept(&job, exchange, to)?, part))
 }
 
 /// What an exchange brought this node, standing where the exchange was: one partition for each
