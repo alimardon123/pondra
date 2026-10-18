@@ -1917,10 +1917,10 @@ def clients():
     checks["no token -> 401"] = _raises(lambda: pondra.connect(f"http://127.0.0.1:{A.port}").sql("SELECT 1").rows())
     admin.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE, _deleted BOOLEAN)")
     admin.sql("CREATE TABLE events (user VARCHAR, amount BIGINT) WITH (cluster_by = 'user')")
-    checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0, false)"))
+    checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0)"))
     checks["write token can't create"] = _raises(lambda: writer.sql("CREATE TABLE nope (a BIGINT)"))
     # SQL writes and the Python client
-    writer.sql("INSERT INTO users VALUES (1, 'ann', 1.0, false), (2, 'bob', 2.0, false), (3, 'cy', 3.0, false)")
+    writer.sql("INSERT INTO users VALUES (1, 'ann', 1.0), (2, 'bob', 2.0), (3, 'cy', 3.0)")
     writer.sql("UPDATE users SET score = score + 10 WHERE id = 1")
     writer.sql("DELETE FROM users WHERE id = 2")
     writer.append("events", [{"user": "ann", "amount": 5}])
@@ -1934,7 +1934,7 @@ def clients():
     # Postgres protocol: psycopg 3 (extended, text and binary), psycopg2, SQLAlchemy + pandas, asyncpg
     dsn = f"host=127.0.0.1 port={A.port + 10} dbname=pondra user=writer password=w-tok"
     with psycopg.connect(dsn, autocommit=True) as c:
-        c.execute("INSERT INTO users VALUES (%s, %s, %s, false)", (4, "dee", 4.5))
+        c.execute("INSERT INTO users VALUES (%s, %s, %s)", (4, "dee", 4.5))
         checks["psycopg 3"] = c.execute("SELECT name FROM users WHERE id = %s", (4,)).fetchone() == ("dee",)
         checks["psycopg 3 binary"] = c.cursor(binary=True).execute("SELECT score FROM users WHERE id = %s", (4,)).fetchone() == (4.5,)
     c2 = psycopg2.connect(dsn); c2.autocommit = True
@@ -1949,12 +1949,12 @@ def clients():
     checks["wrong password refused"] = _raises(lambda: psycopg.connect(dsn.replace("w-tok", "nope")))
     # attached lake: write into it through its own leader, join across the two
     admin.sql("CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, user VARCHAR, amount BIGINT, _deleted BOOLEAN)")
-    writer.sql("INSERT INTO sales.orders VALUES (1, 'ann', 10, false), (2, 'cy', 20, false)")
+    writer.sql("INSERT INTO sales.orders VALUES (1, 'ann', 10), (2, 'cy', 20)")
     time.sleep(1)
     checks["cross-lake join"] = reader.sql("SELECT u.name, o.amount FROM sales.orders o JOIN users u ON o.user = u.name ORDER BY 1").rows() == [{"name": "ann", "amount": 10}, {"name": "cy", "amount": 20}]
     # the bucket inbox: a machine that can't reach the leader still writes (exactly once)
     env = {**os.environ, "PONDRA_NO_DIRECT": "1", "PONDRA_JOB": "inbox-1"}
-    run = lambda: subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (5, 'eve', 5.0, false)"], capture_output=True, text=True, env=env, timeout=120)
+    run = lambda: subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (5, 'eve', 5.0)"], capture_output=True, text=True, env=env, timeout=120)
     t = time.time(); first = run(); inbox_s = time.time() - t
     again = run()
     checks["inbox write"] = '"committed":true' in first.stdout and '"duplicate":true' in again.stdout and reader.lookup("users", 5)["name"] == "eve"
@@ -4356,7 +4356,7 @@ def changes():
         "view top (keeps a min or max)" in (refused[0] or "") and "view's" in (refused[1] or "") and all(refused[2:]) and until(table, want(), 10) == want()
     # keyed tables: an UPDATE keeps the row's id; MERGE updates, inserts and deletes
     q("CREATE TABLE kv (k BIGINT, v BIGINT, _deleted BOOLEAN, PRIMARY KEY (k))")
-    q("INSERT INTO kv VALUES (1, 10, false), (2, 20, false)")
+    q("INSERT INTO kv (k, v, _deleted) VALUES (1, 10, false), (2, 20, false)")
     before = {r["k"]: r["_row_id"] for r in q("SELECT k, _row_id FROM kv")}
     q("UPDATE kv SET v = v + 1 WHERE k = 1", 1)
     q("MERGE INTO kv t USING (VALUES (1, 100), (3, 300), (2, 0)) AS s(k, v) ON t.k = s.k WHEN MATCHED AND s.v = 0 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)", 2)

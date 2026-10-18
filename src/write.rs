@@ -1331,7 +1331,9 @@ fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<S
         }
     }).collect::<Result<Vec<_>, _>>()?;
     if given.len() > 0 {
-        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, the table has {})", given_cols.num_columns(), by_position(target).count())));
+        // (one value too many for a table with a marker is most likely the marker, declared or not: say how it's written)
+        let hint = if given.len() == 1 && marker.is_none() && target.fields().iter().any(|f| f.name() == "_deleted") { "; its delete marker _deleted is written only by name: INSERT INTO t (…, _deleted)" } else { "" };
+        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, the table has {}){hint}", given_cols.num_columns(), by_position(target).count())));
     }
     let (mut fields, mut columns) = (target.fields().to_vec(), columns);
     fields.extend(ids.schema().fields().iter().cloned());
