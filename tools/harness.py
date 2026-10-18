@@ -18944,6 +18944,9 @@ def lateral():
         ("a column of t named like the function's", "SELECT t.x, u.x AS y FROM tx t, unnest(t.xs) AS u(x)", None, False),
         ("generate_series with a step", "SELECT r.id, g FROM r, generate_series(r.a, r.b, 2) AS g", None, False),
         ("JOIN LATERAL … ON a condition", "SELECT t.id, u.x FROM t JOIN LATERAL unnest(t.xs) AS u(x) ON u.x > 1", None, False),
+        # (an array literal of the row's own columns: its elements are planned with the FROM's columns, `friendly::arrays`)
+        ("unnest of ARRAY[the row's columns]", "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b]) AS u(v)", None, False),
+        ("unnest of [the row's columns]", "SELECT r.id, u.v FROM r, unnest([r.a, r.b * 10]) AS u(v)", "SELECT r.id, u.v FROM r, unnest(ARRAY[r.a, r.b * 10]) AS u(v)", False),
         ("a lateral aggregate (DataFusion's)", "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s",
          "SELECT t.id, s.c FROM t, LATERAL (SELECT count(*) AS c FROM (VALUES (1), (2), (3)) w(v) WHERE w.v = t.n) s", False),
         ("WITH ORDINALITY over a column: the positions restart for each row", "SELECT t.id, g.v, g.o FROM t, generate_series(t.n, t.n + 1) WITH ORDINALITY AS g(v, o)", None, False),
@@ -21178,7 +21181,9 @@ def friendly():
     same answers spread over three nodes; and what `random_sql.py` found (`- -3` written again as
     a comment, a DISTINCT over a CASE refused, two IN lists of a column taken as sets of values,
     columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
-    list, a CASE and an aggregate, NULLs and all."""
+    list, a CASE and an aggregate, NULLs and all; array literals reading the outer query's columns
+    and the CTEs around them (`ANY([z.n])`, a CTE in an element), which DataFusion planned without
+    them (`friendly.rs`: an array literal is make_array)."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -21197,7 +21202,9 @@ def friendly():
              "INSERT INTO q VALUES " + ", ".join(f"({k}, TIMESTAMP '{t0 + datetime.timedelta(minutes=37 * i + k)}', {i + k / 10})" for i in range(60) for k in range(6)),
              # (doubles past 10^15 beside decimals: DataFusion made both a DECIMAL(30, 15), and failed)
              "CREATE TABLE big (x DOUBLE, r REAL, d DECIMAL(38, 2))",
-             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)"]
+             "INSERT INTO big VALUES (1e20, 1.5, 12.34), (0.7, 0.25, 0.5), (1e-20, NULL, 99999999999999999999.99), (-3e18, -2.5, -1.25), (NULL, 3, NULL)",
+             "CREATE TABLE z (n INT)",
+             "INSERT INTO z VALUES (1), (2), (5)"]
     for s_ in setup:
         sql(A.port, s_)
         duck.execute(s_)
@@ -21236,6 +21243,7 @@ def friendly():
         "COLUMNS('regex')": ("SELECT COLUMNS('^(id|x)$') FROM t", True, False),
         "min(COLUMNS(*))": ("SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)", True, False),
         "COLUMNS([…]) in a WHERE": ("SELECT id FROM t WHERE COLUMNS(['id', 'x']) > 1000", False, False),
+        "COLUMNS([…]) in a SELECT list, its columns named as they are": ("SELECT COLUMNS(['id', 'x']) FROM t WHERE id < 3 ORDER BY id", True, True),
         "* EXCLUDE … RENAME …": ("SELECT * EXCLUDE (l, j) RENAME (g AS grp) FROM t", True, False),
         "ORDER BY ALL": ("SELECT g, k, id FROM t ORDER BY ALL", True, True),
         "ORDER BY ALL DESC over *": ("SELECT * FROM (SELECT g, id FROM t) ORDER BY ALL DESC", True, True),
@@ -21265,6 +21273,14 @@ def friendly():
         "…in arithmetic, a REAL's and a DECIMAL column's too": ("SELECT x * 1.5 AS a, x + 0.25 AS b, r * 2.5 AS c, d * x AS e, d + 0.01 AS f FROM big", True, False),
         "…as CASE's branches, COALESCE, GREATEST and LEAST": ("SELECT CASE WHEN x > 1 THEN x ELSE 0.5 END AS c, coalesce(x, 0.5) AS o, greatest(x, 0.5) AS g, least(x, 2.5) AS l FROM big", True, False),
         "…in a UNION and as a join's key": ("SELECT x FROM big UNION ALL SELECT 0.25 UNION ALL SELECT big.x FROM big JOIN (VALUES (0.7)) v(e) ON big.x = v.e", True, False),
+        # (an array literal reads the outer query's columns and the CTEs around it: the planner plans its
+        # elements with neither, so `[z.n]` in an EXISTS failed with "No field named z.n". Not checked here:
+        # a correlated scalar subquery whose SELECT list reads an outer column, and a lateral unnest of an
+        # outer column; DataFusion 55 can't plan either, with or without an array literal)
+        "ANY([z.n]) in an EXISTS": ("SELECT n FROM z WHERE EXISTS (SELECT 1 WHERE 5 = ANY([z.n])) ORDER BY n", True, True),
+        "a CTE inside an array element": ("WITH c AS (SELECT 7 AS x) SELECT [(SELECT x FROM c)] AS a", True, False),
+        "nested array literals": ("SELECT [[z.n], [0]] AS a FROM z WHERE n = 2", True, False),
+        "a subscript is still a subscript": ("SELECT [10, 20, 30][2] AS a", True, False),
         # (IN and EXISTS outside a WHERE couldn't be planned: `optimize::SubqueriesMarked`)
         "x IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
         "x NOT IN (SELECT …) in a SELECT list, NULLs among its values": ("SELECT id, x NOT IN (SELECT n FROM t WHERE id < 30) AS i FROM t WHERE id < 40", True, False),
@@ -21302,7 +21318,8 @@ def friendly():
     spread = ["PIVOT (SELECT k, g, x FROM t) ON g USING sum(x) GROUP BY k", "SELECT min(COLUMNS(*)) FROM (SELECT id, x, n FROM t)",
               "SELECT id, [y * 2 FOR y IN l IF y > 0] AS d FROM t", "SELECT g, max_by(id, x), arg_min(id, x) FROM t GROUP BY g",
               "SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", "UNPIVOT (SELECT id, x, n FROM t) ON x, n INTO NAME col VALUE val",
-              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t"]
+              "SELECT id, x IN (SELECT n FROM t WHERE id < 300) AS i, EXISTS (SELECT 1 FROM q WHERE q.k = t.k AND q.p > t.x) AS e FROM t",
+              "SELECT id, [k, id % 3] AS a FROM t WHERE id < 500"]
     apart = {q: (sorted(ours(q, spread=1)[1], key=repr), sorted(ours(q, spread=0)[1], key=repr)) for q in spread}
     checks["spread over three nodes == one node"] = all(a == b for a, b in apart.values())
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:  # (described, then run)
@@ -21310,6 +21327,14 @@ def friendly():
             "SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t WHERE id >= %s", "SELECT g, max_by(id, x) FROM t WHERE k >= %s GROUP BY g")]
     want = [sorted(theirs(q)[1]) for q in ("SELECT id, list_filter(l, y -> y > 0 AND y < 4) AS b FROM t", "SELECT g, max_by(id, x) FROM t GROUP BY g")]
     checks["over Postgres (a lambda, max_by) == DuckDB's"] = door == want
+    array_qs = ("SELECT n FROM z WHERE EXISTS (SELECT 1 WHERE 5 = ANY([z.n])) ORDER BY n", "WITH c AS (SELECT 7 AS x) SELECT [(SELECT x FROM c)] AS a")
+    try:  # (a query that fails is a failed check, as in the loop above)
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+            arrays = [sorted(norm(tuple(r)) for r in pg.execute(q).fetchall()) for q in array_qs]
+        arrays_ok = arrays == [sorted(theirs(q)[1]) for q in array_qs]
+    except Exception:
+        arrays_ok = False
+    checks["over Postgres: array literals read the outer query's columns (ANY) and the CTEs around them == DuckDB's"] = arrays_ok
     sql(A.port, "CREATE VIEW best AS SELECT g, max_by(id, x) AS best, [y + 1 FOR y IN list(k)] AS ks FROM t GROUP BY g")
     call(A.port, "POST", "/views/plus", b"SELECT id, list_transform(l, y -> y + 1) AS a FROM t")
     sql(A.port, "INSERT INTO t VALUES (5000, 1, 'a', 9999.5, NULL, [7, 8], TIMESTAMP '2026-02-01 00:00:00', '{}')")
