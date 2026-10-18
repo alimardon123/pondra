@@ -49,13 +49,15 @@ pub struct HeldOutExec {
     props: Arc<PlanProperties>,
 }
 
-/// The window's input side: counts each batch going into the window against the query memory.
+/// The window's input side: counts each batch going into the window against the query memory. `whole`: the window is a
+/// `WindowAggExec` over whole partitions, which the frugal retry answers (its refusal says so: `query::exhausted`).
 #[derive(Debug)]
 pub struct HeldInExec {
     input: Arc<dyn ExecutionPlan>,
     slots: Arc<Slots>,
     props: Arc<PlanProperties>,
     extra: usize,
+    whole: bool,
 }
 
 /// The bytes a batch's rows hold in a window: their own slices (a slice of a bigger batch counts its own rows),
@@ -105,10 +107,11 @@ impl PhysicalOptimizerRule for Windows {
             let extra: usize = node.schema().fields()[child_fields..].iter().map(|f| f.data_type().primitive_width().unwrap_or(16)).sum(); // (the window's own columns, a value a row each)
             // (`WindowAggExec` concatenates once at the end and is counted whole: only a streaming window is changed)
             let streams = node.downcast_ref::<BoundedWindowAggExec>().is_some_and(|w| !reads_view(w, &child.schema()));
+            let whole = node.is::<WindowAggExec>();
             let input = if streams { plain_below(&child, &keys)? } else { child.clone() };
             let uncast = !Arc::ptr_eq(&input, &child);
             let slots = Arc::new(Slots::default());
-            let kid: Arc<dyn ExecutionPlan> = Arc::new(HeldInExec { props: input.properties().clone(), input, slots: slots.clone(), extra });
+            let kid: Arc<dyn ExecutionPlan> = Arc::new(HeldInExec { props: input.properties().clone(), input, slots: slots.clone(), extra, whole });
             let w = replace_children_if_necessary(node, vec![kid])?; // (`with_new_children` is deprecated in DataFusion 55.1: the repo's own call, as in `optimize.rs`)
             let out: Arc<dyn ExecutionPlan> = Arc::new(HeldOutExec { props: w.properties().clone(), input: w, slots });
             Ok(Transformed::yes(if uncast { views_back(&out, &child.schema())? } else { out }))
@@ -296,7 +299,7 @@ impl ExecutionPlan for HeldInExec {
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
         let input = one_input(children)?;
-        Ok(Arc::new(HeldInExec { props: input.properties().clone(), input, slots: self.slots.clone(), extra: self.extra }))
+        Ok(Arc::new(HeldInExec { props: input.properties().clone(), input, slots: self.slots.clone(), extra: self.extra, whole: self.whole }))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -324,7 +327,7 @@ impl ExecutionPlan for HeldInExec {
         let s = self.input.execute(p, ctx)?;
         let Some(held) = held else { return Ok(s) }; // (run without its HeldOutExec: the input as it is)
         let schema = s.schema();
-        let extra = self.extra;
+        let (extra, whole) = (self.extra, self.whole);
         let out = s.map(move |item| -> Result<RecordBatch> {
             let batch = item?;
             if batch.num_rows() == 0 {
@@ -334,8 +337,14 @@ impl ExecutionPlan for HeldInExec {
             let mut h = held.lock().unwrap();
             h.reservation.try_grow(b).map_err(|_| {
                 let message = format!("out of memory: a window holds more rows than this node's memory for queries ({} MB): partition it by more columns, or give the node more memory (--memory-gb)", memory_limit() >> 20);
-                DataFusionError::ResourcesExhausted(message)
-            })?; // ("Resources exhausted" starts the frugal retry (`query::frugally`), where a window over whole partitions is answered as a GROUP BY; the words give 53200 on every door)
+                // ("Resources exhausted" is what starts the frugal retry (`query::exhausted`): a window over whole partitions is
+                // answered there as a GROUP BY. A streaming window's retry would run out the same way, so its refusal is a plain
+                // error. Both give 53200 on every door, by the message's words.)
+                match whole {
+                    true => DataFusionError::ResourcesExhausted(message),
+                    false => DataFusionError::Execution(message),
+                }
+            })?;
             h.batches.push_back((batch.num_rows(), b));
             Ok(batch)
         });
@@ -479,12 +488,14 @@ mod tests {
         Ok(column.as_primitive::<Int64Type>().value(0))
     }
 
+    /// The error a query is refused with, or None when it answers.
+    async fn refusal(ctx: &SessionContext, sql: &str) -> Option<anyhow::Error> {
+        answer(ctx, sql).await.err().map(anyhow::Error::from)
+    }
+
     /// Whether the query is refused with SQLSTATE 53200 (out of memory), found anywhere in its error's chain.
     async fn refused(ctx: &SessionContext, sql: &str) -> AnyResult<bool> {
-        match answer(ctx, sql).await {
-            Ok(_) => Ok(false),
-            Err(e) => Ok(crate::codes::of(&anyhow::Error::from(e)) == "53200"),
-        }
+        Ok(refusal(ctx, sql).await.is_some_and(|e| crate::codes::of(&e) == "53200"))
     }
 
     #[tokio::test]
@@ -492,6 +503,21 @@ mod tests {
         let ctx = small_session()?;
         assert!(refused(&ctx, "SELECT max(v + n) AS m FROM (SELECT value AS v, count(*) OVER () AS n FROM generate_series(1, 2000000))").await?);
         assert!(refused(&ctx, "SELECT max(n) AS n FROM (SELECT count(*) OVER () AS n FROM generate_series(1, 2000000))").await?); // (it reads no column: the window's own column counts)
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_streaming_window_refused_past_the_pool_is_not_retried_frugally() -> AnyResult<()> {
+        let ctx = small_session()?;
+        // Every row is a peer of `c`, so the window holds them all until its input ends: a streaming window, which a frugal
+        // run would not help. Its refusal must not start that retry (`query::exhausted`); a window over whole partitions must.
+        let streaming = "SELECT max(s) AS m FROM (SELECT sum(id) OVER (ORDER BY c) AS s FROM (SELECT value AS id, 'a' AS c FROM generate_series(1, 2000000)))";
+        assert!(planned(&ctx, streaming).await?.contains("BoundedWindowAggExec"), "not a streaming window");
+        let e = refusal(&ctx, streaming).await.expect("refused past the pool");
+        assert!(!crate::query::exhausted(&e), "{e:#}");
+        assert_eq!(crate::codes::of(&e), "53200", "{e:#}");
+        let whole = refusal(&ctx, "SELECT max(n) AS n FROM (SELECT count(*) OVER () AS n FROM generate_series(1, 2000000))").await.expect("refused past the pool");
+        assert!(crate::query::exhausted(&whole), "{whole:#}");
         Ok(())
     }
 
