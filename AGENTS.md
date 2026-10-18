@@ -1453,7 +1453,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    it is planned) keeps its physical plan, keyed by its SQL, the rows' columns, the partitions and
    the lake's functions (`f/`). The rows are a table with no statistics (DataFusion answers a
    `count(*)` from exact ones), and each write resets every operator's state, as DataFusion runs a
-   recursive query's plan again, with that write's rows in the leaf. `harness.py flows`: "a kept
+   recursive query's plan again, with that write's rows in the leaf. A kept plan is taken out while
+   it runs and kept again only after its run succeeds (at most 8 a key): two writes at once never
+   share its operators' state. `harness.py flows`: "a kept
    plan keeps no write's count…" (1, 1, 1, 1, 1 with exact statistics) and "…nor its time" fail
    without them.
 201. **An inner join runs before a LEFT JOIN only when it reads nothing of the LEFT JOIN's padded side**
@@ -2864,7 +2866,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    answers at once.
 422. **A window over whole partitions that ran out of memory is answered as a GROUP BY joined back to its rows, and
    only then** (`frugal::WholePartition`, `query::frugal`). A window's held rows refuse with "Resources exhausted"
-   (`held.rs`), which starts the frugal retry; its session carries `pondra_frugal.on` (`frugal::mark`), and only
+   (`held.rs`), which starts the frugal retry (`query::frugally`: a copy of the first try's session, its catalogs
+   shared, so it reads the same snapshot); its session carries `pondra_frugal.on` (`frugal::mark`), and only
    there does the rule turn a window whose every expression is `count`, `sum`, `avg`, `min`, `max`, `bool_and` or
    `bool_or` over one partition, with no order, FILTER or DISTINCT and the whole partition as its frame, into each
    partition's aggregates grouped by its keys and joined back on them (NULL equal to NULL), its rows on the side a
