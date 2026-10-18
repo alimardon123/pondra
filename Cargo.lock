@@ -3279,6 +3279,7 @@ dependencies = [
  "slatedb",
  "snap",
  "sysinfo",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
