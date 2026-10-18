@@ -124,12 +124,10 @@ fn fold(e: &Expr, ctx: &SimplifyContext) -> Option<ScalarValue> {
                 (DataType::Timestamp(..), Some(s)) => ScalarValue::Utf8(Some(s)),
                 _ => v,
             };
-            // (a cast to an integer rounds a fraction, as the planned path's `casts::Rounds` has it)
-            let v = match c.field.data_type().is_integer() && crate::casts::fractional(&v.data_type()) {
-                true => ScalarValue::try_from_array(&crate::casts::whole(&v.to_array().ok()?).ok()?, 0).ok()?,
-                false => v,
-            };
-            v.cast_to(c.field.data_type()).ok() // (a cast that fails is the planned path's error to report)
+            // (`casts::into` rounds a fraction going into an integer, as the planned path's `casts::Rounds` does; a cast
+            // that fails is the planned path's error to report)
+            let cast = crate::casts::into(&v.to_array().ok()?, c.field.data_type()).ok()?;
+            ScalarValue::try_from_array(&cast, 0).ok()
         }
         _ => None,
     }

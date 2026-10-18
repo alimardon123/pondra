@@ -893,7 +893,7 @@ impl AsyncScalarUDFImpl for Counter {
         if !(2..=3).contains(&arrays.len()) {
             return exec_err!("setval(sequence, value [, is_called])");
         }
-        let values = datafusion::arrow::compute::cast(&arrays[1], &DataType::Int64)?;
+        let values = crate::casts::into(&arrays[1], &DataType::Int64)?; // (a value with a fraction rounds, as every cast into an integer does: `setval(s, 2.5)` sets 3)
         let called = arrays.get(2).map(|c| datafusion::arrow::compute::cast(c, &DataType::Boolean)).transpose()?;
         let mut out = vec![];
         for i in 0..rows {
