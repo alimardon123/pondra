@@ -554,9 +554,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    over each other's rows and the answer is quietly wrong. This is what `tools/shuffle_spill.py`
    caught when the id wasn't there.
 31. **A step's buckets are kept, not taken** (`spmd::fetch`, `bucket`): reading one clones it, so
-   a step that has to be run again reads the same rows. Everything a job spilled goes when the job
-   ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its spill folder (invariant 419). A gather's
-   spill is freed by the guard its response stream holds instead, since nothing retries it.
+   a step that has to be run again reads the same rows. A step run again runs fresh operators
+   (`Shuffle::again`: `reset_plan_states` in `received`), under piece names of its own (`r`):
+   DataFusion's scans hand out their files from a queue their first run empties, so a second try on
+   the same plan read no rows and answered as if that node's share were empty (since before 0.34). A
+   bucket a node doesn't hold is an error (`kept`), never an empty one. Everything a job spilled
+   goes when the job ends (`Drop for Job`, `gc`, `?drop=true`), and a dead process's goes with its
+   spill folder (invariant 419). A gather's spill is freed by the guard its response stream holds
+   instead, since nothing retries it. `shuffle_spill.py`: "a step that fails once on a follower
+   answers on its second try with the same rows as one node" (a quarter of the keys missing
+   without it), and `PONDRA_DEBUG_FAIL_STEP` with `spread_tpch.py` (22 of 22).
 32. **Every node splits the same rows the same way.** `spmd::scatter` runs a stage's partitions at
    once, each into buckets of its own, and joins them in partition order at the end; the hash is
    DataFusion's `BatchPartitioner` over the exchange's own expressions. Anything that made the
