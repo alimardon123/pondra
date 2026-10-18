@@ -74,9 +74,11 @@ impl Spill {
         if self.rows.is_empty() {
             return Ok(());
         }
+        let bytes = crate::log::encode_ipc(&self.rows)?;
+        crate::store::spill_fits(bytes.len() as u64)?; // (a piece asks for its room first: a full disk refuses it, 53100)
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!("{}-{}.arrow", self.name, self.files.len()));
-        std::fs::write(&path, crate::log::encode_ipc(&self.rows)?)?;
+        std::fs::write(&path, bytes)?;
         crate::metrics::add(&crate::metrics::SPILLED, self.bytes as u64);
         (self.rows, self.bytes) = (vec![], 0);
         self.files.push(path);

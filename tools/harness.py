@@ -3448,6 +3448,35 @@ def schemas():
 LOCK_FILE = ".lock"  # memory.rs's LOCK_FILE: a spill folder's lock, held by its process, not a spilled file
 
 
+def tmpfs(mb):
+    """A tmpfs of `mb` MB on a new folder, or None where this machine can't mount one (neither root nor sudo without a password)."""
+    path = tempfile.mkdtemp(prefix="pondra-disk-")
+    cmd = ["mount", "-t", "tmpfs", "-o", f"size={mb}m,mode=1777", "tmpfs", path]
+    if subprocess.run(cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd], capture_output=True).returncode == 0:
+        return path
+    os.rmdir(path)
+    return None
+
+
+def untmpfs(path):
+    cmd = ["umount", "-l", path]
+    subprocess.run(cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd], capture_output=True)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def fill_to(folder, keep):
+    """A file in `folder` that takes all of the disk's free space but `keep` bytes; its path. Written a megabyte at a time."""
+    path = os.path.join(folder, "filler")
+    st = os.statvfs(folder)
+    left = st.f_bavail * st.f_frsize - keep
+    block = b"\0" * (1 << 20)
+    with open(path, "wb") as f:
+        while left > 0:
+            f.write(block[:min(left, len(block))])
+            left -= min(left, len(block))
+    return path
+
+
 def spill_files(folder):
     """The spilled files under a folder now, as (count, bytes): a file that goes while it is counted is not there.
     Lock files don't count: each process's folder keeps its own while the process lives."""
@@ -3860,12 +3889,47 @@ def scale():
         and sp_1 == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}]
         and refused[0] != 200 and refused[1] == "53100" and "PONDRA_SPILL_GB" in refused[2] and "datafusion.runtime" not in refused[2]
         and after_refusal[0] == 200 and refused_rows in ([{"n": 0}], None))
+    room_rows = 1_000_000  # (the full-disk check below sorts these: a sort that spills within the room a freed tmpfs leaves)
+    reply(f"CREATE TABLE sp_room AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, {room_rows})")
     for t in ("sp_2", "sp_src"):
         try:
             sql(port, f"DROP TABLE IF EXISTS {t}")
         except RuntimeError:
             pass  # (a table the capped sort never made is none to drop)
     capped.kill()
+    # A node started on a full disk spills once room is freed, without a restart: a file fills a 256 MB tmpfs to within
+    # 20 MB before the node starts (its cap at open is then 0), so the sort is refused; the file goes, and the same sort
+    # answers on the same node within 2 s (the query's session looks at the disk again: `store::spill_room`).
+    room = tmpfs(256)  # (None where this machine can't mount one: the check is skipped, with the reason printed)
+    if room is None:
+        print("(not checked: a node started on a full disk; this machine can't mount a 256 MB tmpfs)", file=sys.stderr)
+    else:
+        filler = fill_to(room, keep=20 << 20)
+        full = Node(lake, port, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": room}).start()
+        try:
+            sort_q = "CREATE TABLE sp_room_1 AS SELECT * FROM sp_room ORDER BY k"
+            full_refused = reply(sort_q)  # (a CREATE TABLE AS makes its table first: the refused one leaves it empty)
+            sql(port, "DROP TABLE IF EXISTS sp_room_1")
+            os.remove(filler)
+            t0 = time.time()
+            full_again, full_tries = reply(sort_q), 1
+            while full_again[0] != 200 and time.time() - t0 < 2:  # (the disk is looked at again at most every 500 ms, as a query starts)
+                sql(port, "DROP TABLE IF EXISTS sp_room_1")
+                time.sleep(0.1)
+                full_again, full_tries = reply(sort_q), full_tries + 1
+            full_took = round(time.time() - t0, 2)
+            full_rows = sql(port, "SELECT count(*) AS n FROM sp_room_1") if full_again[0] == 200 else None
+            full_left = spill_files(room)[0]
+            spill_report["full_disk"] = {"refused": [full_refused[0], full_refused[1], full_refused[2][:200]], "again": full_again[0], "again_seconds": full_took, "tries": full_tries,
+                                         "rows": full_rows, "files_after": full_left}
+            checks["a node started on a full disk spills once room is freed, without a restart"] = (
+                full_refused[0] != 200 and full_refused[1] == "53100" and "PONDRA_SPILL_GB" in full_refused[2]
+                and full_again[0] == 200 and full_took < 2 and full_rows == [{"n": room_rows}] and full_left == 0)
+            sql(port, "DROP TABLE IF EXISTS sp_room_1")
+            sql(port, "DROP TABLE IF EXISTS sp_room")
+        finally:
+            full.kill()
+            untmpfs(room)
     shutil.rmtree(spill_top, ignore_errors=True)
     node.kill()
     ok = all(checks.values())

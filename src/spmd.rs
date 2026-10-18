@@ -448,7 +448,16 @@ async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Futu
 /// then how many buckets follow, then each bucket's piece count and its pieces.
 async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
     let res = crate::cluster::http().post(crate::tls::url(&format!("{node}/cluster/stage"))).json(s).send().await?;
-    ensure!(res.status().is_success(), "{node}: {}", res.text().await?);
+    if !res.status().is_success() {
+        // (the node's SQLSTATE is kept, as the leader's is for a follower's write: a step out of disk (53100) is told
+        // apart from one that failed, and is not run again)
+        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(crate::codes::received);
+        let said = format!("{node}: {}", res.text().await?);
+        return Err(match code {
+            Some(code) => crate::codes::coded(code, said),
+            None => anyhow::anyhow!("{said}"),
+        });
+    }
     read_reply(res, &s.job(), &format!("from-{}", node.replace(':', "_"))).await
 }
 
@@ -585,23 +594,18 @@ async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[S
             };
         };
         eprintln!("shuffle: {e:#}; running it again without that node");
-        abandon(&live, me).await; // (the nodes that kept buckets for it can let them go now)
         live.remove(dead);
     }
     Ok(None)
 }
 
-/// Tell the others to forget the shuffle just given up on (and forget it here).
-async fn abandon(nodes: &[String], me: &str) {
-    let Some(id) = LAST.lock().unwrap().clone() else { return };
-    forget(&id);
+/// Tell the others to forget the shuffle `id` just given up on (and forget it here): the nodes that kept its buckets
+/// let them go now. `run` calls it for every shuffle that fails, with that shuffle's own id.
+async fn abandon(nodes: &[String], me: &str, id: &str) {
+    forget(id);
     let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(crate::tls::url(&format!("{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))).send());
     futures::future::join_all(asks).await;
 }
-
-crate::per_node!(
-    /// The id of the shuffle this node started last (for `abandon`).
-    static LAST: Mutex<Option<String>> = Default::default());
 
 /// One attempt, planned each way in turn (`How`) until one splits correctly — and pays (`guard`:
 /// the ways after it move more). Keyed tables, and tables of attached lakes, are always read whole.
@@ -632,7 +636,6 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let cut = |t: &String, meta: &TableMeta| how == How::Sliced || t == main || size(meta).1 >= broadcast_bytes() || scheme.as_ref().is_some_and(|s| s.columns.contains_key(t));
         let big: Vec<(String, TableMeta)> = appends.into_iter().filter(|(t, m)| cut(t, m)).collect();
         let id = uuid::Uuid::new_v4().to_string();
-        *LAST.lock().unwrap() = Some(id.clone());
         let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how, splits: vec![], again: false });
         let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() }).collect();
         for (t, meta) in &big {
@@ -683,6 +686,12 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                     // job ends), so a node that stumbles — a timeout, a restart mid-step — gets
                     // one more try before the query gives up on it.
                     match once(&s).await {
+                        // Out of disk (SQLSTATE class 53) is the node's room, not its health: running the step again
+                        // only fills the disk again, so the query is given up here and runs on the coordinator.
+                        Err(first) if out_of_room(&first) => {
+                            eprintln!("shuffle: node {i}'s step {step} is out of room ({first:#}); it is not run again");
+                            Err(first)
+                        }
                         Err(first) => {
                             tokio::time::sleep(Duration::from_millis(250)).await;
                             let mut again = s.clone();
@@ -692,6 +701,7 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                                     eprintln!("shuffle: node {i}'s step {step} failed ({first:#}); its second try answered");
                                     Ok(out)
                                 }
+                                Err(second) if out_of_room(&second) => Err(second),
                                 Err(second) => Err(Dead { node: i, why: format!("{first:#}; then {second:#}") }.into()),
                             }
                         }
@@ -717,12 +727,20 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
         timed("the finish", &nodes[mine], finish(&job.ctx, &job.plan, job.cut.as_ref(), last)).await
     };
     let out = run.await;
+    if out.is_err() {
+        abandon(nodes, &nodes[mine], &id).await; // (the nodes that kept buckets for it let them go now)
+    }
     crate::metrics::add(&crate::metrics::SHUFFLED, (out.is_ok() && !job.exchanges.is_empty()) as u64);
     let ranged = slices[mine].shuffle.as_ref().is_some_and(|sh| sh.how == How::Ranged);
     crate::metrics::add(&crate::metrics::RANGED, (out.is_ok() && ranged) as u64);
     JOBS.lock().unwrap().remove(&id); // (all steps done: nobody fetches from here any more)
     crate::spill::clear(&id);
     out
+}
+
+/// A step that ran out of disk or memory (SQLSTATE class 53): the query is not shuffled again.
+fn out_of_room(e: &anyhow::Error) -> bool {
+    crate::codes::of(e).starts_with("53")
 }
 
 /// A node that failed its step twice: the shuffle runs again without it.
@@ -1322,8 +1340,8 @@ async fn scatter(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::
             while let Some(b) = futures::StreamExt::next(&mut rows).await {
                 let mut wrote = Ok(());
                 split.partition(b?, |i, b| {
-                    if only.is_none_or(|me| i / parts == me) {
-                        wrote = wrote.as_ref().map_err(|e: &anyhow::Error| anyhow::anyhow!("{e:#}")).and_then(|_| into[i].push(b));
+                    if only.is_none_or(|me| i / parts == me) && wrote.is_ok() {
+                        wrote = into[i].push(b); // (after a refusal nothing more is written, and the refusal is kept as it was: its SQLSTATE too)
                     }
                     Ok(())
                 })?;

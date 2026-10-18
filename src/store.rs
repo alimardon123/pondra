@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
@@ -21,7 +21,7 @@ use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirecto
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -503,7 +503,7 @@ fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filte
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
-        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
+        Some(gb) => Some(gb_bytes(gb)),
         None => dir.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
     }
 }
@@ -512,8 +512,8 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
 /// folder is the user's own, under the disk with the room (`memory::spill_base`), and folders of
 /// processes that ended are swept from it. The cap is the free space when the lake opens, less the room
-/// a lake keeps, or the setting in GB. `0` turns spilling off: a query that needs it is refused (53200).
-/// A negative setting is no setting.
+/// a lake keeps, or the setting in GB; it is looked at again as queries start (`spill_room`). `0` turns
+/// spilling off: a query that needs it is refused (53200). A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder {
     if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
@@ -532,6 +532,99 @@ fn spill_disk() -> DiskManagerBuilder {
         Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
         None => builder,
     }
+}
+
+/// `gb` gibibytes, in bytes.
+fn gb_bytes(gb: f64) -> u64 { (gb * (1u64 << 30) as f64) as u64 }
+
+/// The disk managers of this process's lakes, held weakly: a lake that goes takes its manager with it.
+/// `Lake::open` adds each one (unless spilling is off), `spill_room` sets their caps, `spill_fits` counts
+/// what they hold.
+static SPILLERS: Mutex<Vec<Weak<DiskManager>>> = Mutex::new(Vec::new());
+
+/// Adds a lake's disk manager to `SPILLERS`. A disabled one has no cap to set, so it is left out.
+fn register_spiller(disk: &Arc<DiskManager>) {
+    if spill_gb() != Some(0.0) {
+        SPILLERS.lock().unwrap().push(Arc::downgrade(disk));
+    }
+}
+
+/// The disk managers still alive, the dead ones dropped from `SPILLERS`.
+fn live_spillers() -> Vec<Arc<DiskManager>> {
+    let mut spillers = SPILLERS.lock().unwrap();
+    spillers.retain(|w| w.strong_count() > 0);
+    spillers.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// The cap of one disk manager that holds `used` bytes of spills, given the setting and what shuffles hold
+/// (`shuffled`) or the folder's disk (`disk`: free and total bytes, where the platform says). With the setting,
+/// the shuffles and the spills together stay within it; without, a spill may take the disk's free room beyond
+/// what a lake keeps. None where neither is known: the cap stays as it was.
+fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>) -> Option<u64> {
+    match gb {
+        Some(gb) => Some(gb_bytes(gb).saturating_sub(shuffled)),
+        None => disk.map(|(free, total)| used + free.saturating_sub(lake_keeps(total))),
+    }
+}
+
+/// Sets every live lake's cap from the disk as it is now (`room_cap`).
+fn set_room(gb: Option<f64>) {
+    let shuffled = gb.map_or(0, |_| crate::spill::held()); // (shuffles count only under the setting: without it the disk's free room says it all)
+    let disk = spill_folder().ok().and_then(space);
+    for manager in live_spillers() {
+        if let Some(cap) = room_cap(gb, manager.used_disk_space(), shuffled, disk) {
+            let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
+        }
+    }
+}
+
+/// Looked at again as each query's session is made (`session_with`), at most every 500 ms: a node started on a
+/// full disk spills once room is freed, and one started on an empty disk stops taking room that others need.
+/// Two queries at once may both look, which is harmless. Several lakes in a process each get their own spills
+/// plus the free room, so together they can overshoot between two looks, by what half a second writes.
+pub(crate) fn spill_room() {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    static LOOKED: AtomicU64 = AtomicU64::new(u64::MAX); // when the disk was last looked at, ms since `START` (MAX: never)
+    let now = START.elapsed().as_millis() as u64;
+    let last = LOOKED.load(Relaxed);
+    if last != u64::MAX && now.saturating_sub(last) < 500 {
+        return;
+    }
+    LOOKED.store(now, Relaxed);
+    set_room(spill_gb());
+}
+
+/// Whether `bytes` more fit on the spill disk: within the setting, with `held` already on it (shuffles' pieces
+/// and spills), or in its free room beyond what a lake keeps. Where the platform can't say how much room there
+/// is, it fits.
+fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u64, u64)>) -> bool {
+    match gb {
+        Some(gb) => held.saturating_add(bytes) <= gb_bytes(gb),
+        None => disk.map_or(true, |(free, total)| bytes <= free.saturating_sub(lake_keeps(total))),
+    }
+}
+
+/// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
+/// No spill folder: it fits, and the write fails with its own error.
+pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
+    let Ok(folder) = spill_folder() else { return Ok(()) };
+    let gb = spill_gb();
+    let held = gb.map_or(0, |_| crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>());
+    match piece_fits(gb, held, bytes, space(folder)) {
+        true => Ok(()),
+        false => Err(no_room(bytes, gb)),
+    }
+}
+
+/// The refusal of a piece that doesn't fit (53100): how much more it needed, and the way out. The setting is
+/// named only when it is set.
+fn no_room(bytes: u64, gb: Option<f64>) -> anyhow::Error {
+    let way = match gb {
+        Some(gb) => format!("Free space on the spill disk, or raise PONDRA_SPILL_GB (now {gb} GB) to let it spill more."),
+        None => "Free space on the spill disk to let it spill more.".to_string(),
+    };
+    let more = bytes as f64 / (1u64 << 20) as f64;
+    crate::codes::coded("53100", format!("The shuffle needed {more:.1} MB more on disk than there is room for. {way}"))
 }
 
 pub struct Lake {
@@ -908,6 +1001,7 @@ impl Lake {
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk()).build_arc()?;
+        register_spiller(&rt.disk_manager);
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
@@ -1165,6 +1259,7 @@ impl Lake {
     /// are the same for every query, so they are made once (`made`) and copied; each copy gets
     /// catalogs of its own, so the tables a query registers are its alone.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
+        spill_room(); // (the spill disk's room as it is now: `spill_disk` looked at it once, when the lake opened)
         let mut state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
         let catalogs = datafusion::catalog::MemoryCatalogProviderList::new();
         let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
@@ -2514,5 +2609,40 @@ mod tests {
         writer.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// A node started on a full disk (its cap 0 at open) spills again once room is freed: `spill_room` gives a
+    /// manager what it holds plus the disk's room beyond a lake's keep. The setting is passed in, not read, so
+    /// the test doesn't depend on the environment it runs in.
+    #[test]
+    fn spill_room_follows_the_disk() {
+        let folder = spill_folder().expect("this process's spill folder");
+        let manager = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![folder.to_path_buf()])).with_max_temp_directory_size(0).build().expect("a disk manager");
+        let manager = Arc::new(manager);
+        SPILLERS.lock().unwrap().push(Arc::downgrade(&manager));
+        set_room(None);
+        let cap = manager.max_temp_directory_size();
+        assert!(cap >= manager.used_disk_space() + (1 << 20), "a cap of {cap} with the disk's room");
+        set_room(Some(1.0));
+        assert!(manager.max_temp_directory_size() <= gb_bytes(1.0), "the setting caps the spills");
+    }
+
+    /// A shuffle's piece asks for its room first (`spill_fits`): what doesn't fit is refused with 53100, and the
+    /// setting is named only when it is set.
+    #[test]
+    fn a_piece_that_does_not_fit_is_refused_by_name() {
+        assert!(!piece_fits(Some(0.5), 0, 1 << 30, None), "a gigabyte past half a gigabyte");
+        assert!(piece_fits(Some(0.5), 1 << 20, 1 << 20, None), "a megabyte more under the setting");
+        assert!(!piece_fits(None, 0, 1, Some((0, 1 << 30))), "no free room");
+        assert!(piece_fits(None, 0, 1 << 20, Some((1 << 30, 1 << 30))), "a gigabyte free, a lake keeps 256 MB");
+        let set = no_room(1 << 20, Some(0.5));
+        assert_eq!(crate::codes::of(&set), "53100");
+        assert!(set.to_string().contains("PONDRA_SPILL_GB") && !set.to_string().contains("datafusion"), "{set}");
+        let unset = no_room(1 << 20, None);
+        assert_eq!(crate::codes::of(&unset), "53100");
+        assert!(!unset.to_string().contains("PONDRA_SPILL_GB") && !unset.to_string().contains("datafusion"), "{unset}");
+        let err = spill_fits(u64::MAX / 2).expect_err("no disk holds that");
+        assert_eq!(crate::codes::of(&err), "53100");
+        assert_eq!(err.to_string().contains("PONDRA_SPILL_GB"), spill_gb().is_some(), "{err}");
     }
 }
