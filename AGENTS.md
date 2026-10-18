@@ -2911,6 +2911,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `harness.py objects`: "CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t", "a CREATE OR REPLACE TABLE
    that fails leaves the old table as it was…", "…sent again with its job answers duplicate…"; `history_check.py`: "a
    follower reading t while the leader replaces it 20 times…: never 'no table t'".
+426. **A segment the catalog lists has its rows, so a reader that misses them waits** (`Catalog::inline`): a segment
+   and its inline rows (`d/`) are written in one commit and expired in one, but a follower's view can hold less than
+   its commit number for a moment while a new writer opens the lake, after its mirror let its streamed copy go. A
+   reader then reads again (20 ms, doubling to 500 ms, 10 s in all), its marks moved on between tries; a writer's miss,
+   or one past the wait, is still an error. A failover's reader once got "500: missing inline segment 19178".
+   `cargo test --lib store::tests::a_listed_segment_waits_for_its_inline_rows` (fails at its first read without it).
 ## Tests: run these before and after any change
 
 ```bash
