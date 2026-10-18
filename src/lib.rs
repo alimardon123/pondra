@@ -18,6 +18,7 @@ pub mod page;
 pub mod text;
 pub mod ext_names;
 pub mod lake_files;
+pub mod sketch;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod asof;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
@@ -138,7 +139,6 @@ mod optimize;
 #[cfg(feature = "server")] mod pyfn;
 #[cfg(feature = "server")] mod python;
 #[cfg(feature = "server")] mod runs;
-#[cfg(feature = "server")] mod sketch;
 #[cfg(feature = "server")] mod skew;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;

@@ -1204,7 +1204,7 @@ mod tests {
         assert_eq!(entry.rows, 900_000);
         for (i, f) in schema.fields().iter().enumerate() {
             let cols: Vec<ArrayRef> = batches.iter().map(|b| b.column(i).clone()).collect();
-            let rows = crate::manifest::min_max(&cols).and_then(|(lo, hi)| Some((crate::manifest::text(&lo)?, crate::manifest::text(&hi)?)));
+            let rows = crate::sketch::min_max(&cols).and_then(|(lo, hi)| Some((crate::manifest::text(&lo)?, crate::manifest::text(&hi)?)));
             assert_eq!(entry.stats.get(f.name()), rows.as_ref(), "{}", f.name());
         }
         assert!(!entry.stats.contains_key("long"));

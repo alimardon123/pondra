@@ -863,7 +863,7 @@ fn conflict(table: &str) -> anyhow::Error {
 async fn insert_rows(l: &Locks<'_>, stored: &TableMeta, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
-        let rows = crate::write::rows_of(lake, l.meta, query, Some(at), files).await?;
+        let rows = crate::write::rows_of(lake, lake, l.meta, query, Some(at), files).await?;
         crate::defaults::check(stored, l.name, &rows)?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
@@ -1407,8 +1407,8 @@ fn with_keys(q: &Query, cols: &[String]) -> Query {
 async fn run_at(lake: &Lake, text: &str, at: u64) -> Result<(Schema, Vec<RecordBatch>)> {
     let ctx = crate::query::session_at(lake, text, "", Some(at)).await?;
     let df = crate::query::sql(&ctx, &crate::asof::as_of(text)?).await?;
-    let schema = df.schema().as_arrow().clone();
-    Ok((schema, df.collect().await?))
+    let rows = crate::engine::collect(df).await?; // (never empty: an answer with no rows keeps its columns as they run)
+    Ok((rows[0].schema().as_ref().clone(), rows))
 }
 
 /// A run's rows without its last `n` columns (the appended keys), and those rows' keys as text (a temporary `_row_id` is
@@ -1828,7 +1828,9 @@ async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], s
     };
     let mut new = row.clone();
     for (c, e) in set_to {
-        let Some(v) = crate::defaults::evaluate(&row, e)? else { return Ok(None) };
+        // (a value that won't evaluate here goes the planned way, which says what is wrong: `evaluate` errs on an
+        // unsimplified `now()`, which a default may be)
+        let Some(v) = crate::defaults::evaluate(&row, &crate::defaults::value(meta, c, e)).ok().flatten() else { return Ok(None) };
         let t = new.schema().field_with_name(c)?.data_type().clone();
         new = set(&new, c, crate::query::strict(&v, &t)?)?;
     }

@@ -84,7 +84,7 @@ fn made_by_job(spec: String, job: &str) -> Result<String> {
 
 /// A table's definition refused: invalid_table_definition (42P16) unless the error says its own
 /// code, never an internal error (XX000, which HTTP answers 500).
-fn definition(e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn definition(e: anyhow::Error) -> anyhow::Error {
     match crate::codes::of(&e) {
         "XX000" => crate::codes::coded("42P16", format!("{e:#}")),
         _ => e,
@@ -139,18 +139,13 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
         }
         for (c, expr) in &defaults {
-            let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
-            crate::defaults::validate(c, t, expr).await?;
             crate::seq::named_exist(lake, expr).await?; // (DEFAULT nextval('s'): s is there)
         }
         if let Some((c, t)) = columns.iter().find(|(c, t)| identity.contains_key(c) && !["Int16", "Int32", "Int64"].contains(&t.as_str())) {
             bail!("{c} is an identity column: it counts in smallint, integer or bigint, not {t}");
         }
-        let empty = RecordBatch::new_empty(schema(&columns)?);
-        for (n, c) in &checks {
-            crate::defaults::breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?; // (a condition over its columns)
-        }
+        crate::defaults::definition(&columns, &defaults, &checks).await?; // (a DEFAULT, a CHECK: as a temporary table's are)
         Ok((retention, columns, ttl))
     }
     .await
@@ -301,7 +296,11 @@ impl Stmt {
     fn change_sql(&self) -> Option<String> {
         let w = |cond: &Option<String>| cond.as_ref().map(|c| format!(" WHERE {c}")).unwrap_or_default();
         match self {
-            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| format!("\"{c}\" = ({e})")).collect::<Vec<_>>().join(", "), w(cond))),
+            // (a DEFAULT is written bare: `(DEFAULT)` would be read as a column, `rows_sql` takes the word)
+            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| match crate::defaults::is_word(e) {
+                true => format!("\"{c}\" = DEFAULT"),
+                false => format!("\"{c}\" = ({e})"),
+            }).collect::<Vec<_>>().join(", "), w(cond))),
             Stmt::Delete(t, cond) => Some(format!("DELETE FROM {}{}", sql_name(t), w(cond))),
             Stmt::Merge(m) => Some(m.sql.clone()),
             Stmt::Insert(t, query) => Some(format!("INSERT INTO {} {query}", sql_name(t))), // (its rows checked: `constraints.rs`)
@@ -1067,9 +1066,9 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
         Stmt::Update(t, set, cond) => {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
-            crate::seq::check_set(meta, &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+            crate::seq::check_set(meta, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?; // (SET c = DEFAULT is Postgres's for an ALWAYS identity too)
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
-                Some((_, e)) => format!("({e})"),
+                Some((_, e)) => format!("({})", crate::defaults::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
@@ -1089,8 +1088,8 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
-    let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted" || names.contains(c)).collect();
-    let names = if names.is_empty() { &columns[..] } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: every column)
+    let columns = row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
+    let names = if names.is_empty() { implicit(&columns, rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
     crate::seq::check_given(&meta.logical(), table, &given)?;
     let default = |c: &str| crate::defaults::sql_of(&meta, c);
@@ -1112,6 +1111,57 @@ fn plain_values(query: &str) -> Option<ast::Values> {
         (ast::SetExpr::Values(v), None) => Some(v),
         _ => None,
     }
+}
+
+/// The width of a query's rows, when the query fixes it: a plain `VALUES` whose rows share one width, or a query whose
+/// body is a SELECT (the leftmost of a set operation) with no `*`, `t.*` or `COLUMNS(…)` among its items. None for any
+/// other query, which takes the table's columns as they come.
+pub(crate) fn rows_width(query: &str) -> Option<usize> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let q = Parser::new(&GenericDialect {}).try_with_sql(query).ok()?.parse_query().ok()?;
+    match q.body.as_ref() {
+        ast::SetExpr::Values(_) if q.order_by.is_some() => None, // (`VALUES … ORDER BY` isn't plain: `plain_values` says so too)
+        body => body_width(body),
+    }
+}
+
+fn body_width(body: &ast::SetExpr) -> Option<usize> {
+    match body {
+        ast::SetExpr::Values(v) => {
+            let first = v.rows.first()?.len();
+            v.rows.iter().all(|r| r.len() == first).then_some(first)
+        }
+        ast::SetExpr::Select(s) => (!s.projection.iter().any(is_wildcard)).then_some(s.projection.len()),
+        ast::SetExpr::Query(q) => body_width(&q.body),
+        ast::SetExpr::SetOperation { left, .. } => body_width(left),
+        _ => None,
+    }
+}
+
+/// `*`, `t.*`, DuckDB's `COLUMNS(…)` and `unnest(…)` (a struct's fields, several columns): the items a query's width
+/// isn't known from until it is planned.
+fn is_wildcard(item: &ast::SelectItem) -> bool {
+    let expr = match item {
+        ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(..) => return true,
+        ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
+        _ => return false,
+    };
+    matches!(expr, ast::Expr::Function(f) if ["columns", "unnest"].iter().any(|n| f.name.to_string().eq_ignore_ascii_case(n)))
+}
+
+/// The columns an INSERT without a column list fills, as Postgres takes them: the first `width` of the table's (all of
+/// them when the width isn't known, or isn't smaller). The rest take their DEFAULTs (`fitted`).
+pub(crate) fn implicit(columns: &[String], width: Option<usize>) -> &[String] {
+    match width {
+        Some(n) if n < columns.len() => &columns[..n],
+        _ => columns,
+    }
+}
+
+/// The columns an INSERT's whole rows are built for (`rows_for`): the table's, its delete marker only when the column list
+/// names it (`by_position`).
+pub(crate) fn row_columns(columns: impl IntoIterator<Item = String>, names: &[String]) -> Vec<String> {
+    columns.into_iter().filter(|c| c != "_deleted" || names.contains(c)).collect()
 }
 
 /// Does every row of this `VALUES` say DEFAULT at position `i`?
@@ -1136,10 +1186,10 @@ fn distinct_names(q: &mut ast::Query) {
 }
 
 /// Is this `VALUES` item the word DEFAULT (the column's default, or NULL)?
-fn is_default(e: &ast::Expr) -> bool { matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("default")) }
+fn is_default(e: &ast::Expr) -> bool { matches!(e, ast::Expr::Identifier(i) if i.quote_style.is_none() && crate::defaults::is_word(&i.value)) }
 
 /// `INSERT INTO t VALUES (…, DEFAULT, …)`: the query says DEFAULT somewhere.
-fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().any(|r| r.iter().any(is_default))) }
+pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().any(|r| r.iter().any(is_default))) }
 
 /// `INSERT INTO table (names) query` as a query of all its `columns`, in order (`whole_rows`; a
 /// temporary table's too, `temp.rs`).
@@ -1151,25 +1201,43 @@ pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, 
     ensure!(names.iter().collect::<std::collections::HashSet<_>>().len() == names.len(), "INSERT INTO {table}: a column named twice");
     let at = |c: &String| names.iter().position(|n| n == c);
     Parser::new(&GenericDialect {}).try_with_sql(query)?.parse_query()?; // (what's wrong with it, said)
+    let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
     if let Some(v) = plain_values(query) {
         let mut rows = vec![];
         for r in &v.rows {
-            ensure!(r.len() == names.len(), "INSERT INTO {table} names {} columns, and a row has {}", names.len(), r.len());
+            if r.len() != names.len() {
+                return Err(width_refused(table, names.len(), r.len()));
+            }
             let value = |c: &String| match at(c) {
                 Some(i) if !is_default(&r[i]) => r[i].to_string(),
                 _ => default(c).unwrap_or_else(|| "NULL".into()),
             };
             rows.push(format!("({})", columns.iter().map(value).collect::<Vec<_>>().join(", ")));
         }
-        return Ok(format!("VALUES {}", rows.join(", ")));
+        let values = format!("VALUES {}", rows.join(", "));
+        // (a list that names the delete marker names every column: `fit_with` takes the marker by name, where a plain
+        // VALUES would fill the table's columns by position, the marker among them)
+        return Ok(match columns.iter().any(|c| c == "_deleted") {
+            true => format!("SELECT * FROM ({values}) AS __pondra_v({})", columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")),
+            false => values,
+        });
     }
-    let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
+    // A query of another width is refused as Postgres words it, not as the alias list below says it (DataFusion's error).
+    if let Some(w) = rows_width(query).filter(|&w| w != names.len()) {
+        return Err(width_refused(table, names.len(), w));
+    }
     let list = columns.iter().map(|c| match at(c) {
         Some(i) => format!("__pondra_q.c{i} AS {}", q(c)),
         None => format!("{} AS {}", default(c).unwrap_or_else(|| "NULL".into()), q(c)),
     });
     let aliases = (0..names.len()).map(|i| format!("c{i}")).collect::<Vec<_>>().join(", ");
     Ok(format!("SELECT {} FROM ({query}) AS __pondra_q({aliases})", list.collect::<Vec<_>>().join(", ")))
+}
+
+/// The 42601 for rows `given` wide written into `names` columns, in Postgres's words.
+pub(crate) fn width_refused(table: &str, names: usize, given: usize) -> anyhow::Error {
+    let what = if given > names { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
+    crate::codes::coded("42601", format!("{what} (INSERT INTO {table} names {names} columns, and the query gives {given})"))
 }
 
 /// `CHECKPOINT` (DuckDB's word for it): tier every table's log into Parquet now, and write the
@@ -1195,10 +1263,17 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
     Ok(views || lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?.into_iter().any(|(_, t)| t.source == table))
 }
 
-/// Run a row query here: its rows in the table's column order and types.
-pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
+/// Run a row query here: its rows in the table's column order and types. `lake` is the table's own: the one a
+/// DEFAULT's `nextval` takes its values from.
+pub async fn rows(lake: &Lake, ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
-    let sql = &values_typed(sql, &target);
+    let Some(all) = planned(ctx, &target, sql).await? else { return Ok(RecordBatch::new_empty(target)) };
+    fitted(lake, meta, &target, &all).await
+}
+
+/// A query's rows as planned in `ctx`, before they fit the table (`rows`); None when it gives none.
+pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str) -> Result<Option<RecordBatch>> {
+    let sql = &values_typed(sql, target);
     let one; // (`nextval` numbers `VALUES` in their order, as Postgres does: one partition)
     let ctx = match crate::seq::calls(sql) {
         true => {
@@ -1210,63 +1285,108 @@ pub async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<R
         false => ctx,
     };
     let batches = crate::query::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
-    let Some(first) = batches.first() else { return Ok(RecordBatch::new_empty(target)) };
-    let all = concat_batches(&first.schema(), &batches)?;
-    fit(&target, &all)
+    let Some(first) = batches.first() else { return Ok(None) };
+    Ok(Some(concat_batches(&first.schema(), &batches)?))
 }
 
-/// A query's rows as the table's columns, in its order and types (`rows`, and the literal rows of `literals.rs`).
-pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
+/// A query's rows as the table's columns, in its order and types (`rows` fits them with `fitted`; the tests of `literals.rs`
+/// fit a literal's rows with this, where no table has defaults to fill).
+#[cfg(test)]
+pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> { fit_with(target, all).map(|(batch, _)| batch) }
+
+/// The columns a row fills by position: the table's, but its delete marker (`_deleted`), which SQL has no column for. A
+/// row gives a marker only by name (a change's rows name it, and so does a column list naming it): by position a row one
+/// value too wide made a delete of an INSERT, which answered `INSERT 0 1` and wrote nothing.
+pub(crate) fn by_position(target: &datafusion::arrow::datatypes::Schema) -> impl Iterator<Item = &datafusion::arrow::datatypes::FieldRef> {
+    target.fields().iter().filter(|f| f.name() != "_deleted")
+}
+
+/// `fit`, and the names of the columns the rows left out at the end: NULL in the batch until `fitted` gives them their
+/// DEFAULTs. A batch's `_deleted` column is the table's marker, by name; its other columns fill the table's others in
+/// order (`by_position`).
+fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<String>)> {
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
     let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::sys::ROW_ID, crate::sys::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
-    let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i)).collect();
-    let (ids, all) = (all.project(&kept)?, all.project(&values)?);
-    // The given columns fill the table's in order — all of them, or all but `_deleted`, or the
-    // first few (later ones, such as added columns, are null).
-    let skip_deleted = all.num_columns() < target.fields().len();
-    let mut given = all.columns().iter();
-    let columns = target.fields().iter().map(|f| match given.len() > 0 && !(skip_deleted && f.name() == "_deleted") {
-        true => crate::query::strict(given.next().expect("counted"), f.data_type()),
-        false => Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows())),
+    // (the marker is taken only where the table has one: a table without one takes a `_deleted` column by position, as before)
+    let marker = target.fields().iter().any(|f| f.name() == "_deleted").then(|| (0..all.num_columns()).find(|&i| all.schema().field(i).name() == "_deleted")).flatten();
+    let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i) && Some(*i) != marker).collect();
+    let (ids, given_cols) = (all.project(&kept)?, all.project(&values)?);
+    // The given columns fill the table's others in order, the first few (later ones, such as added columns, are null).
+    let mut given = given_cols.columns().iter();
+    let mut padded = vec![];
+    let columns = target.fields().iter().map(|f| {
+        if f.name() == "_deleted" {
+            // (a row without a marker gives NULL: a missing marker is never a default, so it isn't padded)
+            return match marker {
+                Some(i) => crate::query::strict(all.column(i), f.data_type()),
+                None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows())),
+            };
+        }
+        match given.len() > 0 {
+            true => crate::query::strict(given.next().expect("counted"), f.data_type()),
+            false => {
+                padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `fitted`)
+                Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows()))
+            }
+        }
     }).collect::<Result<Vec<_>, _>>()?;
-    ensure!(given.len() == 0, "{} columns given, the table has {}", all.num_columns(), target.fields().len());
+    if given.len() > 0 {
+        // (one value too many for a table with a marker is most likely the marker, declared or not: say how it's written)
+        let hint = if given.len() == 1 && marker.is_none() && target.fields().iter().any(|f| f.name() == "_deleted") { "; its delete marker _deleted is written only by name: INSERT INTO t (…, _deleted)" } else { "" };
+        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, the table has {}){hint}", given_cols.num_columns(), by_position(target).count())));
+    }
     let (mut fields, mut columns) = (target.fields().to_vec(), columns);
     fields.extend(ids.schema().fields().iter().cloned());
     columns.extend(ids.columns().iter().cloned());
-    Ok(RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?)
+    Ok((RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?, padded))
+}
+
+/// `fit`, with the columns the rows leave out at the end given their DEFAULT, as a bulk INSERT's are (`write_rows`)
+/// and as Postgres fills them: `INSERT INTO t VALUES (1)` is t's first column, the others their defaults.
+async fn fitted(lake: &Lake, meta: &TableMeta, target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
+    let (batch, padded) = fit_with(target, all)?;
+    if padded.is_empty() || !crate::defaults::any(meta) {
+        return Ok(batch); // (a full-width INSERT, or a table with no defaults: nothing more to do)
+    }
+    let n = batch.num_rows();
+    crate::defaults::fill(lake, meta, batch, |c| padded.iter().any(|p| p == c).then(|| crate::defaults::all(n))).await
 }
 
 /// An INSERT's rows into `meta`'s table, from `sql` (its rows' query). A `VALUES` of literals is built here as
 /// DataFusion would plan it, with no session (`literals.rs`); anything else is planned in a session of `lake` as
-/// of `upto` (`files`: this machine's files too), as `rows` plans it.
-pub async fn rows_of(lake: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
+/// of `upto` (`files`: this machine's files too), as `rows` plans it. `home` is the table's own lake (`rows`).
+pub async fn rows_of(lake: &Lake, home: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
     let target = schema(&meta.columns)?;
     if let Some(all) = crate::literals::literal_rows(sql, &target) {
-        return fit(&target, &all);
+        return fitted(home, meta, &target, &all).await;
     }
     let ctx = crate::query::session_at(lake, sql, "", upto).await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    rows(&ctx, meta, sql).await
+    rows(home, &ctx, meta, sql).await
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
 /// type, as Postgres takes them. DataFusion first makes one type of a VALUES column's rows, and
 /// `1e20` and `1e-20`, both decimals to it, made a DECIMAL(38, 20) that couldn't hold the first,
-/// though the column was a DOUBLE. Values fill the table's columns as `rows` fills them.
+/// though the column was a DOUBLE. Values fill the table's columns as `rows` fills them: by position, or, in the
+/// `SELECT * FROM (VALUES …) AS __pondra_v(…)` that `rows_for` makes for a list naming the delete marker, by name.
 fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema) -> std::borrow::Cow<'a, str> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let typed = |t: &DataType| t.is_floating() || t.is_decimal();
-    let values = first_word(sql).get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values"));
+    let values = first_word(sql).get(..6).is_some_and(|w| w.eq_ignore_ascii_case("values") || w.eq_ignore_ascii_case("select"));
     if !values || !target.fields().iter().any(|f| typed(f.data_type())) {
         return sql.into();
     }
     let parse = |s: &str| Parser::new(&GenericDialect {}).try_with_sql(s).and_then(|mut p| p.parse_query());
     let Ok(mut q) = parse(sql) else { return sql.into() };
-    let ast::SetExpr::Values(v) = q.body.as_mut() else { return sql.into() };
+    let Some((v, names)) = values_of(&mut q) else { return sql.into() };
+    let fields: Vec<Option<&datafusion::arrow::datatypes::Field>> = match names {
+        Some(names) => names.iter().map(|n| target.field_with_name(n).ok()).collect(),
+        None => by_position(target).map(|f| Some(&**f)).collect(),
+    };
     for row in &mut v.rows {
-        let skip_deleted = row.content.len() < target.fields().len();
-        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
-        for (e, f) in row.content.iter_mut().zip(fields).filter(|(_, f)| typed(f.data_type())) {
+        for (e, f) in row.content.iter_mut().zip(fields.iter().copied()) {
+            let Some(f) = f.filter(|f| typed(f.data_type())) else { continue };
             let Ok(cast) = Parser::new(&GenericDialect {}).try_with_sql(&format!("arrow_cast(NULL, '{}')", f.data_type())).and_then(|mut p| p.parse_expr()) else { continue };
             let ast::Expr::Function(mut cast) = cast else { continue };
             let ast::FunctionArguments::List(args) = &mut cast.args else { continue };
@@ -1275,6 +1395,23 @@ fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema)
         }
     }
     crate::routines::sql(&Statement::Query(q)).into()
+}
+
+/// The `VALUES` a query is (with no names), or the one `rows_for` wraps for a list naming the delete marker
+/// (`SELECT * FROM (VALUES …) AS __pondra_v(names)`), with the names its columns have.
+fn values_of(q: &mut ast::Query) -> Option<(&mut ast::Values, Option<Vec<String>>)> {
+    match q.body.as_mut() {
+        ast::SetExpr::Values(v) => Some((v, None)),
+        ast::SetExpr::Select(s) => {
+            let [ast::TableWithJoins { relation: ast::TableFactor::Derived { subquery, alias: Some(alias), .. }, joins }] = s.from.as_mut_slice() else { return None };
+            if !joins.is_empty() || alias.name.value != "__pondra_v" {
+                return None;
+            }
+            let ast::SetExpr::Values(v) = subquery.body.as_mut() else { return None };
+            Some((v, Some(alias.columns.iter().map(|c| c.name.value.clone()).collect())))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- bulk INSERT into append tables
@@ -1341,7 +1478,9 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
         // (a new table takes the types the query gives as it runs, as `create_spec` does)
         None => crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
-    ensure!(df.schema().fields().len() <= target.len(), "{} columns given, table {table} has {}", df.schema().fields().len(), target.len());
+    if df.schema().fields().len() > target.len() {
+        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, {table} has {})", df.schema().fields().len(), target.len())));
+    }
     let given = df.schema().columns(); // (the table's first columns; any after them are null)
     let null = || datafusion::prelude::lit(datafusion::scalar::ScalarValue::Null);
     // (a column the query leaves out: its DEFAULT, else NULL)
@@ -1596,7 +1735,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            crate::seq::check_every(&app.lake, &t).await?; // (every column given, an ALWAYS identity's too)
+            crate::seq::check_every(&app.lake, &t, rows_width(&query)).await?; // (the columns it gives: an ALWAYS identity's refused among them)
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
                 if !is_there(&app.lake, &t).await? {
@@ -1760,7 +1899,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows_of(lake, &meta, &sql, None, files).await?;
+    let batch = rows_of(lake, lake, &meta, &sql, None, files).await?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -1803,7 +1942,7 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
     let lake = other.as_deref().unwrap_or(lake);
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
-        crate::seq::check_set(&m.logical(), &set.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+        crate::seq::check_set(&m.logical(), &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
@@ -1946,7 +2085,7 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
             let lake = Lake::open(dir, false, false).await?;
-            crate::seq::check_every(&lake, &t).await?;
+            crate::seq::check_every(&lake, &t, rows_width(&query)).await?;
             if !is_there(&lake, &t).await? {
                 return Err(no_table(&t));
             }
@@ -2157,7 +2296,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     match (meta, stmt) {
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
-            let batch = rows_of(query, &m, &sql, None, files).await?;
+            let batch = rows_of(query, target, &m, &sql, None, files).await?; // (a DEFAULT's sequence is the attached lake's)
             crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {
@@ -2334,4 +2473,85 @@ async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>,
     marks.abort();
     release(store, term).await; // the next writer or node doesn't have to wait
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array};
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    /// A table of `a`, `b`, `c` and a delete marker, as a keyed table has them.
+    fn target() -> SchemaRef {
+        let int = |n: &str| Field::new(n, DataType::Int32, true);
+        Arc::new(Schema::new(vec![int("a"), int("b"), int("c"), Field::new("_deleted", DataType::Boolean, true)]))
+    }
+
+    /// One row of the named columns: `_deleted` a Boolean, the others Int32.
+    fn row(names: &[&str]) -> RecordBatch {
+        let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, if *n == "_deleted" { DataType::Boolean } else { DataType::Int32 }, true)).collect();
+        let columns: Vec<ArrayRef> = names.iter().map(|n| -> ArrayRef { if *n == "_deleted" { Arc::new(BooleanArray::from(vec![false])) } else { Arc::new(Int32Array::from(vec![1])) } }).collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("a row")
+    }
+
+    #[test]
+    fn a_short_row_pads_what_it_leaves_out_but_not_a_delete_marker() {
+        let (out, padded) = fit_with(&target(), &row(&["a"])).expect("fits");
+        assert_eq!(padded, ["b", "c"]);
+        assert_eq!((out.column(0).null_count(), out.column(1).null_count(), out.column(3).null_count()), (0, 1, 1));
+    }
+
+    #[test]
+    fn a_full_row_pads_nothing() {
+        assert!(fit_with(&target(), &row(&["a", "b", "c"])).expect("fits").1.is_empty());
+        assert!(fit_with(&target(), &row(&["a", "b", "c", "_deleted"])).expect("fits").1.is_empty());
+    }
+
+    #[test]
+    fn a_row_wider_than_the_table_is_refused_as_42601() {
+        let err = fit(&target(), &row(&["a", "b", "c", "_deleted", "x"])).expect_err("too wide");
+        assert_eq!(crate::codes::of(&err), "42601");
+    }
+
+    #[test]
+    fn a_row_gives_a_delete_marker_only_by_name() {
+        // one value too many, none of them named `_deleted`: refused, not written as a delete
+        let err = fit(&target(), &row(&["a", "b", "c", "x"])).expect_err("one value too many");
+        assert_eq!(crate::codes::of(&err), "42601");
+        // named, the marker fits
+        assert!(fit_with(&target(), &row(&["a", "b", "c", "_deleted"])).expect("fits").1.is_empty());
+        // a row of a value and a marker: b and c are padded, the marker is the row's own
+        let (out, padded) = fit_with(&target(), &row(&["a", "_deleted"])).expect("fits");
+        assert_eq!(padded, ["b", "c"]);
+        assert_eq!((out.column(1).null_count(), out.column(2).null_count(), out.column(3).null_count()), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_list_naming_the_marker_casts_its_floats_as_plain_values_do() {
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true), Field::new("x", DataType::Float64, true), Field::new("_deleted", DataType::Boolean, true)]));
+        let ctx = SessionContext::new();
+        // (a plain VALUES gives its values to the columns by position, the marker left out: two values)
+        let plain = planned(&ctx, &target, "VALUES (1, 1e20), (2, 1e-20)").await.expect("plain").expect("rows");
+        let named = planned(&ctx, &target, "SELECT * FROM (VALUES (1, 1e20, false), (2, 1e-20, false)) AS __pondra_v(\"k\", \"x\", \"_deleted\")").await.expect("named").expect("rows");
+        let floats = |b: &RecordBatch| b.column(1).as_any().downcast_ref::<Float64Array>().expect("floats").values().to_vec();
+        assert_eq!(floats(&fit(&target, &plain).expect("fits")), [1e20, 1e-20]);
+        assert_eq!(floats(&fit(&target, &named).expect("fits")), [1e20, 1e-20]);
+    }
+
+    #[test]
+    fn the_implicit_column_list_is_the_first_the_values_give() {
+        assert_eq!(rows_width("VALUES (1, 2), (3, 4)"), Some(2));
+        assert_eq!(rows_width("VALUES (1), (2, 3)"), None);
+        assert_eq!(rows_width("SELECT 1, 2"), Some(2));
+        assert_eq!(rows_width("SELECT * FROM t"), None);
+        assert_eq!(rows_width("SELECT unnest(s) FROM t"), None);
+        assert_eq!(rows_width("SELECT 1 UNION SELECT 2"), Some(1));
+        assert_eq!(rows_width("VALUES (1) ORDER BY 1"), None);
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| n.to_string()).collect();
+        assert_eq!(implicit(&names, Some(1)), ["a"]);
+        assert_eq!(implicit(&names, Some(2)), ["a", "b"]);
+        assert_eq!(implicit(&names, Some(3)), ["a", "b", "c"]);
+        assert_eq!(implicit(&names, Some(5)), ["a", "b", "c"]);
+        assert_eq!(implicit(&names, None), ["a", "b", "c"]);
+    }
 }

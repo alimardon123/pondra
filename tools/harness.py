@@ -1917,10 +1917,10 @@ def clients():
     checks["no token -> 401"] = _raises(lambda: pondra.connect(f"http://127.0.0.1:{A.port}").sql("SELECT 1").rows())
     admin.sql("CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE, _deleted BOOLEAN)")
     admin.sql("CREATE TABLE events (user VARCHAR, amount BIGINT) WITH (cluster_by = 'user')")
-    checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0, false)"))
+    checks["read token can't write"] = _raises(lambda: reader.sql("INSERT INTO users VALUES (9, 'x', 0)"))
     checks["write token can't create"] = _raises(lambda: writer.sql("CREATE TABLE nope (a BIGINT)"))
     # SQL writes and the Python client
-    writer.sql("INSERT INTO users VALUES (1, 'ann', 1.0, false), (2, 'bob', 2.0, false), (3, 'cy', 3.0, false)")
+    writer.sql("INSERT INTO users VALUES (1, 'ann', 1.0), (2, 'bob', 2.0), (3, 'cy', 3.0)")
     writer.sql("UPDATE users SET score = score + 10 WHERE id = 1")
     writer.sql("DELETE FROM users WHERE id = 2")
     writer.append("events", [{"user": "ann", "amount": 5}])
@@ -1934,7 +1934,7 @@ def clients():
     # Postgres protocol: psycopg 3 (extended, text and binary), psycopg2, SQLAlchemy + pandas, asyncpg
     dsn = f"host=127.0.0.1 port={A.port + 10} dbname=pondra user=writer password=w-tok"
     with psycopg.connect(dsn, autocommit=True) as c:
-        c.execute("INSERT INTO users VALUES (%s, %s, %s, false)", (4, "dee", 4.5))
+        c.execute("INSERT INTO users VALUES (%s, %s, %s)", (4, "dee", 4.5))
         checks["psycopg 3"] = c.execute("SELECT name FROM users WHERE id = %s", (4,)).fetchone() == ("dee",)
         checks["psycopg 3 binary"] = c.cursor(binary=True).execute("SELECT score FROM users WHERE id = %s", (4,)).fetchone() == (4.5,)
     c2 = psycopg2.connect(dsn); c2.autocommit = True
@@ -1949,12 +1949,12 @@ def clients():
     checks["wrong password refused"] = _raises(lambda: psycopg.connect(dsn.replace("w-tok", "nope")))
     # attached lake: write into it through its own leader, join across the two
     admin.sql("CREATE TABLE sales.orders (id BIGINT PRIMARY KEY, user VARCHAR, amount BIGINT, _deleted BOOLEAN)")
-    writer.sql("INSERT INTO sales.orders VALUES (1, 'ann', 10, false), (2, 'cy', 20, false)")
+    writer.sql("INSERT INTO sales.orders VALUES (1, 'ann', 10), (2, 'cy', 20)")
     time.sleep(1)
     checks["cross-lake join"] = reader.sql("SELECT u.name, o.amount FROM sales.orders o JOIN users u ON o.user = u.name ORDER BY 1").rows() == [{"name": "ann", "amount": 10}, {"name": "cy", "amount": 20}]
     # the bucket inbox: a machine that can't reach the leader still writes (exactly once)
     env = {**os.environ, "PONDRA_NO_DIRECT": "1", "PONDRA_JOB": "inbox-1"}
-    run = lambda: subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (5, 'eve', 5.0, false)"], capture_output=True, text=True, env=env, timeout=120)
+    run = lambda: subprocess.run([BIN, "sql", "--dir", lake, "INSERT INTO users VALUES (5, 'eve', 5.0)"], capture_output=True, text=True, env=env, timeout=120)
     t = time.time(); first = run(); inbox_s = time.time() - t
     again = run()
     checks["inbox write"] = '"committed":true' in first.stdout and '"duplicate":true' in again.stdout and reader.lookup("users", 5)["name"] == "eve"
@@ -4356,7 +4356,7 @@ def changes():
         "view top (keeps a min or max)" in (refused[0] or "") and "view's" in (refused[1] or "") and all(refused[2:]) and until(table, want(), 10) == want()
     # keyed tables: an UPDATE keeps the row's id; MERGE updates, inserts and deletes
     q("CREATE TABLE kv (k BIGINT, v BIGINT, _deleted BOOLEAN, PRIMARY KEY (k))")
-    q("INSERT INTO kv VALUES (1, 10, false), (2, 20, false)")
+    q("INSERT INTO kv (k, v, _deleted) VALUES (1, 10, false), (2, 20, false)")
     before = {r["k"]: r["_row_id"] for r in q("SELECT k, _row_id FROM kv")}
     q("UPDATE kv SET v = v + 1 WHERE k = 1", 1)
     q("MERGE INTO kv t USING (VALUES (1, 100), (3, 300), (2, 0)) AS s(k, v) ON t.k = s.k WHEN MATCHED AND s.v = 0 THEN DELETE WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)", 2)
@@ -4687,6 +4687,16 @@ def copies():
         with cur.copy("COPY ev FROM STDIN WITH (FORMAT csv, HEADER true)") as cp:
             cp.write(csv)
         csv_in = cur.rowcount
+        # a line of another width, or a value its column can't read, is refused as Postgres refuses it, writing nothing
+        refused = {}
+        for name, line in [("one field too many", "1\tx\t1.5\t9\n"), ("one field short", "1\tx\n"), ("not a number", "one\tx\t1.5\n")]:
+            try:
+                with cur.copy("COPY ev FROM STDIN") as cp:
+                    cp.write(line)
+                refused[name] = "accepted"
+            except psycopg.Error as e:
+                refused[name] = e.sqlstate
+        kept = c.execute("SELECT count(*) FROM ev").fetchone()[0]
         got = {}
         for fmt in ("text", "binary"):
             with cur.copy(f"COPY (SELECT id, name, amount FROM ev ORDER BY id) TO STDOUT WITH (FORMAT {fmt})") as cp:
@@ -4706,6 +4716,8 @@ def copies():
         arrow = cur.fetch_arrow_table()
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
+              "COPY FROM a line of another width (22P04) or a value that isn't its type (22P02): refused, nothing written":
+                  refused == {"one field too many": "22P04", "one field short": "22P04", "not a number": "22P02"} and kept == 2000,
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
               "DECIMAL as NUMERIC, text and binary": numeric_ok}
@@ -6715,7 +6727,7 @@ def temps():
     shown = [rows("SHOW CREATE VIEW mine"), rows("SHOW CREATE TABLE picked"), _raises_text(lambda: rows("SHOW CREATE VIEW mine", other))]
     checks["SHOW CREATE of a session's temporary view or table makes it again, over HTTP and Postgres; another session's isn't shown"] = \
         shown[0][0]["definition"].startswith("CREATE TEMPORARY VIEW mine AS SELECT") and "picked" in shown[0][0]["definition"] and \
-        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (id BIGINT, note ") and "no view mine" in shown[2] and \
+        shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (\n  id BIGINT,\n  note ") and "no view mine" in shown[2] and \
         shown_pg[0][0] == "CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1;"
     session = db.session
     db.close()
@@ -6742,8 +6754,10 @@ def _temps_typed(checks, port):
     Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
     rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
     A Postgres connection's temporary table sends its uuid column as a uuid (`pg_types::of`). SHOW CREATE gives each
-    column's type. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
+    column's type. Its NOT NULL, DEFAULT and CHECK are kept and checked as a lake table's are (`temp::create`, `temp::apply`),
+    and a write a DEFAULT leaves out takes it. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
     import psycopg
+    before = len(checks)  # (this function's checks are the last ones: what fails is printed below)
     db = _client(port)
 
     def refused(s):  # (SQLSTATE and words of the error a statement gets over HTTP; None when it is taken)
@@ -6787,8 +6801,39 @@ def _temps_typed(checks, port):
             port_refused = None
         except psycopg.Error as e:
             port_refused = e.sqlstate
+        pg.execute("CREATE TEMP TABLE tpn (a INT NOT NULL)")  # (NOT NULL over the port, and the catalog, in this connection)
+        try:
+            pg.execute("INSERT INTO tpn (a) VALUES (NULL)")
+            port_not_null = None
+        except psycopg.Error as e:
+            port_not_null = e.sqlstate
+        port_nullable = pg.execute("SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'tpn' ORDER BY ordinal_position").fetchall()
+    # NOT NULL, DEFAULT and CHECK: Postgres 16's SQLSTATEs (None: taken), the refused statements writing nothing, the rows
+    db.sql("CREATE TEMP TABLE tcons (a INT NOT NULL, b INT DEFAULT 7, c INT CHECK (c > 0), d TEXT DEFAULT 'x' || 'y')")
+    cons = [
+        ("INSERT INTO tcons (a) VALUES (NULL)", "23502"),
+        ("INSERT INTO tcons (a, c) VALUES (1, -5)", "23514"),
+        ("INSERT INTO tcons (a) VALUES (2)", None),
+        ("INSERT INTO tcons VALUES (3, DEFAULT, 5, DEFAULT)", None),
+        ("INSERT INTO tcons (a, c) SELECT 4, 6", None),
+        ("INSERT INTO tcons VALUES (5)", None),  # (a short row, no column list: the others their DEFAULTs)
+        ("INSERT INTO tcons (b) SELECT 1", "23502"),
+        ("UPDATE tcons SET a = NULL WHERE a = 2", "23502"),
+        ("UPDATE tcons SET c = -1 WHERE a = 2", "23514"),
+    ]
+    cons_got = [refused(s) for s, _ in cons]
+    cons_ok = all((g is None) if want is None else (g is not None and g[0] == want) for g, (_, want) in zip(cons_got, cons))
+    cons_back = [(r["a"], r["b"], r["c"], r["d"]) for r in db.sql("SELECT a, b, c, d FROM tcons ORDER BY a").rows()]
+    shown_cons = db.sql("SHOW CREATE TABLE tcons").rows()[0]["definition"]
+    cons_info = {"got": cons_got, "rows": cons_back, "shown": shown_cons, "port": [port_not_null, port_nullable]}
+    checks["a temporary table's NOT NULL and CHECK refuse what a lake table's do (SQLSTATE 23502, 23514; nothing written), and a DEFAULT fills what a write leaves out"] = \
+        cons_ok and cons_back == [(2, 7, None, "xy"), (3, 7, 5, "xy"), (4, 7, 6, "xy"), (5, 7, None, "xy")]
+    checks["SHOW CREATE of a temporary table keeps NOT NULL, DEFAULT and CHECK"] = \
+        shown_cons.startswith("CREATE TEMPORARY TABLE tcons") and "NOT NULL" in shown_cons and "DEFAULT 7" in shown_cons and "CHECK (" in shown_cons
+    checks["a Postgres connection's temporary table: NOT NULL refused 23502, and the catalog says the column is NOT NULL, with no _deleted"] = \
+        port_not_null == "23502" and port_nullable == [("a", "NO")]
     db.close()
-    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused]}
+    info = {"refusals": got, "back": back, "count": count, "merged": merged, "shown": shown, "port": [repr(row), port_refused], "constraints": cons_info}
     checks["a temporary table's uuid, JSON, JSONB and VARCHAR(n) columns refuse what they can't hold by INSERT, INSERT … SELECT and UPDATE (Postgres's SQLSTATE and words, nothing written), and keep a good value as Postgres prints it"] = \
         refusals_ok and back == [{"doc": '{"a": 1, "b": 2}', "j": "[1, 2]", "u": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", "v": "abc"}] and count == [{"n": 1}]
     checks["a temporary view's || over a temporary table's jsonb merges the objects, as Postgres does (not the two texts joined)"] = \
@@ -6797,7 +6842,7 @@ def _temps_typed(checks, port):
         all(w in shown for w in ("doc JSONB", "j JSON", "u UUID", "v VARCHAR(3)"))
     checks["a Postgres connection's temporary table: an upper-case uuid reads back as a uuid, a bad JSON is refused 22P02"] = \
         type(row[0]).__name__ == "UUID" and str(row[0]) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11" and row[1] == {"a": 1} and port_refused == "22P02"
-    if not all(checks[k] for k in list(checks)[-4:]):
+    if not all(list(checks.values())[before:]):
         print(json.dumps(info, indent=1, default=str))
 
 
@@ -7359,6 +7404,113 @@ def learn():
     return f"learn: the planner uses what runs learned: all {len(checks)} checks pass"
 
 
+def _short_rows(q, pgport, checks, seen):
+    """A row shorter than the table, with no column list, takes the DEFAULTs of the columns it leaves out, as Postgres
+    fills it (`write::fitted`), and a row of the wrong width is refused 42601 (`write::fit_with`, `write::rows_for`).
+    Postgres 16's answers, asked live on /tmp/pg16-l3: the row's first columns, the others their defaults."""
+    import psycopg
+    conn = lambda autocommit=True: psycopg.connect(f"host=127.0.0.1 port={pgport} dbname=pondra user=u", autocommit=autocommit)
+    q("CREATE TABLE lt (a INT, b INT DEFAULT 7, c INT NOT NULL DEFAULT 1, d TEXT DEFAULT 'z')")
+    q("INSERT INTO lt VALUES (1)")
+    q("INSERT INTO lt VALUES (2, 8)")
+    q("INSERT INTO lt VALUES (3), (4)")
+    q("INSERT INTO lt VALUES (5, DEFAULT)")
+    with conn() as c:
+        c.execute("INSERT INTO lt VALUES (%s)", (6,))  # (bound: the extended protocol)
+    with conn(False) as c:  # (a transaction: `txn.rs`)
+        c.execute("INSERT INTO lt VALUES (9)")
+        c.commit()
+    q("INSERT INTO lt SELECT 10")  # (the bulk path: already filled, and stays so)
+    q("ALTER TABLE lt RENAME COLUMN b TO bb")
+    q("INSERT INTO lt VALUES (11)")
+    lt = [(r["a"], r["bb"], r["c"], r["d"]) for r in q("SELECT a, bb, c, d FROM lt ORDER BY a")]
+    q("CREATE TABLE kt (id INT PRIMARY KEY, n INT DEFAULT 3, t TEXT DEFAULT 'k')")
+    q("INSERT INTO kt VALUES (1)")
+    q("INSERT INTO kt SELECT 2")
+    q("INSERT INTO kt VALUES (3, 4)")
+    kt = [(r["id"], r["n"], r["t"]) for r in q("SELECT * FROM kt ORDER BY id")]
+    q("CREATE TABLE it (name TEXT, id BIGINT GENERATED ALWAYS AS IDENTITY)")
+    q("INSERT INTO it VALUES ('x'), ('y')")
+    it = [(r["name"], r["id"]) for r in q("SELECT name, id FROM it ORDER BY id")]
+    # The wrong widths: refused by name with Postgres's code, and nothing written.
+    count = lambda: [q(f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in ("lt", "kt")]
+    before, wrong = count(), {}
+    with conn() as c:
+        for s in ["INSERT INTO lt VALUES (6, 1), (7)", "INSERT INTO lt VALUES (1, 2, 3, 'w', 5)", "INSERT INTO kt (id) VALUES (5, 6)", "INSERT INTO kt (id, n) VALUES (5)",
+                  "INSERT INTO kt VALUES (5, 6, 'w', 7)", "INSERT INTO kt SELECT 5, 6, 'w', 7", "INSERT INTO kt (id) SELECT 5, 6",
+                  "INSERT INTO kt (id, n) SELECT 5", "INSERT INTO kt VALUES (5, 6, 'w', 7) ON CONFLICT (id) DO NOTHING"]:
+            try:
+                c.execute(s)
+                wrong[s] = "accepted"
+            except psycopg.Error as e:
+                wrong[s] = e.sqlstate
+    after = count()
+    seen["short rows"] = {"lt": lt, "kt": kt, "it": it, "wrong width": wrong, "counts": [before, after]}
+    checks["a row shorter than the table (no column list) takes the DEFAULTs of the columns it leaves out, as Postgres fills it: VALUES and SELECT, append and keyed tables, bound, in a transaction, a renamed column, an identity"] = \
+        lt == [(1, 7, 1, "z"), (2, 8, 1, "z"), (3, 7, 1, "z"), (4, 7, 1, "z"), (5, 7, 1, "z"), (6, 7, 1, "z"), (9, 7, 1, "z"), (10, 7, 1, "z"), (11, 7, 1, "z")] \
+        and kt == [(1, 3, "k"), (2, 3, "k"), (3, 4, "k")] and it == [("x", 1), ("y", 2)]
+    checks["a row of the wrong width is refused 42601 on keyed tables, in SELECT and ON CONFLICT too, writing nothing"] = all(v == "42601" for v in wrong.values()) and after == before
+
+
+def _default_words(q, pgport, checks, seen):
+    """DEFAULT is the column's default wherever a write says it: a column an upsert or a MERGE's INSERT leaves
+    out takes its default, and `excluded` holds it; SET c = DEFAULT and VALUES (…, DEFAULT) take it too, in a one-key
+    UPDATE, a transaction, an upsert, a MERGE and an append table. Postgres 16's answers are in the comments."""
+    import psycopg
+    dsn = f"host=127.0.0.1 port={pgport} dbname=pondra user=u"
+    rows = lambda: [tuple(r.values()) for r in q("SELECT id, n, t FROM kd ORDER BY id")]
+    q("CREATE TABLE kd (id INT PRIMARY KEY, n INT NOT NULL DEFAULT 3, t TEXT DEFAULT 'k')")
+    with psycopg.connect(dsn, autocommit=True) as c:  # (bound: 1 | 3 | k)
+        c.execute("INSERT INTO kd (id) VALUES (%s) ON CONFLICT (id) DO NOTHING", (1,))
+    w = {"bound": rows()}
+    q("INSERT INTO kd VALUES (2) ON CONFLICT (id) DO NOTHING")  # (an implicit list: 2 | 3 | k)
+    w["implicit"] = [r for r in rows() if r[0] == 2]
+    q("INSERT INTO kd (id) VALUES (2) ON CONFLICT (id) DO UPDATE SET n = excluded.n + 1")  # (excluded.n is 3: 2 | 4 | k)
+    w["excluded"] = [r for r in rows() if r[0] == 2]
+    q("INSERT INTO kd VALUES (3, 9, 'w')")
+    q("UPDATE kd SET n = DEFAULT, t = DEFAULT WHERE id = 3")  # (a one-key UPDATE: 3 | 3 | k)
+    w["one_key"] = [r for r in rows() if r[0] == 3]
+    q("INSERT INTO kd VALUES (4, 9, 'w')")
+    with psycopg.connect(dsn) as c:  # (a transaction: 4 | 9 | k)
+        c.execute("UPDATE kd SET t = DEFAULT WHERE n = 9")
+        c.commit()
+    q("INSERT INTO kd VALUES (7, 1) ON CONFLICT (id) DO UPDATE SET n = DEFAULT")
+    w["upserts"] = rows()
+    q("INSERT INTO kd VALUES (7, 1) ON CONFLICT (id) DO UPDATE SET n = DEFAULT")  # (row 7 is there: its n is the default)
+    q("MERGE INTO kd USING (SELECT 2 AS id UNION ALL SELECT 5) s ON kd.id = s.id "
+      "WHEN MATCHED THEN UPDATE SET n = DEFAULT WHEN NOT MATCHED THEN INSERT (id, n) VALUES (s.id, DEFAULT)")
+    w["merge"] = rows()
+    q("INSERT INTO kd VALUES (8, DEFAULT) ON CONFLICT (id) DO NOTHING")  # (an implicit list, DEFAULT in the rows: 8 | 3 | k)
+    w["default_row"] = [r for r in rows() if r[0] == 8]
+    q("CREATE TABLE ad (id INT, n INT NOT NULL DEFAULT 3)")
+    q("MERGE INTO ad USING (SELECT 1 AS id) s ON ad.id = s.id WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)")
+    w["ad_merge"] = [tuple(r.values()) for r in q("SELECT id, n FROM ad ORDER BY id")]
+    q("INSERT INTO ad VALUES (2, 9)")
+    q("UPDATE ad SET n = DEFAULT WHERE id = 2")  # (an append table: change::update)
+    w["ad_update"] = [tuple(r.values()) for r in q("SELECT id, n FROM ad ORDER BY id")]
+    q("MERGE INTO ad USING (SELECT 3 AS id) s ON ad.id = s.id WHEN NOT MATCHED THEN INSERT VALUES (s.id)")  # (no column list: 3 | 3)
+    w["ad_implicit"] = [tuple(r.values()) for r in q("SELECT id, n FROM ad WHERE id = 3")]
+    q("CREATE TABLE ia (id INT PRIMARY KEY, s BIGINT GENERATED ALWAYS AS IDENTITY)")
+    q("INSERT INTO ia (id) VALUES (1)")
+    first = q("SELECT s FROM ia")[0]["s"]
+    q("UPDATE ia SET s = DEFAULT WHERE id = 1")  # (ALWAYS takes DEFAULT: a new value, Postgres's 2)
+    w["always"] = [first, q("SELECT s FROM ia")[0]["s"]]
+    q("CREATE TABLE ki (id INT PRIMARY KEY, s BIGINT GENERATED BY DEFAULT AS IDENTITY)")
+    q("INSERT INTO ki (id) VALUES (1), (2) ON CONFLICT (id) DO NOTHING")
+    q("INSERT INTO ki (id) VALUES (2), (3) ON CONFLICT (id) DO NOTHING")  # (Postgres: 1, 2, 4; how many a conflict uses may differ)
+    w["identity"] = [(r["id"], r["s"]) for r in q("SELECT id, s FROM ki ORDER BY id")]
+    seen["default_words"] = w
+    checks["a column an upsert or a MERGE's INSERT leaves out takes its DEFAULT, and excluded holds it, as Postgres does (bound, an implicit column list, an identity)"] = \
+        w["bound"] == [(1, 3, "k")] and w["implicit"] == [(2, 3, "k")] and w["excluded"] == [(2, 4, "k")] \
+        and w["upserts"] == [(1, 3, "k"), (2, 4, "k"), (3, 3, "k"), (4, 9, "k"), (7, 1, "k")] \
+        and w["merge"] == [(1, 3, "k"), (2, 3, "k"), (3, 3, "k"), (4, 9, "k"), (5, 3, "k"), (7, 3, "k")] \
+        and w["default_row"] == [(8, 3, "k")] and w["ad_merge"] == [(1, 3)] and w["ad_implicit"] == [(3, 3)] \
+        and len(w["identity"]) == 3 and all(a[1] < b[1] for a, b in zip(w["identity"], w["identity"][1:]))
+    checks["SET x = DEFAULT and VALUES (…, DEFAULT) in UPDATE, MERGE and ON CONFLICT: the column's default (a one-key UPDATE, a transaction, an append table)"] = \
+        w["one_key"] == [(3, 3, "k")] and w["upserts"][3] == (4, 9, "k") and w["ad_update"] == [(1, 3), (2, 3)] \
+        and w["always"][1] > w["always"][0]
+
+
 def found():
     """What writing the docs found (round 26), each fixed: a filtered materialized view follows
     UPDATE and DELETE; a producer's seq 0 refused (HTTP, Flight); a merge table that leaves a
@@ -7373,7 +7525,9 @@ def found():
     padding, its ingest modes and table types; `pondra run`'s flags anywhere. And what the console
     found: a time without seconds, BASE TABLE, exact numbers, files() after PUT. And the Postgres catalog's
     text columns (`text`, varchar kept in pg_type) and COMMENT ON (obj_description, col_description, pg_description).
-    And a cast of a decimal or a float to an integer rounding as Postgres's does."""
+    And a cast of a decimal or a float to an integer rounding as Postgres's does. And a row shorter than the table, with
+    no column list, takes the DEFAULTs of the columns it leaves out, as Postgres fills it; a row of the wrong width is
+    refused 42601."""
     import datetime as dt, psycopg, pyarrow as pa, pyarrow.flight as fl
     import adbc_driver_flightsql.dbapi as adbc
     lake, guarded = new_lake(), new_lake()
@@ -7588,6 +7742,9 @@ def found():
         all("is NOT NULL" in v for v in null_refused.values()) and "acct.id is NOT NULL" in null_refused["a NULL key"] and q("SELECT count(*) AS n FROM acct") == [{"n": 8}] \
         and "Cannot cast" in fails("CREATE TABLE bad (a BIGINT DEFAULT 'abc')") and "nope" in fails("CREATE TABLE bad (a BIGINT DEFAULT nope())") \
         and "rows already there" in fails("ALTER TABLE acct ADD COLUMN z BIGINT DEFAULT 3")
+    _short_rows(q, pgport, checks, seen)
+    # DEFAULT as the column's default in upserts, MERGE, UPDATE and VALUES (Postgres 16's answers): `_default_words`.
+    _default_words(q, pgport, checks, seen)
     # Read your writes on a follower: each statement sees the one before it (a script's INSERT, then
     # its SELECT; an UPDATE; a table made, then filled), as on the leader.
     follower = Node(lake, port + 2).start()
@@ -14846,11 +15003,11 @@ def jsonfns():
     expands (Postgres's meaning); DataFusion's list is json_keys. Every answer is Postgres 16's: the names, the types and the
     rows, over HTTP and over the Postgres port (psycopg, as text and through its own decoders), and each refusal's SQLSTATE and
     words. A function in FROM that reads a column of the same query is LATERAL, as Postgres takes it (implicitly, CROSS
-    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's). WITH ORDINALITY numbers each
-    row's elements from 1, as Postgres does; over a record's columns Postgres refuses it (ROWS FROM() is not taken), and so
-    does this. Not taken yet, refused by name where Postgres takes them: a LEFT JOIN LATERAL over an expanding function
-    whose outputs are expressions of its rows (a padded row needs each output NULL, which lateral.rs can't show for an
-    expression), and an expanding function in GROUP BY, ORDER BY, a window or INSERT's VALUES."""
+    JOIN LATERAL, LEFT JOIN LATERAL … ON true when its outputs are its own unnest's, or read from them by a field, a JSON
+    operator or a cast). WITH ORDINALITY numbers each row's elements from 1, as Postgres does; over a record's columns Postgres
+    refuses it (ROWS FROM() is not taken), and so does this. Not taken yet, refused by name where Postgres takes them: a LEFT
+    JOIN LATERAL over a constant (a padded row can't make it NULL), and an expanding function in GROUP BY, ORDER BY, a window
+    or INSERT's VALUES."""
     import psycopg
     from psycopg.types.json import JsonbLoader, JsonLoader
     from psycopg.types.string import TextLoader
@@ -14992,6 +15149,30 @@ def jsonfns():
         ("a JSON operator over the rows of a FROM call that reads a column (e.value ->> 'sku')", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d, jsonb_array_elements(d.doc -> 'items') AS e ORDER BY 1, 2",
          ['id', 'sku'], [23, 25],
          [[1, 'A1'], [1, 'B7']]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements ON true: each element, and one NULL row for each row whose array is missing", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true ORDER BY d.id, e.value ->> 'sku'",
+         ['id', 'value'], [23, 3802],
+         [[1, '{"qty": 2, "sku": "A1"}'], [1, '{"qty": 1, "sku": "B7"}'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_each ON true: each key and its value, a NULL row for each row with no object", "SELECT d.id, kv.key, kv.value FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 3802],
+         [[1, 'a', '3'], [1, 'b', '1'], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements WITH ORDINALITY ON true: each element's position, NULL for a row with no array", "SELECT d.id, e.value, e.ordinality FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true ORDER BY d.id, e.ordinality",
+         ['id', 'value', 'ordinality'], [23, 3802, 20],
+         [[1, '{"qty": 2, "sku": "A1"}', 1], [1, '{"qty": 1, "sku": "B7"}', 2], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_array_elements ON true, a JSON operator over an element read from its row", "SELECT d.id, e.value ->> 'sku' AS sku FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true ORDER BY d.id, sku",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_to_recordset ON true, its columns made by casts of the rows", "SELECT d.id, r.sku, r.qty FROM docs d LEFT JOIN LATERAL jsonb_to_recordset(d.doc -> 'items') AS r(sku text, qty int) ON true ORDER BY d.id, r.sku",
+         ['id', 'sku', 'qty'], [23, 25, 23],
+         [[1, 'A1', 2], [1, 'B7', 1], [2, None, None], [3, None, None], [4, None, None]]),
+        ("lateral: LEFT JOIN LATERAL json_array_elements of a json column ON true, each element as written", "SELECT d.id, x.value FROM docs d LEFT JOIN LATERAL json_array_elements(d.jdoc -> 'items') AS x ON true ORDER BY d.id",
+         ['id', 'value'], [23, 114],
+         [[1, '{"sku":"A1"}'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL over a subquery that reads the rows, the element named bare (e ->> 'sku')", "SELECT d.id, s.sku FROM docs d LEFT JOIN LATERAL (SELECT e ->> 'sku' AS sku FROM jsonb_array_elements(d.doc -> 'items') e) s ON true ORDER BY d.id, s.sku",
+         ['id', 'sku'], [23, 25],
+         [[1, 'A1'], [1, 'B7'], [2, None], [3, None], [4, None]]),
+        ("lateral: LEFT JOIN LATERAL jsonb_each_text ON true, the values as text", "SELECT d.id, kv.key, kv.value FROM docs d LEFT JOIN LATERAL jsonb_each_text(d.doc -> 'tags') AS kv ON true ORDER BY d.id, kv.key",
+         ['id', 'key', 'value'], [23, 25, 25],
+         [[1, 'a', '3'], [1, 'b', '1'], [2, None, None], [3, None, None], [4, None, None]]),
     ]
     # (name, sql, SQLSTATE, message): refused by Postgres 16 with these words.
     ERRORS = [
@@ -15018,9 +15199,7 @@ def jsonfns():
     ]
     # Refused by name where Postgres 16 takes the call (the words are the ones this engine says, then the SQLSTATE).
     NOT_YET = [
-        ("a LEFT JOIN LATERAL over an expanding function whose outputs are expressions, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
-        ("a LEFT JOIN LATERAL over jsonb_each, not taken yet (Postgres takes it)", "SELECT d.id, kv.key FROM docs d LEFT JOIN LATERAL jsonb_each(d.doc -> 'tags') AS kv ON true", "0A000", "LEFT JOIN LATERAL over kv is not supported yet"),
-        ("a LEFT JOIN LATERAL over an expanding function with WITH ORDINALITY, not taken yet (Postgres takes it)", "SELECT d.id, e.value FROM docs d LEFT JOIN LATERAL jsonb_array_elements(d.doc -> 'items') WITH ORDINALITY AS e ON true", "0A000", "LEFT JOIN LATERAL over e is not supported yet"),
+        ("a LEFT JOIN LATERAL over a constant, not taken yet: a padded row can't make it NULL (Postgres takes it)", "SELECT d.id, s.one FROM docs d LEFT JOIN LATERAL (SELECT 1 AS one FROM jsonb_array_elements(d.doc -> 'items') e) s ON true", "0A000", "LEFT JOIN LATERAL over s is not supported yet"),
         ("an expanding function in GROUP BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs GROUP BY jsonb_array_elements(doc)", "0A000", "in GROUP BY isn't taken yet"),
         ("an expanding function in ORDER BY, not taken yet (Postgres takes it)", "SELECT 1 FROM docs ORDER BY jsonb_array_elements('[1]')", "0A000", "in ORDER BY isn't taken yet"),
         ("an expanding function in a window's PARTITION BY, not taken yet (Postgres takes it)", "SELECT sum(id) OVER (PARTITION BY jsonb_array_elements('[1]')) FROM docs", "0A000", "in window definitions isn't taken yet"),

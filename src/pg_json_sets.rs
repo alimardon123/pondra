@@ -696,42 +696,87 @@ fn value_alias(factor: &TableFactor) -> Option<String> {
 }
 
 /// The value names of a SELECT's FROM.
-fn value_aliases(s: &Select) -> Vec<String> {
-    s.from.iter().flat_map(|twj| std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation))).filter_map(value_alias).collect()
+fn value_aliases(s: &Select) -> Vec<String> { from_items(s).filter_map(value_alias).collect() }
+
+/// The FROM items of a SELECT: its first relation and the ones joined to it.
+fn from_items(s: &Select) -> impl Iterator<Item = &TableFactor> {
+    s.from.iter().flat_map(|twj| std::iter::once(&twj.relation).chain(twj.joins.iter().map(|join| &join.relation)))
 }
 
-/// The value names of a query's body, when the body is one SELECT. Its ORDER BY is the query's own, so it sees them; a set
-/// operation's ORDER BY names output columns only.
-fn body_aliases(body: &SetExpr) -> Vec<String> {
-    match body {
-        SetExpr::Select(s) => value_aliases(s),
-        _ => vec![],
+/// Whether a FROM item's columns are unknown here: a derived table, or anything but a table or view and a JSON call. Such
+/// an item may have a column of any name.
+fn unknown_columns(factor: &TableFactor) -> bool {
+    match factor {
+        TableFactor::Table { args: None, .. } => false,
+        TableFactor::Table { name, .. } | TableFactor::Function { name, .. } => !is_set_name(&name.to_string()),
+        _ => true,
     }
+}
+
+/// How many of a SELECT's FROM items have unknown columns (`unknown_columns`).
+fn unknown_in(s: &Select) -> usize { from_items(s).filter(|factor| unknown_columns(factor)).count() }
+
+/// A query or a SELECT in scope, as a walk stands in it: its value names, whether an item with unknown columns is in scope
+/// from an enclosing level (`outer`), and how many of its own FROM items have unknown columns (`unknown`).
+#[derive(Default)]
+struct Level {
+    names: Vec<String>,
+    outer: bool,
+    unknown: usize,
+}
+
+impl Level {
+    /// A bare name here may be a column of an item whose columns aren't known, so it is not a value.
+    fn blocked(&self) -> bool { self.outer || self.unknown > 0 }
 }
 
 /// The value names in scope where a walk stands: those of the innermost query or SELECT, never an outer one's. A
 /// subquery's bare use of an outer name is an outer reference, which `lateral.rs` refuses, so it is left as it is.
 /// Both walks of a bare name (`Bare` writes it, `Found` says whether there is one) enter and leave their scopes here,
-/// so what a scope holds is written once.
+/// so what a scope holds is written once. Postgres takes a column of any level over a FROM alias's whole row, so a level
+/// with an item of unknown columns, here or in an enclosing level, has no value names.
 #[derive(Default)]
-struct Scopes(Vec<Vec<String>>);
+struct Scopes {
+    levels: Vec<Level>,
+    /// Set by a derived table's FROM item, for the query that comes next (its own query, `enter_query` clears it).
+    pending: bool,
+}
 
 impl Scopes {
-    /// Enters a query: its body's value names, when the body is one SELECT (its ORDER BY sees them).
-    fn enter_query(&mut self, q: &Query) { self.0.push(body_aliases(&q.body)); }
+    /// Notes a FROM item: a derived table's query is the next one entered.
+    fn enter_factor(&mut self, factor: &TableFactor) { self.pending = matches!(factor, TableFactor::Derived { .. }); }
 
-    /// Enters a SELECT: the value names of its FROM.
-    fn enter_select(&mut self, s: &Select) { self.0.push(value_aliases(s)); }
+    /// Enters a query: its body's value names and unknown items, when the body is one SELECT (its ORDER BY sees that
+    /// FROM). A derived table's query is blocked when a sibling of its FROM item may be in scope (every sibling, LATERAL
+    /// or not: more is blocked than needed, which is safe). Any other query is blocked where its enclosing level is.
+    fn enter_query(&mut self, q: &Query) {
+        let derived = std::mem::take(&mut self.pending);
+        let outer = match (self.levels.last(), derived) {
+            (None, _) => false,
+            (Some(parent), true) => parent.outer || parent.unknown > 1,
+            (Some(parent), false) => parent.blocked(),
+        };
+        let (names, unknown) = match &*q.body {
+            SetExpr::Select(s) => (value_aliases(s), unknown_in(s)),
+            _ => (vec![], 0),
+        };
+        self.levels.push(Level { names, outer, unknown });
+    }
+
+    /// Enters a SELECT: the value names and unknown items of its FROM. It is in its query's scope.
+    fn enter_select(&mut self, s: &Select) {
+        let outer = self.levels.last().is_some_and(|query| query.outer);
+        self.levels.push(Level { names: value_aliases(s), outer, unknown: unknown_in(s) });
+    }
 
     /// Leaves the query or SELECT entered last.
-    fn leave(&mut self) { self.0.pop(); }
-
-    fn value(&self, ident: &ast::Ident) -> bool { self.0.last().is_some_and(|names| names.contains(&fold(ident))) }
+    fn leave(&mut self) { self.levels.pop(); }
 
     /// The identifier `e` is, when it is a value name in scope (before the FROM's columns are checked: `Bare` does that).
     fn bare(&self, e: &Expr) -> Option<ast::Ident> {
         let Expr::Identifier(ident) = e else { return None };
-        self.value(ident).then(|| ident.clone())
+        let level = self.levels.last().filter(|level| !level.blocked())?;
+        level.names.contains(&fold(ident)).then(|| ident.clone())
     }
 }
 
@@ -772,6 +817,11 @@ impl ast::VisitorMut for Bare<'_> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<()> {
+        self.scopes.enter_factor(factor);
+        ControlFlow::Continue(())
+    }
+
     fn post_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
         if let Some(ident) = self.bare(e) {
             *e = Expr::CompoundIdentifier(vec![ident, ast::Ident::new("value")]);
@@ -806,6 +856,11 @@ impl ast::Visitor for Found {
 
     fn post_visit_select(&mut self, _: &Select) -> ControlFlow<()> {
         self.scopes.leave();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        self.scopes.enter_factor(factor);
         ControlFlow::Continue(())
     }
 
@@ -1005,10 +1060,27 @@ mod tests {
         assert!(default.contains("jsonb_array_elements.value AS \"jsonb_array_elements\""), "{default}");
     }
 
+    /// A derived table is a scope of its own: a bare name in its query is its value, unless an item of unknown columns is in
+    /// scope there, in its own FROM or an enclosing one (Postgres reads a column of any level before a FROM alias's row).
+    #[test]
+    fn a_bare_value_name_inside_a_derived_table_is_its_value() {
+        let alone = rewritten_with("SELECT s.sku FROM (SELECT e ->> 'sku' AS sku FROM jsonb_array_elements('[1]') e) s", Some(&[])).unwrap();
+        assert!(alone.contains("e.value ->> 'sku'"), "{alone}");
+        let lateral = rewritten_with("SELECT d.id, s.sku FROM docs d LEFT JOIN LATERAL (SELECT e ->> 'sku' AS sku FROM jsonb_array_elements(d.doc -> 'items') e) s ON true", Some(&["id", "doc"])).unwrap();
+        assert!(lateral.contains("e.value ->> 'sku'"), "{lateral}");
+        let outer = rewritten_with("SELECT e ->> 'k' FROM (SELECT '{}' AS e) s, jsonb_array_elements('[1]') e", Some(&[])).unwrap();
+        assert!(!outer.contains("e.value"), "{outer}"); // (the derived table's column `e` is the one Postgres reads)
+        let sibling = rewritten_with("SELECT b.x FROM (SELECT 1 AS e) a, LATERAL (SELECT e AS x FROM jsonb_array_elements('[1]') e) b", Some(&[])).unwrap();
+        assert!(!sibling.contains("e.value"), "{sibling}"); // (Postgres reads that `e` as `a.e`)
+        let subquery = rewritten_with("SELECT (SELECT e ->> 'k' FROM jsonb_array_elements('[1]') e) FROM (SELECT 1 AS e) s", Some(&[])).unwrap();
+        assert!(!subquery.contains("e.value"), "{subquery}"); // (an outer column `e` is read before the inner alias's row)
+    }
+
     #[test]
     fn a_bare_value_name_is_found_before_the_catalog_is_asked() {
         let parse = |sql: &str| Parser::parse_sql(&GenericDialect {}, sql).expect("parses").remove(0);
         assert!(bare_aliases(&parse("SELECT e FROM jsonb_array_elements('[1]') e")));
+        assert!(bare_aliases(&parse("SELECT s.sku FROM (SELECT e ->> 'sku' AS sku FROM jsonb_array_elements('[1]') e) s")));
         assert!(bare_aliases(&parse("SELECT 1 FROM t, jsonb_array_elements_text(t.doc) WHERE jsonb_array_elements_text IS NULL")));
         assert!(!bare_aliases(&parse("SELECT e.value FROM jsonb_array_elements('[1]') e")));
         assert!(!bare_aliases(&parse("SELECT e FROM jsonb_each('{}') e")));

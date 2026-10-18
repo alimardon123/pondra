@@ -145,13 +145,11 @@ fn text(v: &ScalarValue) -> Option<&str> {
 
 /// Each value cast to its column's type where the column is a DOUBLE, REAL or DECIMAL: DataFusion would
 /// otherwise give one column's values the one type it finds for them all, and `1e20` with `1e-20` made a
-/// DECIMAL(38, 20) that couldn't hold the first (`write::values_typed`). A row shorter than the table
-/// skips `_deleted`, as `write::fit` skips it.
+/// DECIMAL(38, 20) that couldn't hold the first (`write::values_typed`). The values fill the table's columns as
+/// `write::fit` fills them: a row gives `_deleted` only by name (`write::by_position`).
 fn typed(mut rows: Vec<Vec<ScalarValue>>, target: &Schema) -> Option<Vec<Vec<ScalarValue>>> {
     for row in &mut rows {
-        let skip_deleted = row.len() < target.fields().len();
-        let fields = target.fields().iter().filter(|f| !(skip_deleted && f.name() == "_deleted"));
-        for (v, f) in row.iter_mut().zip(fields) {
+        for (v, f) in row.iter_mut().zip(crate::write::by_position(target)) {
             let t = f.data_type();
             if t.is_floating() || t.is_decimal() {
                 *v = v.cast_to(t).ok()?;
@@ -218,7 +216,7 @@ mod tests {
     use super::*;
     use crate::store::TableMeta;
     use chrono::{DateTime, Timelike, Utc};
-    use crate::write::{fit, rows};
+    use crate::write::{fit, planned};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::prelude::SessionContext;
 
@@ -231,6 +229,16 @@ mod tests {
             .with_optimizer_rules(crate::optimize::rules())
             .build();
         SessionContext::new_with_state(state)
+    }
+
+    /// `write::rows` for these tests' tables, which have no DEFAULTs: their rows are planned and fit, with no lake to
+    /// take a default's values from.
+    async fn rows(ctx: &SessionContext, meta: &TableMeta, sql: &str) -> anyhow::Result<RecordBatch> {
+        let target = crate::query::schema(&meta.columns)?;
+        match planned(ctx, &target, sql).await? {
+            Some(all) => fit(&target, &all),
+            None => Ok(RecordBatch::new_empty(target)),
+        }
     }
 
     fn meta(columns: &[(&str, &str)]) -> TableMeta {
@@ -458,10 +466,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleted_is_skipped_for_a_shorter_row_as_planned() {
+    async fn a_row_gives_deleted_only_by_name() {
         let table = [("k", "Int64"), ("v", "Utf8"), ("_deleted", "Boolean")];
         agree(&table, "VALUES (1, 'x')").await;
-        agree(&table, "VALUES (1, 'x', true)").await;
+        agree(&table, "VALUES (1, 'x', true)").await; // (one value too many: 42601 both ways)
     }
 
     #[tokio::test]

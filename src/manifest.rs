@@ -117,13 +117,6 @@ impl Seen {
 /// system columns.
 fn ranged(i: usize, f: &datafusion::arrow::datatypes::Field) -> bool { (i < 32 || crate::sys::NAMES.contains(&f.name().as_str())) && orderable(f.data_type()) }
 
-/// The least and greatest value in `cols` (None if they can't be ordered).
-pub fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
-    let (mut lo, mut hi) = (MinAccumulator::try_new(cols.first()?.data_type()).ok()?, MaxAccumulator::try_new(cols[0].data_type()).ok()?);
-    cols.iter().try_for_each(|c| lo.update_batch(&[c.clone()]).and_then(|_| hi.update_batch(&[c.clone()]))).ok()?;
-    Some((lo.evaluate().ok()?, hi.evaluate().ok()?))
-}
-
 /// Column `name`'s min and max from a file's footer: over its row groups' own, when every row
 /// group that holds a value has them, exact (not cut short).
 pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::Schema, name: &str) -> Option<(ScalarValue, ScalarValue)> {
@@ -135,7 +128,7 @@ pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::
     let complete = groups().enumerate().all(|(j, g)| {
         nulls.value(j) as i64 == g.num_rows() || (lo.is_valid(j) && hi.is_valid(j) && lo_exact.value(j) && hi_exact.value(j))
     });
-    complete.then(|| min_max(&[lo]).zip(min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
+    complete.then(|| crate::sketch::min_max(&[lo]).zip(crate::sketch::min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
 }
 
 /// A value as text that casts back to it exactly (timestamps as ISO 8601), or None for a null
@@ -173,20 +166,6 @@ pub fn ranges(table: &str, manifests: &[Manifest], files: &[DataFile], schema: &
     let stats = Arc::new(union(&parts, schema));
     SEEN.lock().unwrap().put(table.to_string(), (mark, stats.clone()));
     stats
-}
-
-/// How many values a range could hold, for the types that count in whole numbers: an upper bound
-/// on a column's distinct values, which is what the size of a join on it turns on. None where a
-/// range says nothing about that — floats, strings, timestamps.
-pub fn span(lo: &ScalarValue, hi: &ScalarValue) -> Option<u64> {
-    // (dates as the days they are: a difference of dates comes out in seconds)
-    let whole = |v: &ScalarValue| match v.cast_to(&DataType::Int64).ok()? {
-        ScalarValue::Int64(Some(n)) if matches!(v.data_type(), DataType::Date64) => Some(n / 86_400_000),
-        ScalarValue::Int64(Some(n)) if v.data_type().is_integer() || v.data_type() == DataType::Date32 => Some(n),
-        _ => None,
-    };
-    let (lo, hi) = (whole(lo)?, whole(hi)?);
-    (hi >= lo).then(|| hi.abs_diff(lo) + 1)
 }
 
 /// The ranges covering all of `parts` (a column missing from any of them has no range).

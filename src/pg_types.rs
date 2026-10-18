@@ -469,8 +469,9 @@ async fn look_up(lake: &Lake, stmt: &Statement, known: &mut Known, depth: usize)
 }
 
 /// The lower-case names of the columns of the relations `stmt` names, for `pg_json_sets::sets`. None when a relation's
-/// columns aren't known here (a CTE, a file, a table function), or when a FROM item names no relation at all (a derived
-/// table, a CTE): either may have a column of any name. A JSON call in a FROM is a call, not a relation, and is left out.
+/// columns aren't known here (a CTE, a file, a table function), or when a FROM item names no relation at all (a CTE, or a
+/// call of another kind): either may have a column of any name. A JSON call in a FROM is a call, not a relation, and is
+/// left out. A derived table's own columns are handled where it is in scope, by `pg_json_sets`' scopes.
 pub(crate) async fn columns_named(lake: &Lake, stmt: &Statement) -> Option<HashSet<String>> {
     if !names_its_columns(stmt) {
         return None;
@@ -487,8 +488,9 @@ pub(crate) async fn columns_named(lake: &Lake, stmt: &Statement) -> Option<HashS
     Some(names)
 }
 
-/// Whether every FROM item of `stmt` is a table, a view or a call (`TableFactor::Table`, or a LATERAL JSON call), and no
-/// query has a WITH: a derived table, a CTE or a function of another kind hides columns that `look_up` can't see.
+/// Whether every FROM item of `stmt` is a table, a view, a derived table or a call (`TableFactor::Table`, or a LATERAL
+/// JSON call), and no query has a WITH: a CTE or a function of another kind hides columns that `look_up` can't see. A
+/// derived table's own columns are handled where it is in scope, by `pg_json_sets`' scopes.
 fn names_its_columns(stmt: &Statement) -> bool {
     struct Named;
     impl ast::Visitor for Named {
@@ -505,7 +507,7 @@ fn names_its_columns(stmt: &Statement) -> bool {
         fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
             // (LATERAL makes a call a `Function` factor, so a JSON call written CROSS JOIN LATERAL is one too)
             let json_call = matches!(factor, TableFactor::Function { name, .. } if crate::pg_json_sets::is_set_name(&name.to_string()));
-            if json_call || matches!(factor, TableFactor::Table { .. }) {
+            if json_call || matches!(factor, TableFactor::Table { .. } | TableFactor::Derived { .. }) {
                 ControlFlow::Continue(())
             } else {
                 ControlFlow::Break(())
@@ -1467,6 +1469,13 @@ mod tests {
     fn a_lateral_json_call_is_a_call_not_a_relation() {
         assert!(names_its_columns(&one("SELECT e FROM t CROSS JOIN LATERAL jsonb_array_elements(t.doc) e").unwrap()));
         assert!(!names_its_columns(&one("SELECT e FROM t CROSS JOIN LATERAL generate_series(1, 2) e").unwrap()));
+    }
+
+    /// A derived table is no reason to leave the columns unnamed: a JSON call inside it names none, and `pg_json_sets`
+    /// decides where a bare name in it may be a value.
+    #[test]
+    fn a_derived_table_names_its_columns() {
+        assert!(names_its_columns(&one("SELECT 1 FROM (SELECT e FROM jsonb_array_elements('[1]') e) s").unwrap()));
     }
 
     #[test]

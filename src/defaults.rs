@@ -81,6 +81,21 @@ pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }
 
+/// A table's DEFAULTs and CHECKs, checked as its CREATE checks them: a default gives one value of its column's type,
+/// and a CHECK is a condition over the table's columns. A lake table's CREATE (`write::create_table`) and a temporary
+/// table's (`temp::create`) make the same calls, so both refuse the same definitions.
+pub async fn definition(columns: &[(String, String)], defaults: &std::collections::BTreeMap<String, String>, checks: &[(String, String)]) -> Result<()> {
+    for (c, expr) in defaults {
+        let t = &columns.iter().find(|(n, _)| n == c).with_context(|| format!("column \"{c}\" does not exist"))?.1;
+        validate(c, t, expr).await?;
+    }
+    let empty = RecordBatch::new_empty(crate::query::schema(columns)?);
+    for (n, c) in checks {
+        breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?;
+    }
+    Ok(())
+}
+
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
@@ -167,6 +182,18 @@ pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::H
 /// the table's types after).
 pub fn sql_of(meta: &TableMeta, column: &str) -> Option<String> {
     Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
+}
+
+/// Is this text the word DEFAULT (any case, spaces aside)? A quoted `"default"` is a column's name.
+pub fn is_word(text: &str) -> bool { text.trim().eq_ignore_ascii_case("default") }
+
+/// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
+/// reads it in an UPDATE's SET, a MERGE's INSERT and an upsert; anything else is the value as written.
+pub fn value(meta: &TableMeta, column: &str, text: &str) -> String {
+    match is_word(text) {
+        true => sql_of(meta, column).unwrap_or_else(|| "NULL".into()),
+        false => text.to_string(),
+    }
 }
 
 /// Is a DEFAULT the NULL literal (`DEFAULT NULL`, `NULL::text`, `CAST(NULL AS text)`)? Postgres keeps
@@ -278,6 +305,20 @@ mod tests {
         assert!(fills_existing(&column("c INT DEFAULT 0")));
         assert!(fills_existing(&column("c INT NOT NULL")));
         assert!(fills_existing(&column("c INT NOT NULL DEFAULT NULL")));
+    }
+
+    #[test]
+    fn the_word_default_is_the_column_default() {
+        // (one test of the word: a SET, a VALUES item, an upsert and a MERGE all take it from `value`)
+        let meta = TableMeta { columns: vec![("n".into(), "Int32".into()), ("t".into(), "Utf8".into())], defaults: [("n".to_string(), "3".to_string())].into(), ..Default::default() };
+        for w in ["DEFAULT", "default", " DEFAULT "] {
+            assert!(is_word(w), "{w}");
+            assert_eq!(value(&meta, "n", w), "(3)", "{w}");
+            assert_eq!(value(&meta, "t", w), "NULL", "{w}");
+        }
+        assert!(!is_word("\"default\""));
+        assert_eq!(value(&meta, "n", "\"default\""), "\"default\"");
+        assert_eq!(value(&meta, "n", "n + 1"), "n + 1");
     }
 
     #[test]
