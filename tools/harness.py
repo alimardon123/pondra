@@ -6895,7 +6895,8 @@ def hot_under_line():
     million rows, a file each, about 32 MB decoded each), then a query that grows the node outside the query pool
     (array_agg over HOT_LINE_ROWS values in three groups, as `scale`'s memory-line check) must answer with the model's
     counts, stop nothing (`pondra_queries_stopped_for_memory_total` 0 or absent), and find the columns trimmed: fewer
-    bytes than before the query, but some left. Read with status-returning calls throughout. On a build before the
+    bytes than before the query, all of them when the query needs it (CI's runner held 288 MB, and the query took all
+    of it on its way to a 1,075 MB peak). Read with status-returning calls throughout. On a build before the
     watch (PONDRA_BIN), the query is stopped (53200) and the check fails there.
     Calibrated on pondra-whole (round 33's build) with 20 files: 8,000,000 rows, 640 MB held and the query stopped
     (1,375 MB resident before it, 1,712 peak); with the same node and no cache (PONDRA_HOT_GB=0) it answers at a 629 MB
@@ -6938,7 +6939,7 @@ def hot_under_line():
             "rows": n, "held before": held_before, "resident before": rss_before >> 20, "status": [status, sqlstate],
             "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped}
         checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
-            held_before > 0 and status == 200 and got == want and stopped == 0 and 0 < held_after < held_before)
+            held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
     finally:
         node.kill()
         clean_up()

@@ -227,6 +227,7 @@ These print what a node does, on its standard error. Leave them off except when 
 | `PONDRA_DEBUG_SPREAD` | unset | `1`: why each query ran on one node, or across them, with the estimate that decided |
 | `PONDRA_DEBUG_JOIN_ORDER` | unset | `1`: each join order the planner weighs, with the rows the order written moves and the rows the order chosen moves |
 | `PONDRA_DEBUG_PG` | unset | `1`: each statement the Postgres port gets, as it arrives and as it runs |
+| `PONDRA_DEBUG_FAIL_STEP` | unset | a step's number: that step of every spread query fails once on each node, so its second try runs. It prints nothing; tests use it to check that a retried step answers as one node does |
 | `PONDRA_TRACE_PG` | unset | `1`: where each Postgres statement's time goes |
 | `PONDRA_TRACE_RERUN` | unset | `1`: each step of a materialized view's run and its time (a view that runs its query again) |
 | `PONDRA_TRACE_START` | unset | `1`: a cold start's steps and their times (`tools/cold_trace.sh`) |
