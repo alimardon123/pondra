@@ -7028,6 +7028,8 @@ def across():
 
 HOT_LINE_ROWS = 8_000_000  # the values array_agg holds in hot_under_line's query (calibrated on pondra-whole: see its docstring)
 HOT_LINE_FILES = 20  # the bulk INSERTs of hot_under_line's table: a file of its own each (about 32 MB decoded each)
+HOT_HELD_FILES = 12  # the bulk INSERTs of its second check's table `hw`: about 384 MB decoded, so the cache can hold HOT_HELD_BYTES
+HOT_HELD_BYTES = 100 << 20  # what the cache must hold of `hw` before the second check's query: a trim worth crediting (the grower's overshoot grew with it)
 
 
 def hot_under_line():
@@ -7044,15 +7046,27 @@ def hot_under_line():
     (1,375 MB resident before it, 1,712 peak); with the same node and no cache (PONDRA_HOT_GB=0) it answers at a 629 MB
     peak. Two waits make the cache read the same way on every run: the table's files stop changing (the leader's first
     tiering rounds merge the small files, and a merge forgets their decoded columns, `hot.forget`), and resident memory
-    stops falling (the decoding's memory goes back to the OS over about ten seconds)."""
+    stops falling (the decoding's memory goes back to the OS over about ten seconds).
+    The second check (the purge, `oom.rs`): a fresh node on the same lake, warmed on `hw` (twelve bulk INSERTs of a million
+    rows, four BIGINT columns, about 384 MB decoded), whose cache must hold HOT_HELD_BYTES (100 MB) before the query. Then a
+    query over three times the rows, which needs more than the line by itself (alone on a node with no cache, the build
+    before the purge peaks at 1,724 MB for 3 × HOT_LINE_ROWS values, 582 MB for HOT_LINE_ROWS). The cache is trimmed and its
+    memory purged, and the query is still stopped near the line: 53200, one stop, fewer cache bytes after, the peak at most
+    1.1 × the line (1,126 MB), and the node answers `SELECT 1`. The peak is reset after the warm-up (`clear_refs`).
+    Calibrated on pondra-grower (the build before the purge, which keeps the credit): 128 MB held, the query stopped at
+    1,038 MB, and a peak of 1,198 MB (174 MB past the line, against 26 MB past it with 32 MB held: the overshoot grows with
+    what the cache gave back), so the check fails there."""
     import re
     lake = new_lake()
     # The table is made by `pondra sql` in its own processes (as `scale` makes its tables), so the node starts with
     # nothing decoded in memory: a node that made it through its own INSERTs kept the writes' memory, over the line.
     for statement in ["CREATE TABLE hl (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [
-            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)]:
+            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)] + [
+            "CREATE TABLE hw (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [  # (the second check's: made here too, before any node starts)
+            "INSERT INTO hw SELECT value, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for _ in range(HOT_HELD_FILES)]:
         subprocess.run([BIN, "sql", "--dir", lake, statement], check=True, capture_output=True, timeout=900)  # (a bulk INSERT is a file of its own)
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    env = {"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}
+    node = Node(lake, A.port, env=env).start()
     q = lambda s: sql(A.port, s)
     def answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it (`scale`'s `answer`)
         c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=600)
@@ -7062,14 +7076,22 @@ def hot_under_line():
     def resident_of(pid):  # resident memory, in bytes: statm counts pages of the size the OS says
         return int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+    def reset_peak():  # VmHWM back to the resident memory now (`scale` does the same): a peak read after it is the next query's own
+        try:
+            open(f"/proc/{node.p.pid}/clear_refs", "w").write("5")
+            return True
+        except OSError:  # not allowed here: the peak then counts from the node's start, the warm-up included
+            return False
+    def warm(table):  # the table's columns held and resident memory settled: the state each check starts from
+        for run in range(2):  # (a file's columns load on its second read)
+            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM {table} -- warm {run}")
+        hot_settled(A.port)
+        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
+        return hot_bytes(), resident_of(node.p.pid)
     checks, seen = {}, {}
     try:
         seen["files once the leader's first tiering rounds are done"] = files_settled(lake, "data/hl/")
-        for run in range(2):  # (a file's columns load on its second read)
-            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM hl -- warm {run}")
-        hot_settled(A.port)
-        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
-        held_before, rss_before = hot_bytes(), resident_of(node.p.pid)
+        held_before, rss_before = warm("hl")
         n = HOT_LINE_ROWS
         status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
         held_after = hot_bytes()
@@ -7082,6 +7104,30 @@ def hot_under_line():
             "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped}
         checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
             held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
+        # The second check, on a fresh node of its own: the first node is killed and a new one starts on the same lake with
+        # the same env, so its cache starts empty under the trim line. It is warmed on `hw`, whose decoded columns must fill
+        # the cache past HOT_HELD_BYTES. Then a query over three times the rows, which needs more than the line by itself:
+        # the cache is trimmed and purged, and the query is still stopped near the line (`oom.rs`).
+        node.kill()
+        node = Node(lake, A.port, env=env).start()
+        seen["files of hw once the leader's first tiering rounds are done"] = files_settled(lake, "data/hw/")
+        held_before2, rss_before2 = warm("hw")
+        peak_reset = reset_peak()  # the peak from here is the query's own (VmHWM); where clear_refs isn't allowed it counts from the node's start
+        stopped_before2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        big = 3 * HOT_LINE_ROWS
+        status2, sqlstate2, body2 = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {big}) GROUP BY 1")
+        held_after2 = hot_bytes()
+        peak2 = vm_hwm(node.p.pid)
+        stopped2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        after_status, _, after_body = answer("SELECT 1 AS one")
+        after_ok = after_status == 200 and json.loads(after_body) == [{"one": 1}]
+        seen["a memory line of 1 GB, then a query past it (three times the rows, a fresh node): the columns held, the peak resident memory (MB)"] = {
+            "rows": big, "held before": held_before2, "resident before": rss_before2 >> 20, "status": [status2, sqlstate2],
+            "stopped": stopped2 - stopped_before2, "held after": held_after2, "peak resident": peak2 >> 20,
+            "peak reset": peak_reset, "select 1": after_ok}
+        checks["a query that needs more than the line is stopped near it, even while the hot columns give memory back (peak at most 1.1 × the line)"] = (
+            held_before2 >= HOT_HELD_BYTES and status2 == 503 and sqlstate2 == "53200" and "out of memory" in body2
+            and stopped2 - stopped_before2 == 1 and held_after2 < held_before2 and peak2 <= 1.1 * (1 << 30) and after_ok)
     finally:
         node.kill()
         clean_up()

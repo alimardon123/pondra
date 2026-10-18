@@ -24,8 +24,7 @@ pub const OOM: &str = "out of memory: the node was nearly out of memory and stop
 
 /// How long a stop holds the watch: the node's allocator gives freed pages back over about ten
 /// seconds (`main.rs`), so resident memory falls after a stop, and a second stop would be for memory
-/// the first one already let go. The same time holds the credit for what the hot columns gave back
-/// (`felt`).
+/// the first one already let go.
 const HOLD: Duration = Duration::from_secs(10);
 
 /// How long a request must have run to be stopped: one that has only just started did not grow the
@@ -108,27 +107,6 @@ fn givers() -> Vec<Arc<crate::hot::Hot>> {
     list.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// Memory the hot columns let go of at one look: what it freed, the resident memory then, and the least seen since.
-struct Given {
-    at: Instant,
-    bytes: usize,
-    from: usize,
-    low: usize,
-}
-
-/// The memory the watch goes by: resident, less what was let go in the last [`HOLD`] and hasn't left the
-/// process yet (freed pages go back to the OS over seconds, `HOLD`'s comment). Each credit shrinks as
-/// resident falls below where it was taken, so memory that came back is never counted twice.
-fn felt(resident: usize, given: &mut Vec<Given>, now: Instant) -> usize {
-    given.retain(|g| now.saturating_duration_since(g.at) < HOLD);
-    let mut credit = 0;
-    for g in given.iter_mut() {
-        g.low = g.low.min(resident);
-        credit += g.bytes.saturating_sub(g.from.saturating_sub(g.low));
-    }
-    resident.saturating_sub(credit)
-}
-
 /// Starts the watch, when the process can say how much memory it holds and the hot columns can be given
 /// back (`trim_line`). The line is checked only where there is one (a node's own process). A node stopped
 /// ends it (`panics::task`), as its other loops end.
@@ -144,15 +122,14 @@ pub fn start() {
         let _ = datafusion::common::runtime::set_join_set_tracer(&TRACER);
     }
     crate::panics::task(async move {
-        let mut given: Vec<Given> = vec![]; // what the hot columns let go of, held by `felt` for `HOLD`
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
         loop {
             let resident = crate::store::resident().unwrap_or(0);
-            SEEN.store(resident, Relaxed); // (resident, never felt: `noted` and `pick` compare what the OS says)
+            SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
             crate::panics::note(resident); // (a request that started unread takes this look's reading, before any stop)
             let now = Instant::now();
-            let mut felt = felt(resident, &mut given, now);
+            let mut felt = resident;
             if felt > trim {
                 // The cache goes first: a column is decoded again when it is read, a query can't be.
                 let need = felt - trim;
@@ -166,8 +143,12 @@ pub fn start() {
                 }
                 drop(holders); // (held over a wait, a closed lake's columns would stay in memory)
                 if freed > 0 {
-                    given.push(Given { at: now, bytes: freed, from: resident, low: resident });
-                    felt = felt.saturating_sub(freed);
+                    // The pages just freed would stay resident for seconds (`purge`), so they are handed back now:
+                    // the reading after it is what the process holds, and the watch goes by that alone.
+                    purge();
+                    felt = crate::store::resident().unwrap_or(felt);
+                    SEEN.store(felt, Relaxed);
+                    crate::panics::note(felt);
                 }
             }
             if let Some(line) = line {
@@ -266,6 +247,13 @@ mod counters {
         // SAFETY: both are this thread's own counters, which jemalloc keeps for the thread's life.
         unsafe { (*allocated as i64).wrapping_sub(*freed as i64) }
     }
+
+    // Every arena's free pages go back to the OS (4096 is `MALLCTL_ARENAS_ALL`); the command takes no value, and a
+    // failed purge leaves the pages where they were, so its return code is ignored.
+    pub fn purge() {
+        // SAFETY: jemalloc is given the command's name and no buffer: it only gives back pages it has already freed.
+        let _ = unsafe { tikv_jemalloc_sys::mallctl(b"arena.4096.purge\0".as_ptr() as *const c_char, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
+    }
 }
 
 /// Bytes this thread has allocated less the bytes it has freed (see above); 0 where there are no counters.
@@ -279,6 +267,19 @@ fn thread_net() -> i64 {
 fn thread_net() -> i64 {
     0
 }
+
+/// Hands the allocator's free pages back to the OS now. jemalloc keeps freed pages about ten seconds (`main.rs`):
+/// purged, resident memory read after this says what the process holds, and the watch goes by that. Where jemalloc
+/// isn't the allocator (another OS, or a program embedding the library), there is nothing to purge, and a big free
+/// goes back at once.
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+fn purge() {
+    counters::purge()
+}
+
+// (no jemalloc to purge here: see the version above)
+#[cfg(not(all(feature = "server", target_os = "linux", target_env = "gnu")))]
+fn purge() {}
 
 // The tests run on jemalloc too, as the node does, so the meter has counters to read there.
 #[cfg(all(test, feature = "server", target_os = "linux", target_env = "gnu"))]
@@ -505,19 +506,6 @@ mod tests {
     fn the_watch_gives_the_cache_seven_tenths_of_the_line() {
         assert_eq!(of_line(10 << 30), 7 << 30);
         assert_eq!(of_line(LINE), LINE / 10 * 7);
-    }
-
-    #[test]
-    fn what_the_cache_gave_back_is_credited_until_it_leaves_the_process_and_never_twice() {
-        let start = Instant::now();
-        let at = |secs: u64| start + Duration::from_secs(secs);
-        // Resident 1000 MB, and the cache lets 300 MB go at once.
-        let mut given = vec![Given { at: start, bytes: 300 * MB, from: 1000 * MB, low: 1000 * MB }];
-        assert_eq!(felt(1000 * MB, &mut given, at(0)), 700 * MB, "just trimmed: the pages haven't left yet");
-        assert_eq!(felt(700 * MB, &mut given, at(1)), 700 * MB, "resident fell by what was freed: felt is resident");
-        assert_eq!(felt(800 * MB, &mut given, at(2)), 800 * MB, "then it grew: felt follows it");
-        assert_eq!(felt(800 * MB, &mut given, at(11)), 800 * MB, "past HOLD: no credit, and the entry is gone");
-        assert!(given.is_empty());
     }
 
     // (only where the counters are: jemalloc's, on Linux with glibc; elsewhere `thread_net` is 0)
