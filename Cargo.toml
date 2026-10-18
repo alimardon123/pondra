@@ -14,7 +14,7 @@ default = ["server"]
 server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "dep:toml", "dep:uuid", "dep:clap", "dep:mimalloc",
           "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
           "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tower", "dep:http-body-util", "dep:moka"]
+          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tower", "dep:http-body-util", "dep:moka"]
 # jemalloc's heap profiling and statistics built in (Linux), for a soak whose nodes dump their
 # heaps: soak.yml's `binary: heap`, read by tools/heap_report.py. Off unless asked: a node built
 # with it profiles nothing until `_RJEM_MALLOC_CONF` says `prof:true`.
@@ -88,6 +88,7 @@ libc = { version = "0.2", optional = true } # (free disk space: statvfs)
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tikv-jemallocator = { version = "0.7", optional = true, features = ["background_threads", "disable_initial_exec_tls"] } # (the program's allocator on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)
+tikv-jemalloc-sys = { version = "0.7", optional = true } # (jemalloc's own statistics on `/metrics`: `metrics::allocator`; already built for tikv-jemallocator)
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu")))'.dependencies]
 mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"], optional = true } # (the program's allocator but on Linux: `main.rs`; its features as the library's, `capi/`, so one build makes both)

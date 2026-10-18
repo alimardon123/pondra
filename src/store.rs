@@ -608,13 +608,19 @@ fn cgroup_memory() -> Option<usize> {
 /// This process's resident memory, if the OS says.
 pub fn resident() -> Option<usize> {
     let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
-    proc.map(|pages| pages * 4096).or_else(|| {
+    // (in the system's pages: arm64 kernels may have 64 KB ones)
+    proc.map(|pages| pages * page_size()).or_else(|| {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
         let (pid, mut s) = (sysinfo::get_current_pid().ok()?, System::new());
         s.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), false, ProcessRefreshKind::nothing().with_memory());
         Some(s.process(pid)?.memory() as usize).filter(|&b| b > 0)
     })
 }
+
+#[cfg(unix)]
+fn page_size() -> usize { usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok().filter(|&b| b > 0).unwrap_or(4096) }
+#[cfg(not(unix))]
+fn page_size() -> usize { 4096 }
 
 pub type Rows = Arc<Vec<datafusion::arrow::record_batch::RecordBatch>>;
 

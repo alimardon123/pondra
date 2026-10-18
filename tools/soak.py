@@ -14,10 +14,10 @@ and then, and what drifts over time measured.
   follower killed; it starts again a moment later (by default 8 times a run, at most hourly).
 
   Each minute it writes a line to --timeline: every node's resident memory (and its anonymous memory by
-  kind of mapping: glibc's heaps, thread stacks, the rest), its queries (running,
-  waiting, finished, failed) and the query memory they hold, the leader's rows not yet tiered and
-  its commit times, the longest a batch waited for its acknowledgement, the lake's
-  objects (a folder's; a bucket's every 30 minutes).
+  kind of mapping: glibc's heaps, thread stacks, the rest; with jemalloc's statistics built in, its
+  count), its queries (running, waiting, finished, failed) and the query memory they hold, the
+  leader's rows not yet tiered and its commit times, the longest a batch waited for its
+  acknowledgement, the lake's objects (a folder's; a bucket's every 30 minutes).
 
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
   on every node; the views equal their rows; the log drained (no rows left untiered within two
@@ -96,6 +96,13 @@ def gauges(x):
         return {l.rsplit(" ", 1)[0]: float(l.rsplit(" ", 1)[1]) for l in text.splitlines() if l.startswith("pondra_")}
     except Exception:
         return {}
+
+
+def allocator_mb(g):
+    """jemalloc's own count from a node's `gauges` (allocated, active, resident), in MB: only a build with jemalloc's
+    statistics reports it (`binary: heap`). Beside `anon_mb` it says whether the heap grew or pages were held."""
+    key = lambda k: f'pondra_allocator_bytes{{kind="{k}"}}'
+    return {k: round(g[key(k)] / 2**20) for k in ("allocated", "active", "resident") if key(k) in g} or None
 
 
 def requests_of(g):
@@ -213,7 +220,7 @@ def main():
         made = deltas["write"]
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "jemalloc_mb": {p: allocator_mb(g) for p, g in got.items()}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}

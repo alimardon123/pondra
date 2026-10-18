@@ -59,6 +59,28 @@ pub fn job_failed(job: &str) {
     }
 }
 
+/// jemalloc's count of what it holds, when it keeps one (built with its statistics: the `heap-profile` build), else
+/// nothing. Beside the process's resident memory it says whether the heap grew or pages were held, and how much of
+/// the process is outside jemalloc (C libraries' malloc, thread stacks): reviews/soak-heap-0fa48fb.md.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn allocator() -> Vec<(&'static str, u64)> {
+    use std::ffi::{c_void, CString};
+    use std::ptr::null_mut;
+    use tikv_jemalloc_sys::mallctl;
+    // (its statistics are a snapshot, taken when the epoch moves)
+    let mut epoch = 1u64;
+    if unsafe { mallctl(c"epoch".as_ptr(), null_mut(), null_mut(), &mut epoch as *mut u64 as *mut c_void, size_of::<u64>()) } != 0 {
+        return vec![];
+    }
+    ["allocated", "active", "resident", "metadata", "retained"].into_iter().filter_map(|k| {
+        let name = CString::new(format!("stats.{k}")).ok()?;
+        let (mut v, mut n) = (0usize, size_of::<usize>());
+        (unsafe { mallctl(name.as_ptr(), &mut v as *mut usize as *mut c_void, &mut n, null_mut(), 0) } == 0).then_some((k, v as u64))
+    }).collect()
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn allocator() -> Vec<(&'static str, u64)> { vec![] }
+
 /// Each background job and how many times it has failed (for `/metrics` and `/stats`).
 pub fn failures() -> Vec<(&'static str, u64)> { BG_FAILS.iter().map(|(k, c)| (*k, c.load(Relaxed))).collect() }
 
@@ -116,6 +138,10 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     caches.push(("{cache=\"answers\"}".into(), app.results.held() as f64));
     metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers", &caches);
     metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
+    let held: Vec<(String, f64)> = allocator().into_iter().map(|(k, b)| (format!("{{kind=\"{k}\"}}"), b as f64)).collect();
+    if !held.is_empty() {
+        metric("allocator_bytes", "gauge", "jemalloc's own count: allocated (what the node holds), active (its pages), resident (those, its free pages not yet given back and its metadata), metadata, retained (address space kept, not resident)", &held);
+    }
     if let Some(seq) = &app.seq {
         metric("untiered_rows", "gauge", "rows in the log waiting to become Parquet", &one(app.lake.backlog.load(Relaxed) as f64));
         let mut ms = seq.commit_ms.lock().unwrap().clone();
