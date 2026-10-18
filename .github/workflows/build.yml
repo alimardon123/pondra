@@ -316,6 +316,8 @@ jobs:
         with:
           node-version: 22
       - name: Build # (the program, the library and its launcher, into one folder: the packages carry the two, the archive the program)
+        # (a dist build links the library first and the programs after it: each links the whole engine with LTO,
+        # and the two at once lost linux-arm64's runner, 16 GB, on every main build from #131 on)
         env:
           # (jemalloc, Linux's allocator, takes the build machine's page size and won't start on a
           # kernel with bigger pages: arm64 kernels use 4, 16 or 64 KB (a Raspberry Pi 5, some RHEL),
@@ -330,8 +332,10 @@ jobs:
           elif [ -n "${{ matrix.zig }}" ]; then
             pip install ziglang cargo-zigbuild
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
+            RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace --lib
             RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
           else
+            cargo build --profile dist --target ${{ matrix.target }} --workspace --lib
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
