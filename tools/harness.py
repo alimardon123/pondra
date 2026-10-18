@@ -1460,7 +1460,7 @@ def tails():
             body = json.loads(r.read())
             with pair_lock:
                 pair_reads[0] += 1
-            if r.status != 200 or not body or not (body[0]["a"] == body[0]["b"] == body[0]["a2"]):  # (NULL equals NULL)
+            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2")):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
                 with pair_lock:
                     pair_wrong.append(body)
 
@@ -7852,6 +7852,31 @@ def found():
     want = [{"lo": 1000000000000000, "hi": 1000000000000000, "n": 2}]
     seen["exps_fed"] = until(lambda: _try(lambda: q("SELECT min(y) AS lo, max(y) AS hi, count(*) AS n FROM exps_fed")), want, 30)
     checks["a view fed by a topic with 1e15 fills with 1000000000000000 (two records)"] = seen["exps_fed"] == want
+    # 1e15 is the whole number on every path that reads a literal (`optimize::whole_literals`, invariant 415): the fast INSERT of
+    # VALUES (`literals.rs`), a session's DECLARE (`vars.rs`), a DEFAULT and a one-key UPDATE's value (`defaults.rs`, `txn.rs`).
+    # (Each step is `_try`: on a build without the fix a step fails, and its check is false, not the harness.)
+    _try(lambda: q("CREATE TABLE e (d DOUBLE, n DECIMAL(20, 0), b BIGINT)"))
+    _try(lambda: q("INSERT INTO e VALUES (1e15, 1e15, 1e15)"))
+    _try(lambda: q("INSERT INTO e SELECT 1e15, 1e15, 1e15"))
+    seen["e_rows"] = _try(lambda: q("SELECT d, n, b, d = 1000000000000000.0 AS exact FROM e ORDER BY b"))
+    checks["INSERT … VALUES (1e15) and INSERT … SELECT 1e15 store the same whole number: a DOUBLE exactly 1e15, a DECIMAL and a BIGINT too"] = \
+        seen["e_rows"] == [{"d": 1e15, "n": 1000000000000000, "b": 1000000000000000, "exact": True}] * 2
+    found_s = {"x-pondra-session": "harness-found-1e15"}
+    qs = lambda t: call(port, "POST", "/sql", t.encode(), headers=found_s)
+    _try(lambda: qs("DECLARE $x = 1e15"))
+    _try(lambda: qs("CREATE TABLE e2 AS SELECT $x AS x"))
+    seen["e2"] = _try(lambda: qs("SELECT x = 1e15 AS same FROM e2"))
+    checks["DECLARE $x = 1e15, then CREATE TABLE e2 AS SELECT $x AS x writes (no Parquet error), and x = 1e15 is true"] = \
+        seen["e2"] == [{"same": True}]
+    _try(lambda: q("CREATE TABLE ek (k BIGINT PRIMARY KEY, d DOUBLE)"))
+    _try(lambda: q("INSERT INTO ek VALUES (1, 2.5)"))
+    _try(lambda: q("UPDATE ek SET d = 1e15 WHERE k = 1"))
+    seen["ek"] = _try(lambda: q("SELECT d FROM ek"))
+    checks["UPDATE of a keyed table's DOUBLE to 1e15 by its key reads exactly 1e15"] = seen["ek"] == [{"d": 1e15}]
+    _try(lambda: q("CREATE TABLE ed (id BIGINT, d DOUBLE DEFAULT 1e15)"))
+    _try(lambda: q("INSERT INTO ed (id) VALUES (1)"))
+    seen["ed"] = _try(lambda: q("SELECT d FROM ed"))
+    checks["a column DEFAULT 1e15 on a DOUBLE reads exactly 1e15"] = seen["ed"] == [{"d": 1e15}]
     node.kill(); locked.kill()
     ok = all(checks.values())
     print(json.dumps({"found": checks, "ok": ok}, indent=1))
@@ -13163,6 +13188,96 @@ def objects():
         ctas_bad[1] == "22P02" and ctas_read[1] == "42P01" and ctas_fixed[0] == 200 and ctas_rows == [{"a": 1}] \
         and cli_bad.returncode != 0 and cli_fixed.returncode == 0 and "42P07" not in cli_fixed.stdout + cli_fixed.stderr and cli_read.returncode == 0 and "| 1 |" in cli_read.stdout \
         and stopped[1] == "53200" and gone is not None and big_after == [{"one": 1}]
+    # Two CREATE TABLE of one name at once, on a leader and a follower of one lake (A.port + 8 and + 9: + 6 is the big
+    # node's above). The race: 20 rounds of a CTAS on each node, released together (one answers 200, the other 42P07,
+    # and the table holds one winner's rows); 5 rounds with IF NOT EXISTS (both 200, exactly one says exists); 5 plain
+    # CREATE TABLEs (one 200, one 42P07). The drop: the follower's CTAS fails 2 s or more after its table is there, and
+    # meanwhile the leader drops that table and makes another under the name; the failure must leave that table
+    # (`write.rs`, `drop_made`).
+    race_env = {"PONDRA_SECRET_KEY": "objects-key"}
+    race_lake = new_lake()
+    lead = Node(race_lake, A.port + 8, env=race_env).start()
+    follow = Node(race_lake, A.port + 9, env=race_env).start()
+    def post_on(port, body):  # (status, SQLSTATE, answer) of one statement sent to a node over HTTP
+        c = http_client.HTTPConnection("127.0.0.1", port, timeout=600)
+        c.request("POST", "/sql", body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode(errors="replace"))
+    def read_on(port, body):  # the answer, or its status when it isn't one
+        status, _, answer = post_on(port, body)
+        return answer if status == 200 else status
+    def together(stmts):  # stmts[0] to the leader and stmts[1] to the follower, sent at the same moment
+        gate, answers = threading.Barrier(2), [None, None]
+        def send(k):
+            gate.wait()
+            try:
+                answers[k] = post_on((lead.port, follow.port)[k], stmts[k])
+            except Exception as e:
+                answers[k] = (0, None, str(e))
+        ts = [threading.Thread(target=send, args=(k,)) for k in (0, 1)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        return answers
+    raced, race_ok = 0, 0
+    for i in range(20):
+        got = together([f"CREATE TABLE race_{i} AS SELECT {n} AS who, value AS v FROM generate_series(1, 50000)" for n in (1, 2)])
+        raced += [a[0] for a in got] == [200, 200]
+        won = [k for k in (0, 1) if got[k][0] == 200]
+        if len(won) == 1 and got[1 - won[0]][:2] == (409, "42P07") and \
+                read_on(lead.port, f"SELECT count(*) AS n, count(DISTINCT who) AS w, min(who) AS first FROM race_{i}") == [{"n": 50000, "w": 1, "first": won[0] + 1}]:
+            race_ok += 1
+    ine_ok = 0
+    for i in range(5):
+        got = together([f"CREATE TABLE IF NOT EXISTS race_ine_{i} AS SELECT {n} AS who, value AS v FROM generate_series(1, 50000)" for n in (1, 2)])
+        said = [isinstance(a[2], dict) and a[2].get("exists") is True for a in got]
+        if [a[0] for a in got] == [200, 200] and sum(said) == 1 and \
+                read_on(lead.port, f"SELECT count(*) AS n, count(DISTINCT who) AS w FROM race_ine_{i}") == [{"n": 50000, "w": 1}]:
+            ine_ok += 1
+    plain_ok = 0
+    for i in range(5):
+        got = together([f"CREATE TABLE race_p_{i} (v INT)"] * 2)
+        if sorted(a[0] for a in got) == [200, 409] and [a[1] for a in got if a[0] == 409] == ["42P07"] and \
+                read_on(lead.port, f"SELECT count(*) AS n FROM race_p_{i}") == [{"n": 0}]:
+            plain_ok += 1
+    g_sql = "CREATE TABLE g AS SELECT 1 / (value - 60000000) AS v FROM generate_series(1, 60000000)"  # (its last row divides by zero, a second or more after g is there at 60M rows; made_at < failed_at says the drop came first)
+    failing, seen_at = {}, None
+    def fail_late():
+        try:
+            failing["answer"] = post_on(follow.port, g_sql)
+        except Exception as e:
+            failing["answer"] = (0, None, str(e))
+        failing["done"] = time.time()
+    failer = threading.Thread(target=fail_late)
+    failer.start()
+    deadline = time.time() + 120
+    while seen_at is None and time.time() < deadline:  # (poll until g is there, from the leader)
+        if post_on(lead.port, "SELECT 1 FROM g LIMIT 1")[0] == 200:
+            seen_at = time.time()
+        else:
+            time.sleep(0.05)
+    dropped = post_on(lead.port, "DROP TABLE g")
+    made = post_on(lead.port, "CREATE TABLE g AS SELECT 7 AS v")
+    made_at = time.time()
+    failer.join(timeout=900)
+    a = failing.get("answer", (0, None, "no answer"))
+    failed_at = failing.get("done")
+    g_lead, g_follow = read_on(lead.port, "SELECT v FROM g"), read_on(follow.port, "SELECT v FROM g")
+    drop_ok = seen_at is not None and dropped[0] == 200 and made[0] == 200 and a[0] != 200 and failed_at is not None \
+        and made_at < failed_at and g_lead == [{"v": 7}] and g_follow == [{"v": 7}]
+    info["race"] = {"rounds": 20, "both_200": raced, "one_200_and_42P07_one_winner": race_ok,
+                    "if_not_exists_rounds": ine_ok, "plain_rounds": plain_ok}
+    info["drop"] = {"seen_to_failure_s": round(failed_at - seen_at, 1) if failed_at and seen_at else None,
+                    "failure": [a[0], a[1], str(a[2])[:200]], "dropped_and_made_first": made_at < (failed_at or 0),
+                    "leader_drop_and_make": [dropped[0], made[0]], "after": [g_lead, g_follow]}
+    lead.kill()
+    follow.kill()
+    if not race_lake.startswith("s3://"):
+        shutil.rmtree(race_lake, ignore_errors=True)  # (its nodes are stopped: its lake goes now)
+    checks["two CREATE TABLE of one name at once, on two nodes: one makes it, the other is refused 42P07 (IF NOT EXISTS: one table), and a CREATE TABLE … AS SELECT that fails drops no other statement's table"] = \
+        race_ok == 20 and ine_ok == 5 and plain_ok == 5 and drop_ok
     # DuckDB's EXPORT DATABASE and IMPORT DATABASE are not Pondra's yet (ADR-071): refused by name
     # with the ways it has (0A000), not with the parser's words.
     exported, imported = http("EXPORT DATABASE 'out'"), http("IMPORT DATABASE 'out'")
@@ -18321,6 +18436,12 @@ def sparksql():
     q("CREATE TABLE people AS SELECT id, name, xs, CAST(d AS DOUBLE) AS d FROM (VALUES (1, 'ann', make_array(1, 2, 3), 2.5), (2, 'bob', make_array(4), -2.5), "
       "(3, 'cy', CAST(make_array() AS BIGINT[]), 0.5), (4, 'dee', CAST(NULL AS BIGINT[]), 7.5)) AS v(id, name, xs, d)")  # (Spark's floor of a DOUBLE is a BIGINT; 2.5 is a DECIMAL, whose floor has scale 0)
     rows = lambda df: [r.asDict() for r in df.collect()]
+    def tried(f):
+        # A binary without the feature answers with an error: the check fails by name, the run goes on.
+        try:
+            return f()
+        except Exception as e:
+            return f"error: {e}"
     got = {
         "text": rows(spark.sql('SELECT "hi" AS s, `name` FROM people WHERE name = "ann"')),
         "floor": rows(spark.sql("SELECT id, floor(d) AS f, ceil(d) AS c FROM people ORDER BY id")),
@@ -18337,7 +18458,16 @@ def sparksql():
         "args": [r["id"] for r in rows(spark.sql("SELECT id FROM people WHERE id > :m ORDER BY id", args={"m": 2}))],
         "frame": rows(spark.sql("SELECT count(*) AS n FROM {d} WHERE `name` <> \"bob\"", d=spark.table("people"))),
         "door": q("SELECT f, arrow_typeof(f) AS t FROM spark_sql('SELECT floor(CAST(2.5 AS DOUBLE)) AS f')"),
+        # Casts to an integer: Spark's cut the fraction toward zero, Pondra's SQL rounds it (invariant 293).
+        "spark cast": q("SELECT * FROM spark_sql('SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b, CAST(9007199254740993 AS BIGINT) AS c, 7 DIV 2 AS d')"),
+        "plain cast": q("SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b"),
+        "frame cast": tried(lambda: [(r["i"], r["b"]) for r in sorted(rows(spark.createDataFrame([{"x": 2.7}, {"x": -2.7}]).select("x", F.col("x").cast("int").alias("i"),
+            F.col("x").cast("bigint").alias("b"))), key=lambda r: r["x"])]),
     }
+    # A session in Spark's dialect (SET names it, as a client's does) cuts a cast; the session beside it rounds.
+    dialect = {"x-pondra-session": "harness-sparksql-dialect"}
+    call(A.port, "POST", "/sql", b"SET datafusion.sql_parser.dialect = 'spark'", headers=dialect)
+    got["dialect cast"] = call(A.port, "POST", "/sql", b"SELECT CAST(2.7 AS INT) AS a, CAST(-2.7 AS BIGINT) AS b", headers=dialect)
     q("CREATE VIEW floors AS SELECT * FROM spark_sql('SELECT id, floor(d) AS f FROM people')")
     got["view"] = q("SELECT sum(f) AS s FROM floors")
     refused = {
@@ -18365,6 +18495,9 @@ def sparksql():
     checks["spark_sql('…') from any door, and a view over it"] = got["door"] == [{"f": 2, "t": "Int64"}] and got["view"] == [{"s": 6}]
     checks["refused by name: " + ", ".join(refused)] = "takes a query" in refused["a statement that isn't a query"] and "posexplode" in refused["posexplode"] \
         and "over a join" in refused["a lateral view over a join"]
+    checks["a cast to an integer cuts the fraction toward zero in Spark's dialect (spark_sql, a session's SET, the frames' cast; 2.7 is 2, -2.7 is -2), and rounds in Pondra's SQL (3, -3)"] = \
+        [(str(r["c"]), r["d"]) for r in got["spark cast"]] == [("9007199254740993", 3)] and [(r["a"], r["b"]) for r in got["spark cast"]] == [(2, -2)] \
+        and got["plain cast"] == [{"a": 3, "b": -3}] and got["dialect cast"] == [{"a": 2, "b": -2}] and got["frame cast"] == [(-2, -2), (2, 2)]
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"sparksql": checks, "ok": ok, "info": info}, indent=1, default=str))

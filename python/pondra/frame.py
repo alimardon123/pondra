@@ -128,7 +128,7 @@ class Expr:
         return out
 
     def cast(self, dtype):
-        return Expr(f"CAST({self.sql} AS {sql_type(dtype)})", self.name)
+        return Expr(_cast_sql(self.sql, sql_type(dtype)), self.name)
 
     def not_(self):
         return ~self
@@ -327,7 +327,7 @@ class _Dt:
         self.e = e
 
     def _part(self, part):
-        return Expr(f"CAST(date_part('{part}', {self.e.sql}) AS BIGINT)", self.e.name)
+        return Expr(_cast_sql(f"date_part('{part}', {self.e.sql})", "BIGINT"), self.e.name)
 
     year = lambda s: s._part("year")
     month = lambda s: s._part("month")
@@ -339,7 +339,7 @@ class _Dt:
     ordinal_day = lambda s: s._part("doy")
 
     def weekday(self):  # (Monday 1 … Sunday 7)
-        return Expr(f"CAST((date_part('dow', {self.e.sql}) + 6) % 7 + 1 AS BIGINT)", self.e.name)
+        return Expr(_cast_sql(f"(date_part('dow', {self.e.sql}) + 6) % 7 + 1", "BIGINT"), self.e.name)
 
     def date(self):
         return Expr(f"CAST({self.e.sql} AS DATE)", self.e.name)
@@ -356,8 +356,15 @@ class _Dt:
         return Expr(f"to_char({self.e.sql}, {_literal(format)})", self.e.name)
 
     def epoch(self, time_unit="us"):
-        scale = {"s": 1, "ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}[time_unit]
-        return Expr(f"CAST(date_part('epoch', {self.e.sql}) * {scale} AS BIGINT)", self.e.name)
+        # The microseconds since 1970 in integers, then whole units floored as Polars floors them (a float would round
+        # a fraction now, `casts::Rounds`; a time before 1970 floors, not cut toward 0). A zoned time keeps its instant.
+        u = f"arrow_cast(arrow_cast({self.e.sql}, 'Timestamp(Microsecond, None)'), 'Int64')"
+        if time_unit == "us":
+            return Expr(u, self.e.name)
+        if time_unit == "ns":
+            return Expr(f"{u} * 1000", self.e.name)
+        d = {"s": 1_000_000, "ms": 1_000}[time_unit]
+        return Expr(f"({u} - (({u} % {d}) + {d}) % {d}) / {d}", self.e.name)
 
 
 def col(name):
@@ -511,6 +518,19 @@ def sql_type(t):
     return SQL_TYPES.get(name.split("(")[0].lower(), name)
 
 
+# A cast to one of these drops a fraction toward zero, as Polars and PySpark cast (`pondra_truncate`); SQL's
+# own CAST rounds it (invariant 293). JavaScript's frames write the same text (`castSql`).
+INTEGER_SQL = ("TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT")
+
+
+def _cast_sql(x, sql_t):
+    """`x` cast to the SQL type `sql_t` (from `sql_type`): an integer type truncates, any other is a plain CAST."""
+    words = sql_t.replace("(", " ").split()  # (TINYINT UNSIGNED is an integer too; DECIMAL(10, 2) is not)
+    if words and words[0].upper() in INTEGER_SQL:
+        return f"CAST(pondra_truncate({x}) AS {sql_t})"
+    return f"CAST({x} AS {sql_t})"
+
+
 # ---------------------------------------------------------------- frames
 
 class Frame:
@@ -635,7 +655,7 @@ class Frame:
         return self._step(lambda r: f"SELECT {', '.join(cols)} FROM {r}", self._kept(set(have) - set(mapping)))
 
     def cast(self, dtypes):
-        casts = ", ".join(f"CAST({_quote(c)} AS {sql_type(t)}) AS {_quote(c)}" for c, t in dtypes.items())
+        casts = ", ".join(f"{_cast_sql(_quote(c), sql_type(t))} AS {_quote(c)}" for c, t in dtypes.items())
         return self._step(lambda r: f"SELECT * REPLACE ({casts}) FROM {r}", self._kept())
 
     def sort(self, by, *more, descending=False, nulls_last=False):

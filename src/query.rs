@@ -1200,8 +1200,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     Ok(ctx)
 }
 
-/// Whether a query ran out of memory (DataFusion's "Resources exhausted": 53200).
-pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resources exhausted") }
+/// Whether a query ran out of memory, so a frugal run may help (DataFusion's "Resources exhausted", 53200).
+/// A spill past its cap carries the same words (53100), and a frugal run would spill to the cap again.
+pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resources exhausted") && crate::codes::of(e) != "53100" }
 
 /// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), sorts
 /// keeping 1 MB aside to merge, and the rewrites in `frugal.rs` (a window over whole partitions as a GROUP BY).
@@ -1309,5 +1310,23 @@ pub fn first_table(sql: &str) -> Result<String> {
     match &Parser::parse_sql(&GenericDialect {}, sql)?[..] {
         [Statement::Query(q)] => first(q).ok_or_else(|| anyhow::anyhow!("a view is one SELECT … FROM <table> …")),
         _ => bail!("a view is one SELECT … FROM <table> …"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exhausted;
+    use datafusion::common::DataFusionError;
+
+    #[test]
+    fn only_memory_runs_out_is_retried_frugally() {
+        // A window that ran out of memory (`held.rs`) is retried frugally.
+        let window = DataFusionError::ResourcesExhausted("out of memory: a window holds more rows than this node's memory for queries (64 MB): partition it by more columns, or give the node more memory (--memory-gb)".into());
+        assert!(exhausted(&anyhow::Error::new(window)));
+        // DataFusion's spill-cap refusal (53100) carries the same words, and a frugal run would spill to the cap again.
+        let cap = DataFusionError::ResourcesExhausted("The used disk space during the spilling process has exceeded the allowable limit of 10.00 MB. Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.".into());
+        assert!(!exhausted(&anyhow::Error::new(cap)));
+        // The memory watch's stop (`oom::OOM`) says "out of memory", not "Resources exhausted": not retried either.
+        assert!(!exhausted(&anyhow::anyhow!("{}", crate::oom::OOM)));
     }
 }

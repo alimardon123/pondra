@@ -245,7 +245,7 @@ impl TableFunctionImpl for TableFn {
         let simplifier = ExprSimplifier::new(datafusion::logical_expr::simplify::SimplifyContext::builder().with_current_time().build());
         let mut values = vec![];
         for (i, a) in args.iter().enumerate() {
-            let v = match simplifier.simplify(a.clone())? {
+            let v = match simplifier.simplify(crate::optimize::whole_literals(a.clone())?)? { // (an argument's `1e15` is the whole number, as in a planned query)
                 Expr::Literal(v, _) => v,
                 e => return plan_err!("{}: its arguments are values (worked out once), not {e}", self.name),
             };

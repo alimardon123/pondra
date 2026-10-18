@@ -79,6 +79,16 @@ export function sqlType(t) {
   return SQL_TYPES.get(name.split("(")[0].toLowerCase()) ?? name;
 }
 
+// A cast to one of these drops a fraction toward zero, as Polars and PySpark cast (`pondra_truncate`); SQL's
+// own CAST rounds it (invariant 293). The same text as Python's `_cast_sql`.
+const INTEGER_SQL = new Set(["TINYINT", "SMALLINT", "INT", "INTEGER", "BIGINT"]);
+
+/** `x` cast to the SQL type `t` (from `sqlType`): an integer type truncates, any other is a plain CAST. */
+function castSql(x, t) {
+  const word = t.replace(/\(/g, " ").trim().split(/\s+/)[0].toUpperCase(); // (TINYINT UNSIGNED is an integer; DECIMAL(10, 2) is not)
+  return INTEGER_SQL.has(word) ? `CAST(pondra_truncate(${x}) AS ${t})` : `CAST(${x} AS ${t})`;
+}
+
 const sqlOf = (x) => (x instanceof Expr ? x.sql : literal(x));
 
 /** Python's `re.escape`, for `replace(…, {literal: true})`. */
@@ -136,7 +146,7 @@ export class Expr {
     return out;
   }
 
-  cast(dtype) { return new Expr(`CAST(${this.sql} AS ${sqlType(dtype)})`, this.name); }
+  cast(dtype) { return new Expr(castSql(this.sql, sqlType(dtype)), this.name); }
   isNull() { return new Expr(`(${this.sql} IS NULL)`, this.name); }
   isNotNull() { return new Expr(`(${this.sql} IS NOT NULL)`, this.name); }
   isNan() { return this._fn("isnan"); }
@@ -256,12 +266,13 @@ class StrNs {
 }
 
 const UNITS = new Map(Object.entries({ us: "microsecond", ms: "millisecond", s: "second", m: "minute", h: "hour", d: "day", w: "week", mo: "month", q: "quarter", y: "year" }));
-const SCALES = new Map([["s", 1], ["ms", 1_000], ["us", 1_000_000], ["ns", 1_000_000_000]]);
+// The microseconds in one whole unit of `epoch` (`s` and `ms` are floored; `us` is itself, `ns` is 1,000 of them).
+const EPOCH_DIVISORS = new Map([["s", 1_000_000], ["ms", 1_000]]);
 
 /** `.dt`: date and time functions, with Polars' names. */
 class DtNs {
   constructor(e) { this.e = e; }
-  _part(part) { return new Expr(`CAST(date_part('${part}', ${this.e.sql}) AS BIGINT)`, this.e.name); }
+  _part(part) { return new Expr(castSql(`date_part('${part}', ${this.e.sql})`, "BIGINT"), this.e.name); }
   year() { return this._part("year"); }
   month() { return this._part("month"); }
   day() { return this._part("day"); }
@@ -270,7 +281,7 @@ class DtNs {
   second() { return this._part("second"); }
   quarter() { return this._part("quarter"); }
   ordinalDay() { return this._part("doy"); }
-  weekday() { return new Expr(`CAST((date_part('dow', ${this.e.sql}) + 6) % 7 + 1 AS BIGINT)`, this.e.name); } // (Monday 1 … Sunday 7)
+  weekday() { return new Expr(castSql(`(date_part('dow', ${this.e.sql}) + 6) % 7 + 1`, "BIGINT"), this.e.name); } // (Monday 1 … Sunday 7)
   date() { return new Expr(`CAST(${this.e.sql} AS DATE)`, this.e.name); }
 
   /** Down to the start of its `every`: "1h", "15m", "1d", "1mo"… */
@@ -287,8 +298,14 @@ class DtNs {
   strftime(format) { return new Expr(`to_char(${this.e.sql}, ${literal(format)})`, this.e.name); }
 
   epoch(timeUnit = "us") {
-    if (!SCALES.has(timeUnit)) throw new Error(`epoch("${timeUnit}"): s, ms, us or ns`);
-    return new Expr(`CAST(date_part('epoch', ${this.e.sql}) * ${SCALES.get(timeUnit)} AS BIGINT)`, this.e.name);
+    if (!["s", "ms", "us", "ns"].includes(timeUnit)) throw new Error(`epoch("${timeUnit}"): s, ms, us or ns`);
+    // The same SQL as frame.py's: the microseconds since 1970 in integers, then whole units floored as Polars floors them
+    // (a float would round a fraction now, `casts::Rounds`; a time before 1970 floors, not cut toward 0). A zoned time keeps its instant.
+    const u = `arrow_cast(arrow_cast(${this.e.sql}, 'Timestamp(Microsecond, None)'), 'Int64')`;
+    if (timeUnit === "us") return new Expr(u, this.e.name);
+    if (timeUnit === "ns") return new Expr(`${u} * 1000`, this.e.name);
+    const d = EPOCH_DIVISORS.get(timeUnit);
+    return new Expr(`(${u} - ((${u} % ${d}) + ${d}) % ${d}) / ${d}`, this.e.name);
   }
 }
 
@@ -611,7 +628,7 @@ export class Frame {
 
   /** Columns cast: `cast({ n: "Float64" })`, or SQL types (`{ n: "DOUBLE" }`). */
   cast(dtypes) {
-    const casts = Object.entries(dtypes).map(([c, t]) => `CAST(${quote(c)} AS ${sqlType(t)}) AS ${quote(c)}`).join(", ");
+    const casts = Object.entries(dtypes).map(([c, t]) => `${castSql(quote(c), sqlType(t))} AS ${quote(c)}`).join(", ");
     return this._step((r) => `SELECT * REPLACE (${casts}) FROM ${r}`, this._kept());
   }
 
