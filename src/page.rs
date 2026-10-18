@@ -558,6 +558,25 @@ mod tests {
         assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
     }
 
+    /// `EXPLAIN ANALYZE` answers in a page, which has no tokio runtime. DataFusion's own would spawn its input's tasks
+    /// on one and panic, so this runs under `block_on` alone: a `#[tokio::test]` would have a runtime and hide that.
+    #[test]
+    fn explain_analyze_runs_where_the_page_is() {
+        futures::executor::block_on(async {
+            let page = page_with_tables().await;
+            let plain = page.request("POST", "/sql?format=csv", &[], "EXPLAIN ANALYZE SELECT count(*) FROM orders".into()).await;
+            assert_eq!(plain.status, 200, "{:?}", plain.body);
+            let text = String::from_utf8_lossy(&plain.body).into_owned();
+            assert!(text.contains("Plan with Metrics") && text.contains("output_rows="), "{text}");
+            let verbose = page.request("POST", "/sql?format=csv", &[], "EXPLAIN ANALYZE VERBOSE SELECT count(*) FROM orders".into()).await;
+            assert_eq!(verbose.status, 200, "{:?}", verbose.body);
+            let text = String::from_utf8_lossy(&verbose.body).into_owned();
+            assert!(text.contains("Output Rows") && text.contains("Duration"), "{text}");
+            // The page's tables are still there after it.
+            assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
+        });
+    }
+
     #[tokio::test]
     async fn a_put_answers_the_nodes_json_and_an_etag() {
         let page = Page::open(&Options::default());
