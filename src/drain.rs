@@ -45,6 +45,10 @@ impl Busy {
         }
         Busy(Some(count))
     }
+
+    /// The request's count, held again by the body of an answer sent in pieces, which goes on after its response: counted
+    /// whatever the drain says, so it is taken only while the request's own `Busy` (`panics::door`) is held.
+    pub fn carried() -> Busy { let count = in_flight(); count.fetch_add(1, SeqCst); Busy(Some(count)) }
 }
 
 impl Drop for Busy {

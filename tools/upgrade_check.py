@@ -23,7 +23,7 @@ Prints the checks as JSON and exits 1 if one fails (a failing release's lakes an
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
 (deltalake, pyiceberg); without them those checks are skipped, and say so.
 """
-import argparse, atexit, collections, io, json, os, platform, random, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
+import argparse, atexit, collections, http.client, io, json, os, platform, random, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = "alimardon123/pondra"
@@ -840,6 +840,21 @@ def drain_check(new_bin, work, port):
     th.join()
     info["seconds to stop with PONDRA_DRAIN_SECS=1 and a longer query"] = round(took, 1)
     checks["…but for PONDRA_DRAIN_SECS at most"] = took < 4
+    # An answer sent in pieces when its node is told to stop is sent whole, then the node stops. Two shapes: a plan's
+    # pieces (`server::sql`'s handed answer), and an answer collected whole before it is sent (`?catalog=postgres` with
+    # a `pg_` name: `server::stream`, `query::hand_out`).
+    N = 1_250_000  # (about 40 MB of JSON)
+    piecewise = {
+        "/sql": ("value", f"SELECT value, 'x' || value AS s FROM range(0, {N})"),
+        "/sql?catalog=postgres": ("pg_value", f"SELECT value AS pg_value, 'x' || value AS s FROM range(0, {N})"),
+    }
+    for path, (col, sql) in piecewise.items():
+        got_pieces = piecewise_stop(new_bin, work, port, path, sql, col, N)
+        info[f"an answer in pieces, told to stop ({path})"] = got_pieces
+        if path == "/sql":
+            checks["…an answer being sent in pieces when it is told to stop is sent whole, then it stops (exit 0)"] = got_pieces["whole"] and got_pieces["exit"] == 0
+        else:
+            checks["…and one collected whole, then sent in pieces (?catalog=postgres), likewise"] = got_pieces["whole"] and got_pieces["exit"] == 0
     # A leader stopped under load hands over at once; killed, its followers wait out the lease. They
     # are on other machines: each node has a temporary folder of its own, where its terms' lock files
     # are (invariant 370), so none sees another's lock let go. On one machine a killed leader's lock is
@@ -878,6 +893,41 @@ def drain_check(new_bin, work, port):
         gone(lake)
     info["killed, its follower on the same machine leads after, s"] = killed_here(new_bin, work, port, machine("tmp-here"))
     return checks, info
+
+
+def piecewise_stop(new_bin, work, port, path, sql, col, rows):
+    """An answer sent in pieces when its node is told to stop (PONDRA_STREAM_MB=1): the client reads its first 64 KB,
+    the node is told to stop, the client waits a second and reads the rest slowly. `whole`: all `rows` came back in
+    order, and the node exited 0 within 10 s of the read's end (ADR-039: a stopping node finishes what it sends)."""
+    n = Node(new_bin, os.path.join(work, "drain-lake"), port, work, env={"PONDRA_STREAM_MB": "1"}).start()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+    conn.request("POST", path, body=sql.encode(), headers={"Authorization": f"Bearer {TOKEN}", "x-pondra-owner": OWNER})
+    resp = conn.getresponse()
+    parts, error = [resp.read(64 << 10)], None
+    n.p.send_signal(signal.SIGTERM)
+    time.sleep(1)
+    try:
+        while chunk := resp.read(64 << 10):
+            parts.append(chunk)
+            time.sleep(0.005)
+    except Exception as e:  # (a body cut short says so here: http.client's IncompleteRead)
+        error = str(e)[:200]
+    read_ended = time.time()
+    try:
+        exit_code = n.p.wait(10)
+    except subprocess.TimeoutExpired:
+        exit_code = None
+    conn.close()
+    n.stop("kill")
+    body, got = b"".join(parts), None
+    try:
+        got = json.loads(body)
+    except ValueError as e:
+        error = error or f"not a whole answer: {str(e)[:120]}"
+    # (every row once, whatever order its partitions came in: a range's rows are not sent in order across partitions)
+    whole = got is not None and len(got) == rows and sorted(g[col] for g in got) == list(range(rows)) and all(g["s"] == f"x{g[col]}" for g in got)
+    return {"answer MB": round(len(body) / 2**20, 1), "rows": len(got) if got is not None else None, "whole": whole,
+            "exit": exit_code, "seconds to exit after the read": round(time.time() - read_ended, 2), "error": error}
 
 
 def killed_here(new_bin, work, port, env):

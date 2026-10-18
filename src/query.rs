@@ -943,14 +943,52 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
     }
 }
 
-/// The pieces after the first: the prefix's, then each batch of the stream's, counted while it is written; then the
-/// end. Returns the rows written.
-async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation) -> Result<u64> {
+/// An answer already whole, sent in pieces as `send_rest` sends a plan's (`server::stream`): its first piece is written
+/// now, the rest on the queries' runtime as its client reads them. `held`'s memory goes when the last piece is written,
+/// or when the client goes (the body that holds the pieces counts the request for a node told to stop: `server::pieces`).
+pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> Result<Handed> {
+    let mut enc = crate::answer::Encoding::new(format);
+    let mut parts: std::collections::VecDeque<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+    let Some(piece) = parts.pop_front() else {
+        // (no rows: the answer is its end, and nothing is left to write)
+        let first = enc.step(None)?;
+        ended.store(true, std::sync::atomic::Ordering::Release);
+        return Ok(Handed { first, rest: rx, ended });
+    };
+    let first = enc.step(Some(&piece))?;
+    let done = ended.clone();
+    crate::panics::aside(async move {
+        let _held = held;
+        let written = match write_all(&mut enc, &tx, parts).await {
+            Ok(_) => step_to(&mut enc, &tx, None).await,
+            Err(e) => Err(e),
+        };
+        match written {
+            Ok(()) => done.store(true, std::sync::atomic::Ordering::Release), // (the end is written: the body may end)
+            Err(e) => {
+                let _ = tx.try_send(Err(std::io::Error::other(format!("{e:#}")))); // (if the channel is full, its close says the answer was cut short)
+            }
+        }
+    });
+    Ok(Handed { first, rest: rx, ended })
+}
+
+/// Writes each piece to the body (`step_to`), and returns the rows written.
+async fn write_all(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, pieces: impl IntoIterator<Item = RecordBatch>) -> Result<u64> {
     let mut rows = 0u64;
-    for piece in prefix {
+    for piece in pieces {
         rows += piece.num_rows() as u64;
         step_to(enc, tx, Some(&piece)).await?;
     }
+    Ok(rows)
+}
+
+/// The pieces after the first: the prefix's, then each batch of the stream's, counted while it is written; then the
+/// end. Returns the rows written.
+async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<std::io::Result<bytes::Bytes>>, prefix: std::collections::VecDeque<RecordBatch>, stream: &mut datafusion::physical_plan::SendableRecordBatchStream, held: &mut MemoryReservation) -> Result<u64> {
+    let mut rows = write_all(enc, tx, prefix).await?;
     held.free(); // (the prefix's batches are written: their memory goes)
     loop {
         let next = tokio::select! {
