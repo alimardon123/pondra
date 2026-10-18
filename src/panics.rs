@@ -27,8 +27,9 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 /// or two, a sixth of their transactions. Dropped, as when its client goes, it stops the work.
 ///
 /// A `stoppable` request is one the node may stop for memory (`oom.rs`), where the node has a line to
-/// stop it at: then it answers [`crate::oom::OOM`] and its future is dropped, its memory let go. Any other
-/// request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
+/// stop it at: then it answers [`crate::oom::OOM`] and its future is dropped, its memory let go, and its
+/// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node.
+/// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
@@ -44,16 +45,19 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     }
     let id = NEXT.fetch_add(1, Relaxed);
     let stoppable = stoppable && crate::oom::line().is_some(); // (nothing could stop it otherwise)
-    let (f, handle) = if stoppable {
-        let (f, handle) = futures::future::abortable(f);
-        (Either::Left(f), Some(handle))
-    } else {
-        (Either::Right(f.map(Ok::<T, Aborted>)), None)
+    // A request the node may stop is charged the memory its polls allocate (`oom::charge`): the watch stops the one that grew it.
+    let used = stoppable.then(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)));
+    let (f, handle) = match &used {
+        Some(used) => {
+            let (f, handle) = futures::future::abortable(crate::oom::charge(used.clone(), f));
+            (Either::Left(f), Some(handle))
+        }
+        None => (Either::Right(f.map(Ok::<T, Aborted>)), None),
     };
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
-        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false });
+        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, used });
         long
     };
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
@@ -226,8 +230,8 @@ mod tests {
     // keeps the others'; the entries are this test's own, with no stop, so no other test can stop them)
     #[test]
     fn a_request_that_started_unread_takes_the_watchs_next_reading() {
-        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false };
-        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false };
+        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, used: None };
+        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, used: None };
         RUNNING.lock().unwrap().insert(u64::MAX - 1, unread);
         RUNNING.lock().unwrap().insert(u64::MAX, read);
         note(7 << 20);

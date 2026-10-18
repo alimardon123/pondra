@@ -3785,6 +3785,27 @@ def scale():
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
     checks.update(_flight_memory_stop(port + 30, aggregate, lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), settle))  # (the same stop over Flight)
+    # The watch stops the request that grew the node, not an older cheap one beside it (`oom.rs`, invariant 417): a long
+    # count(*) over generate_series, started first, is still answered (200, its count) when the array_agg started after it
+    # is the one stopped (53200). CHEAP_ROWS (4e9) runs about 9 s alone here, and the grower is stopped about 2 s after it starts,
+    # so the cheap one is still running when the watch decides.
+    CHEAP_ROWS = 4_000_000_000
+    time.sleep(11)  # (the watch's hold after the last stop; settle waits for the memory to go back under the line)
+    settle()
+    cheap = {}
+    cheap_thread = threading.Thread(target=lambda: cheap.update(answer=answer(f"SELECT count(*) AS n FROM generate_series(1, {CHEAP_ROWS})")))
+    cheap_thread.start()
+    time.sleep(1.5)  # (the cheap one has run past the watch's FIRST before the grower starts)
+    t0 = time.time()
+    grower = answer(aggregate)
+    grower_seconds = time.time() - t0
+    cheap_thread.join()
+    cheap_status, cheap_sqlstate, cheap_body = cheap.get("answer", (None, None, "the cheap query's thread failed"))
+    cheap_rows = json.loads(cheap_body) if cheap_status == 200 else None
+    memory_line["memory_watch"] = {"grower": [grower[0], grower[1], grower[2][:120]], "grower_seconds": round(grower_seconds, 1),
+                                   "cheap": [cheap_status, cheap_sqlstate, cheap_body[:120]], "cheap_rows": CHEAP_ROWS}
+    checks[f"the memory watch stops the request that grew the node, not an older cheap one beside it (a count(*) over {CHEAP_ROWS} rows started first answers 200 with its count; the array_agg started after it answers 53200)"] = (
+        grower[0] == 503 and grower[1] == "53200" and cheap_rows == [{"n": CHEAP_ROWS}])
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
