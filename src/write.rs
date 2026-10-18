@@ -1118,14 +1118,15 @@ fn body_width(body: &ast::SetExpr) -> Option<usize> {
     }
 }
 
-/// `*`, `t.*` and DuckDB's `COLUMNS(…)`: the items a query's width isn't known from until it is planned.
+/// `*`, `t.*`, DuckDB's `COLUMNS(…)` and `unnest(…)` (a struct's fields, several columns): the items a query's width
+/// isn't known from until it is planned.
 fn is_wildcard(item: &ast::SelectItem) -> bool {
     let expr = match item {
         ast::SelectItem::Wildcard(_) | ast::SelectItem::QualifiedWildcard(..) => return true,
         ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } => e,
         _ => return false,
     };
-    matches!(expr, ast::Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("columns"))
+    matches!(expr, ast::Expr::Function(f) if ["columns", "unnest"].iter().any(|n| f.name.to_string().eq_ignore_ascii_case(n)))
 }
 
 /// The columns an INSERT without a column list fills, as Postgres takes them: the first `width` of the table's (all of
@@ -2470,6 +2471,7 @@ mod tests {
         assert_eq!(rows_width("VALUES (1), (2, 3)"), None);
         assert_eq!(rows_width("SELECT 1, 2"), Some(2));
         assert_eq!(rows_width("SELECT * FROM t"), None);
+        assert_eq!(rows_width("SELECT unnest(s) FROM t"), None);
         assert_eq!(rows_width("SELECT 1 UNION SELECT 2"), Some(1));
         assert_eq!(rows_width("VALUES (1) ORDER BY 1"), None);
         let names: Vec<String> = ["a", "b", "c"].iter().map(|n| n.to_string()).collect();
