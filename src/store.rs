@@ -1400,7 +1400,7 @@ impl Lake {
         }
         let Some(parts) = seg.parts.get(table) else { return Ok(Rows::default()) };
         let bytes = match seg.path.is_empty() {
-            true => self.cat.get_raw(&data_key(n)).await?.with_context(|| format!("missing inline segment {n}"))?,
+            true => self.cat.inline(&data_key(n)).await?,
             false => self.object(&seg.path).await?,
         };
         let mut rows = vec![];
@@ -2166,6 +2166,26 @@ impl Catalog {
         })
     }
 
+    /// The inline data (`d/`) of a segment the catalog lists, which always arrives. A reader's view can
+    /// hold less than its commit number says for a moment while a new writer opens the lake, so a miss
+    /// waits here (20 ms, doubling to 500 ms, 10 s in all) rather than failing the read.
+    pub async fn inline(&self, key: &str) -> Result<Bytes> {
+        let started = Instant::now();
+        let mut wait = Duration::from_millis(20);
+        loop {
+            if let Some(bytes) = self.get_raw(key).await? {
+                return Ok(bytes);
+            }
+            if self.is_writer() || started.elapsed() >= Duration::from_secs(10) {
+                let n = key.strip_prefix("d/").and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+                bail!("missing inline segment {n}");
+            }
+            tokio::time::sleep(wait).await;
+            self.mark().await?; // (our view's marks move on, so the next read sees what it has now)
+            wait = (wait * 2).min(Duration::from_millis(500));
+        }
+    }
+
     /// All entries with keys in [from, to).
     pub async fn scan<T: DeserializeOwned>(&self, from: &str, to: &str) -> Result<Vec<(String, T)>> {
         self.scan_raw(from, to).await?.into_iter().map(|(k, v)| Ok((k, serde_json::from_slice(&v)?))).collect()
@@ -2429,6 +2449,69 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(gone.upgrade().is_none(), "the lake is still held");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A listed segment's inline rows can reach a reader a moment late, while its view is behind the
+    /// commit number it has streamed (a new writer opening the lake): the read waits for them. A writer's
+    /// miss is an error at once (`Catalog::inline`; a reader's after 10 s, which no test waits out).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_listed_segment_waits_for_its_inline_rows() -> Result<()> {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let dir = std::env::temp_dir().join(format!("pondra-inline-{}", uuid::Uuid::new_v4()));
+        let writer = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        writer.cat.commit(vec![("t/x".into(), b"1".to_vec())], &[]).await?;
+        writer.cat.checkpoint().await?; // (a reader's view sees only what is flushed)
+        let reader = Lake::open(dir.to_str().unwrap(), false, true).await?;
+        assert!(reader.cat.mirror.load(Relaxed), "a streamed reader holds the whole catalog once it opens");
+
+        // The next commit, streamed to the reader with its segment and inline rows.
+        let batch = RecordBatch::try_from_iter([("a", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)])?;
+        let ipc = crate::log::encode_ipc(&[batch])?;
+        let n = writer.cat.committed() + 1;
+        let seg = Segment { parts: BTreeMap::from([("t".to_string(), vec![(0, ipc.len() as u64, 3)])]), ..Default::default() };
+        let streamed = vec![
+            (seg_key(n), Bytes::from(json(&seg))),
+            (data_key(n), Bytes::from(ipc.clone())),
+            ("n".to_string(), Bytes::from(json(&(n + 1)))),
+            ("c".to_string(), Bytes::from(json(&n))),
+        ];
+        reader.cat.apply(&Delta { id: n, puts: streamed, deletes: vec![] });
+
+        // Commit n reaches the writer's next flush without its inline rows, so the reader's view takes
+        // its commit number and not the rows.
+        writer.cat.commit(vec![("t/y".into(), b"2".to_vec())], &[]).await?;
+        writer.cat.checkpoint().await?;
+        let since = Instant::now();
+        while reader.cat.view_now().await? < n {
+            anyhow::ensure!(since.elapsed() < Duration::from_secs(10), "the reader's view never reached commit {n}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reader.cat.refresh().await?; // (the streamed copy of `d/n` goes: the view has its commit)
+        assert!(reader.cat.get_raw(&data_key(n)).await?.is_none(), "the view holds no inline rows of commit {n} yet");
+
+        // The rows land 300 ms later. The read below starts first, so it has to wait for them.
+        let late = writer.clone();
+        let before = Instant::now();
+        let landing = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            late.cat.commit(vec![(data_key(n), ipc.clone())], &[]).await?;
+            late.cat.checkpoint().await
+        });
+        let rows = reader.segment_rows(n, &seg, "t").await?;
+        assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3, "the segment's rows, once they arrive");
+        assert!(before.elapsed() >= Duration::from_millis(300), "the read answered before its rows were written");
+        landing.await??;
+
+        // A writer has the whole catalog: its miss is an error at once.
+        let quick = Instant::now();
+        let miss = writer.cat.inline(&data_key(999_999)).await.unwrap_err();
+        assert_eq!(miss.to_string(), "missing inline segment 999999");
+        assert!(quick.elapsed() < Duration::from_secs(1), "a writer's miss waited");
+
+        reader.cat.close().await?;
+        writer.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
