@@ -668,10 +668,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
         Some(s) => one(old, s)?,
         None => None,
     };
-    let new = one(new, ids.clone())?;
-    if let Some(n) = &new {
-        crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
-    }
+    let new = one(new, ids.clone())?.map(|n| crate::defaults::fit(meta, table, n)).transpose()?; // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
     if crate::constraints::needs_check(meta, plain) {
         crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain).await?; // (under the lake's lock: no other write of the table between)
     }

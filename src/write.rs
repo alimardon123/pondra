@@ -2016,7 +2016,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows_of(lake, lake, &meta, &sql, None, files).await?;
+    let batch = crate::defaults::fit(&meta, &table, rows_of(lake, lake, &meta, &sql, None, files).await?)?; // (as the table holds them: a jsonb in its own form, `RETURNING` too)
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -2400,7 +2400,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
             let batch = rows_of(query, target, &m, &sql, None, files).await?; // (a DEFAULT's sequence is the attached lake's)
-            crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
+            let batch = crate::defaults::fit(&m, table, batch)?; // (NOT NULL, and each jsonb in its own form: as a node's own log checks its rows)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)

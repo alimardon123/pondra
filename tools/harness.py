@@ -16486,9 +16486,11 @@ def _jsons_spaces(check, over_http, over_port, info):
 
 def jsons():
     """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
-    holds the text as it was written, and every write door refuses a value that isn't JSON with 22P02, writing nothing:
-    SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM STDIN and `pondra sql`. A valid value is
-    taken and read back as written. The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
+    holds a json column's text as it was written, and a jsonb column's as jsonb writes it (keys sorted and once, Postgres's
+    spacing: `types::as_held`, which every write door runs through `defaults::fit`). Every write door refuses a value that
+    isn't JSON with 22P02, writing nothing: SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM
+    STDIN and `pondra sql`. A valid value is taken: a json value is read back as written, a jsonb value as Postgres prints
+    it, so DISTINCT and GROUP BY compare jsonb values as Postgres does (`jdoor_doors`). The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
     hands over dicts and lists, in text and binary cursors, for a column, RETURNING, a view and a literal cast alike, and
     takes psycopg's Json and Jsonb parameters. `'x'::json` is 22P02 (TRY_CAST NULL); pg_typeof says json and jsonb; the
     catalog says so too; SHOW CREATE TABLE says JSON and JSONB and runs again after a DROP; ADD COLUMN keeps the type; ALTER
@@ -16959,6 +16961,45 @@ def jsons():
         ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
         return all(http) and all(ported)
 
+    def jdoor_doors():
+        """A jsonb column holds jsonb's text whichever door wrote it (`types::as_held`, run by `defaults::fit`): written as text,
+        `{"b":2,"a":1}` reads back as Postgres 16 prints it, and DISTINCT and GROUP BY compare the values, not the texts. The
+        INSERT … SELECT takes the bulk path (only VALUES goes through the log), so each of the two sites is run: `fit` in the
+        plain INSERT's path and in the log's, and in a transaction's insert and its change."""
+        q("CREATE TABLE jdoor (id INT, j JSONB)")
+        doc = '{"b":2,"a":1}'  # (as written: keys out of order, no spaces)
+
+        def copy_jdoor(line):
+            """COPY FROM STDIN of one text line into jdoor: None when it went in, else the SQLSTATE."""
+            try:
+                with psycopg.connect(url, autocommit=True) as conn:
+                    with conn.cursor() as cur, cur.copy("COPY jdoor (id, j) FROM STDIN") as cp:
+                        cp.write(line)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+        q(f"INSERT INTO jdoor (id, j) VALUES (1, {lit(doc)})")
+        q(f"INSERT INTO jdoor (id, j) SELECT 2, {lit(doc)}")
+        appended = err(json.dumps({"id": 3, "j": doc}) + "\n", "/append/jdoor?producer=jdoor&seq=1")[0]
+        copied = copy_jdoor(f"4\t{doc}\n")
+        q("INSERT INTO jdoor (id, j) VALUES (5, NULL)")
+        q(f"UPDATE jdoor SET j = {lit(doc)} WHERE id = 5")
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("BEGIN")
+            conn.execute(f"INSERT INTO jdoor (id, j) VALUES (6, {lit(doc)})")
+            conn.execute("INSERT INTO jdoor (id, j) VALUES (7, NULL)")
+            conn.execute(f"UPDATE jdoor SET j = {lit(doc)} WHERE id = 7")
+            conn.execute("COMMIT")
+        seven = [r["j"] for r in q("SELECT j FROM jdoor WHERE id <= 7 ORDER BY id")]
+        q("INSERT INTO jdoor (id, j) VALUES (8, '[1,  2]'), (9, '[1,2]')")
+        distinct = [r["n"] for r in q("SELECT count(DISTINCT j) AS n FROM jdoor")]
+        grouped = [[r["j"], r["n"]] for r in q("SELECT j, count(*) AS n FROM jdoor GROUP BY j ORDER BY 1")]
+        info["jdoor: the append's and COPY's statuses (200, None); the seven rows' texts; count(DISTINCT j); GROUP BY j"] = [
+            appended, copied, seven, distinct, grouped]
+        return (appended == 200 and copied is None and seven == ['{"a": 1, "b": 2}'] * 7 and distinct == [2]
+                and grouped == [["[1, 2]", 2], ['{"a": 1, "b": 2}', 7]])
+
     def wholes_nested():
         """A maker in a WHERE clause and one in a scalar subquery, over HTTP and the port, against Postgres 16's rows."""
         where = "SELECT id FROM d_json WHERE json_build_object('d', doc)::text <> '{}' ORDER BY id"
@@ -17389,6 +17430,7 @@ def jsons():
         check("json_object_agg and jsonb_object_agg, and json_agg of json_build_object, nest their documents as Postgres 16 does, over HTTP and the port", wholes_objects)
         check("PostgREST's coalesce(json_agg(...), '[]') answers its rows or '[]', nests in json_build_object, and is json (114) to psycopg", wholes_postgrest)
         check("a jsonb column with keys out of order and a duplicate key, nested by json_build_object, json_agg and jsonb_build_object, prints as jsonb does", wholes_jsonb)
+        check("a jsonb column holds jsonb's text from every door (VALUES, SELECT, an append, COPY, UPDATE, a transaction): DISTINCT and GROUP BY count as Postgres 16 does", jdoor_doors)
         check("a maker in a WHERE clause and in a scalar subquery answers Postgres 16's rows, over HTTP and the port", wholes_nested)
         check("a whole row Pondra can't make is refused by name: 0A000 for an unnamed item and a file's columns, 42883 for DISTINCT over json, 22023 for a json key", wholes_refusals)
         check("json_agg over 3,000 rows in seven groups, on three nodes (spread=1) and one (spread=0): equal to each other and to Postgres 16's text", wholes_spread)

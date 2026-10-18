@@ -458,7 +458,7 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
             columns.extend([Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(Int64Array::from(vec![version; len])), time(created), time(vec![now; len])]);
             let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
             let batch = RecordBatch::try_new(schema.clone(), columns)?;
-            crate::defaults::check(&t.meta, name, &batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
+            let batch = crate::defaults::fit(&t.meta, name, batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
             rows.push(batch);
         }
         check_key(name, &t.meta.columns, &t.meta.key, &rows)?;

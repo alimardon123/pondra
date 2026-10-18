@@ -575,7 +575,7 @@ fn lock_of(lake: &Arc<Lake>) -> Option<Arc<tokio::sync::Mutex<()>>> {
 /// future is first polled: a producer that awaits its batches in order (Flight, Kafka) sends them in
 /// order, one answered before the next goes.
 pub fn queue(lake: Arc<Lake>, meta: &TableMeta, table: String, src: Src, batch: RecordBatch) -> Result<impl Future<Output = Result<Ack>> + use<>> {
-    crate::defaults::check(meta, &table, &batch)?; // (NOT NULL, refused here as the plain path refuses it, not after a round trip)
+    let batch = crate::defaults::fit(meta, &table, batch)?; // (NOT NULL, refused here as the plain path refuses it, not after a round trip; jsonb in its own form)
     crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
     let to = lake.to.get().cloned().ok_or_else(|| anyhow::anyhow!("no leader for {table} yet"))?;
     Ok(async move {
@@ -607,7 +607,7 @@ pub async fn leader(lake: Arc<Lake>, seq: Arc<Sequencer>, table: String, src: Sr
 /// The leader's part of a checked append, under the lock. A batch its producer already committed is a
 /// duplicate (the sequencer's own test: `log::commit`), answered before any check; a `prev` that
 /// doesn't match is a conflict, as the sequencer answers it. Otherwise the rows are checked against
-/// the table (`change::appends` runs `defaults::check` and `check`) and committed as one flush whose
+/// the table (`change::appends` runs `defaults::fit` and `constraints::check`) and committed as one flush whose
 /// table append carries the producer's seq, so the sequencer's progress moves with the rows.
 async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: RecordBatch) -> Result<Ack> {
     let meta: TableMeta = lake.cat.get(&crate::store::table_key(table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?;
