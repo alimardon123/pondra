@@ -13233,6 +13233,94 @@ def objects():
         and quiet.get("exists") is True and q("SELECT count(*) AS n FROM t") == [{"n": 2}]
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
+    # CREATE OR REPLACE TABLE puts the new table in the old one's place in one commit, the old one kept for UNDROP
+    # (`ddl::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
+    # leaves t as it was; the same job sent again writes its rows once. Each check has tables of its own, and the
+    # replaces and their follow-ups answer their status rather than raise, so every check gets its answer on a build
+    # that gets one wrong.
+    def read(s):
+        try:
+            return q(s)
+        except RuntimeError as e:
+            return f"ERR {e}"[:200]
+
+    def sent(body, job=None):
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql" + (f"?job={job}" if job else ""), body.encode())
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), (json.loads(data) if data[:1] in (b"{", b"[") else data.decode(errors="replace"))
+
+    # self-read: t AS SELECT … FROM t
+    q("CREATE TABLE rs (a BIGINT)")
+    q("INSERT INTO rs VALUES (1), (2), (3)")
+    http("CREATE OR REPLACE TABLE rs AS SELECT a * 10 AS a FROM rs")
+    self_read = read("SELECT a FROM rs ORDER BY a")
+    # a failing replace (a cast failing as it runs, after the staged table is made), by HTTP and by pondra sql
+    q("CREATE TABLE rf (a BIGINT)")
+    q("INSERT INTO rf VALUES (10), (20), (30)")
+    q("CREATE TABLE rf_bad (s VARCHAR)")
+    q("INSERT INTO rf_bad VALUES ('x')")
+    failed = http("CREATE OR REPLACE TABLE rf AS SELECT CAST(s AS INT) AS a FROM rf_bad")
+    after_fail = read("SELECT a FROM rf ORDER BY a")
+    cli_failed = subprocess.run([BIN, "sql", "--dir", lake, "CREATE OR REPLACE TABLE rf AS SELECT CAST(s AS INT) AS a FROM rf_bad"], capture_output=True, text=True, timeout=120, env=node.env)
+    cli_after = subprocess.run([BIN, "sql", "--dir", lake, "SELECT a FROM rf ORDER BY a"], capture_output=True, text=True, timeout=120, env=node.env)
+    # a replace a materialized view follows is refused before it runs
+    mv_made = http("CREATE MATERIALIZED VIEW rf_mv AS SELECT a FROM rf")[0] == 200
+    followed = http("CREATE OR REPLACE TABLE rf AS SELECT 5 AS a")
+    after_followed = read("SELECT a FROM rf ORDER BY a")
+    http("DROP MATERIALIZED VIEW rf_mv")
+    # a stored view reads the new t by name
+    q("CREATE TABLE rv (a BIGINT)")
+    q("INSERT INTO rv VALUES (10), (20), (30)")
+    view_made = http("CREATE VIEW rv_v AS SELECT a FROM rv")[0] == 200
+    http("CREATE OR REPLACE TABLE rv AS SELECT 5 AS a")
+    through_view = read("SELECT a FROM rv_v")
+    # the table a replace took the place of is kept: UNDROP after a rename brings it back, the new one keeps its name
+    q("CREATE TABLE ru (a BIGINT)")
+    q("INSERT INTO ru VALUES (10), (20), (30)")
+    http("CREATE OR REPLACE TABLE ru AS SELECT 5 AS a")
+    renamed_ok = http("ALTER TABLE ru RENAME TO ru_now")[0] == 200
+    undrop = http("UNDROP TABLE ru")
+    undone = read("SELECT a FROM ru ORDER BY a")
+    renamed = read("SELECT a FROM ru_now")
+    # a PRIMARY KEY and a UNIQUE table of 2,000 rows replaced by a statement that carries 2,000 rows
+    q("CREATE TABLE rp (id BIGINT PRIMARY KEY, v BIGINT)")
+    q("INSERT INTO rp SELECT value, value * 2 FROM range(0, 2000)")
+    http("CREATE OR REPLACE TABLE rp (id BIGINT PRIMARY KEY, v BIGINT) AS SELECT value AS id, value * 3 AS v FROM range(0, 2000)")
+    pk = read("SELECT count(*) AS n, sum(v) AS s FROM rp")
+    pk_dup = http("INSERT INTO rp VALUES (5, 0)")  # (the key still holds in the replaced table)
+    q("CREATE TABLE rq (k BIGINT UNIQUE, v BIGINT)")
+    q("INSERT INTO rq SELECT value, value FROM range(0, 2000)")
+    http("CREATE OR REPLACE TABLE rq (k BIGINT UNIQUE, v BIGINT) AS SELECT value AS k, value * 3 AS v FROM range(0, 2000)")
+    uq = read("SELECT count(*) AS n, sum(v) AS s FROM rq")
+    uq_dup = http("INSERT INTO rq VALUES (5, 0)")
+    # an identity column: the replaced table counts from 1 again
+    q("CREATE TABLE ri (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
+    q("INSERT INTO ri (v) VALUES ('a'), ('b')")
+    http("CREATE OR REPLACE TABLE ri (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)")
+    http("INSERT INTO ri (v) VALUES ('c')")
+    ids = read("SELECT id, v FROM ri ORDER BY id")
+    # the same job sent again: its rows once
+    first = sent("CREATE OR REPLACE TABLE rj AS SELECT value AS a FROM range(0, 3)", "rep-job-1")
+    again = sent("CREATE OR REPLACE TABLE rj AS SELECT value AS a FROM range(0, 3)", "rep-job-1")
+    job_rows = read("SELECT count(*) AS n FROM rj")
+    info["replace"] = {"self": self_read, "failed": [failed[0], str(failed[2])[:200]], "cli": [cli_failed.returncode, (cli_failed.stdout + cli_failed.stderr)[-200:]],
+                       "followed": [followed[0], str(followed[2])[:200]], "undrop": undrop[:2], "undone": undone, "renamed": renamed, "pk": [pk, pk_dup[:2]], "uq": [uq, uq_dup[:2]],
+                       "ids": ids, "job": [first[0], again[0], job_rows]}
+    checks["CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t"] = self_read == [{"a": 10}, {"a": 20}, {"a": 30}]
+    checks["a CREATE OR REPLACE TABLE that fails leaves the old table as it was: a cast failing as it runs, and a replace a materialized view follows (refused by name)"] = \
+        failed[0] != 200 and after_fail == [{"a": 10}, {"a": 20}, {"a": 30}] and mv_made and followed[0] != 200 and "follow" in str(followed[2]) and after_followed == [{"a": 10}, {"a": 20}, {"a": 30}]
+    checks["pondra sql: a CREATE OR REPLACE TABLE that fails leaves the old table"] = \
+        cli_failed.returncode != 0 and cli_after.returncode == 0 and "| 10 |" in cli_after.stdout and "| 30 |" in cli_after.stdout
+    checks["a PRIMARY KEY table of 2,000 rows and a UNIQUE one replaced: both read back, and their keys still hold in the new ones"] = \
+        pk == [{"n": 2000, "s": 5997000}] and pk_dup[1] == "23505" and uq == [{"n": 2000, "s": 5997000}] and uq_dup[1] == "23505"
+    checks["a replaced table with an identity column takes values again from 1"] = ids == [{"id": 1, "v": "c"}]
+    checks["a view over t reads the new t after a replace"] = view_made and through_view == [{"a": 5}]
+    checks["the table a replace took the place of is kept: UNDROP brings it back once t is renamed, and the new t is under the renamed name"] = \
+        renamed_ok and undrop[0] == 200 and undone == [{"a": 10}, {"a": 20}, {"a": 30}] and renamed == [{"a": 5}]
+    checks["a CREATE OR REPLACE TABLE sent again with its job answers duplicate, its rows once"] = \
+        first[0] == 200 and again[0] == 200 and isinstance(again[2], dict) and again[2].get("duplicate") is True and job_rows == [{"n": 3}]
     # An INSERT into a name no table has is refused (42P01, as Postgres and DuckDB refuse it), over
     # HTTP and pondra sql, and nothing is made; the bulk door (POST /insert/{t}) still makes one.
     nope = http("INSERT INTO nope VALUES (1, 'a')")
@@ -13578,6 +13666,26 @@ def objects():
     checks["a notebook's %%sql df << cell is a frame in its Python; a SQL cell reads a Python table by name"] = ran == [{"eu": 3}] \
         and joined == [{"region": "eu", "n": 3, "target": 3}, {"region": "us", "n": 2, "target": 1}]
     info.update({"ran": ran, "joined": joined})
+    # A user's CREATE of a `$` name is refused by name: those tables are Pondra's (a replace's staged table among them,
+    # and invariant 373's rule: no caller writes a `$` table). A superuser and a plain user, on a node of its own.
+    import base64
+    own = Node(new_lake(), A.port + 15, env={"PONDRA_SECRET_KEY": "objects-key-2"}).start()
+    boss_h = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+    ann_h = {"Authorization": "Basic " + base64.b64encode(b"ann:ann-password-1").decode()}
+    call(A.port + 15, "POST", "/sql", b"CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    call(A.port + 15, "POST", "/sql", b"CREATE USER ann PASSWORD 'ann-password-1'", headers=boss_h)
+    def refused_as(headers, s):
+        try:
+            call(A.port + 15, "POST", "/sql", s.encode(), headers=headers)
+            return ""
+        except RuntimeError as e:
+            return str(e)
+    dollar_boss = refused_as(boss_h, 'CREATE TABLE "a$b" (x INT)')
+    dollar_ann = refused_as(ann_h, 'CREATE TABLE "a$b" (x INT)')
+    info["dollar"] = [dollar_boss[:200], dollar_ann[:200]]
+    checks["a user's CREATE TABLE \"a$b\" (x INT) is refused by name (a superuser's by name, a plain user's by its role)"] = \
+        "a$b" in dollar_boss and "Pondra alone" in dollar_boss and dollar_ann != ""
+    own.kill()
     node.kill()
     ok = all(checks.values())
     print(json.dumps({"objects": checks, "ok": ok, "info": info}, indent=1, default=str))

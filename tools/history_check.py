@@ -448,6 +448,35 @@ def history_check(bin, work, port):
     checks["a clone's identity sequence outlives the clone, and its source: DROP … PURGE of either leaves the other numbering rows"] = \
         distinct[0][0] == distinct[0][1] == 3
 
+    # CREATE OR REPLACE TABLE puts the new table in t's place in one commit, so a follower reading t while the
+    # leader replaces it 20 times never finds no table t, and every count is src's (both tables have 3 rows).
+    q("CREATE TABLE rsrc (id BIGINT)")
+    q("INSERT INTO rsrc VALUES (1), (2), (3)")
+    q("CREATE TABLE rt (id BIGINT)")
+    q("INSERT INTO rt VALUES (9)")
+    q("CREATE OR REPLACE TABLE rt AS SELECT * FROM rsrc")  # (from here on, every count is 3)
+    counts, misses, stop_read = [], [], threading.Event()
+
+    def reader():
+        while not stop_read.is_set():
+            try:
+                counts.append(f.q("SELECT count(*) AS n FROM rt")[0]["n"])
+            except Failed as e:
+                misses.append(str(e)[:200])
+            time.sleep(0.002)
+
+    rd = threading.Thread(target=reader)
+    rd.start()
+    try:
+        for _ in range(20):
+            q("CREATE OR REPLACE TABLE rt AS SELECT * FROM rsrc")
+    finally:
+        stop_read.set()
+        rd.join()
+    checks["a follower reading t while the leader replaces it 20 times (CREATE OR REPLACE TABLE t AS SELECT * FROM src): never 'no table t', every count src's"] = \
+        not misses and len(counts) > 0 and set(counts) == {3}
+    print(f"(replaced 20 times beside {len(counts)} follower reads; misses: {misses[:3]})", file=sys.stderr)
+
     # Writes paused by backpressure (`--backlog`) wait for tiering, which takes the lake's lock. A
     # statement holding that lock while it goes through the sequencer (an UPDATE, a rename's hold)
     # must not wait for them: tiering would wait for it, and neither would ever go.
