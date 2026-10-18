@@ -75,6 +75,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     #[cfg(feature = "server")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
+    rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
@@ -251,29 +252,42 @@ impl OptimizerRule for ScaledLiterals {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        if matches!(plan, LogicalPlan::TableScan(_)) {
-            return Ok(Transformed::no(plan)); // (a scan's own filters have no input to read the types from)
-        }
-        let mut has = false;
-        plan.apply_expressions(|e| {
-            has |= e.exists(|e| Ok(scalable(e)))?;
-            Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
-        })?;
-        if !has {
-            return Ok(Transformed::no(plan)); // (nearly every step: no sum or difference with a decimal literal in it)
-        }
-        let schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs()); // (each column's type, from the inputs)
-        let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
-        let t = plan.map_expressions(|e| {
+        rewrite_typed(plan, scalable, at_scale)
+    }
+}
+
+/// One pass of a rule that rewrites expressions by their types (`ScaledLiterals`, `multiply::Products`):
+/// where `looks` finds an expression the rule may change, `rewrite` gives its new form, given the schema
+/// its columns have (the plan's inputs', or a scan's own table's for its filters: the copy a pushed
+/// filter leaves in a scan is rewritten too). An expression keeps its name (`NamePreserver`); a grouping
+/// set's children are named, the set is not (as DataFusion's simplifier names them). The plan's schema
+/// is worked out again when something changed, since a node above reads the types its columns have now.
+pub(crate) fn rewrite_typed(plan: LogicalPlan, looks: fn(&Expr) -> bool, rewrite: fn(&Expr, &DFSchema) -> Option<Expr>) -> Result<Transformed<LogicalPlan>> {
+    let mut has = false;
+    plan.apply_expressions(|e| {
+        has |= e.exists(|e| Ok(looks(e)))?;
+        Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+    })?;
+    if !has {
+        return Ok(Transformed::no(plan)); // (nearly every step: nothing it looks for in it)
+    }
+    let schema = match &plan {
+        LogicalPlan::TableScan(ts) => DFSchema::try_from_qualified_schema(ts.table_name.clone(), &ts.source.schema())?, // (its filters name its own columns)
+        _ => datafusion::logical_expr::utils::merge_schema(&plan.inputs()), // (each column's type, from the inputs)
+    };
+    let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+    let t = plan.map_expressions(|e| {
+        let mut rewrite_one = |e: Expr| -> Result<Transformed<Expr>> {
             let name = names.save(&e);
-            Ok(e.transform_up(|e| match at_scale(&e, &schema) {
+            Ok(e.transform_up(|e| match rewrite(&e, &schema) {
                 Some(new) => Ok(Transformed::yes(new)),
                 None => Ok(Transformed::no(e)),
             })?
             .update_data(|e| name.restore(e)))
-        })?;
-        if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
-    }
+        };
+        if let Expr::GroupingSet(_) = &e { e.map_children(&mut rewrite_one) } else { rewrite_one(e) } // (a set's aliasing stays: its children are named)
+    })?;
+    if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) }
 }
 
 /// A sum or difference with a DECIMAL literal on one side: the only expressions `ScaledLiterals` looks at.
@@ -1009,6 +1023,7 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
             },
             Expr::Literal(..) | Expr::Alias(_) => 0,
             Expr::InList(l) => l.list.len(),
+            Expr::ScalarFunction(f) if f.func.name() == crate::multiply::NAME => 1, // (a product, as the `*` it replaces)
             Expr::Like(_) | Expr::SimilarTo(_) | Expr::ScalarFunction(_) => 20,
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => 1000,
             _ => 1,
@@ -2514,6 +2529,85 @@ mod tests {
             let plan = plan_of(&ctx, sql).await;
             assert!(plan.contains(text), "{sql}: {text} in the plan:\n{plan}");
         }
+    }
+
+    /// A DECIMAL product runs as `pondra_multiply` (`multiply::Products`) and gives the answers, types, names and
+    /// nullability the `*` gives without it, values past i32 and negatives included; a literal written at its
+    /// column's scale in a ROLLUP's children (`rewrite_typed`) keeps the set's own name and answers.
+    #[tokio::test]
+    async fn a_decimal_product_is_the_same_answer_in_native_integers() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int32Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let dec = |v: Vec<Option<i128>>, p: u8, s: i8| -> ArrayRef { Arc::new(Decimal128Array::from(v).with_precision_and_scale(p, s).unwrap()) };
+        let table = |fields: Vec<Field>, columns: Vec<ArrayRef>| RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        // (a = 123456789012.34 and -99999999999.99 past i32; b has a NULL; the values keep every product in i128)
+        let t = table(
+            vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("a", DataType::Decimal128(15, 2), false),
+                Field::new("b", DataType::Decimal128(15, 2), true),
+                Field::new("c", DataType::Decimal128(15, 4), false),
+                Field::new("n", DataType::Decimal128(10, 2), false),
+                Field::new("m", DataType::Decimal128(10, 2), false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 3])),
+                dec(vec![Some(150), Some(-225), Some(12_345_678_901_234), Some(5), Some(-9_999_999_999_999)], 15, 2),
+                dec(vec![Some(200), None, Some(250), Some(-12_500), Some(9_999_999_999_999)], 15, 2),
+                dec(vec![Some(5_000), Some(12_500), Some(-30_000), Some(1), Some(0)], 15, 4),
+                dec(vec![Some(1_234_567_890), Some(-150), Some(0), Some(5), Some(99)], 10, 2),
+                dec(vec![Some(-150), Some(200), Some(7), Some(5), Some(-99)], 10, 2),
+            ],
+        );
+        let u = table(vec![Field::new("x", DataType::Decimal128(31, 4), true)], vec![dec(vec![Some(30_000), Some(-62_500), Some(3_086_419_725_308_500), Some(7)], 31, 4)]);
+        let ten37 = 10i128.pow(37);
+        let big = table(vec![Field::new("x", DataType::Decimal128(38, 0), false), Field::new("y", DataType::Decimal128(38, 0), false)], vec![dec(vec![Some(ten37)], 38, 0), dec(vec![Some(ten37)], 38, 0)]);
+        let (ctx, plain, scaled) = (session(), session_without(Some("pondra_decimal_products")), session_without(Some("pondra_scaled_literals")));
+        for c in [&ctx, &plain, &scaled] {
+            c.register_batch("t", t.clone()).unwrap();
+            c.register_batch("u", u.clone()).unwrap();
+            c.register_batch("big", big.clone()).unwrap();
+        }
+        assert!(plan_of(&ctx, "SELECT a * b FROM t").await.contains("pondra_multiply"));
+        assert!(!plan_of(&plain, "SELECT a * b FROM t").await.contains("pondra_multiply"));
+        let same = [
+            "SELECT a * b FROM t ORDER BY k, a",
+            "SELECT a * 1.5 FROM t ORDER BY k, a",
+            "SELECT 2.25 * a FROM t ORDER BY k, a",
+            "SELECT a * (1 - b) FROM t ORDER BY k, a",
+            "SELECT a * (1 - b) * (1 + c) FROM t ORDER BY k, a",
+            "SELECT c * (a * b) FROM t ORDER BY k, a",
+            "SELECT k, sum(a * (1 - b)) FROM t GROUP BY k ORDER BY k",
+            "SELECT a FROM t WHERE a * b > 0 ORDER BY k, a",
+            "SELECT a * b AS p, count(*) AS n FROM t GROUP BY a * b ORDER BY p NULLS LAST",
+            "SELECT a * b AS p, count(*) AS n FROM t GROUP BY ROLLUP (a * b) ORDER BY p NULLS LAST, n",
+            "SELECT k FROM t ORDER BY a * b, k",
+            "SELECT k, sum(a * b) OVER (PARTITION BY k) AS s FROM t ORDER BY k, a",
+            "SELECT t.k, u.x FROM t JOIN u ON t.a * t.b = u.x ORDER BY t.k, u.x",
+            "SELECT sum(a * b), avg(a * b) FROM t",
+            "SELECT n * m FROM t ORDER BY k, a",
+        ];
+        for sql in same {
+            assert_eq!(answer(&ctx, sql).await, answer(&plain, sql).await, "{sql}: the types, names and answers without the rule");
+        }
+        let rollup = "SELECT 1 - a AS p, count(*) AS n FROM t GROUP BY ROLLUP (1 - a) ORDER BY p NULLS LAST, n";
+        assert_eq!(answer(&ctx, rollup).await, answer(&scaled, rollup).await, "{rollup}: a literal in a ROLLUP, rewritten");
+        // (the answers written out: 1.50 × 2.00, NULL, 0.05 × -125.00, 123456789012.34 × 2.50, in key then value order)
+        let got = answer(&ctx, "SELECT a * b FROM t ORDER BY k, a").await.1;
+        let want: Vec<Vec<Option<String>>> = [None, Some("3.0000"), Some("-6.2500"), Some("308641972530.8500")].into_iter().map(|v| vec![v.map(String::from)]).collect();
+        assert_eq!(got[..4].to_vec(), want);
+        // (a product of two NOT NULL values is NOT NULL, a product with a nullable one nullable, in both)
+        for c in [&ctx, &plain] {
+            let plan = c.sql("SELECT n * m, a * b FROM t").await.unwrap().into_optimized_plan().unwrap();
+            let schema = plan.schema();
+            assert!(!schema.field(0).is_nullable() && schema.field(1).is_nullable(), "{}", plan.display_indent());
+        }
+        // (on table columns, so no constant folding: the product of two values near 10^37 overflows in both, with the same error)
+        let overflow = "SELECT x * y FROM big";
+        let with = ctx.sql(overflow).await.unwrap().collect().await.unwrap_err().to_string();
+        let without = plain.sql(overflow).await.unwrap().collect().await.unwrap_err().to_string();
+        assert_eq!(with, without, "{overflow}");
+        assert!(with.contains("Overflow happened on"), "{with}");
     }
 
     /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is

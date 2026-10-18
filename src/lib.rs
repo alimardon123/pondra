@@ -21,6 +21,7 @@ pub mod lake_files;
 pub mod sketch;
 mod asof;
 mod explain;
+mod multiply;
 mod sparksql;
 mod past_names;
 mod diff;
