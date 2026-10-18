@@ -62,8 +62,8 @@ def rss_mb(n, kind="VmRSS"):
 def maps_mb(n):
     """A node's anonymous memory by kind of mapping (Linux), or None: glibc's (its main heap, and the arenas it
     reserves 64 MB at a time, aligned to 64 MB: what C libraries such as aws-lc and zstd allocate), thread
-    stacks (8 MB each) and the rest (jemalloc's, mostly). jemalloc's heap profile sees only the rest: on R2
-    a node's own memory grew 160 MB that jemalloc never handed out (reviews/soak-heap-0fa48fb.md)."""
+    stacks (8 MB each) and the rest (jemalloc's, mostly). jemalloc's heap profile sees only the rest: on R2 a
+    node's resident memory grew ~170 MB past what its live allocations held (reviews/soak-heap-0fa48fb.md)."""
     try:
         with open(f"/proc/{n.p.pid}/smaps") as f:
             lines = f.read().splitlines()
