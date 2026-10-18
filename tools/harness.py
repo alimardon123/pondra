@@ -22596,6 +22596,21 @@ def memorylake():
         status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
         checks["a folder holding other things is refused, and no part of the lake is written there"] = (
             status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+        # A place a move didn't finish (its _moving mark is there, written first) is refused by name, by SET LOCATION
+        # and by a node opening it: a copy that stopped half way never looks like a lake.
+        torn_place = new_lake()
+        put_object(torn_place, "_moving", b'{"from": "memory://torn", "pid": 1, "started_ms": 0}')
+        put_object(torn_place, "catalog/x", b"half a copy")
+        status, hdrs, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{torn_place}'".encode())
+        torn_node = Node(torn_place, P + 6)
+        try:
+            torn_node.start(tries=1)
+        except RuntimeError:
+            pass  # (it stopped at once: a node opening a torn place says why and exits)
+        torn_log = open(torn_node.log).read() if os.path.exists(torn_node.log) else ""
+        checks["a place where a move didn't finish (its _moving mark) is refused by name, by SET LOCATION and by a node opening it"] = (
+            status != 200 and hdrs.get("x-pondra-sqlstate") == "55000" and "_moving" in text
+            and torn_node.p is not None and not torn_node.alive() and "_moving" in torn_log)
 
         # The move, under writes.
         wt = threading.Thread(target=writer, daemon=True)
@@ -22628,7 +22643,7 @@ def memorylake():
         checks["a task keeps ticking after the move"] = more(lambda: sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"], ticks_before)
         checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
             bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
-            and bool(lake_objects(target, "files/notes/")))
+            and bool(lake_objects(target, "files/notes/")) and not os.path.exists(os.path.join(target, "_moving")))
         status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
         checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
         # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
@@ -22669,7 +22684,7 @@ def memorylake():
 
         # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
         # whole, says why in /stats, and the target is left empty; db.save says so too.
-        bad = Node(":memory:", P + 4, env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        bad = Node(":memory:", P + 4, pg=f"127.0.0.1:{P + 14}", env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
         nodes.append(bad)
         sql(P + 4, "CREATE TABLE kept (v BIGINT)")
         sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
@@ -22687,7 +22702,13 @@ def memorylake():
         bad_stats = {"move_failed": why}
         checks["a move whose second pass fails leaves the lake in memory with every row, says why in /stats, and nothing at the target"] = (
             back and bool(bad_stats.get("move_failed")) and sql(P + 4, "SELECT v FROM kept ORDER BY v") == [{"v": 1}, {"v": 2}, {"v": 3}]
-            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/"))
+            and not lake_objects(bad_target, "catalog/") and not lake_objects(bad_target, "data/") and not os.path.exists(os.path.join(bad_target, "_moving")))
+        # pondra.databases.move_failed says why at every door (M12): the same text over HTTP and over Postgres.
+        import psycopg
+        over_http = [r["move_failed"] for r in sql(P + 4, f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'")]
+        with psycopg.connect(f"host=127.0.0.1 port={P + 14} user=admin dbname=lake", autocommit=True) as c:  # (an open node: no password)
+            over_pg = [r[0] for r in c.execute(f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'").fetchall()]
+        checks["a failed move: pondra.databases.move_failed says the same over HTTP and Postgres"] = over_http == [why] and over_pg == [why]
         said = ""
         try:
             _client(P + 4).save(new_lake())
@@ -22750,6 +22771,45 @@ def memorylake():
                 isinstance(inproc, list) and [str(v) for v in inproc] == ["1", "2", "3"] and bool(lake_objects(t5, "catalog/")))
             if ran.returncode != 0:
                 print((ran.stdout + ran.stderr)[-500:], file=sys.stderr)
+        # A shell on :memory: that spilled leaves no spill folder once it ends (`memory::leave`: a process's statics
+        # run no destructor, so the program's end removes what it made). The node is the shell's child: never by pid.
+        shell_dir, spill_dir = tempfile.mkdtemp(prefix="pondra-shell-"), tempfile.mkdtemp(prefix="pondra-spill-")
+        with open(os.path.join(shell_dir, "shell.out"), "w") as out:
+            shell = subprocess.Popen([BIN, ":memory:"], cwd=shell_dir, stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT,
+                                     env={**os.environ, **env, "PONDRA_SPILL_DIR": spill_dir})
+            shell.stdin.write(b"CREATE TABLE t AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(20000);\n")
+            shell.stdin.flush()
+            spilled = False
+            for _ in range(300):  # (30 s: the table's files are past the 10 KB budget, so they go to a folder)
+                if glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")):
+                    spilled = True
+                    break
+                time.sleep(0.1)
+            try:
+                shell.stdin.close()
+                shell.wait(30)
+            except (OSError, subprocess.TimeoutExpired):
+                shell.kill()
+                shell.wait()
+        left = glob_.glob(os.path.join(spill_dir, "pondra-memory-*", "*")) + glob_.glob(os.path.join(spill_dir, "pondra-spill-*", "*"))
+        checks["a shell on :memory: that spilled leaves no spill folder once it ends"] = spilled and not left
+        shutil.rmtree(shell_dir, ignore_errors=True)
+        shutil.rmtree(spill_dir, ignore_errors=True)
+        # Past its spill cap (PONDRA_SPILL_GB=2 MB) a lake in memory refuses a load by name (53100: the disk takes what
+        # it may and no more), leaves no table behind (invariant 420), and answers after.
+        capped_dir = new_lake()
+        capped = Node(":memory:", P + 5, env={**env, "PONDRA_SPILL_GB": "0.002", "PONDRA_SPILL_DIR": capped_dir}).start()
+        nodes.append(capped)
+        status, hdrs, text = reply(P + 5, "POST", "/sql", b"CREATE TABLE big AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(400000)")
+        refused = status != 200 and hdrs.get("x-pondra-sqlstate") == "53100" and "PONDRA_SPILL_GB" in text
+        gone = reply(P + 5, "POST", "/sql", b"SELECT count(*) AS n FROM big")[1].get("x-pondra-sqlstate") == "42P01"
+        answers = sql(P + 5, "SELECT 1 AS one") == [{"one": 1}]
+        sql(P + 5, "CREATE TABLE small (n INT)")
+        sql(P + 5, "INSERT INTO small VALUES (1)")
+        small = [r["n"] for r in sql(P + 5, "SELECT n FROM small")] == [1]
+        checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"] = refused and gone and answers and small
+        if not checks["past its spill cap a lake in memory refuses a load by name (53100), and answers after"]:
+            print(f"memorylake: the capped load answered {status}: {text[:300]}", file=sys.stderr)
         if not all(checks.values()):
             return False  # (its checks are printed on the way out)
         return f"a lake in memory moved to a folder under {len(acked)} writes ({downtime:.1f} s from the move to its first answer there), then Python's and JavaScript's clients (and the library's, when it is built); {len(checks)} checks"

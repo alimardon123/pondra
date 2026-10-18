@@ -1304,7 +1304,8 @@
    "branches Int64",
    "protected Boolean",
    "lifted_at Timestamp(\u00b5s, \"UTC\")",
-   "lifted_by Utf8"
+   "lifted_by Utf8",
+   "move_failed Utf8"
   ],
   "pondra.dropped": [
    "name Utf8",

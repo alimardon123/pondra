@@ -476,9 +476,10 @@ pub fn short_of_room(dir: &std::path::Path) -> Option<(u64, u64)> {
 }
 
 /// The folder of this process's spills, DataFusion's and a shuffle's (`spill::dir`): a `memory::Folder` of
-/// this process's own, made by the first spill that needs one and held until the process ends. A static is
-/// never dropped, so the folder (with its lock file, and nothing else once the spills are gone) is left for
-/// the next process on the machine to sweep. A folder that can't be made is remembered as the reason why.
+/// this process's own, made by the first spill that needs one. A static's end runs no destructor, so the
+/// folder goes when the program ends through `memory::leave` (which `cli.rs` calls before each exit); where
+/// that can't remove it (Windows, while its lock file is open), it stays for the next process's sweep. A
+/// folder that can't be made is remembered as the reason why.
 static SPILLS: std::sync::OnceLock<Result<crate::memory::Folder, String>> = std::sync::OnceLock::new();
 
 /// The folder of this process's spills (`SPILLS`), made on first use. Its error when there is none: DataFusion's
@@ -496,15 +497,25 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
     }
 }
 
-/// Where DataFusion's spills go, and how much of the disk they may take (`PONDRA_SPILL_GB`). Not the
+/// `PONDRA_SPILL_GB`: how many GB of spills the node may keep on disk. None when unset (a negative setting is none).
+fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
+
+/// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
+pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
+    match spill_gb() {
+        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
+        None => dir.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
+    }
+}
+
+/// Where DataFusion's spills go, and how much of the disk they may take (`spill_cap`). Not the
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
 /// folder is the user's own, under the disk with the room (`memory::spill_base`), and folders of
 /// processes that ended are swept from it. The cap is the free space when the lake opens, less the room
 /// a lake keeps, or the setting in GB. `0` turns spilling off: a query that needs it is refused (53200).
 /// A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder {
-    let gb = crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0);
-    if gb == Some(0.0) {
+    if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
     let folder = spill_folder().ok();
@@ -517,11 +528,7 @@ fn spill_disk() -> DiskManagerBuilder {
     // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
     let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
     let builder = builder.with_max_spill_merge_fan_in(fan_in);
-    let cap = match gb {
-        Some(gb) => Some((gb * (1u64 << 30) as f64) as u64),
-        None => folder.and_then(space).map(|(free, total)| free.saturating_sub(lake_keeps(total))),
-    };
-    match cap {
+    match spill_cap(folder) {
         Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
         None => builder,
     }
@@ -901,17 +908,24 @@ impl Lake {
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
         let cache = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
         let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
-        let cat = match writer {
-            true => Catalog::writer(store.clone(), cache, local).await?,
-            false => match Catalog::opened(store.clone(), streamed, cache).await {
-                Ok(cat) => cat,
-                // (no catalog at all: say so, rather than the database's own words for it)
-                Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
-                    None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
-                    Some(_) => return Err(e),
+        let opening = async {
+            Ok::<_, anyhow::Error>(match writer {
+                true => Catalog::writer(store.clone(), cache, local).await?,
+                false => match Catalog::opened(store.clone(), streamed, cache).await {
+                    Ok(cat) => cat,
+                    // (no catalog at all: say so, rather than the database's own words for it)
+                    Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+                        None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
+                        Some(_) => return Err(e),
+                    },
                 },
-            },
+            })
         };
+        // (the place's torn check runs beside the catalog's opening, so a bucket pays no extra round trip; `join`
+        // and not `try_join`: a failure of one must not drop the other half way, with SlateDB's tasks still running)
+        let (torn, cat) = tokio::join!(crate::memory::refuse_torn(&store, &url), opening);
+        torn?;
+        let cat = cat?;
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)

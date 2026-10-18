@@ -437,8 +437,8 @@ async fn supervise(mut options: Options, state: Arc<Mutex<State>>, router: Arc<M
                         }
                     }
                 }
-                Ok(Err(e)) if e.downcast_ref::<crate::format::Newer>().is_some() => {
-                    return failed_until_closed(&set, format!("{e:#}"), &mut events, first.take()).await; // (no try will open it)
+                Ok(Err(e)) if e.downcast_ref::<crate::format::Newer>().is_some() || crate::memory::torn(&e) => {
+                    return failed_until_closed(&set, format!("{e:#}"), &mut events, first.take()).await; // (no try will open it: nor a place a move didn't finish)
                 }
                 Ok(Err(e)) => format!("{e:#}"), // (`Node::open` gave back what it took)
                 Err(p) => {
