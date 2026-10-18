@@ -121,6 +121,10 @@ pub fn escape(bytes: &[u8]) -> String {
 /// A bytea as a SQL literal DataFusion reads as Binary: `X'01ff'` (`X''` for none).
 pub fn sql(bytes: &[u8]) -> String { format!("X'{}'", digits(bytes)) }
 
+/// Postgres's functions that take only a bytea in their first argument: a string literal there is a bytea literal,
+/// read as `parse` reads it (friendly.rs's `expression`).
+pub const TAKES_BYTEA: &[&str] = &["sha224", "sha256", "sha384", "sha512"];
+
 /// The hex digits of `bytes`, two a byte, in lower case.
 fn digits(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);

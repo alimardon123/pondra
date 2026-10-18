@@ -46,7 +46,9 @@ pub fn wanted(sql: &str) -> bool {
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
     });
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || alias_in_where(sql)
+    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
+    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -1123,6 +1125,23 @@ fn expression(e: &mut Expr) -> Result<()> {
                         false => format!("{call}({}, {keys})", a[0]),
                     })?;
                 }
+                // (Postgres's sha functions take only a bytea: a string literal there is one, so `sha256('\x01')`
+                // hashes the byte 0x01, as Postgres does; a column or any other expression is left as it is)
+                (fname, 1) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
+                    if let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })) = a.first() {
+                        let bytes = crate::pg_bytea::parse(s).map_err(|e| crate::codes::coded(e.code, e.message))?;
+                        let lit = expr(&crate::pg_bytea::sql(&bytes))?;
+                        if let FunctionArguments::List(l) = &mut f.args {
+                            let first = l.args.iter_mut().find_map(|x| match x {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) => Some(arg),
+                                _ => None,
+                            });
+                            if let Some(arg) = first {
+                                *arg = lit;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1751,6 +1770,23 @@ mod tests {
         assert_eq!(backslash_pattern("a\\b", Some('/')).unwrap(), "a\\\\b");
         assert_eq!(backslash_pattern("a\\b", None).unwrap(), "a\\\\b");
         assert!(backslash_pattern("a/", Some('/')).is_err());
+    }
+
+    #[test]
+    fn sha_functions_take_a_bytea_literal() {
+        // (Postgres's sha functions take only a bytea: a string literal in their call is one, in either form; a column,
+        // another function and a literal that isn't a bytea are as Postgres answers them)
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("sha256('\\x01')").unwrap(), "sha256(X'01')");
+        assert_eq!(call("sha512('a\\\\b')").unwrap(), "sha512(X'615c62')");
+        assert_eq!(call("sha256(t.a)").unwrap(), "sha256(t.a)");
+        assert_eq!(call("md5('\\x01')").unwrap(), "md5('\\x01')");
+        let refusal = call("sha256('\\x0')").unwrap_err();
+        assert_eq!((crate::codes::of(&refusal), refusal.to_string()), ("22023", "invalid hexadecimal data: odd number of digits".to_string()));
+        assert!(wanted("SELECT sha256('\\x01')"));
     }
 
     #[test]
