@@ -73,7 +73,7 @@ PROCESS = {
     "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
     "optimize.rs:NEXT": COUNTER,
     "panics.rs:NEXT": COUNTER,
-    "panics.rs:R": "the queries' runtime, one a process (ADR-061 §4): the node's tasks on it end with the node, the runtime doesn't",
+    "panics.rs:R": "the queries' runtime and the memory watch's, one each a process (ADR-061 §4): the node's tasks on them end with the node, the runtimes don't",
     "path.rs:HEADS": "regexes and constants",
     "path.rs:LATE": "regexes and constants",
     "pg_json.rs:FUNCTIONS": "Postgres's JSON operators' and functions' definitions, made once: nothing of a lake",

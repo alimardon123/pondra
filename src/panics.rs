@@ -114,6 +114,17 @@ pub fn aside<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
     tracked(queries().spawn(f))
 }
 
+/// Start a loop that must keep its pace whatever the queries do (the memory watch) on a thread of its own: on the
+/// node's runtime, a query's partitions busy on every core held its timer back past the moment it had to look (the
+/// hot memory-line check passed its line now and then). Ended with the node, as [`task`]'s are.
+pub fn alone<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    let watch = R.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).thread_name("pondra-watch").enable_all().build().expect("a runtime")
+    });
+    tracked(watch.spawn(f))
+}
+
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
 /// query's time grows as the cores are shared, so dashboards beside writers pass it at once.
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);
