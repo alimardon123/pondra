@@ -1832,6 +1832,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
+    if let Stmt::Insert(t, query) = &stmt {
+        crate::seq::check_every(&app.lake, t, rows_width(query)).await?; // (the columns it gives: an ALWAYS identity's refused among them, in a transaction too)
+    }
     // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
     // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
     if let Some(note) = Box::pin(crate::txn::ddl_at_once(app, &stmt)).await? {
@@ -1865,7 +1868,6 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            crate::seq::check_every(&app.lake, &t, rows_width(&query)).await?; // (the columns it gives: an ALWAYS identity's refused among them)
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
                 if !is_there(&app.lake, &t).await? {
