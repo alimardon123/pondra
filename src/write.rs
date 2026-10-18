@@ -2016,7 +2016,8 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = crate::defaults::fit(&meta, &table, rows_of(lake, lake, &meta, &sql, None, files).await?)?; // (as the table holds them: a jsonb in its own form, `RETURNING` too)
+    // (each jsonb in its own form, so `RETURNING` answers what is held; the log checks the rows, as every door's)
+    let batch = crate::types::as_held(&meta, rows_of(lake, lake, &meta, &sql, None, files).await?, true)?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
