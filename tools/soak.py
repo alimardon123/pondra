@@ -13,7 +13,8 @@ and then, and what drifts over time measured.
   stopped (SIGTERM: drained, stepping down), the leader killed (kill -9), a follower stopped, a
   follower killed; it starts again a moment later (by default 8 times a run, at most hourly).
 
-  Each minute it writes a line to --timeline: every node's resident memory, its queries (running,
+  Each minute it writes a line to --timeline: every node's resident memory (and its anonymous memory by
+  kind of mapping: glibc's heaps, thread stacks, the rest), its queries (running,
   waiting, finished, failed) and the query memory they hold, the leader's rows not yet tiered and
   its commit times, the longest a batch waited for its acknowledgement, the lake's
   objects (a folder's; a bucket's every 30 minutes).
@@ -39,7 +40,7 @@ alone drifted still saves, so the day goes on and is checked whole. --steady sto
 node: each node process lives the whole leg, which is what memory over hours is measured on (the
 day's last leg: soak.yml).
 """
-import argparse, collections, json, os, random, shutil, sys, tempfile, threading, time, uuid
+import argparse, collections, json, os, random, re, shutil, sys, tempfile, threading, time, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from upgrade_check import Load, Node, stop_all, until  # noqa: E402  (the same nodes and load)
@@ -56,6 +57,36 @@ def rss_mb(n, kind="VmRSS"):
             return next(int(l.split()[1]) // 1024 for l in f if l.startswith(kind + ":"))
     except (OSError, StopIteration, AttributeError):
         return None
+
+
+def maps_mb(n):
+    """A node's anonymous memory by kind of mapping (Linux), or None: glibc's (its main heap, and the arenas it
+    reserves 64 MB at a time, aligned to 64 MB: what C libraries such as aws-lc and zstd allocate), thread
+    stacks (8 MB each) and the rest (jemalloc's, mostly). jemalloc's heap profile sees only the rest: on R2
+    a node's own memory grew 160 MB that jemalloc never handed out (reviews/soak-heap-0fa48fb.md)."""
+    try:
+        with open(f"/proc/{n.p.pid}/smaps") as f:
+            lines = f.read().splitlines()
+    except (OSError, AttributeError):
+        return None
+    maps = []  # [start, end, permissions, name, resident kB]
+    for line in lines:
+        m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) (\S+) \S+ \S+ \S+\s*(.*)$", line)
+        if m:
+            maps.append([int(m[1], 16), int(m[2], 16), m[3], m[4].strip(), 0])
+        elif line.startswith("Rss:") and maps:
+            maps[-1][4] = int(line.split()[1])
+    kb = {"glibc": 0, "stacks": 0, "rest": 0}
+    arena = 64 << 20
+    for i, (lo, hi, _, name, rss) in enumerate(maps):
+        if name not in ("", "[heap]", "[stack]"):
+            continue  # (a file's pages, or the kernel's: not the node's own)
+        after = maps[i + 1] if i + 1 < len(maps) else None
+        # An arena is used from its start, the rest of its 64 MB held back with no access (---p).
+        reserved = lo % arena == 0 and (hi - lo == arena or (after and after[0] == hi and after[2].startswith("---") and after[1] - lo == arena))
+        kind = "glibc" if name == "[heap]" or reserved else "stacks" if name == "[stack]" or 8188 << 10 <= hi - lo <= 8200 << 10 else "rest"
+        kb[kind] += rss
+    return {k: v // 1024 for k, v in kb.items()}
 
 
 def gauges(x):
@@ -182,7 +213,7 @@ def main():
         made = deltas["write"]
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
@@ -249,6 +280,7 @@ def main():
     info["memory"] = drift
     info["hot columns at the end, MB"] = samples[-1].get("hot_mb") if samples else None
     info["caches at the end, MB"] = samples[-1].get("cache_mb") if samples else None
+    info["anonymous memory by kind at the end, MB (glibc's heaps, thread stacks, the rest: jemalloc's)"] = samples[-1].get("maps_mb") if samples else None
     checks["memory flat (its own, less its caches): each node's last tenth within 1.5x (+64 MB) of its second (lower quartiles)"] = bool(drift) and all(d["late_mb"] <= d["early_mb"] * 1.5 + 64 for d in drift.values())
     end = objects(lake)
     info["objects at the end"] = end
