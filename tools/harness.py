@@ -2204,6 +2204,11 @@ def kafka():
         and len(failed) == 1 and failed[0] is not None and failed[0].code() == ck.KafkaError.INVALID_RECORD and "PRIMARY KEY" in open(node.log).read()
     checks["raw values (_value), queried as JSON"] = sql_("SELECT _key, _value FROM lines ORDER BY _key")[0] == {"_key": "k1", "_value": "plain text, not JSON"} and \
         sql_("SELECT _value->>'event' AS e, json_get_int(_value, 'n') AS n FROM lines WHERE _key = 'k2'") == [{"e": "click", "n": 3}]
+    # A JSON value's fraction into an INT column rounds as SQL writes it (`query::from_json`, invariant 293): 2.5 is 3.
+    sql_("CREATE TABLE rounds (v INT)")
+    p.produce("rounds", value=json.dumps({"v": 2.5}))
+    assert p.flush(30) == 0
+    checks["a JSON value's 2.5 into an INT column is 3, as SQL writes it"] = sql_("SELECT v FROM rounds") == [{"v": 3}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
@@ -8158,6 +8163,13 @@ def found():
         [{"di": -3, "fi": 4}, {"di": 2, "fi": -2}, {"di": 3, "fi": 2}, {"di": 100, "fi": -4}],
         [{"i": 3, "b": 2}, {"i": 3, "b": 5}, {"i": 7, "b": 8}],
         [{"a": 3, "b": -3}]]
+    # JSON rows appended into integer columns round as SQL writes them (`query::from_json`, invariant 293): 2.5 is 3, and a
+    # BIGINT's digits stay exact (arrow-json cut a JSON number through a float, so 2.5 was 2 and big integers lost digits).
+    q("CREATE TABLE jwholes (i INT, b BIGINT)")
+    call(port, "POST", "/append/jwholes?producer=jw&seq=1", b'{"i": 2.5, "b": -2.5}\n{"i": 7, "b": 9007199254740993}\n')
+    seen["jwholes"] = q("SELECT i, b FROM jwholes ORDER BY i")
+    checks["JSON rows appended into integer columns round as SQL writes them (2.5 is 3), and a big BIGINT stays exact"] = \
+        seen["jwholes"] == [{"i": 3, "b": -3}, {"i": 7, "b": 9007199254740993}]
     # A number with an exponent is a whole decimal (`optimize::WholeLiterals`): CAST(1e15 AS DOUBLE) is 1e15, and a table made from
     # 1e15 is written to files (Parquet has no negative scale). The table's files are listed by the catalog, after a CHECKPOINT.
     q("CREATE TABLE exps AS SELECT 1e15 AS x, 6.02e23 AS n")

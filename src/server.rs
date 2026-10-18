@@ -1129,7 +1129,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
             let ipc = ipc.collect::<Result<Vec<_>, _>>()?;
             (ipc.iter().map(|b| crate::query::conform(b, &schema)).collect::<anyhow::Result<Vec<_>>>()?, Some(given))
         } else {
-            (arrow_json::ReaderBuilder::new(schema.clone()).build(&body[..])?.collect::<Result<Vec<_>, _>>()?, None)
+            (vec![crate::json_rows::from_json(&body, &schema)?], None) // (integers round as SQL writes them: invariant 293)
         })
     };
     // (rows that can't be read as the table's are the sender's: 22P02, never the node's 500)

@@ -88,6 +88,7 @@ mod optimize;
 #[cfg(feature = "server")] mod inbox;
 #[cfg(feature = "server")] mod kafka;
 #[cfg(feature = "server")] mod kafka_client;
+#[cfg(feature = "server")] mod json_rows;
 #[cfg(feature = "server")] mod live;
 #[cfg(feature = "server")] mod locks;
 #[cfg(feature = "server")] mod serve;

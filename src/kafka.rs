@@ -614,10 +614,7 @@ fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8>)> {
     let json_schema = Arc::new(Schema::new(schema.fields().iter().filter(|f| !meta_cols.contains(&f.name().as_str())).cloned().collect::<Vec<_>>()));
     let decoded = match raw {
         true => RecordBatch::try_new_with_options(json_schema.clone(), json_schema.fields().iter().map(|f| new_null_array(f.data_type(), kept.len())).collect(), &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(kept.len())))?,
-        false => {
-            let batches = arrow_json::ReaderBuilder::new(json_schema.clone()).build(&lines[..])?.collect::<Result<Vec<_>, _>>()?;
-            concat_batches(&json_schema, &batches)?
-        }
+        false => crate::json_rows::from_json(&lines, &json_schema)?, // (integers round as SQL writes them: invariant 293)
     };
     ensure!(decoded.num_rows() == kept.len(), "a value isn't a JSON object");
     let text = |f: fn(&Rec) -> Option<&Bytes>| -> ArrayRef { Arc::new(BinaryArray::from_iter(kept.iter().map(|r| f(*r).map(|b| b.as_ref())))) };
