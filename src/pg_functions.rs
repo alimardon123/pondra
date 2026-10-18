@@ -129,6 +129,7 @@ pub fn register(ctx: &SessionContext) {
             ctx.register_udf(ScalarUDF::new_from_impl(Templated { inner, kind }));
         }
     }
+    crate::pg_bytea::register(ctx);
 }
 
 /// `generate_series(1, array_upper(…, 1))`: DataFusion's series take only BIGINT literals, and Postgres's

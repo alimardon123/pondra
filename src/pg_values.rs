@@ -26,7 +26,7 @@ pub(crate) fn value(t: &Type, raw: Option<&[u8]>, binary: bool) -> anyhow::Resul
 }
 
 fn utf8(raw: &[u8]) -> anyhow::Result<String> {
-    std::str::from_utf8(raw).map(str::to_string).map_err(|_| crate::codes::coded("22021", "invalid byte sequence for encoding \"UTF8\""))
+    crate::pg_bytea::utf8(raw).map_err(|e| crate::codes::coded(e.code, e.message))
 }
 
 /// The SQL literal of `text`, a value of type `t` as Postgres writes it. A typed value that doesn't
