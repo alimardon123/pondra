@@ -48,6 +48,7 @@ mod pg_json_edit;
 mod pg_json_sets;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_text;
+pub mod pg_bytea;
 mod optimize;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).

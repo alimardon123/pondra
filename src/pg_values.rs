@@ -4,6 +4,7 @@
 
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use pgwire::api::Type;
+use crate::pg_bytea;
 use crate::pg_text::{array_literal, interval_text, time_text};
 use std::ops::ControlFlow;
 
@@ -35,7 +36,7 @@ fn literal(t: &Type, text: &str) -> anyhow::Result<String> {
     Ok(match *t {
         Type::NUMERIC => sql_number(text).ok_or_else(|| bad("numeric", "22P02"))?,
         Type::UNKNOWN => sql_number(text).unwrap_or_else(|| quoted(text)), // (a number bare, anything else quoted)
-        Type::BYTEA => format!("X'{}'", hex_of(text).ok_or_else(|| bad("bytea", "22P02"))?),
+        Type::BYTEA => pg_bytea::sql(&pg_bytea::parse(text).map_err(|e| crate::codes::coded(e.code, e.message))?),
         Type::DATE => format!("DATE '{}'", date_of(text).ok_or_else(|| bad("date", "22007"))?.format("%Y-%m-%d")),
         Type::TIME => format!("TIME '{}'", time_of(text).ok_or_else(|| bad("time", "22007"))?.format("%H:%M:%S%.f")),
         Type::TIMESTAMP => format!("TIMESTAMP '{}'", timestamp_of(text).ok_or_else(|| bad("timestamp", "22007"))?.format("%Y-%m-%d %H:%M:%S%.f")),
@@ -107,12 +108,6 @@ fn sql_number(text: &str) -> Option<String> {
         t => t.to_string(),
     };
     Some(if negative { format!("(-{plain})") } else { plain })
-}
-
-/// `0x…` hex (Postgres's bytea text form) as lowercase hex digits; None for the other forms.
-fn hex_of(text: &str) -> Option<String> {
-    let hex = text.strip_prefix("\\x")?;
-    (hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
 }
 
 fn date_of(text: &str) -> Option<chrono::NaiveDate> { chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok() }
@@ -267,8 +262,8 @@ fn binary_text(t: &Type, raw: &[u8]) -> anyhow::Result<String> {
     let eight = || -> anyhow::Result<i64> { Ok(i64::from_be_bytes(raw.try_into().map_err(|_| short())?)) };
     let four = || -> anyhow::Result<i64> { Ok(i32::from_be_bytes(raw.try_into().map_err(|_| short())?).into()) };
     Ok(match *t {
-        // bytea's bytes, in the hex form the literal reads
-        Type::BYTEA => raw.iter().fold("\\x".to_string(), |s, b| format!("{s}{b:02x}")),
+        // bytea's bytes as Postgres writes them, which the literal reads back
+        Type::BYTEA => pg_bytea::text(raw),
         Type::NUMERIC => numeric_text(raw)?,
         // a float's bits, read as the text Rust writes it (which reads back to the same value)
         Type::FLOAT8 => f64::from_bits(eight()? as u64).to_string(),
@@ -451,12 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn bytea_is_hex_and_other_forms_are_refused() {
+    fn bytea_reads_both_of_postgres_forms() {
         assert_eq!(lit(Type::BYTEA, "\\xff0001"), "X'ff0001'");
         assert_eq!(lit(Type::BYTEA, "\\x"), "X''");
         assert_eq!(lit(Type::BYTEA, "\\xFF"), "X'ff'");
-        assert!(lit(Type::BYTEA, "ff00").starts_with("ERR 22P02"));
-        assert!(lit(Type::BYTEA, "\\x0").starts_with("ERR 22P02"));
+        // (no `\x`: the escape form, so the text's own bytes)
+        assert_eq!(lit(Type::BYTEA, "ff00"), "X'66663030'");
+        assert!(lit(Type::BYTEA, "\\x0").starts_with("ERR 22023"));
+        assert!(lit(Type::BYTEA, "a\\b").starts_with("ERR 22P02"));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 use crate::codes::{coded, Coded};
 use crate::pg_functions::MARK;
 use crate::pg_json::{is_text, json_refusal};
+use crate::pg_bytea;
 use crate::pg_text::{interval_text, time_text};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
@@ -507,11 +508,8 @@ fn interval(out: &mut String, a: &ArrayRef, i: usize) {
     json_string(out, &interval_text(months, days, micros));
 }
 
-/// Binary as Postgres's bytea text: `\x` and its hex digits, which JSON then escapes (`"\\x0102"`).
-fn bytea(out: &mut String, bytes: &[u8]) {
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    json_string(out, &format!("\\x{hex}"));
-}
+/// Binary as Postgres's bytea text (`pg_bytea::text`: `\x` and its hex digits), which JSON then escapes (`"\\x0102"`).
+fn bytea(out: &mut String, bytes: &[u8]) { json_string(out, &pg_bytea::text(bytes)); }
 
 /// A list as `[1,2]`, no spaces, each element by `value` with its item field's mark.
 fn list(out: &mut String, items: &ArrayRef, item: &Field) -> Result<()> {
