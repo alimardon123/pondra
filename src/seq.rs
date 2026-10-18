@@ -518,8 +518,8 @@ pub fn calls(sql: &str) -> bool {
     WORDS.is_match(sql)
 }
 
-/// A positional `INSERT INTO t query` gives the columns its rows have (`width`: a `VALUES`' width, None for any other
-/// query, which gives them all): refused when one of those is an ALWAYS identity.
+/// A positional `INSERT INTO t query` gives the columns its rows have (`width`: the rows' width, `write::rows_width`; None
+/// when the query doesn't fix it, which gives them all): refused when one of those is an ALWAYS identity.
 pub async fn check_every(lake: &Lake, table: &str, width: Option<usize>) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };

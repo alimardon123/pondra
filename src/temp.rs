@@ -399,7 +399,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     let query = match names {
         Some(n) => {
             let all = crate::write::row_columns(meta.columns.iter().map(|(c, _)| c.clone()), n);
-            let names = if n.is_empty() { crate::write::implicit(&all, crate::write::values_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
+            let names = if n.is_empty() { crate::write::implicit(&all, crate::write::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
             crate::write::rows_for(name, &all, names, query, &|c: &str| crate::defaults::sql_of(&meta, c))? // (a column left out takes its DEFAULT)
         }
         None => query.to_string(),

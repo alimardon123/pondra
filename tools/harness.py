@@ -7417,7 +7417,9 @@ def _short_rows(q, pgport, checks, seen):
     count = lambda: [q(f"SELECT count(*) AS n FROM {t}")[0]["n"] for t in ("lt", "kt")]
     before, wrong = count(), {}
     with conn() as c:
-        for s in ["INSERT INTO lt VALUES (6, 1), (7)", "INSERT INTO lt VALUES (1, 2, 3, 'w', 5)", "INSERT INTO kt (id) VALUES (5, 6)", "INSERT INTO kt (id, n) VALUES (5)"]:
+        for s in ["INSERT INTO lt VALUES (6, 1), (7)", "INSERT INTO lt VALUES (1, 2, 3, 'w', 5)", "INSERT INTO kt (id) VALUES (5, 6)", "INSERT INTO kt (id, n) VALUES (5)",
+                  "INSERT INTO kt VALUES (5, 6, 'w', 7)", "INSERT INTO kt SELECT 5, 6, 'w', 7", "INSERT INTO kt (id) SELECT 5, 6",
+                  "INSERT INTO kt (id, n) SELECT 5", "INSERT INTO kt VALUES (5, 6, 'w', 7) ON CONFLICT (id) DO NOTHING"]:
             try:
                 c.execute(s)
                 wrong[s] = "accepted"
@@ -7428,7 +7430,7 @@ def _short_rows(q, pgport, checks, seen):
     checks["a row shorter than the table (no column list) takes the DEFAULTs of the columns it leaves out, as Postgres fills it: VALUES and SELECT, append and keyed tables, bound, in a transaction, a renamed column, an identity"] = \
         lt == [(1, 7, 1, "z"), (2, 8, 1, "z"), (3, 7, 1, "z"), (4, 7, 1, "z"), (5, 7, 1, "z"), (6, 7, 1, "z"), (9, 7, 1, "z"), (10, 7, 1, "z"), (11, 7, 1, "z")] \
         and kt == [(1, 3, "k"), (2, 3, "k"), (3, 4, "k")] and it == [("x", 1), ("y", 2)]
-    checks["a row of the wrong width is refused 42601, writing nothing"] = all(v == "42601" for v in wrong.values()) and after == before
+    checks["a row of the wrong width is refused 42601 on keyed tables, in SELECT and ON CONFLICT too, writing nothing"] = all(v == "42601" for v in wrong.values()) and after == before
 
 
 def _default_words(q, pgport, checks, seen):

@@ -293,11 +293,17 @@ impl Upsert {
     /// (DO NOTHING, when `repeats` found a key twice): the source keeps each conflict key's first row.
     fn merge(&self, meta: &TableMeta, m: &Merge, first_only: bool) -> Result<Merge> {
         // The columns the rows give: the query's aliases below, and the conflict's.
+        let width = crate::write::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
             // (no list: the table's first columns, as many as the rows give, as an INSERT's: `write::implicit`)
-            true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), crate::write::values_width(&self.query)).to_vec(),
+            true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(),
             false => self.columns.clone(),
         };
+        // The rows must be as wide as the columns they are written to: the source's alias list below would otherwise fail
+        // with DataFusion's words (XX000), where Postgres says 42601.
+        if let Some(w) = width.filter(|&w| w != given.len()) {
+            return Err(crate::write::width_refused(&m.target, given.len(), w));
+        }
         let on = self.on_columns(meta, &m.target)?;
         ensure!(on.iter().all(|c| given.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
         // A DEFAULT in the rows' own VALUES is written as an INSERT writes it (`write::rows_for`): the source can't hold the word.
