@@ -279,11 +279,14 @@ pub async fn resource(lake: &Lake, resource: &str) -> Option<Value> {
 pub async fn anyone(lake: &Lake) -> bool { all(lake).await.is_ok_and(|a| a.iter().any(|(_, p)| p.any)) }
 
 /// The provider the Postgres port asks a name with no password to sign in through with OAUTHBEARER: the
-/// first, by name, that says `POSTGRES 'oauth'` and would sign it in (`listed`: a user made here; else
-/// only `USERS 'any'`). Its issuer and scopes, as psql 18 is told them (RFC 7628's error).
+/// first, by name, that says `POSTGRES 'oauth'`; for a name no user has, one that takes `USERS 'any'` first,
+/// since only that one would sign it in. A name no user has is asked the way a user with no password is, so
+/// what the port offers never says whether a user of that name is here (its token is refused after).
+/// Its issuer and scopes, as psql 18 is told them (RFC 7628's error).
 pub async fn oauth_for(lake: &Lake, listed: bool) -> Option<(String, String)> {
     let all = all(lake).await.ok()?;
-    let (_, p) = all.iter().find(|(_, p)| p.postgres_oauth && (listed || p.any))?;
+    let oauth = || all.iter().filter(|(_, p)| p.postgres_oauth);
+    let (_, p) = oauth().find(|(_, p)| listed || p.any).or_else(|| oauth().next())?;
     Some((p.issuer.trim_end_matches('/').to_string(), p.scopes.clone()))
 }
 

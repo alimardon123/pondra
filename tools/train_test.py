@@ -582,6 +582,47 @@ def main_changed_a_workflow(path):
         expect(sc.train_heads() == [4] and sc.gh.bare_rev("refs/heads/train^1") == sc.main_sha(), f"{sc.train_heads()}")
 
 
+def stray_tip_recut(sc, out, stray):
+    """A stray tip, green: main is left alone and the train is cut again from its PRs, on main."""
+    expect(sc.main_sha() != stray and sc.gh.bare_rev("refs/heads/main") == sc.gh.bare_rev("refs/heads/train^1^1"),
+           "main moved, or the train wasn't cut again on main")
+    expect(sc.tip() != stray and sc.train_heads() == [1, 2], f"tip {sc.tip()}, train merged {sc.train_heads()}")
+    expect("the train's tip isn't what a cut makes" in out and "cut #1 #2" in out, out)
+    expect(all(c == [] for c in sc.gh.comments.values()), f"comments {sc.gh.comments}")
+
+
+@case
+def stray_commit_never_lands(path):
+    """A commit pushed onto the train after its cut, its run green: it doesn't land; the train is cut again."""
+    with Scenario(path) as sc:
+        sc.riders()
+        git(sc.work, "fetch", "-q", "origin")
+        git(sc.work, "checkout", "-q", "-B", "stray", "origin/train")
+        write_commit(sc.work, {"stray.txt": "no PR brought this\n"}, "stray")
+        git(sc.work, "push", "-q", sc.bare, "HEAD:refs/heads/train")
+        stray = sc.tip()
+        sc.add_run(5, stray, conclusion="success")
+        time.sleep(1.1)
+        stray_tip_recut(sc, sc.step(), stray)
+
+
+@case
+def forged_merge_never_lands(path):
+    """A merge with a PR's parents and trailers but more in its tree, its run green: it doesn't land either."""
+    with Scenario(path) as sc:
+        sc.riders()
+        git(sc.work, "fetch", "-q", "origin")
+        git(sc.work, "checkout", "-q", "-B", "forged", "origin/train^1")
+        git(sc.work, "merge", "-q", "--no-ff", "--no-commit", "origin/train^2")
+        write_commit(sc.work, {"extra.txt": "slipped in\n"}, git(sc.work, "log", "-1", "--format=%B", "origin/train"))
+        git(sc.work, "push", "-q", "-f", sc.bare, "HEAD:refs/heads/train")
+        stray = sc.tip()
+        expect(sc.gh.bare_rev("refs/heads/train^2") == sc.gh.bare_rev("refs/pull/2/head"), "the forged merge's parents")
+        sc.add_run(5, stray, conclusion="success")
+        time.sleep(1.1)
+        stray_tip_recut(sc, sc.step(), stray)
+
+
 def main():
     os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
     with tempfile.TemporaryDirectory() as root:

@@ -147,15 +147,28 @@ class Train:
 
     def train_merges(self, tip):
         """The train's merges as (PR number, PR head sha), oldest first, and the main it was cut on. Both are
-        written in the commits (Train-Head, Train-Base), so the train keeps no state of its own."""
+        written in the commits (Train-Head, Train-Base), so the train keeps no state of its own. ([], None) unless
+        the tip is exactly what a cut makes, which is what lands on main: from the base, one merge a PR, each the
+        clean merge of the commit before it and the head it names. A push to `train` from anywhere else (another
+        commit, or a merge carrying more than its PR) never lands: the train is cut again."""
         base = re.search(r"^Train-Base: ([0-9a-f]{40})$", git("log", "-1", "--format=%B", tip), re.M)
         if not base:
+            say(f"the train's tip isn't what a cut makes ({tip[:7]} names no base): cutting it again")
             return [], None
-        merges = []
-        for body in git("log", "--first-parent", "--reverse", "--format=%B%x00", f"{base[1]}..{tip}").split("\0"):
+        merges, before = [], base[1]
+        for row in git("log", "--first-parent", "--reverse", "--format=%H %T %P%x01%B%x00", f"{base[1]}..{tip}").split("\0"):
+            if not row.strip():
+                continue
+            shas, body = row.strip().split("\x01", 1)
+            sha, tree, *parents = shas.split()
             head = re.search(r"^Train-Head: (\d+) ([0-9a-f]{40})$", body, re.M)
-            if head:
-                merges.append((int(head[1]), head[2]))
+            if not head or parents != [before, head[2]] or f"Train-Base: {base[1]}" not in body \
+                    or subprocess.run(["git", "merge-tree", "--write-tree", before, head[2]],
+                                      capture_output=True, text=True).stdout.split("\n")[0] != tree:
+                say(f"the train's tip isn't what a cut makes ({sha[:7]}): cutting it again")
+                return [], None
+            merges.append((int(head[1]), head[2]))
+            before = sha
         return merges, base[1]
 
     def tip_age(self, tip):
