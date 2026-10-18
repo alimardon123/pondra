@@ -1355,7 +1355,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `datafusion.runtime.*` is refused. A script sent without a session gets one of its own
    (`temp::of_script`, `#` in its id: no client can name it), ended with the script.
 189. **SQL's CREATE TABLE refuses a table that is there** (`write::there`, 42P07), unless `IF NOT
-   EXISTS` (left as it is: no rows added) or `OR REPLACE` (dropped first). Only `POST
+   EXISTS` (left as it is: no rows added) or `OR REPLACE` (invariant 425). Only `POST
    /tables/{name}` may be sent again (it may add columns at the end). A statement's definition carries its job
    (`TableMeta::made_by`), so two statements making one name at once, on two nodes, never share a table: the leader
    refuses the second 42P07 (`IF NOT EXISTS` takes it for the table that is there: `write::raced`), and only that
@@ -2888,6 +2888,18 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the plan it replaces, which couldn't answer. A query that fits plans as before (TPC-H SF1: the same answers, B/A
    wall 0.98). `harness.py scale`: "a median of 12M values in 3 groups past the memory limit answers…" (3.9 s on a
    0.05 GB node; refused before, 53200); `frugal::tests::medians_…`.
+425. **`CREATE OR REPLACE TABLE` keeps the old table until the new one takes its place, in one commit** (`write::replacing`,
+   `ddl::replace`). The new table is made and filled under a staged name of its job (`sys::staged`: `t$new-…`, hidden,
+   never published), so its query may read the old `t`, and a statement that fails or stops leaves `t` as it was; the
+   leader then sets the old table's entries aside as a drop sets them (UNDROP brings it back) and moves the staged ones
+   under `t`, every entry at the largest `tiered` mark (as a swap, invariant 281), with `t`'s appends held meanwhile
+   (283). A table a materialized view or a task follows is refused before any query runs; a stored view reads the new
+   `t`. A retry of a replace that went through answers duplicate; a staged table a node left behind goes after
+   `PONDRA_STAGED_SECS`, in `tier::expire`'s own scan. A node or `pondra sql` take the same steps (`write::create_as`).
+   Before, the old table was dropped first: a failed statement lost it, and `… AS SELECT … FROM t` read nothing.
+   `harness.py objects`: "CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t", "a CREATE OR REPLACE TABLE
+   that fails leaves the old table as it was…", "…sent again with its job answers duplicate…"; `history_check.py`: "a
+   follower reading t while the leader replaces it 20 times…: never 'no table t'".
 ## Tests: run these before and after any change
 
 ```bash
