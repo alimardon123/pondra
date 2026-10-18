@@ -64,19 +64,12 @@ pub fn job_failed(job: &str) {
 /// the process is outside jemalloc (C libraries' malloc, thread stacks): reviews/soak-heap-0fa48fb.md.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn allocator() -> Vec<(&'static str, u64)> {
-    use std::ffi::{c_void, CString};
-    use std::ptr::null_mut;
-    use tikv_jemalloc_sys::mallctl;
-    // (its statistics are a snapshot, taken when the epoch moves)
-    let mut epoch = 1u64;
-    if unsafe { mallctl(c"epoch".as_ptr(), null_mut(), null_mut(), &mut epoch as *mut u64 as *mut c_void, size_of::<u64>()) } != 0 {
-        return vec![];
+    use crate::jemalloc::{read, write};
+    if !write(c"epoch", 1u64) {
+        return vec![]; // (its statistics are a snapshot, taken when the epoch moves)
     }
-    ["allocated", "active", "resident", "metadata", "retained"].into_iter().filter_map(|k| {
-        let name = CString::new(format!("stats.{k}")).ok()?;
-        let (mut v, mut n) = (0usize, size_of::<usize>());
-        (unsafe { mallctl(name.as_ptr(), &mut v as *mut usize as *mut c_void, &mut n, null_mut(), 0) } == 0).then_some((k, v as u64))
-    }).collect()
+    [("allocated", c"stats.allocated"), ("active", c"stats.active"), ("resident", c"stats.resident"), ("metadata", c"stats.metadata"), ("retained", c"stats.retained")]
+        .into_iter().filter_map(|(k, name)| read::<usize>(name).map(|v| (k, v as u64))).collect()
 }
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn allocator() -> Vec<(&'static str, u64)> { vec![] }

@@ -212,31 +212,22 @@ fn pending(last_stop: Option<Instant>, resident: usize, line: usize, now: Instan
 #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
 mod counters {
     use std::cell::Cell;
-    use std::ffi::{c_char, c_void};
 
     thread_local! {
         // This thread's two counters' addresses, read on its first poll (null where jemalloc has none).
         static POINTERS: Cell<Option<(*const u64, *const u64)>> = const { Cell::new(None) };
     }
 
-    // The address jemalloc keeps for the counter `name` (a NUL-terminated name).
-    fn address(name: &[u8]) -> *const u64 {
-        let mut p: *const u64 = std::ptr::null();
-        let mut len = std::mem::size_of::<*const u64>();
-        // SAFETY: jemalloc writes one pointer, `len` bytes long, into `p`, and is given no new value.
-        let rc = unsafe { tikv_jemalloc_sys::mallctl(name.as_ptr() as *const c_char, &mut p as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
-        if rc == 0 {
-            p
-        } else {
-            std::ptr::null()
-        }
+    // The address jemalloc keeps for the counter `name` (null where it keeps none).
+    fn address(name: &std::ffi::CStr) -> *const u64 {
+        crate::jemalloc::read(name).unwrap_or(std::ptr::null())
     }
 
     pub fn net() -> i64 {
         let (allocated, freed) = POINTERS.with(|c| match c.get() {
             Some(p) => p,
             None => {
-                let p = (address(b"thread.allocatedp\0"), address(b"thread.deallocatedp\0"));
+                let p = (address(c"thread.allocatedp"), address(c"thread.deallocatedp"));
                 c.set(Some(p));
                 p
             }
@@ -251,8 +242,7 @@ mod counters {
     // Every arena's free pages go back to the OS (4096 is `MALLCTL_ARENAS_ALL`); the command takes no value, and a
     // failed purge leaves the pages where they were, so its return code is ignored.
     pub fn purge() {
-        // SAFETY: jemalloc is given the command's name and no buffer: it only gives back pages it has already freed.
-        let _ = unsafe { tikv_jemalloc_sys::mallctl(b"arena.4096.purge\0".as_ptr() as *const c_char, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0) };
+        crate::jemalloc::write(c"arena.4096.purge", ());
     }
 }
 
