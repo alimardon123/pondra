@@ -2799,13 +2799,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
    pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
    of growth could pass the line: every 20 ms near it, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
-   machine's or container's memory; 0 is off, and a host's process has none) stops the oldest client query (`/sql`,
-   `/mcp`, pages, every Postgres statement) that has run 200 ms and started a tenth of the line lower: its future is dropped, it answers 53200, and its transaction
-   fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   machine's or container's memory; 0 is off, and a host's process has none) stops the client query (`/sql`, `/mcp`,
+   pages, every Postgres statement) that grew it. Of those that have run 200 ms and started a tenth of the line lower,
+   that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
+   the oldest. `oom::Meter` reads jemalloc's own thread counters around each poll, and DataFusion's spawned tasks are
+   metered too (its join-set tracer, `oom::start`), so nothing is counted per allocation. Its future is dropped, it
+   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
-   below half the line and stopping only after a second, CI's runner reached 1.75 GB). The same one watch gives the
+   below half the line and stopping only after a second, CI's runner reached 1.75 GB), and "the memory watch stops the
+   request that grew the node, not an older cheap one beside it…" (the cheap one was stopped by age). The same one watch gives the
    hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
    there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
    decoded again and a query can't. A request takes the watch's last reading as it starts (`oom::seen`), never reads
