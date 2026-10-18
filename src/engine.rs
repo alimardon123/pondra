@@ -23,6 +23,16 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A statement's session: `state`'s functions, settings and runtime, with catalogs of its own whose default catalog is
+/// `catalog`, so what the statement registers is its alone. Both hosts copy their kept session this way
+/// (`Lake::session_with`, the page's `statement`).
+pub fn with_catalog(mut state: datafusion::execution::SessionState, catalog: Arc<dyn datafusion::catalog::CatalogProvider>) -> SessionContext {
+    let catalogs = datafusion::catalog::MemoryCatalogProviderList::new();
+    datafusion::catalog::CatalogProviderList::register_catalog(&catalogs, state.config().options().catalog.default_catalog.clone(), catalog);
+    state.register_catalog_list(Arc::new(catalogs));
+    SessionContext::new_with_state(state)
+}
+
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
 /// that need no lake. `Lake::made` adds the node's own.
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
