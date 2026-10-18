@@ -105,6 +105,9 @@ pub struct Shuffle {
     /// This step's partitions too big for one node, shared out (`skew.rs`).
     #[serde(default)]
     pub splits: Vec<crate::skew::Split>,
+    /// A second try of this step: the coordinator ran it again after a failure (`run`).
+    #[serde(default)]
+    pub again: bool,
 }
 
 /// The ways a shuffle is tried, cheapest first.
@@ -636,7 +639,7 @@ async fn spread_once(lake: &Lake, nodes: &[String], mine: usize, sql: &str, tabl
         let big: Vec<(String, TableMeta)> = appends.into_iter().filter(|(t, m)| cut(t, m)).collect();
         let id = uuid::Uuid::new_v4().to_string();
         *LAST.lock().unwrap() = Some(id.clone());
-        let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how, splits: vec![] });
+        let shuffle = |me| Some(Shuffle { id: id.clone(), nodes: nodes.to_vec(), me, step: 0, how, splits: vec![], again: false });
         let mut slices: Vec<Slice> = (0..nodes.len()).map(|me| Slice { sql: sql.into(), parts: vec![], shuffle: shuffle(me), id: id.clone(), whole: vec![], upto, partitions: partitions(), ext: ext.clone(), learned: learned.clone() }).collect();
         for (t, meta) in &big {
             let parts = match scheme.as_ref().filter(|s| s.columns.contains_key(t)) {
@@ -688,7 +691,9 @@ async fn run(lake: &Lake, nodes: &[String], mine: usize, slices: &[Slice], job: 
                     match once(&s).await {
                         Err(first) => {
                             tokio::time::sleep(Duration::from_millis(250)).await;
-                            once(&s).await.map_err(|again| Dead { node: i, why: format!("{first:#}; then {again:#}") }.into())
+                            let mut again = s.clone();
+                            again.shuffle.as_mut().expect("a shuffle").again = true;
+                            once(&again).await.map_err(|second| Dead { node: i, why: format!("{first:#}; then {second:#}") }.into())
                         }
                         ok => ok,
                     }
@@ -1182,6 +1187,15 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     format!("{}[{}]", what.trim(), p.children().iter().map(|c| shape(c)).collect::<Vec<_>>().join(", "))
 }
 
+/// For tests only: a step's first try on this node fails once after it has run, as a reply lost on
+/// the way does (`PONDRA_DEBUG_FAIL_STEP` names the step); the second try goes through.
+fn fails_once(sh: &Shuffle) -> Result<()> {
+    if !sh.again && crate::env::parse::<usize>("PONDRA_DEBUG_FAIL_STEP") == Some(sh.step) {
+        bail!("step {} failed on purpose (PONDRA_DEBUG_FAIL_STEP)", sh.step);
+    }
+    Ok(())
+}
+
 /// One step of a shuffle on this node: the stage below exchange `step` (or, after the last
 /// exchange, the last stage), over the buckets for this node of the exchanges right below it.
 async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill>)> {
@@ -1208,6 +1222,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     let top = received(&job, sh, &top).await?;
     if last {
         let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{}", sh.step)).await?;
+        fails_once(sh)?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
     }
@@ -1227,6 +1242,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
         }
     };
     let sent: Vec<Vec<u64>> = made.iter().map(|to| to.iter().map(|s| s.bytes()).collect()).collect();
+    fails_once(sh)?;
     let mut buckets = job.buckets.lock().unwrap();
     for (to, spill) in made.into_iter().enumerate() {
         buckets.insert((sh.step, to), spill);

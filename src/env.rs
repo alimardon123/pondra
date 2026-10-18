@@ -51,6 +51,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_CORES", Node),
     ("PONDRA_CURSORS_MB", Node),
     ("PONDRA_DATABASE_IDLE_SECS", Node),
+    ("PONDRA_DEBUG_FAIL_STEP", Node),
     ("PONDRA_DEBUG_JOIN_ORDER", Node),
     ("PONDRA_DEBUG_PG", Node),
     ("PONDRA_DEBUG_SPREAD", Node),
