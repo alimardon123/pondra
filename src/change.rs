@@ -545,7 +545,8 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
     let m = match &m.upsert {
         Some(u) => {
             let plain = u.merge(meta, m, false)?;
-            built = if repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
+            // (one row of VALUES, an ORM's upsert, can't repeat a key: no query of the source under the lake's lock)
+            built = if !crate::write::one_row(&u.query) && repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
                 // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
                 if u.update.is_some() {
