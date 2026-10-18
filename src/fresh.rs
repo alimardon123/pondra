@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 type Kept = (Arc<dyn ExecutionPlan>, Arc<TaskContext>);
-crate::per_node!(static PLANS: Mutex<BTreeMap<String, Kept>> = Mutex::new(BTreeMap::new()));
+crate::per_node!(static PLANS: Mutex<BTreeMap<String, Vec<Kept>>> = Mutex::new(BTreeMap::new()));
 
 /// `sql` with table `source` standing for just `rows` (as columns `s`), `prepare` given its logical
 /// plan first (a row-by-row view carries its ids through it; `kind` names what it does). Another
@@ -26,10 +26,15 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
     let parts = if rows.iter().map(|b| b.num_rows()).sum::<usize>() < 1 << 17 { 1 } else { crate::store::partitions() }; // (a flush's rows: one; a view's filling: every core)
     let functions = lake.cat.scan_raw("f/", "f0").await?; // (a function replaced is planned again)
     let key = format!("{}\0{kind}\0{sql}\0{:?}\0{parts}\0{:x}", lake.url, s.fields(), fingerprint(&functions));
-    let kept = PLANS.lock().unwrap().get(&key).cloned();
-    if let Some((plan, task)) = kept {
-        let plan = renew(&plan, &rows)?;
-        return Ok((plan.schema(), datafusion::physical_plan::collect(plan, task).await?));
+    // (a kept plan is taken out while it runs, so two runs at once never share its operators' state, a window's held
+    // rows among it: a run that finds none plans afresh. Taken out here, not cloned: the lock is not held while it runs)
+    let taken = PLANS.lock().unwrap().get_mut(&key).and_then(Vec::pop);
+    if let Some((plan, task)) = taken {
+        let renewed = renew(&plan, &rows)?;
+        let schema = renewed.schema();
+        let out = datafusion::physical_plan::collect(renewed, task.clone()).await?;
+        keep(key, (plan, task)); // (the plan taken out, not the copy that ran: that one holds these rows; a run that failed keeps none)
+        return Ok((schema, out));
     }
     let ctx = crate::query::session(lake, sql, source).await?;
     let alone = registered_none(&ctx);
@@ -46,14 +51,25 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
     let plan = prepare(crate::query::sql(&ctx, sql).await?.into_unoptimized_plan())?;
     let physical = ctx.state().create_physical_plan(&plan).await?;
     let task = ctx.task_ctx();
+    let out = datafusion::physical_plan::collect(physical.clone(), task.clone()).await?;
     if alone && steady(&plan) {
-        let mut plans = PLANS.lock().unwrap();
-        if plans.len() >= 512 {
-            plans.clear(); // (views dropped and fillings leave theirs: a bound, not a policy)
-        }
-        plans.insert(key, (renew(&physical, &[])?, task.clone())); // (holding none of these rows)
+        // (kept only now that its run succeeded: the copy kept shares the windows' state with `physical`, which ran)
+        keep(key, (renew(&physical, &[])?, task)); // (holding none of these rows)
     }
-    Ok((physical.schema(), datafusion::physical_plan::collect(physical, task).await?))
+    Ok((physical.schema(), out))
+}
+
+/// Keeps a plan for the next run of its key, at most 8 a key (writes packed side by side each find one, and plan
+/// nothing); every key is dropped past 512 (views dropped and fillings leave theirs: a bound, not a policy).
+fn keep(key: String, kept: Kept) {
+    let mut plans = PLANS.lock().unwrap();
+    if !plans.contains_key(&key) && plans.len() >= 512 {
+        plans.clear();
+    }
+    let of_key = plans.entry(key).or_default();
+    if of_key.len() < 8 {
+        of_key.push(kept);
+    }
 }
 
 fn fingerprint(raw: &BTreeMap<String, bytes::Bytes>) -> u64 {
