@@ -693,6 +693,7 @@ async fn caught_up(lake: &Lake, table: &str, after: u64, upto: u64, rows: u64) -
 pub async fn expire(lake: &Lake, grace_ms: u64) -> Result<()> {
     let cutoff = crate::log::now_ms().saturating_sub(grace_ms);
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
+    crate::ddl::drop_stale_staged(lake, &mut tables).await?; // (a staged table a node left: let go, and not read below)
     // A table with nothing new in the log moves its mark to the end of it here (tiering skips it,
     // rather than commit nothing), so an idle table doesn't hold retention back.
     let hwm = lake.visible();

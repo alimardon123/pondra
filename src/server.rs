@@ -1087,6 +1087,9 @@ impl App {
 /// Body: a table's definition (see `write::TableSpec`): `[["user","Utf8"],…]`, or
 /// `{"columns": [...], "key": ["user"], "merge": {...}, "publish": [...], "cluster_by": [...]}`.
 async fn create_table(State(app): State<App>, Path(name): Path<String>, headers: HeaderMap, body: String) -> Result<Json<Value>, E> {
+    if crate::sys::hidden(&name) {
+        return Err(E(anyhow::anyhow!("{name} is written by Pondra alone"))); // (a replace's staged table is the leader's own: `write::create_as`)
+    }
     if !cluster_call(&app, &headers) {
         crate::protect::check_table(&app.lake, &name).await?; // (it may add columns to a project's table)
     }

@@ -842,6 +842,7 @@ fn ddl_names(d: &crate::ddl::Ddl) -> Vec<String> {
         Ddl::AlterColumn { table, .. } | Ddl::Constraint { table, .. } => vec![table.clone()],
         Ddl::Object(crate::objects::Op::OrAlterTable { name, .. }) => vec![name.clone()], // (CREATE OR ALTER TABLE changes a table's shape)
         Ddl::Swap { name, with } => vec![name.clone(), with.clone()],
+        Ddl::ReplaceTable { name, .. } => vec![name.clone()],
         Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => ddl_names(then),
         _ => vec![],
     }

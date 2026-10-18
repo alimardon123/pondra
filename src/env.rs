@@ -108,6 +108,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_SPILL_MB", Node),
     ("PONDRA_SPREAD_MB", Node),
     ("PONDRA_SQL_OPTIONS", Node),
+    ("PONDRA_STAGED_SECS", Node),
     ("PONDRA_STATEMENT_TIMEOUT", Node),
     ("PONDRA_STREAM_MB", Node),
     ("PONDRA_TEMP_MB", Node),

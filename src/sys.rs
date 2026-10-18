@@ -106,6 +106,48 @@ pub fn deleted(table: &str) -> String { format!("{table}$deleted") }
 
 pub fn hidden(table: &str) -> bool { table.contains('$') }
 
+/// The name a `CREATE OR REPLACE TABLE` builds its new table under while the statement runs, until
+/// `ddl::replace` puts it in the old one's place (`$`: a name no user gives, as with `deleted`). It
+/// depends on the job, so a statement's retry finds the table its first try made.
+pub fn staged(table: &str, job: &str) -> String { format!("{table}$new-{}", &crate::users::sha256(job)[..8]) }
+
+/// The table a staged name (`staged`) is for, if the name is one.
+pub fn staged_for(name: &str) -> Option<&str> {
+    let (table, h) = name.rsplit_once("$new-")?;
+    (h.len() == 8 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(table)
+}
+
+/// Is a staged table left behind (a node died between its define and its replace) and old enough to
+/// let go? `made_ms` is when it was made; a replace takes seconds, so `secs` (PONDRA_STAGED_SECS) is
+/// far past any statement still running.
+pub fn stale_staged(name: &str, made_ms: u64, now_ms: u64, secs: u64) -> bool {
+    staged_for(name).is_some() && now_ms.saturating_sub(made_ms) >= secs.saturating_mul(1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_names_are_per_job_and_read_back() {
+        let a = staged("s.t", "job-1");
+        assert_eq!(a, staged("s.t", "job-1"), "a retry finds its own staged table");
+        assert_ne!(a, staged("s.t", "job-2"));
+        assert_eq!(staged_for(&a), Some("s.t"));
+        assert_eq!(staged_for("t"), None);
+        assert_eq!(staged_for("t$new-zz"), None, "eight hex digits, as `staged` makes them");
+        assert_eq!(staged_for("t$deleted"), None);
+    }
+
+    #[test]
+    fn a_staged_table_is_stale_only_past_its_time() {
+        let name = staged("t", "job-1");
+        assert!(!stale_staged(&name, 1_000, 1_000 + 86_399_999, 86_400));
+        assert!(stale_staged(&name, 1_000, 1_000 + 86_400_000, 86_400));
+        assert!(!stale_staged("t", 0, u64::MAX, 86_400), "a table that isn't staged is never stale");
+    }
+}
+
 /// Can a file (or manifest) with these column ranges hold one of the rows `dead` names — sorted
 /// (`_row_id`, `_version`) pairs? By its `_row_id` and `_version` ranges; yes if it has none.
 pub fn holds(dead: &[(i64, i64)], stats: &crate::manifest::Stats) -> bool {

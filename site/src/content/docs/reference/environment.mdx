@@ -133,6 +133,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 |---|---|---|
 | `PONDRA_GC_SECS` | `5` for the write-ahead log and `60` for manifests on a local disk; `60` for both on a bucket | how often the catalog's write-ahead-log objects and old manifests are cleared, and how old they must be. Set it to use one value for both |
 | `PONDRA_RUNS_DAYS` | `30` | how many days the run log, `pondra.runs`, keeps. Read when the log is first made |
+| `PONDRA_STAGED_SECS` | `86400` (a day) | how old a table a `CREATE OR REPLACE TABLE` left half made may be before the leader drops it. A replace takes seconds; this is for a node that died between making the new table and putting it in place |
 | `PONDRA_LOAD_RETENTION_SECS` | `5529600` (64 days) | how long `COPY INTO` remembers the files it loaded, so a file loaded again within it, unchanged, is skipped (`pondra.loads` lists them). Shorter for tests |
 | `PONDRA_BUCKET_REQUESTS` | `256` | how many requests a node sends a bucket at once to start with. It halves when the bucket answers 503 or 429, and grows back, up to four times this |
 | `PONDRA_FILE_VERSIONS` | `50` | how many versions of each of the lake's files are kept ([versions](/pondra/reference/http/#files)) |
