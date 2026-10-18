@@ -1209,13 +1209,27 @@ pub fn frugal(ctx: &SessionContext) {
     crate::frugal::mark(o);
 }
 
-/// Run `work`, and once more frugally (`work(true)`, which makes its session with `frugal`) when it ran
-/// out of memory. Every path that runs a query for someone goes through it: a door's query
-/// (`server::query_listed`), `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`), and
-/// `COPY … TO` files (`copy::copy_to`).
-pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(work: impl Fn(bool) -> F) -> Result<T> {
-    match work(false).await {
-        Err(e) if exhausted(&e) && handed().is_none() => work(true).await, // (an answer half sent is never run again: its client has the first rows)
+/// Whether `ctx` is a frugal retry's session (`frugally` made it), for a caller that must know it is the second try.
+pub fn retrying(ctx: &SessionContext) -> bool {
+    let state = ctx.state_ref();
+    let state = state.read();
+    crate::frugal::is_on(state.config().options())
+}
+
+/// Run `work` on `ctx`, and once more when it ran out of memory: on a frugal copy of `ctx` (`frugal`), which
+/// shares its catalogs, so the retry reads the tables the first try registered at the same snapshot, and changes
+/// only its own options (`ctx` itself is never changed). An answer half sent is never run again: its client has
+/// the first rows. The paths that run a query for someone go through it: a door's query (`server::run_query`),
+/// `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`) and a node's share of one (`spmd::insert_share`),
+/// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
+/// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
+pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
+    match work(ctx.clone()).await {
+        Err(e) if exhausted(&e) && handed().is_none() => {
+            let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
+            frugal(&copy);
+            work(copy).await
+        }
         r => r,
     }
 }

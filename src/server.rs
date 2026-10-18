@@ -874,16 +874,14 @@ impl App {
                 Ok(None) => {}
                 Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
             }
-            let run = |frugal: bool| async move {
-                let ctx = session(&self.lake, query, "").await?;
-                let ctx = if files { ctx.enable_url_table() } else { ctx };
-                if explained && !query.to_lowercase().contains("pgjson") {
-                    // (each operator's expected rows: `history::expected`; Postgres's JSON has no place for them)
-                    ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true;
-                }
-                if frugal {
-                    crate::query::frugal(&ctx);
-                }
+            let here = std::time::Instant::now();
+            let ctx = session(&self.lake, query, "").await?;
+            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            if explained && !query.to_lowercase().contains("pgjson") {
+                // (each operator's expected rows: `history::expected`; Postgres's JSON has no place for them)
+                ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true;
+            }
+            let out = crate::query::frugally(&ctx, |ctx| async move {
                 let df = crate::query::sql(&ctx, query).await?;
                 let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
@@ -894,9 +892,7 @@ impl App {
                 let out = if explained { crate::history::explained(out)? } else { out };
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
                 anyhow::Ok(crate::engine::kept(out, &plan))
-            };
-            let here = std::time::Instant::now();
-            let out = crate::query::frugally(run).await?;
+            }).await?;
             // How fast queries go here (`guard.rs`): every query's time, so a quick one is known to be
             // quick and stays here, and the bytes it read only for one long enough to say what rate
             // this node reads at. The time is taken before they are looked up, which isn't the query.

@@ -3683,6 +3683,13 @@ def scale():
         and written(f"COPY ({join}) TO '{folder}/' (FORMAT parquet)")
         and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
     shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
+    # A COPY to a Delta folder that runs out of memory: the first try makes the table and commits no rows, so the retry adds
+    # to that table (`write_outside::copy_table`). Refused (53200) before the retry existed.
+    delta = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-delta-"), "out")
+    checks["COPY … TO a Delta folder that runs out of memory answers on the frugal retry"] = (
+        written(f"COPY ({join}) TO '{delta}' (FORMAT delta)")
+        and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_delta('{delta}')".encode(), headers=owner) == [{"n": 3000000}])
+    shutil.rmtree(os.path.dirname(delta), ignore_errors=True)
     node.kill()
     # A sort of 10 M md5 strings under a 256 MB query pool, on four cores: each partition's sort hands up views into its
     # input's buffers, and the merge above counted those batches whole (66 MB for about 2 MB of rows, so the pool was
