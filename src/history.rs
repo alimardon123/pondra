@@ -102,48 +102,9 @@ pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn E
         crate::learned::note(&note.learned); // (the planner knows them here at once)
         if took >= slow() || note.misestimate.is_some_and(|m| m >= 10.0) {
             let text = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref()).set_show_statistics(true).indent(true).to_string();
-            note.plan = Some(cut(expected(&text), 64 << 10));
+            note.plan = Some(cut(crate::explain::expected(&text), 64 << 10));
         }
     });
-}
-
-/// A plan's text with each operator's estimate as `expected_rows=n` before its metrics, in place of
-/// DataFusion's `statistics=[…]` (its every column's range and bytes, too long to read): `EXPLAIN`'s
-/// physical plans, `EXPLAIN ANALYZE`'s and the plans kept here. An operator nothing is known about
-/// shows none.
-pub fn expected(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for line in text.split_inclusive('\n') {
-        let Some(at) = line.rfind(", statistics=[Rows=") else {
-            out.push_str(line);
-            continue;
-        };
-        let (head, stats) = (&line[..at], &line[at + ", statistics=[Rows=".len()..]);
-        let rows = stats.split(',').next().unwrap_or("");
-        let rows = rows.strip_prefix("Exact(").or_else(|| rows.strip_prefix("Inexact(")).and_then(|r| r.strip_suffix(')'));
-        let (op, metrics) = head.find(", metrics=[").map_or((head, ""), |m| head.split_at(m));
-        out.push_str(op);
-        if let Some(rows) = rows {
-            out.push_str(if op.contains(':') { ", " } else { ": " });
-            out.push_str("expected_rows=");
-            out.push_str(rows);
-        }
-        out.push_str(metrics);
-        out.push_str(if line.ends_with('\n') { "\n" } else { "" });
-    }
-    out
-}
-
-/// `EXPLAIN`'s rows with each operator's estimate made readable (`expected`).
-pub fn explained(batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
-    batches.into_iter().map(|b| {
-        let schema = b.schema();
-        let columns = b.columns().iter().zip(schema.fields()).map(|(c, f)| match (f.name().as_str(), c.as_any().downcast_ref::<StringArray>()) {
-            ("plan", Some(text)) => Arc::new(text.iter().map(|t| t.map(expected)).collect::<StringArray>()) as ArrayRef,
-            _ => c.clone(),
-        });
-        Ok(RecordBatch::try_new(schema.clone(), columns.collect())?)
-    }).collect()
 }
 
 /// The worst ratio between a join's expected and actual rows, where either is 1,000 or more: where a

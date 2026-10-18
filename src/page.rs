@@ -147,9 +147,11 @@ impl Page {
     }
 
     /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`plan`), then the
-    /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88).
+    /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88). An
+    /// EXPLAIN's rows are made readable as a node's are (`explain::answered`).
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let batches = crate::engine::collect(self.plan(text).await?).await?;
+        let batches = if crate::explain::asked(text) { crate::explain::answered(batches)? } else { batches };
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
@@ -160,6 +162,7 @@ impl Page {
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
         let (ctx, overlay) = self.statement()?;
+        crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
         self.given(&overlay, &expanded).await?;
         crate::engine::sql_checked(&ctx, &expanded, may).await
     }
@@ -550,6 +553,25 @@ mod tests {
             assert!(text.contains("Output Rows") && text.contains("Duration"), "{text}");
             // The page's tables are still there after it.
             assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
+        });
+    }
+
+    /// An EXPLAIN answers as a node's does (`explain::answered`): each operator's expected rows, with no DataFusion
+    /// statistics, plain and ANALYZE alike; and a file it reads is named as SQL wrote it, not by its `ext:` name.
+    #[test]
+    fn explain_answers_as_a_node_does() {
+        futures::executor::block_on(async {
+            let page = page_with_tables().await;
+            for sql in ["EXPLAIN SELECT count(*) FROM orders", "EXPLAIN ANALYZE SELECT count(*) FROM orders"] {
+                let answer = page.request("POST", "/sql?format=csv", &[], sql.into()).await;
+                let text = String::from_utf8_lossy(&answer.body).into_owned();
+                assert_eq!(answer.status, 200, "{text}");
+                assert!(text.contains("expected_rows=") && !text.contains("statistics=["), "{sql}\n{text}");
+            }
+            assert_eq!(put(&page, "x.csv", ORDERS).await.status, 200);
+            let file = page.request("POST", "/sql?format=csv", &[], "EXPLAIN SELECT * FROM 'files/x.csv'".into()).await;
+            let text = String::from_utf8_lossy(&file.body).into_owned();
+            assert!(text.contains("'files/x.csv'") && !text.contains("ext:"), "{text}");
         });
     }
 

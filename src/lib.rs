@@ -20,6 +20,7 @@ pub mod ext_names;
 pub mod lake_files;
 pub mod sketch;
 mod asof;
+mod explain;
 mod sparksql;
 mod past_names;
 mod diff;
