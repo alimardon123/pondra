@@ -1125,9 +1125,10 @@ fn expression(e: &mut Expr) -> Result<()> {
                         false => format!("{call}({}, {keys})", a[0]),
                     })?;
                 }
-                // (Postgres's sha functions take only a bytea: a string literal there is one, so `sha256('\x01')`
-                // hashes the byte 0x01, as Postgres does; a column or any other expression is left as it is)
-                (fname, 1) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
+                // (Postgres's bytea-only functions read a string literal as their first argument as a bytea, of any
+                // arity: `sha256('\x01')` hashes the byte 0x01, and `encode('\x01', 'hex')` is `01`, as Postgres does;
+                // a column or any other expression is left as it is)
+                (fname, _) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
                     if let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })) = a.first() {
                         let bytes = crate::pg_bytea::parse(s).map_err(|e| crate::codes::coded(e.code, e.message))?;
                         let lit = expr(&crate::pg_bytea::sql(&bytes))?;
@@ -1781,6 +1782,9 @@ mod tests {
             expression(&mut e).map(|_| e.to_string())
         };
         assert_eq!(call("sha256('\\x01')").unwrap(), "sha256(X'01')");
+        assert_eq!(call("encode('\\x01', 'hex')").unwrap(), "encode(X'01', 'hex')");
+        assert_eq!(call("get_byte('ab', 0)").unwrap(), "get_byte(X'6162', 0)");
+        assert_eq!(call("decode('ff', 'hex')").unwrap(), "decode('ff', 'hex')");
         assert_eq!(call("sha512('a\\\\b')").unwrap(), "sha512(X'615c62')");
         assert_eq!(call("sha256(t.a)").unwrap(), "sha256(t.a)");
         assert_eq!(call("md5('\\x01')").unwrap(), "md5('\\x01')");

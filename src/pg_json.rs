@@ -132,12 +132,22 @@ fn type_name(e: &Expr, f: &Field) -> &'static str {
     if let Some(mark) = json_mark(f) {
         return if mark == "json" { "json" } else { "jsonb" };
     }
-    match f.data_type() {
+    // (a text literal is Postgres's `unknown`, not `text`)
+    if is_text(f.data_type()) && matches!(e, Expr::Literal(..)) {
+        return "unknown";
+    }
+    type_word(f.data_type())
+}
+
+/// The name Postgres gives a type in its messages (`integer`, `text[]`, `bytea`), as a refusal of a function names it.
+pub(crate) fn type_word(t: &DataType) -> &'static str {
+    match t {
         DataType::Null => "unknown",
-        t if is_text(t) => if matches!(e, Expr::Literal(..)) { "unknown" } else { "text" },
+        t if is_text(t) => "text",
         t if is_list(t) => "text[]",
         t if is_integer(t) => "integer",
         DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(..) | DataType::Decimal256(..) => "numeric",
+        t if crate::engine::bytes(t) => "bytea",
         _ => "unknown",
     }
 }

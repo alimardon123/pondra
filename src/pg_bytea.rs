@@ -6,12 +6,10 @@
 
 use crate::engine::bytes as is_binary;
 use crate::pg_functions::{function, int_arg, text_arg};
-use crate::pg_json::is_text;
+use crate::pg_json::{is_text, type_word};
 use crate::pg_json_make::refuse;
-use base64::alphabet;
 use base64::engine::general_purpose::STANDARD;
-use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use base64::{DecodeError, Engine as _};
+use base64::Engine as _;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
@@ -121,9 +119,10 @@ pub fn escape(bytes: &[u8]) -> String {
 /// A bytea as a SQL literal DataFusion reads as Binary: `X'01ff'` (`X''` for none).
 pub fn sql(bytes: &[u8]) -> String { format!("X'{}'", digits(bytes)) }
 
-/// Postgres's functions that take only a bytea in their first argument: a string literal there is a bytea literal,
-/// read as `parse` reads it (friendly.rs's `expression`).
-pub const TAKES_BYTEA: &[&str] = &["sha224", "sha256", "sha384", "sha512"];
+/// Postgres's functions whose first argument only a bytea takes: a string literal there is a bytea literal, read as
+/// `parse` reads it (friendly.rs's `expression`). `get_bit` and `set_bit` are not here: Postgres has them over a bit
+/// string too, which wins for a bare literal.
+pub const TAKES_BYTEA: &[&str] = &["sha224", "sha256", "sha384", "sha512", "encode", "get_byte", "set_byte", "convert_from"];
 
 /// The hex digits of `bytes`, two a byte, in lower case.
 fn digits(bytes: &[u8]) -> String {
@@ -162,12 +161,14 @@ fn invalid_at(bytes: &[u8], at: usize) -> Bad {
 // ---------------------------------------------------------------- the functions
 
 /// A DataFusion function Postgres also has over bytea: a call whose first argument is binary is Postgres's bytea
-/// function (`over`), any other call DataFusion's own, as it was.
+/// function (`over`), any other call DataFusion's own, as it was. It answers to `name` and `aliases`.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct OrBytes {
     inner: Arc<ScalarUDF>,
     over: Over,
     signature: Signature,
+    name: String,
+    aliases: Vec<String>,
 }
 
 /// The bytea function a call is: the one of DataFusion's text functions it stands in for.
@@ -175,7 +176,6 @@ struct OrBytes {
 enum Over {
     Octets,
     Bits,
-    Chars,
     Position,
     Trim(Side),
 }
@@ -192,7 +192,7 @@ impl Over {
     /// The arguments a call takes: one for a length, two for a search or a trim.
     fn arity(self) -> usize {
         match self {
-            Over::Octets | Over::Bits | Over::Chars => 1,
+            Over::Octets | Over::Bits => 1,
             Over::Position | Over::Trim(_) => 2,
         }
     }
@@ -207,9 +207,21 @@ impl Over {
 }
 
 /// `inner`, which takes bytea too: a call whose first argument is binary is `over`'s, any other call is `inner`'s.
+/// It keeps `inner`'s name and aliases.
 fn or_bytes(inner: Arc<ScalarUDF>, over: Over) -> ScalarUDF {
+    let (name, aliases) = (inner.name().to_string(), inner.aliases().to_vec());
+    with_names(inner, over, name, aliases)
+}
+
+/// `or_bytes`, named `name` alone, with no aliases: `length` is registered this way, so DataFusion's `character_length`
+/// keeps its own names.
+fn or_bytes_as(inner: Arc<ScalarUDF>, over: Over, name: &str) -> ScalarUDF {
+    with_names(inner, over, name.to_string(), Vec::new())
+}
+
+fn with_names(inner: Arc<ScalarUDF>, over: Over, name: String, aliases: Vec<String>) -> ScalarUDF {
     let signature = Signature::user_defined(inner.signature().volatility);
-    ScalarUDF::new_from_impl(OrBytes { inner, over, signature })
+    ScalarUDF::new_from_impl(OrBytes { inner, over, signature, name, aliases })
 }
 
 impl OrBytes {
@@ -225,10 +237,10 @@ impl OrBytes {
 
 impl ScalarUDFImpl for OrBytes {
     fn name(&self) -> &str {
-        self.inner.name()
+        &self.name
     }
     fn aliases(&self) -> &[String] {
-        self.inner.aliases()
+        &self.aliases
     }
     fn signature(&self) -> &Signature {
         &self.signature
@@ -238,7 +250,7 @@ impl ScalarUDFImpl for OrBytes {
     }
     fn coerce_types(&self, types: &[DataType]) -> DfResult<Vec<DataType>> {
         match types.first() {
-            // Binary stays binary; text stays text, which `bytes_arg` reads as Postgres reads a literal. The count is
+            // Binary stays binary; text stays text, which `literal_bytes` reads as Postgres reads a literal. The count is
             // checked where the answer's type is made: DataFusion turns an error from here into text, code and all.
             Some(first) if is_binary(first) => Ok(types.iter().map(|t| if is_text(t) { t.clone() } else { DataType::Binary }).collect()),
             _ => {
@@ -272,16 +284,16 @@ impl ScalarUDFImpl for OrBytes {
 
 /// Postgres's answer for every row of a bytea call: `a` holds the call's arguments, `n` rows each.
 fn bytea_answer(over: Over, a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let hay = bytes_arg(&a[0])?;
+    let hay = literal_bytes(&a[0])?;
     Ok(match over {
-        Over::Octets | Over::Chars => int32s((0..n).map(|i| value(&hay, i).map(|v| v.len() as i32))),
+        Over::Octets => int32s((0..n).map(|i| value(&hay, i).map(|v| v.len() as i32))),
         Over::Bits => int32s((0..n).map(|i| value(&hay, i).map(|v| 8 * v.len() as i32))),
         Over::Position => {
-            let needle = bytes_arg(&a[1])?;
+            let needle = literal_bytes(&a[1])?;
             int32s((0..n).map(|i| Some(position(value(&hay, i)?, value(&needle, i)?))))
         }
         Over::Trim(side) => {
-            let set = bytes_arg(&a[1])?;
+            let set = literal_bytes(&a[1])?;
             binaries((0..n).map(|i| Some(trim(value(&hay, i)?, value(&set, i)?, side).to_vec())))
         }
     })
@@ -301,13 +313,16 @@ pub fn register(ctx: &SessionContext) {
     for (inner, over) in [
         (datafusion::functions::string::octet_length(), Over::Octets),
         (datafusion::functions::string::bit_length(), Over::Bits),
-        (datafusion::functions::unicode::character_length(), Over::Chars),
         (datafusion::functions::string::btrim(), Over::Trim(Side::Both)),
         (datafusion::functions::string::ltrim(), Over::Trim(Side::Leading)),
         (datafusion::functions::string::rtrim(), Over::Trim(Side::Trailing)),
     ] {
         ctx.register_udf(or_bytes(inner, over));
     }
+    // Postgres's `length` takes a bytea and counts its bytes; over text it is DataFusion's count of characters. It is
+    // registered after the loop and under no alias, so `length` is this one, while `character_length` and
+    // `char_length` stay DataFusion's, since Postgres has no `character_length(bytea)`.
+    ctx.register_udf(or_bytes_as(datafusion::functions::unicode::character_length(), Over::Octets, "length"));
     let pure = |n: usize| Signature::any(n, Volatility::Immutable);
     for f in [
         function("get_byte", pure(2), |_| DataType::Int32, get_byte),
@@ -325,7 +340,7 @@ pub fn register(ctx: &SessionContext) {
 
 /// A bytea argument as an array of binary: binary as it is, text read as Postgres reads a literal (`'\x01'` is one
 /// byte, not four), NULL where the argument is NULL.
-fn bytes_arg(a: &ArrayRef) -> DfResult<BinaryArray> {
+fn literal_bytes(a: &ArrayRef) -> DfResult<BinaryArray> {
     if is_binary(a.data_type()) {
         return Ok(cast(a, &DataType::Binary)?.as_binary::<i32>().clone());
     }
@@ -336,6 +351,45 @@ fn bytes_arg(a: &ArrayRef) -> DfResult<BinaryArray> {
         .map(|v| v.map(|s| parse(s).map_err(as_refusal)).transpose())
         .collect::<DfResult<Vec<_>>>()?;
     Ok(BinaryArray::from_iter(read))
+}
+
+/// A bytea function's first argument as binary: binary as it is, text as its UTF-8 bytes (a column's or an
+/// expression's text, as DataFusion's `encode` reads it; a string literal there was made a bytea where SQL came in,
+/// friendly.rs), and anything else refused 42883 as Postgres refuses it.
+fn bytes_arg(name: &str, a: &ArrayRef) -> DfResult<BinaryArray> {
+    let a = unpacked(a)?;
+    match a.data_type() {
+        DataType::Null => Ok(BinaryArray::new_null(a.len())),
+        t if is_binary(t) => literal_bytes(&a),
+        t if is_text(t) => Ok(cast(&a, &DataType::Binary)?.as_binary::<i32>().clone()),
+        t => Err(refuse("42883", format!("function {name}({}, …) does not exist", type_word(t)))),
+    }
+}
+
+/// A text function's first argument (`decode`, `convert_to`) as text: text as it is, a binary's bytes when they are
+/// UTF-8 (DataFusion's `decode` takes a binary; bytes that aren't are refused as `utf8` refuses them, 22021), and
+/// anything else refused 42883 as Postgres refuses it.
+fn text_first(name: &str, a: &ArrayRef) -> DfResult<Vec<Option<String>>> {
+    let a = unpacked(a)?;
+    match a.data_type() {
+        DataType::Null => Ok(vec![None; a.len()]),
+        t if is_text(t) => text_arg(&a),
+        t if is_binary(t) => {
+            let bytes = cast(&a, &DataType::Binary)?;
+            let texts = bytes.as_binary::<i32>().iter().map(|v| v.map(|b| utf8(b).map_err(as_refusal)).transpose());
+            texts.collect::<DfResult<Vec<Option<String>>>>()
+        }
+        t => Err(refuse("42883", format!("function {name}({}, …) does not exist", type_word(t)))),
+    }
+}
+
+/// A dictionary of text or binary as its values (a Hive partition column of `read_parquet` is one); anything else as
+/// it is.
+fn unpacked(a: &ArrayRef) -> DfResult<ArrayRef> {
+    match a.data_type() {
+        DataType::Dictionary(_, values) if is_text(values) || is_binary(values) => Ok(cast(a, values)?),
+        _ => Ok(a.clone()),
+    }
 }
 
 /// A `Bad` as the refusal it is: its SQLSTATE and message.
@@ -387,7 +441,7 @@ fn place(at: i64, last: i64) -> DfResult<usize> {
 }
 
 fn get_byte(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, pos) = (bytes_arg(&a[0])?, int_arg(&a[1])?);
+    let (data, pos) = (bytes_arg("get_byte", &a[0])?, int_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), pos[i]) {
             (Some(v), Some(at)) => Ok(Some(i32::from(v[place(at, v.len() as i64 - 1)?]))),
@@ -398,7 +452,7 @@ fn get_byte(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn set_byte(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, pos, new) = (bytes_arg(&a[0])?, int_arg(&a[1])?, int_arg(&a[2])?);
+    let (data, pos, new) = (bytes_arg("set_byte", &a[0])?, int_arg(&a[1])?, int_arg(&a[2])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), pos[i], new[i]) {
             (Some(v), Some(at), Some(byte)) => {
@@ -413,7 +467,7 @@ fn set_byte(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn get_bit(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, pos) = (bytes_arg(&a[0])?, int_arg(&a[1])?);
+    let (data, pos) = (bytes_arg("get_bit", &a[0])?, int_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), pos[i]) {
             (Some(v), Some(at)) => {
@@ -427,7 +481,7 @@ fn get_bit(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn set_bit(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, pos, new) = (bytes_arg(&a[0])?, int_arg(&a[1])?, int_arg(&a[2])?);
+    let (data, pos, new) = (bytes_arg("set_bit", &a[0])?, int_arg(&a[1])?, int_arg(&a[2])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), pos[i], new[i]) {
             (Some(v), Some(at), Some(bit)) => {
@@ -461,7 +515,7 @@ fn check_encoding(func: &str, name: &str) -> DfResult<()> {
 }
 
 fn convert_to(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (texts, names) = (text_arg(&a[0])?, text_arg(&a[1])?);
+    let (texts, names) = (text_first("convert_to", &a[0])?, text_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (&texts[i], &names[i]) {
             (Some(text), Some(name)) => {
@@ -475,7 +529,7 @@ fn convert_to(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn convert_from(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, names) = (bytes_arg(&a[0])?, text_arg(&a[1])?);
+    let (data, names) = (bytes_arg("convert_from", &a[0])?, text_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), &names[i]) {
             (Some(v), Some(name)) => {
@@ -489,7 +543,7 @@ fn convert_from(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn encode(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (data, formats) = (bytes_arg(&a[0])?, text_arg(&a[1])?);
+    let (data, formats) = (bytes_arg("encode", &a[0])?, text_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (value(&data, i), &formats[i]) {
             (Some(v), Some(format)) => encode_as(v, format).map(Some),
@@ -500,7 +554,7 @@ fn encode(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 }
 
 fn decode(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-    let (texts, formats) = (text_arg(&a[0])?, text_arg(&a[1])?);
+    let (texts, formats) = (text_first("decode", &a[0])?, text_arg(&a[1])?);
     let answers = (0..n)
         .map(|i| match (&texts[i], &formats[i]) {
             (Some(text), Some(format)) => decode_as(text, format).map(Some),
@@ -521,8 +575,8 @@ fn encode_as(bytes: &[u8], format: &str) -> DfResult<String> {
     }
 }
 
-/// `decode(text, format)`: the bytes of a text in one of its formats. `base64pad` reads as `base64` does, since the
-/// padding may be left off either way.
+/// `decode(text, format)`: the bytes of a text in one of its formats. `base64pad` is DataFusion's name, which Postgres
+/// doesn't have; it reads as `base64` does.
 fn decode_as(text: &str, format: &str) -> DfResult<Vec<u8>> {
     match format.to_ascii_lowercase().as_str() {
         "hex" => unhex(text).map_err(as_refusal),
@@ -549,22 +603,57 @@ fn base64_lines(bytes: &[u8]) -> String {
     out
 }
 
-/// Postgres's base64 reading: whitespace skipped, the padding optional, and bits past the last whole byte ignored.
-const READ_BASE64: GeneralPurpose = GeneralPurpose::new(
-    &alphabet::STANDARD,
-    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent).with_decode_allow_trailing_bits(true),
-);
-
-fn unbase64(text: &str) -> DfResult<Vec<u8>> {
-    let stripped: String = text.chars().filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\r')).collect();
-    READ_BASE64.decode(&stripped).map_err(|e| match e {
-        DecodeError::InvalidByte(_, b'=') => refuse("22023", "unexpected \"=\" while decoding base64 sequence"),
-        DecodeError::InvalidByte(at, _) => {
-            let symbol = stripped.get(at..).and_then(|rest| rest.chars().next()).unwrap_or('\u{fffd}');
-            refuse("22023", format!("invalid symbol \"{symbol}\" found while decoding base64 sequence"))
-        }
-        _ => refuse("22023", "invalid base64 end sequence"),
+/// A base64 character's value: its place in A–Z a–z 0–9 + /, None for any other character.
+fn base64_value(c: char) -> Option<u32> {
+    Some(match c {
+        'A'..='Z' => c as u32 - 'A' as u32,
+        'a'..='z' => c as u32 - 'a' as u32 + 26,
+        '0'..='9' => c as u32 - '0' as u32 + 52,
+        '+' => 62,
+        '/' => 63,
+        _ => return None,
     })
+}
+
+/// Postgres 16's base64 reading (`pg_base64_decode`), as hand-written so each refusal says what Postgres says. Spaces,
+/// tabs and line breaks are skipped; `=` ends a group of two or three characters, and a group after it gives as many
+/// bytes as the padded one did; a last group that isn't whole is refused.
+fn unbase64(text: &str) -> DfResult<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3);
+    let (mut buf, mut pos, mut end) = (0u32, 0usize, 0usize);
+    for c in text.chars() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r') {
+            continue;
+        }
+        let value = if c == '=' {
+            if end == 0 {
+                match pos {
+                    2 => end = 1,
+                    3 => end = 2,
+                    _ => return Err(refuse("22023", "unexpected \"=\" while decoding base64 sequence")),
+                }
+            }
+            0
+        } else {
+            base64_value(c).ok_or_else(|| refuse("22023", format!("invalid symbol \"{c}\" found while decoding base64 sequence")))?
+        };
+        buf = (buf << 6) | value;
+        pos += 1;
+        if pos == 4 {
+            out.push((buf >> 16) as u8);
+            if end == 0 || end > 1 {
+                out.push((buf >> 8) as u8);
+            }
+            if end == 0 || end > 2 {
+                out.push(buf as u8);
+            }
+            (buf, pos) = (0, 0);
+        }
+    }
+    if pos != 0 {
+        return Err(refuse("22023", "invalid base64 end sequence"));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -732,15 +821,15 @@ mod tests {
     #[test]
     fn lengths_of_bytes() {
         assert_eq!(ints(bytea_answer(Over::Octets, &[bin(&[Some(&[1, 255])])], 1)), vec![Some(2)]);
-        assert_eq!(ints(bytea_answer(Over::Chars, &[bin(&[Some(&[0xc3, 0xa9])])], 1)), vec![Some(2)]);
+        assert_eq!(ints(bytea_answer(Over::Octets, &[bin(&[Some(&[0xc3, 0xa9])])], 1)), vec![Some(2)]);
         assert_eq!(ints(bytea_answer(Over::Bits, &[bin(&[Some(&[1, 255])])], 1)), vec![Some(16)]);
     }
 
     #[test]
     fn a_text_argument_is_read_as_a_literal() {
-        let read = bytes_arg(&txt(&[Some("\\x01"), Some("\\xc3a9"), None])).unwrap();
+        let read = literal_bytes(&txt(&[Some("\\x01"), Some("\\xc3a9"), None])).unwrap();
         assert_eq!(read.iter().map(|v| v.map(<[u8]>::to_vec)).collect::<Vec<_>>(), vec![Some(vec![1]), Some(vec![0xc3, 0xa9]), None]);
-        match bytes_arg(&txt(&[Some("\\x0")])) {
+        match literal_bytes(&txt(&[Some("\\x0")])) {
             Err(e) => assert_eq!(refusal_of(&e).0, "22023"),
             Ok(_) => panic!("an odd hex digit count answered"),
         }
@@ -778,13 +867,35 @@ mod tests {
     fn base64_reads_what_postgres_reads() {
         assert_eq!(decode_as("YWJj", "base64").unwrap(), b"abc");
         assert_eq!(decode_as("YW Jj\n", "BASE64").unwrap(), b"abc");
-        assert_eq!(decode_as("YQ", "base64").unwrap(), b"a");
-        assert_eq!(decode_as("YR", "base64").unwrap(), b"a");
         let refused = |text: &str| refusal_of(&decode_as(text, "base64").unwrap_err());
         assert_eq!(refused("Y=Q="), ("22023", "unexpected \"=\" while decoding base64 sequence".to_string()));
         assert_eq!(refused("Y!"), ("22023", "invalid symbol \"!\" found while decoding base64 sequence".to_string()));
         assert_eq!(refused("YWJjé"), ("22023", "invalid symbol \"é\" found while decoding base64 sequence".to_string()));
         assert_eq!(refused("Y"), ("22023", "invalid base64 end sequence".to_string()));
+    }
+
+    #[test]
+    fn unbase64_reads_as_postgres_16_does() {
+        assert_eq!(unbase64("YQ==").unwrap(), b"a");
+        assert_eq!(unbase64("YWI=").unwrap(), b"ab");
+        assert_eq!(unbase64("YWJj").unwrap(), b"abc");
+        assert_eq!(unbase64("YW Jj\n").unwrap(), b"abc");
+        assert_eq!(unbase64("YQ==YQ==").unwrap(), b"aa");
+        assert_eq!(unbase64("WB==").unwrap(), b"X");
+        assert_eq!(unbase64("").unwrap(), Vec::<u8>::new());
+        assert_eq!(unbase64("dG9tbXk=").unwrap(), b"tommy");
+    }
+
+    #[test]
+    fn unbase64_refuses_as_postgres_16_does() {
+        let refused = |text: &str| refusal_of(&unbase64(text).unwrap_err());
+        let end = ("22023", "invalid base64 end sequence".to_string());
+        for text in ["invalid", "YQ", "YQ==Y", "cXdlcXc=="] {
+            assert_eq!(refused(text), end, "{text}");
+        }
+        assert_eq!(refused("Y=Q="), ("22023", "unexpected \"=\" while decoding base64 sequence".to_string()));
+        assert_eq!(refused("YQ$="), ("22023", "invalid symbol \"$\" found while decoding base64 sequence".to_string()));
+        assert_eq!(refused("YQé="), ("22023", "invalid symbol \"é\" found while decoding base64 sequence".to_string()));
     }
 
     #[test]
@@ -850,5 +961,32 @@ mod tests {
         assert_eq!(refused_by(&ctx, "SELECT get_byte(X'01', 5)").await.0, "2202E");
         assert_eq!(refused_by(&ctx, "SELECT convert_from(X'ff', 'UTF8')").await.0, "22021");
         assert_eq!(refused_by(&ctx, "SELECT btrim(X'00')").await.0, "42883");
+    }
+
+    /// Whether `sql`'s one answer is NULL.
+    async fn null_of(ctx: &SessionContext, sql: &str) -> bool {
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        batches[0].column(0).is_null(0)
+    }
+
+    #[tokio::test]
+    async fn a_session_refuses_and_answers_arguments_as_postgres_16_does() {
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        assert_eq!(refused_by(&ctx, "SELECT encode(12, 'hex')").await, ("42883", "function encode(integer, …) does not exist".to_string()));
+        assert_eq!(refused_by(&ctx, "SELECT convert_to(12, 'UTF8')").await.0, "42883");
+        assert_eq!(refused_by(&ctx, "SELECT decode(12, 'hex')").await.0, "42883");
+        assert_eq!(refused_by(&ctx, "SELECT decode(X'8f50', 'base64')").await.0, "22021");
+        assert_eq!(refused_by(&ctx, "SELECT decode('invalid', 'base64')").await.0, "22023");
+        refused_by(&ctx, "SELECT char_length(X'c328')").await;
+        for sql in ["SELECT encode(NULL, 'hex')", "SELECT decode(NULL, 'hex')", "SELECT get_byte(NULL, 0)"] {
+            assert!(null_of(&ctx, sql).await, "{sql} is not NULL");
+        }
+        assert_eq!(value_of(&ctx, "SELECT decode(X'59513d3d', 'base64')").await, "61");
+        assert_eq!(value_of(&ctx, "SELECT length(X'c328')").await, "2");
+        assert_eq!(value_of(&ctx, "SELECT length('é')").await, "1");
+        assert_eq!(value_of(&ctx, "SELECT octet_length(X'c328')").await, "2");
+        assert_eq!(value_of(&ctx, "SELECT encode(arrow_cast('tom', 'Utf8View'), 'base64')").await, "dG9t");
+        // (a dictionary of text, as a Hive partition column of read_parquet is, reads as its values)
+        assert_eq!(value_of(&ctx, "SELECT encode(arrow_cast('tom', 'Dictionary(Int32, Utf8)'), 'hex')").await, "746f6d");
     }
 }
