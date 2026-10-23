@@ -184,8 +184,8 @@ async fn view(app: &App, ask: &apply::Ask, who: Who) -> Result<View> {
 /// Whether a statement names `full`: by its full name, or unqualified by its short name when only one line
 /// is that short name (`ALTER TABLE memos` in a project's schema means `sales.memos`, when nothing else is).
 fn hits(named: &[String], full: &str, all: &[String]) -> bool {
-    let short = crate::ddl::split(full).1;
-    named.iter().any(|n| n == full || (n == short && !n.contains('.') && all.iter().filter(|x| crate::ddl::split(x.as_str()).1 == short).count() == 1))
+    let short = crate::text::split(full).1;
+    named.iter().any(|n| n == full || (n == short && !n.contains('.') && all.iter().filter(|x| crate::text::split(x.as_str()).1 == short).count() == 1))
 }
 
 #[derive(Deserialize)]
@@ -306,7 +306,7 @@ fn write_line(app: &App, v: &View, l: &Line, work: &mut BTreeMap<String, String>
     }
     let to = l.to.clone().unwrap_or_else(|| l.name.clone());
     let names: Vec<&str> = work.keys().filter_map(|p| p.strip_prefix("migrations/")).collect();
-    let name = format!("{}-rename-{}.sql", number(&names), crate::ddl::split(&to).1);
+    let name = format!("{}-rename-{}.sql", number(&names), crate::text::split(&to).1);
     let text = migration(app, v, l, &to);
     work.insert(format!("migrations/{name}"), text.clone());
     out.insert(format!("migrations/{name}"), Some(text));
@@ -421,8 +421,8 @@ fn migration(app: &App, v: &View, l: &Line, to: &str) -> String {
         sql.push_str(&format!("DROP {} IF EXISTS {};\n", d.kind.word().to_uppercase(), quoted(&d.name)));
     }
     if from != to {
-        let rename = match crate::ddl::split(from).0 == crate::ddl::split(to).0 {
-            true => crate::ddl::split(to).1, // (in the same schema: its short name)
+        let rename = match crate::text::split(from).0 == crate::text::split(to).0 {
+            true => crate::text::split(to).1, // (in the same schema: its short name)
             false => to,
         };
         sql.push_str(&format!("ALTER TABLE {} RENAME TO {rename};\n", quoted(from)));

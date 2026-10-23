@@ -885,7 +885,7 @@ impl VisitorMut for Expander<'_> {
                 Ok(None) => {}
             }
         }
-        match crate::past::table_factor(self.name, t) {
+        match crate::past_names::table_factor(self.name, t) {
             Ok(true) => return ControlFlow::Continue(()),
             Err(e) => return ControlFlow::Break(e),
             Ok(false) => {}

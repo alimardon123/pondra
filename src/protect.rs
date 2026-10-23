@@ -95,8 +95,8 @@ pub(crate) fn named(sql: &str) -> Vec<String> {
     let Some(stmt) = crate::write::parse(sql) else { return vec![] };
     touched(&stmt).into_iter().filter_map(|t| match t {
         Touch::Object(n) => {
-            let (s, t) = ddl::split(&n);
-            Some(ddl::join(s, t))
+            let (s, t) = crate::text::split(&n);
+            Some(crate::text::join(s, t))
         }
         _ => None,
     }).collect()
@@ -106,7 +106,7 @@ pub(crate) fn named(sql: &str) -> Vec<String> {
 fn touched(stmt: &Stmt) -> Vec<Touch> {
     match stmt {
         Stmt::Create(c) if c.temporary => vec![], // (a session's: `temp.rs`)
-        Stmt::Create(c) => vec![Touch::Object(crate::write::object(&c.name))],
+        Stmt::Create(c) => vec![Touch::Object(crate::text::object(&c.name))],
         Stmt::Define(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) => vec![Touch::Object(t.clone())],
         Stmt::Ddl(ds) => ds.iter().flat_map(ddl_touches).collect(),
         Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => vec![],

@@ -445,7 +445,7 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
 /// A shared table, as a table of files: the provider's answer for its newest version (or the
 /// spec's `version`), each file read through its link (`share://`), deletion vectors and renamed
 /// columns as Delta's readers take them (`read_delta::table`).
-pub async fn read(lake: &crate::store::Lake, spec: &crate::ext::Spec) -> anyhow::Result<crate::store::TableMeta> {
+pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> anyhow::Result<crate::store::TableMeta> {
     use anyhow::{ensure, Context};
     let endpoint = spec.urls[0].trim_end_matches('/');
     let o = |k: &str| spec.options.get(k).map(String::as_str).unwrap_or_default();

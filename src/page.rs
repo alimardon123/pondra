@@ -4,8 +4,6 @@
 //! mean, through ADR-061's request contract. DuckDB's forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) and
 //! ASOF JOIN answer as on a node. `web/` wraps it for a browser.
 
-use crate::expander::Routine;
-use crate::ext_names::Attached;
 use crate::front::{Host, Own};
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use async_trait::async_trait;
@@ -77,10 +75,11 @@ impl Answer {
     }
 }
 
-/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::answer`).
+/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::of`, `codes::http`; a page's
+/// caller sees all the words: `codes::words`).
 fn failed(e: anyhow::Error) -> Answer {
-    let (status, code, words) = crate::codes::answer(&e);
-    Answer { status, headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: words.into() }
+    let code = crate::codes::of(&e);
+    Answer { status: crate::codes::http(code), headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: crate::codes::words(&e).into() }
 }
 
 /// A file refused (409, 412, 404): the node's status and words, with no SQLSTATE.
@@ -449,6 +448,7 @@ impl SchemaProvider for Overlay {
 /// of those answers "none"; the columns are its tables' own.
 struct PageHost<'a>(&'a Page);
 
+// (a page keeps no routines, attached catalogs, views with measures or types of its own: the trait's defaults say so)
 impl Host for PageHost<'_> {
     fn name(&self) -> String {
         "page".to_string()
@@ -461,14 +461,6 @@ impl Host for PageHost<'_> {
         }
     }
 
-    async fn routines(&self) -> anyhow::Result<Arc<HashMap<String, Routine>>> {
-        Ok(Arc::default())
-    }
-
-    async fn attached(&self) -> anyhow::Result<Vec<(String, Attached)>> {
-        Ok(vec![])
-    }
-
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for name in tables {
@@ -477,18 +469,6 @@ impl Host for PageHost<'_> {
             }
         }
         Ok(out)
-    }
-
-    async fn measured(&self, _sql: &str) -> anyhow::Result<bool> {
-        Ok(false) // (a page keeps no views, so none with measures)
-    }
-
-    async fn measures(&self, _sql: &str, _stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        Ok(false) // (nor measures)
-    }
-
-    async fn types(&self, _stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        Ok(false) // (nor types of its own)
     }
 
     async fn friendly(&self, stmts: &mut [Statement]) -> anyhow::Result<bool> {
@@ -633,6 +613,14 @@ mod tests {
         assert_eq!(page.request("DELETE", "/files/orders.csv", &[], bytes::Bytes::new()).await.status, 404);
         assert_eq!(page.request("POST", "/sql", &[], "DROP TABLE t".into()).await.status, 200);
         assert_eq!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_pages_front_fills_default_values() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE d (a INT, b TEXT)".into()).await.status, 200);
+        let front = crate::front::expand(&PageHost(&page), "INSERT INTO d DEFAULT VALUES", &HashMap::new()).await.unwrap();
+        assert!(front.contains("VALUES (DEFAULT, DEFAULT)"), "{front}");
     }
 
     #[tokio::test]

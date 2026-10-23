@@ -37,8 +37,8 @@ pub fn key(name: &str) -> String { format!("f/{name}") }
 /// The list is re-read at most once a second: a query must not pay a catalog scan for it.
 pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
     for (k, udf) in listed(lake).await?.iter().cloned() {
-        let args = udf.args.iter().map(|t| crate::query::dtype(t)).collect::<Result<Vec<_>>>()?;
-        let f = Flighted { name: k[2..].to_string(), returns: crate::query::dtype(&udf.returns)?, udf, signature: Signature::exact(args, Volatility::Volatile) };
+        let args = udf.args.iter().map(|t| crate::answer::dtype(t)).collect::<Result<Vec<_>>>()?;
+        let f = Flighted { name: k[2..].to_string(), returns: crate::answer::dtype(&udf.returns)?, udf, signature: Signature::exact(args, Volatility::Volatile) };
         ctx.register_udf(AsyncScalarUDF::new(Arc::new(f)).into_scalar_udf());
     }
     Ok(())

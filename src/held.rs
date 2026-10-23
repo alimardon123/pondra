@@ -352,7 +352,7 @@ impl ExecutionPlan for HeldInExec {
     }
 }
 
-/// Hands up each batch with only its own rows' strings (`query::compact`). A sort reads a string column as views into
+/// Hands up each batch with only its own rows' strings (`answer::compact`). A sort reads a string column as views into
 /// its input's buffers, and `take` and the merge's `interleave` copy the views but keep those buffers: a batch of
 /// 8,192 rows then points into every batch of the runs it merges. The merge above counts each batch's buffers whole,
 /// so 4 partitions of a 10 M-row sort of md5 strings counted 66 MB for about 2 MB of rows, and a 256 MB pool refused
@@ -414,7 +414,7 @@ impl ExecutionPlan for LeanExec {
     fn execute(&self, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let s = self.input.execute(p, ctx)?;
         let schema = s.schema();
-        let out = s.map(|item| item.map(crate::query::compact));
+        let out = s.map(|item| item.map(crate::answer::compact));
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, out)))
     }
 }

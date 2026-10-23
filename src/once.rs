@@ -29,7 +29,7 @@ pub fn open(name: &str) -> String { format!("{name}$open") }
 
 /// `CREATE MATERIALIZED VIEW … EMIT FINAL`: the statement without its last two words.
 pub fn emit_final(sql: &str) -> Option<String> {
-    if crate::write::head(sql) != "create" {
+    if crate::text::head(sql) != "create" {
         return None;
     }
     static END: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW\b.*?)\s+EMIT\s+FINAL\s*;?\s*$").expect("a regex"));
@@ -263,7 +263,7 @@ async fn planned(lake: &Lake, source: &str, o: &Once) -> Result<Planned> {
         return Ok(p.clone());
     }
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.with_context(|| format!("no table {source}"))?.logical();
-    let t = crate::query::schema(&src.columns)?.field_with_name(&o.time)?.data_type().clone();
+    let t = crate::answer::schema(&src.columns)?.field_with_name(&o.time)?.data_type().clone();
     let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(&o.time, t, true)]));
     let df = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
     let ctx = crate::query::session(lake, "", "").await?;

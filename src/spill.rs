@@ -59,7 +59,7 @@ impl Spill {
     }
 
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
-        let batch = crate::query::compact(batch); // (a shuffle cuts every batch into a piece per node and partition: without it, each piece carries, writes and sends all of the batch's strings; TPC-H q21 wrote 2.5 GB a node, not a tenth of that)
+        let batch = crate::answer::compact(batch); // (a shuffle cuts every batch into a piece per node and partition: without it, each piece carries, writes and sends all of the batch's strings; TPC-H q21 wrote 2.5 GB a node, not a tenth of that)
         self.schema.get_or_insert_with(|| batch.schema());
         self.bytes += size(&batch);
         self.rows.push(batch);

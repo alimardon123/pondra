@@ -124,7 +124,7 @@ impl Encoding {
             Shape::Arrow => {
                 let mut w = match self.arrow.take() {
                     Some(w) => w,
-                    None => StreamWriter::try_new(Vec::new(), &datafusion::arrow::datatypes::Schema::empty())?, // (no rows at all: as `query::ipc` writes them)
+                    None => StreamWriter::try_new(Vec::new(), &datafusion::arrow::datatypes::Schema::empty())?, // (no rows at all: as `answer::ipc` writes them)
                 };
                 w.finish()?;
                 Ok(std::mem::take(w.get_mut()))

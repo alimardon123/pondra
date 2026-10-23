@@ -8,13 +8,15 @@ use crate::codes::coded;
 use crate::constraints::{informational, Change, Constraint, Kind};
 use crate::ddl::{query_key, Ddl, StoredView};
 use crate::store::{json, table_key, Lake, TableMeta};
-use crate::write::{first_word, object, Stmt};
+use crate::write::Stmt;
+use crate::text::{first_word, object};
+use crate::measures::{joins_checked, shape, Definition, MARK};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use datafusion::common::DFSchema;
-use datafusion::sql::sqlparser::{ast::{AlterTableOperation, Statement, TableConstraint}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::{ast::{self, AlterTableOperation, ObjectName, SetExpr, Statement, TableConstraint, TableFactor}, dialect::GenericDialect, parser::Parser};
 use regex::Regex;
 use serde_json::{json as j, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 const WANT: &str = "ALTER VIEW … ADD | DROP CONSTRAINT: a view takes PRIMARY KEY, UNIQUE and FOREIGN KEY, said NOT ENFORCED";
@@ -56,7 +58,7 @@ fn alter(s: &str) -> Option<Stmt> {
             Err(e) => Stmt::Invalid(format!("{e:#}")),
         },
         [AlterTableOperation::DropConstraint { if_exists: constraint_if_exists, name, .. }] => {
-            Stmt::Ddl(vec![Ddl::ViewFacts { view, if_exists, change: Change::Drop { name: crate::write::ident(name), if_exists: *constraint_if_exists } }])
+            Stmt::Ddl(vec![Ddl::ViewFacts { view, if_exists, change: Change::Drop { name: crate::text::ident(name), if_exists: *constraint_if_exists } }])
         }
         _ => Stmt::Invalid(WANT.into()),
     })
@@ -332,7 +334,7 @@ pub async fn apply(lake: &Lake, view: &str, if_exists: bool, change: Change) -> 
 async fn stored_columns(lake: &Lake, view: &str, v: &StoredView) -> Result<Vec<String>> {
     let sql = format!("SELECT * FROM {} LIMIT 0", crate::write::sql_name(view));
     let ctx = crate::query::session(lake, &sql, "").await?;
-    let df = crate::query::sql(&ctx, &sql).await?;
+    let df = crate::engine::sql(&ctx, &sql).await?;
     Ok(shown_columns(&v.sql, df.schema().fields().iter().map(|f| f.name().clone())))
 }
 
@@ -400,6 +402,45 @@ pub fn in_list(facts: &[Constraint]) -> String {
     }
     let items: Vec<String> = facts.iter().map(|c| c.sql(&crate::objects::ident)).collect();
     format!(" (\n  {}\n)", items.join(",\n  "))
+}
+
+/// Checks a view with measures where it is made: `sql` is its SELECT as stored. Its shape is checked, and each join of its FROM
+/// must be onto a key of the table it joins.
+pub async fn measures_checked(lake: &Lake, sql: &str) -> Result<()> {
+    if !sql.contains(MARK) {
+        return Ok(());
+    }
+    let stmts = Parser::parse_sql(&GenericDialect {}, sql)?;
+    let [Statement::Query(query)] = stmts.as_slice() else { bail!("a view with measures is one SELECT") };
+    let Some(d) = Definition::of(query)? else { return Ok(()) };
+    shape(&d, query)?;
+    let keys = join_keys(lake, query).await?;
+    joins_checked(&d, &|name: &ObjectName| keys.get(&object(name)).cloned())
+}
+
+/// The keys of each table a SELECT joins, by the name the query gives it.
+async fn join_keys(lake: &Lake, query: &ast::Query) -> Result<HashMap<String, Vec<Vec<String>>>> {
+    let mut keys = HashMap::new();
+    let SetExpr::Select(select) = &*query.body else { return Ok(keys) };
+    for join in select.from.iter().flat_map(|item| item.joins.iter()) {
+        let TableFactor::Table { name, .. } = &join.relation else { continue };
+        let full = object(name);
+        let (other, local) = crate::ddl::resolve(lake, &full).await?;
+        let owner: &Lake = other.as_deref().unwrap_or(lake);
+        let mut found = Vec::new();
+        if let Some(meta) = owner.cat.get::<TableMeta>(&table_key(&local)).await? {
+            let meta = meta.logical();
+            if !meta.key.is_empty() {
+                found.push(meta.key.clone());
+            }
+            found.extend(meta.constraints.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone()));
+        }
+        if let Some(view) = owner.cat.get::<StoredView>(&query_key(&local)).await? {
+            found.extend(view.facts.iter().filter(|c| matches!(c.kind, Kind::PrimaryKey | Kind::Unique)).map(|c| c.columns.clone())); // (a view's key facts: ADR-065 §2)
+        }
+        keys.insert(full, found);
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]

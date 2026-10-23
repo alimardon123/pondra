@@ -23,7 +23,7 @@ pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: 
 
 /// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
 pub fn is(sql: &str) -> bool {
-    let word = crate::write::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
+    let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
     matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
         && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
 }
@@ -43,11 +43,11 @@ async fn current(lake: &Lake, sql: &str) -> Result<Option<Done>> {
         }
         ensure!(word(&mut p, "materialized") && word(&mut p, "view"), "REFRESH MATERIALIZED VIEW name");
         let _ = word(&mut p, "concurrently");
-        crate::write::object(&p.parse_object_name(false)?)
+        crate::text::object(&p.parse_object_name(false)?)
     };
     let (other, local) = crate::ddl::resolve(lake, &name).await?;
     let l = other.as_deref().unwrap_or(lake);
-    let (schema, view) = crate::ddl::split(&local);
+    let (schema, view) = crate::text::split(&local);
     let here = crate::ddl::lake_name(l);
     let found = crate::ddl::listed(l).await?.into_iter().any(|t| t.lake == here && t.schema == schema && t.name == view && t.kind == "materialized view");
     ensure!(found, "REFRESH MATERIALIZED VIEW {name}: there is no materialized view of that name");
@@ -308,7 +308,7 @@ pub fn dialect() -> Option<Box<dyn datafusion::sql::sqlparser::dialect::Dialect>
 /// as Postgres answers it (`search_path` is `public` until set). DataFusion's own (`datafusion.*`,
 /// `TIME ZONE`) and a name never set are left to DataFusion's `SHOW`.
 pub fn show(sql: &str) -> Option<String> {
-    if crate::write::head(sql) != "show" {
+    if crate::text::head(sql) != "show" {
         return None;
     }
     static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^\s*show\s+([a-z_][a-z0-9_]*)\s*;?\s*$").expect("a regex"));

@@ -145,7 +145,7 @@ pub(crate) fn pin_key(branch: &str) -> String { format!("pn/{}", id_of(branch)) 
 
 /// Is `name` (a table or view, `schema.t` or `t`) in the schemas a clone took (none: all)?
 fn took(schemas: &[String], name: &str) -> bool {
-    schemas.is_empty() || schemas.iter().any(|s| s == name.split_once('.').map_or(crate::ddl::PUBLIC, |(s, _)| s))
+    schemas.is_empty() || schemas.iter().any(|s| s == name.split_once('.').map_or(crate::text::PUBLIC, |(s, _)| s))
 }
 
 /// `_base/<id>/rest` as (id, rest).

@@ -8,8 +8,8 @@
 //! written they serve its location only (`within`); its files are then read through a store of
 //! their own, `delegated://<id>/…` (`rehome`), never through the bucket's store, so no other
 //! statement, and no file another table names, ever reads with them (invariant 339).
-use crate::ext::{Attached, Spec};
-pub use crate::ext_names::endpoint;
+use crate::ext_names::{Attached, Spec};
+use crate::ext_names::endpoint;
 use crate::store::{DataFile, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use object_store::aws::{AwsAuthorizer, AwsCredential};

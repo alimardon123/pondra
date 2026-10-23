@@ -36,7 +36,6 @@ macro_rules! atomics {
 }
 atomics!(AtomicBool = false, AtomicU32 = 0, AtomicU64 = 0, AtomicUsize = 0, AtomicI64 = 0);
 
-#[cfg(feature = "server")]
 impl<T: Default> Clear for tokio::sync::watch::Sender<T> {
     fn clear(&self) {
         drop(self.send_replace(T::default()));

@@ -170,10 +170,10 @@ impl Set {
     /// The call as a SELECT list has it: its rows unnested, an element marked JSON (`pondra_as_json`, or
     /// `pondra_as_jsonb`, which normalizes a jsonb once). The mark doesn't survive `unnest`, so the wrap is outside it.
     fn in_list(&self, args: Vec<Expr>) -> Expr {
-        let rows = crate::types::function("unnest", vec![crate::types::function(self.list, args)]);
+        let rows = crate::text::function("unnest", vec![crate::text::function(self.list, args)]);
         match (self.how, self.jsonb) {
-            (How::Elements, false) => crate::types::function("pondra_as_json", vec![rows]),
-            (How::Elements, true) => crate::types::function("pondra_as_jsonb", vec![rows]),
+            (How::Elements, false) => crate::text::function("pondra_as_json", vec![rows]),
+            (How::Elements, true) => crate::text::function("pondra_as_jsonb", vec![rows]),
             _ => rows,
         }
     }

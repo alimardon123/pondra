@@ -268,8 +268,8 @@ pub fn start(lake: &Arc<crate::store::Lake>) {
 /// `s.t`; another lake's keeps its three parts.
 fn local(name: &str, lake: &str) -> String {
     match name.split('.').collect::<Vec<_>>()[..] {
-        [s, t] => crate::ddl::join(s, t),
-        [l, s, t] if l == lake => crate::ddl::join(s, t),
+        [s, t] => crate::text::join(s, t),
+        [l, s, t] if l == lake => crate::text::join(s, t),
         _ => name.to_string(),
     }
 }

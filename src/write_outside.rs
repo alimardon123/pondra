@@ -20,12 +20,12 @@ use std::sync::Arc;
 
 const FILE_BYTES: usize = 128 << 20; // (a file this big is closed, and another started)
 
-/// INSERT INTO `table` (a table of files: `ext::attached_table`) the rows of `query`.
+/// INSERT INTO `table` (a table of files: `ext_names::attached_table`) the rows of `query`.
 pub async fn insert(lake: &Lake, table: &str, query: &str, job: &str) -> Result<Value> {
-    let spec = crate::ext::spec(table).context("not another engine's table")?;
+    let spec = crate::ext_names::spec(table).context("not another engine's table")?;
     crate::ext::check(lake, &spec).await?; // (written by whoever may read it: a secret covering it, or the node's owner)
     let query = crate::routines::expand(lake, query).await?;
-    let df = crate::query::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
+    let df = crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
     match spec.format.as_str() {
         "delta" => delta(lake, spec.urls[0].trim_end_matches('/'), df, job, false).await,
         "iceberg" => iceberg(lake, &spec, df, job, false).await,
@@ -57,7 +57,7 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
         true => ensure!(append || overwrite, "COPY … TO {to}: a {format} table is there already: APPEND adds to it, OVERWRITE replaces its rows"),
         false => {
             ensure!(there.is_empty(), "COPY … TO {to}: the folder holds files that aren't a {format} table");
-            let columns: Vec<(String, String)> = crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(&crate::write::stored(f.data_type())))).collect(); // (the types as the query runs, not as the planner first typed them)
+            let columns: Vec<(String, String)> = crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(&crate::answer::stored(f.data_type())))).collect(); // (the types as the query runs, not as the planner first typed them)
             let name = root.rsplit('/').next().unwrap_or("table");
             let now = crate::log::now_ms();
             let (file, body) = match format {
@@ -78,7 +78,7 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
     let replace = table && overwrite;
     match format {
         "delta" => delta(lake, root, df, &job, replace).await,
-        _ => iceberg(lake, &crate::ext::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, &job, replace).await,
+        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, &job, replace).await,
     }
 }
 
@@ -110,7 +110,7 @@ async fn delta(lake: &Lake, root: &str, df: datafusion::prelude::DataFrame, job:
             groups.entry(key).or_default().push(r as u32);
         }
         Ok(groups.into_iter().map(|(values, rows)| {
-            let folder = partitions.iter().zip(&values).map(|(p, v)| format!("{p}={}/", v.as_deref().map_or(crate::ext::NULL_FOLDER.to_string(), hive_escape))).collect::<String>();
+            let folder = partitions.iter().zip(&values).map(|(p, v)| format!("{p}={}/", v.as_deref().map_or(crate::ext_names::NULL_FOLDER.to_string(), hive_escape))).collect::<String>();
             Part { folder, rows: UInt32Array::from(rows), values: json!(partitions.iter().cloned().zip(values).collect::<BTreeMap<_, _>>()) }
         }).collect())
     };
@@ -355,7 +355,7 @@ pub async fn put_new(lake: &Lake, url: &str, body: Vec<u8>) -> Result<bool> {
 /// the snapshot's manifests and it, and the next metadata — a new file beside the last (put if
 /// absent), or the REST catalog's commit (the current snapshot asserted).
 /// …`replace`: the snapshot holds only the new files (an overwrite).
-pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
+pub async fn iceberg(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let (at, meta, d) = crate::read_iceberg::current(lake, url, &spec.options).await?;
     crate::catalogs::within(d, written(lake, spec, df, job, replace, at, meta)).await
@@ -364,7 +364,7 @@ pub async fn iceberg(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelu
 /// Write a table's files and commit their snapshot, on top of its current metadata (`at`, `meta`),
 /// as often as another writer's commit makes it wait. Run where the catalog's credentials for the
 /// table's location are in scope (`iceberg`).
-async fn written(lake: &Lake, spec: &crate::ext::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
+async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::prelude::DataFrame, job: &str, replace: bool, mut at: String, mut meta: Value) -> Result<Value> {
     let url = spec.urls[0].trim_end_matches('/');
     let rest = spec.options.contains_key("namespace");
     if done(&meta, job) {

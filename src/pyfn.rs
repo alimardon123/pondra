@@ -13,7 +13,7 @@
 //!
 //! A function made `WITH (cache = '10 minutes')` has its answers reused for that long (`Answers`,
 //! ADR-028): an API or a model called again for the same arguments costs nothing.
-use crate::routines::{Kind, Routine};
+use crate::expander::{Kind, Routine};
 use crate::store::Lake;
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{ArrayRef, RecordBatch};
@@ -27,7 +27,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-pub use crate::text::{is_json, loose};
+use crate::text::{is_json, loose};
 
 /// A SQL type as DataFusion reads it (`VARCHAR` → Utf8, `DOUBLE` → Float64, `INT[]` → a list),
 /// strings as plain Utf8; `VARIANT` and `JSON` are JSON text, and so are the types the lake holds as
@@ -52,7 +52,7 @@ pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
 fn plain(t: &DataType) -> DataType {
     match t {
         DataType::List(f) | DataType::LargeList(f) => DataType::List(Arc::new(Field::new("item", plain(f.data_type()), true))),
-        t => crate::write::stored(t),
+        t => crate::answer::stored(t),
     }
 }
 
@@ -71,7 +71,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
         match r.kind {
             Kind::Table => {
                 let mut fields = vec![];
-                for (c, t) in crate::routines::columns_of(r.returns.as_deref().unwrap_or_default())? {
+                for (c, t) in crate::expander::columns_of(r.returns.as_deref().unwrap_or_default())? {
                     fields.push(Field::new(c, arrow_of(&t).await?, true));
                 }
                 ctx.register_udtf(name, Arc::new(TableFn { name: name.clone(), routine, args, schema: Arc::new(Schema::new(fields)) }));
@@ -93,7 +93,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
 /// What a worker needs to run it: its body, parameters and options.
 fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
     let json: Vec<bool> = r.params.iter().map(|p| is_json(p.ty.as_deref())).collect();
-    json!({"op": "apply", "name": name, "body": r.body, "entry": r.with.entry, "params": crate::routines::names(r), "json": json,
+    json!({"op": "apply", "name": name, "body": r.body, "entry": r.with.entry, "params": crate::expander::names(r), "json": json,
            "json_returns": is_json(r.returns.as_deref()), "vectorized": r.with.vectorized, "strict": r.with.strict, "table": table})
 }
 
@@ -101,7 +101,7 @@ fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
 async fn ask(name: &str, r: &Routine, table: bool, args: RecordBatch, out: SchemaRef) -> Result<Vec<RecordBatch>> {
     crate::python::ready(&format!("{name} is a Python function"))?;
     let limit = std::time::Duration::try_from_secs_f64(r.with.timeout.unwrap_or(60.0)).unwrap_or(std::time::Duration::from_secs(60));
-    let parts = vec![crate::query::ipc(&[args])?, crate::query::ipc(&[RecordBatch::new_empty(out)])?];
+    let parts = vec![crate::answer::ipc(&[args])?, crate::answer::ipc(&[RecordBatch::new_empty(out)])?];
     let mut log = |n: String| eprintln!("function {name}: {n}");
     let (_, parts) = crate::python::ask(&r.with.packages, crate::python::Use::Function, head(name, r, table), parts, Some(limit), &mut log).await.with_context(|| name.to_string())?;
     crate::query::read_ipc(parts.first().context("no rows back")?)

@@ -21,7 +21,7 @@
 //! applied once, whichever leader runs it. Nothing is held between runs.
 use crate::query::{session_at, table_ref};
 use crate::store::*;
-use crate::sys::{CREATED, ROW_ID, VERSION};
+use crate::text::{CREATED, ROW_ID, VERSION};
 use crate::views::View;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{ArrayRef, RecordBatch, UInt32Array};
@@ -420,8 +420,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     };
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
     let ctx = crate::query::session(lake, sql, "").await?; // (the table's columns are the types the query runs with)
-    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
-    if let Some((c, _)) = columns.iter().find(|(c, _)| crate::sys::NAMES.contains(&c.as_str())) {
+    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    if let Some((c, _)) = columns.iter().find(|(c, _)| crate::text::NAMES.contains(&c.as_str())) {
         bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
     }
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
@@ -777,7 +777,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         if pending.is_empty() {
             // (nothing came out different: only its progress moves, both parts' together)
             let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0 };
-            let s = crate::query::schema(&meta.columns)?;
+            let s = crate::answer::schema(&meta.columns)?;
             pending = vec![empty(view.to_string(), s.clone()), empty(crate::sys::deleted(view), s)];
         }
         // Both parts under the same seq and `prev`: they always move together, so a run that lost
@@ -805,7 +805,7 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
     if !joins.is_empty() {
         // (windows over a join: each table's changed rows' columns equal to the keys, as the keys' types)
-        let plan = crate::query::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+        let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
         let (by, input) = window(&plan).and_then(partitioned).context("a view kept by key over a join is windows within keys")?;
         let tables = joined(input, &by).context("its windows' join is no longer on the columns they partition by: make it again")?;
         let mut keys: Option<DataFrame> = None;
@@ -822,7 +822,7 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     }
     ctx.deregister_table(table_ref(&v.source))?;
     ctx.register_table(table_ref(&v.source), changed(lake, &v.source, done, now).await?.into_view())?;
-    let plan = crate::query::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+    let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     let (by, input) = grouping(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
     let keys: Vec<Expr> = by.iter().enumerate().map(|(i, g)| g.clone().unalias().alias(format!("__k{i}"))).collect();
     let p = LogicalPlanBuilder::from(input.clone()).project(keys)?.distinct()?.build()?;
@@ -853,7 +853,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     }
     let out = crate::change::taken_out(lake, source, after, Some(upto)).await?;
     if out.iter().any(|b| b.num_rows() > 0) {
-        let stored = crate::query::schema(&crate::sys::with_sys(&meta).columns)?;
+        let stored = crate::answer::schema(&crate::sys::with_sys(&meta).columns)?;
         let out = out.iter().map(|b| meta.to_logical(&crate::query::conform(b, &stored)?)).collect::<Result<Vec<_>>>()?;
         all = all.union(pick(ctx.read_batches(out)?)?)?;
     }
@@ -883,7 +883,7 @@ fn key(i: usize) -> Expr { Expr::Column(Column::new(Some(TOUCHED), format!("__k{
 /// the `GROUP BY` or the windows), or of every key.
 async fn worked_out(lake: &Lake, v: &View, now: u64, touched: Option<&Touched>) -> Result<Vec<RecordBatch>> {
     let ctx = session_at(lake, &v.sql, "", Some(now)).await?;
-    let plan = crate::query::sql(&ctx, &crate::asof::rewrite(&v.sql)?).await?.into_unoptimized_plan();
+    let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     let plan = match touched {
         Some(t) => {
             kept_as_written(&ctx);
@@ -974,7 +974,7 @@ async fn old_rows(lake: &Lake, view: &str, keys: &[String], touched: Option<&Tou
 fn diff(meta: &TableMeta, keys: &[String], old: &[RecordBatch], new: &[RecordBatch]) -> Result<(RecordBatch, RecordBatch)> {
     use datafusion::arrow::compute::{concat_batches, filter_record_batch, take, take_record_batch};
     use datafusion::arrow::row::{RowConverter, SortField};
-    let s = crate::query::schema(&meta.columns)?;
+    let s = crate::answer::schema(&meta.columns)?;
     let mut fields = s.fields().to_vec();
     let ts = crate::sys::time();
     fields.extend([Field::new(ROW_ID, DataType::Int64, true), Field::new(CREATED, ts, true), Field::new(VERSION, DataType::Int64, true)].map(Arc::new));

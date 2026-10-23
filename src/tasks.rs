@@ -12,7 +12,8 @@
 //! `s % n`-th live node and only ever touches its own keys, so shards never conflict.
 use crate::cluster::Cluster;
 use crate::log::{Log, Src};
-use crate::query::{over, schema, session, tail};
+use crate::query::{over, session, tail};
+use crate::answer::schema;
 use crate::store::*;
 use anyhow::{bail, Context, Result};
 use datafusion::arrow::array::BooleanArray;
@@ -92,11 +93,11 @@ pub async fn create(lake: &Lake, name: &str, task: &Task) -> Result<()> {
         bail!("shard_by is required with shards > 1");
     }
     let ctx = session(lake, &task.sql, "").await?;
-    let df = crate::query::sql(&ctx, &crate::asof::rewrite(&task.sql)?).await?;
+    let df = crate::engine::sql(&ctx, &crate::sys::planned(&task.sql)?).await?;
     let out = crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow().clone(); // (the types as the query runs, not as the planner first typed them: the table takes them)
     let mut puts = vec![(task_key(name), json(task))];
     if lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.is_none() {
-        let columns = out.fields().iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+        let columns = out.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
         puts.push((table_key(&task.target), json(&TableMeta { columns, key: task.key.clone(), publish: default_publish(), ..Default::default() })));
     }
     lake.cat.commit(puts, &[]).await

@@ -18,7 +18,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::sync::Arc;
-pub use crate::text::{join, local_in, mentions, split, PUBLIC};
+use crate::text::{join, local_in, mentions, split, PUBLIC};
 
 pub fn schema_key(s: &str) -> String { format!("ns/{s}") }
 /// A stored view (`CREATE VIEW`): a query with a name, run where it is used.
@@ -128,7 +128,7 @@ pub async fn has_schema(lake: &Lake, s: &str) -> Result<bool> {
 }
 
 /// Where a name points: this lake (None) or an attached one, and the name inside it. Names are as
-/// SQL resolves them (`write::object`): unquoted parts already lower-case.
+/// SQL resolves them (`text::object`): unquoted parts already lower-case.
 pub async fn resolve(lake: &Lake, name: &str) -> Result<(Option<Arc<Lake>>, String)> {
     let parts: Vec<&str> = name.split('.').collect();
     Ok(match parts[..] {
@@ -173,7 +173,7 @@ pub async fn database(lake: &Lake, name: &str) -> Result<Option<Arc<Lake>>> {
     attached(lake, name).await
 }
 
-/// A table of this lake by its name inside it, from a name as SQL wrote it (`write::object`):
+/// A table of this lake by its name inside it, from a name as SQL wrote it (`text::object`):
 /// None for another lake's. (A two-part name may yet be an attached lake's: no table has it here.)
 pub fn local(lake: &Lake, name: &str) -> Option<String> { local_in(&lake_name(lake), name) }
 
@@ -233,7 +233,7 @@ pub enum Ddl {
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     Swap { name: String, with: String }, // ALTER TABLE … SWAP WITH … (write-audit-publish)
     ReplaceTable { name: String, staged: String }, // CREATE OR REPLACE TABLE: the staged table takes name's place in one commit (`replace`, audit M3)
-    CreateRoutine { name: String, routine: crate::routines::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
+    CreateRoutine { name: String, routine: crate::expander::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
     AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
@@ -395,9 +395,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             let name = new_name(lake, &name).await?;
             let facts = crate::facts::taken(&mut options)?; // (ALTER VIEW's facts in its list: `facts.rs`)
             ensure!(lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "{name} is a (stored) view");
-            let outside = crate::ext::names(&sql);
+            let outside = crate::ext_names::names(&sql);
             if let [topic] = &outside[..] {
-                if crate::ext::spec(topic).is_some_and(|s| s.format == "kafka") {
+                if crate::ext_names::spec(topic).is_some_and(|s| s.format == "kafka") {
                     crate::feeds::create(lake, &name, &sql, topic, &options).await?; // (a topic's records, as they arrive)
                     crate::views::forget(lake);
                     if let Err(e) = crate::facts::materialized(lake, &name, facts).await {
@@ -560,7 +560,7 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
 async fn lake_dir(dir: &str) -> Result<(String, bool)> {
-    let dir = &crate::store::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `inbox::lead_once`)
+    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `inbox::lead_once`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -613,7 +613,7 @@ pub async fn delete_lake(dir: &str) -> Result<()> {
 }
 
 pub async fn has_catalog(dir: &str) -> Result<bool> {
-    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::store::in_memory(dir) && !crate::store::memory_held(dir)) {
+    if (!dir.contains("://") && !std::path::Path::new(dir).exists()) || (crate::memory::in_memory(dir) && !crate::memory::memory_held(dir)) {
         return Ok(false); // (asking a lake in memory that nothing here opened would make an empty one)
     }
     let store = crate::store::open_store(dir)?.1;
@@ -804,7 +804,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
             _ => None,
         });
         for _ in 0..200 {
-            if lake.cat.get::<crate::routines::Routine>(&key).await? == want {
+            if lake.cat.get::<crate::expander::Routine>(&key).await? == want {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -830,10 +830,10 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
     ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
-    crate::measures::check(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
+    crate::facts::measures_checked(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
-    let planned = crate::asof::rewrite(&expanded)?;
-    let df = crate::query::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
+    let planned = crate::sys::planned(&expanded)?;
+    let df = crate::engine::sql(&crate::query::session(lake, &planned, "").await?, &planned).await.context(if external { "reading its files" } else { "the view's query" })?; // (it plans)
     let facts = crate::facts::settled(lake, &name, &sql, df.schema(), facts, replace).await?; // (its key facts: `facts.rs`)
     lake.cat.commit(vec![(query_key(&name), json(&StoredView { sql, external, facts }))], &[]).await?;
     Ok(match external {
@@ -1317,7 +1317,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     let owner = name.strip_suffix("_final").unwrap_or(&name);
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none() && lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(&name))).await?.is_none(),
         "{name} is materialized view {owner}'s: its columns are its query's");
-    let system = |c: &str| crate::sys::NAMES.contains(&c) || c == "_old_version" || c == "_deleted" || c.contains('~');
+    let system = |c: &str| crate::text::NAMES.contains(&c) || c == "_old_version" || c == "_deleted" || c.contains('~');
     ensure!(!system(column), "{column} is a system column: it stays as it is");
     if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
         return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
@@ -1378,9 +1378,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             }
             let ctx = datafusion::prelude::SessionContext::new();
             ctx.sql(&format!("CREATE TABLE t (c {sql_type})")).await?;
-            let new = crate::write::stored(ctx.table("t").await?.schema().field(0).data_type());
+            let new = crate::answer::stored(ctx.table("t").await?.schema().field(0).data_type());
             let at = m.columns.iter().position(|(c, _)| *c == stored).expect("a live column");
-            let old = crate::query::dtype(&m.columns[at].1)?;
+            let old = crate::answer::dtype(&m.columns[at].1)?;
             if let Some(wanted) = declared.filter(|_| old == new) {
                 // A length on text only grows: the rows there were checked against the one it had.
                 match (held.as_deref().and_then(crate::types::length), crate::types::length(&wanted)) {
@@ -1401,7 +1401,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 }
                 ensure!(old == new || widens(&old, &new), "{column} is {old}: a column's type can only widen (a smaller integer to a bigger one, FLOAT to DOUBLE, a DECIMAL to more digits), which every file already written still reads as");
                 ensure!(old == new || partition != Some(stored.as_str()), "{column} is {name}'s partition_by column: its type stays");
-                m.columns[at].1 = crate::query::type_name(&new);
+                m.columns[at].1 = crate::answer::type_name(&new);
                 j!({"column": column, "type": m.columns[at].1})
             }
         }

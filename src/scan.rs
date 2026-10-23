@@ -148,7 +148,7 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     let url = url_of(&lake.full(&first.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let (mut ids, mut mapping) = (std::collections::BTreeMap::new(), std::collections::HashMap::new());
-    let own = meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::sys::NAMES.contains(&c.as_str()));
+    let own = meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::text::NAMES.contains(&c.as_str()));
     for (i, (c, _)) in own.clone() {
         ids.insert(c.clone(), i as i64 + 1); // (`iceberg::fields`)
         mapping.insert(c.clone(), i as i64 + 1); // (Pondra's own files carry the stored name…)
@@ -171,9 +171,9 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
     let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row) }))?;
     Ok(df.select(schema.fields().iter().map(|f| match f.name().as_str() {
-        crate::sys::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
-        crate::sys::VERSION => col("__version").alias(f.name()),
-        crate::sys::CREATED | crate::sys::UPDATED => col("__at").alias(f.name()),
+        crate::text::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
+        crate::text::VERSION => col("__version").alias(f.name()),
+        crate::text::CREATED | crate::text::UPDATED => col("__at").alias(f.name()),
         n => cast(ident(n), f.data_type().clone()).alias(n),
     }).collect::<Vec<_>>())?)
 }

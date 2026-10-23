@@ -11,7 +11,8 @@
 //! A session is a Postgres connection, or a client's `x-pondra-session` header (the Python and
 //! JavaScript clients send one, and end it on `close()`); a procedure has its caller's. An idle one
 //! ends after `PONDRA_SESSION_IDLE_SECS` (3600).
-use crate::ddl::{mentions, Ddl};
+use crate::ddl::Ddl;
+use crate::text::mentions;
 use crate::server::App;
 use crate::store::TableMeta;
 use crate::write::Stmt;
@@ -97,7 +98,7 @@ struct Table {
 }
 
 impl Table {
-    fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::query::schema(&[self.meta.columns.clone(), crate::sys::columns()].concat()) }
+    fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[self.meta.columns.clone(), crate::sys::columns()].concat()) }
     fn bytes(&self) -> usize { self.rows.iter().map(|b| b.get_array_memory_size()).sum() }
 }
 
@@ -261,7 +262,7 @@ pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
     let Some(x) = all.get_mut(&s) else { return Ok(()) };
     x.used = Some(Instant::now());
     for (name, t) in x.tables.iter().filter(|(n, _)| mentions(text, n)) {
-        let keep: Vec<usize> = (0..t.meta.columns.len() + if sys { crate::sys::NAMES.len() } else { 0 }).collect();
+        let keep: Vec<usize> = (0..t.meta.columns.len() + if sys { crate::text::NAMES.len() } else { 0 }).collect();
         let rows = t.rows.iter().map(|b| b.project(&keep)).collect::<Result<Vec<_>, _>>()?;
         ctx.deregister_table(name.as_str())?;
         ctx.register_table(name.as_str(), Arc::new(MemTable::try_new(Arc::new(t.schema()?.project(&keep)?), vec![rows])?))?;
@@ -305,7 +306,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            crate::query::sql(&crate::query::session(&app.lake, sql, "").await?, &crate::asof::rewrite(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
+            crate::engine::sql(&crate::query::session(&app.lake, sql, "").await?, &crate::sys::planned(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
         }
@@ -355,7 +356,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
 
 /// `CREATE [OR REPLACE] TEMP TABLE name (columns) | AS query`.
 async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result<Value> {
-    let name = crate::write::object(&c.name);
+    let name = crate::text::object(&c.name);
     ensure!(!name.contains('.'), "{name}: a temporary table's name has no schema (it is the session's)");
     ensure!(!(c.or_replace && c.if_not_exists), "CREATE OR REPLACE TEMP TABLE … IF NOT EXISTS: one or the other");
     if has(s, &name, true) && !c.or_replace {
@@ -370,8 +371,8 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
         return Err(crate::codes::coded("0A000", format!("{name}: a temporary table keeps its rows as they come (UNIQUE is a lake table's; NOT ENFORCED keeps none)")));
     }
     let columns: Vec<(String, String)> = serde_json::from_value(spec["columns"].clone())?;
-    let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::write::stored(&crate::query::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
-    ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::sys::NAMES.join(", "));
+    let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::stored(&crate::answer::dtype(t)?))))).collect::<Result<Vec<_>>>()?;
+    ensure!(columns.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str())), "{}: system columns (every table has them)", crate::text::NAMES.join(", "));
     let sql_types: std::collections::BTreeMap<String, String> = serde_json::from_value(spec["sql_types"].clone()).unwrap_or_default(); // (a uuid, JSON or VARCHAR(n) column: its values checked as a lake table's are)
     let not_null: Vec<String> = serde_json::from_value(spec["not_null"].clone()).unwrap_or_default();
     let defaults: std::collections::BTreeMap<String, String> = serde_json::from_value(spec["defaults"].clone()).unwrap_or_default();
@@ -417,9 +418,9 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
     let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.meta.clone()).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
     let (old, new) = crate::change::rows_of(&app.lake, name, &meta, stmt, app.lake.visible()).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
-    let inserted: usize = new.iter().map(|b| b.column_by_name(crate::sys::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
+    let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
     let (replaced, added) = (count(&old), count(&new));
-    let gone: HashSet<i64> = old.iter().filter_map(|b| b.column_by_name(crate::sys::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().collect::<Vec<_>>()).collect();
+    let gone: HashSet<i64> = old.iter().filter_map(|b| b.column_by_name(crate::text::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().collect::<Vec<_>>()).collect();
     apply(s, name, gone, new)?;
     Ok(j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted}))
 }
@@ -434,7 +435,7 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
         let now = crate::log::now_ms() as i64 * 1000;
         let mut rows = vec![];
         for b in &t.rows {
-            let ids = b.column_by_name(crate::sys::ROW_ID).expect("a temporary table's row ids").as_primitive::<Int64Type>();
+            let ids = b.column_by_name(crate::text::ROW_ID).expect("a temporary table's row ids").as_primitive::<Int64Type>();
             let keep = datafusion::arrow::array::BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| gone.contains(&i)))).collect::<Vec<_>>());
             rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
         }
@@ -449,8 +450,8 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
                     _ => (*next, *next += 1).0,
                 }).collect()
             };
-            let ids = fresh(b.column_by_name(crate::sys::ROW_ID), &mut t.next);
-            let created = b.column_by_name(crate::sys::CREATED).map(|c| datafusion::arrow::compute::cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))).transpose()?;
+            let ids = fresh(b.column_by_name(crate::text::ROW_ID), &mut t.next);
+            let created = b.column_by_name(crate::text::CREATED).map(|c| datafusion::arrow::compute::cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))).transpose()?;
             let created: Vec<i64> = (0..len).map(|i| created.as_ref().filter(|c| c.is_valid(i)).map_or(now, |c| c.as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(i))).collect();
             let time = |v: Vec<i64>| -> ArrayRef { Arc::new(TimestampMicrosecondArray::from(v).with_timezone("UTC")) };
             let mut columns: Vec<ArrayRef> = b.columns()[..n].to_vec();

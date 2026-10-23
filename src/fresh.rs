@@ -48,7 +48,7 @@ pub async fn run(lake: &Lake, source: &str, s: SchemaRef, rows: &[RecordBatch], 
         false => Arc::new(MemTable::try_new(s.clone(), vec![rows])?),
     };
     ctx.register_table(crate::query::table_ref(source), table)?;
-    let plan = prepare(crate::query::sql(&ctx, sql).await?.into_unoptimized_plan())?;
+    let plan = prepare(crate::engine::sql(&ctx, sql).await?.into_unoptimized_plan())?;
     let physical = ctx.state().create_physical_plan(&plan).await?;
     let task = ctx.task_ctx();
     let out = datafusion::physical_plan::collect(physical.clone(), task.clone()).await?;

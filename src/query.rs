@@ -66,7 +66,7 @@ pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     })
 }
 
-pub use crate::optimize::seconds;
+use crate::optimize::seconds;
 
 /// Text meant as timestamps, the ones without seconds given them (`seconds`).
 fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
@@ -268,7 +268,8 @@ pub async fn raw(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 /// spread query may read none of the table's log itself (`upto` 0), but its files hold rows
 /// changed since.
 async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>, at: Option<u64>) -> Result<DataFrame> {
-    use crate::sys::{with_sys, ROW_ID, VERSION};
+    use crate::sys::with_sys;
+    use crate::text::{ROW_ID, VERSION};
     let upto = upto.or(Some(lake.visible()));
     let at = at.or(upto); // (as of one commit: a change writes both. `at.or` of the `upto` given, None,
     // read every old row while the table's own were read to `visible`: a reader whose view is behind
@@ -290,7 +291,8 @@ async fn current(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta
 /// A changed table's old rows (`_row_id`, `_version`), sorted, from the changes after its last
 /// purge up to commit `at` (`{t}$deleted`'s files may be newer than the query's snapshot).
 async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, at: Option<u64>) -> Result<Vec<(i64, i64)>> {
-    use crate::sys::{with_sys, ROW_ID, VERSION};
+    use crate::sys::with_sys;
+    use crate::text::{ROW_ID, VERSION};
     use datafusion::arrow::array::AsArray;
     let deleted = crate::sys::deleted(name);
     let Some(dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted)).await? else { return Ok(vec![]) };
@@ -330,7 +332,7 @@ pub async fn sources(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Table
         let df = read_files(lake, ctx, meta.files.iter().collect(), meta, &schema).await?;
         files.push(if keyed { df.with_column("_ord", lit(0u64))? } else { df });
     }
-    let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID); // (`sys::with_sys`)
+    let sys = meta.columns.iter().any(|(c, _)| c == crate::text::ROW_ID); // (`sys::with_sys`)
     let mut fields = schema.fields().to_vec(); // the table's own schema, so every batch agrees
     if keyed {
         fields.push(Arc::new(Field::new("_ord", DataType::UInt64, false)));
@@ -363,7 +365,7 @@ fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &Sche
 async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     use datafusion::datasource::memory::MemorySourceConfig;
     let schema = read_schema(&meta.columns)?;
-    let sys = meta.columns.iter().any(|(c, _)| c == crate::sys::ROW_ID);
+    let sys = meta.columns.iter().any(|(c, _)| c == crate::text::ROW_ID);
     let tail = tail_rows(lake, name, meta.tiered, upto, false, sys, &schema).await?;
     let mut parts: Vec<Arc<dyn datafusion::physical_plan::ExecutionPlan>> = vec![];
     if !tail.is_empty() {
@@ -995,8 +997,8 @@ fn keep_held(held: MemoryReservation) {
 /// The memory of the answer a request kept, for the body that sends it (`server::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
-pub use crate::answer::{compact, dtype, ipc, schema, type_name};
-pub use crate::engine::sql;
+use crate::answer::{compact, schema};
+use crate::engine::sql;
 
 /// An Arrow IPC stream's batches (none for no bytes).
 pub fn read_ipc(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
@@ -1034,7 +1036,7 @@ pub async fn session(lake: &Lake, sql: &str, except: &str) -> Result<SessionCont
 
 /// `session`, this lake's tables as of log segment `upto` (every query in it reads the same rows).
 pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>) -> Result<SessionContext> {
-    use crate::ddl::{mentions, split, PUBLIC};
+    use crate::text::{mentions, split, PUBLIC};
     lake.caught_up().await?; // (a node that just started: not from an older catalog than its leader's)
     let upto = upto.or_else(crate::txn::snapshot); // (in a transaction: as of its snapshot, its writes over it)
     use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
@@ -1080,7 +1082,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             }
         }
     }
-    let (names, direct) = (crate::ext::names(&text), crate::ext::names(sql));
+    let (names, direct) = (crate::ext_names::names(&text), crate::ext_names::names(sql));
     let metas = futures::future::join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await; // (listed at once)
     for (name, meta) in names.into_iter().zip(metas) {
         let meta = match meta {
@@ -1187,8 +1189,8 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
     register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
     if listing {
-        let direct = crate::ext::names(sql);
-        for n in crate::ext::names(&text).into_iter().filter(|n| !direct.contains(n)) {
+        let direct = crate::ext_names::names(sql);
+        for n in crate::ext_names::names(&text).into_iter().filter(|n| !direct.contains(n)) {
             ctx.deregister_table(datafusion::common::TableReference::bare(n))?; // (files its views read: theirs, not tables to list)
         }
     }
@@ -1240,7 +1242,7 @@ pub async fn stored_views(lake: &Lake, sql: &str, listing: bool) -> Result<Vec<(
     let stored = lake.cat.scan_raw("q/", "q0").await?; // (decoded and expanded only when named: every query paid for every view)
     loop {
         let more: Vec<(&String, &bytes::Bytes)> = stored.iter()
-            .filter(|(k, _)| !views.iter().any(|(m, _): &(String, String)| m == &k[2..]) && (listing || crate::ddl::mentions(&text, &k[2..]))).collect();
+            .filter(|(k, _)| !views.iter().any(|(m, _): &(String, String)| m == &k[2..]) && (listing || crate::text::mentions(&text, &k[2..]))).collect();
         if more.is_empty() {
             return Ok(views);
         }
@@ -1262,7 +1264,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
         let before = views.len();
         let mut left = vec![];
         for (name, sql) in views {
-            match self::sql(ctx, &crate::asof::rewrite(&sql)?).await {
+            match self::sql(ctx, &crate::sys::planned(&sql)?).await {
                 Ok(df) => {
                     ctx.deregister_table(table_ref(&name))?;
                     let view = Arc::new(datafusion::catalog::view::ViewTable::new(df.into_unoptimized_plan(), Some(crate::ext_names::readable(&sql)))); // (its files as SQL named them)
@@ -1291,7 +1293,7 @@ pub async fn register_views(ctx: &SessionContext, mut views: Vec<(String, String
 /// other table it mentions is read from the lake as usual.
 pub async fn over(lake: &Lake, source: &str, rows: Vec<RecordBatch>, sql: &str) -> Result<RecordBatch> {
     let meta: TableMeta = lake.cat.get::<TableMeta>(&table_key(source)).await?.ok_or_else(|| anyhow::anyhow!("no table {source}"))?.logical(); // (rows under SQL's names)
-    let sql = crate::asof::rewrite(sql)?;
+    let sql = crate::sys::planned(sql)?;
     let (out, batches) = crate::fresh::run(lake, source, schema(&meta.columns)?, &rows, &sql, "", Ok).await?; // (its plan kept, when it reads the rows alone)
     Ok(datafusion::arrow::compute::concat_batches(&out, &batches)?)
 }
@@ -1311,7 +1313,7 @@ pub fn first_table(sql: &str) -> Result<String> {
     fn first(q: &Query) -> Option<String> {
         let SetExpr::Select(s) = q.body.as_ref() else { return None };
         match &s.from.first()?.relation {
-            TableFactor::Table { name, .. } => Some(crate::write::object(name)),
+            TableFactor::Table { name, .. } => Some(crate::text::object(name)),
             TableFactor::Derived { subquery, .. } => first(subquery),
             _ => None,
         }

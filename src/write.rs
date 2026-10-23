@@ -6,7 +6,8 @@
 //! leads for a moment itself when nobody does.
 use crate::cluster::{alive, claim, http, latest, mark_alive, release};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
-use crate::query::{schema, session};
+use crate::query::session;
+use crate::answer::schema;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-pub use crate::text::{first_word, head, ident, object};
+use crate::text::{first_word, head, ident, object};
 
 // ---------------------------------------------------------------- tables
 
@@ -104,15 +105,15 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
         let retention = retention.as_deref().map(crate::ddl::retention).transpose()?;
-        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `query::dtype`).
-        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::query::type_name(&crate::query::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
+        // Types as the lake records them: `VARIANT` is JSON text, `Float32[]` a list (see `answer::dtype`).
+        let columns = columns.iter().map(|(n, t)| Ok((n.clone(), crate::answer::type_name(&crate::answer::dtype(t)?)))).collect::<Result<Vec<_>>>()?;
         let ttl = ttl.map(|t| -> Result<(String, u64)> {
             let (c, s) = t.split_once(':').ok_or_else(|| anyhow::anyhow!("ttl: \"column:seconds\""))?;
             ensure!(!key.is_empty() && columns.iter().any(|(n, ty)| n == c && (ty.starts_with("Timestamp") || ty.starts_with("Date"))), "TTL: a timestamp or date column of a keyed table");
             Ok((c.to_string(), s.trim().parse()?))
         }).transpose()?;
         schema(&columns)?; // validate types
-        ensure!(columns.iter().all(|(c, _)| !crate::sys::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::sys::NAMES.join(", "));
+        ensure!(columns.iter().all(|(c, _)| !crate::text::NAMES.contains(&c.as_str()) && c != "_old_version"), "{} are system columns: every table has them (`SELECT _row_id, * FROM t`)", crate::text::NAMES.join(", "));
         ensure!(merge.values().all(|f| ["sum", "count", "min", "max", crate::finish::MOMENTS].contains(&f.as_str())), "MERGE: sum, count, min or max"); // (moments: a view's variance, `finish.rs`; an ALTER of its table sends them back)
         ensure!(merge.is_empty() || !key.is_empty(), "MERGE needs a key: a merge table combines the rows of each key");
         ensure!(merge.keys().all(|c| columns.iter().any(|(n, _)| n == c)), "MERGE: columns of the table");
@@ -894,13 +895,13 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
             ensure!(c.columns.is_empty() && c.query.is_none(), "CREATE TABLE {} LIKE {}: columns or a query, or LIKE, not both", c.name, l.name);
             (enums, sql_types) = crate::types::of_table(from, &object(&l.name)).await; // (its enum and uuid columns are those here too)
             let sql = format!("SELECT * FROM {} LIMIT 0", l.name);
-            crate::query::sql(&session(from, &sql, "").await?, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
+            crate::engine::sql(&session(from, &sql, "").await?, &sql).await?.schema().fields().iter().cloned().collect::<Vec<_>>()
         }
         (None, Some(q)) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
             let ctx = if files { ctx.enable_url_table() } else { ctx };
-            let df = crate::query::sql(&ctx, &sql).await?;
+            let df = crate::engine::sql(&ctx, &sql).await?;
             // (the types the query gives: the analyzer's rules make 1e15 a whole decimal and a float meeting a decimal a float, and the table must hold what the query gives)
             let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
             match c.columns.is_empty() {
@@ -917,7 +918,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         }
         (None, None) => declared().await?,
     };
-    let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::query::type_name(f.data_type()))).collect();
+    let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
     let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
     // (a PRIMARY KEY said NOT ENFORCED is a fact, not the key: `constraints.rs`)
     let mut key: Vec<String> = c.constraints.iter().flat_map(|k| match k {
@@ -993,8 +994,6 @@ pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<
     Ok(out)
 }
 
-pub use crate::answer::stored;
-
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
 async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
@@ -1022,7 +1021,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
             ctx.sql(&format!("CREATE TABLE t ({column} {sql_type})")).await?;
             let mut columns = m.columns.clone();
-            columns.push((column.to_string(), crate::query::type_name(ctx.table("t").await?.schema().field(0).data_type())));
+            columns.push((column.to_string(), crate::answer::type_name(ctx.table("t").await?.schema().field(0).data_type())));
             spec["columns"] = j!(columns);
             if let Some(e) = enumerated {
                 spec["enums"] = j!({column: e});
@@ -1286,7 +1285,7 @@ pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str)
         }
         false => ctx,
     };
-    let batches = crate::query::sql(ctx, &crate::asof::rewrite(&crate::routines::rows_apart(sql))?).await?.collect().await?;
+    let batches = crate::engine::sql(ctx, &crate::sys::planned(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(None) };
     Ok(Some(concat_batches(&first.schema(), &batches)?))
 }
@@ -1308,7 +1307,7 @@ pub(crate) fn by_position(target: &datafusion::arrow::datatypes::Schema) -> impl
 /// order (`by_position`).
 fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<String>)> {
     // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
-    let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::sys::ROW_ID, crate::sys::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
+    let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::text::ROW_ID, crate::text::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
     // (the marker is taken only where the table has one: a table without one takes a `_deleted` column by position, as before)
     let marker = target.fields().iter().any(|f| f.name() == "_deleted").then(|| (0..all.num_columns()).find(|&i| all.schema().field(i).name() == "_deleted")).flatten();
     let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i) && Some(*i) != marker).collect();
@@ -1396,7 +1395,7 @@ fn values_typed<'a>(sql: &'a str, target: &datafusion::arrow::datatypes::Schema)
             *e = ast::Expr::Function(cast);
         }
     }
-    crate::routines::sql(&Statement::Query(q)).into()
+    crate::text::sql(&Statement::Query(q)).into()
 }
 
 /// The `VALUES` a query is (with no names), or the one `rows_for` wraps for a list naming the delete marker
@@ -1446,7 +1445,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
     let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
         in_order(&ctx);
-        let df = crate::query::sql(&ctx, &crate::asof::rewrite(query)?).await?;
+        let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
         write_rows(lake, &ctx, table, df, stamp).await
     }).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
@@ -1473,7 +1472,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
     // (a table's live columns, in order, written under their stored names: ADR-022)
     let target: Vec<(String, DataType)> = match &meta {
-        Some(m) => m.live().map(|(s, _, t)| Ok((s.to_string(), crate::query::dtype(t)?))).collect::<Result<_>>()?,
+        Some(m) => m.live().map(|(s, _, t)| Ok((s.to_string(), crate::answer::dtype(t)?))).collect::<Result<_>>()?,
         // (a new table takes the types the query gives as it runs, as `create_spec` does)
         None => crate::query::run_schema(ctx, df.logical_plan())?.fields().iter().map(|f| (f.name().clone(), if *f.data_type() == DataType::Utf8View { DataType::Utf8 } else { f.data_type().clone() })).collect(),
     };
@@ -1519,7 +1518,7 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
     let new = TableMeta { columns: f.columns.clone(), publish: default_publish(), ids: true, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), ..Default::default() }; // (a table `POST /insert/{t}` makes starts at the log's end, as CREATE TABLE's does; SQL's INSERT needs one already: `is_there`)
     let meta = lake.cat.get::<TableMeta>(&table_key(&f.table)).await?.unwrap_or_else(|| new.clone());
     // Types as the lake stores them, so a writer may name them its own way (`Utf8View`, `VARIANT`).
-    let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::query::dtype(t).map(|t| crate::query::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
+    let types = |c: &[(String, String)]| c.iter().map(|(_, t)| crate::answer::dtype(t).map(|t| crate::answer::type_name(&t)).unwrap_or_else(|_| t.clone())).collect::<Vec<_>>();
     ensure!(meta.key.is_empty(), "INSERT into a keyed table goes through the log");
     ensure!(!f.files.iter().any(|d| d.sys) || !follows(lake, &f.table).await?, "{AGAIN}: a materialized view or task of {} was made as it was written", f.table);
     let live: Vec<(String, String)> = meta.live().map(|(s, _, t)| (s.to_string(), t.to_string())).collect(); // (dropped columns aren't written)
@@ -1750,7 +1749,7 @@ pub async fn seen_here(app: &crate::server::App) {
 /// attached, and a name this lake can't resolve answer yes: their own paths take them (or refuse
 /// them by name).
 async fn is_there(lake: &Lake, table: &str) -> Result<bool> {
-    if crate::ext::spec(table).is_some() || crate::ext::outside_target(lake, table).await?.is_some() {
+    if crate::ext_names::spec(table).is_some() || crate::ext::outside_target(lake, table).await?.is_some() {
         return Ok(true);
     }
     let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(true) };
@@ -1905,7 +1904,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     }
     // (an UPDATE's, DELETE's or MERGE's target reaches here named as its files already: it read
     // "no table" with a quoted path)
-    if let Some(spec) = crate::ext::spec(&stmt.table()) {
+    if let Some(spec) = crate::ext_names::spec(&stmt.table()) {
         bail!("{}: files or another engine's table; Pondra INSERTs into a Delta or Iceberg table (UPDATE, DELETE and MERGE: not yet)", spec.urls.join(", "));
     }
     // UPDATE and DELETE of an append table, and MERGE: the leader's (of the table's lake), from
@@ -2013,7 +2012,7 @@ fn attached_as(stmt: &Stmt) -> String { stmt.table().split('.').next().unwrap_or
 /// table not made yet). A spread that fails leaves what it wrote to the orphan sweep (no entry
 /// names those files), and this node writes it all.
 async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>, to: &crate::log::To, here: bool) -> Result<Option<Option<Files>>> {
-    let query = crate::asof::rewrite(query)?;
+    let query = crate::sys::planned(query)?;
     if here || app.here_only(&query).await {
         return Ok(crate::spmd::refused("it reads what only this node has"));
     }

@@ -48,7 +48,7 @@ use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
-pub use crate::text::{function, is_uuid};
+use crate::text::{function, is_uuid};
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -93,7 +93,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     static WORD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(CREATE(\s+OR\s+REPLACE)?|ALTER|DROP)\s+TYPE\b").expect("a regex"));
     static UNLESS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+TYPE\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
     static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*DROP\s+TYPE\s+(IF\s+EXISTS\s+)?(.+?)(\s+(CASCADE|RESTRICT))?\s*;?\s*$"#).expect("a regex"));
-    let first = crate::write::first_word(sql);
+    let first = crate::text::first_word(sql);
     let c = WORD.captures(first)?;
     let ddl = |c: Change| Some(Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]));
     let invalid = |e: String| Some(Stmt::Invalid(e));
@@ -113,13 +113,13 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     let parsed = Parser::parse_sql(&GenericDialect {}, &text).map(|mut s| s.pop());
     Some(match parsed {
         Ok(Some(Statement::CreateType { name, representation: Some(ast::UserDefinedTypeRepresentation::Enum { labels }) })) => {
-            return ddl(Change::Create { name: crate::write::object(&name), labels: labels.iter().map(|l| l.value.clone()).collect(), if_not_exists: unless })
+            return ddl(Change::Create { name: crate::text::object(&name), labels: labels.iter().map(|l| l.value.clone()).collect(), if_not_exists: unless })
         }
         Ok(Some(Statement::CreateType { .. })) | Err(_) if word.starts_with("CREATE") => Stmt::Invalid("CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)".into()),
         Ok(Some(Statement::AlterType(a))) => {
-            let name = crate::write::object(&a.name);
+            let name = crate::text::object(&a.name);
             match a.operation {
-                ast::AlterTypeOperation::Rename(r) => return ddl(Change::Rename { name, to: crate::write::ident(&r.new_name) }),
+                ast::AlterTypeOperation::Rename(r) => return ddl(Change::Rename { name, to: crate::text::ident(&r.new_name) }),
                 ast::AlterTypeOperation::AddValue(v) => {
                     let (before, after) = match v.position {
                         Some(ast::AlterTypeAddValuePosition::Before(n)) => (Some(n.value), None),
@@ -172,7 +172,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
         Change::Rename { name, to } => {
             let (name, t) = find(lake, &name).await?.with_context(|| format!("type \"{name}\" does not exist"))?;
-            let to = crate::ddl::new_name(lake, &crate::ddl::join(crate::ddl::split(&name).0, &to)).await?;
+            let to = crate::ddl::new_name(lake, &crate::text::join(crate::text::split(&name).0, &to)).await?;
             ensure!(lake.cat.get::<Type>(&key(&to)).await?.is_none(), "type \"{to}\" already exists");
             let mut puts = vec![(key(&to), json(&t))];
             for (k, mut m) in users(lake, &name).await? {
@@ -243,7 +243,7 @@ pub async fn of(lake: &Lake, t: &ast::DataType) -> Result<Option<Enum>> {
             Some(Enum { of: None, labels })
         }
         ast::DataType::Custom(name, args) if args.is_empty() => {
-            let name = crate::write::object(name);
+            let name = crate::text::object(name);
             find(lake, &name).await?.map(|(of, t)| Enum { of: Some(of), labels: t.labels })
         }
         _ => None,
@@ -269,10 +269,10 @@ pub async fn columns(lake: &Lake, cols: &[ast::ColumnDef]) -> Result<(Vec<ast::C
     let (mut out, mut enums, mut sql_types) = (cols.to_vec(), BTreeMap::new(), BTreeMap::new());
     for c in out.iter_mut() {
         if let Some(e) = of(lake, &c.data_type).await? {
-            enums.insert(crate::write::ident(&c.name), e);
+            enums.insert(crate::text::ident(&c.name), e);
             c.data_type = ast::DataType::Varchar(None);
         } else if let Some(t) = sql_type(&c.data_type)? {
-            sql_types.insert(crate::write::ident(&c.name), t);
+            sql_types.insert(crate::text::ident(&c.name), t);
             c.data_type = ast::DataType::Varchar(None);
         }
     }
@@ -419,7 +419,7 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         if let Some(i) = (0..text.len()).find(|&i| text.is_valid(i) && !labels.contains(text.value(i)) && !marker(i)) {
             let what = e.of.clone().unwrap_or_else(|| format!("column {}", meta.name_of(stored)));
             let message = format!("invalid input value for enum {what}: \"{}\" (its labels: {})", text.value(i), quoted(&e.labels));
-            return Err(anyhow::Error::new(crate::views::Violation(message, "22P02")));
+            return Err(anyhow::Error::new(crate::codes::Violation(message, "22P02")));
         }
     }
     for (stored, t) in &meta.sql_types {
@@ -432,7 +432,7 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         let column = meta.name_of(stored);
         let first = (0..text.len()).filter(|&i| text.is_valid(i) && !marker(i)).find_map(|i| refusal(t, column, text.value(i)));
         if let Some((message, code)) = first {
-            return Err(anyhow::Error::new(crate::views::Violation(message, code)));
+            return Err(anyhow::Error::new(crate::codes::Violation(message, code)));
         }
     }
     Ok(())
@@ -492,7 +492,7 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
 }
 
 struct Casts {
-    types: HashMap<String, Type>, // the names found, by their name as written (`crate::write::object`)
+    types: HashMap<String, Type>, // the names found, by their name as written (`text::object`)
     named: Vec<String>,
     labelled: Vec<String>, // the types `enum_range` and its kin name, which must be there
     typed: bool,           // a cast to uuid, json or jsonb was found
@@ -503,7 +503,7 @@ struct Casts {
 impl Casts {
     fn custom(t: &ast::DataType) -> Option<String> {
         match t {
-            ast::DataType::Custom(name, args) if args.is_empty() => Some(crate::write::object(name)),
+            ast::DataType::Custom(name, args) if args.is_empty() => Some(crate::text::object(name)),
             _ => None,
         }
     }
