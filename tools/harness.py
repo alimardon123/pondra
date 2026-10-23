@@ -7096,13 +7096,15 @@ def hot_under_line():
         # decide how many) the node starts low, and 8,000,000 values reached 739 MB of a 717 MB trim line. So a run whose
         # own peak stays within 100 MB of the trim line, with nothing trimmed, is run again with a quarter more values
         # (the cache is as it was), twice at most; past that margin the node was over the line for some 50 ms, ten looks.
+        # Where the peak can't be reset, it counts from the node's start, the warm-up included, so it says nothing of the
+        # run: the first run is the only one taken.
         trim, n, tries = (1 << 30) // 10 * 7, HOT_LINE_ROWS, []
         for _ in range(3):
-            reset_peak()  # (where it isn't allowed, the peak counts from the node's start, the warm-up included, so no run is taken again)
+            own = reset_peak()
             status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
             held_after, peak = hot_bytes(), vm_hwm(node.p.pid)
             tries.append({"rows": n, "peak resident": peak >> 20})
-            if status != 200 or held_after < held_before or peak > trim + (100 << 20):
+            if not own or status != 200 or held_after < held_before or peak > trim + (100 << 20):
                 break
             n = n * 5 // 4
         stopped = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
