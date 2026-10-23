@@ -160,16 +160,49 @@ pub fn left_out(name: &str, meta: &TableMeta) -> Option<String> {
     (!formats.is_empty()).then(|| format!("{name} isn't published as {}, though --publish asks for it: {}", formats.join(" or "), whys.join("; ")))
 }
 
-/// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
-pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
-    let folder = crate::store::folder_of(lake, table).await?;
-    let (dir, state) = match format {
-        "delta" => (format!("data/{folder}/_delta_log"), format!("x/{table}")),
-        _ => (format!("data/{folder}/metadata"), format!("i/{table}")),
+/// The catalog key of a table's published state in `format`: the Delta log's (`x/`) or the Iceberg metadata's (`i/`).
+pub fn state_key(table: &str, format: &str) -> String {
+    match format {
+        "delta" => format!("x/{table}"),
+        _ => format!("i/{table}"),
+    }
+}
+
+/// The formats, of those given, whose published state the catalog holds for `table`. Only those have metadata the table owns
+/// in its folder: a staged table has none, and its folder is its live table's.
+pub async fn published(lake: &Lake, table: &str, formats: &[String]) -> Result<Vec<String>> {
+    let mut out = vec![];
+    for format in formats {
+        if lake.cat.get_raw(&state_key(table, format)).await?.is_some() {
+            out.push(format.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Deletes a format's metadata objects in `folder` (its Delta log, or its Iceberg metadata), once the catalog no longer
+/// names them: the caller's commit deletes the state (`state_key`) first.
+pub async fn delete_objects(lake: &Lake, folder: &str, format: &str) -> Result<()> {
+    let dir = match format {
+        "delta" => format!("data/{folder}/_delta_log"),
+        _ => format!("data/{folder}/metadata"),
     };
-    lake.cat.commit(vec![], &[state]).await?;
     let objects: Vec<_> = futures::TryStreamExt::try_collect(lake.store.list(Some(&Path::from(dir)))).await?;
     futures::future::join_all(objects.iter().map(|o| lake.delete(o.location.as_ref()))).await;
+    Ok(())
+}
+
+/// Stop publishing a table in `format`: its state goes, then its metadata, so no engine reads a stale copy.
+pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
+    let folder = crate::store::folder_of(lake, table).await?;
+    let formats = published(lake, table, &[format.to_string()]).await?;
+    let states: Vec<String> = formats.iter().map(|f| state_key(table, f)).collect();
+    if !states.is_empty() {
+        lake.cat.commit(vec![], &states).await?;
+    }
+    for format in &formats {
+        delete_objects(lake, &folder, format).await?;
+    }
     Ok(())
 }
 
