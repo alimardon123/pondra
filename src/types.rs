@@ -420,7 +420,7 @@ pub fn as_held(meta: &TableMeta, rows: RecordBatch, sql_names: bool) -> Result<R
 fn jsonb_refused(column: &str, v: &str, e: datafusion::error::DataFusionError) -> anyhow::Error {
     let code = crate::codes::of(&anyhow::Error::from(e));
     let (message, code) = refusal("jsonb", column, v).unwrap_or_else(|| (json_refusal(v), code));
-    anyhow::Error::new(crate::views::Violation(message, code))
+    anyhow::Error::new(crate::codes::Violation(message, code))
 }
 
 /// Why a uuid column refuses a value: not a uuid, or one written another way than the column holds.
