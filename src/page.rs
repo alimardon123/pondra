@@ -6,10 +6,12 @@
 
 use crate::front::Host;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
+use anyhow::Context;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, Session, SchemaProvider, TableProvider};
 use datafusion::common::{Constraints, Statistics};
+use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::{MemTable, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
@@ -214,10 +216,10 @@ impl Page {
     /// was put; given to the statement only once its columns are known.
     async fn register(&self, overlay: &Overlay, name: &str, spec: &crate::ext_names::Spec) -> anyhow::Result<()> {
         use crate::ext_names::CSV_OPTIONS;
-        if !["parquet", "csv", "json", "arrow"].contains(&spec.format.as_str()) {
-            return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files given to it, not {} tables", spec.format)));
+        if !["parquet", "csv", "json", "arrow", "delta"].contains(&spec.format.as_str()) {
+            return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files and Delta tables, not {} tables", spec.format)));
         }
-        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k));
+        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version");
         if let Some(k) = spec.options.keys().find(|k| !takes(k)) {
             return Err(crate::codes::coded("0A000", format!("a page doesn't take {k} yet")));
         }
@@ -226,6 +228,10 @@ impl Page {
         let given = crate::ext_names::Spec { urls, ..spec.clone() };
         // (a file not put is named as SQL wrote it: the URL at the same place in `spec.urls`, not the store's form)
         let written = |u: &str| given.urls.iter().position(|g| g == u).map_or(u.to_string(), |i| spec.urls[i].clone());
+        self.reach_web(&given, &written).await?;
+        if spec.format == "delta" {
+            return self.delta(overlay, name, &given).await;
+        }
         let found = crate::ext_names::listed(&state, &given, |u| Some(crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))).await?;
         let files = crate::ext_names::schema_of(&state, &given, &found).await?;
         let columns: Vec<(String, String)> = files.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
@@ -235,6 +241,56 @@ impl Page {
         let refs: Vec<(&str, &str)> = pairs.iter().map(|(file, part)| (file.as_str(), part.as_str())).collect();
         let df = crate::ext_names::read_files(&self.ctx, &refs, &schema, &given).await?;
         overlay.own(name.to_string(), df.into_view()); // (a name is one table: the statement's own map)
+        Ok(())
+    }
+
+    /// The store a URL is in, and the object's path there. A page's own files are in the `mem://` store it was opened
+    /// with. A web address's origin has no store until a statement names it: the program's `web` makes one, which is
+    /// registered in the session, so the reads of that origin's files find it too.
+    fn reached(&self, url: &str) -> anyhow::Result<(Arc<dyn ObjectStore>, Path)> {
+        let at = ListingTableUrl::parse(url)?;
+        match self.ctx.runtime_env().object_store(at.object_store()) {
+            Ok(store) => return Ok((store, at.prefix().clone())),
+            Err(e) if !is_web(url) => return Err(e.into()),
+            Err(_) => {}
+        }
+        let Some(web) = &self.web else {
+            return Err(crate::codes::coded("0A000", format!("{url}: this page reads no web addresses (its program gave it no way to fetch)")));
+        };
+        let origin = at.object_store();
+        let store = web(origin.as_str().trim_end_matches('/'));
+        self.ctx.register_object_store(origin.as_ref(), store.clone());
+        Ok((store, at.prefix().clone()))
+    }
+
+    /// The web addresses a statement names, reached before anything reads them: each origin's store is in the session
+    /// (`reached`), so the files' reads find it. A web server lists nothing, so a folder or a glob is refused by name,
+    /// and a file is asked for by `head` first, so one that isn't there is 42P01 by the name SQL wrote. A Delta table
+    /// is read from its log, not listed: only its origin is reached.
+    async fn reach_web(&self, spec: &crate::ext_names::Spec, written: &impl Fn(&str) -> String) -> anyhow::Result<()> {
+        for u in spec.urls.iter().filter(|u| is_web(u)) {
+            if spec.format != "delta" && (u.ends_with('/') || crate::ext_names::glob_at(u).is_some()) {
+                return Err(crate::codes::coded("0A000", format!("{}: a web server lists nothing, so a page reads the files it names (not a folder or a glob)", written(u))));
+            }
+            let (store, at) = self.reached(u)?;
+            if spec.format == "delta" {
+                continue;
+            }
+            match store.head(&at).await {
+                Ok(_) => {}
+                Err(StoreError::NotFound { .. }) => return Err(crate::codes::coded("42P01", format!("no file {} at that web address", written(u)))),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// A Delta table (`read_delta`) at the version asked, or its latest: read from its log as a node reads it
+    /// (`read_delta::resolve`, over this page's own `Reach`), its columns as SQL names them (`delta_table`).
+    async fn delta(&self, overlay: &Overlay, name: &str, given: &crate::ext_names::Spec) -> anyhow::Result<()> {
+        let version = given.options.get("version").map(|v| v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))).transpose()?;
+        let found = crate::read_delta::resolve(&PageReach(self), given.urls[0].trim_end_matches('/'), version).await?;
+        overlay.own(name.to_string(), delta_table(&self.ctx, found).await?);
         Ok(())
     }
 
@@ -309,17 +365,55 @@ impl Page {
     }
 }
 
-/// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a relative
-/// path (`'x.csv'`, `'./d/*.parquet'`) in the working folder (`under_files`), and any other URL refused: a page reads the
-/// files it was given, not the web (yet).
+/// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
+/// (`http://`, `https://`) as written (`reached` finds its origin's store), a relative path (`'x.csv'`, `'./d/*.parquet'`)
+/// in the working folder (`under_files`), and any other URL refused by name: a page reads the files it was given and the web.
 fn located(url: &str) -> anyhow::Result<String> {
-    if url.starts_with(WORKING) {
+    if url.starts_with(WORKING) || is_web(url) {
         return Ok(url.to_string());
     }
     if url.contains("://") {
-        return Err(crate::codes::coded("0A000", format!("{url}: a page reads the files given to it (PUT /files/{{path}}); URLs come later")));
+        return Err(crate::codes::coded("0A000", format!("{url}: a page reads the files given to it (PUT /files/{{path}}) and the web (http, https)")));
     }
     Ok(format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))))
+}
+
+/// Whether a URL is a web address, which a page reads through the store its program gives it (`Page::reached`).
+fn is_web(url: &str) -> bool {
+    matches!(crate::ext_names::scheme(url), Some("http" | "https"))
+}
+
+/// A page's way to read another engine's files: `read_delta` reads a log through it. The store a URL is in is
+/// `Page::reached`'s, and the files are read by the page's session.
+struct PageReach<'a>(&'a Page);
+
+impl crate::reach::Reach for PageReach<'_> {
+    fn store(&self, url: &str) -> impl Future<Output = anyhow::Result<(Arc<dyn ObjectStore>, Path)>> + Send {
+        std::future::ready(self.0.reached(url))
+    }
+
+    fn session(&self) -> SessionContext {
+        self.0.ctx.clone()
+    }
+}
+
+/// A Delta table at the version read, as SQL names its columns. A column the table renames (column mapping) is
+/// read under its physical name and renamed to its SQL name. A table with no files is empty, with its columns, as a
+/// node reads one.
+async fn delta_table(ctx: &SessionContext, found: crate::read_delta::Found) -> anyhow::Result<Arc<dyn TableProvider>> {
+    use datafusion::prelude::ident;
+    if found.files.is_empty() {
+        let columns: Vec<(String, String)> = found.columns.iter().map(|(c, t)| (found.names.get(c).unwrap_or(c).clone(), t.clone())).collect();
+        return Ok(Arc::new(MemTable::try_new(crate::answer::schema(&columns)?, vec![vec![]])?));
+    }
+    let files: Vec<&crate::data_file::DataFile> = found.files.iter().collect();
+    let df = crate::scan::read(ctx, &files, &crate::answer::schema(&found.columns)?, None).await?;
+    let select = found.columns.iter().map(|(c, _)| {
+        let name = found.names.get(c).map_or(c.as_str(), String::as_str);
+        // (a column named as it is is not aliased to itself: `query.rs` says why)
+        if name == c { ident(c) } else { ident(c).alias(name) }
+    }).collect::<Vec<_>>();
+    Ok(df.select(select)?.into_view())
 }
 
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for
@@ -1049,5 +1143,157 @@ mod tests {
         let logical = rows.as_array().unwrap().iter().find(|r| r["plan_type"] == "logical_plan").unwrap()["plan"].as_str().unwrap();
         let first_join = logical.lines().find(|l| l.contains("Join")).unwrap();
         assert!(first_join.contains("big.k"), "{logical}");
+    }
+
+    /// A web server over memory: it reads every object, and lists nothing as a web server does, so a test passes only if
+    /// no read lists.
+    #[derive(Debug)]
+    struct NoList(Arc<InMemory>);
+
+    impl std::fmt::Display for NoList {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("NoList") }
+    }
+
+    #[async_trait]
+    impl ObjectStore for NoList {
+        async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> datafusion::object_store::Result<datafusion::object_store::PutResult> { self.0.put_opts(l, p, o).await }
+        async fn put_multipart_opts(&self, l: &Path, o: datafusion::object_store::PutMultipartOptions) -> datafusion::object_store::Result<Box<dyn datafusion::object_store::MultipartUpload>> { self.0.put_multipart_opts(l, o).await }
+        async fn get_opts(&self, l: &Path, o: datafusion::object_store::GetOptions) -> datafusion::object_store::Result<datafusion::object_store::GetResult> { self.0.get_opts(l, o).await }
+        fn delete_stream(&self, l: futures::stream::BoxStream<'static, datafusion::object_store::Result<Path>>) -> futures::stream::BoxStream<'static, datafusion::object_store::Result<Path>> { self.0.delete_stream(l) }
+        fn list(&self, _: Option<&Path>) -> futures::stream::BoxStream<'static, datafusion::object_store::Result<datafusion::object_store::ObjectMeta>> { futures::StreamExt::boxed(futures::stream::once(async { Err(StoreError::NotSupported { source: "a web server lists nothing".into() }) })) }
+        async fn list_with_delimiter(&self, _: Option<&Path>) -> datafusion::object_store::Result<datafusion::object_store::ListResult> { Err(StoreError::NotSupported { source: "a web server lists nothing".into() }) }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: datafusion::object_store::CopyOptions) -> datafusion::object_store::Result<()> { self.0.copy_opts(f, t, o).await }
+    }
+
+    /// The root of the tests' Delta table, at the origin a page's program gives it.
+    const DELTA_ROOT: &str = "https://lake.test/lake/orders";
+
+    /// A Parquet file of `(id, label)` rows, its columns named as a column-mapped table's files name them (`col-2`).
+    fn delta_file(rows: &[(i64, &str)]) -> Vec<u8> {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("col-2", DataType::Utf8, true)]));
+        let ids = Int64Array::from_iter_values(rows.iter().map(|r| r.0));
+        let labels = StringArray::from_iter_values(rows.iter().map(|r| r.1));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ids), Arc::new(labels)]).unwrap();
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        body
+    }
+
+    /// A `add` action of a file with `rows` rows, `size` bytes.
+    fn add(path: &str, rows: u64, size: u64) -> serde_json::Value {
+        json!({"add": {"path": path, "partitionValues": {}, "size": size, "modificationTime": 0, "dataChange": true, "stats": json!({"numRecords": rows}).to_string()}})
+    }
+
+    /// The Delta table of the tests, put under `lake/orders` in `memory` as a node publishes one: three Parquet files and
+    /// three commits. The first has the protocol, the schema (`label` is `col-2` in the files) and `a.parquet` and
+    /// `b.parquet`. The second removes `a.parquet` and adds it again with row 1 deleted by an inline deletion vector.
+    /// The third adds `c.parquet`.
+    async fn put_delta_table(memory: &InMemory) {
+        let files = [
+            ("a.parquet", delta_file(&[(1, "a"), (2, "b")])),
+            ("b.parquet", delta_file(&[(3, "c")])),
+            ("c.parquet", delta_file(&[(4, "d")])),
+        ];
+        let (a, b, c) = (files[0].1.len() as u64, files[1].1.len() as u64, files[2].1.len() as u64);
+        let protocol = json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["columnMapping", "deletionVectors"], "writerFeatures": ["columnMapping", "deletionVectors"]}});
+        let schema = json!({"type": "struct", "fields": [
+            {"name": "id", "type": "long", "nullable": true, "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}},
+            {"name": "label", "type": "string", "nullable": true, "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "col-2"}},
+        ]});
+        let metadata = json!({"metaData": {"id": "orders", "format": {"provider": "parquet", "options": {}}, "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {"delta.columnMapping.mode": "name"}}});
+        let bitmap = crate::scan::roaring_bytes(&[1]);
+        let mut deleted = add("a.parquet", 2, a);
+        deleted["add"]["deletionVector"] = json!({"storageType": "i", "pathOrInlineDv": crate::scan::z85_of(&bitmap), "sizeInBytes": bitmap.len(), "cardinality": 1});
+        let commits = [
+            vec![protocol, metadata, add("a.parquet", 2, a), add("b.parquet", 1, b)],
+            vec![json!({"remove": {"path": "a.parquet", "deletionTimestamp": 0, "dataChange": true}}), deleted],
+            vec![add("c.parquet", 1, c)],
+        ];
+        for (v, actions) in commits.iter().enumerate() {
+            let body: String = actions.iter().map(|a| format!("{a}\n")).collect();
+            memory.put(&Path::from(format!("lake/orders/_delta_log/{v:020}.json")), body.into_bytes().into()).await.unwrap();
+        }
+        for (name, body) in files {
+            memory.put(&Path::from(format!("lake/orders/{name}")), body.into()).await.unwrap();
+        }
+    }
+
+    /// A page whose program gives it the origin `https://lake.test`: a store over `memory` that lists nothing.
+    fn web_page(memory: Arc<InMemory>) -> Page {
+        let web: Web = Arc::new(move |origin: &str| {
+            assert_eq!(origin, "https://lake.test");
+            Arc::new(NoList(memory.clone())) as Arc<dyn ObjectStore>
+        });
+        Page::open(&Options { web: Some(web), ..Default::default() })
+    }
+
+    /// A Delta table over the web reads as a node reads it: its latest version without the deleted row, its renamed
+    /// column under its SQL name, and an older version as it was.
+    #[tokio::test]
+    async fn a_delta_table_is_read_over_the_web_at_its_version() {
+        let memory = Arc::new(InMemory::new());
+        put_delta_table(&memory).await;
+        let page = web_page(memory);
+        let read = |version: &str| format!("SELECT id, label FROM read_delta('{DELTA_ROOT}'{version}) ORDER BY id");
+        let latest = page.request("POST", "/sql?format=csv", &[], read("").into()).await;
+        assert_eq!((latest.status, latest.header("x-pondra-sqlstate")), (200, None), "{:?}", latest.body);
+        assert_eq!(latest.body, "id,label\n1,a\n3,c\n4,d\n");
+        let zero = page.request("POST", "/sql?format=csv", &[], read(", version => 0").into()).await;
+        assert_eq!(zero.body, "id,label\n1,a\n2,b\n3,c\n");
+        let one = page.request("POST", "/sql?format=csv", &[], read(", version => 1").into()).await;
+        assert_eq!(one.body, "id,label\n1,a\n3,c\n");
+    }
+
+    /// A file over the web is read by its name, as a file given to a page is; a file that isn't there is 42P01 by the
+    /// name SQL wrote.
+    #[tokio::test]
+    async fn a_web_file_is_read_by_name_and_a_missing_one_is_not_found() {
+        let memory = Arc::new(InMemory::new());
+        put_delta_table(&memory).await;
+        let page = web_page(memory);
+        let got = page.request("POST", "/sql?format=csv", &[], "FROM 'https://lake.test/lake/orders/b.parquet'".into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{:?}", got.body);
+        assert_eq!(got.body, "id,col-2\n3,c\n");
+        let missing = page.request("POST", "/sql?format=csv", &[], "FROM 'https://lake.test/lake/orders/nope.parquet'".into()).await;
+        assert_eq!((missing.status, missing.header("x-pondra-sqlstate")), (404, Some("42P01")));
+        assert!(std::str::from_utf8(&missing.body).unwrap().contains("at that web address"), "{:?}", missing.body);
+    }
+
+    /// A web server lists nothing, so a folder or a glob over the web is refused by name, not listed.
+    #[tokio::test]
+    async fn a_web_folder_or_glob_is_refused_by_name() {
+        let memory = Arc::new(InMemory::new());
+        put_delta_table(&memory).await;
+        let page = web_page(memory);
+        for sql in ["FROM read_parquet('https://lake.test/lake/orders/')", "FROM 'https://lake.test/lake/orders/*.parquet'"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
+            assert!(std::str::from_utf8(&got.body).unwrap().contains("lists nothing"), "{sql}");
+        }
+    }
+
+    /// A web address with no Delta table at it says so.
+    #[tokio::test]
+    async fn a_web_address_with_no_delta_table_says_so() {
+        let memory = Arc::new(InMemory::new());
+        put_delta_table(&memory).await;
+        let page = web_page(memory);
+        let got = page.request("POST", "/sql", &[], "FROM read_delta('https://lake.test/lake/none')".into()).await;
+        assert_ne!(got.status, 200);
+        assert!(std::str::from_utf8(&got.body).unwrap().contains("no Delta table there"), "{:?}", got.body);
+    }
+
+    /// A page whose program gives it no way to fetch reads no web address, and says so by name.
+    #[tokio::test]
+    async fn a_page_with_no_web_reads_no_web_address() {
+        let page = Page::open(&Options::default());
+        let got = page.request("POST", "/sql", &[], format!("FROM read_delta('{DELTA_ROOT}')").into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
+        assert!(std::str::from_utf8(&got.body).unwrap().contains("reads no web addresses"), "{:?}", got.body);
     }
 }
