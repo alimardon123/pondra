@@ -1,5 +1,5 @@
 //! Planning rules Pondra adds to DataFusion's, and the engine settings it starts from.
-use datafusion::arrow::datatypes::{i256, DataType, Field};
+use datafusion::arrow::datatypes::{i256, DataType, Field, Schema};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
@@ -75,6 +75,7 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     #[cfg(feature = "server")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
+    rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
     rules.push(Arc::new(CheapFirst));
     rules.push(Arc::new(AsyncBelow)); // (last: after COUNT(DISTINCT) became a GROUP BY)
     rules
@@ -251,29 +252,42 @@ impl OptimizerRule for ScaledLiterals {
     }
 
     fn rewrite(&self, plan: LogicalPlan, _: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        if matches!(plan, LogicalPlan::TableScan(_)) {
-            return Ok(Transformed::no(plan)); // (a scan's own filters have no input to read the types from)
-        }
-        let mut has = false;
-        plan.apply_expressions(|e| {
-            has |= e.exists(|e| Ok(scalable(e)))?;
-            Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
-        })?;
-        if !has {
-            return Ok(Transformed::no(plan)); // (nearly every step: no sum or difference with a decimal literal in it)
-        }
-        let schema = datafusion::logical_expr::utils::merge_schema(&plan.inputs()); // (each column's type, from the inputs)
-        let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
-        let t = plan.map_expressions(|e| {
+        rewrite_typed(plan, scalable, at_scale)
+    }
+}
+
+/// One pass of a rule that rewrites expressions by their types (`ScaledLiterals`, `multiply::Products`):
+/// where `looks` finds an expression the rule may change, `rewrite` gives its new form, given the schema
+/// its columns have (the plan's inputs', or a scan's own table's for its filters: the copy a pushed
+/// filter leaves in a scan is rewritten too). An expression keeps its name (`NamePreserver`); a grouping
+/// set's children are named, the set is not (as DataFusion's simplifier names them). The plan's schema
+/// is worked out again when something changed, since a node above reads the types its columns have now.
+pub(crate) fn rewrite_typed(plan: LogicalPlan, looks: fn(&Expr) -> bool, rewrite: fn(&Expr, &DFSchema) -> Option<Expr>) -> Result<Transformed<LogicalPlan>> {
+    let mut has = false;
+    plan.apply_expressions(|e| {
+        has |= e.exists(|e| Ok(looks(e)))?;
+        Ok(if has { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+    })?;
+    if !has {
+        return Ok(Transformed::no(plan)); // (nearly every step: nothing it looks for in it)
+    }
+    let schema = match &plan {
+        LogicalPlan::TableScan(ts) => DFSchema::try_from_qualified_schema(ts.table_name.clone(), &ts.source.schema())?, // (its filters name its own columns)
+        _ => datafusion::logical_expr::utils::merge_schema(&plan.inputs()), // (each column's type, from the inputs)
+    };
+    let names = datafusion::logical_expr::expr_rewriter::NamePreserver::new(&plan); // (a column keeps the name its expression gave it)
+    let t = plan.map_expressions(|e| {
+        let mut rewrite_one = |e: Expr| -> Result<Transformed<Expr>> {
             let name = names.save(&e);
-            Ok(e.transform_up(|e| match at_scale(&e, &schema) {
+            Ok(e.transform_up(|e| match rewrite(&e, &schema) {
                 Some(new) => Ok(Transformed::yes(new)),
                 None => Ok(Transformed::no(e)),
             })?
             .update_data(|e| name.restore(e)))
-        })?;
-        if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) } // (a node above reads the types its columns have now)
-    }
+        };
+        if let Expr::GroupingSet(_) = &e { e.map_children(&mut rewrite_one) } else { rewrite_one(e) } // (a set's aliasing stays: its children are named)
+    })?;
+    if t.transformed { t.map_data(|p| p.recompute_schema()) } else { Ok(t) }
 }
 
 /// A sum or difference with a DECIMAL literal on one side: the only expressions `ScaledLiterals` looks at.
@@ -1009,6 +1023,7 @@ fn cost(e: &Expr, schema: &DFSchema) -> usize {
             },
             Expr::Literal(..) | Expr::Alias(_) => 0,
             Expr::InList(l) => l.list.len(),
+            Expr::ScalarFunction(f) if f.func.name() == crate::multiply::NAME => 1, // (a product, as the `*` it replaces)
             Expr::Like(_) | Expr::SimilarTo(_) | Expr::ScalarFunction(_) => 20,
             Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) => 1000,
             _ => 1,
@@ -1085,6 +1100,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
+    rules.insert(end, Arc::new(AndsOnce)); // (last: the filters are where they will run)
     // (the hot columns are the node's)
     #[cfg(feature = "server")]
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
@@ -1322,6 +1338,96 @@ impl PhysicalOptimizerRule for MinMaxBounds {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+/// A filter's plain conditions are ANDed right-deep, so DataFusion copies its batch once. An AND
+/// copies the rows its left side keeps when that is a fifth or fewer, and works the right side out on
+/// the copy. Left-deep, each level of ANDs can copy the whole batch; right-deep, only the first
+/// condition can. Only plain conditions move (they can't fail on any row and are cheap on a whole
+/// batch), so no error a row would raise shows up that the written order hid, and nothing costly runs
+/// on rows it didn't before. EXPLAIN's text is the same: `BinaryExpr`'s Display adds no parentheses
+/// for a right-nested AND.
+#[derive(Debug)]
+struct AndsOnce;
+
+impl PhysicalOptimizerRule for AndsOnce {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|p| {
+            let Some(f) = p.downcast_ref::<FilterExec>() else { return Ok(Transformed::no(p)) };
+            match right_deep_filter(f)? {
+                Some(new) => Ok(Transformed::yes(new)),
+                None => Ok(Transformed::no(p)),
+            }
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "ands_once"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// `f` with its conditions ANDed right-deep: when it has three or more, every one is plain, and they
+/// aren't ANDed right-deep already.
+fn right_deep_filter(f: &FilterExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    use datafusion::physical_plan::filter::FilterExecBuilder;
+    let schema = f.input().schema();
+    let terms: Vec<Arc<dyn PhysicalExpr>> = datafusion::physical_expr::utils::split_conjunction(f.predicate()).into_iter().cloned().collect();
+    if terms.len() < 3 || !terms.iter().all(|t| plain(t, &schema)) || is_right_deep(f.predicate()) {
+        return Ok(None);
+    }
+    let predicate = ands_right(terms);
+    let new: Arc<dyn ExecutionPlan> = Arc::new(FilterExecBuilder::from(f).with_predicate(predicate).build()?);
+    Ok(Some(new))
+}
+
+/// A condition that can't fail on any row and is cheap on a whole batch: comparing two columns, or a
+/// column with a value of its type, NULL tests of a column, and a column's IN list of its type's values.
+fn plain(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr, IsNotNullExpr, IsNullExpr, Literal};
+    let column = |e: &Arc<dyn PhysicalExpr>| e.is::<PhysicalColumn>();
+    if let Some(b) = e.downcast_ref::<BinaryExpr>() {
+        let compares = matches!(b.op(), Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq);
+        let operand = |x: &Arc<dyn PhysicalExpr>| column(x) || x.is::<Literal>();
+        let both_values = b.left().is::<Literal>() && b.right().is::<Literal>();
+        let same_type = matches!((b.left().data_type(schema), b.right().data_type(schema)), (Ok(l), Ok(r)) if l == r);
+        return compares && operand(b.left()) && operand(b.right()) && !both_values && same_type;
+    }
+    if let Some(n) = e.downcast_ref::<IsNullExpr>() {
+        return column(n.arg());
+    }
+    if let Some(n) = e.downcast_ref::<IsNotNullExpr>() {
+        return column(n.arg());
+    }
+    if let Some(l) = e.downcast_ref::<InListExpr>() {
+        let Ok(t) = l.expr().data_type(schema) else { return false };
+        return column(l.expr()) && l.list().iter().all(|v| v.downcast_ref::<Literal>().is_some_and(|v| v.value().data_type() == t));
+    }
+    false
+}
+
+/// `t1 AND (t2 AND (… AND tn))` for the terms in the order they were written.
+fn ands_right(terms: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    terms
+        .into_iter()
+        .rev()
+        .reduce(|right, left| -> Arc<dyn PhysicalExpr> { Arc::new(BinaryExpr::new(left, Operator::And, right)) })
+        .expect("at least one term")
+}
+
+/// Whether every AND's left side is a condition, not an AND: `t1 AND (t2 AND …)`.
+fn is_right_deep(e: &Arc<dyn PhysicalExpr>) -> bool {
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    let is_and = |e: &Arc<dyn PhysicalExpr>| e.downcast_ref::<BinaryExpr>().is_some_and(|b| *b.op() == Operator::And);
+    match e.downcast_ref::<BinaryExpr>() {
+        Some(b) if *b.op() == Operator::And => !is_and(b.left()) && is_right_deep(b.right()),
+        _ => true,
     }
 }
 
@@ -2516,6 +2622,85 @@ mod tests {
         }
     }
 
+    /// A DECIMAL product runs as `pondra_multiply` (`multiply::Products`) and gives the answers, types, names and
+    /// nullability the `*` gives without it, values past i32 and negatives included; a literal written at its
+    /// column's scale in a ROLLUP's children (`rewrite_typed`) keeps the set's own name and answers.
+    #[tokio::test]
+    async fn a_decimal_product_is_the_same_answer_in_native_integers() {
+        use datafusion::arrow::array::{ArrayRef, Decimal128Array, Int32Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let dec = |v: Vec<Option<i128>>, p: u8, s: i8| -> ArrayRef { Arc::new(Decimal128Array::from(v).with_precision_and_scale(p, s).unwrap()) };
+        let table = |fields: Vec<Field>, columns: Vec<ArrayRef>| RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        // (a = 123456789012.34 and -99999999999.99 past i32; b has a NULL; the values keep every product in i128)
+        let t = table(
+            vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("a", DataType::Decimal128(15, 2), false),
+                Field::new("b", DataType::Decimal128(15, 2), true),
+                Field::new("c", DataType::Decimal128(15, 4), false),
+                Field::new("n", DataType::Decimal128(10, 2), false),
+                Field::new("m", DataType::Decimal128(10, 2), false),
+            ],
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 3])),
+                dec(vec![Some(150), Some(-225), Some(12_345_678_901_234), Some(5), Some(-9_999_999_999_999)], 15, 2),
+                dec(vec![Some(200), None, Some(250), Some(-12_500), Some(9_999_999_999_999)], 15, 2),
+                dec(vec![Some(5_000), Some(12_500), Some(-30_000), Some(1), Some(0)], 15, 4),
+                dec(vec![Some(1_234_567_890), Some(-150), Some(0), Some(5), Some(99)], 10, 2),
+                dec(vec![Some(-150), Some(200), Some(7), Some(5), Some(-99)], 10, 2),
+            ],
+        );
+        let u = table(vec![Field::new("x", DataType::Decimal128(31, 4), true)], vec![dec(vec![Some(30_000), Some(-62_500), Some(3_086_419_725_308_500), Some(7)], 31, 4)]);
+        let ten37 = 10i128.pow(37);
+        let big = table(vec![Field::new("x", DataType::Decimal128(38, 0), false), Field::new("y", DataType::Decimal128(38, 0), false)], vec![dec(vec![Some(ten37)], 38, 0), dec(vec![Some(ten37)], 38, 0)]);
+        let (ctx, plain, scaled) = (session(), session_without(Some("pondra_decimal_products")), session_without(Some("pondra_scaled_literals")));
+        for c in [&ctx, &plain, &scaled] {
+            c.register_batch("t", t.clone()).unwrap();
+            c.register_batch("u", u.clone()).unwrap();
+            c.register_batch("big", big.clone()).unwrap();
+        }
+        assert!(plan_of(&ctx, "SELECT a * b FROM t").await.contains("pondra_multiply"));
+        assert!(!plan_of(&plain, "SELECT a * b FROM t").await.contains("pondra_multiply"));
+        let same = [
+            "SELECT a * b FROM t ORDER BY k, a",
+            "SELECT a * 1.5 FROM t ORDER BY k, a",
+            "SELECT 2.25 * a FROM t ORDER BY k, a",
+            "SELECT a * (1 - b) FROM t ORDER BY k, a",
+            "SELECT a * (1 - b) * (1 + c) FROM t ORDER BY k, a",
+            "SELECT c * (a * b) FROM t ORDER BY k, a",
+            "SELECT k, sum(a * (1 - b)) FROM t GROUP BY k ORDER BY k",
+            "SELECT a FROM t WHERE a * b > 0 ORDER BY k, a",
+            "SELECT a * b AS p, count(*) AS n FROM t GROUP BY a * b ORDER BY p NULLS LAST",
+            "SELECT a * b AS p, count(*) AS n FROM t GROUP BY ROLLUP (a * b) ORDER BY p NULLS LAST, n",
+            "SELECT k FROM t ORDER BY a * b, k",
+            "SELECT k, sum(a * b) OVER (PARTITION BY k) AS s FROM t ORDER BY k, a",
+            "SELECT t.k, u.x FROM t JOIN u ON t.a * t.b = u.x ORDER BY t.k, u.x",
+            "SELECT sum(a * b), avg(a * b) FROM t",
+            "SELECT n * m FROM t ORDER BY k, a",
+        ];
+        for sql in same {
+            assert_eq!(answer(&ctx, sql).await, answer(&plain, sql).await, "{sql}: the types, names and answers without the rule");
+        }
+        let rollup = "SELECT 1 - a AS p, count(*) AS n FROM t GROUP BY ROLLUP (1 - a) ORDER BY p NULLS LAST, n";
+        assert_eq!(answer(&ctx, rollup).await, answer(&scaled, rollup).await, "{rollup}: a literal in a ROLLUP, rewritten");
+        // (the answers written out: 1.50 × 2.00, NULL, 0.05 × -125.00, 123456789012.34 × 2.50, in key then value order)
+        let got = answer(&ctx, "SELECT a * b FROM t ORDER BY k, a").await.1;
+        let want: Vec<Vec<Option<String>>> = [None, Some("3.0000"), Some("-6.2500"), Some("308641972530.8500")].into_iter().map(|v| vec![v.map(String::from)]).collect();
+        assert_eq!(got[..4].to_vec(), want);
+        // (a product of two NOT NULL values is NOT NULL, a product with a nullable one nullable, in both)
+        for c in [&ctx, &plain] {
+            let plan = c.sql("SELECT n * m, a * b FROM t").await.unwrap().into_optimized_plan().unwrap();
+            let schema = plan.schema();
+            assert!(!schema.field(0).is_nullable() && schema.field(1).is_nullable(), "{}", plan.display_indent());
+        }
+        // (on table columns, so no constant folding: the product of two values near 10^37 overflows in both, with the same error)
+        let overflow = "SELECT x * y FROM big";
+        let with = ctx.sql(overflow).await.unwrap().collect().await.unwrap_err().to_string();
+        let without = plain.sql(overflow).await.unwrap().collect().await.unwrap_err().to_string();
+        assert_eq!(with, without, "{overflow}");
+        assert!(with.contains("Overflow happened on"), "{with}");
+    }
+
     /// A number with an exponent is a whole decimal (`WholeLiterals`): a cast of `1e15` to a float is
     /// the float it was written as, its type is a decimal at scale 0 (a `Decimal256` past 38 digits, a
     /// float past 76), and exact decimals beside it keep their types.
@@ -2537,6 +2722,82 @@ mod tests {
             ("SELECT 2.5e3", "2500"),
         ] {
             assert_eq!(first(&ctx, sql).await, want, "{sql}");
+        }
+    }
+
+    /// The first filter's predicate in a physical plan, found by walking its inputs.
+    fn predicate_of(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn PhysicalExpr>> {
+        match plan.downcast_ref::<FilterExec>() {
+            Some(f) => Some(f.predicate().clone()),
+            None => plan.children().into_iter().find_map(predicate_of),
+        }
+    }
+
+    /// How many conditions a predicate has, when it is a right-deep AND chain (`t1 AND (t2 AND …)`).
+    fn right_chain(e: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        let Some(b) = e.downcast_ref::<BinaryExpr>().filter(|b| *b.op() == Operator::And) else { return Some(1) };
+        if b.left().downcast_ref::<BinaryExpr>().is_some_and(|l| *l.op() == Operator::And) {
+            return None;
+        }
+        Some(right_chain(b.right())? + 1)
+    }
+
+    /// A physical plan's rows, as the batches print them.
+    async fn rows_of(ctx: &datafusion::prelude::SessionContext, plan: Arc<dyn ExecutionPlan>) -> String {
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string()
+    }
+
+    /// A query's physical plan, and that plan after `AndsOnce`.
+    async fn ands_once_of(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let out = AndsOnce.optimize(plan.clone(), &ConfigOptions::default()).unwrap();
+        (plan, out)
+    }
+
+    /// A filter whose conditions are all plain is ANDed right-deep (`AndsOnce`), with the same text and
+    /// rows; one with a condition that isn't plain (arithmetic, LIKE) or with two conditions is left as it is.
+    #[tokio::test]
+    async fn plain_conditions_are_anded_right_deep() {
+        use datafusion::arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let t = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("d", DataType::Date32, false),
+                Field::new("p", DataType::Decimal128(15, 2), false),
+                Field::new("s", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from((0..20).collect::<Vec<i32>>())) as ArrayRef,
+                // (days since 1970: 19,783 is 2024-03-01, so the dates fall on both sides of it)
+                Arc::new(Date32Array::from((0..20).map(|i| 19_700 + 9 * i).collect::<Vec<i32>>())),
+                Arc::new(Decimal128Array::from((0..20i128).map(|i| Some(i * 37 - 150)).collect::<Vec<_>>()).with_precision_and_scale(15, 2).unwrap()),
+                Arc::new(StringArray::from((0..20).map(|i: i32| (i % 3 != 0).then(|| if i % 2 == 0 { "x" } else { "y" })).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let ctx = session();
+        ctx.register_batch("t", t).unwrap();
+        for (sql, terms) in [
+            ("SELECT * FROM t WHERE a >= 2 AND a < 15 AND p > 1.00 AND s IS NOT NULL AND d < DATE '2024-03-01'", 5),
+            ("SELECT * FROM t WHERE a IN (1, 3, 5, 7) AND s = 'x' AND a <> 4", 3), // (a list of three or fewer becomes ORs)
+        ] {
+            let (plan, out) = ands_once_of(&ctx, sql).await;
+            let (before, after) = (predicate_of(&plan).unwrap(), predicate_of(&out).unwrap());
+            assert!(!Arc::ptr_eq(&before, &after), "{sql}: changed");
+            assert_eq!(right_chain(&after), Some(terms), "{sql}: {after}");
+            assert_eq!(after.to_string(), before.to_string(), "{sql}");
+            assert_eq!(rows_of(&ctx, out).await, rows_of(&ctx, plan).await, "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE a > 1 AND a / 2 > 3 AND p > 0",
+            "SELECT * FROM t WHERE a > 1 AND s LIKE 'x%' AND p > 0",
+            "SELECT * FROM t WHERE a > 1 AND p > 0",
+        ] {
+            let (plan, out) = ands_once_of(&ctx, sql).await;
+            assert!(Arc::ptr_eq(&predicate_of(&plan).unwrap(), &predicate_of(&out).unwrap()), "{sql}: left as it is");
         }
     }
 }

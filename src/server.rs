@@ -857,7 +857,7 @@ impl App {
         }
         let start = std::time::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
-        let explained = crate::text::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
+        let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         let run = async {
             let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
@@ -878,10 +878,7 @@ impl App {
             let run = |frugal: bool| async move {
                 let ctx = session(&self.lake, query, "").await?;
                 let ctx = if files { ctx.enable_url_table() } else { ctx };
-                if explained && !query.to_lowercase().contains("pgjson") {
-                    // (each operator's expected rows: `history::expected`; Postgres's JSON has no place for them)
-                    ctx.state_ref().write().config_mut().options_mut().explain.show_statistics = true;
-                }
+                crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
                 if frugal {
                     crate::query::frugal(&ctx);
                 }
@@ -892,7 +889,6 @@ impl App {
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
-                let out = if explained { crate::history::explained(out)? } else { out };
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
                 anyhow::Ok(crate::engine::kept(out, &plan))
             };
@@ -922,6 +918,7 @@ impl App {
                 }
                 add(&SPREAD, spread as u64);
                 crate::history::rows(handed.unwrap_or_else(|| batches.iter().map(|b| b.num_rows() as u64).sum()));
+                let batches = if explained { crate::explain::answered(batches)? } else { batches }; // (files as SQL named them: a node's EXPLAIN and a page's alike)
                 Ok(batches.into_iter().map(crate::answer::compact).collect()) // (an answer kept or sent holds only its own strings)
             }
             Err(e) => {
@@ -1575,9 +1572,8 @@ impl App {
 
 /// Run a query (across the cluster if it's worth it) and format the result.
 async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
-    let explained = crate::text::first_word(query).get(..7).is_some_and(|w| w.eq_ignore_ascii_case("explain"));
     // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
-    let _armed = (crate::answer::streams(p.format.as_deref()) && !explained).then(|| crate::query::arm(p.format.as_deref()));
+    let _armed = (crate::answer::streams(p.format.as_deref()) && !crate::explain::asked(query)).then(|| crate::query::arm(p.format.as_deref()));
     let batches = match files {
         true => app.query_as(&crate::sys::planned(query)?, Some("0"), true).await?, // (a file here: this node only)
         false => app.query(query, p.spread.as_deref()).await?,
@@ -1585,7 +1581,6 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     if crate::query::handed().is_some() {
         return Ok(Rendered::Sent); // (its answer went to the door in pieces as its plan made them)
     }
-    let batches = if explained { crate::ext::readable_rows(batches)? } else { batches }; // (files as SQL named them)
     answer(&batches, p)
 }
 

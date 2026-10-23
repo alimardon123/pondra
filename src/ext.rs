@@ -218,18 +218,6 @@ pub fn said(e: &anyhow::Error) -> String {
     }
 }
 
-/// An EXPLAIN's rows, its tables of files named as SQL named them (`ext_names::readable`).
-pub fn readable_rows(batches: Vec<datafusion::arrow::record_batch::RecordBatch>) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
-    use datafusion::arrow::array::{ArrayRef, AsArray, StringArray};
-    batches.into_iter().map(|b| {
-        let columns = b.columns().iter().map(|c| match c.data_type() {
-            datafusion::arrow::datatypes::DataType::Utf8 => Arc::new(c.as_string::<i32>().iter().map(|v| v.map(crate::ext_names::readable)).collect::<StringArray>()) as ArrayRef,
-            _ => c.clone(),
-        });
-        Ok(datafusion::arrow::record_batch::RecordBatch::try_new(b.schema(), columns.collect())?)
-    }).collect()
-}
-
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)
 
