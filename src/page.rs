@@ -29,14 +29,21 @@ const FILES: &str = "/files/";
 /// The folder SQL reads a relative path's file from, as a node's owner reads its working folder (`/objects` names it).
 const WORKING: &str = "mem:///files/";
 
-/// How a page's session is made: its target partitions (a page in a browser has one).
+/// How a page's session is made: its target partitions (a page in a browser has one), and how it reaches the web.
 pub struct Options {
     pub partitions: usize,
+    /// The store for a web origin (`https://host[:port]`) a statement names, made the first time one does: a
+    /// browser's `fetch` (`web/`). None: the page reads only the files given to it.
+    pub web: Option<Web>,
 }
+
+/// A page's way to the web: a store for an origin. The program that runs the page gives it, so the core holds no
+/// HTTP client of its own.
+pub type Web = Arc<dyn Fn(&str) -> Arc<dyn ObjectStore> + Send + Sync>;
 
 impl Default for Options {
     fn default() -> Self {
-        Options { partitions: 1 }
+        Options { partitions: 1, web: None }
     }
 }
 
@@ -45,6 +52,7 @@ impl Default for Options {
 pub struct Page {
     ctx: SessionContext,
     files: Arc<InMemory>, // (the lake's own files, `files/…`, as they were put: what `FROM 'x.csv'` reads)
+    web: Option<Web>,
 }
 
 /// What a request answers, as ADR-061's contract says: a status, its headers (the node's names, in lower case) and its
@@ -119,7 +127,7 @@ impl Page {
         let files = Arc::new(InMemory::new());
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files }
+        Page { ctx, files, web: options.web.clone() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
