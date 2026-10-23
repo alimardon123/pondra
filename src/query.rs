@@ -1035,6 +1035,59 @@ fn keep_held(held: MemoryReservation) {
 /// The memory of the answer a request kept, for the body that sends it (`server::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
+tokio::task_local! {
+    /// The stages of the one statement a request runs, while `PONDRA_TRACE_QUERY` is on (`traced`, `mark`).
+    static TRACE: std::cell::RefCell<Option<StatementTrace>>;
+}
+
+/// `PONDRA_TRACE_QUERY=1`: where one HTTP `/sql` statement's time goes, one line on stderr at its end. A stage is the
+/// time since the mark before it, so the stages add up to the statement's time up to its last mark.
+struct StatementTrace {
+    start: std::time::Instant,
+    last: std::time::Instant,
+    stages: Vec<(&'static str, f64)>, // (name, ms)
+}
+
+impl StatementTrace {
+    fn mark(&mut self, stage: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages.push((stage, (now - self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
+
+    fn done(self) {
+        let stages: Vec<String> = self.stages.iter().map(|(name, ms)| format!("{name} {ms:.3}")).collect();
+        eprintln!("query {:.3}: {}", self.start.elapsed().as_secs_f64() * 1000.0, stages.join(", "));
+    }
+}
+
+/// `PONDRA_TRACE_QUERY`, checked once: a statement with it off carries no trace.
+fn tracing() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_QUERY"));
+    *ON
+}
+
+/// A request's statement, run with its trace when `PONDRA_TRACE_QUERY` is on: `mark` stages it as it goes, and
+/// its line is printed when `work` ends.
+pub async fn traced<T>(work: impl std::future::Future<Output = T>) -> T {
+    if !tracing() {
+        return work.await;
+    }
+    let now = std::time::Instant::now();
+    let trace = std::cell::RefCell::new(Some(StatementTrace { start: now, last: now, stages: vec![] }));
+    TRACE.scope(trace, async {
+        let out = work.await;
+        let _ = TRACE.try_with(|t| t.borrow_mut().take().map(StatementTrace::done));
+        out
+    })
+    .await
+}
+
+/// Ends the stage that has run since the last mark, named `stage`. Nothing outside `traced` (or a task it spawns) is traced.
+pub fn mark(stage: &'static str) {
+    let _ = TRACE.try_with(|t| t.borrow_mut().as_mut().map(|t| t.mark(stage)));
+}
+
 use crate::answer::{compact, schema};
 use crate::engine::sql;
 
