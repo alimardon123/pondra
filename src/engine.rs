@@ -23,6 +23,16 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A statement's session: `state`'s functions, settings and runtime, with catalogs of its own whose default catalog is
+/// `catalog`, so what the statement registers is its alone. Both hosts copy their kept session this way
+/// (`Lake::session_with`, the page's `statement`).
+pub fn with_catalog(mut state: datafusion::execution::SessionState, catalog: Arc<dyn datafusion::catalog::CatalogProvider>) -> SessionContext {
+    let catalogs = datafusion::catalog::MemoryCatalogProviderList::new();
+    datafusion::catalog::CatalogProviderList::register_catalog(&catalogs, state.config().options().catalog.default_catalog.clone(), catalog);
+    state.register_catalog_list(Arc::new(catalogs));
+    SessionContext::new_with_state(state)
+}
+
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
 /// that need no lake. `Lake::made` adds the node's own.
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
@@ -347,7 +357,8 @@ pub async fn collect(df: datafusion::dataframe::DataFrame) -> anyhow::Result<Vec
 
 /// `EXPLAIN ANALYZE` run in this task. DataFusion's `AnalyzeExec` runs each input partition on a tokio task, and a
 /// page has no tokio runtime to spawn one on: it panics there and takes every table of the page with it. So the
-/// input runs here, one partition after another, and the answer is built as DataFusion builds it.
+/// input runs here, one partition after another, and the answer is built as DataFusion builds it. Its names and
+/// estimates are made readable by `explain::answered`, on a node and a page alike.
 async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType>) -> anyhow::Result<Vec<RecordBatch>> {
     let task = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
@@ -429,6 +440,30 @@ mod tests {
             let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
             let got = array_value_to_string(batches[0].column(0), 0).unwrap();
             assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    /// `EXPLAIN ANALYZE` is answered by `collect` (`analyzed`, this file's copy of DataFusion's `create_output_batch`) and
+    /// by DataFusion itself (its `AnalyzeExec`): the same columns, the same plan types, and the same plan text once every
+    /// number is `N` (times and counts differ run to run). If DataFusion changes its answer, this fails, and the copy follows.
+    #[tokio::test]
+    async fn explain_analyze_is_datafusions_answer() {
+        let ctx = session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let batch = RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef)]).unwrap();
+        ctx.register_batch("t", batch).unwrap();
+        let numbers = regex::Regex::new(r"\d+(\.\d+)?(ns|µs|ms|s|K|M|B)?").expect("a regex");
+        let texts = |batches: &[RecordBatch], col: usize| -> Vec<String> {
+            batches.iter().flat_map(|b| b.column(col).as_string::<i32>().iter().map(|v| v.unwrap_or_default().to_string()).collect::<Vec<_>>()).collect()
+        };
+        let names = |batches: &[RecordBatch]| batches[0].schema().fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>();
+        for sql in ["EXPLAIN ANALYZE SELECT count(*) FROM t", "EXPLAIN ANALYZE VERBOSE SELECT count(*) FROM t"] {
+            let ours = collect(ctx.sql(sql).await.unwrap()).await.unwrap();
+            let theirs = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+            let drift = "the copy has drifted from DataFusion's create_output_batch (physical-plan/src/analyze.rs)";
+            assert_eq!(names(&ours), names(&theirs), "{sql}: its columns; {drift}");
+            assert_eq!(texts(&ours, 0), texts(&theirs, 0), "{sql}: its plan types; {drift}");
+            let plans = |b: &[RecordBatch]| texts(b, 1).iter().map(|t| numbers.replace_all(t, "N").into_owned()).collect::<Vec<_>>();
+            assert_eq!(plans(&ours), plans(&theirs), "{sql}: its plan text with numbers as N; {drift}");
         }
     }
 }
