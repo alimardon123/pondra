@@ -207,16 +207,8 @@ fn located(l: &str) -> Result<String> {
 
 // ---------------------------------------------------------------- the table they make
 
-/// An error in words for whoever sent the statement: its causes after it, each said once, files named as SQL
-/// named them (`codes::words` does both, for every door). A node leaves out what its caller may not see: a Python
-/// routine's lines are cut where the caller may not see its code (S27).
-pub fn said(e: &anyhow::Error) -> String {
-    let out = crate::codes::words(e);
-    match crate::auth::shows_code() {
-        true => out,
-        false => crate::codes::unquoted(&out), // (a Python routine's lines, quoted wherever its batch ran: S27)
-    }
-}
+/// An error in words for whoever sent the statement, as this caller may see it (`codes::told`).
+pub fn said(e: &anyhow::Error) -> String { crate::codes::told(e, crate::auth::shows_code()) }
 
 /// Does this table read files on the node's machine? (Such a query stays on it.)
 pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "share" || s.urls.iter().any(|u| scheme(u).is_none_or(|s| s == "file"))) } // (a share's links: as its node got them)

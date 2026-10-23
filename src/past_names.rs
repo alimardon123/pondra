@@ -1,4 +1,5 @@
-//! `t AT (…)` as SQL (ADR-043): its syntax, and the table name `"at:…"` it becomes; reading it is the node's (`past.rs`).
+//! `t AT (…)` as text (ADR-043): its syntax, the table name `"at:…"` it becomes, reading that name back, and
+//! `RESTORE`'s words. Reading the table as it was is the node's (`past.rs`).
 
 use anyhow::{anyhow, bail, ensure, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
@@ -12,6 +13,13 @@ pub(crate) struct Spec {
     pub(crate) table: String,
     pub(crate) at: String,   // version, timestamp or offset
     pub(crate) expr: String, // as written: worked out when the query runs (`now()` is then)
+}
+
+impl Spec {
+    /// The spec a table's name stands for, with or without its `at:`: base64url of its JSON, as `table_factor` wrote it.
+    pub(crate) fn of(name: &str) -> Result<Spec> {
+        Ok(serde_json::from_slice(&B64.decode(name.trim_start_matches("at:"))?)?)
+    }
 }
 
 /// `t AT (VERSION => …)` → `pondra_at(t, version => …) AS t`, outside strings and comments: the
@@ -163,4 +171,38 @@ pub fn table_factor(lake: &str, t: &mut ast::TableFactor) -> Result<bool> {
     let ast::TableFactor::Table { name, args, .. } = t else { unreachable!() };
     (*name, *args) = (ast::ObjectName::from(vec![ast::Ident::with_quote('"', format!("at:{spec}"))]), None);
     Ok(true)
+}
+
+/// Does this (expanded) SQL read a table as it was? Such a query runs on its node alone.
+pub fn mentioned(sql: &str) -> bool { sql.contains("\"at:") }
+
+/// The `t AT (… => …)` that each table as it was in this (expanded) SQL stands for, as written: its
+/// moment is worked out as the query runs, so `server::query` looks there for one that moves.
+pub fn spelled(sql: &str) -> String {
+    names(sql).iter().filter_map(|n| Spec::of(n).ok()).map(|s| format!("{} AT ({} => {})", s.table, s.at.to_uppercase(), s.expr)).collect::<Vec<_>>().join(" ")
+}
+
+/// The tables as they were that `sql` reads, by their names in it.
+pub fn names(sql: &str) -> Vec<String> {
+    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""(at:[A-Za-z0-9_-]+)""#).expect("a regex"));
+    let mut out: Vec<String> = NAMES.captures_iter(sql).map(|c| c[1].to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
+pub(crate) static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
+});
+
+/// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
+/// the parser doesn't read a RESTORE). None: not a RESTORE.
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
+pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
+    if crate::text::head(sql) != "restore" {
+        return None;
+    }
+    let moment = RESTORE.captures(sql)?.get(3)?;
+    Some((&sql[..moment.start()], moment.as_str()))
 }

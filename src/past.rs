@@ -9,7 +9,6 @@
 //! session reading it registers (`table`), as files anywhere are (`ext.rs`).
 
 use anyhow::{anyhow, ensure, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use crate::past_names::Spec;
 use crate::store::{table_key, Lake, TableMeta};
 use anyhow::Context;
@@ -24,25 +23,6 @@ enum At {
     Time(i64), // microseconds since 1970, UTC
 }
 
-/// Does this (expanded) SQL read a table as it was? Such a query runs on its node alone.
-pub fn mentioned(sql: &str) -> bool { sql.contains("\"at:") }
-
-/// The `t AT (… => …)` that each table as it was in this (expanded) SQL stands for, as written: its
-/// moment is worked out as the query runs, so `server::query` looks there for one that moves.
-pub fn spelled(sql: &str) -> String {
-    let spec = |n: &String| serde_json::from_slice::<Spec>(&B64.decode(n.trim_start_matches("at:")).ok()?).ok();
-    names(sql).iter().filter_map(spec).map(|s| format!("{} AT ({} => {})", s.table, s.at.to_uppercase(), s.expr)).collect::<Vec<_>>().join(" ")
-}
-
-/// The tables as they were that `sql` reads, by their names in it.
-pub fn names(sql: &str) -> Vec<String> {
-    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#""(at:[A-Za-z0-9_-]+)""#).expect("a regex"));
-    let mut out: Vec<String> = NAMES.captures_iter(sql).map(|c| c[1].to_string()).collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// The table `name` (`at:…`) stands for, read as of `upto` as any is: (the table's name, its rows
 /// as they were). `sys`: with the system columns, which the query names.
 ///
@@ -53,7 +33,7 @@ pub fn names(sql: &str) -> Vec<String> {
 pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>)> {
     use crate::sys::with_sys;
     use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
-    let spec: Spec = serde_json::from_slice(&B64.decode(name.trim_start_matches("at:"))?)?;
+    let spec = Spec::of(name)?;
     let t = &spec.table;
     let meta: TableMeta = lake.cat.get(&table_key(t)).await?.ok_or_else(|| anyhow!("no table {t}"))?;
     ensure!(meta.key.is_empty(), "{t} AT (…): a keyed table keeps only each key's newest version, so only append tables are read as they were");
@@ -145,20 +125,6 @@ async fn when(lake: &Lake, spec: &Spec) -> Result<At> {
     })
 }
 
-static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
-});
-
-/// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
-/// the parser doesn't read a RESTORE). None: not a RESTORE.
-pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
-    if crate::text::head(sql) != "restore" {
-        return None;
-    }
-    let moment = RESTORE.captures(sql)?.get(3)?;
-    Some((&sql[..moment.start()], moment.as_str()))
-}
-
 /// `RESTORE TABLE t TO VERSION AS OF n` (or `TIMESTAMP AS OF …`, Delta's words): t's rows as they
 /// were then, by one MERGE from `t AT (…)`. A row changed since gets its old values back (its
 /// `_row_id` kept), a row made since goes, a row deleted since comes back as a new row. It is a
@@ -167,7 +133,7 @@ pub async fn restore(lake: &Lake, sql: &str) -> Result<Option<String>> {
     if crate::text::head(sql) != "restore" {
         return Ok(None);
     }
-    let Some(c) = RESTORE.captures(sql) else { return Ok(None) };
+    let Some(c) = crate::past_names::RESTORE.captures(sql) else { return Ok(None) };
     let name = c[1].split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
     let t = crate::ddl::local(lake, &name).ok_or_else(|| anyhow!("RESTORE {name}: a table of this lake (run it on a node of {name}'s)"))?;
     let meta: TableMeta = lake.cat.get(&table_key(&t)).await?.ok_or_else(|| anyhow!("no table {name}"))?;

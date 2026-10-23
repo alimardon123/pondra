@@ -75,11 +75,11 @@ impl Answer {
     }
 }
 
-/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::of`, `codes::http`; a page's
-/// caller sees all the words: `codes::words`).
+/// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::answer`; a page's
+/// caller sees all the words, so no line is cut).
 fn failed(e: anyhow::Error) -> Answer {
-    let code = crate::codes::of(&e);
-    Answer { status: crate::codes::http(code), headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: crate::codes::words(&e).into() }
+    let (status, code, words) = crate::codes::answer(&e, true);
+    Answer { status, headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", code.to_string())], body: words.into() }
 }
 
 /// A file refused (409, 412, 404): the node's status and words, with no SQLSTATE.
@@ -160,6 +160,10 @@ impl Page {
     /// makes (a table) is the page's; nothing else it registers reaches the page or another statement.
     async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
+        // (a page keeps no table's past, so `AT (…)` is refused by name: left alone, it would fail as an unknown table "at:…")
+        if crate::past_names::mentioned(&expanded) {
+            return Err(crate::codes::coded("0A000", format!("{}: a page keeps no table's past (a node reads a table as it was)", crate::past_names::spelled(&expanded))));
+        }
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
         let (ctx, overlay) = self.statement()?;
         crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
@@ -724,6 +728,16 @@ mod tests {
         assert_eq!(external.header("x-pondra-sqlstate"), Some("0A000"));
         let route = page.request("GET", "/nowhere", &[], bytes::Bytes::new()).await;
         assert_eq!((route.status, route.header("x-pondra-sqlstate")), (404, Some("0A000")));
+    }
+
+    /// A page keeps no table's past: `AT (…)` is refused by name, as a node would name the table it was asked of.
+    #[tokio::test]
+    async fn a_page_refuses_a_tables_past_by_name() {
+        let page = page_with_tables().await;
+        let got = page.request("POST", "/sql", &[], "FROM orders AT (VERSION => 1)".into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
+        let body = std::str::from_utf8(&got.body).unwrap();
+        assert!(body.contains("orders AT (VERSION => 1)"), "{body}");
     }
 
     #[tokio::test]
