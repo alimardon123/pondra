@@ -97,8 +97,11 @@ struct Table {
     version: i64,           // the last change's number (its rows' `_version`)
 }
 
+/// A temporary table's rows' schema: its columns, then its system columns.
+fn schema_of(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[meta.columns.clone(), crate::sys::columns()].concat()) }
+
 impl Table {
-    fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { crate::answer::schema(&[self.meta.columns.clone(), crate::sys::columns()].concat()) }
+    fn schema(&self) -> Result<datafusion::arrow::datatypes::SchemaRef> { schema_of(&self.meta) }
     fn bytes(&self) -> usize { self.rows.iter().map(|b| b.get_array_memory_size()).sum() }
 }
 
@@ -426,47 +429,67 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
 }
 
 /// The table without the rows `gone` names, and with `new` (the table's columns, and the ids a
-/// changed row keeps): one change, within the memory temporary tables may take.
+/// changed row keeps): one change, within the memory temporary tables may take. The rows are made and
+/// checked outside the sessions' lock, so a big change never stalls another session; they are put in
+/// place only if the table is still as it was read, else made again from what it is now.
 fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Result<()> {
     static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_TEMP_MB", 1024usize) << 20);
-    let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
-    with(s, true, |x| {
-        let t = x.tables.get_mut(name).with_context(|| format!("no temporary table {name}"))?;
-        let now = crate::log::now_ms() as i64 * 1000;
-        let mut rows = vec![];
-        for b in &t.rows {
-            let ids = b.column_by_name(crate::text::ROW_ID).expect("a temporary table's row ids").as_primitive::<Int64Type>();
-            let keep = datafusion::arrow::array::BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| gone.contains(&i)))).collect::<Vec<_>>());
-            rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
-        }
-        let schema = t.schema()?;
-        let (version, n) = (t.version + 1, t.meta.columns.len());
-        for b in new.iter().filter(|b| b.num_rows() > 0) {
-            let len = b.num_rows();
-            let fresh = |c: Option<&ArrayRef>, next: &mut i64| -> Vec<i64> {
-                let given = c.map(|c| c.as_primitive::<Int64Type>().clone());
-                (0..len).map(|i| match &given {
-                    Some(g) if g.is_valid(i) => g.value(i),
-                    _ => (*next, *next += 1).0,
-                }).collect()
-            };
-            let ids = fresh(b.column_by_name(crate::text::ROW_ID), &mut t.next);
-            let created = b.column_by_name(crate::text::CREATED).map(|c| datafusion::arrow::compute::cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))).transpose()?;
-            let created: Vec<i64> = (0..len).map(|i| created.as_ref().filter(|c| c.is_valid(i)).map_or(now, |c| c.as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(i))).collect();
-            let time = |v: Vec<i64>| -> ArrayRef { Arc::new(TimestampMicrosecondArray::from(v).with_timezone("UTC")) };
-            let mut columns: Vec<ArrayRef> = b.columns()[..n].to_vec();
-            columns.extend([Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(Int64Array::from(vec![version; len])), time(created), time(vec![now; len])]);
-            let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
-            let batch = RecordBatch::try_new(schema.clone(), columns)?;
-            let batch = crate::defaults::fit(&t.meta, name, batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
-            rows.push(batch);
-        }
-        check_key(name, &t.meta.columns, &t.meta.key, &rows)?;
+    loop {
+        let (meta, old, next, version) = with(s, false, |x| {
+            let t = x.tables.get(name).with_context(|| format!("no temporary table {name}"))?;
+            Ok((t.meta.clone(), t.rows.clone(), t.next, t.version))
+        })?;
+        let (rows, next) = changed(&meta, name, &old, &gone, &new, next, version + 1)?;
+        let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
         let bytes: usize = rows.iter().map(|b| b.get_array_memory_size()).sum();
         ensure!(others + bytes <= *BUDGET, "temporary tables on this node would hold {} MB, past PONDRA_TEMP_MB ({} MB): a lake table holds more", (others + bytes) >> 20, *BUDGET >> 20);
-        (t.rows, t.version) = (rows, version);
-        Ok(())
-    })
+        let put = with(s, true, |x| {
+            let t = x.tables.get_mut(name).with_context(|| format!("no temporary table {name}"))?;
+            if t.version != version {
+                return Ok(false);
+            }
+            (t.rows, t.next, t.version) = (rows, next, version + 1);
+            Ok(true)
+        })?;
+        if put {
+            return Ok(());
+        }
+    }
+}
+
+/// `old` without the rows `gone` names, and with `new` as change `version`, each new row given its id (from
+/// `next` unless it keeps one) and checked as its table checks it: the rows, and the next row id.
+fn changed(meta: &TableMeta, name: &str, old: &[RecordBatch], gone: &HashSet<i64>, new: &[RecordBatch], mut next: i64, version: i64) -> Result<(Vec<RecordBatch>, i64)> {
+    let now = crate::log::now_ms() as i64 * 1000;
+    let mut rows = vec![];
+    for b in old {
+        let ids = b.column_by_name(crate::text::ROW_ID).expect("a temporary table's row ids").as_primitive::<Int64Type>();
+        let keep = datafusion::arrow::array::BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| gone.contains(&i)))).collect::<Vec<_>>());
+        rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
+    }
+    let (schema, n) = (schema_of(meta)?, meta.columns.len());
+    for b in new.iter().filter(|b| b.num_rows() > 0) {
+        let len = b.num_rows();
+        let fresh = |c: Option<&ArrayRef>, next: &mut i64| -> Vec<i64> {
+            let given = c.map(|c| c.as_primitive::<Int64Type>().clone());
+            (0..len).map(|i| match &given {
+                Some(g) if g.is_valid(i) => g.value(i),
+                _ => (*next, *next += 1).0,
+            }).collect()
+        };
+        let ids = fresh(b.column_by_name(crate::text::ROW_ID), &mut next);
+        let created = b.column_by_name(crate::text::CREATED).map(|c| datafusion::arrow::compute::cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))).transpose()?;
+        let created: Vec<i64> = (0..len).map(|i| created.as_ref().filter(|c| c.is_valid(i)).map_or(now, |c| c.as_primitive::<datafusion::arrow::datatypes::TimestampMicrosecondType>().value(i))).collect();
+        let time = |v: Vec<i64>| -> ArrayRef { Arc::new(TimestampMicrosecondArray::from(v).with_timezone("UTC")) };
+        let mut columns: Vec<ArrayRef> = b.columns()[..n].to_vec();
+        columns.extend([Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(Int64Array::from(vec![version; len])), time(created), time(vec![now; len])]);
+        let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
+        let batch = RecordBatch::try_new(schema.clone(), columns)?;
+        let batch = crate::defaults::fit(meta, name, batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
+        rows.push(batch);
+    }
+    check_key(name, &meta.columns, &meta.key, &rows)?;
+    Ok((rows, next))
 }
 
 /// A temporary table's PRIMARY KEY, checked over every row as a change leaves them: no NULL in a key
