@@ -205,7 +205,8 @@ pub async fn unclaimed(lake: &Lake, name: &str) -> Result<()> {
 pub enum Ddl {
     CreateSchema { name: String, if_not_exists: bool },
     DropSchema { name: String, if_exists: bool, cascade: bool },
-    DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool }, // (PURGE: not kept to be undropped)
+    // (made_by: only the table that job made, a failed CREATE TABLE … AS undoing itself; any other table under the name is left)
+    DropTable { name: String, if_exists: bool, #[serde(default)] purge: bool, #[serde(default, skip_serializing_if = "Option::is_none")] made_by: Option<String> }, // (PURGE: not kept to be undropped)
     Undrop { name: String },                                                   // UNDROP TABLE (ADR-043)
     Clone { name: String, from: String },                                      // CREATE TABLE c CLONE t: t's files, none copied (ADR-043)
     CreateView { name: String, sql: String, replace: bool, #[serde(default)] facts: Option<Vec<crate::constraints::Constraint>> }, // (None: as before, or kept through OR REPLACE: `facts.rs`)
@@ -288,7 +289,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         _ => n,
     };
     let d = match d {
-        Ddl::DropTable { name, if_exists, purge } => Ddl::DropTable { name: here(name), if_exists, purge },
+        Ddl::DropTable { name, if_exists, purge, made_by } => Ddl::DropTable { name: here(name), if_exists, purge, made_by },
         Ddl::Undrop { name } => Ddl::Undrop { name: here(name) },
         Ddl::Clone { name, from } => Ddl::Clone { name: here(name), from: here(from) },
         Ddl::CreateView { name, sql, replace, facts } => Ddl::CreateView { name: here(name), sql, replace, facts },
@@ -371,12 +372,12 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 drop_view(lake, v, true).await?;
             }
             for t in tables.iter().filter(|t| !views.iter().any(|v| *t == v || **t == format!("{v}_final"))) {
-                drop_table(lake, t, true, false).await?;
+                drop_table(lake, t, true, false, None).await?;
             }
             lake.cat.commit(vec![], &[schema_key(&name)]).await?;
             Ok(j!({"schema": name, "dropped": true}))
         }
-        Ddl::DropTable { name, if_exists, purge } => drop_table(lake, &name, if_exists, purge).await,
+        Ddl::DropTable { name, if_exists, purge, made_by } => drop_table(lake, &name, if_exists, purge, made_by.as_deref()).await,
         Ddl::Undrop { name } => undrop(lake, &new_name(lake, &name).await?).await,
         Ddl::Clone { name, from } => clone(lake, &new_name(lake, &name).await?, &from).await,
         Ddl::CreateView { name, sql, replace, facts } => create_view(lake, &name, sql, replace, false, facts).await,
@@ -846,7 +847,14 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
 /// its rows in the log sent to files first, so nothing of it is left in a log that moves on; with
 /// PURGE, or `retention = '0 seconds'`, it isn't, and its files go once a day old
 /// (`tier::collect_orphans`). It leaves the shares that hand it out (`shares::tables_moved`).
-async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool) -> Result<Value> {
+/// `made_by` (a failed `CREATE TABLE … AS SELECT`'s undo): only a table that job made is dropped. The leader decides it
+/// here, under the lake's lock: a follower may not see the table yet, and another statement's table under the name stays.
+async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_by: Option<&str>) -> Result<Value> {
+    if let Some(job) = made_by {
+        if lake.cat.get::<TableMeta>(&table_key(name)).await?.and_then(|m| m.made_by).as_deref() != Some(job) {
+            return Ok(j!({"table": name, "dropped": false, "kept": true}));
+        }
+    }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some_and(|v| v.external) {
         lake.cat.commit(vec![], &[query_key(name)]).await?; // (CREATE EXTERNAL TABLE's: its files stay)
         return Ok(j!({"table": name, "dropped": true}));
@@ -1241,7 +1249,7 @@ pub async fn drop_stale_staged(lake: &Lake, tables: &mut Vec<(String, TableMeta)
         .map(|(key, _)| key[2..].to_string())
         .collect();
     for name in &stale {
-        drop_table(lake, name, true, true).await?;
+        drop_table(lake, name, true, true, None).await?;
     }
     tables.retain(|(key, _)| !stale.iter().any(|name| name.as_str() == &key[2..]));
     Ok(())
@@ -1511,5 +1519,28 @@ fn reads(lake: &Lake, sql: &str, t: &str) -> bool {
     match crate::spmd::tables(sql) {
         Some(names) => names.iter().any(|n| local(lake, n).as_deref() == Some(t)),
         None => mentions(sql, t),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed `CREATE TABLE … AS SELECT` drops only the table its own job made: the leader checks `made_by` under the lake's
+    /// lock, so another statement's table under the name stays, and the job's own table goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_ctas_drops_only_the_table_its_job_made() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-made-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        crate::write::create_table(&lake, "t", r#"{"columns": [["a", "Int64"]], "made_by": "job-a"}"#).await?;
+        let drop = |made_by: &str| Ddl::DropTable { name: "t".into(), if_exists: true, purge: true, made_by: Some(made_by.into()) };
+        let out = apply(&lake, drop("job-b")).await?;
+        assert_eq!(out["dropped"], false, "{out}");
+        assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_some(), "another job's table was dropped");
+        apply(&lake, drop("job-a")).await?;
+        assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_none(), "the job's own table was kept");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

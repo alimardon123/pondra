@@ -2204,6 +2204,11 @@ def kafka():
         and len(failed) == 1 and failed[0] is not None and failed[0].code() == ck.KafkaError.INVALID_RECORD and "PRIMARY KEY" in open(node.log).read()
     checks["raw values (_value), queried as JSON"] = sql_("SELECT _key, _value FROM lines ORDER BY _key")[0] == {"_key": "k1", "_value": "plain text, not JSON"} and \
         sql_("SELECT _value->>'event' AS e, json_get_int(_value, 'n') AS n FROM lines WHERE _key = 'k2'") == [{"e": "click", "n": 3}]
+    # A JSON value's fraction into an INT column rounds as SQL writes it (`query::from_json`, invariant 293): 2.5 is 3.
+    sql_("CREATE TABLE rounds (v INT)")
+    p.produce("rounds", value=json.dumps({"v": 2.5}))
+    assert p.flush(30) == 0
+    checks["a JSON value's 2.5 into an INT column is 3, as SQL writes it"] = sql_("SELECT v FROM rounds") == [{"v": 3}]
     # consumers: kafka-python and librdkafka read the log back from the beginning
     tp = kp.TopicPartition("users", 0)
     c = kp.KafkaConsumer(bootstrap_servers=f"127.0.0.1:{kport}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
@@ -3448,6 +3453,35 @@ def schemas():
 LOCK_FILE = ".lock"  # memory.rs's LOCK_FILE: a spill folder's lock, held by its process, not a spilled file
 
 
+def tmpfs(mb):
+    """A tmpfs of `mb` MB on a new folder, or None where this machine can't mount one (neither root nor sudo without a password)."""
+    path = tempfile.mkdtemp(prefix="pondra-disk-")
+    cmd = ["mount", "-t", "tmpfs", "-o", f"size={mb}m,mode=1777", "tmpfs", path]
+    if subprocess.run(cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd], capture_output=True).returncode == 0:
+        return path
+    os.rmdir(path)
+    return None
+
+
+def untmpfs(path):
+    cmd = ["umount", "-l", path]
+    subprocess.run(cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd], capture_output=True)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def fill_to(folder, keep):
+    """A file in `folder` that takes all of the disk's free space but `keep` bytes; its path. Written a megabyte at a time."""
+    path = os.path.join(folder, "filler")
+    st = os.statvfs(folder)
+    left = st.f_bavail * st.f_frsize - keep
+    block = b"\0" * (1 << 20)
+    with open(path, "wb") as f:
+        while left > 0:
+            f.write(block[:min(left, len(block))])
+            left -= min(left, len(block))
+    return path
+
+
 def spill_files(folder):
     """The spilled files under a folder now, as (count, bytes): a file that goes while it is counted is not there.
     Lock files don't count: each process's folder keeps its own while the process lives."""
@@ -3683,6 +3717,13 @@ def scale():
         and written(f"COPY ({join}) TO '{folder}/' (FORMAT parquet)")
         and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_parquet('{folder}/*.parquet')".encode(), headers=owner) == [{"n": 3000000}])
     shutil.rmtree(os.path.dirname(folder), ignore_errors=True)
+    # A COPY to a Delta folder that runs out of memory: the first try makes the table and commits no rows, so the retry adds
+    # to that table (`write_outside::copy_table`). Refused (53200) before the retry existed.
+    delta = os.path.join(tempfile.mkdtemp(prefix="pondra-frugal-delta-"), "out")
+    checks["COPY … TO a Delta folder that runs out of memory answers on the frugal retry"] = (
+        written(f"COPY ({join}) TO '{delta}' (FORMAT delta)")
+        and call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_delta('{delta}')".encode(), headers=owner) == [{"n": 3000000}])
+    shutil.rmtree(os.path.dirname(delta), ignore_errors=True)
     node.kill()
     # A sort of 10 M md5 strings under a 256 MB query pool, on four cores: each partition's sort hands up views into its
     # input's buffers, and the merge above counted those batches whole (66 MB for about 2 MB of rows, so the pool was
@@ -3785,6 +3826,27 @@ def scale():
         and stopped_pg == ("53200", True) and count_pg == 2 and tx_sqlstate == "53200" and "nearly out of memory" in tx_body and count_tx == 3
         and tx_after == "25P02" and '"transaction":"rollback"' in tx_commit.replace(" ", "") and tx_count == [{"n": 0}])
     checks.update(_flight_memory_stop(port + 30, aggregate, lambda: metrics_of(port).get("pondra_queries_stopped_for_memory_total"), settle))  # (the same stop over Flight)
+    # The watch stops the request that grew the node, not an older cheap one beside it (`oom.rs`, invariant 417): a long
+    # count(*) over generate_series, started first, is still answered (200, its count) when the array_agg started after it
+    # is the one stopped (53200). CHEAP_ROWS (4e9) runs about 9 s alone here, and the grower is stopped about 2 s after it starts,
+    # so the cheap one is still running when the watch decides.
+    CHEAP_ROWS = 4_000_000_000
+    time.sleep(11)  # (the watch's hold after the last stop; settle waits for the memory to go back under the line)
+    settle()
+    cheap = {}
+    cheap_thread = threading.Thread(target=lambda: cheap.update(answer=answer(f"SELECT count(*) AS n FROM generate_series(1, {CHEAP_ROWS})")))
+    cheap_thread.start()
+    time.sleep(1.5)  # (the cheap one has run past the watch's FIRST before the grower starts)
+    t0 = time.time()
+    grower = answer(aggregate)
+    grower_seconds = time.time() - t0
+    cheap_thread.join()
+    cheap_status, cheap_sqlstate, cheap_body = cheap.get("answer", (None, None, "the cheap query's thread failed"))
+    cheap_rows = json.loads(cheap_body) if cheap_status == 200 else None
+    memory_line["memory_watch"] = {"grower": [grower[0], grower[1], grower[2][:120]], "grower_seconds": round(grower_seconds, 1),
+                                   "cheap": [cheap_status, cheap_sqlstate, cheap_body[:120]], "cheap_rows": CHEAP_ROWS}
+    checks[f"the memory watch stops the request that grew the node, not an older cheap one beside it (a count(*) over {CHEAP_ROWS} rows started first answers 200 with its count; the array_agg started after it answers 53200)"] = (
+        grower[0] == 503 and grower[1] == "53200" and cheap_rows == [{"n": CHEAP_ROWS}])
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
@@ -3832,12 +3894,47 @@ def scale():
         and sp_1 == [{"n": 10000000, "lo": "0000023f507999464aa2b78875b7e5d6", "hi": "fffffe98d0963d27015c198262d97221"}]
         and refused[0] != 200 and refused[1] == "53100" and "PONDRA_SPILL_GB" in refused[2] and "datafusion.runtime" not in refused[2]
         and after_refusal[0] == 200 and refused_rows in ([{"n": 0}], None))
+    room_rows = 1_000_000  # (the full-disk check below sorts these: a sort that spills within the room a freed tmpfs leaves)
+    reply(f"CREATE TABLE sp_room AS SELECT value AS id, md5(CAST(value AS VARCHAR)) AS k FROM generate_series(1, {room_rows})")
     for t in ("sp_2", "sp_src"):
         try:
             sql(port, f"DROP TABLE IF EXISTS {t}")
         except RuntimeError:
             pass  # (a table the capped sort never made is none to drop)
     capped.kill()
+    # A node started on a full disk spills once room is freed, without a restart: a file fills a 256 MB tmpfs to within
+    # 20 MB before the node starts (its cap at open is then 0), so the sort is refused; the file goes, and the same sort
+    # answers on the same node within 2 s (the query's session looks at the disk again: `store::spill_room`).
+    room = tmpfs(256)  # (None where this machine can't mount one: the check is skipped, with the reason printed)
+    if room is None:
+        print("(not checked: a node started on a full disk; this machine can't mount a 256 MB tmpfs)", file=sys.stderr)
+    else:
+        filler = fill_to(room, keep=20 << 20)
+        full = Node(lake, port, memory_gb=0.25, env={"PONDRA_CORES": "4", "PONDRA_SPILL_DIR": room}).start()
+        try:
+            sort_q = "CREATE TABLE sp_room_1 AS SELECT * FROM sp_room ORDER BY k"
+            full_refused = reply(sort_q)  # (a CREATE TABLE AS makes its table first: the refused one leaves it empty)
+            sql(port, "DROP TABLE IF EXISTS sp_room_1")
+            os.remove(filler)
+            t0 = time.time()
+            full_again, full_tries = reply(sort_q), 1
+            while full_again[0] != 200 and time.time() - t0 < 2:  # (the disk is looked at again at most every 500 ms, as a query starts)
+                sql(port, "DROP TABLE IF EXISTS sp_room_1")
+                time.sleep(0.1)
+                full_again, full_tries = reply(sort_q), full_tries + 1
+            full_took = round(time.time() - t0, 2)
+            full_rows = sql(port, "SELECT count(*) AS n FROM sp_room_1") if full_again[0] == 200 else None
+            full_left = spill_files(room)[0]
+            spill_report["full_disk"] = {"refused": [full_refused[0], full_refused[1], full_refused[2][:200]], "again": full_again[0], "again_seconds": full_took, "tries": full_tries,
+                                         "rows": full_rows, "files_after": full_left}
+            checks["a node started on a full disk spills once room is freed, without a restart"] = (
+                full_refused[0] != 200 and full_refused[1] == "53100" and "PONDRA_SPILL_GB" in full_refused[2]
+                and full_again[0] == 200 and full_took < 2 and full_rows == [{"n": room_rows}] and full_left == 0)
+            sql(port, "DROP TABLE IF EXISTS sp_room_1")
+            sql(port, "DROP TABLE IF EXISTS sp_room")
+        finally:
+            full.kill()
+            untmpfs(room)
     shutil.rmtree(spill_top, ignore_errors=True)
     node.kill()
     ok = all(checks.values())
@@ -6931,6 +7028,8 @@ def across():
 
 HOT_LINE_ROWS = 8_000_000  # the values array_agg holds in hot_under_line's query (calibrated on pondra-whole: see its docstring)
 HOT_LINE_FILES = 20  # the bulk INSERTs of hot_under_line's table: a file of its own each (about 32 MB decoded each)
+HOT_HELD_FILES = 12  # the bulk INSERTs of its second check's table `hw`: about 384 MB decoded, so the cache can hold HOT_HELD_BYTES
+HOT_HELD_BYTES = 100 << 20  # what the cache must hold of `hw` before the second check's query: a trim worth crediting (the grower's overshoot grew with it)
 
 
 def hot_under_line():
@@ -6947,15 +7046,27 @@ def hot_under_line():
     (1,375 MB resident before it, 1,712 peak); with the same node and no cache (PONDRA_HOT_GB=0) it answers at a 629 MB
     peak. Two waits make the cache read the same way on every run: the table's files stop changing (the leader's first
     tiering rounds merge the small files, and a merge forgets their decoded columns, `hot.forget`), and resident memory
-    stops falling (the decoding's memory goes back to the OS over about ten seconds)."""
+    stops falling (the decoding's memory goes back to the OS over about ten seconds).
+    The second check (the purge, `oom.rs`): a fresh node on the same lake, warmed on `hw` (twelve bulk INSERTs of a million
+    rows, four BIGINT columns, about 384 MB decoded), whose cache must hold HOT_HELD_BYTES (100 MB) before the query. Then a
+    query over three times the rows, which needs more than the line by itself (alone on a node with no cache, the build
+    before the purge peaks at 1,724 MB for 3 × HOT_LINE_ROWS values, 582 MB for HOT_LINE_ROWS). The cache is trimmed and its
+    memory purged, and the query is still stopped near the line: 53200, one stop, fewer cache bytes after, the peak at most
+    1.1 × the line (1,126 MB), and the node answers `SELECT 1`. The peak is reset after the warm-up (`clear_refs`).
+    Calibrated on pondra-grower (the build before the purge, which keeps the credit): 128 MB held, the query stopped at
+    1,038 MB, and a peak of 1,198 MB (174 MB past the line, against 26 MB past it with 32 MB held: the overshoot grows with
+    what the cache gave back), so the check fails there."""
     import re
     lake = new_lake()
     # The table is made by `pondra sql` in its own processes (as `scale` makes its tables), so the node starts with
     # nothing decoded in memory: a node that made it through its own INSERTs kept the writes' memory, over the line.
     for statement in ["CREATE TABLE hl (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [
-            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)]:
+            f"INSERT INTO hl SELECT value + {i * 1000000}, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for i in range(HOT_LINE_FILES)] + [
+            "CREATE TABLE hw (a BIGINT, b BIGINT, c BIGINT, d BIGINT)"] + [  # (the second check's: made here too, before any node starts)
+            "INSERT INTO hw SELECT value, value * 2, value % 1000, value + 7 FROM generate_series(1, 1000000)" for _ in range(HOT_HELD_FILES)]:
         subprocess.run([BIN, "sql", "--dir", lake, statement], check=True, capture_output=True, timeout=900)  # (a bulk INSERT is a file of its own)
-    node = Node(lake, A.port, env={"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}).start()
+    env = {"PONDRA_HOT_GB": "2", "PONDRA_MEMORY_MAX_GB": "1"}
+    node = Node(lake, A.port, env=env).start()
     q = lambda s: sql(A.port, s)
     def answer(s):  # (status, SQLSTATE, body): the answer, or the refusal as the node sends it (`scale`'s `answer`)
         c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=600)
@@ -6965,28 +7076,35 @@ def hot_under_line():
     def resident_of(pid):  # resident memory, in bytes: statm counts pages of the size the OS says
         return int(open(f"/proc/{pid}/statm").read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     hot_bytes = lambda: float(re.search(rb"\npondra_hot_bytes (\S+)", call(A.port, "GET", "/metrics")).group(1))
+    def reset_peak():  # VmHWM back to the resident memory now (`scale` does the same): a peak read after it is the next query's own
+        try:
+            open(f"/proc/{node.p.pid}/clear_refs", "w").write("5")
+            return True
+        except OSError:  # not allowed here: the peak then counts from the node's start, the warm-up included
+            return False
+    def warm(table):  # the table's columns held and resident memory settled: the state each check starts from
+        for run in range(2):  # (a file's columns load on its second read)
+            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM {table} -- warm {run}")
+        hot_settled(A.port)
+        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
+        return hot_bytes(), resident_of(node.p.pid)
     checks, seen = {}, {}
     try:
         seen["files once the leader's first tiering rounds are done"] = files_settled(lake, "data/hl/")
-        for run in range(2):  # (a file's columns load on its second read)
-            q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM hl -- warm {run}")
-        hot_settled(A.port)
-        resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
-        held_before, rss_before = hot_bytes(), resident_of(node.p.pid)
+        held_before, rss_before = warm("hl")
         # A query that never takes the node past the trim line has nothing to show: with few columns held (the merges
         # decide how many) the node starts low, and 8,000,000 values reached 739 MB of a 717 MB trim line. So a run whose
         # own peak stays within 100 MB of the trim line, with nothing trimmed, is run again with a quarter more values
         # (the cache is as it was), twice at most; past that margin the node was over the line for some 50 ms, ten looks.
+        # Where the peak can't be reset, it counts from the node's start, the warm-up included, so it says nothing of the
+        # run: the first run is the only one taken.
         trim, n, tries = (1 << 30) // 10 * 7, HOT_LINE_ROWS, []
         for _ in range(3):
-            try:
-                open(f"/proc/{node.p.pid}/clear_refs", "w").write("5")  # (the peak from here is the query's own, as in `scale`)
-            except OSError:
-                pass  # (not allowed here: the peak counts from the node's start, the warm-up included, so no run is taken again)
+            own = reset_peak()
             status, sqlstate, body = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {n}) GROUP BY 1")
             held_after, peak = hot_bytes(), vm_hwm(node.p.pid)
             tries.append({"rows": n, "peak resident": peak >> 20})
-            if status != 200 or held_after < held_before or peak > trim + (100 << 20):
+            if not own or status != 200 or held_after < held_before or peak > trim + (100 << 20):
                 break
             n = n * 5 // 4
         stopped = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
@@ -6997,6 +7115,30 @@ def hot_under_line():
             "answer == model": got == want, "held after": held_after, "peak resident": peak >> 20, "stopped": stopped, "runs": tries}
         checks["under a memory line below three fifths of RAM, the hot columns are let go before a query is stopped"] = (
             held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
+        # The second check, on a fresh node of its own: the first node is killed and a new one starts on the same lake with
+        # the same env, so its cache starts empty under the trim line. It is warmed on `hw`, whose decoded columns must fill
+        # the cache past HOT_HELD_BYTES. Then a query over three times the rows, which needs more than the line by itself:
+        # the cache is trimmed and purged, and the query is still stopped near the line (`oom.rs`).
+        node.kill()
+        node = Node(lake, A.port, env=env).start()
+        seen["files of hw once the leader's first tiering rounds are done"] = files_settled(lake, "data/hw/")
+        held_before2, rss_before2 = warm("hw")
+        peak_reset = reset_peak()  # the peak from here is the query's own (VmHWM); where clear_refs isn't allowed it counts from the node's start
+        stopped_before2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        big = 3 * HOT_LINE_ROWS
+        status2, sqlstate2, body2 = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {big}) GROUP BY 1")
+        held_after2 = hot_bytes()
+        peak2 = vm_hwm(node.p.pid)
+        stopped2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
+        after_status, _, after_body = answer("SELECT 1 AS one")
+        after_ok = after_status == 200 and json.loads(after_body) == [{"one": 1}]
+        seen["a memory line of 1 GB, then a query past it (three times the rows, a fresh node): the columns held, the peak resident memory (MB)"] = {
+            "rows": big, "held before": held_before2, "resident before": rss_before2 >> 20, "status": [status2, sqlstate2],
+            "stopped": stopped2 - stopped_before2, "held after": held_after2, "peak resident": peak2 >> 20,
+            "peak reset": peak_reset, "select 1": after_ok}
+        checks["a query that needs more than the line is stopped near it, even while the hot columns give memory back (peak at most 1.1 × the line)"] = (
+            held_before2 >= HOT_HELD_BYTES and status2 == 503 and sqlstate2 == "53200" and "out of memory" in body2
+            and stopped2 - stopped_before2 == 1 and held_after2 < held_before2 and peak2 <= 1.1 * (1 << 30) and after_ok)
     finally:
         node.kill()
         clean_up()
@@ -8078,6 +8220,13 @@ def found():
         [{"di": -3, "fi": 4}, {"di": 2, "fi": -2}, {"di": 3, "fi": 2}, {"di": 100, "fi": -4}],
         [{"i": 3, "b": 2}, {"i": 3, "b": 5}, {"i": 7, "b": 8}],
         [{"a": 3, "b": -3}]]
+    # JSON rows appended into integer columns round as SQL writes them (`query::from_json`, invariant 293): 2.5 is 3, and a
+    # BIGINT's digits stay exact (arrow-json cut a JSON number through a float, so 2.5 was 2 and big integers lost digits).
+    q("CREATE TABLE jwholes (i INT, b BIGINT)")
+    call(port, "POST", "/append/jwholes?producer=jw&seq=1", b'{"i": 2.5, "b": -2.5}\n{"i": 7, "b": 9007199254740993}\n')
+    seen["jwholes"] = q("SELECT i, b FROM jwholes ORDER BY i")
+    checks["JSON rows appended into integer columns round as SQL writes them (2.5 is 3), and a big BIGINT stays exact"] = \
+        seen["jwholes"] == [{"i": 3, "b": -3}, {"i": 7, "b": 9007199254740993}]
     # A number with an exponent is a whole decimal (`optimize::WholeLiterals`): CAST(1e15 AS DOUBLE) is 1e15, and a table made from
     # 1e15 is written to files (Parquet has no negative scale). The table's files are listed by the catalog, after a CHECKPOINT.
     q("CREATE TABLE exps AS SELECT 1e15 AS x, 6.02e23 AS n")
@@ -13918,6 +14067,12 @@ def sequences():
     info["o"] = [o, cur, before, none, after_set, restarted, stepped]
     checks["START 10 INCREMENT 5 in any order; currval the session's last (55000 before, none without a session); setval; RESTART; INCREMENT changed"] = \
         o == [10, 15] and cur == 15 and before[1] == "55000" and none[0] == 409 and none[1] == "55000" and after_set == 105 and restarted == 7 and stepped[1] - stepped[0] == 2 and stepped[0] > restarted
+    # setval's value is a cast into an integer: 2.5 rounds to 3, as every cast into an integer does (invariant 293)
+    q("CREATE SEQUENCE half")
+    half = (q("SELECT setval('half', 2.5) AS v")[0]["v"], q("SELECT nextval('half') AS v")[0]["v"])
+    info["half"] = half
+    checks["setval(s, 2.5) sets 3, as a cast into an integer rounds"] = half == (3, 4)
+    q("DROP SEQUENCE half")  # (gone again: the listing of sequences below names the others alone)
     q("ALTER SEQUENCE o RENAME TO o2")
     renamed = (q("SELECT nextval('o2') AS v")[0]["v"], err("SELECT nextval('o') AS v")[1])
     q("CREATE SEQUENCE c AS smallint MAXVALUE 3 CYCLE")

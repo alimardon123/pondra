@@ -236,7 +236,7 @@ pub fn own(stmt: &Stmt) -> bool {
         Stmt::Create(c) => c.temporary,
         Stmt::TempView(..) | Stmt::TempSecret(..) => true,
         Stmt::Ddl(d) => !d.is_empty() && d.iter().all(|d| match d {
-            Ddl::DropTable { name, .. } => has(&s, name, true),
+            Ddl::DropTable { name, made_by: None, .. } => has(&s, name, true), // (a failed CREATE TABLE … AS's drop is the lake's table, never a session's)
             Ddl::DropView { name, .. } => has(&s, name, false),
             Ddl::DropSecret { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.secrets.contains_key(name)),
             _ => false,
@@ -334,7 +334,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             }
             let s = session.context(NO_SESSION)?;
             let dropped = with(&s, true, |x| Ok(d.iter().map(|d| match d {
-                Ddl::DropTable { name, .. } => x.tables.remove(name).map(|_| name.clone()),
+                Ddl::DropTable { name, made_by: None, .. } => x.tables.remove(name).map(|_| name.clone()),
                 Ddl::DropView { name, .. } => x.views.remove(name).map(|_| name.clone()),
                 Ddl::DropSecret { name, .. } => x.secrets.remove(name).map(|_| name.clone()),
                 _ => None,

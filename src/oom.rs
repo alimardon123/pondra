@@ -6,12 +6,17 @@
 //! node: `array_agg` of 30 M values in 3 groups peaked at 1,941 MB resident. A cap that looked only
 //! when something asked the pool found 1.8–1.9 GB already resident when it refused, no better than
 //! none. So a watch reads the process's resident memory on a timer, whatever asked for it, and when
-//! it passes the node's line it stops the oldest request that has grown since it started: its future
-//! is dropped, so its memory is let go, and it answers 53200. The node stays up and answers the rest.
+//! it passes the node's line it stops the request that grew it: its future is dropped, so its memory
+//! is let go, and it answers 53200. The node stays up and answers the rest. Which request grew it is
+//! read from the allocator (`Meter`): each request is charged what its own polls allocated, less what
+//! they freed, so a long cheap request started early is not stopped for a query that grew the node.
 //! The one watch lets the hot columns (`hot.rs`) go first, past seven tenths of the line, since a column
 //! is decoded again when it is read; it stops a query only past the line itself.
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 /// What a stopped request answers (SQLSTATE 53200: `codes::by_words` reads "out of memory").
@@ -19,8 +24,7 @@ pub const OOM: &str = "out of memory: the node was nearly out of memory and stop
 
 /// How long a stop holds the watch: the node's allocator gives freed pages back over about ten
 /// seconds (`main.rs`), so resident memory falls after a stop, and a second stop would be for memory
-/// the first one already let go. The same time holds the credit for what the hot columns gave back
-/// (`felt`).
+/// the first one already let go.
 const HOLD: Duration = Duration::from_secs(10);
 
 /// How long a request must have run to be stopped: one that has only just started did not grow the
@@ -103,27 +107,6 @@ fn givers() -> Vec<Arc<crate::hot::Hot>> {
     list.iter().filter_map(Weak::upgrade).collect()
 }
 
-/// Memory the hot columns let go of at one look: what it freed, the resident memory then, and the least seen since.
-struct Given {
-    at: Instant,
-    bytes: usize,
-    from: usize,
-    low: usize,
-}
-
-/// The memory the watch goes by: resident, less what was let go in the last [`HOLD`] and hasn't left the
-/// process yet (freed pages go back to the OS over seconds, `HOLD`'s comment). Each credit shrinks as
-/// resident falls below where it was taken, so memory that came back is never counted twice.
-fn felt(resident: usize, given: &mut Vec<Given>, now: Instant) -> usize {
-    given.retain(|g| now.saturating_duration_since(g.at) < HOLD);
-    let mut credit = 0;
-    for g in given.iter_mut() {
-        g.low = g.low.min(resident);
-        credit += g.bytes.saturating_sub(g.from.saturating_sub(g.low));
-    }
-    resident.saturating_sub(credit)
-}
-
 /// Starts the watch, when the process can say how much memory it holds and the hot columns can be given
 /// back (`trim_line`). The line is checked only where there is one (a node's own process). It runs on a thread of
 /// its own (`panics::alone`), which a node stopped ends, as its other loops end.
@@ -133,16 +116,20 @@ pub fn start() {
         return;
     }
     let line = line(); // (None in a host's process: there the watch only gives the cache back)
+    if line.is_some() {
+        // DataFusion's spawned work charges the request that spawned it, as the request's own polls do (`charge`).
+        // (A tracer a program embedding the library set first is kept: its error is ignored.)
+        let _ = datafusion::common::runtime::set_join_set_tracer(&TRACER);
+    }
     crate::panics::alone(async move {
-        let mut given: Vec<Given> = vec![]; // what the hot columns let go of, held by `felt` for `HOLD`
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
         loop {
             let resident = crate::store::resident().unwrap_or(0);
-            SEEN.store(resident, Relaxed); // (resident, never felt: `noted` and `pick` compare what the OS says)
+            SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
             crate::panics::note(resident); // (a request that started unread takes this look's reading, before any stop)
             let now = Instant::now();
-            let mut felt = felt(resident, &mut given, now);
+            let mut felt = resident;
             if felt > trim {
                 // The cache goes first: a column is decoded again when it is read, a query can't be.
                 let need = felt - trim;
@@ -156,8 +143,12 @@ pub fn start() {
                 }
                 drop(holders); // (held over a wait, a closed lake's columns would stay in memory)
                 if freed > 0 {
-                    given.push(Given { at: now, bytes: freed, from: resident, low: resident });
-                    felt = felt.saturating_sub(freed);
+                    // The pages just freed would stay resident for seconds (`purge`), so they are handed back now:
+                    // the reading after it is what the process holds, and the watch goes by that alone.
+                    purge();
+                    felt = crate::store::resident().unwrap_or(felt);
+                    SEEN.store(felt, Relaxed);
+                    crate::panics::note(felt);
                 }
             }
             if let Some(line) = line {
@@ -212,6 +203,153 @@ fn pending(last_stop: Option<Instant>, resident: usize, line: usize, now: Instan
     resident >= line && last_stop.is_some_and(|at| now.saturating_duration_since(at) < HOLD)
 }
 
+// The request's memory. Each thread of jemalloc keeps two counters, the bytes it has allocated and the
+// bytes it has freed (`thread.allocatedp`, `thread.deallocatedp`: no stats build needed). A poll of a future
+// runs on one thread, so the difference of the two counters across the poll is what that poll did, and a
+// request charged each poll's difference is charged its own memory, less what it gave back. jemalloc
+// is the node's allocator on Linux with glibc (`main.rs`); a program with another allocator, and every
+// other OS, has no counters: `thread_net` is then 0, and every request counts 0, so `pick` goes by age.
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+mod counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        // This thread's two counters' addresses, read on its first poll (null where jemalloc has none).
+        static POINTERS: Cell<Option<(*const u64, *const u64)>> = const { Cell::new(None) };
+    }
+
+    // The address jemalloc keeps for the counter `name` (null where it keeps none).
+    fn address(name: &std::ffi::CStr) -> *const u64 {
+        crate::jemalloc::read(name).unwrap_or(std::ptr::null())
+    }
+
+    pub fn net() -> i64 {
+        let (allocated, freed) = POINTERS.with(|c| match c.get() {
+            Some(p) => p,
+            None => {
+                let p = (address(c"thread.allocatedp"), address(c"thread.deallocatedp"));
+                c.set(Some(p));
+                p
+            }
+        });
+        if allocated.is_null() || freed.is_null() {
+            return 0;
+        }
+        // SAFETY: both are this thread's own counters, which jemalloc keeps for the thread's life.
+        unsafe { (*allocated as i64).wrapping_sub(*freed as i64) }
+    }
+
+    // Every arena's free pages go back to the OS (4096 is `MALLCTL_ARENAS_ALL`); the command takes no value, and a
+    // failed purge leaves the pages where they were, so its return code is ignored.
+    pub fn purge() {
+        crate::jemalloc::write(c"arena.4096.purge", ());
+    }
+}
+
+/// Bytes this thread has allocated less the bytes it has freed (see above); 0 where there are no counters.
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+fn thread_net() -> i64 {
+    counters::net()
+}
+
+/// Bytes this thread has allocated less the bytes it has freed; 0 where there are no counters.
+#[cfg(not(all(feature = "server", target_os = "linux", target_env = "gnu")))]
+fn thread_net() -> i64 {
+    0
+}
+
+/// Hands the allocator's free pages back to the OS now. jemalloc keeps freed pages about ten seconds (`main.rs`):
+/// purged, resident memory read after this says what the process holds, and the watch goes by that. Where jemalloc
+/// isn't the allocator (another OS, or a program embedding the library), there is nothing to purge, and a big free
+/// goes back at once.
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+fn purge() {
+    counters::purge()
+}
+
+// (no jemalloc to purge here: see the version above)
+#[cfg(not(all(feature = "server", target_os = "linux", target_env = "gnu")))]
+fn purge() {}
+
+// The tests run on jemalloc too, as the node does, so the meter has counters to read there.
+#[cfg(all(test, feature = "server", target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// A future that charges what its polls allocate, less what they free, to `used`. The poll reads the
+/// thread's counters before and after the inner poll, so what the inner future does on its thread is
+/// what counts; work it only starts (a spawned task, a blocking closure) is charged where it runs, through
+/// [`charge`] and [`TRACER`]. The inner future is boxed, so the meter is `Unpin` and needs no `unsafe`.
+pub struct Meter<F> {
+    inner: Pin<Box<F>>,
+    used: Arc<AtomicI64>,
+}
+
+impl<F: Future> Meter<F> {
+    pub fn new(inner: F, used: Arc<AtomicI64>) -> Self {
+        Meter { inner: Box::pin(inner), used }
+    }
+}
+
+impl<F: Future> Future for Meter<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        let before = thread_net();
+        let out = this.inner.as_mut().poll(cx);
+        this.used.fetch_add(thread_net().wrapping_sub(before), Relaxed); // (one relaxed add per poll)
+        out
+    }
+}
+
+tokio::task_local! {
+    /// The memory counter of the request the current task is part of, set by [`charge`]. Work it spawns
+    /// (DataFusion's tasks and blocking closures, through [`TRACER`]) charges the same counter.
+    static REQUEST: Arc<AtomicI64>;
+}
+
+/// Runs `f` as a request whose memory is `used`: its polls are metered, and the work it spawns is too.
+/// Work that Pondra spawns itself is not: the hot columns' decoding (`hot.rs`), which the cache owns, and a
+/// write's Parquet encoding (`tier.rs`), which is bounded.
+pub fn charge<F: Future>(used: Arc<AtomicI64>, f: F) -> impl Future<Output = F::Output> {
+    REQUEST.scope(used.clone(), Meter::new(f, used))
+}
+
+/// DataFusion's tracer (`datafusion::common::runtime`): a task or a blocking closure it spawns while a
+/// request runs is charged to that request, wherever it runs. Outside a request nothing changes.
+struct Tracer;
+
+static TRACER: Tracer = Tracer;
+
+impl datafusion::common::runtime::JoinSetTracer for Tracer {
+    fn trace_future(
+        &self,
+        fut: futures::future::BoxFuture<'static, Box<dyn std::any::Any + Send>>,
+    ) -> futures::future::BoxFuture<'static, Box<dyn std::any::Any + Send>> {
+        use futures::FutureExt;
+        match REQUEST.try_with(Arc::clone) {
+            Ok(used) => charge(used, fut).boxed(),
+            Err(_) => fut,
+        }
+    }
+
+    fn trace_block(
+        &self,
+        f: Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn std::any::Any + Send> + Send> {
+        match REQUEST.try_with(Arc::clone) {
+            Ok(used) => Box::new(move || {
+                let before = thread_net();
+                let out = f();
+                used.fetch_add(thread_net().wrapping_sub(before), Relaxed);
+                out
+            }),
+            Err(_) => f,
+        }
+    }
+}
+
 /// A request running through `panics::work`, as the choice of which to stop sees it (`panics::RUNNING`,
 /// by id).
 pub struct Running {
@@ -222,19 +360,32 @@ pub struct Running {
     /// How to stop it, when it may be stopped (the node has a line: `panics::work`).
     pub stop: Option<futures::future::AbortHandle>,
     pub stopped: bool,
+    /// What the request's polls have allocated, less what they freed (its [`Meter`]'s counter): set only for
+    /// a request the node may stop, and 0 for the rest.
+    pub used: Option<Arc<AtomicI64>>,
 }
 
-/// The request to stop: the oldest that can be stopped, has run for [`FIRST`], and started at least
-/// `margin` bytes below the memory now, so it is one that grew it. None when no request qualifies. Of
-/// requests that started together, the lower id (the map's first) is the older.
+impl Running {
+    fn used(&self) -> i64 {
+        self.used.as_ref().map_or(0, |u| u.load(Relaxed))
+    }
+}
+
+/// The request to stop, of those that may be stopped, have run for [`FIRST`], and started at least `margin`
+/// bytes below the memory now (so they may have grown it). Of those, the one whose own allocations are the
+/// most, if that is at least `margin`: the request that grew the node. Otherwise the oldest, as before: the
+/// growth was elsewhere (an operator that doesn't count what it holds, or no counters at all), and age is
+/// then all there is to go on. None when no request qualifies. Of requests that tie, the lower id (the
+/// map's first) is the older, and is taken.
 pub fn pick(running: &std::collections::BTreeMap<u64, Running>, now: Instant, resident: usize, margin: usize) -> Option<u64> {
-    running
+    let fit: Vec<(&u64, &Running)> = running
         .iter()
         .filter(|(_, r)| r.stop.is_some() && !r.stopped)
         .filter(|(_, r)| now.saturating_duration_since(r.since) >= FIRST)
         .filter(|(_, r)| r.noted.saturating_add(margin) <= resident)
-        .min_by_key(|(_, r)| r.since)
-        .map(|(id, _)| *id)
+        .collect();
+    let grew = fit.iter().min_by_key(|(_, r)| std::cmp::Reverse(r.used())).filter(|(_, r)| r.used() >= margin as i64);
+    grew.or_else(|| fit.iter().min_by_key(|(_, r)| r.since)).map(|(id, _)| **id)
 }
 
 #[cfg(test)]
@@ -251,7 +402,12 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None }
+    }
+
+    // A request that has allocated `used` bytes so far (its meter's counter).
+    fn grew(since: Instant, noted: usize, used: usize) -> Running {
+        Running { used: Some(Arc::new(AtomicI64::new(used as i64))), ..req(since, noted) }
     }
 
     fn runs(list: Vec<(u64, Running)>) -> BTreeMap<u64, Running> {
@@ -281,6 +437,28 @@ mod tests {
         let running = runs(vec![(7, req(start + Duration::from_secs(2), 0)), (3, req(start, 0)), (9, req(start, 0))]);
         // (3 and 9 started together: the lower id is the older in the map, and both qualify; 3 comes first)
         assert_eq!(pick(&running, start + Duration::from_secs(5), LINE, MARGIN), Some(3));
+    }
+
+    #[test]
+    fn the_request_that_grew_the_node_is_stopped_not_the_oldest() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(5);
+        let margin = 100 * MB;
+        // An old request that has allocated 1 MB, and a young one that has allocated 500 MB: the young one grew the node.
+        let old = grew(start, 0, MB);
+        let young = grew(start + Duration::from_secs(1), 0, 500 * MB);
+        assert_eq!(pick(&runs(vec![(1, old), (2, young)]), now, LINE, margin), Some(2));
+    }
+
+    #[test]
+    fn below_the_margin_no_request_grew_the_node_and_the_oldest_is_stopped() {
+        let start = Instant::now();
+        let now = start + Duration::from_secs(5);
+        let margin = 100 * MB;
+        // Both allocated less than the margin: the growth was elsewhere, so age is all there is to go on.
+        let old = grew(start, 0, 10 * MB);
+        let young = grew(start + Duration::from_secs(1), 0, 20 * MB);
+        assert_eq!(pick(&runs(vec![(1, old), (2, young)]), now, LINE, margin), Some(1));
     }
 
     #[test]
@@ -320,16 +498,23 @@ mod tests {
         assert_eq!(of_line(LINE), LINE / 10 * 7);
     }
 
+    // (only where the counters are: jemalloc's, on Linux with glibc; elsewhere `thread_net` is 0)
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
-    fn what_the_cache_gave_back_is_credited_until_it_leaves_the_process_and_never_twice() {
-        let start = Instant::now();
-        let at = |secs: u64| start + Duration::from_secs(secs);
-        // Resident 1000 MB, and the cache lets 300 MB go at once.
-        let mut given = vec![Given { at: start, bytes: 300 * MB, from: 1000 * MB, low: 1000 * MB }];
-        assert_eq!(felt(1000 * MB, &mut given, at(0)), 700 * MB, "just trimmed: the pages haven't left yet");
-        assert_eq!(felt(700 * MB, &mut given, at(1)), 700 * MB, "resident fell by what was freed: felt is resident");
-        assert_eq!(felt(800 * MB, &mut given, at(2)), 800 * MB, "then it grew: felt follows it");
-        assert_eq!(felt(800 * MB, &mut given, at(11)), 800 * MB, "past HOLD: no credit, and the entry is gone");
-        assert!(given.is_empty());
+    fn a_meter_charges_what_its_polls_keep_and_not_what_they_free() {
+        let used = Arc::new(AtomicI64::new(0));
+        let kept = futures::executor::block_on(Meter::new(async { vec![1u8; 64 * MB] }, used.clone())); // (allocated in its poll, and returned)
+        let after_kept = used.load(Relaxed);
+        assert!(after_kept >= (64 * MB) as i64, "a 64 MB Vec kept is charged at least 64 MB ({after_kept} bytes)");
+        futures::executor::block_on(Meter::new(
+            async {
+                let scratch = vec![2u8; 64 * MB];
+                std::hint::black_box(scratch.len()) // (allocated and freed within the poll)
+            },
+            used.clone(),
+        ));
+        let freed = used.load(Relaxed) - after_kept;
+        assert!(freed.abs() < MB as i64, "a 64 MB Vec allocated and freed is charged under 1 MB ({freed} bytes)");
+        drop(kept);
     }
 }
