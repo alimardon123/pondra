@@ -385,6 +385,7 @@ differences entirely.
 | `hilbert.rs` | `cluster_by` over two or more columns: rows along a Hilbert curve through their ranks |
 | `ddl.rs` | Schemas and names (`lake.schema.table`, attached lakes), and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`, `CREATE VIEW` (stored), `CREATE MATERIALIZED VIEW`, `DROP VIEW`, `ALTER TABLE … RENAME/DROP/ALTER COLUMN` — carried out by the leader |
 | `write.rs` | Writes in SQL from anywhere (CREATE TABLE [AS], INSERT, UPDATE, DELETE, and the DDL of `ddl.rs`): the work runs where the statement runs; the leader records it — over HTTP, through the bucket inbox, or the statement leads for a moment when nobody does. Attached lakes' writes go to their own leaders |
+| `replace.rs` | `CREATE OR REPLACE TABLE`: the new table filled under a staged name, then put in the old one's place in one commit, the old one set aside as a drop does (invariant 425) |
 | `inbox.rs` | The bucket inbox: writers that can't reach the leader leave requests in the bucket; the leader answers them |
 | `pg.rs` | The Postgres wire protocol (queries and writes, text and binary results, typed `$1` parameters, a small `pg_catalog`) |
 | `auth.rs` | Read / write / admin tokens, over HTTP, Postgres and MCP |

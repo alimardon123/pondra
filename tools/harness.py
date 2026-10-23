@@ -13553,7 +13553,7 @@ def objects():
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
     # CREATE OR REPLACE TABLE puts the new table in the old one's place in one commit, the old one kept for UNDROP
-    # (`ddl::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
+    # (`replace::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
     # leaves t as it was; the same job sent again writes its rows once. Each check has tables of its own, and the
     # replaces and their follow-ups answer their status rather than raise, so every check gets its answer on a build
     # that gets one wrong.
@@ -13640,7 +13640,7 @@ def objects():
         renamed_ok and undrop[0] == 200 and undone == [{"a": 10}, {"a": 20}, {"a": 30}] and renamed == [{"a": 5}]
     checks["a CREATE OR REPLACE TABLE sent again with its job answers duplicate, its rows once"] = \
         first[0] == 200 and again[0] == 200 and isinstance(again[2], dict) and again[2].get("duplicate") is True and job_rows == [{"n": 3}]
-    # A published table replaced (`ddl::replace`, `write::create_table`): the new table takes the old one's folder, so Delta and
+    # A published table replaced (`replace::replace`, `write::create_table`): the new table takes the old one's folder, so Delta and
     # Iceberg readers find its copies where they were (no `pubr__2`), the same Delta log and Iceberg metadata go on, and the new
     # rows are read from both. Then the old table is UNDROPped beside the new one in that folder: publishing it there is refused.
     import open_check

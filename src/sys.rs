@@ -116,7 +116,7 @@ pub fn deleted(table: &str) -> String { format!("{table}$deleted") }
 pub fn hidden(table: &str) -> bool { table.contains('$') }
 
 /// The name a `CREATE OR REPLACE TABLE` builds its new table under while the statement runs, until
-/// `ddl::replace` puts it in the old one's place (`$`: a name no user gives, as with `deleted`). It
+/// `replace::replace` puts it in the old one's place (`$`: a name no user gives, as with `deleted`). It
 /// depends on the job, so a statement's retry finds the table its first try made.
 pub fn staged(table: &str, job: &str) -> String { format!("{table}$new-{}", &crate::users::sha256(job)[..8]) }
 
