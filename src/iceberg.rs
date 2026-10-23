@@ -205,7 +205,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if st.uuid.is_empty() {
         st.uuid = uuid::Uuid::new_v4().to_string();
     }
-    let (dir, now, mut v) = (format!("data/{}/metadata", meta.folder(table)), crate::log::now_ms(), st.version + 1);
+    let (dir, now, mut v) = (metadata_dir(meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
     // never overwritten, so this one takes the next number)
     while lake.store.head(&Path::from(format!("{dir}/v{v}.metadata.json"))).await.is_ok() {
@@ -328,6 +328,21 @@ fn forget(st: &mut Published) -> Vec<(Value, String)> {
     st.deleted.clear();
     st.since.clear();
     std::mem::take(&mut st.snapshots)
+}
+
+/// The metadata folder of a table's folder under `data/` (where its versions, snapshot lists and version hint are).
+fn metadata_dir(folder: &str) -> String { format!("data/{folder}/metadata") }
+
+/// `CREATE OR REPLACE TABLE` continues a table's Iceberg state under the new table, whose files are in the same folder: the
+/// same uuid and version, with its history let go as `forget` lets it go (the old schema's snapshots must not be read with the
+/// new one). Returns the state's bytes to record, and the objects of the snapshots let go (their metadata and manifest lists),
+/// which the caller deletes once its commit is in.
+pub fn reset(state: &[u8], folder: &str) -> Result<(Vec<u8>, Vec<String>)> {
+    let mut st: Published = serde_json::from_slice(state)?;
+    let dir = metadata_dir(folder);
+    let stale = forget(&mut st);
+    let objects: Vec<String> = stale.into_iter().flat_map(|(s, list)| [format!("{dir}/v{}.metadata.json", s["sequence-number"]), list]).collect();
+    Ok((json(&st), objects))
 }
 
 /// Whether a published table names a place other than this lake's (the lake was moved or copied: invariant
