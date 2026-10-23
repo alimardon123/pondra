@@ -339,7 +339,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
-                "delta" => (crate::read_delta::resolve(lake, &spec.urls[0], version("version")?).await?, None),
+                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, version("version")?).await?), None), // (a folder named relatively: from where the node runs)
                 _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
             };
             check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
@@ -511,10 +511,18 @@ pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::O
     Ok((lake.rt.object_store(&u)?, u.prefix().clone()))
 }
 
-/// An object's bytes (a log's commit, a manifest), through its store.
-pub async fn get(lake: &Lake, url: &str) -> Result<bytes::Bytes> {
-    let (store, path) = store(lake, url).await?;
-    Ok(object_store_df::ObjectStoreExt::get(&store, &path).await.with_context(|| format!("reading {url}"))?.bytes().await?)
+/// A node reads another engine's files through its lake's stores and its own session (`reach.rs`).
+impl crate::reach::Reach for Lake {
+    fn store(&self, url: &str) -> impl std::future::Future<Output = Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)>> + Send {
+        store(self, url)
+    }
+    fn session(&self) -> datafusion::prelude::SessionContext { Lake::session(self) }
+}
+
+/// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the
+/// catalog's own and empty).
+pub(crate) fn table_meta(found: crate::read_delta::Found) -> TableMeta {
+    TableMeta { columns: found.columns, names: found.names, files: found.files, ..Default::default() }
 }
 
 /// Whom a store `build` makes is for.

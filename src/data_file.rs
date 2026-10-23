@@ -1,10 +1,23 @@
 //! A table's data file as the catalog records it, and what reading it needs: its partition values,
 //! deletes and lineage. In the core because a page reads files too.
+use datafusion::arrow::datatypes::DataType;
+use datafusion::common::ScalarValue;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Column -> (min, max), as text parsed with the column's type.
 pub type Stats = BTreeMap<String, (String, String)>;
+
+/// A value as text that casts back to it exactly (timestamps as ISO 8601), or None for a null
+/// or a string too long to keep.
+pub fn text(v: &ScalarValue) -> Option<String> {
+    use datafusion::arrow::array::AsArray;
+    if v.is_null() {
+        return None;
+    }
+    let s = datafusion::arrow::compute::cast(&v.to_array().ok()?, &DataType::Utf8).ok()?;
+    Some(s.as_string::<i32>().value(0).to_string()).filter(|s| s.len() <= 64)
+}
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct DataFile {

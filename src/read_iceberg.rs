@@ -121,7 +121,7 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
     out.outside = Some(crate::scan::Table { field_ids: columns.iter().map(|(n, id, _)| (n.clone(), *id)).collect(), name_mapping: meta["properties"]["schema.name-mapping.default"].as_str().map(str::to_string) });
     let Some(snapshot) = snapshot(meta, options)? else { return Ok(out) }; // (no snapshot yet: no rows)
     let manifests: Vec<Value> = match snapshot["manifest-list"].as_str() {
-        Some(list) => crate::avro::records(&crate::ext::get(lake, &place(list)).await?)?,
+        Some(list) => crate::avro::records(&crate::reach::get(lake, &place(list)).await?)?,
         None => snapshot["manifests"].as_array().into_iter().flatten().map(|m| serde_json::json!({"manifest_path": m, "content": 0, "sequence_number": 0})).collect(), // (v1)
     };
     let mut reads = vec![];
@@ -198,7 +198,7 @@ async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
     if let Some(e) = MANIFESTS.lock().unwrap().get(&path).cloned() {
         return Ok(e);
     }
-    let e = Arc::new(crate::avro::records(&crate::ext::get(lake, &path).await?)?);
+    let e = Arc::new(crate::avro::records(&crate::reach::get(lake, &path).await?)?);
     MANIFESTS.lock().unwrap().put(path, e.clone());
     Ok(e)
 }
@@ -207,7 +207,7 @@ async fn manifest(lake: &Lake, path: String) -> Result<Arc<Vec<Value>>> {
 /// or the newest in `metadata/`.
 pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(String, Value)> {
     let read = |at: String| async move {
-        let b = crate::ext::get(lake, &at).await?;
+        let b = crate::reach::get(lake, &at).await?;
         let b = if at.ends_with(".gz") { let mut v = vec![]; std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&b[..]), &mut v)?; v.into() } else { b };
         anyhow::Ok((at, serde_json::from_slice::<Value>(&b)?))
     };
@@ -221,7 +221,7 @@ pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(
     let wanted = match version {
         Some(v) => Some(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?),
         None if listed.iter().any(|n| n == "version-hint.text") => {
-            let hint = String::from_utf8(crate::ext::get(lake, &format!("{url}/metadata/version-hint.text")).await?.to_vec())?;
+            let hint = String::from_utf8(crate::reach::get(lake, &format!("{url}/metadata/version-hint.text")).await?.to_vec())?;
             match hint.trim().parse::<i64>() {
                 Ok(v) => Some(v),
                 Err(_) => return read(format!("{url}/metadata/{}", hint.trim())).await,

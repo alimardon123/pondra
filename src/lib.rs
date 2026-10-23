@@ -40,6 +40,10 @@ mod optimize;
 mod data_file;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod scan;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
+mod reach;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
+mod read_delta;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
@@ -136,7 +140,6 @@ mod scan;
 #[cfg(feature = "server")] mod protect;
 #[cfg(feature = "server")] mod public;
 #[cfg(feature = "server")] mod query;
-#[cfg(feature = "server")] mod read_delta;
 #[cfg(feature = "server")] mod read_iceberg;
 #[cfg(feature = "server")] mod ranges;
 #[cfg(feature = "server")] mod pyfn;
