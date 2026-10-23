@@ -1,5 +1,5 @@
 //! Planning rules Pondra adds to DataFusion's, and the engine settings it starts from.
-use datafusion::arrow::datatypes::{i256, DataType, Field};
+use datafusion::arrow::datatypes::{i256, DataType, Field, Schema};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, NullEquality, Result, ScalarValue};
 use datafusion::logical_expr::utils::{can_hash, conjunction, disjunction, find_valid_equijoin_key_pair, split_binary, split_conjunction};
@@ -1100,6 +1100,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
+    rules.insert(end, Arc::new(AndsOnce)); // (last: the filters are where they will run)
     // (the hot columns are the node's)
     #[cfg(feature = "server")]
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
@@ -1337,6 +1338,96 @@ impl PhysicalOptimizerRule for MinMaxBounds {
 
     fn schema_check(&self) -> bool {
         true
+    }
+}
+
+/// A filter's plain conditions are ANDed right-deep, so DataFusion copies its batch once. An AND
+/// copies the rows its left side keeps when that is a fifth or fewer, and works the right side out on
+/// the copy. Left-deep, each level of ANDs can copy the whole batch; right-deep, only the first
+/// condition can. Only plain conditions move (they can't fail on any row and are cheap on a whole
+/// batch), so no error a row would raise shows up that the written order hid, and nothing costly runs
+/// on rows it didn't before. EXPLAIN's text is the same: `BinaryExpr`'s Display adds no parentheses
+/// for a right-nested AND.
+#[derive(Debug)]
+struct AndsOnce;
+
+impl PhysicalOptimizerRule for AndsOnce {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|p| {
+            let Some(f) = p.downcast_ref::<FilterExec>() else { return Ok(Transformed::no(p)) };
+            match right_deep_filter(f)? {
+                Some(new) => Ok(Transformed::yes(new)),
+                None => Ok(Transformed::no(p)),
+            }
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "ands_once"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// `f` with its conditions ANDed right-deep: when it has three or more, every one is plain, and they
+/// aren't ANDed right-deep already.
+fn right_deep_filter(f: &FilterExec) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+    use datafusion::physical_plan::filter::FilterExecBuilder;
+    let schema = f.input().schema();
+    let terms: Vec<Arc<dyn PhysicalExpr>> = datafusion::physical_expr::utils::split_conjunction(f.predicate()).into_iter().cloned().collect();
+    if terms.len() < 3 || !terms.iter().all(|t| plain(t, &schema)) || is_right_deep(f.predicate()) {
+        return Ok(None);
+    }
+    let predicate = ands_right(terms);
+    let new: Arc<dyn ExecutionPlan> = Arc::new(FilterExecBuilder::from(f).with_predicate(predicate).build()?);
+    Ok(Some(new))
+}
+
+/// A condition that can't fail on any row and is cheap on a whole batch: comparing two columns, or a
+/// column with a value of its type, NULL tests of a column, and a column's IN list of its type's values.
+fn plain(e: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    use datafusion::physical_expr::expressions::{BinaryExpr, InListExpr, IsNotNullExpr, IsNullExpr, Literal};
+    let column = |e: &Arc<dyn PhysicalExpr>| e.is::<PhysicalColumn>();
+    if let Some(b) = e.downcast_ref::<BinaryExpr>() {
+        let compares = matches!(b.op(), Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq);
+        let operand = |x: &Arc<dyn PhysicalExpr>| column(x) || x.is::<Literal>();
+        let both_values = b.left().is::<Literal>() && b.right().is::<Literal>();
+        let same_type = matches!((b.left().data_type(schema), b.right().data_type(schema)), (Ok(l), Ok(r)) if l == r);
+        return compares && operand(b.left()) && operand(b.right()) && !both_values && same_type;
+    }
+    if let Some(n) = e.downcast_ref::<IsNullExpr>() {
+        return column(n.arg());
+    }
+    if let Some(n) = e.downcast_ref::<IsNotNullExpr>() {
+        return column(n.arg());
+    }
+    if let Some(l) = e.downcast_ref::<InListExpr>() {
+        let Ok(t) = l.expr().data_type(schema) else { return false };
+        return column(l.expr()) && l.list().iter().all(|v| v.downcast_ref::<Literal>().is_some_and(|v| v.value().data_type() == t));
+    }
+    false
+}
+
+/// `t1 AND (t2 AND (… AND tn))` for the terms in the order they were written.
+fn ands_right(terms: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    terms
+        .into_iter()
+        .rev()
+        .reduce(|right, left| -> Arc<dyn PhysicalExpr> { Arc::new(BinaryExpr::new(left, Operator::And, right)) })
+        .expect("at least one term")
+}
+
+/// Whether every AND's left side is a condition, not an AND: `t1 AND (t2 AND …)`.
+fn is_right_deep(e: &Arc<dyn PhysicalExpr>) -> bool {
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    let is_and = |e: &Arc<dyn PhysicalExpr>| e.downcast_ref::<BinaryExpr>().is_some_and(|b| *b.op() == Operator::And);
+    match e.downcast_ref::<BinaryExpr>() {
+        Some(b) if *b.op() == Operator::And => !is_and(b.left()) && is_right_deep(b.right()),
+        _ => true,
     }
 }
 
@@ -2631,6 +2722,82 @@ mod tests {
             ("SELECT 2.5e3", "2500"),
         ] {
             assert_eq!(first(&ctx, sql).await, want, "{sql}");
+        }
+    }
+
+    /// The first filter's predicate in a physical plan, found by walking its inputs.
+    fn predicate_of(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn PhysicalExpr>> {
+        match plan.downcast_ref::<FilterExec>() {
+            Some(f) => Some(f.predicate().clone()),
+            None => plan.children().into_iter().find_map(predicate_of),
+        }
+    }
+
+    /// How many conditions a predicate has, when it is a right-deep AND chain (`t1 AND (t2 AND …)`).
+    fn right_chain(e: &Arc<dyn PhysicalExpr>) -> Option<usize> {
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        let Some(b) = e.downcast_ref::<BinaryExpr>().filter(|b| *b.op() == Operator::And) else { return Some(1) };
+        if b.left().downcast_ref::<BinaryExpr>().is_some_and(|l| *l.op() == Operator::And) {
+            return None;
+        }
+        Some(right_chain(b.right())? + 1)
+    }
+
+    /// A physical plan's rows, as the batches print them.
+    async fn rows_of(ctx: &datafusion::prelude::SessionContext, plan: Arc<dyn ExecutionPlan>) -> String {
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches).unwrap().to_string()
+    }
+
+    /// A query's physical plan, and that plan after `AndsOnce`.
+    async fn ands_once_of(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (Arc<dyn ExecutionPlan>, Arc<dyn ExecutionPlan>) {
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let out = AndsOnce.optimize(plan.clone(), &ConfigOptions::default()).unwrap();
+        (plan, out)
+    }
+
+    /// A filter whose conditions are all plain is ANDed right-deep (`AndsOnce`), with the same text and
+    /// rows; one with a condition that isn't plain (arithmetic, LIKE) or with two conditions is left as it is.
+    #[tokio::test]
+    async fn plain_conditions_are_anded_right_deep() {
+        use datafusion::arrow::array::{ArrayRef, Date32Array, Decimal128Array, Int32Array, RecordBatch, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let t = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("d", DataType::Date32, false),
+                Field::new("p", DataType::Decimal128(15, 2), false),
+                Field::new("s", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from((0..20).collect::<Vec<i32>>())) as ArrayRef,
+                // (days since 1970: 19,783 is 2024-03-01, so the dates fall on both sides of it)
+                Arc::new(Date32Array::from((0..20).map(|i| 19_700 + 9 * i).collect::<Vec<i32>>())),
+                Arc::new(Decimal128Array::from((0..20i128).map(|i| Some(i * 37 - 150)).collect::<Vec<_>>()).with_precision_and_scale(15, 2).unwrap()),
+                Arc::new(StringArray::from((0..20).map(|i: i32| (i % 3 != 0).then(|| if i % 2 == 0 { "x" } else { "y" })).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let ctx = session();
+        ctx.register_batch("t", t).unwrap();
+        for (sql, terms) in [
+            ("SELECT * FROM t WHERE a >= 2 AND a < 15 AND p > 1.00 AND s IS NOT NULL AND d < DATE '2024-03-01'", 5),
+            ("SELECT * FROM t WHERE a IN (1, 3, 5, 7) AND s = 'x' AND a <> 4", 3), // (a list of three or fewer becomes ORs)
+        ] {
+            let (plan, out) = ands_once_of(&ctx, sql).await;
+            let (before, after) = (predicate_of(&plan).unwrap(), predicate_of(&out).unwrap());
+            assert!(!Arc::ptr_eq(&before, &after), "{sql}: changed");
+            assert_eq!(right_chain(&after), Some(terms), "{sql}: {after}");
+            assert_eq!(after.to_string(), before.to_string(), "{sql}");
+            assert_eq!(rows_of(&ctx, out).await, rows_of(&ctx, plan).await, "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE a > 1 AND a / 2 > 3 AND p > 0",
+            "SELECT * FROM t WHERE a > 1 AND s LIKE 'x%' AND p > 0",
+            "SELECT * FROM t WHERE a > 1 AND p > 0",
+        ] {
+            let (plan, out) = ands_once_of(&ctx, sql).await;
+            assert!(Arc::ptr_eq(&predicate_of(&plan).unwrap(), &predicate_of(&out).unwrap()), "{sql}: left as it is");
         }
     }
 }
