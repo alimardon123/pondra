@@ -788,57 +788,16 @@ fn read_whole(json: &str) -> Option<Node<'_>> {
     Some(node)
 }
 
-/// Why `json` isn't JSON as Postgres's `json` takes it, as Postgres's SQLSTATE: 22P02 for text that isn't JSON, 54001 past
-/// `MAX_DEPTH` levels; None when it is. Every check of a document (a write, `is_json`) asks it. serde's reader goes first:
-/// it is the faster walk, and it takes what Postgres's `json` takes, a lone surrogate's escape too (which only `jsonb`
-/// and the functions that read the text refuse, as Postgres's do). What serde refuses, the walk below judges as `read`
-/// reads: serde stops at 128 levels, and the functions read to `MAX_DEPTH`. The walk stops at the level it refuses, so
-/// a deep text costs no more than `MAX_DEPTH` levels of recursion.
+/// Why `json` isn't JSON as Postgres's `json` takes it, as Postgres's SQLSTATE: 54001 past `MAX_DEPTH` levels, judged
+/// first as `parse` judges it (`depth_check`), so every check of a document (a write, `is_json`) takes the levels the
+/// functions read; then 22P02 for text that isn't JSON, by serde's reader, the faster walk, which takes any depth and
+/// what Postgres's `json` takes, a lone surrogate's escape too (only `jsonb` and reading the text refuse it, as
+/// Postgres's do). None when it is JSON.
 pub(crate) fn refused(json: &str) -> Option<&'static str> {
-    if serde_json::from_str::<serde::de::IgnoredAny>(json).is_ok() {
-        return None;
+    if depth_check(json).is_err() {
+        return Some("54001");
     }
-    let mut jiter = Jiter::new(json.as_bytes());
-    let outcome = jiter.peek().map_err(|_| "22P02").and_then(|peek| skip(&mut jiter, peek, 1)).and_then(|()| jiter.finish().map_err(|_| "22P02"));
-    outcome.err()
-}
-
-/// Skips the value at the reader's place, whose first byte is `peek`, as `read` reads it, the value being at nesting
-/// `depth` (the outermost array or object is 1). Past `MAX_DEPTH` levels it is 54001, counted as `depth_check` counts
-/// them; anything jiter refuses is 22P02. It reads texts and keys as bytes: jiter checks their escapes as `read`'s
-/// calls do and only leaves out the check that they are UTF-8, which a `&str` already is, so it accepts exactly what
-/// `read` accepts, with nothing built or copied.
-fn skip(jiter: &mut Jiter, peek: Peek, depth: usize) -> Result<(), &'static str> {
-    let not_json = |_| "22P02";
-    if peek == Peek::Null {
-        jiter.known_null().map_err(not_json)?;
-    } else if peek == Peek::True || peek == Peek::False {
-        jiter.known_bool(peek).map_err(not_json)?;
-    } else if peek == Peek::String {
-        jiter.known_bytes().map_err(not_json)?;
-    } else if peek == Peek::Array || peek == Peek::Object {
-        if depth > MAX_DEPTH {
-            return Err("54001");
-        }
-        if peek == Peek::Array {
-            let mut next = jiter.known_array().map_err(not_json)?;
-            while let Some(peek) = next {
-                skip(jiter, peek, depth + 1)?;
-                next = jiter.array_step().map_err(not_json)?;
-            }
-        } else {
-            // (a key borrows the reader, so whether one came is kept as a flag, not the key)
-            let mut more = jiter.next_object_bytes().map_err(not_json)?.is_some();
-            while more {
-                let peek = jiter.peek().map_err(not_json)?;
-                skip(jiter, peek, depth + 1)?;
-                more = jiter.next_key_bytes().map_err(not_json)?.is_some();
-            }
-        }
-    } else {
-        jiter.known_number_bytes(peek).map_err(not_json)?;
-    }
-    Ok(())
+    serde_json::from_str::<serde::de::IgnoredAny>(json).is_err().then_some("22P02")
 }
 
 /// Refuses a document nested past `MAX_DEPTH` levels, before anything is read: a bracket inside a string doesn't count,
@@ -1220,10 +1179,10 @@ mod tests {
                 assert_eq!(jsonb_text(&nested(MAX_DEPTH)).unwrap(), nested(MAX_DEPTH));
                 let refused = jsonb_text(&nested(MAX_DEPTH + 1)).unwrap_err();
                 assert_eq!(crate::codes::of(&anyhow::Error::new(refused)), "54001");
-                // (a write's check takes the same levels: `skip` recurses once per level, on a node's stack too)
+                // (a write's check takes the levels the functions read)
                 assert_eq!(super::refused(&nested(MAX_DEPTH)), None);
                 assert_eq!(super::refused(&nested(MAX_DEPTH + 1)), Some("54001"));
-                // (the walk stops at MAX_DEPTH + 1 levels, so a million open brackets never recurse a million deep)
+                // (a million open brackets are refused before anything is read)
                 assert_eq!(super::refused(&"[".repeat(1_000_000)), Some("54001"));
             })
             .unwrap()
