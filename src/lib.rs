@@ -132,6 +132,7 @@ mod optimize;
 #[cfg(feature = "server")] mod pg_names;
 #[cfg(feature = "server")] mod pg_types;
 #[cfg(feature = "server")] mod pg_values;
+#[cfg(feature = "server")] mod pg_copy;
 #[cfg(feature = "server")] mod literals;
 #[cfg(feature = "server")] mod ci;
 #[cfg(feature = "server")] mod project;

@@ -135,11 +135,15 @@ fn digits(bytes: &[u8]) -> String {
 }
 
 /// The bytes as UTF-8 text, or Postgres's 22021 naming them (`convert_from`, and text from the Postgres port).
-pub fn utf8(bytes: &[u8]) -> Result<String, Bad> {
+pub fn utf8(bytes: &[u8]) -> Result<String, Bad> { checked_utf8(bytes).map(str::to_string) }
+
+/// `bytes` as text Postgres takes: UTF-8 with no NUL, refused as Postgres words it (22021, `invalid_at`). It
+/// borrows, so a 32 MB COPY is checked without a copy.
+pub fn checked_utf8(bytes: &[u8]) -> Result<&str, Bad> {
     // NUL is valid UTF-8 but not in Postgres's text, so the first NUL ends the text.
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     match std::str::from_utf8(&bytes[..nul]) {
-        Ok(text) if nul == bytes.len() => Ok(text.to_string()),
+        Ok(text) if nul == bytes.len() => Ok(text),
         Ok(_) => Err(invalid_at(bytes, nul)),
         Err(e) => Err(invalid_at(bytes, e.valid_up_to())),
     }

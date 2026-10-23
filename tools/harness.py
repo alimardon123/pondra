@@ -4700,7 +4700,9 @@ def copies():
     """COPY over the Postgres protocol (ADR-021): `COPY … FROM STDIN` loads text (psycopg's
     write_row, NULLs included) and CSV with a header and quoted commas; `COPY … TO STDOUT` sends
     text, CSV and binary, each read back as the rows went in; the ADBC Postgres driver, which reads
-    every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow."""
+    every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
+    the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
+    in text and CSV; COPY TO piped back gives the rows."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
     lake, pg = new_lake(), A.port + 10
     node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
@@ -4744,13 +4746,46 @@ def copies():
     with adbc.connect(f"postgresql://u@127.0.0.1:{pg}/lake") as c, c.cursor() as cur:
         cur.execute("SELECT id, name, amount FROM ev ORDER BY id")
         arrow = cur.fetch_arrow_table()
+    # COPY FROM reads the text format as Postgres 16 does: escapes, octal and hex, an escaped delimiter, and bytea
+    # in text and CSV. What COPY TO writes, piped back into COPY FROM, gives the same rows. The data are copied as written.
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        cur.execute("CREATE TABLE cx (id INT, v BYTEA, s TEXT)")
+        cur.execute("CREATE TABLE cy (id INT, v BYTEA, s TEXT)")
+        with cur.copy("COPY cx FROM STDIN") as cp:
+            cp.write("1\t\\\\x01ff\ta\\|b\\101\\x41\\q\n3\t\\\\101\t\\N\n")
+        with cur.copy("COPY cx FROM STDIN WITH (DELIMITER '|')") as cp:
+            cp.write("7|\\\\x00|x\\|y\n")
+        with cur.copy("COPY cx FROM STDIN WITH (FORMAT csv)") as cp:
+            cp.write("8,\\x0a0b,plain\n")
+        read = "SELECT id, encode(v, 'hex') AS h, s FROM {} ORDER BY id"
+        text_rows = c.execute(read.format("cx")).fetchall()
+        with cur.copy("COPY cx TO STDOUT") as cp:
+            dumped = b"".join(cp)
+        with cur.copy("COPY cy FROM STDIN") as cp:
+            cp.write(dumped)
+        piped = c.execute(read.format("cy")).fetchall()
+        # each of these is refused with its code, and writes nothing
+        text_refusals = []
+        for copy_sql, data in [("COPY cx FROM STDIN", "2\tab\\\\c\tz\n"), ("COPY cx FROM STDIN", "2\t\\x80\tz\n"),
+                               ("COPY cx FROM STDIN", "2\t\\\\x01\n"), ("COPY cx FROM STDIN WITH (DELIMITER 'é')", "2\tz\n")]:
+            try:
+                with cur.copy(copy_sql) as cp:
+                    cp.write(data)
+                text_refusals.append("accepted")
+            except psycopg.Error as e:
+                text_refusals.append(e.sqlstate)
+        kept_text = c.execute("SELECT count(*) FROM cx").fetchone()[0]
+    text_ok = (text_rows == [(1, "01ff", "a|bAAq"), (3, "41", None), (7, "00", "x|y"), (8, "0a0b", "plain")]
+               and piped == text_rows and text_refusals == ["22P02", "22021", "22P04", "0A000"] and kept_text == 4)
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM a line of another width (22P04) or a value that isn't its type (22P02): refused, nothing written":
                   refused == {"one field too many": "22P04", "one field short": "22P04", "not a number": "22P02"} and kept == 2000,
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
-              "DECIMAL as NUMERIC, text and binary": numeric_ok}
+              "DECIMAL as NUMERIC, text and binary": numeric_ok,
+              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok}
     out = {"passed": all(checks.values()), "checks": checks}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
