@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // The page form's module (web/, designs/l2-b4-web.md) in Node: each request's status, headers and body checked against
 // what a node answers (ADR-061's contract: files are files, tables are made by SQL, the routes mean what a node's mean).
-// `node tools/web_check.mjs [--pkg web/pkg] [--sizes]`; one JSON line, exit 1 on a failure.
-import { readFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+// `node tools/web_check.mjs [--pkg web/pkg] [--sizes] [--lake web/lake]`; one JSON line, exit 1 on a failure. The lake's
+// checks run when its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a
+// web server that lists nothing, each read compared with the node's own answer for the same bytes.
+import { createHash } from 'node:crypto';
+import { readFile, stat } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
 
@@ -11,6 +15,9 @@ const args = process.argv.slice(2);
 const pkg = args.includes('--pkg')
   ? resolve(args[args.indexOf('--pkg') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/pkg');
+const lake = args.includes('--lake')
+  ? resolve(args[args.indexOf('--lake') + 1])
+  : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
 
 const { default: init, Page } = await import(pathToFileURL(join(pkg, 'pondra_web.js')).href);
@@ -33,12 +40,15 @@ let passed = 0;
 const report = {};
 
 // Judges one answer: its status, its SQLSTATE (null: none), its content type, its quoted etag, its body text, or what
-// `json` says of its body (a list of problems, none when it is right). A failure names the check and what came back.
+// `json` says of its body (a list of problems, none when it is right); `error` wants any status of 400 or more, and `says`
+// a text the body holds. A failure names the check and what came back.
 function judge(name, answer, want = {}) {
   const why = [];
   const headers = answer.headers ?? {};
   const text = dec.decode(answer.body);
   if (want.status !== undefined && answer.status !== want.status) why.push(`status ${answer.status}`);
+  if (want.error && !(answer.status >= 400)) why.push(`status ${answer.status}, not an error`);
+  if (want.says !== undefined && !text.includes(want.says)) why.push(`body ${JSON.stringify(text)}`);
   const sqlstate = headers['x-pondra-sqlstate'] ?? null;
   if (want.sqlstate !== undefined && sqlstate !== want.sqlstate) why.push(`sqlstate ${sqlstate}`);
   if (!headers['content-type']) why.push('no content-type');
@@ -202,6 +212,123 @@ const series = await ask('generate_series of 10M rows', 'POST', '/sql?format=csv
 const series_10m_ms = Number((performance.now() - t1).toFixed(1));
 if (series) judge('generate_series of 10M rows', series, { status: 200, sqlstate: null, out: 'count(*),sum(t.x)\n10000000,50000005000000\n' });
 
+// A web server over a folder, as a bucket's public address is: files by their bytes (GET, HEAD, a Range), and nothing
+// listed (a folder, a path ending in `/`, a name not there: 404). It counts the requests it answers.
+async function serveFolder(root) {
+  const started = new Date().toUTCString();
+  let served = 0;
+  const server = createServer(async (req, res) => {
+    served++;
+    try {
+      await answerFile(root, started, req, res);
+    } catch (e) {
+      reply(req, res, { status: 500, body: enc.encode(String(e)), modified: started });
+    }
+  });
+  await new Promise((listening) => server.listen(0, '127.0.0.1', listening));
+  return { server, port: server.address().port, served: () => served };
+}
+
+// One request: a file's bytes, or the Range of them; anything that is not a file is 404 (405 for a method but GET and HEAD).
+async function answerFile(root, started, req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    return reply(req, res, { status: 405, body: enc.encode('only GET and HEAD'), modified: started, headers: { Allow: 'GET, HEAD' } });
+  }
+  const path = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname);
+  const file = resolve(root, `.${path}`);
+  const info = path.endsWith('/') || !file.startsWith(root + sep) ? null : await stat(file).catch(() => null);
+  if (!info?.isFile()) return reply(req, res, { status: 404, body: enc.encode('not found'), modified: started });
+  const body = await readFile(file);
+  const etag = `"${createHash('sha256').update(body).digest('hex').slice(0, 32)}"`; // (the whole file's: a Range keeps it)
+  const modified = info.mtime.toUTCString();
+  const type = typeOf(basename(file));
+  const range = rangeOf(req.headers.range, body.length);
+  if (range === 'unsatisfiable') {
+    return reply(req, res, { status: 416, body: new Uint8Array(0), etag, modified, headers: { 'Content-Range': `bytes */${body.length}` } });
+  }
+  if (!range) return reply(req, res, { status: 200, type, body, etag, modified });
+  return reply(req, res, {
+    status: 206, type, body: body.subarray(range.start, range.end + 1), etag, modified,
+    headers: { 'Content-Range': `bytes ${range.start}-${range.end}/${body.length}` },
+  });
+}
+
+// Writes one answer with the headers every answer carries: its length, its etag (a file's, else its body's) and when it
+// last changed. A HEAD gets those headers and no body.
+function reply(req, res, { status, type = TEXT, body, etag, modified, headers = {} }) {
+  const tag = etag ?? `"${createHash('sha256').update(body).digest('hex').slice(0, 32)}"`;
+  res.writeHead(status, {
+    'Content-Type': type, 'Content-Length': body.length, ETag: tag, 'Last-Modified': modified, 'Accept-Ranges': 'bytes', ...headers,
+  });
+  res.end(req.method === 'HEAD' ? undefined : body);
+}
+
+// A file's content type by its name (`_last_checkpoint` is JSON too).
+function typeOf(name) {
+  if (name === '_last_checkpoint') return JSON_TYPE;
+  const types = { '.json': JSON_TYPE, '.parquet': 'application/vnd.apache.parquet', '.csv': 'text/csv; charset=utf-8' };
+  return types[extname(name)] ?? 'application/octet-stream';
+}
+
+// The bytes a Range header asks for, as {start, end}: `bytes=a-b`, `bytes=a-` (to the end) and `bytes=-n` (the last n).
+// 'unsatisfiable' when it starts past the end, or asks for no bytes (416). Anything else is ignored and the file is
+// answered whole, as RFC 9110 lets a server do with a range it does not do.
+function rangeOf(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header ?? '');
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  if (m[1] === '') {
+    const n = Number(m[2]);
+    return n === 0 || size === 0 ? 'unsatisfiable' : { start: Math.max(0, size - n), end: size - 1 };
+  }
+  const start = Number(m[1]);
+  if (m[2] !== '' && Number(m[2]) < start) return null; // (syntactically invalid: ignored)
+  if (start >= size) return 'unsatisfiable';
+  return { start, end: m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1) };
+}
+
+// The lake's checks: the page reads a node's published Delta table over a web server that lists nothing, and each read is
+// the node's own answer for the same bytes (expected.json). The latest version is read first: the page keeps what it
+// read, and `Object.keys` would put "0", "1", ... first.
+async function lakeChecks(dir) {
+  let expected;
+  try {
+    expected = JSON.parse(await readFile(join(dir, 'expected.json'), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+  const web = await serveFolder(dir);
+  const at = `http://127.0.0.1:${web.port}/orders`;
+  const { versions, file } = expected;
+  const order = ['latest', ...Object.keys(versions).filter((k) => k !== 'latest')];
+  let latest_requests = 0;
+  for (const key of order) {
+    const from = web.served();
+    const clause = key === 'latest' ? '' : `, version => ${key}`;
+    const answer = await ask(`lake ${key}`, 'POST', '/sql?format=csv', undefined, `SELECT * FROM read_delta('${at}'${clause}) ORDER BY id`);
+    if (key === 'latest') latest_requests = web.served() - from;
+    const want = versions[key];
+    if (answer) judge(`lake ${key}`, answer, typeof want === 'string' ? { status: 200, sqlstate: null, out: want } : { error: true });
+  }
+  const counted = await ask('lake file', 'POST', '/sql?format=csv', undefined, `SELECT count(*) AS n FROM '${at}/${file.name}'`);
+  if (counted) judge('lake file', counted, { status: 200, sqlstate: null, out: file.out });
+  const refusals = [
+    ['lake read_delta of /none', `SELECT * FROM read_delta('http://127.0.0.1:${web.port}/none')`, { error: true, says: 'no Delta table there' }],
+    ['lake read_parquet of a folder', `SELECT * FROM read_parquet('${at}/')`, { status: 501, sqlstate: '0A000' }],
+    ['lake a file not there', `SELECT * FROM '${at}/nope.parquet'`, { status: 404, sqlstate: '42P01' }],
+    ['lake read_delta with nothing listening', "SELECT * FROM read_delta('http://127.0.0.1:1/x')", { status: 503, sqlstate: '58030' }],
+  ];
+  for (const [name, text, want] of refusals) {
+    const answer = await ask(name, 'POST', '/sql?format=csv', undefined, text);
+    if (answer) judge(name, answer, want);
+  }
+  report.lake_versions = order.length - 1;
+  report.lake_requests = latest_requests;
+  web.server.closeAllConnections(); // (Node waits for kept-alive sockets otherwise)
+  await new Promise((closed) => web.server.close(closed));
+}
+
+await lakeChecks(lake);
 const result = { ok: failed.length === 0, checks: passed, failed, open_ms, series_10m_ms, wasm_bytes: wasm.length, ...report };
 if (sizes) {
   result.gzip_bytes = gzipSync(wasm, { level: 9 }).length;
