@@ -863,7 +863,7 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_
         ensure!(if_exists, "no table {name}");
         return Ok(j!({"table": name, "dropped": false}));
     };
-    table_only(lake, name).await?;
+    table_only(lake, name, "dropped").await?;
     let readers = readers(lake, name).await?;
     if !readers.is_empty() {
         // (CASCADE drops views only: with a task among the readers, it would refuse too)
@@ -889,13 +889,40 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_
     Ok(left_shares(j!({"table": name, "dropped": true}), from))
 }
 
-/// What a table's own statements leave alone: a materialized view's table or part of one (its `_final`, its open table), and
-/// a table a topic feeds (`feeds::feed_key`: a feed has no view of its own, so a drop missed it before).
-async fn table_only(lake: &Lake, name: &str) -> Result<()> {
+/// What a statement on a table leaves alone, for `doing` (the verb its refusal names: "dropped", "renamed", "swapped",
+/// "replaced"): a materialized view's own table, its `_final` part, its open table, and a table a topic feeds
+/// (`feeds::feed_key`: a feed has no view of its own, so a drop missed it before). Drop, rename, swap and replace all call it.
+async fn table_only(lake: &Lake, name: &str, doing: &str) -> Result<()> {
     let owner = name.strip_suffix("_final").unwrap_or(name);
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
-    ensure!(lake.cat.get::<Value>(&crate::feeds::feed_key(name)).await?.is_none(), "{name} is fed by a topic: DROP MATERIALIZED VIEW {name}");
+    let open = crate::once::open(name);
+    for (key, view) in [(name, name), (owner, owner), (open.as_str(), name)] {
+        if lake.cat.get::<Value>(&crate::views::view_key(key)).await?.is_some() {
+            bail!(kept_by(name, view, doing));
+        }
+    }
+    ensure!(lake.cat.get::<Value>(&crate::feeds::feed_key(name)).await?.is_none(), "{name} is fed by a topic, so it can't be {doing}: DROP MATERIALIZED VIEW {name}");
+    Ok(())
+}
+
+/// The refusal for a table that materialized view `view` keeps: `name` is the view's own table, or its `_final` part. A rename
+/// is said to be done by dropping the view and creating it under the new name; the other statements say `DROP MATERIALIZED VIEW`.
+fn kept_by(name: &str, view: &str, doing: &str) -> String {
+    let hint = match doing {
+        "renamed" => "DROP it, and CREATE it under the new name".to_string(),
+        _ => format!("DROP MATERIALIZED VIEW {view}"),
+    };
+    let what = match name == view {
+        true => "a materialized view".to_string(),
+        false => format!("part of materialized view {view}"),
+    };
+    format!("{name} is {what}, so it can't be {doing}: {hint}")
+}
+
+/// Refused while a table has followers: a materialized view or a task that reads it (`readers`, but not a stored view, which
+/// reads a table by name). `why` says what the followers keep, as the refusal words it.
+async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<()> {
+    let followers: Vec<String> = readers(lake, name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
+    ensure!(followers.is_empty(), "{name} is followed by {}: {why}, so drop them first", followers.join(", "));
     Ok(())
 }
 
@@ -1064,13 +1091,10 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
         lake.cat.commit(vec![(query_key(&to), json(&v))], &[query_key(&name)]).await?;
         return Ok(j!({"view": name, "renamed": to}));
     }
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view: they aren't renamed yet (DROP it, and CREATE it under the new name)");
-    let owner = name.strip_suffix("_final").unwrap_or(&name);
-    ensure!(!crate::sys::hidden(&name) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is part of materialized view {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(&name))).await?.is_none(), "{name} is a materialized view: they aren't renamed yet (DROP it, and CREATE it under the new name)");
+    table_only(lake, &name, "renamed").await?;
+    ensure!(!crate::sys::hidden(&name), "{name} is written by Pondra alone");
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some(), "no table or view {name}");
-    let followers: Vec<String> = readers(lake, &name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{name} is followed by {}: they follow it by name, so drop them first", followers.join(", "));
+    no_followers(lake, &name, "they follow it by name").await?;
     // Its rows in the log go to files, so none is left under the old name; its changed rows' old
     // versions (`{name}$deleted`) too, or they would show again. Appends wait meanwhile, then go to
     // whatever has the name, or are refused if nothing does.
@@ -1132,14 +1156,11 @@ async fn swap(lake: &Lake, name: &str, with: &str) -> Result<Value> {
 /// that nothing keeps rows derived from, and that no other engine reads or a share hands out.
 async fn swappable(lake: &Lake, n: &str) -> Result<()> {
     ensure!(lake.cat.get::<StoredView>(&query_key(n)).await?.is_none(), "{n} is a view: a swap exchanges two tables (CREATE OR REPLACE VIEW changes a view)");
-    let owner = n.strip_suffix("_final").unwrap_or(n);
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(n)).await?.is_none(), "{n} is a materialized view: they aren't swapped");
-    ensure!(!crate::sys::hidden(n) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{n} is part of materialized view {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(n))).await?.is_none(), "{n} is a materialized view: they aren't swapped");
+    table_only(lake, n, "swapped").await?;
+    ensure!(!crate::sys::hidden(n), "{n} is written by Pondra alone");
     let meta = lake.cat.get::<TableMeta>(&table_key(n)).await?.ok_or_else(|| anyhow::anyhow!("no table {n}"))?;
     // (a stored view reads by name, so it keeps working after a swap; what keeps rows derived from the table does not)
-    let followers: Vec<String> = readers(lake, n).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{n} is followed by {}: they keep rows derived from what it holds, so drop them first", followers.join(", "));
+    no_followers(lake, n, "they keep rows derived from what it holds").await?;
     // (a share publishes its table as Delta, so its share is named before its publishing)
     if let Some((s, _)) = crate::shares::shares(lake).await?.into_iter().find(|(_, s)| s.tables.iter().any(|x| x.table == n)) {
         bail!("{n} is in share {s}: its recipients read its files by name");
@@ -1158,6 +1179,11 @@ async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
+/// The largest `tiered` mark of the entries given (0 if none): the entries that move together take it (see `exchange`).
+fn mark<'a>(metas: impl IntoIterator<Item = Option<&'a TableMeta>>) -> u64 {
+    metas.into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0)
+}
+
 /// The swap itself, in one commit (leader), the four tables' rows all in files and their appends held
 /// (`still`). Each name takes the other's entry, and its `$deleted` entry (or none, when the other had
 /// none), keeping the folder it had. Every moved entry takes the largest of the four `tiered` marks: a
@@ -1167,7 +1193,7 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
     let (da, db) = (crate::sys::deleted(a), crate::sys::deleted(b));
     let (ea, eb) = (lake.cat.get::<TableMeta>(&table_key(a)).await?, lake.cat.get::<TableMeta>(&table_key(b)).await?);
     let (eda, edb) = (lake.cat.get::<TableMeta>(&table_key(&da)).await?, lake.cat.get::<TableMeta>(&table_key(&db)).await?);
-    let mark = [&ea, &eb, &eda, &edb].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
+    let mark = mark([ea.as_ref(), eb.as_ref(), eda.as_ref(), edb.as_ref()]);
     let (mut puts, mut gone) = (vec![], vec![]);
     for (to, from, from_name) in [(a, eb, b), (b, ea, a), (&da[..], edb, &db[..]), (&db[..], eda, &da[..])] {
         match from {
@@ -1187,11 +1213,9 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
 /// those first). Stored views read a table by name, so they keep working, as after a rename.
 pub(crate) async fn replaceable(lake: &Lake, name: &str) -> Result<()> {
     ensure!(lake.cat.get::<StoredView>(&query_key(name)).await?.is_none(), "{name} is a view: CREATE OR REPLACE VIEW changes a view");
-    table_only(lake, name).await?;
+    table_only(lake, name, "replaced").await?;
     ensure!(!crate::sys::hidden(name), "{name} is written by Pondra alone");
-    let followers: Vec<String> = readers(lake, name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{name} is followed by {}: they keep rows derived from what it holds, so drop them first", followers.join(", "));
-    Ok(())
+    no_followers(lake, name, "they keep rows derived from what it holds").await
 }
 
 /// `CREATE OR REPLACE TABLE`'s last step (leader, under the lock): the staged table, filled, takes `name`'s place in one commit.
@@ -1229,7 +1253,7 @@ async fn replace(lake: &Lake, name: &str, staged: &str) -> Result<Value> {
     if !new.publish.is_empty() {
         publishes_alone(lake, name, &folder, &[name, staged]).await?;
     }
-    let mark = [old.as_ref(), old_del.as_ref(), new_del.as_ref(), Some(&new)].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
+    let mark = mark([old.as_ref(), old_del.as_ref(), new_del.as_ref(), Some(&new)]);
     let (at, now) = (lake.visible(), crate::log::now_ms());
     let kept = old.as_ref().is_some_and(|m| keeps(name, m, false));
     let (mut puts, shares) = match &old {
