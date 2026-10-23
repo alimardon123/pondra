@@ -161,11 +161,15 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         None => {
             crate::ddl::unclaimed(lake, owner).await?;
             // (a renamed table may still have this name's folder; a staged table's folder is its table's name, unless taken)
-            let folder = match lake.cat.get::<TableMeta>(&table_key(owner)).await? {
-                // (a staged table replacing a live one takes that table's folder: its new files go beside the old one's (uuid
-                // names), so the published copies stay where other engines read them)
-                Some(old) if owner != name.as_str() => Some(old.folder(owner).to_string()),
-                _ => crate::ddl::free_folder(lake, owner).await?.or_else(|| (owner != name.as_str()).then(|| owner.to_string())),
+            // (a staged table replacing a live one takes that table's folder: its new files go beside the old one's (uuid
+            // names), so the published copies stay where other engines read them)
+            let live = match owner != name.as_str() {
+                true => lake.cat.get::<TableMeta>(&table_key(owner)).await?,
+                false => None,
+            };
+            let folder = match live {
+                Some(old) => Some(old.folder(owner).to_string()),
+                None => crate::ddl::free_folder(lake, owner).await?.or_else(|| (owner != name.as_str()).then(|| owner.to_string())),
             };
             let mut identity = identity;
             for (c, i) in identity.iter_mut() {
@@ -193,12 +197,8 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
-            // (a folder a live table uses too: other engines would read that table's files as this one's; `ALTER TABLE … RENAME` keeps a folder)
             if publish.iter().flatten().any(|f| !m.publish.contains(f)) {
-                let users = crate::ddl::folder_users(lake).await?;
-                if let Some((other, _)) = users.get(m.folder(name)).and_then(|u| u.iter().find(|(o, kept)| !kept && o != name)) {
-                    bail!("{name} can't be published: {other} is a live table in its folder ({}), and other engines would read it as {name}", m.folder(name));
-                }
+                crate::ddl::publishes_alone(lake, name, m.folder(name), &[name]).await?;
             }
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);

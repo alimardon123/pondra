@@ -186,7 +186,7 @@ impl Layout {
 pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&Named<'_>>) -> Result<Option<(String, Vec<u8>)>> {
     let Some(fields) = fields(meta) else { return Ok(None) }; // a type Iceberg can't carry
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
-    let key = format!("i/{table}");
+    let key = crate::delta::state_key(table, "iceberg");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
     let here = lake.full(&format!("data/{}", meta.folder(table)));
     let moved = !st.location.is_empty() && st.location.trim_end_matches('/') != here.trim_end_matches('/');
@@ -290,9 +290,8 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if inline_changed {
         st.dropped.extend([st.inline.take(), st.inline_deleting.take()].into_iter().flatten().map(|a| (v, a.path)));
     }
-    for (s, list) in &gone {
-        lake.delete(&format!("{dir}/v{}.metadata.json", s["sequence-number"])).await;
-        lake.delete(list).await;
+    for object in snapshot_objects(&dir, &gone) {
+        lake.delete(&object).await;
     }
     let oldest = st.snapshots.first().map_or(v, |(s, _)| s["sequence-number"].as_u64().unwrap_or(v));
     for (_, path) in st.dropped.iter().filter(|(at, _)| *at < oldest) {
@@ -336,13 +335,17 @@ fn metadata_dir(folder: &str) -> String { format!("data/{folder}/metadata") }
 /// `CREATE OR REPLACE TABLE` continues a table's Iceberg state under the new table, whose files are in the same folder: the
 /// same uuid and version, with its history let go as `forget` lets it go (the old schema's snapshots must not be read with the
 /// new one). Returns the state's bytes to record, and the objects of the snapshots let go (their metadata and manifest lists),
-/// which the caller deletes once its commit is in.
+/// which the caller deletes once the new version is written.
 pub fn reset(state: &[u8], folder: &str) -> Result<(Vec<u8>, Vec<String>)> {
     let mut st: Published = serde_json::from_slice(state)?;
     let dir = metadata_dir(folder);
-    let stale = forget(&mut st);
-    let objects: Vec<String> = stale.into_iter().flat_map(|(s, list)| [format!("{dir}/v{}.metadata.json", s["sequence-number"]), list]).collect();
+    let objects = snapshot_objects(&dir, &forget(&mut st));
     Ok((json(&st), objects))
+}
+
+/// The objects of snapshots let go: each one's metadata version and manifest list.
+fn snapshot_objects(dir: &str, snapshots: &[(Value, String)]) -> Vec<String> {
+    snapshots.iter().flat_map(|(s, list)| [format!("{dir}/v{}.metadata.json", s["sequence-number"]), list.clone()]).collect()
 }
 
 /// Whether a published table names a place other than this lake's (the lake was moved or copied: invariant
