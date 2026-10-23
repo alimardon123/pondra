@@ -7,7 +7,7 @@
 //! integer where an array is, or a path into a scalar, is refused. `pg_json::operator` plans `-` and `#-` onto these.
 use crate::codes::coded;
 use crate::pg_functions::{function, marked};
-use crate::pg_json::{index_of, is_integer, is_text, json_refusal, lists, JSON_SPACE};
+use crate::pg_json::{index_of, is_integer, is_text, json_refusal, lists, skip, JSON_SPACE};
 use crate::pg_json_make::{as_text, depth_check, fail, find, in_jsonb_order, is_null_at, json_string, parse, per_row, refuse, text_at, write, Node};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
@@ -450,7 +450,7 @@ fn stripped(jiter: &mut Jiter, doc: &str, peek: Peek, out: &mut String) -> Optio
         out.push('}');
     } else {
         let start = jiter.current_index();
-        jiter.known_skip(peek).ok()?;
+        skip(jiter, peek).ok()?;
         out.push_str(doc.get(start..jiter.current_index())?.trim_matches(JSON_SPACE));
     }
     Some(())

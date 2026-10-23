@@ -82,7 +82,7 @@ fn operator(op: &BinaryOperator) -> Option<(&'static str, bool)> {
 /// Text in any of DataFusion's string types: what the JSON functions read as a document's text, from a column or a literal.
 pub(crate) fn is_text(t: &DataType) -> bool { matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) }
 
-/// `s` parses as JSON (`json` and `jsonb` alike): jiter reads its syntax, as the functions do, and nothing is built.
+/// `s` is JSON as a `json` column takes it (`pg_json_make::refused`), and nothing is built.
 pub fn is_json(s: &str) -> bool { crate::pg_json_make::refused(s).is_none() }
 
 /// Postgres's words for a value that isn't JSON, which it quotes as far as 60 characters (jsonb's
@@ -92,14 +92,18 @@ pub(crate) fn json_refusal(s: &str) -> String {
     format!("invalid input syntax for type json: \"{head}\"")
 }
 
-/// `s` as JSON text the lake keeps: itself when it parses as JSON, else Postgres's refusal (22P02).
-pub fn json_of(s: &str) -> anyhow::Result<String> {
+/// Nothing where `s` is JSON as a `json` column takes it, else Postgres's refusal: 54001 past `MAX_DEPTH` levels, 22P02
+/// for text that isn't JSON.
+pub(crate) fn checked(s: &str) -> anyhow::Result<()> {
     match crate::pg_json_make::refused(s) {
-        None => Ok(s.to_string()),
+        None => Ok(()),
         Some("54001") => Err(crate::codes::coded("54001", "stack depth limit exceeded")),
         Some(code) => Err(crate::codes::coded(code, json_refusal(s))),
     }
 }
+
+/// `s` as JSON text the lake keeps: itself when it is JSON, else Postgres's refusal (`checked`).
+pub fn json_of(s: &str) -> anyhow::Result<String> { checked(s).map(|()| s.to_string()) }
 
 fn is_list(t: &DataType) -> bool { matches!(t, DataType::List(_) | DataType::LargeList(_)) }
 
@@ -277,13 +281,10 @@ pub(crate) fn text_of(raw: &str, jsonb: bool) -> anyhow::Result<Option<String>> 
 }
 
 /// The JSON type of a document's one value, as Postgres names it (`object`, `array`, `string`, `number`, `boolean`,
-/// `null`). Text that isn't one JSON value is 22P02, as Postgres refuses it.
+/// `null`). Text that isn't one JSON value is refused as a `json` column refuses it (`checked`), at any depth it takes.
 pub(crate) fn kind(doc: &str) -> anyhow::Result<&'static str> {
-    let refused = || crate::codes::coded("22P02", json_refusal(doc));
-    let mut jiter = Jiter::new(doc.as_bytes());
-    let peek = jiter.peek().map_err(|_| refused())?;
-    jiter.known_skip(peek).map_err(|_| refused())?;
-    jiter.finish().map_err(|_| refused())?;
+    checked(doc)?;
+    let peek = Jiter::new(doc.as_bytes()).peek().map_err(|_| crate::codes::coded("22P02", json_refusal(doc)))?;
     Ok(match peek {
         Peek::Null => "null",
         Peek::True | Peek::False => "boolean",
@@ -415,7 +416,7 @@ fn member<'a>(doc: &'a str, key: &str) -> Option<&'a str> {
     while let Some(is_key) = next {
         let peek = jiter.peek().ok()?;
         let start = jiter.current_index();
-        jiter.known_skip(peek).ok()?;
+        skip(&mut jiter, peek).ok()?;
         if is_key {
             found = Some((start, jiter.current_index()));
         }
@@ -438,11 +439,11 @@ fn element<'a>(doc: &'a str, at: i64) -> Option<&'a str> {
     }
     let mut peek = jiter.known_array().ok()??;
     for _ in 0..at {
-        jiter.known_skip(peek).ok()?;
+        skip(&mut jiter, peek).ok()?;
         peek = jiter.array_step().ok()??;
     }
     let start = jiter.current_index();
-    jiter.known_skip(peek).ok()?;
+    skip(&mut jiter, peek).ok()?;
     doc.get(start..jiter.current_index()).map(|value| value.trim_matches(JSON_SPACE))
 }
 
@@ -455,6 +456,60 @@ pub(crate) fn opened(doc: &str, want: Peek) -> Option<Jiter<'_>> {
     (jiter.peek().ok()? == want).then_some(jiter)
 }
 
+/// Passes over the value `peek` starts, as jiter's `known_skip` does, as deep as the document goes: jiter's own skip
+/// stops at 200 levels, and a column takes documents to `MAX_DEPTH`. Each open container's kind is a bit (an object's
+/// is 1), so nothing is allocated for a value nested less than 64 levels deep.
+pub(crate) fn skip(jiter: &mut Jiter, peek: Peek) -> jiter::JiterResult<()> {
+    let (mut bits, mut deeper, mut depth) = (0u64, Vec::<bool>::new(), 0usize);
+    let mut next = Some(peek);
+    loop {
+        if let Some(p) = next.take() {
+            let opened = match p {
+                Peek::Array => jiter.known_array()?.map(|p| (false, p)),
+                Peek::Object => match jiter.known_object()? {
+                    Some(_) => Some((true, jiter.peek()?)),
+                    None => None,
+                },
+                p => {
+                    jiter.known_skip(p)?;
+                    None
+                }
+            };
+            if let Some((object, p)) = opened {
+                if depth < 64 {
+                    bits = (bits & !(1 << depth)) | (u64::from(object) << depth);
+                } else {
+                    deeper.push(object);
+                }
+                depth += 1;
+                next = Some(p);
+                continue;
+            }
+        }
+        // (the value is read: the next one in its container, each container that ends closed)
+        while next.is_none() {
+            if depth == 0 {
+                return Ok(());
+            }
+            let object = if depth <= 64 { (bits >> (depth - 1)) & 1 == 1 } else { deeper[depth - 65] };
+            next = if object {
+                match jiter.next_key()? {
+                    Some(_) => Some(jiter.peek()?),
+                    None => None,
+                }
+            } else {
+                jiter.array_step()?
+            };
+            if next.is_none() {
+                depth -= 1;
+                if depth >= 64 {
+                    deeper.pop();
+                }
+            }
+        }
+    }
+}
+
 /// The number of elements of the array `doc`, read through once more (a negative index counts from the end, as
 /// functions-json does). `Jiter` can't be copied, so the count reads its own reader.
 fn array_len(doc: &str) -> Option<usize> {
@@ -462,7 +517,7 @@ fn array_len(doc: &str) -> Option<usize> {
     let mut peek = jiter.known_array().ok()?;
     let mut len = 0;
     while let Some(p) = peek {
-        jiter.known_skip(p).ok()?;
+        skip(&mut jiter, p).ok()?;
         len += 1;
         peek = jiter.array_step().ok()?;
     }
@@ -1201,6 +1256,27 @@ mod tests {
         args.extend(keys.iter().map(|k| Arc::new(StringArray::from(vec![*k])) as ArrayRef));
         let out = extract(name, &args, 1, text, jsonb)?;
         Ok(out.as_string::<i32>().iter().next().flatten().map(str::to_string))
+    }
+
+    #[test]
+    fn values_nested_past_jiters_200_levels_are_read() {
+        // (arrays and objects in turn, so each level's kind is read back, below 64 levels and past them)
+        let deep = |n: usize| {
+            let mut s: String = (0..n).map(|i| if i % 2 == 0 { "[" } else { r#"{"k":"# }).collect();
+            s.push('1');
+            s.extend((0..n).rev().map(|i| if i % 2 == 0 { ']' } else { '}' }));
+            s
+        };
+        for n in [1, 2, 63, 64, 65, 66, 300, crate::pg_json_make::MAX_DEPTH - 1] {
+            let v = deep(n);
+            let doc = format!(r#"{{"a": {v}, "b": 2}}"#);
+            assert_eq!(member(&doc, "a"), Some(v.as_str()), "{n} levels");
+            assert_eq!(member(&doc, "b"), Some("2"), "{n} levels");
+            let list = format!("[{v}, 3]");
+            assert_eq!((element(&list, 1), element(&list, -2), array_len(&list)), (Some("3"), Some(v.as_str()), Some(2)), "{n} levels");
+            assert_eq!(kind(&doc).unwrap(), "object", "{n} levels");
+        }
+        assert_eq!(member(r#"{"a": [[1], "b": 2}"#, "b"), None, "text that isn't JSON where a value is passed over");
     }
 
     #[test]
