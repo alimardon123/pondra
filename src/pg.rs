@@ -1132,7 +1132,9 @@ impl Copy {
             return None; // (`COPY … TO 's3://…'`: files anywhere, the statement every door runs: ADR-026)
         }
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::PostgreSqlDialect {}, sql);
-        let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else { return Some(Err(user_error(anyhow::anyhow!("COPY: can't read {sql}")))) };
+        let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else {
+            return Some(Err(user_error(crate::pg_copy::not_one_byte(sql).unwrap_or_else(|| anyhow::anyhow!("COPY: can't read {sql}")))));
+        };
         if !matches!((to, &target), (true, CopyTarget::Stdout) | (false, CopyTarget::Stdin)) {
             return Some(Err(user_error(anyhow::anyhow!("COPY reads and writes the client's files: psql's \\copy, or COPY … TO STDOUT / FROM STDIN"))));
         }
@@ -1158,9 +1160,6 @@ impl Copy {
                 CopyLegacyOption::Null(n) => c.null = Some(n),
                 _ => {}
             }
-        }
-        if c.delimiter.is_some_and(|d| !d.is_ascii()) {
-            return Some(Err(user_error(crate::codes::coded("0A000", "COPY delimiter must be a single one-byte character"))));
         }
         Some(Ok(c))
     }

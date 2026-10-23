@@ -186,6 +186,15 @@ fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
     cast_with_options(column.as_ref(), target, &options).map_err(|e| coded("22P02", format!("{e} (column {})", field.name())))
 }
 
+/// Postgres's refusal of a COPY option that must be one byte (DELIMITER, QUOTE, ESCAPE) and isn't, `'é'` or `''`:
+/// sqlparser takes one byte there and refuses the statement, so this names the option as Postgres does (0A000).
+pub(crate) fn not_one_byte(sql: &str) -> Option<anyhow::Error> {
+    static OPTION: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(delimiter|quote|escape)\s+(?:as\s+)?'((?:[^']|'')*)'").expect("a pattern"));
+    let c = OPTION.captures_iter(sql).find(|c| c[2].replace("''", "'").len() != 1)?;
+    Some(coded("0A000", format!("COPY {} must be a single one-byte character", c[1].to_lowercase())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +330,14 @@ b
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
         let b = typed(vec![column.clone()], &one("n", DataType::Int64)).expect("kept");
         assert!(Arc::ptr_eq(b.column(0), &column));
+    }
+
+    #[test]
+    fn an_option_of_more_or_less_than_one_byte_is_refused_as_postgres_refuses_it() {
+        let refused = |sql: &str| super::not_one_byte(sql).map(|e| (crate::codes::of(&e), e.to_string()));
+        assert_eq!(refused("COPY t FROM STDIN WITH (DELIMITER 'é')"), Some(("0A000", "COPY delimiter must be a single one-byte character".into())));
+        assert_eq!(refused("COPY t FROM STDIN WITH (FORMAT csv, QUOTE '')").map(|r| r.1), Some("COPY quote must be a single one-byte character".into()));
+        assert_eq!(refused("copy t from stdin delimiter as '||'").map(|r| r.1), Some("COPY delimiter must be a single one-byte character".into()));
+        assert_eq!(refused("COPY t FROM STDIN WITH (FORMAT csv, ESCAPE '''', DELIMITER ';')"), None, "'''' is one quote");
     }
 }
