@@ -902,7 +902,7 @@ impl VisitorMut for Leftover<'_> {
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<anyhow::Error> {
         let Expr::Function(f) = e else { return ControlFlow::Continue(()) };
         if measure_call(f, self.routine) {
-            return ControlFlow::Break(anyhow!("MEASURE(...) reads a measure of a view with measures, and this query reads none"));
+            return ControlFlow::Break(crate::codes::coded("42883", "MEASURE(...) reads a measure of a view with measures, and this query reads none")); // (undefined_function, as Postgres says for a function it hasn't: a client's mistake, not a fault)
         }
         ControlFlow::Continue(())
     }
@@ -934,6 +934,22 @@ pub fn rewrite_with(stmts: &mut [Statement], view: &dyn Fn(&ObjectName) -> Optio
         }
     }
     Ok(rewrite.changed)
+}
+
+/// Whether `sql` may need the measure rewrite: it names a measure (`MARK`, a `MEASURE(…)` call), or names one of
+/// `views` (every name a view with measures can be read by).
+pub(crate) fn wanted(sql: &str, views: &HashMap<String, Arc<Definition>>) -> bool {
+    sql.contains(MARK) || CALL_TEXT.is_match(sql) || views.keys().any(|n| text::mentions(sql, n))
+}
+
+/// The names a view may be found under for a name a statement gives: with `public.` and this lake's own name optional.
+pub(crate) fn candidates(full: &str, me: &str) -> Vec<String> {
+    let inner = full.strip_prefix(me).unwrap_or(full);
+    let mut out = vec![full.to_string(), inner.to_string()];
+    if let Some(rest) = inner.strip_prefix("public.") {
+        out.push(rest.to_string());
+    }
+    out
 }
 
 // Joins: a view with measures joins each table onto one of its keys, so no row of the view is counted twice.

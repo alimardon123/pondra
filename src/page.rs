@@ -4,7 +4,7 @@
 //! mean, through ADR-061's request contract. DuckDB's forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) and
 //! ASOF JOIN answer as on a node. `web/` wraps it for a browser.
 
-use crate::front::{Host, Own};
+use crate::front::Host;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -18,7 +18,6 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
-use datafusion::sql::sqlparser::ast::Statement;
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -446,22 +445,16 @@ impl SchemaProvider for Overlay {
     }
 }
 
-/// What a page's SQL asks of where it runs. DuckDB's forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) ask the
-/// page itself, as a node asks its own. A page has no routines, no attached lakes and no views with measures, so each
-/// of those answers "none"; the columns are its tables' own.
+/// What a page's SQL asks of where it runs (`front::Host`). The front runs the passes itself, as it does for a node: DuckDB's
+/// forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) ask the page through `ask`, as a node asks its own. A page keeps
+/// no routines, attached lakes, views with measures or types, so the trait's defaults answer "none" for those; the columns
+/// are its tables' own.
 struct PageHost<'a>(&'a Page);
 
 // (a page keeps no routines, attached catalogs, views with measures or types of its own: the trait's defaults say so)
 impl Host for PageHost<'_> {
     fn name(&self) -> String {
         "page".to_string()
-    }
-
-    async fn own(&self, sql: &str) -> anyhow::Result<Own> {
-        match crate::friendly::summarize(self, sql).await? {
-            Some(q) => Ok(Own::Answer(q)),
-            None => Ok(Own::Go(sql.to_string())),
-        }
     }
 
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
@@ -472,10 +465,6 @@ impl Host for PageHost<'_> {
             }
         }
         Ok(out)
-    }
-
-    async fn friendly(&self, stmts: &mut [Statement]) -> anyhow::Result<bool> {
-        crate::friendly::rewrite(self, stmts).await
     }
 
     // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
@@ -490,6 +479,7 @@ mod tests {
     use super::*;
     use datafusion::arrow::ipc::reader::StreamReader;
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
     const ORDERS: &str = "id,name,qty\n1,a,5\n2,b,7\n3,c,9\n";
     const NAMES: &str = "id,label\n1,x\n3,z\n";
@@ -643,6 +633,19 @@ mod tests {
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE d (a INT, b TEXT)".into()).await.status, 200);
         let front = crate::front::expand(&PageHost(&page), "INSERT INTO d DEFAULT VALUES", &HashMap::new()).await.unwrap();
         assert!(front.contains("VALUES (DEFAULT, DEFAULT)"), "{front}");
+    }
+
+    /// `MEASURE()` with no view with measures to read is refused on a page as on a node: the front runs the measure pass
+    /// for both, so the answer is the same error, with the same status and SQLSTATE.
+    #[tokio::test]
+    async fn a_page_refuses_measure_as_a_node_does() {
+        let page = page_with_tables().await;
+        let sql = "SELECT MEASURE(qty) FROM orders";
+        let got = page.request("POST", "/sql", &[], sql.into()).await;
+        let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).unwrap();
+        let want = failed(crate::measures::rewrite_with(&mut stmts, &|_| None, &|_| false).unwrap_err());
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (want.status, want.header("x-pondra-sqlstate")));
+        assert_eq!(got.body, want.body);
     }
 
     #[tokio::test]

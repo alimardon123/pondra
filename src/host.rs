@@ -3,11 +3,11 @@
 use crate::ext_names::Attached;
 use crate::front::{Host, Own};
 use crate::expander::Routine;
-use crate::measures::{Definition, CALL_TEXT, MARK};
+use crate::measures::Definition;
 use crate::store::Lake;
-use crate::{ddl, routines, text};
+use crate::ddl;
 use anyhow::Result;
-use datafusion::sql::sqlparser::ast::{ObjectName, Statement};
+use datafusion::sql::sqlparser::ast::Statement;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -34,48 +34,15 @@ impl Host for Lake {
         Ok(out)
     }
 
-    // (The four below wrap free functions for the same reason as `own`: their passes ask queries.)
-    fn measured(&self, sql: &str) -> impl Future<Output = Result<bool>> + Send { measured_of(self, sql) }
+    async fn measure_views(&self, sql: &str) -> Result<Arc<HashMap<String, Arc<Definition>>>> { measure_views(self, sql).await }
 
-    fn measures(&self, sql: &str, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { measures_of(self, sql, stmts) }
-
+    // (The two below wrap free functions for the same reason as `own`: their passes ask queries.)
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { types_of(self, stmts) }
-
-    fn friendly(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { friendly_of(self, stmts) }
 
     fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(self, sql) }
 }
 
-/// Whether a statement may need the rewrite: it names a measure, or may read a view with measures. The words come first,
-/// then this lake's views as kept, then an attached lake's only when the statement names it (every statement asks: no copy).
-async fn measured_of(lake: &Lake, sql: &str) -> Result<bool> {
-    if sql.contains(MARK) || CALL_TEXT.is_match(sql) {
-        return Ok(true);
-    }
-    if own_measure_views(lake).await?.keys().any(|name| crate::text::mentions(sql, name)) {
-        return Ok(true);
-    }
-    let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
-    for (name, other) in attached {
-        if own_measure_views(&other).await?.keys().any(|local| crate::text::mentions(sql, &format!("{name}.{local}")) || crate::text::mentions(sql, &format!("{name}.public.{local}"))) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Rewrites statements against the views with measures of `lake`, and the functions it has (see `rewrite_with`).
-async fn measures_of(lake: &Lake, sql: &str, stmts: &mut [Statement]) -> Result<bool> {
-    let views = measure_views(lake, sql).await?;
-    let routines = routines::listed(lake).await?;
-    let me = format!("{}.", ddl::lake_name(lake));
-    let view = |name: &ObjectName| -> Option<Arc<Definition>> { candidates(&text::object(name), &me).iter().find_map(|c| views.get(c).cloned()) };
-    crate::measures::rewrite_with(stmts, &view, &|name: &str| routines.contains_key(name))
-}
-
 async fn types_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::types::rewrite(lake, stmts).await }
-
-async fn friendly_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::friendly::rewrite(lake, stmts).await }
 
 /// What the front's passes ask, planned as the node plans a query: expanded, ASOF JOIN's marker, the caller's session.
 async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame> {
@@ -85,7 +52,7 @@ async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame
     crate::engine::sql(&ctx, &sql).await
 }
 
-/// The node's own statements, asked before anything else (`Host::own`): the seven passes of the
+/// The node's own statements, asked before anything else (`Host::own`): the six passes of the
 /// front, in their order.
 async fn own(lake: &Lake, sql: &str) -> Result<Own> {
     let sql = &crate::vars::parameters_in(lake, sql).await?; // (`pondra.parameters('etl/orders.sql')`: a file's parameters, as rows)
@@ -97,14 +64,11 @@ async fn own(lake: &Lake, sql: &str) -> Result<Own> {
     if let Some(q) = crate::objects::show_create(lake, sql).await? {
         return Ok(Own::Answer(q)); // (`SHOW CREATE TABLE t`: the statements that make it again)
     }
-    if let Some(q) = crate::friendly::summarize(lake, sql).await? {
-        return Ok(Own::Answer(q));
-    }
     let sql = &crate::past::restore(lake, sql).await?.unwrap_or_else(|| sql.to_string()); // (`RESTORE TABLE t TO VERSION AS OF n`: a MERGE, ADR-043)
     Ok(Own::Go(sql.to_string()))
 }
 
-// The lake's views with measures: what `measured` and `measures` read.
+// The lake's views with measures: what `measure_views` answers.
 
 /// The views with measures a lake holds, by local name (`sales`, or `crm.sales`). Read again only after a commit, as
 /// `routines::listed` is: every query asks.
@@ -133,10 +97,14 @@ async fn own_measure_views(lake: &Lake) -> Result<Arc<HashMap<String, Arc<Defini
 }
 
 /// The views with measures a lake can read: its own by local name, and those of the lakes attached to it (`lake.sales`).
-async fn measure_views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Definition>>> {
-    let mut out: HashMap<String, Arc<Definition>> = own_measure_views(lake).await?.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
+/// A statement that names no attached lake gets its own map as it is: every statement asks, so it is not copied.
+async fn measure_views(lake: &Lake, sql: &str) -> Result<Arc<HashMap<String, Arc<Definition>>>> {
     // (another lake's only when the statement names it: its catalog has no version to keep them by, so each look reads it)
     let attached: Vec<(String, Arc<Lake>)> = lake.attached.read().unwrap().iter().filter(|(name, _)| crate::text::mentions(sql, name)).cloned().collect();
+    if attached.is_empty() {
+        return own_measure_views(lake).await;
+    }
+    let mut out: HashMap<String, Arc<Definition>> = own_measure_views(lake).await?.iter().map(|(k, d)| (k.clone(), d.clone())).collect();
     for (name, other) in attached {
         for (local, d) in own_measure_views(&other).await?.iter() {
             if !local.contains('.') {
@@ -145,15 +113,5 @@ async fn measure_views(lake: &Lake, sql: &str) -> Result<HashMap<String, Arc<Def
             out.insert(format!("{name}.{local}"), d.clone());
         }
     }
-    Ok(out)
-}
-
-/// The names a view may be found under for a name a statement gives: with `public.` and this lake's own name optional.
-fn candidates(full: &str, me: &str) -> Vec<String> {
-    let inner = full.strip_prefix(me).unwrap_or(full);
-    let mut out = vec![full.to_string(), inner.to_string()];
-    if let Some(rest) = inner.strip_prefix("public.") {
-        out.push(rest.to_string());
-    }
-    out
+    Ok(Arc::new(out))
 }
