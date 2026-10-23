@@ -2,7 +2,10 @@
 //! through wasm-bindgen. Its requests and answers are a node's (ADR-061's contract), so a client speaks to a page as
 //! it speaks to a node.
 
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
+
+mod fetch;
 
 #[wasm_bindgen]
 extern "C" {
@@ -16,12 +19,17 @@ pub struct Page(pondra::page::Page);
 
 #[wasm_bindgen]
 impl Page {
-    /// A page with no tables, on one partition (a page runs on one thread).
+    /// A page with no tables, on one partition (a page runs on one thread). It reads the web through `fetch` (`fetch.rs`):
+    /// a web server must allow the page's origin (CORS) and expose `Content-Range` and `ETag`.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Page {
         static HOOK: std::sync::Once = std::sync::Once::new();
         HOOK.call_once(|| std::panic::set_hook(Box::new(|p| error(&p.to_string())))); // (a panic says why, not just "unreachable")
-        Page(pondra::page::Page::open(&pondra::page::Options::default()))
+        let options = pondra::page::Options {
+            web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
+            ..Default::default()
+        };
+        Page(pondra::page::Page::open(&options))
     }
 
     /// One request, as to a node (ADR-061's contract): `request('POST', '/sql?format=csv', {}, 'FROM t')`,
