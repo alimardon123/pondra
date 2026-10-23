@@ -528,7 +528,7 @@ async fn run() -> anyhow::Result<()> {
                         break;
                     }
                     _ = &mut stop => {
-                        tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => {} }
+                        tokio::select! { _ = drain::drain() => {}, _ = stopped(false) => drain::hurry() }
                         node.stop().await;
                         crate::memory::leave();
                         std::process::exit(0);

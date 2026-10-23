@@ -732,7 +732,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
         let _ = &streamed;
         Ok::<_, std::io::Error>(f.encode())
     });
-    Body::from_stream(frames).into_response()
+    Body::from_stream(crate::drain::endless(frames)).into_response() // (never ends by itself: it ends when the node's door closes)
 }
 
 #[derive(Deserialize, Default)]
@@ -1705,7 +1705,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
             hwm.changed().await.ok()?;
         }
     });
-    Body::from_stream(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty())))).into_response()
+    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))))).into_response() // (never ends by itself: `drain::endless`)
 }
 
 fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {
