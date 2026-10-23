@@ -1141,7 +1141,7 @@ async fn keyed(lake: &Lake, name: &str, meta: &TableMeta, c: &mut Commit) -> Res
         }
     }
     for p in &c.removed {
-        for b in crate::scan::placed(lake, &ctx, &file(p)?, &stored).await?.select_columns(&meta.key.iter().map(String::as_str).collect::<Vec<_>>())?.collect().await? {
+        for b in crate::lake_scan::placed(lake, &ctx, &file(p)?, &stored).await?.select_columns(&meta.key.iter().map(String::as_str).collect::<Vec<_>>())?.collect().await? {
             gone.push(meta.to_logical(&b)?);
         }
     }

@@ -34,8 +34,7 @@ pub const INLINE: usize = 128; // at most this many files in the catalog entryâ€
 pub const SEAL: usize = 64; // â€¦then all but the newest this many are sealed
 const BIG: u64 = 4096; // files per manifest at most; smaller manifests are merged, 16 at a time
 
-/// Column -> (min, max), as text parsed with the column's type.
-pub type Stats = BTreeMap<String, (String, String)>;
+pub use crate::data_file::Stats;
 
 /// A manifest's entry in the table's list: where it is, what it holds, its columns' ranges.
 #[derive(Serialize, Deserialize, Clone, Default)]

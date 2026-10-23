@@ -36,6 +36,10 @@ mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
 mod optimize;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
+mod data_file;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
+mod scan;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
@@ -84,6 +88,7 @@ mod optimize;
 #[cfg(feature = "server")] mod inbox;
 #[cfg(feature = "server")] mod kafka;
 #[cfg(feature = "server")] mod kafka_client;
+#[cfg(feature = "server")] mod lake_scan;
 #[cfg(feature = "server")] mod live;
 #[cfg(feature = "server")] mod locks;
 #[cfg(feature = "server")] mod serve;
@@ -141,7 +146,6 @@ mod optimize;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
 #[cfg(feature = "server")] mod host;
-#[cfg(feature = "server")] mod scan;
 #[cfg(feature = "server")] mod script;
 #[cfg(feature = "server")] mod seq;
 #[cfg(feature = "server")] mod server;

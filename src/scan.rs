@@ -2,6 +2,7 @@
 //! scan by DataFusion's Parquet reader, each file with the rows its deletes leave (Delta's
 //! deletion vectors, Iceberg's position deletes and deletion vectors) as a row selection, so the
 //! reader never decodes a deleted row; filters reach row groups and pages as for any Parquet.
+//! In the core, so a page reads with it too.
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
@@ -68,17 +69,29 @@ pub enum Delete {
 
 /// A file's place as a URL: a path on this machine first, as `ListingTableUrl::parse` does
 /// (`Url::parse` would take Windows' `C:\…` for a URL of scheme `c`), then `s3://…` and the like.
-fn url_of(path: &str) -> Result<url::Url> {
+pub(crate) fn url_of(path: &str) -> Result<url::Url> {
     if std::path::Path::new(path).is_absolute() {
-        return url::Url::from_file_path(path).map_err(|_| anyhow::anyhow!("{path}: not a path"));
+        return file_url(path).with_context(|| format!("{path}: not a path"));
     }
     Ok(url::Url::parse(path)?)
+}
+
+/// A path on this machine as a `file://` URL, if it is one.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_url(path: &str) -> Option<url::Url> {
+    url::Url::from_file_path(path).ok()
+}
+
+/// None: a page in a browser has no disk (its files are `mem://` and the web's).
+#[cfg(target_arch = "wasm32")]
+fn file_url(_: &str) -> Option<url::Url> {
+    None
 }
 
 /// Another engine's files (`files`, of one table) read as `schema` says: its columns in its
 /// order, matched by field id where `table` gives them, partition values from each file's place,
 /// deleted rows left out.
-pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &SchemaRef, table: Option<&Table>) -> Result<datafusion::prelude::DataFrame> {
+pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::data_file::DataFile], schema: &SchemaRef, table: Option<&Table>) -> Result<datafusion::prelude::DataFrame> {
     use datafusion::prelude::{cast, ident};
     let first = files.first().context("no files")?;
     let url = url_of(&first.path)?;
@@ -121,122 +134,11 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::st
 
 const SEQ: &str = "__pondra_seq";
 
-/// A lake's files as another engine wrote them, recorded where they are (ADR-029 §1), read as
-/// `schema` (stored names; the system columns too, if it has them): the table's columns matched by
-/// field id (a stored column's place, as the table's Iceberg schema numbers them) or else by name;
-/// the system columns from each file's lineage: `_row_id` its first id plus the row's place in the
-/// file (Parquet's row number, right under skipped row groups and pages), `_version` and the times
-/// its commit's.
-pub async fn adopted(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], meta: &crate::store::TableMeta, schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
-    adopted_in(lake, ctx, files, meta, schema, Pick::All).await
-}
-
-/// Which of a file's rows a read takes: all (but those deleted), a range of them, or those at
-/// some places (by their place in the file, deleted or not).
-#[derive(Clone)]
-pub enum Pick {
-    All,
-    Range(u64, u64),
-    At(Arc<Vec<u64>>),
-}
-
-/// `adopted`, only the rows `pick` names of each file.
-async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], meta: &crate::store::TableMeta, schema: &SchemaRef, pick: Pick) -> Result<datafusion::prelude::DataFrame> {
-    use datafusion::arrow::datatypes::{DataType, TimeUnit};
-    use datafusion::prelude::{cast, col, ident};
-    let first = files.first().context("no files")?;
-    let url = url_of(&lake.full(&first.path))?;
-    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
-    let (mut ids, mut mapping) = (std::collections::BTreeMap::new(), std::collections::HashMap::new());
-    let own = meta.columns.iter().enumerate().filter(|(_, (c, _))| !crate::text::NAMES.contains(&c.as_str()));
-    for (i, (c, _)) in own.clone() {
-        ids.insert(c.clone(), i as i64 + 1); // (`iceberg::fields`)
-        mapping.insert(c.clone(), i as i64 + 1); // (Pondra's own files carry the stored name…)
-    }
-    for (i, (c, _)) in own {
-        mapping.insert(meta.name_of(c).to_string(), i as i64 + 1); // (…others' the name SQL knows, which wins)
-    }
-    let file_schema = Arc::new(Schema::new(schema.fields().iter().filter(|f| ids.contains_key(f.name())).cloned().collect::<Vec<_>>())); // (the ids go to `ById`)
-    let time = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
-    let partition = vec![field("__first", DataType::Int64), field("__version", DataType::Int64), field("__at", time.clone())];
-    let mut out = vec![];
-    for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
-        let l = f.lineage.context("a file without lineage")?;
-        let values = vec![ScalarValue::Int64(Some(l.first)), ScalarValue::Int64(Some(l.version as i64)), ScalarValue::TimestampMicrosecond(Some(l.ms as i64 * 1000), Some("UTC".into()))];
-        let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, &file_schema));
-        let (range, only) = pick.of();
-        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted, range, only, stats });
-    }
-    let adapter = Some(Arc::new(ById { ids, mapping }) as _);
-    let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
-    let df = ctx.read_table(Arc::new(Files { store, file_schema, partition, files: out, adapter, row: Some(row) }))?;
-    Ok(df.select(schema.fields().iter().map(|f| match f.name().as_str() {
-        crate::text::ROW_ID => (col("__first") + col("__row")).alias(f.name()),
-        crate::text::VERSION => col("__version").alias(f.name()),
-        crate::text::CREATED | crate::text::UPDATED => col("__at").alias(f.name()),
-        n => cast(ident(n), f.data_type().clone()).alias(n),
-    }).collect::<Vec<_>>())?)
-}
-
-/// One of a lake's own files as `schema` (stored names), each row with its place in the file
-/// (`__row`), the rows deleted by position skipped unread.
-pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, f: &crate::store::DataFile, schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
-    use datafusion::arrow::datatypes::DataType;
-    let url = url_of(&lake.full(&f.path))?;
-    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
-    let deleted = lake_gone(lake, ctx, &[f]).await?.pop().flatten();
-    let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
-    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats };
-    let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: Some(row) }))?)
-}
-
-/// A lake's own files that hold their rows' system columns, some of their rows deleted by
-/// position (`DataFile::deletes`), read as `schema` (stored names): those rows skipped unread.
-pub async fn with_deletes(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile], schema: &SchemaRef) -> Result<datafusion::prelude::DataFrame> {
-    let first = files.first().context("no files")?;
-    let url = url_of(&lake.full(&first.path))?;
-    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
-    let mut out = vec![];
-    for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
-        let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
-        out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats });
-    }
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: out, adapter: None, row: None }))?)
-}
-
-/// A lake's files' deleted rows (positions), from their deletes (whose paths are in the lake).
-async fn lake_gone(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, files: &[&crate::store::DataFile]) -> Result<Vec<Option<Arc<Vec<u64>>>>> {
-    let full = |d: &Delete| match d {
-        Delete::Positions { path, file, rows, bytes } => Delete::Positions { path: lake.full(path), file: file.clone(), rows: *rows, bytes: *bytes },
-        Delete::Blob { path, offset, size } => Delete::Blob { path: lake.full(path), offset: *offset, size: *size },
-        Delete::Vector { path, offset, size } => Delete::Vector { path: lake.full(path), offset: *offset, size: *size },
-        d => d.clone(),
-    };
-    gone(ctx, &files.iter().map(|f| f.deletes.iter().map(full).collect()).collect::<Vec<_>>()).await
-}
-
-/// Rows `from..to` (by their place) of one of a lake's own files, as `schema` (stored names, the
-/// system columns too): from its lineage (`adopted`), or from the file itself. What the log's
-/// readers read of a file commit, a piece at a time (a Kafka fetch of a big one).
-pub async fn file_rows(lake: &crate::store::Lake, ctx: &datafusion::prelude::SessionContext, f: &crate::store::DataFile, meta: &crate::store::TableMeta, schema: &SchemaRef, pick: Pick) -> Result<datafusion::prelude::DataFrame> {
-    let f = &crate::store::DataFile { deletes: vec![], ..f.clone() }; // (rows by their place: deleted since or not)
-    if f.lineage.is_some() {
-        return adopted_in(lake, ctx, &[f], meta, schema, pick).await;
-    }
-    let url = url_of(&lake.full(&f.path))?;
-    let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
-    let stats = Arc::new(datafusion::common::Statistics::new_unknown(schema));
-    let (range, only) = pick.of();
-    let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted: None, range, only, stats };
-    Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: None }))?)
-}
-
 /// What the planner knows of a file before reading it (the join order rests on it): its rows
 /// and bytes and, for plain Parquet files, its columns' ranges from their footers, as the
 /// statement listed them (bounds for pruning, never read as answers). Another engine's counts
 /// come from its log: estimates.
-fn statistics(f: &crate::store::DataFile, rows: u64, deleted: usize, plain: bool, schema: &Schema) -> datafusion::common::Statistics {
+pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, deleted: usize, plain: bool, schema: &Schema) -> datafusion::common::Statistics {
     use datafusion::common::stats::Precision::{Exact, Inexact};
     let mut s = datafusion::common::Statistics::new_unknown(schema);
     let n = rows.saturating_sub(deleted as u64) as usize;
@@ -252,7 +154,7 @@ fn statistics(f: &crate::store::DataFile, rows: u64, deleted: usize, plain: bool
 
 /// Rows left by Iceberg's equality deletes: a delete file's row removes the equal rows (NULL
 /// equal to NULL) of the files older than it (a smaller data sequence number).
-async fn without_equal(ctx: &datafusion::prelude::SessionContext, mut df: datafusion::prelude::DataFrame, files: &[&crate::store::DataFile]) -> Result<datafusion::prelude::DataFrame> {
+async fn without_equal(ctx: &datafusion::prelude::SessionContext, mut df: datafusion::prelude::DataFrame, files: &[&crate::data_file::DataFile]) -> Result<datafusion::prelude::DataFrame> {
     use datafusion::prelude::{col, lit};
     let mut by_columns: std::collections::BTreeMap<Vec<String>, Vec<(String, i64)>> = Default::default();
     for d in files.iter().flat_map(|f| f.outside.iter().flat_map(|o| o.deletes.iter())) {
@@ -285,9 +187,9 @@ async fn without_equal(ctx: &datafusion::prelude::SessionContext, mut df: datafu
 /// names them before DataFusion's own matching by name. Files written without ids go by the
 /// table's name mapping, or by name.
 #[derive(Debug)]
-struct ById {
-    ids: std::collections::BTreeMap<String, i64>, // table column -> id
-    mapping: std::collections::HashMap<String, i64>, // a name files may use -> id
+pub(crate) struct ById {
+    pub(crate) ids: std::collections::BTreeMap<String, i64>, // table column -> id
+    pub(crate) mapping: std::collections::HashMap<String, i64>, // a name files may use -> id
 }
 
 impl datafusion::physical_expr_adapter::PhysicalExprAdapterFactory for ById {
@@ -348,23 +250,23 @@ fn name_mapping(json: &str) -> std::collections::HashMap<String, i64> {
 }
 
 /// A file's object path in its store (as the log names it: escapes kept).
-fn key_of(path: &str, root: &url::Url) -> Result<String> {
+pub(crate) fn key_of(path: &str, root: &url::Url) -> Result<String> {
     match path.contains("://") {
         true => Ok(path[root[..url::Position::BeforePath].len()..].trim_start_matches('/').to_string()),
-        false => Ok(url::Url::from_file_path(path).ok().and_then(|u| object_store_df::path::Path::from_url_path(u.path()).ok()).map_or_else(|| path.trim_start_matches('/').to_string(), |p| p.to_string())), // (this machine's: the whole path, `C:/…` on Windows)
+        false => Ok(file_url(path).and_then(|u| datafusion::object_store::path::Path::from_url_path(u.path()).ok()).map_or_else(|| path.trim_start_matches('/').to_string(), |p| p.to_string())), // (this machine's: the whole path, `C:/…` on Windows)
     }
 }
 
 /// A file's row count from its footer (for a file its table doesn't count).
 async fn footer_rows(ctx: &datafusion::prelude::SessionContext, store: &ObjectStoreUrl, key: &str, size: u64) -> Result<u64> {
     let s = ctx.runtime_env().object_store(store)?;
-    let meta = object_store_df::ObjectMeta { location: object_store_df::path::Path::parse(key)?, last_modified: Default::default(), size, e_tag: None, version: None };
+    let meta = datafusion::object_store::ObjectMeta { location: datafusion::object_store::path::Path::parse(key)?, last_modified: Default::default(), size, e_tag: None, version: None };
     let footer = datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata::new(s.as_ref(), &meta).fetch_metadata().await?;
     Ok(footer.file_metadata().num_rows() as u64)
 }
 
 /// Each file's deleted rows (positions, sorted) from its list of deletes (by value: none here).
-async fn gone(ctx: &datafusion::prelude::SessionContext, lists: &[Vec<Delete>]) -> Result<Vec<Option<Arc<Vec<u64>>>>> {
+pub(crate) async fn gone(ctx: &datafusion::prelude::SessionContext, lists: &[Vec<Delete>]) -> Result<Vec<Option<Arc<Vec<u64>>>>> {
     let positions = positions(ctx, lists).await?;
     let mut loaded = vec![];
     for deletes in lists {
@@ -433,7 +335,7 @@ async fn deleted(ctx: &datafusion::prelude::SessionContext, deletes: &[Delete], 
 async fn range(ctx: &datafusion::prelude::SessionContext, path: &str, offset: u64, size: u64) -> Result<bytes::Bytes> {
     let url = datafusion::datasource::listing::ListingTableUrl::parse(path)?;
     let store = ctx.runtime_env().object_store(&url)?;
-    Ok(object_store_df::ObjectStoreExt::get_range(&store, &object_store_df::path::Path::parse(url.prefix().as_ref())?, offset..offset + size).await?)
+    Ok(datafusion::object_store::ObjectStoreExt::get_range(&store, &datafusion::object_store::path::Path::parse(url.prefix().as_ref())?, offset..offset + size).await?)
 }
 
 /// A table's data files, read as one.
@@ -481,8 +383,8 @@ impl TableProvider for Files {
         let mut files = self.files.clone();
         files.sort_by(|a, b| b.size.cmp(&a.size).then(a.key.cmp(&b.key)));
         for f in files {
-            let mut pf = datafusion::datasource::listing::PartitionedFile::new_from_meta(object_store_df::ObjectMeta {
-                location: object_store_df::path::Path::parse(&f.key).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
+            let mut pf = datafusion::datasource::listing::PartitionedFile::new_from_meta(datafusion::object_store::ObjectMeta {
+                location: datafusion::object_store::path::Path::parse(&f.key).map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?,
                 last_modified: Default::default(),
                 size: f.size,
                 e_tag: None,
@@ -508,16 +410,6 @@ impl TableProvider for Files {
         let groups = groups.into_iter().filter(|g| !g.1.is_empty()).map(|g| FileGroup::new(g.1)).collect();
         let config = FileScanConfigBuilder::new(self.store.clone(), source).with_file_groups(groups).with_statistics(stats).with_projection_indices(projection.cloned())?.with_limit(limit).with_expr_adapter(self.adapter.clone()).build();
         format.create_physical_plan(state, config).await
-    }
-}
-
-impl Pick {
-    fn of(&self) -> (Option<(u64, u64)>, Option<Arc<Vec<u64>>>) {
-        match self {
-            Pick::All => (None, None),
-            Pick::Range(a, b) => (Some((*a, *b)), None),
-            Pick::At(at) => (None, Some(at.clone())),
-        }
     }
 }
 
@@ -679,12 +571,6 @@ pub fn z85_of(bytes: &[u8]) -> String {
         out.push_str(std::str::from_utf8(&digits).expect("ASCII"));
     }
     out
-}
-
-/// A lake's file's deleted rows (positions, sorted), from its deletes.
-pub async fn deleted_rows(lake: &crate::store::Lake, f: &crate::store::DataFile) -> Result<Vec<u64>> {
-    let gone = lake_gone(lake, &lake.session(), &[f]).await?;
-    Ok(gone.into_iter().flatten().next().map(|g| g.to_vec()).unwrap_or_default())
 }
 
 /// Z85, the base-85 of Delta's inline deletion vectors and of the UUIDs naming their files.

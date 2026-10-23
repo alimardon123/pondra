@@ -398,10 +398,10 @@ pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], 
         parts.push(ctx.read_parquet(own.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
     }
     if !deleted.is_empty() {
-        parts.push(crate::scan::with_deletes(lake, ctx, &deleted, schema).await?);
+        parts.push(crate::lake_scan::with_deletes(lake, ctx, &deleted, schema).await?);
     }
     if !adopted.is_empty() {
-        parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
+        parts.push(crate::lake_scan::adopted(lake, ctx, &adopted, meta, schema).await?);
     }
     union_all(parts)
 }
