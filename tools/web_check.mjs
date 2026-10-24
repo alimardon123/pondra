@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // The page form's module (web/, designs/l2-b4-web.md) checked against what a node answers (ADR-061's contract: files are
 // files, tables are made by SQL, the routes mean what a node's mean): each request's status, headers and body.
-// `node tools/web_check.mjs [--pkg web/pkg] [--sizes] [--lake web/lake] [--browser]`; one JSON line, exit 1 on a failure.
+// `node tools/web_check.mjs [--pkg web/pkg] [--sizes] [--lake web/lake] [--browser] [--node-bin pondra]`; one JSON line,
+// exit 1 on a failure. `--node-bin` (the `pondra` binary) starts a node for the run and checks a page's table joined with
+// its tables, in Node and in Chromium from the site's origin (which the node names), and from another origin (refused).
 // The module runs in Node, or with `--browser` in headless Chromium: a page on 127.0.0.1 loads it, and the lake's checks
 // read the lake from another origin, so CORS decides what the page may see. Playwright isn't a dependency of the
 // repository: `--browser` loads it from the working folder or NODE_PATH, as in
@@ -10,10 +12,13 @@
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
 // (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name.
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFile, stat } from 'node:fs/promises';
+import { once } from 'node:events';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
@@ -26,6 +31,8 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
+const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
 // every header, so there that server's 206s carry no Content-Range, where a browser is sent one and hides it.
 const IN_BROWSER = args.includes('--browser');
@@ -77,11 +84,12 @@ function judge(name, answer, want = {}) {
   return text;
 }
 
-// One request of a check, to the page object `on` ('pondra', or 'kept' in Chromium); a throw is a failure of that check,
-// not of the run.
-async function ask(name, method, path, headers, body, on = 'pondra') {
+// One request of a check, to the page object `on` ('pondra', 'kept', or one `withNode` made) of `from`: the run's target,
+// a browser tab's, or the node's own (which has no pages, so `on` is not read). A throw is a failure of that check, not
+// of the run.
+async function ask(name, method, path, headers, body, on = 'pondra', from = target) {
   try {
-    return await target.request(method, path, headers, body, on);
+    return await from.request(method, path, headers, body, on);
   } catch (e) {
     failed.push(name);
     console.error(`${name}: threw ${e}`);
@@ -96,12 +104,17 @@ async function openInNode() {
   const t0 = performance.now();
   const page = new Page();
   const open_ms = Number((performance.now() - t0).toFixed(1));
+  const pages = new Map([['pondra', page]]); // (the pages by the name `on` gives: `withNode` adds one of its own)
   return {
     open_ms,
     Page,
     request: (method, path, headers, body, on = 'pondra') => {
-      if (on !== 'pondra') throw new Error(`Node has no page ${on}: a kept page is in a browser`);
-      return page.request(method, path, headers, body);
+      const chosen = pages.get(on);
+      if (!chosen) throw new Error(`Node has no page ${on}: a kept page is in a browser`);
+      return chosen.request(method, path, headers, body);
+    },
+    withNode: async (name, url) => {
+      pages.set(name, new Page({ node: url }));
     },
     close: async () => {},
   };
@@ -131,10 +144,14 @@ async function openInBrowser() {
     await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
     await untilStarted(page);
     return {
-      browser: browser.version(),
+      browser, // (kept for check 5's tab of the same browser)
+      version: browser.version(),
+      port: site.port,
+      origin: `http://127.0.0.1:${site.port}`, // (the origin a node names for this page, in PONDRA_WEB_ORIGINS)
       page,
       open_ms: await page.evaluate(() => window.open_ms),
       request: (method, path, headers, body, on) => requestInBrowser(page, method, path, headers, body, on),
+      withNode: (name, url) => pageWithNode(page, name, url),
       close: () => closeAll(browser, site),
     };
   } catch (e) {
@@ -156,6 +173,13 @@ async function requestInBrowser(page, method, path, headers, body, on = 'pondra'
     { method, path, headers, body: sent, on },
   );
   return { ...answer, body: Uint8Array.from(answer.body) };
+}
+
+// A page of the browser, given its node: `window[name]` is a Page with the node at `url`, made as `window.pondra` is.
+function pageWithNode(page, name, url) {
+  return page.evaluate(({ name, url }) => {
+    window[name] = new window.Page({ node: url });
+  }, { name, url });
 }
 
 async function closeAll(browser, site) {
@@ -247,6 +271,11 @@ const KEPT_ROWS_AFTER_INSERT = 'id,name\n1,a\n2,b\n3,c\n9,z\n';
 // The big file of the kept checks: 524,288 rows of `id,text`, a 40-character text, about 24 MiB (made in the page).
 const BIG_ROWS = 524288;
 const BIG_TEXT = 'abcdefghij'.repeat(4);
+
+// Waits `ms` milliseconds.
+function pause(ms) {
+  return new Promise((wake) => setTimeout(wake, ms));
+}
 
 // Same as `a` and `b`, counted as a check of its own.
 function same(name, got, want) {
@@ -651,7 +680,7 @@ async function untilListed(demo, want) {
   const until = Date.now() + 30_000;
   let listed = await listedTables(demo);
   while (JSON.stringify(listed) !== JSON.stringify(want) && Date.now() < until) {
-    await new Promise((wake) => setTimeout(wake, 100));
+    await pause(100);
     listed = await listedTables(demo);
   }
   return listed;
@@ -942,18 +971,192 @@ async function lakeChecks(dir) {
   await stop(hidden);
 }
 
+// The node's checks: a node `pondra serve` starts for the run is asked as a page's node is asked (B5): its own tables, a
+// page's table joined with them, what a page refuses by name, and a table nobody has. In Chromium a tab on another origin
+// is refused too (check 5). The node is stopped however its checks end, so none outlives the run.
+async function nodeRun(target) {
+  const node = await startNode(target.origin);
+  if (!node) {
+    report.node = 'left out: the node did not start';
+    return;
+  }
+  try {
+    await nodeChecks(target, node);
+  } finally {
+    await node.stop();
+  }
+}
+
+// The node's tables, made before any page asks: `sales` is the node's own, and `page_orders` holds the rows of ORDERS.
+const NODE_TABLES = [
+  ['sales', 'CREATE TABLE sales AS SELECT * FROM (VALUES (1, 10), (1, 5), (3, 7), (4, 1)) t(id, amount)'],
+  ['page_orders', "CREATE TABLE page_orders AS SELECT * FROM (VALUES (1, 'a', 5), (2, 'b', 7), (3, 'c', 9)) t(id, name, qty)"],
+];
+// The answer the node gives to the join of a table with `sales` (summed per id; a row with no sale is left out): every
+// page's join must give the same body.
+const JOINED = 'id,name,total\n1,a,15\n3,c,7\n';
+function joinSql(table) {
+  return `SELECT o.id, o.name, sum(s.amount) AS total FROM ${table} o JOIN sales s ON s.id = o.id GROUP BY o.id, o.name ORDER BY o.id`;
+}
+// What a page refuses by name, before anything is sent to its node: a copy of the node's table, and a file joined with it.
+const REFUSED = ['CREATE TABLE copy AS SELECT * FROM sales', "SELECT count(*) FROM 'orders.csv' o JOIN sales s ON s.id = o.id"];
+
+// The checks in order. The node's tables are made first, and a step that needs the node's answer is left out when it gave
+// none; the report names the join only when every check of the node ran and passed.
+async function nodeChecks(target, node) {
+  const before = failed.length;
+  if (!(await nodeTables(node))) return;
+  // (1) The node's own answer to the join of its own tables: the body every page's join must equal.
+  const own = await ask('node: its own join', 'POST', '/sql?format=csv', undefined, joinSql('page_orders'), undefined, node);
+  if (!own) return;
+  const want = judge('node: its own join', own, { status: 200, sqlstate: null, out: JOINED });
+  // (2) A page's table joined with the node's: the page sends the node the rows of its `orders`, and gives on the answer.
+  await target.withNode('withNode', node.url);
+  await makeOrders('withNode');
+  const joined = await ask('withNode: orders joined with sales', 'POST', '/sql?format=csv', undefined, joinSql('orders'), 'withNode');
+  if (joined) judge('withNode: orders joined with sales', joined, { status: 200, sqlstate: null, out: want });
+  // (3) What the page can't keep is refused by name, on the same page.
+  for (const text of REFUSED) {
+    const refused = await ask(`withNode: ${text}`, 'POST', '/sql', undefined, text, 'withNode');
+    if (refused) judge(`withNode: ${text}`, refused, { status: 501, sqlstate: '0A000' });
+  }
+  // (4) A table nobody has: the node's own answer, 404 with 42P01.
+  const nowhere = await ask('withNode: a table nobody has', 'POST', '/sql', undefined, 'SELECT * FROM nowhere', 'withNode');
+  if (nowhere) judge('withNode: a table nobody has', nowhere, { status: 404, sqlstate: '42P01' });
+  if (IN_BROWSER) await otherOriginCheck(target, node);
+  const where = IN_BROWSER ? `from ${target.origin}` : '(Node)';
+  if (failed.length === before) report.node = `a page's table joined with the node's ${where}`;
+}
+
+// The node's tables, made through its own /sql before any page asks. Each must answer 200, or the checks stop there.
+async function nodeTables(node) {
+  const before = failed.length;
+  for (const [name, text] of NODE_TABLES) {
+    const made = await ask(`node: ${name}`, 'POST', '/sql', undefined, text, undefined, node);
+    if (made) judge(`node: ${name}`, made, { status: 200, sqlstate: null });
+    if (failed.length > before) return false;
+  }
+  return true;
+}
+
+// A page's `orders`, made as a page makes a table: ORDERS put as a file, and the table made from that file by SQL.
+async function makeOrders(on, from = target) {
+  const put = await ask(`${on}: PUT /files/orders.csv`, 'PUT', '/files/orders.csv', undefined, ORDERS, on, from);
+  if (put) judge(`${on}: PUT /files/orders.csv`, put, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+  const made = await ask(`${on}: CREATE TABLE orders`, 'POST', '/sql', undefined, "CREATE TABLE orders AS FROM 'orders.csv'", on, from);
+  if (made) judge(`${on}: CREATE TABLE orders`, made, { status: 200, sqlstate: null });
+}
+
+// Check 5, in Chromium: a tab of the same browser on `localhost` is the site under another origin, which the node doesn't
+// name. Its join is refused: 503 with 08001, and the words say the node must allow the page's origin (`web_origins`).
+async function otherOriginCheck(target, node) {
+  const tab = await target.browser.newPage();
+  try {
+    watch(tab);
+    await tab.goto(`http://localhost:${target.port}/`, { waitUntil: 'commit' });
+    await untilStarted(tab);
+    await pageWithNode(tab, 'other', node.url);
+    const from = { request: (method, path, headers, body, on) => requestInBrowser(tab, method, path, headers, body, on) };
+    await makeOrders('other', from);
+    const refused = await ask('other: orders joined with sales', 'POST', '/sql?format=csv', undefined, joinSql('orders'), 'other', from);
+    if (refused) judge('other: orders joined with sales', refused, { status: 503, sqlstate: '08001', says: 'web_origins' });
+  } finally {
+    await tab.close();
+  }
+}
+
+// A node of the run's own: `pondra serve` on a folder and a free port. Its origins are those a browser page may call it
+// from (`PONDRA_WEB_ORIGINS`), when there are any. Returns { url, request, stop }, or null after naming the failure: the
+// node exited, or did not answer `/stats` within 60 s.
+async function startNode(origins) {
+  const port = await closedPort();
+  const folder = await mkdtemp(join(tmpdir(), 'pondra-web-node-'));
+  const node = spawnNode(origins, folder, port);
+  const why = await untilNodeAnswers(node);
+  if (why === null) {
+    const { url } = node;
+    return { url, request: (method, path, headers, body) => nodeRequest(url, method, path, headers, body), stop: () => endNode(node, folder) };
+  }
+  await endNode(node, folder);
+  failed.push('the node starts');
+  console.error(`the node starts: ${why}: ${node.stderr}`);
+  return null;
+}
+
+// `pondra serve` as a child process, with the run's environment and the origins given. Its stderr's last 2 KB are kept, for
+// a failure to name.
+function spawnNode(origins, folder, port) {
+  const env = origins === undefined ? process.env : { ...process.env, PONDRA_WEB_ORIGINS: origins };
+  const child = spawn(NODE_BIN, ['serve', '--dir', folder, '--addr', `127.0.0.1:${port}`], { env, stdio: ['ignore', 'ignore', 'pipe'] });
+  const node = { url: `http://127.0.0.1:${port}`, child, error: null, stderr: '' };
+  child.on('error', (e) => {
+    node.error = e.message; // (a binary that is not there: no process starts, and none exits)
+  });
+  child.stderr.on('data', (chunk) => {
+    node.stderr = (node.stderr + chunk).slice(-2048);
+  });
+  return node;
+}
+
+// Waits until the node's `/stats` answers 200 (every 50 ms, for up to 60 s): null when it does, else why it did not, as
+// text (the process failed or exited, or the time ran out).
+async function untilNodeAnswers(node) {
+  const until = Date.now() + 60_000;
+  while (Date.now() < until) {
+    if (node.error !== null) return node.error;
+    if (node.child.exitCode !== null || node.child.signalCode !== null) {
+      return `it exited with ${node.child.exitCode ?? node.child.signalCode}`;
+    }
+    if (await statsAnswers(node.url)) return null;
+    await pause(50);
+  }
+  return 'it did not answer /stats within 60 s';
+}
+
+// Whether the node's `/stats` answers 200 now: no answer (refused, or cut off) is not yet.
+async function statsAnswers(url) {
+  try {
+    return (await nodeRequest(url, 'GET', '/stats')).status === 200;
+  } catch {
+    return false;
+  }
+}
+
+// A request to the node, with Node's fetch. Node sends no Origin header, so a browser's rule for a page's origin never
+// applies to it; the answer is read as `judge` reads one.
+async function nodeRequest(url, method, path, headers, body) {
+  const answer = await fetch(`${url}${path}`, { method, headers, body });
+  return { status: answer.status, headers: Object.fromEntries(answer.headers), body: new Uint8Array(await answer.arrayBuffer()) };
+}
+
+// Ends a node: its process, then its folder.
+async function endNode(node, folder) {
+  await stopProcess(node.child);
+  await rm(folder, { recursive: true, force: true });
+}
+
+// Ends a process with SIGTERM and waits for its exit. A process that has exited, or never started, is not waited for.
+async function stopProcess(child) {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const exited = once(child, 'exit');
+  child.kill('SIGTERM');
+  await exited;
+}
+
 try {
   await lakeChecks(lake);
   if (IN_BROWSER) {
     await keptChecks(target.page, lake);
     await demoChecks(target.page);
   } else await keptRefused(target.Page);
+  if (NODE_BIN) await nodeRun(target);
+  else report.node = 'left out: no --node-bin';
 } finally {
   await target.close();
 }
 const result = {
   ok: failed.length === 0, checks: passed, failed, open_ms: target.open_ms, series_10m_ms, wasm_bytes: wasm.length,
-  browser: target.browser, // (absent in Node: JSON leaves out an undefined value)
+  browser: target.version, // (absent in Node: JSON leaves out an undefined value)
   ...report,
 };
 if (sizes) {
