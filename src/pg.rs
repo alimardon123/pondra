@@ -1386,7 +1386,8 @@ impl ExtendedQueryHandler for Backend {
     }
 
     // (psycopg describes the portal named after a DECLARE'd cursor right after the DECLARE: `cursor_portal`
-    // makes it when asked, as Postgres has it.)
+    // makes it when asked, as Postgres has it. The unnamed portal is pgwire's `DEFAULT_NAME`, found by
+    // `_on_describe`; only a named one can be a cursor.)
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1394,9 +1395,10 @@ impl ExtendedQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let name = message.name.clone().unwrap_or_default();
-        if message.target_type == TARGET_TYPE_BYTE_PORTAL && client.portal_store().get_portal(&name).is_none() {
-            crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+        if let Some(name) = message.name.clone().filter(|_| message.target_type == TARGET_TYPE_BYTE_PORTAL) {
+            if client.portal_store().get_portal(&name).is_none() {
+                crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+            }
         }
         self._on_describe(client, message).await
     }
