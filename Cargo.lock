@@ -3261,6 +3261,7 @@ dependencies = [
  "http-body-util",
  "jiter",
  "libc",
+ "log",
  "lru",
  "lz4_flex",
  "mimalloc",

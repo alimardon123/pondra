@@ -1081,6 +1081,13 @@ mod tests {
         let disk: Store = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
         check(disk, false).await;
         std::fs::remove_dir_all(&dir).ok();
+
+        // (a lake's folder as `open_store` opens it: it takes the conditional overwrites)
+        let dir = std::env::temp_dir().join(format!("pondra-served-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder: Store = Arc::new(crate::store::Local(LocalFileSystem::new_with_prefix(&dir).unwrap()));
+        check(folder, true).await;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

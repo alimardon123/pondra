@@ -36,7 +36,7 @@ def child(engine):
         import duckdb
         out["import"] = time.perf_counter() - t0
         con = duckdb.connect()
-        q = lambda s: con.execute(s).fetch_arrow_table()
+        q = lambda s: con.execute(s).to_arrow_table()
         do = lambda s: con.execute(s)
         series = f"SELECT x AS id, x % 1000 AS k, (x * 7919 % 100003) / 100.0 AS v FROM range({A.rows}) AS g(x)"
     else:
