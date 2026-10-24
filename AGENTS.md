@@ -2963,6 +2963,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    old manifest or compaction record, so the catalog grows for good (5 h at 25 inserts a second: 206 → 13,373 objects,
    commits' p95 0.4 → 5.2 ms). A store a catalog opens on takes them; the boundary files stay on. SlateDB's errors
    reach the `pondra` command's stderr (`cli::main`). `cargo test --lib store::`, harness `versions`.
+433. **A value its column can't take is refused with Postgres's words and code, at every door** (`casts::into`,
+   `write::cast_given`): text that doesn't parse is 22P02 `invalid input syntax for type integer: "abc"`, text out of
+   range 22003 `value "…" is out of range for type integer`, a number out of range 22003 `integer out of range`
+   (`smallint`, `bigint`; `numeric field overflow` for a decimal); never a quiet NULL, never Arrow's words. INSERT, a
+   bulk INSERT, COPY INTO, the Postgres port's COPY, setval and a DEFAULT's check all cast through `casts::into`, and
+   a new write path does too. `cargo test --lib casts:: codes::`, harness `loads`, `found`.
 ## Tests: run these before and after any change
 
 ```bash
