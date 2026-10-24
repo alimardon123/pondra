@@ -5,12 +5,15 @@
     python3 tools/surface.py --bin PATH --check docs/surface.json [--base OLD.json]
 
 --write reads the build's public surface (command line, HTTP routes, SQL functions and system
-tables, SQLSTATEs, kinds, metrics, Python and JavaScript names) and writes it sorted, so diffs are
-stable. --check reads it again and compares: a name the build has that the file lacks is "added", a
-name the file has that the build lacks "gone". Until the file is promised (`--write --promise`, at
-the freeze) they are notices, so the lanes adding names before then don't all edit one file; once it
-is, either fails until the file says so. --base OLD also compares the file with main's copy: a name
-OLD has and the file lacks was "removed since main", which fails once Cargo.toml is 1.x.
+tables, SQLSTATEs, kinds, metrics, Python and JavaScript names, the console's `register.*`) and
+writes it sorted, so diffs are stable. --check reads it again and compares: a name the build has
+that the file lacks is "added", a name the file has that the build lacks "gone". Until the file is
+promised (`--write --promise`, at the freeze) they are notices, so the lanes adding names before
+then don't all edit one file; once it is, either fails until the file says so. --base OLD also
+compares the file with main's copy: a name OLD has and the file lacks was "removed since main",
+which fails once Cargo.toml is 1.x. A preview section (PREVIEW: the console's `window.pondra`, kept
+from 1.1 by ADR-075 §5) is listed and compared, but what it adds or loses is a notice even once the
+file is promised.
 
 Standard library only. It starts the build's node on 127.0.0.1 (a free port in 9650-9699) with a
 lake in a temporary folder, and stops it again.
@@ -40,6 +43,7 @@ SYSTEM_COLUMNS = ("SELECT table_schema, table_name, column_name, data_type FROM 
                   "WHERE table_schema = 'pondra' ORDER BY table_schema, table_name, ordinal_position")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never send localhost through a proxy
 METHODS = ("get", "post", "put", "delete", "patch", "head", "any")  # any = every method (ANY /db/{name})
+PREVIEW = {"console"}  # sections listed before they are kept: never a failure (ADR-068's table)
 # Runs inside `python3 -I`: the repo's python/ folder is put first, and nothing else from the cwd is read.
 PY_CODE = r'''
 import importlib, inspect, json, sys
@@ -343,6 +347,17 @@ def collect_sqlstates():
         return sorted(set(re.findall(r'"([0-9A-Z]{5})"', f.read())))
 
 
+def collect_console():
+    """`window.pondra.register`'s names, as `register.view`: the methods of core.js's `register` object."""
+    with open(os.path.join(REPO, "src", "console", "core.js"), encoding="utf-8") as f:
+        text = f.read()
+    start = text.find("export const register = {")
+    if start < 0:
+        fail("src/console/core.js has no `export const register = {`")
+    body = text[start:closing(text, text.index("{", start) + 1)]
+    return sorted(f"register.{name}" for name in re.findall(r"^  (\w+)\(o\) \{", body, re.M))
+
+
 def collect_python():
     r = subprocess.run([sys.executable, "-I", "-c", PY_CODE, os.path.join(REPO, "python")],
                        capture_output=True, text=True, timeout=120, cwd=REPO)
@@ -369,7 +384,7 @@ def collect_javascript():
 # ---- collect, write, compare ----
 
 def collect(bin_path):
-    data = {"cli": collect_cli(bin_path), "http": collect_http(), "sqlstates": collect_sqlstates()}
+    data = {"cli": collect_cli(bin_path), "http": collect_http(), "sqlstates": collect_sqlstates(), "console": collect_console()}
     node, how = collect_node(bin_path)
     data.update(node)
     data["python"], how["python"] = collect_python()
@@ -411,10 +426,11 @@ def load(path):
         fail(f"{path} doesn't exist: write it with --write")
 
 
-def differences(have, want):
-    """(added, gone) as `section: name` strings; a section either side skipped is left out."""
+def differences(have, want, preview=False):
+    """(added, gone) as `section: name` strings; a section either side skipped is left out, and so are the
+    preview sections, or only they with `preview`."""
     added, gone = [], []
-    for section in sorted(k for k in set(have) | set(want) if not k.startswith("_")):
+    for section in sorted(k for k in set(have) | set(want) if not k.startswith("_") and (k in PREVIEW) == preview):
         if unread(have, section) or unread(want, section):
             print(f"note: {section} not compared: skipped on this or the file's machine")
             continue
@@ -484,6 +500,11 @@ def main():
         print(dump(data), end="")
         return 0
     want = load(args.check)
+    early, dropped = differences(data, want, preview=True)
+    for line in early:
+        print(f"notice: added to a preview: {line}")
+    for line in dropped:
+        print(f"notice: gone from a preview: {line}")
     added, gone = differences(data, want)
     promised = want.get("_promised", False)
     for line in added:
