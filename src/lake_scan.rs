@@ -58,7 +58,7 @@ async fn adopted_in(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
         let l = f.lineage.context("a file without lineage")?;
         let values = vec![ScalarValue::Int64(Some(l.first)), ScalarValue::Int64(Some(l.version as i64)), ScalarValue::TimestampMicrosecond(Some(l.ms as i64 * 1000), Some("UTC".into()))];
-        let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, &file_schema));
+        let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, &file_schema));
         let (range, only) = pick.of();
         out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: values, deleted, range, only, stats });
     }
@@ -80,7 +80,7 @@ pub async fn placed(lake: &crate::store::Lake, ctx: &datafusion::prelude::Sessio
     let url = url_of(&lake.full(&f.path))?;
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let deleted = lake_gone(lake, ctx, &[f]).await?.pop().flatten();
-    let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
+    let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
     let file = File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats };
     let row = Arc::new(Field::new("__row", DataType::Int64, false).with_extension_type(datafusion::parquet::arrow::RowNumber));
     Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: vec![file], adapter: None, row: Some(row) }))?)
@@ -94,7 +94,7 @@ pub async fn with_deletes(lake: &crate::store::Lake, ctx: &datafusion::prelude::
     let store = ObjectStoreUrl::parse(&url[..url::Position::BeforePath])?;
     let mut out = vec![];
     for (f, deleted) in files.iter().zip(lake_gone(lake, ctx, files).await?) {
-        let stats = Arc::new(statistics(f, f.rows, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
+        let stats = Arc::new(statistics(f, f.rows, true, deleted.as_ref().map_or(0, |d| d.len()), true, schema));
         out.push(File { key: key_of(&lake.full(&f.path), &url)?, size: f.bytes, rows: f.rows, partition: vec![], deleted, range: None, only: None, stats });
     }
     Ok(ctx.read_table(Arc::new(Files { store, file_schema: schema.clone(), partition: vec![], files: out, adapter: None, row: None }))?)

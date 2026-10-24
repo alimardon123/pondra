@@ -185,7 +185,7 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
         }
         // Rows deleted by position: its count is no longer exact, just an upper bound.
         // (with equality deletes about, every file's sequence number: a newer row isn't deleted)
-        d.outside = (!deletes.is_empty() || !equality.is_empty()).then(|| Box::new(Outside { values: vec![], deletes, rows: Some(d.rows), seq: Some(*seq) }));
+        d.outside = (!deletes.is_empty() || !equality.is_empty()).then(|| Box::new(Outside { values: vec![], deletes, rows: Some(d.rows), seq: Some(*seq), guessed: false }));
         files.push(d);
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));

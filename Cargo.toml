@@ -43,7 +43,7 @@ axum = { version = "0.8", optional = true }
 tower = { version = "0.5", default-features = false, features = ["util"], optional = true } # (a library's request handed to the router: `library.rs`; already built for axum)
 http-body-util = { version = "0.1", optional = true } # (a body capped at a size: Flight's calls before their caller signs in; already built for axum)
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] } # (raw_value: Delta's decimal statistics read as written, read_delta.rs; a node has it through axum, a page only through this)
 jiter = "0.17" # (a JSON walk that reads only the bytes it needs: `pg_json.rs`; already in Cargo.lock through datafusion-functions-json)
 anyhow = "1"
 toml = { version = "0.8", default-features = false, features = ["parse"], optional = true } # pondra.toml (already built for slatedb's figment)

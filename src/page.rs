@@ -1623,6 +1623,23 @@ mod tests {
         json!({"add": {"path": path, "partitionValues": {}, "size": size, "modificationTime": 0, "dataChange": true, "stats": stats.to_string()}})
     }
 
+    /// A Delta table's first actions, as a node writes them: its protocol (columns mapped by name, deletion vectors) and
+    /// its schema, `fields` in Delta's names and types.
+    fn table_start(id: &str, fields: serde_json::Value) -> Vec<serde_json::Value> {
+        let protocol = json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["columnMapping", "deletionVectors"], "writerFeatures": ["columnMapping", "deletionVectors"]}});
+        let schema = json!({"type": "struct", "fields": fields});
+        let metadata = json!({"metaData": {"id": id, "format": {"provider": "parquet", "options": {}}, "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {"delta.columnMapping.mode": "name"}}});
+        vec![protocol, metadata]
+    }
+
+    /// A Delta table's log under `folder` in `memory`: commit n's actions, one JSON line each, as version n.
+    async fn put_log(memory: &InMemory, folder: &str, commits: &[Vec<serde_json::Value>]) {
+        for (v, actions) in commits.iter().enumerate() {
+            let body: String = actions.iter().map(|a| format!("{a}\n")).collect();
+            memory.put(&Path::from(format!("{folder}/_delta_log/{v:020}.json")), body.into_bytes().into()).await.unwrap();
+        }
+    }
+
     /// The Delta table of the tests, put under `lake/orders` in `memory` as a node publishes one: three Parquet files and
     /// three commits. The first has the protocol, the schema (`label` is `col-2` in the files) and `a.parquet` and
     /// `b.parquet`. The second removes `a.parquet` and adds it again with row 1 deleted by an inline deletion vector.
@@ -1634,24 +1651,21 @@ mod tests {
             ("c.parquet", delta_file(&[(4, "d")])),
         ];
         let (a, b, c) = (files[0].1.len() as u64, files[1].1.len() as u64, files[2].1.len() as u64);
-        let protocol = json!({"protocol": {"minReaderVersion": 3, "minWriterVersion": 7, "readerFeatures": ["columnMapping", "deletionVectors"], "writerFeatures": ["columnMapping", "deletionVectors"]}});
-        let schema = json!({"type": "struct", "fields": [
+        let fields = json!([
             {"name": "id", "type": "long", "nullable": true, "metadata": {"delta.columnMapping.id": 1, "delta.columnMapping.physicalName": "id"}},
             {"name": "label", "type": "string", "nullable": true, "metadata": {"delta.columnMapping.id": 2, "delta.columnMapping.physicalName": "col-2"}},
-        ]});
-        let metadata = json!({"metaData": {"id": "orders", "format": {"provider": "parquet", "options": {}}, "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {"delta.columnMapping.mode": "name"}}});
+        ]);
         let bitmap = crate::scan::roaring_bytes(&[1]);
         let mut deleted = add("a.parquet", 2, a, (1, 2));
         deleted["add"]["deletionVector"] = json!({"storageType": "i", "pathOrInlineDv": crate::scan::z85_of(&bitmap), "sizeInBytes": bitmap.len(), "cardinality": 1});
+        let mut first = table_start("orders", fields);
+        first.extend([add("a.parquet", 2, a, (1, 2)), add("b.parquet", 1, b, (3, 3))]);
         let commits = [
-            vec![protocol, metadata, add("a.parquet", 2, a, (1, 2)), add("b.parquet", 1, b, (3, 3))],
+            first,
             vec![json!({"remove": {"path": "a.parquet", "deletionTimestamp": 0, "dataChange": true}}), deleted],
             vec![add("c.parquet", 1, c, (4, 4))],
         ];
-        for (v, actions) in commits.iter().enumerate() {
-            let body: String = actions.iter().map(|a| format!("{a}\n")).collect();
-            memory.put(&Path::from(format!("lake/orders/_delta_log/{v:020}.json")), body.into_bytes().into()).await.unwrap();
-        }
+        put_log(memory, "lake/orders", &commits).await;
         for (name, body) in files {
             memory.put(&Path::from(format!("lake/orders/{name}")), body.into()).await.unwrap();
         }
@@ -1703,6 +1717,96 @@ mod tests {
         let none = page.request("POST", "/sql?format=csv", &[], format!("SELECT label FROM read_delta('{DELTA_ROOT}') WHERE id > 9").into()).await;
         assert_eq!(none.body, "label\n");
         assert_eq!(asked.lock().unwrap().iter().filter(|p| p.ends_with(".parquet")).count(), 1);
+    }
+
+    /// A Parquet file of one `decimal(38,18)` column `d`, holding `values` as their unscaled integers (18 places each).
+    fn decimal_file(values: &[i128]) -> Vec<u8> {
+        use datafusion::arrow::array::Decimal128Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Decimal128(38, 18), true)]));
+        let column = Decimal128Array::from(values.to_vec()).with_precision_and_scale(38, 18).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(column)]).unwrap();
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        body
+    }
+
+    /// The schema of `delta_file`'s table: `id`, and `label` in the file's column `col-2`.
+    fn id_and_label() -> serde_json::Value {
+        json!([{"name": "id", "type": "long", "nullable": true, "metadata": {}},
+               {"name": "label", "type": "string", "nullable": true, "metadata": {"delta.columnMapping.physicalName": "col-2"}}])
+    }
+
+    /// A Delta table of one commit at `folder`, put in `memory` as a node publishes one: its schema as `fields` (Delta's
+    /// names and types), and each file as its name, its Parquet body and its stats as the log writes them (a JSON text,
+    /// or none). The stats are passed as text and never through `json!`, which would round a decimal literal itself.
+    async fn put_one_commit(memory: &InMemory, folder: &str, fields: serde_json::Value, files: Vec<(&str, Vec<u8>, Option<&str>)>) {
+        let mut actions = table_start(folder, fields);
+        for (name, body, stats) in files {
+            let mut add = json!({"path": name, "partitionValues": {}, "size": body.len(), "modificationTime": 0, "dataChange": true});
+            if let Some(stats) = stats {
+                add["stats"] = json!(stats);
+            }
+            actions.push(json!({"add": add}));
+            memory.put(&Path::from(format!("{folder}/{name}")), body.into()).await.unwrap();
+        }
+        put_log(memory, folder, &[actions]).await;
+    }
+
+    /// A decimal bound is read at full precision, as Spark writes it: the file whose `d` is 0.123456789012345678 at its
+    /// least is the one `WHERE d = 0.123456789012345678` asks for. Read through an f64, the least rounds up and the file
+    /// is skipped, and the count is 0.
+    #[tokio::test]
+    async fn a_delta_decimal_bound_is_read_at_full_precision() {
+        let memory = Arc::new(InMemory::new());
+        let stats = r#"{"numRecords":2,"minValues":{"d":0.123456789012345678},"maxValues":{"d":0.5},"nullCount":{"d":0}}"#;
+        let fields = json!([{"name": "d", "type": "decimal(38,18)", "nullable": true, "metadata": {}}]);
+        let body = decimal_file(&[123_456_789_012_345_678, 500_000_000_000_000_000]); // (0.123456789012345678 and 0.5)
+        put_one_commit(&memory, "lake/decimals", fields, vec![("d.parquet", body, Some(stats))]).await;
+        let page = web_page(memory);
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM read_delta('https://lake.test/lake/decimals') WHERE d = 0.123456789012345678".into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{:?}", got.body);
+        assert_eq!(got.body, "n\n1\n");
+    }
+
+    /// A file whose add gives no row count is counted by reading it, never from its size: `size / 100` is only a guess,
+    /// and the planner is told so (an inexact count), so `count(*)` reads the file and answers 3.
+    #[tokio::test]
+    async fn a_delta_file_with_no_count_is_counted_by_reading_it() {
+        use datafusion::common::stats::Precision::Inexact;
+        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+        let memory = Arc::new(InMemory::new());
+        let body = delta_file(&[(1, "a"), (2, "b"), (3, "c")]);
+        let size = body.len() as u64;
+        assert_ne!(size / 100, 3, "the size must not give the right count by chance");
+        put_one_commit(&memory, "lake/uncounted", id_and_label(), vec![("f.parquet", body, None)]).await;
+        let root = "https://lake.test/lake/uncounted";
+        let page = web_page(memory);
+        let got = page.request("POST", "/sql?format=csv", &[], format!("SELECT count(*) AS n FROM read_delta('{root}')").into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{:?}", got.body);
+        assert_eq!(got.body, "n\n3\n");
+        let (frame, _) = page.plan(&format!("SELECT * FROM read_delta('{root}')")).await.unwrap();
+        let plan = frame.create_physical_plan().await.unwrap();
+        let stats = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()).unwrap();
+        assert_eq!(stats.num_rows, Inexact((size / 100) as usize));
+    }
+
+    /// A file whose add gives its row count keeps that count exact, so the planner may answer `count(*)` from the log.
+    #[tokio::test]
+    async fn a_delta_file_whose_log_counts_its_rows_keeps_them_exact() {
+        use datafusion::common::stats::Precision::Exact;
+        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+        let memory = Arc::new(InMemory::new());
+        let body = delta_file(&[(1, "a"), (2, "b"), (3, "c")]);
+        put_one_commit(&memory, "lake/counted", id_and_label(), vec![("f.parquet", body, Some(r#"{"numRecords":3}"#))]).await;
+        let page = web_page(memory);
+        let (frame, _) = page.plan("SELECT * FROM read_delta('https://lake.test/lake/counted')").await.unwrap();
+        let plan = frame.create_physical_plan().await.unwrap();
+        let stats = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()).unwrap();
+        assert_eq!(stats.num_rows, Exact(3));
     }
 
     /// A file over the web is read by its name, as a file given to a page is; a file that isn't there is 42P01 by the
