@@ -96,6 +96,8 @@ role. The same code path whether one node or a hundred: a cluster is only more d
 
 ### 6. Extensions and plugins, kept in the lake
 
+Replaced by ADR-075 (2026-10-24): one word, "extension", and one package for both.
+
 - **Extensions** (ADR-031): WebAssembly components adding functions, formats and connectors, kept
   under `ext/<name>/<version>.wasm` with a catalog entry, so every node and session has them;
   sandboxed, granted capabilities at `LOAD`, signed by their publisher. The same `.wasm` runs in the
@@ -175,7 +177,7 @@ a run records what it ran. To add:
 - **30–32:** §4 (the catalog door, scoped URLs, column keys) with ADR-029's phase 3; §9's export and
   apply with `CLONE`.
 - **34:** §10 with the in-process library.
-- **After 1.0:** §6's plugins with ADR-031; §7 beyond what Python functions do today.
+- **After 1.0:** §6's plugins as ADR-075's extensions; §7 beyond what Python functions do today.
 
 ## Rejected
 
