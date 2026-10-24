@@ -347,9 +347,12 @@ impl Page {
         let columns: Vec<(String, String)> = files.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
         let keys = crate::ext_names::keys(&found, &given, &[], &columns)?;
         let schema = crate::answer::schema(&[columns, keys.clone()].concat())?;
-        let pairs: Vec<(String, String)> = found.iter().map(|f| (f.full(), if keys.is_empty() { String::new() } else { f.part() })).collect();
-        let refs: Vec<(&str, &str)> = pairs.iter().map(|(file, part)| (file.as_str(), part.as_str())).collect();
-        let df = crate::ext_names::read_files(&self.ctx, &refs, &schema, &given).await?;
+        // (the files as a node lists and reads them: a Parquet footer's rows and ranges for the planner, every column kept)
+        let stored: Vec<String> = files.fields().iter().map(|f| f.name().clone()).collect();
+        let format = crate::ext_names::file_format(&given, &state)?;
+        let data = crate::ext_names::data_files(&state, &format, &files, found, !keys.is_empty(), &stored, false).await?;
+        let refs: Vec<_> = data.iter().collect();
+        let df = crate::ext_names::read(&self.ctx, &refs, &schema, &given).await?;
         overlay.own(name.to_string(), df.into_view()); // (a name is one table: the statement's own map)
         Ok(())
     }
@@ -1199,6 +1202,60 @@ mod tests {
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE big AS FROM 'big.parquet'".into()).await.status, 200);
         let got = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n, sum(x) AS s FROM big".into()).await;
         assert_eq!(got.body, "n,s\n20000,200010000\n");
+    }
+
+    /// A page's Parquet file tells the planner what its footer says, as a node's does: its rows exactly, and its column's
+    /// range as bounds (inexact: they prune, and no answer is read from them).
+    #[tokio::test]
+    async fn a_pages_parquet_tells_the_planner_its_footer() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::stats::Precision::{Exact, Inexact};
+        use datafusion::common::ScalarValue;
+        use datafusion::parquet::arrow::ArrowWriter;
+        use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut body = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), None).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(1..=100))]).unwrap()).unwrap();
+        writer.close().unwrap();
+        let page = Page::open(&Options::default());
+        assert_eq!(put(&page, "p.parquet", body).await.status, 200);
+        let (frame, _)= page.plan("SELECT * FROM 'p.parquet'").await.unwrap();
+        let plan = frame.create_physical_plan().await.unwrap();
+        let stats = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()).unwrap();
+        assert_eq!(stats.num_rows, Exact(100));
+        assert_eq!(stats.column_statistics[0].min_value, Inexact(ScalarValue::Int64(Some(1))));
+        assert_eq!(stats.column_statistics[0].max_value, Inexact(ScalarValue::Int64(Some(100))));
+    }
+
+    /// Hive-style folders of Parquet files are one table as a node reads them: `k` is each folder's value, and NULL in
+    /// the `__HIVE_DEFAULT_PARTITION__` folder (the answers `tools/harness.py`'s "Hive-style folders" asks of a node).
+    #[tokio::test]
+    async fn a_page_reads_hive_folders_of_parquet_as_a_node_does() {
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let page = Page::open(&Options::default());
+        for (path, rows) in [("h/k=x/a.parquet", 3), ("h/k=__HIVE_DEFAULT_PARTITION__/b.parquet", 2)] {
+            let mut body = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut body, schema.clone(), None).unwrap();
+            writer.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(0..rows))]).unwrap()).unwrap();
+            writer.close().unwrap();
+            assert_eq!(put(&page, path, body).await.status, 200);
+        }
+        let read = |tail: &str| format!("SELECT {tail} FROM read_parquet('h/')");
+        let counts = [
+            (read("count(k) AS n, count(*) AS rows"), "n,rows\n3,5\n"),
+            (read("count(*) AS n") + " WHERE k IS NULL", "n\n2\n"),
+            (read("count(*) AS n") + " WHERE k = 'x'", "n\n3\n"),
+        ];
+        for (sql, body) in counts {
+            let got = page.request("POST", "/sql?format=csv", &[], sql.clone().into()).await;
+            assert_eq!(got.status, 200, "{sql}: {}", String::from_utf8_lossy(&got.body));
+            assert_eq!(got.body, body, "{sql}");
+        }
     }
 
     #[tokio::test]
