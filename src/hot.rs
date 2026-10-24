@@ -341,7 +341,7 @@ fn base(key: &str) -> &str { key.rsplit_once('#').map_or(key, |(path, _)| path) 
 /// columns come from its lineage if it has one; with `deletes`, its deleted rows are left out.
 async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool) -> Result<(Vec<usize>, Vec<Vec<ArrayRef>>, Vec<Option<Ranges>>)> {
     let bytes = lake.object(&file.path).await?;
-    let gone = if deletes && !file.deletes.is_empty() { crate::scan::deleted_rows(lake, file).await? } else { vec![] };
+    let gone = if deletes && !file.deletes.is_empty() { crate::lake_scan::deleted_rows(lake, file).await? } else { vec![] };
     let (fields, lineage) = (fields.to_vec(), file.lineage);
     tokio::task::spawn_blocking(move || {
         // Strings straight to views (no copy of their bytes), as the table is read (see `read_schema`).
@@ -484,7 +484,7 @@ fn ranges(arrays: &[ArrayRef]) -> Option<Ranges> {
 }
 
 /// A field of `batch`, whose first row is the file's `at`-th: a system column from the file's
-/// lineage when it has one (as `scan::adopted` gives it), else the file's column, or nulls.
+/// lineage when it has one (as `lake_scan::adopted` gives it), else the file's column, or nulls.
 fn column(batch: &RecordBatch, f: &FieldRef, lineage: Option<Lineage>, at: u64) -> ArrayRef {
     let n = batch.num_rows();
     match (lineage, f.name().as_str()) {

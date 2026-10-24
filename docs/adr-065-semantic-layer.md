@@ -117,7 +117,7 @@ SELECT region, MEASURE(per_customer) FROM sales WHERE day >= DATE '2026-01-01' G
   unnamed item that isn't a plain column. A query that names no measure reads the default form, with
   SQL's meaning.
 - **Expanded where SQL comes in, before anything plans it** (`measures::rewrite`, first in
-  `routines::expand_with`'s tree stage, so the macros, DuckDB's spellings and enum casts of the
+  `front::expand`'s tree stage, so the macros, DuckDB's spellings and enum casts of the
   inserted SQL are expanded after it). After it the query is a plain `GROUP BY`: spread, the result
   cache, the guard and the join order work unchanged. A query without measures pays a look at the
   lake's views with measures, kept per catalog version (`measures::own_views`, as `routines::listed`
@@ -160,7 +160,7 @@ proposed from `pondra.history`) follow E13 after 1.0's freeze unless asked soone
    columns…", "never a remembered answer…".
 
 346. **A measure is worked out at the query's own grain, from the view's base rows, never from its
-   default form's** (`measures::rewrite`, first in `routines::expand_with`'s tree stage): a query naming
+   default form's** (`measures::rewrite`, first in `front::expand`'s tree stage): a query naming
    a measure reads the view's FROM and WHERE with the dimensions it uses and each column its measures
    read, and each measure is its expression over those, grouped by the query's GROUP BY; the base is
    then written in place (`measures::flattened`) unless that could change a name's meaning. Everything

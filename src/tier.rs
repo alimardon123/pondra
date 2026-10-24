@@ -181,7 +181,7 @@ async fn shadow(lake: &Lake, table: &str, meta: &mut TableMeta, new: &[String], 
     let mut hit: Vec<(String, Vec<u64>)> = vec![];
     let mut fresh: Vec<(u64, datafusion::prelude::DataFrame)> = vec![]; // (each new file's keys, by its generation)
     for f in meta.files.iter().filter(|f| new.contains(&f.path)) {
-        let df = crate::scan::placed(lake, &ctx, f, &schema).await?;
+        let df = crate::lake_scan::placed(lake, &ctx, f, &schema).await?;
         fresh.push((f.ord, df.clone().select(meta.key.iter().map(|k| ident(k).alias(format!("__k_{k}"))).collect::<Vec<_>>())?));
         if marked {
             hit.push((f.path.clone(), places(df.filter(col("_deleted").is_true())?.select_columns(&["__row"])?.collect().await?)));
@@ -191,7 +191,7 @@ async fn shadow(lake: &Lake, table: &str, meta: &mut TableMeta, new: &[String], 
         let Some(newer) = fresh.iter().filter(|(ord, _)| *ord > f.ord).map(|(_, k)| k.clone()).reduce(|a, b| a.union(b).expect("the same columns")) else { continue };
         let (left, right): (Vec<String>, Vec<String>) = meta.key.iter().map(|k| (k.clone(), format!("__k_{k}"))).unzip();
         let (left, right) = (left.iter().map(String::as_str).collect::<Vec<_>>(), right.iter().map(String::as_str).collect::<Vec<_>>());
-        let df = crate::scan::placed(lake, &ctx, f, &schema).await?.join(newer, datafusion::common::JoinType::LeftSemi, &left, &right, None)?;
+        let df = crate::lake_scan::placed(lake, &ctx, f, &schema).await?.join(newer, datafusion::common::JoinType::LeftSemi, &left, &right, None)?;
         hit.push((f.path.clone(), places(df.select_columns(&["__row"])?.collect().await?)));
     }
     let folder = meta.folder(table).to_string();

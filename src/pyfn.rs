@@ -27,7 +27,7 @@ use datafusion::prelude::SessionContext;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use crate::text::{is_json, loose};
+use crate::text::{is_json_type, loose};
 
 /// A SQL type as DataFusion reads it (`VARCHAR` → Utf8, `DOUBLE` → Float64, `INT[]` → a list),
 /// strings as plain Utf8; `VARIANT` and `JSON` are JSON text, and so are the types the lake holds as
@@ -38,7 +38,7 @@ pub async fn arrow_of(sql_type: &str) -> Result<DataType> {
     if let Some(t) = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sql_type) {
         return Ok(t.clone());
     }
-    let t = match is_json(Some(sql_type)) || crate::types::declared(sql_type)?.is_some() {
+    let t = match is_json_type(Some(sql_type)) || crate::types::declared(sql_type)?.is_some() {
         true => DataType::Utf8,
         false => {
             let df = SessionContext::new().sql(&format!("SELECT CAST(NULL AS {sql_type}) AS v")).await?;
@@ -92,9 +92,9 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
 
 /// What a worker needs to run it: its body, parameters and options.
 fn head(name: &str, r: &Routine, table: bool) -> serde_json::Value {
-    let json: Vec<bool> = r.params.iter().map(|p| is_json(p.ty.as_deref())).collect();
+    let json: Vec<bool> = r.params.iter().map(|p| is_json_type(p.ty.as_deref())).collect();
     json!({"op": "apply", "name": name, "body": r.body, "entry": r.with.entry, "params": crate::expander::names(r), "json": json,
-           "json_returns": is_json(r.returns.as_deref()), "vectorized": r.with.vectorized, "strict": r.with.strict, "table": table})
+           "json_returns": is_json_type(r.returns.as_deref()), "vectorized": r.with.vectorized, "strict": r.with.strict, "table": table})
 }
 
 /// Rows through a worker: the arguments' batch out, the answer back (as `out`'s columns).

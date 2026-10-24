@@ -34,8 +34,7 @@ pub const INLINE: usize = 128; // at most this many files in the catalog entryâ€
 pub const SEAL: usize = 64; // â€¦then all but the newest this many are sealed
 const BIG: u64 = 4096; // files per manifest at most; smaller manifests are merged, 16 at a time
 
-/// Column -> (min, max), as text parsed with the column's type.
-pub type Stats = BTreeMap<String, (String, String)>;
+pub use crate::data_file::{text, Stats};
 
 /// A manifest's entry in the table's list: where it is, what it holds, its columns' ranges.
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -129,17 +128,6 @@ pub fn from_footer(md: &ParquetMetaData, schema: &datafusion::arrow::datatypes::
         nulls.value(j) as i64 == g.num_rows() || (lo.is_valid(j) && hi.is_valid(j) && lo_exact.value(j) && hi_exact.value(j))
     });
     complete.then(|| crate::sketch::min_max(&[lo]).zip(crate::sketch::min_max(&[hi]))).flatten().map(|((lo, _), (_, hi))| (lo, hi))
-}
-
-/// A value as text that casts back to it exactly (timestamps as ISO 8601), or None for a null
-/// or a string too long to keep.
-pub fn text(v: &ScalarValue) -> Option<String> {
-    use datafusion::arrow::array::AsArray;
-    if v.is_null() {
-        return None;
-    }
-    let s = datafusion::arrow::compute::cast(&v.to_array().ok()?, &DataType::Utf8).ok()?;
-    Some(s.as_string::<i32>().value(0).to_string()).filter(|s| s.len() <= 64)
 }
 
 /// A type whose files keep a range (floats too, from their rows: Parquet leaves NaN out of its own).

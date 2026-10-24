@@ -208,7 +208,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
         let same = state.dvs.get(p).filter(|d| d["cardinality"].as_u64() == Some(f.deleted));
         dvs.insert(p.clone(), match same {
             Some(d) => d.clone(),
-            None => vector(&crate::scan::deleted_rows(lake, f).await?),
+            None => vector(&crate::lake_scan::deleted_rows(lake, f).await?),
         });
     }
     let was = |p: &String| state.inline.contains_key(p) || lost.contains_key(p);

@@ -121,11 +121,11 @@ pub const UPDATED: &str = "_updated_at";
 pub const NAMES: [&str; 4] = [ROW_ID, VERSION, CREATED, UPDATED];
 
 /// VARIANT (JSON) values go to Python as what they hold, and come back as JSON.
-pub fn is_json(sql_type: Option<&str>) -> bool { sql_type.is_some_and(|t| ["VARIANT", "JSON"].contains(&t.trim().to_uppercase().as_str())) }
+pub fn is_json_type(sql_type: Option<&str>) -> bool { sql_type.is_some_and(|t| ["VARIANT", "JSON"].contains(&t.trim().to_uppercase().as_str())) }
 
 /// A parameter that takes any value as it comes, not cast: none given, `ANY` (Postgres's
 /// `anyelement`), or VARIANT / JSON (a JSON document's text, or any other value).
-pub fn loose(sql_type: Option<&str>) -> bool { sql_type.is_none_or(|t| is_json(Some(t)) || ["ANY", "ANYELEMENT"].contains(&t.trim().to_uppercase().as_str())) }
+pub fn loose(sql_type: Option<&str>) -> bool { sql_type.is_none_or(|t| is_json_type(Some(t)) || ["ANY", "ANYELEMENT"].contains(&t.trim().to_uppercase().as_str())) }
 
 /// `name(args…)` as SQL's tree has a call.
 pub fn function(name: &str, args: Vec<ast::Expr>) -> ast::Expr {

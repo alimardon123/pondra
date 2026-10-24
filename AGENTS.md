@@ -2441,7 +2441,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
    "never a remembered answer…".
 346. **A measure is worked out at the query's own grain, from the view's base rows, never from its default
-   form's** (`measures::rewrite_with`, first in `routines::expand_with`'s tree stage): a query naming a measure
+   form's** (`measures::rewrite_with`, first in `front::expand`'s tree stage): a query naming a measure
    reads the view's FROM and WHERE with the dimensions it uses and each column its measures read, and each
    measure is its expression over those, grouped by the query's GROUP BY; the base is then written in place
    (`measures::flattened`) unless that could change a name's meaning. Everything after it sees a plain

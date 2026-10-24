@@ -107,11 +107,13 @@ const CASES = [
     'id,run\n1,5\n2,12\n3,21\n'],
   ['syntax error', 'POST', '/sql', 'SELEC 1', 400, '42601', undefined],
   ['CREATE EXTERNAL TABLE refused', 'POST', '/sql', "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'orders.csv'", 501, '0A000', undefined],
+  ['AT refused', 'POST', '/sql', 'FROM orders AT (VERSION => 1)', 501, '0A000', undefined],
   ['a file by name', 'POST', '/sql?format=csv', "SELECT sum(qty) AS s FROM 'orders.csv'", 200, null, 's\n21\n'],
   ['a file by its files/ path', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'files/orders.csv'", 200, null, 'n\n3\n'],
   ['a glob', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'order*.csv'", 200, null, 'n\n3\n'],
   ['PIVOT', 'POST', '/sql?format=csv', 'PIVOT (SELECT name, qty FROM orders) ON name USING sum(qty)', 200, null, 'a,b,c\n5,7,9\n'],
   ['SUMMARIZE', 'POST', '/sql?format=csv', 'SUMMARIZE orders', 200, null, undefined],
+  ['MEASURE without a view', 'POST', '/sql', 'SELECT MEASURE(qty) FROM orders', 404, '42883', undefined],
   ['unknown route', 'GET', '/nowhere', undefined, 404, '0A000', undefined],
 ];
 
