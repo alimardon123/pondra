@@ -16,6 +16,7 @@ pub mod answer;
 pub mod engine;
 pub mod page;
 pub mod text;
+pub mod extension;
 pub mod ext_names;
 pub mod lake_files;
 pub mod sketch;

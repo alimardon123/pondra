@@ -22057,6 +22057,80 @@ def friendly():
     view = sorted((r["g"], r["best"]) for r in sql(A.port, "SELECT g, best FROM best"))
     plus = {r["id"]: r.get("a") for r in sql(A.port, "SELECT id, a FROM plus WHERE id IN (5000, 1)")}
     checks["a stored view and a materialized view over them, read after a write"] = view == sorted(duck.execute("SELECT g, max_by(id, x) FROM t GROUP BY g").fetchall()) and plus == {5000: [8, 9], 1: [2, 2]}
+    # DuckDB's INSTALL and LOAD (extension.rs, ADR-075): a built-in name answers with its notice, any other is refused by name
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    pq_dir = tempfile.mkdtemp(prefix="pondra-ext-")
+    pq = os.path.join(pq_dir, "two.parquet")
+    duck.execute(f"COPY (SELECT 1 AS a UNION ALL SELECT 2) TO '{pq}' (FORMAT parquet)")
+
+    class Ranged(BaseHTTPRequestHandler):  # (a file in pieces, as a bucket serves it: httpfs asks for ranges)
+        def do_HEAD(self):
+            self.serve(False)
+
+        def do_GET(self):
+            self.serve(True)
+
+        def serve(self, body):
+            path = os.path.join(pq_dir, os.path.basename(self.path))
+            if not os.path.isfile(path):
+                return self.send_error(404)
+            data = open(path, "rb").read()
+            m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range") or "")
+            start = int(m.group(1) or 0) if m else 0
+            end = min(int(m.group(2)) if m and m.group(2) else len(data) - 1, len(data) - 1)
+            part = data[start:end + 1]
+            self.send_response(206 if m else 200)
+            self.send_header("Content-Length", str(len(part)))
+            self.send_header("Accept-Ranges", "bytes")
+            if m:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+            self.end_headers()
+            if body:
+                self.wfile.write(part)
+
+        def log_message(self, *args):
+            pass
+
+    files = ThreadingHTTPServer(("127.0.0.1", A.port + 30), Ranged)
+    threading.Thread(target=files.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{A.port + 30}/two.parquet"
+
+    def raw(q):  # (status, headers in lower case, body), as the node answers them
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", "/sql", q.encode())
+        r = c.getresponse()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read().decode()
+
+    said = lambda name, step: f"{name} is built into Pondra: nothing to {step}"
+    sql(A.port, f"CREATE SECRET web (TYPE http, SCOPE 'http://127.0.0.1:{A.port + 30}')")  # (an http(s) read needs a secret that covers its URL)
+    st, hd, body = raw(f"INSTALL httpfs; LOAD httpfs; SELECT count(*) AS n FROM read_parquet('{url}')")
+    checks["INSTALL httpfs; LOAD httpfs; then a file read over HTTP: the query answers, each notice in the header"] = \
+        st == 200 and json.loads(body) == [{"n": 2}] and json.loads(hd.get("x-pondra-notices", "[]")) == [said("httpfs", "install"), said("httpfs", "load")]
+    st, hd, body = raw("FORCE INSTALL json")
+    checks["FORCE INSTALL json alone over HTTP: the command tag, and its notice in the header"] = \
+        st == 200 and json.loads(body) == {"command": "INSTALL"} and json.loads(hd.get("x-pondra-notices", "[]")) == [said("json", "install")]
+    st, hd, body = raw("INSTALL spatial")
+    checks["INSTALL spatial over HTTP: refused by name, naming it and the 1.1 that brings Pondra's own, SQLSTATE 0A000"] = \
+        st != 200 and hd.get("x-pondra-sqlstate") == "0A000" and "spatial" in body and "1.1" in body
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
+        told = []
+        pg.add_notice_handler(lambda n: told.append(n.message_primary))
+        cur = pg.execute("INSTALL httpfs")
+        told += [str(r[0]) for r in cur.fetchall()] if cur.description else []
+        try:
+            pg.execute("INSTALL spatial")
+            refused = None
+        except psycopg.Error as e:
+            refused = e.sqlstate
+    checks["INSTALL httpfs over Postgres: its notice reaches the client (a row or a NOTICE)"] = any(said("httpfs", "install") in t for t in told)
+    checks["INSTALL spatial over Postgres: refused by name, SQLSTATE 0A000"] = refused == "0A000"
+    files.shutdown()
+    shutil.rmtree(pq_dir, ignore_errors=True)
+    # the docs name the built-in names extension.rs has, each one (sql/index.mdx)
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    built = re.findall(r'\("([a-z_]+)", "', open(os.path.join(root, "src", "extension.rs")).read().split("const BUILT_IN")[1].split("];")[0])
+    docs = open(os.path.join(root, "site", "src", "content", "docs", "sql", "index.mdx")).read().split("DuckDB scripts that begin with")[1].split("## The reference")[0]
+    checks["sql/index.mdx names every built-in extension in extension.rs"] = len(built) > 0 and all(f"`{n}`" in docs for n in built)
     for n in nodes:
         n.kill()
     ok = all(checks.values())
