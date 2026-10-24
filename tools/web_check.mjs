@@ -7,7 +7,8 @@
 // repository: `--browser` loads it from the working folder or NODE_PATH, as in
 // `NODE_PATH=/opt/node-tools/node_modules node tools/web_check.mjs --pkg web/pkg --browser`. The lake's checks run when
 // its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
-// lists nothing, each read compared with the node's own answer for the same bytes.
+// lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
+// its files and tables in the origin's private file system) is checked last, with reloads; in Node it is refused by name.
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -72,10 +73,11 @@ function judge(name, answer, want = {}) {
   return text;
 }
 
-// One request of a check; a throw is a failure of that check, not of the run.
-async function ask(name, method, path, headers, body) {
+// One request of a check, to the page object `on` ('pondra', or 'kept' in Chromium); a throw is a failure of that check,
+// not of the run.
+async function ask(name, method, path, headers, body, on = 'pondra') {
   try {
-    return await target.request(method, path, headers, body);
+    return await target.request(method, path, headers, body, on);
   } catch (e) {
     failed.push(name);
     console.error(`${name}: threw ${e}`);
@@ -92,7 +94,11 @@ async function openInNode() {
   const open_ms = Number((performance.now() - t0).toFixed(1));
   return {
     open_ms,
-    request: (method, path, headers, body) => page.request(method, path, headers, body),
+    Page,
+    request: (method, path, headers, body, on = 'pondra') => {
+      if (on !== 'pondra') throw new Error(`Node has no page ${on}: a kept page is in a browser`);
+      return page.request(method, path, headers, body);
+    },
     close: async () => {},
   };
 }
@@ -113,14 +119,13 @@ async function openInBrowser() {
       failed.push(`page error: ${e.message}`);
       console.error(`browser page error: ${e.message}`);
     });
-    await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: wait below)
-    await page.waitForFunction(() => window.ready || window.startError, null, { timeout: 120_000 });
-    const startError = await page.evaluate(() => window.startError);
-    if (startError) throw new Error(`the module did not start in the browser: ${startError}`);
+    await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
+    await untilStarted(page);
     return {
       browser: browser.version(),
+      page,
       open_ms: await page.evaluate(() => window.open_ms),
-      request: (method, path, headers, body) => requestInBrowser(page, method, path, headers, body),
+      request: (method, path, headers, body, on) => requestInBrowser(page, method, path, headers, body, on),
       close: () => closeAll(browser, site),
     };
   } catch (e) {
@@ -129,16 +134,17 @@ async function openInBrowser() {
   }
 }
 
-// One request in the page. A Uint8Array can't cross into the page, so bytes go in as numbers and come back as numbers.
-async function requestInBrowser(page, method, path, headers, body) {
+// One request in the page, to the page object `on` (`window.pondra`, or `window.kept`). A Uint8Array can't cross into the
+// page, so bytes go in as numbers and come back as numbers.
+async function requestInBrowser(page, method, path, headers, body, on = 'pondra') {
   const sent = typeof body === 'string' || body === undefined ? body : Array.from(body);
   const answer = await page.evaluate(
-    async ({ method, path, headers, body }) => {
+    async ({ method, path, headers, body, on }) => {
       const bytes = typeof body === 'string' || body === undefined ? body : new Uint8Array(body);
-      const out = await window.pondra.request(method, path, headers, bytes);
+      const out = await window[on].request(method, path, headers, bytes);
       return { status: out.status, headers: out.headers, body: Array.from(out.body) };
     },
-    { method, path, headers, body: sent },
+    { method, path, headers, body: sent, on },
   );
   return { ...answer, body: Uint8Array.from(answer.body) };
 }
@@ -176,6 +182,7 @@ const PAGE = `<!doctype html>
   try {
     const { default: init, Page } = await import('/pkg/pondra_web.js');
     await init();
+    window.Page = Page; // (for the kept checks: Page.kept is made in the page)
     const t0 = performance.now();
     window.pondra = new Page();
     window.open_ms = Number((performance.now() - t0).toFixed(1));
@@ -220,6 +227,254 @@ async function servePage(req, res) {
 function send(res, status, type, text) {
   res.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
+}
+
+// The rows a kept page's table holds, before and after the INSERT, and the bytes of the file as it was put.
+const KEPT_ROWS = 'id,name\n1,a\n2,b\n3,c\n';
+const KEPT_ROWS_AFTER_INSERT = 'id,name\n1,a\n2,b\n3,c\n9,z\n';
+// The big file of the kept checks: 524,288 rows of `id,text`, a 40-character text, about 24 MiB (made in the page).
+const BIG_ROWS = 524288;
+const BIG_TEXT = 'abcdefghij'.repeat(4);
+
+// Same as `a` and `b`, counted as a check of its own.
+function same(name, got, want) {
+  if (got === want) passed++;
+  else {
+    failed.push(name);
+    console.error(`${name}: ${JSON.stringify(got)} is not ${JSON.stringify(want)}`);
+  }
+}
+
+// What a page's GET /objects must list: its tables' names, sorted, and the rows of the tables given.
+function objectsProblems(j, names, rows = {}) {
+  const found = j.objects ?? [];
+  const problems = [];
+  const listed = found.map((o) => o.name);
+  if (JSON.stringify(listed) !== JSON.stringify(names)) problems.push(`objects ${JSON.stringify(listed)}`);
+  for (const [name, count] of Object.entries(rows)) {
+    const object = found.find((o) => o.name === name);
+    if (object?.rows !== count) problems.push(`${name} rows ${object?.rows}`);
+  }
+  return problems;
+}
+
+// The lake's expected answers (made by tools/web_lake.py), or None when its folder has none.
+async function expectedOf(dir) {
+  try {
+    return JSON.parse(await readFile(join(dir, 'expected.json'), 'utf8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+// Waits until the page's module has started in the browser, or has failed to start (the run then says why). It takes
+// long to start, so this is waited for after each load of the page, the first and each reload.
+async function untilStarted(page) {
+  await page.waitForFunction(() => window.ready || window.startError, null, { timeout: 120_000 });
+  const startError = await page.evaluate(() => window.startError);
+  if (startError) throw new Error(`the module did not start in the browser: ${startError}`);
+}
+
+// `window.kept` is the kept page of `folder`, made in the page. A rejection is one of the run's failures, and the checks
+// that need the page are then left out (the caller stops).
+async function openKept(page, folder) {
+  const error = await page.evaluate(async (folder) => {
+    try {
+      window.kept = await window.Page.kept(folder);
+      return null;
+    } catch (e) {
+      return String(e);
+    }
+  }, folder);
+  if (error) {
+    failed.push(`Page.kept('${folder}')`);
+    console.error(`Page.kept('${folder}'): ${error}`);
+  }
+  return !error;
+}
+
+// The version checks of one file on one page (`on`), the file already put: its etag is read, a second PUT without If-Match
+// is 409, one with the etag read replaces the file (so its etag changes), and one with the old etag is 412.
+async function versionChecks(on, path) {
+  const read = await ask(`GET /files/${path} (${on})`, 'GET', `/files/${path}`, undefined, undefined, on);
+  if (read) judge(`GET /files/${path} (${on})`, read, { status: 200, sqlstate: null, etag: true });
+  const first = read?.headers.etag;
+  const again = await ask(`PUT again without If-Match (${on})`, 'PUT', `/files/${path}`, undefined, 'x\n', on);
+  if (again) {
+    judge(`PUT again without If-Match (${on})`, again, {
+      status: 409, sqlstate: null, type: TEXT,
+      out: `files/${path} is there already: send If-Match with the version you read to replace it, or put it under another name`,
+    });
+  }
+  const replaced = first && (await ask(`PUT with the etag it read (${on})`, 'PUT', `/files/${path}`, { 'If-Match': first }, ORDERS, on));
+  if (replaced) {
+    judge(`PUT with the etag it read (${on})`, replaced, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+    if (replaced.headers.etag === first) {
+      failed.push(`PUT with the etag it read changes the version (${on})`);
+      console.error(`PUT with the etag it read changes the version (${on}): the etag did not change`);
+    } else passed++;
+    const stale = await ask(`PUT with the stale etag (${on})`, 'PUT', `/files/${path}`, { 'If-Match': first }, 'x\n', on);
+    if (stale) {
+      judge(`PUT with the stale etag (${on})`, stale, {
+        status: 412, sqlstate: null, type: TEXT,
+        out: `files/${path}: the file changed since it was opened: open it again, or save under another name`,
+      });
+    }
+  }
+}
+
+// In Node there is no origin's private file system, so `Page.kept` is refused by name: the kept checks are left out.
+async function keptRefused(Page) {
+  const refused = await Page.kept().then(() => null, (e) => String(e));
+  if (refused?.includes('OPFS')) passed++;
+  else {
+    failed.push('Page.kept() in Node');
+    console.error(`Page.kept() in Node: ${refused ?? 'it was not refused'}`);
+  }
+  report.kept = 'left out: Node has no OPFS';
+}
+
+// The kept page in Chromium (`Page.kept`): its files and tables are kept in the origin's private file system, so they are
+// there after a reload, and a large file is read by ranges, not whole. It runs last among the checks: a reload runs the
+// page's script again, so `window.pondra` is then a new memory page.
+async function keptChecks(page, lake) {
+  const expected = await expectedOf(lake);
+  // (a folder left by an earlier run is removed first)
+  await page.evaluate(async () => {
+    try {
+      await (await navigator.storage.getDirectory()).removeEntry('pondra-check', { recursive: true });
+    } catch (e) {
+      if (e.name !== 'NotFoundError') throw e;
+    }
+  });
+  if (!(await openKept(page, 'pondra-check'))) return;
+
+  // (a) Files put, and tables made from them and changed by SQL.
+  const kput = await ask('kept: PUT /files/k.csv', 'PUT', '/files/k.csv', undefined, KEPT_ROWS, 'kept');
+  if (kput) judge('kept: PUT /files/k.csv', kput, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+  for (const [name, text] of [
+    ['kept: CREATE TABLE k AS FROM k.csv', "CREATE TABLE k AS FROM 'k.csv'"],
+    ['kept: INSERT INTO k', "INSERT INTO k VALUES (9, 'z')"],
+    ['kept: CREATE TABLE "a{b}"', 'CREATE TABLE "a{b}" AS SELECT 1 AS x'],
+  ]) {
+    const made = await ask(name, 'POST', '/sql', undefined, text, 'kept');
+    if (made) judge(name, made, { status: 200, sqlstate: null });
+  }
+  const before = await ask('kept: SELECT * FROM k', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM k ORDER BY id', 'kept');
+  if (before) judge('kept: SELECT * FROM k', before, { status: 200, sqlstate: null, out: KEPT_ROWS_AFTER_INSERT });
+  const etagBefore = await ask('kept: GET /files/k.csv', 'GET', '/files/k.csv', undefined, undefined, 'kept');
+  if (etagBefore) {
+    judge('kept: GET /files/k.csv', etagBefore, { status: 200, sqlstate: null, type: 'text/csv; charset=utf-8', etag: true, out: KEPT_ROWS });
+  }
+  // The big file is made in the page and put there, so its bytes never cross from Node.
+  const big = await page.evaluate(async ({ rows, text }) => {
+    const lines = new Array(rows);
+    for (let i = 0; i < rows; i++) lines[i] = `${i + 1},${text}\n`;
+    const bytes = new TextEncoder().encode(`id,text\n${lines.join('')}`);
+    const out = await window.kept.request('PUT', '/files/big.csv', {}, bytes);
+    return { status: out.status, headers: out.headers, body: Array.from(out.body), size: bytes.length };
+  }, { rows: BIG_ROWS, text: BIG_TEXT });
+  judge('kept: PUT /files/big.csv', { ...big, body: Uint8Array.from(big.body) }, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+  if (expected) {
+    // The lake's Parquet file, put as given: the kept page reads it by its name.
+    const parquet = await readFile(join(lake, 'orders', expected.file.name));
+    const oput = await ask('kept: PUT /files/o.parquet', 'PUT', '/files/o.parquet', undefined, parquet, 'kept');
+    if (oput) judge('kept: PUT /files/o.parquet', oput, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+    const counted = await ask('kept: count of o.parquet', 'POST', '/sql?format=csv', undefined, "SELECT count(*) AS n FROM 'o.parquet'", 'kept');
+    if (counted) judge('kept: count of o.parquet', counted, { status: 200, sqlstate: null, out: expected.file.out });
+  }
+
+  // (b) The version checks on the kept page, on a file of its own, and a PUT with If-Match on a missing file is 412.
+  const vput = await ask('kept: PUT /files/v.csv', 'PUT', '/files/v.csv', undefined, ORDERS, 'kept');
+  if (vput) judge('kept: PUT /files/v.csv', vput, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
+  await versionChecks('kept', 'v.csv');
+  const noFile = await ask('kept: PUT with If-Match on a missing file', 'PUT', '/files/nothere.csv', { 'If-Match': '"v"' }, 'x\n', 'kept');
+  if (noFile) judge('kept: PUT with If-Match on a missing file', noFile, { status: 412, sqlstate: null, type: TEXT });
+
+  // (c) A reload: the page's script runs again, and the kept page is made again from its folder.
+  await page.reload({ waitUntil: 'commit' });
+  await untilStarted(page);
+  if (!(await openKept(page, 'pondra-check'))) return;
+  const after = await ask('kept after reload: SELECT * FROM k', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM k ORDER BY id', 'kept');
+  if (after && before) judge('kept after reload: SELECT * FROM k', after, { status: 200, sqlstate: null, out: dec.decode(before.body) });
+  const letters = await ask('kept after reload: FROM "a{b}"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a{b}"', 'kept');
+  if (letters) judge('kept after reload: FROM "a{b}"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
+  const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
+  if (listed) {
+    judge('kept after reload: GET /objects', listed, {
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}', 'k'], { k: 4 }),
+    });
+  }
+  if (expected) {
+    const counted = await ask('kept after reload: count of o.parquet', 'POST', '/sql?format=csv', undefined, "SELECT count(*) AS n FROM 'o.parquet'", 'kept');
+    if (counted) judge('kept after reload: count of o.parquet', counted, { status: 200, sqlstate: null, out: expected.file.out });
+  }
+  const etagAfter = await ask('kept after reload: GET /files/k.csv', 'GET', '/files/k.csv', undefined, undefined, 'kept');
+  if (etagAfter) {
+    judge('kept after reload: GET /files/k.csv', etagAfter, { status: 200, sqlstate: null, etag: true, out: KEPT_ROWS });
+    if (etagBefore) same('kept after reload: k.csv keeps its etag', etagAfter.headers.etag, etagBefore.headers.etag);
+  }
+
+  // (d) Read as asked, not whole: a LIMIT 1 over the big file slices less than half of its bytes, since the scan stops at
+  // the limit. Each slice's size is added up while the read runs; the slice is restored after, however the read ends.
+  const limited = await page.evaluate(async () => {
+    const slice = Blob.prototype.slice;
+    let read = 0;
+    Blob.prototype.slice = function (...args) {
+      const part = slice.apply(this, args);
+      read += part.size;
+      return part;
+    };
+    try {
+      const out = await window.kept.request('POST', '/sql?format=csv', {}, "SELECT * FROM 'big.csv' LIMIT 1");
+      return { status: out.status, headers: out.headers, body: Array.from(out.body), read };
+    } finally {
+      Blob.prototype.slice = slice;
+    }
+  });
+  judge('kept: SELECT * FROM big.csv LIMIT 1', { ...limited, body: Uint8Array.from(limited.body) }, {
+    status: 200, sqlstate: null, out: `id,text\n1,${BIG_TEXT}\n`,
+  });
+  const bigBytes = big.size;
+  if (limited.read * 2 < bigBytes) passed++;
+  else {
+    failed.push('kept: LIMIT 1 reads less than half of big.csv');
+    console.error(`kept: LIMIT 1 read ${limited.read} of ${bigBytes} bytes`);
+  }
+  report.kept_bytes_read = `${limited.read} of ${bigBytes} for LIMIT 1`;
+
+  // (e) A file removed and a table dropped: after a reload, neither is there.
+  const removed = await ask('kept: DELETE /files/k.csv', 'DELETE', '/files/k.csv', undefined, undefined, 'kept');
+  if (removed) judge('kept: DELETE /files/k.csv', removed, { status: 200, sqlstate: null, type: JSON_TYPE, out: '{"removed":"files/k.csv"}' });
+  const dropped = await ask('kept: DROP TABLE k', 'POST', '/sql', undefined, 'DROP TABLE k', 'kept');
+  if (dropped) judge('kept: DROP TABLE k', dropped, { status: 200, sqlstate: null });
+  await page.reload({ waitUntil: 'commit' });
+  await untilStarted(page);
+  if (!(await openKept(page, 'pondra-check'))) return;
+  const droppedList = await ask('kept after the drop: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
+  if (droppedList) {
+    judge('kept after the drop: GET /objects', droppedList, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}']) });
+  }
+  const gone = await ask('kept after the drop: GET /files/k.csv', 'GET', '/files/k.csv', undefined, undefined, 'kept');
+  if (gone) judge('kept after the drop: GET /files/k.csv', gone, { status: 404, sqlstate: null, type: TEXT, out: 'no such file: files/k.csv' });
+
+  // (f) A folder name that is a path, or that reaches out of the page's folder, is refused by name.
+  for (const folder of ['a/b', '..']) {
+    const refused = await page.evaluate(async (folder) => {
+      try {
+        await window.Page.kept(folder);
+        return null;
+      } catch (e) {
+        return String(e);
+      }
+    }, folder);
+    if (refused?.includes('folder name')) passed++;
+    else {
+      failed.push(`Page.kept('${folder}') is refused by name`);
+      console.error(`Page.kept('${folder}'): ${refused ?? 'it was not refused'}`);
+    }
+  }
 }
 
 const target = IN_BROWSER ? await openInBrowser() : await openInNode();
@@ -281,31 +536,8 @@ if (missing) judge('GET a missing file', missing, { status: 404, sqlstate: null,
 const versions = await ask('GET ?versions refused', 'GET', '/files/orders.csv?versions');
 if (versions) judge('GET ?versions refused', versions, { status: 501, sqlstate: '0A000' });
 
-// A second PUT without If-Match is 409 in the node's words, with no SQLSTATE. With the etag the first PUT gave, quotes
-// and all, it replaces the file and the version changes; with that first etag again it is 412.
-const again = await ask('PUT again without If-Match', 'PUT', '/files/orders.csv', undefined, 'x\n');
-if (again) {
-  judge('PUT again without If-Match', again, {
-    status: 409, sqlstate: null, type: TEXT,
-    out: 'files/orders.csv is there already: send If-Match with the version you read to replace it, or put it under another name',
-  });
-}
-const first = put?.headers.etag;
-const replaced = first && (await ask('PUT with the etag', 'PUT', '/files/orders.csv', { 'If-Match': first }, ORDERS));
-if (replaced) {
-  judge('PUT with the etag it read', replaced, { status: 200, sqlstate: null, type: JSON_TYPE, etag: true });
-  if (replaced.headers.etag === first) {
-    failed.push('PUT with the etag it read changes the version');
-    console.error('PUT with the etag it read changes the version: the etag did not change');
-  } else passed++;
-  const stale = await ask('PUT with the stale etag', 'PUT', '/files/orders.csv', { 'If-Match': first }, 'x\n');
-  if (stale) {
-    judge('PUT with the stale etag', stale, {
-      status: 412, sqlstate: null, type: TEXT,
-      out: 'files/orders.csv: the file changed since it was opened: open it again, or save under another name',
-    });
-  }
-}
+// The version checks of orders.csv, put above, on the memory page (`versionChecks`, below).
+await versionChecks('pondra', 'orders.csv');
 
 // DELETE answers the node's JSON, and the file is gone: FROM 'names.csv' is 42P01, and the table made from it stays.
 const removed = await ask('DELETE /files/names.csv', 'DELETE', '/files/names.csv');
@@ -317,11 +549,13 @@ if (read_gone) judge("FROM 'names.csv' after its DELETE", read_gone, { status: 4
 const kept = await ask('FROM names after its file is gone', 'POST', '/sql?format=csv', undefined, 'FROM names ORDER BY id');
 if (kept) judge('FROM names after its file is gone', kept, { status: 200, sqlstate: null, out: 'id,label\n1,x\n3,z\n' });
 
-// Tables by SQL: CREATE TABLE makes an empty one, which takes no INSERT (a page's SQL has no DML).
+// Tables by SQL: CREATE TABLE makes an empty one, and INSERT adds its rows (a page's own tables take DML).
 const empty = await ask('CREATE TABLE t (a INT)', 'POST', '/sql', undefined, 'CREATE TABLE t (a INT)');
 if (empty) judge('CREATE TABLE t (a INT)', empty, { status: 200, sqlstate: null });
-const insert = await ask('INSERT INTO t refused', 'POST', '/sql', undefined, 'INSERT INTO t VALUES (1)');
-if (insert) judge('INSERT INTO t refused', insert, { status: 501, sqlstate: '0A000' });
+const insert = await ask('INSERT INTO t', 'POST', '/sql', undefined, 'INSERT INTO t VALUES (1)');
+if (insert) judge('INSERT INTO t', insert, { status: 200, sqlstate: null });
+const inserted = await ask('count of t after its INSERT', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) AS n FROM t');
+if (inserted) judge('count of t after its INSERT', inserted, { status: 200, sqlstate: null, out: 'n\n1\n' });
 
 // GET /objects lists the tables as a node does, sorted, and says where SQL reads a relative file from.
 const objects = await ask('GET /objects', 'GET', '/objects');
@@ -472,13 +706,8 @@ function stop(web) {
 // the node's own answer for the same bytes (expected.json). The latest version is read first: the page keeps what it
 // read, and `Object.keys` would put "0", "1", ... first.
 async function lakeChecks(dir) {
-  let expected;
-  try {
-    expected = JSON.parse(await readFile(join(dir, 'expected.json'), 'utf8'));
-  } catch (e) {
-    if (e.code === 'ENOENT') return;
-    throw e;
-  }
+  const expected = await expectedOf(dir);
+  if (!expected) return;
   const web = await serveFolder(dir);
   const nobody = await closedPort(); // (not port 1: a browser refuses to ask it at all, so nothing would be tried)
   const hidden = await serveFolder(dir, { hidden: true, sendsRange: IN_BROWSER });
@@ -533,8 +762,13 @@ async function lakeChecks(dir) {
   await stop(hidden);
 }
 
-await lakeChecks(lake);
-await target.close();
+try {
+  await lakeChecks(lake);
+  if (IN_BROWSER) await keptChecks(target.page, lake);
+  else await keptRefused(target.Page);
+} finally {
+  await target.close();
+}
 const result = {
   ok: failed.length === 0, checks: passed, failed, open_ms: target.open_ms, series_10m_ms, wasm_bytes: wasm.length,
   browser: target.browser, // (absent in Node: JSON leaves out an undefined value)

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 mod fetch;
+mod js;
+mod opfs;
 
 #[wasm_bindgen]
 extern "C" {
@@ -24,13 +26,27 @@ impl Page {
     /// object needs it (an `ETag` it hides is only left out of the object's meta).
     #[wasm_bindgen(constructor)]
     pub fn new() -> Page {
-        static HOOK: std::sync::Once = std::sync::Once::new();
-        HOOK.call_once(|| std::panic::set_hook(Box::new(|p| error(&p.to_string())))); // (a panic says why, not just "unreachable")
-        let options = pondra::page::Options {
-            web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
-            ..Default::default()
-        };
-        Page(pondra::page::Page::open(&options))
+        set_panic_hook();
+        Page(pondra::page::Page::open(&options(None)))
+    }
+
+    /// A page kept in the origin's private file system (OPFS): its files and its tables are kept in the folder `folder`
+    /// (`"pondra"` when none is given), so what it had is there again after a reload. Two pages on one origin given one
+    /// folder share it, one writer at a time. `new Page()` keeps nothing. Without OPFS (Node, or a browser without it)
+    /// this rejects, before anything is read.
+    #[wasm_bindgen(js_name = kept)]
+    pub async fn kept(folder: Option<String>) -> Result<Page, JsValue> {
+        set_panic_hook();
+        let folder = folder.unwrap_or_else(|| "pondra".into());
+        check_folder(&folder)?;
+        if !opfs::available() {
+            return Err(JsValue::from_str(
+                "this page has no private file system (OPFS): Page.kept needs navigator.storage.getDirectory",
+            ));
+        }
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(opfs::Opfs::new(folder));
+        let page = pondra::page::Page::kept(&options(Some(store))).await;
+        Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?))
     }
 
     /// One request, as to a node (ADR-061's contract): `request('POST', '/sql?format=csv', {}, 'FROM t')`,
@@ -80,4 +96,32 @@ impl Default for Page {
     fn default() -> Self {
         Page::new()
     }
+}
+
+/// A page's options: it reads the web through `fetch` (`fetch.rs`) and keeps its files and tables in `store` (none is
+/// memory, as `new` has it; OPFS is `kept`'s).
+fn options(store: Option<Arc<dyn object_store::ObjectStore>>) -> pondra::page::Options {
+    pondra::page::Options {
+        web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
+        store,
+        ..Default::default()
+    }
+}
+
+/// Sets the panic hook once: a panic says why, not just "unreachable".
+fn set_panic_hook() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| std::panic::set_hook(Box::new(|p| error(&p.to_string()))));
+}
+
+/// A page's folder is one name in the origin's private file system: not empty, not `.` or `..`, and with no `/` or `\`
+/// (a path would reach past the page's folder). Refused by name.
+fn check_folder(folder: &str) -> Result<(), JsValue> {
+    let bad = folder.is_empty() || folder == "." || folder == ".." || folder.contains(['/', '\\']);
+    if bad {
+        return Err(JsValue::from_str(&format!(
+            "{folder:?} is no folder name: a page's folder is one name, not empty, '.' or '..', and with no '/' or '\\'"
+        )));
+    }
+    Ok(())
 }
