@@ -191,7 +191,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   so data is queryable the moment it commits.
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
-  and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
+  and window emission), `g/` the expiry of producers' marks (`g/{due}/{producer}` → its seq; `g/~old` the pass that
+  keyed marks from before expiries), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
   secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
   (round 34: only the sequencer writes them), `ix/` indexes (round 34), `ty/` types (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
@@ -2946,6 +2947,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    LRU of parsed entries by key (256, 16 MB of raw bytes), a hit when the bytes are the ones it was parsed from. A
    per-request read of one table's entry goes through `cat.meta`, not `cat.get::<TableMeta>`; whole scans of every
    entry, writes and restarts parse as before. `cargo test --lib store::`.
+430. **A write's retry mark goes once no resend can come** (`store::kept_ms`, `log::Producers`): a job a client named
+   is remembered for `copy::retention_ms` (64 days), an `auto-` id (`log::auto_job`, and the Python and JS clients'
+   own), a transaction's COMMIT and a COPY's chunks for `store::retry_ms` (twice the lock lease); every other producer
+   is kept for good. A mark goes by the expiry key it was committed with, only while its seq still matches, never in a
+   sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave a commit quiet.
+   A new kind of producer names its window in `kept_ms`. `cargo test --lib log:: store::`, harness `writes`.
+431. **A table version's planning facts are worked out once** (`query::facts`): its read schema, manifest list, ranges,
+   statistics and `hot::known`, kept by the parsed entry's `Arc` (a hit only while its `Weak` upgrades to that same
+   `Arc`) and whether system columns are in. `table_view` takes the catalog's `Arc`; a meta of a caller's own goes
+   through `table_view_once`, which keeps nothing. No query copies a table's whole entry on the plain scan path.
+   `cargo test --lib query::`, harness `scale`.
 ## Tests: run these before and after any change
 
 ```bash

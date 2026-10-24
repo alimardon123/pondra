@@ -613,7 +613,7 @@ async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
 }
 
 /// A page's table: its rows a `MemTable`, and what the join order needs to know of them, worked out the first time it
-/// asks (as `query::Pruned::stats` is). The rule asks only when three or more inputs are joined, so a table never joined
+/// asks (as `query::Pruned::sized` is). The rule asks only when three or more inputs are joined, so a table never joined
 /// so costs its load nothing. A write (INSERT, UPDATE, DELETE) goes to the rows; the statistics it leaves stale are
 /// worked out again, because the table is registered again after the write (`written`).
 #[derive(Debug)]

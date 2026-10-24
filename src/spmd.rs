@@ -506,16 +506,17 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
     let views = crate::query::stored_views(lake, &s.sql, false).await?;
     let text = views.iter().fold(s.sql.clone(), |t, (_, v)| format!("{t} {v}"));
     let deleted = crate::query::names_deleted(&text); // (as `session_at` decides)
-    let sys = |m: TableMeta| if crate::sys::mentioned(&text) { crate::sys::with_sys(&m) } else { m }; // (a query naming `_row_id`: its tables get their system columns, as `session_at` gives them)
+    let sys_cols = crate::sys::mentioned(&text); // (a query naming `_row_id`: its tables get their system columns, as `session_at` gives them)
+    let sys = |m: TableMeta| if sys_cols { crate::sys::with_sys(&m) } else { m };
     {
         for (t, meta) in &s.whole {
-            let meta = &sys(meta.clone());
-            let mut inner = crate::query::named(&ctx, crate::query::table_view(lake, &ctx, t, meta, Some(s.upto)).await?, meta, deleted)?;
+            let meta = Arc::new(sys(meta.clone()));
+            let mut inner = crate::query::named(&ctx, crate::query::table_view_once(lake, &ctx, t, meta.clone(), Some(s.upto)).await?, &meta, deleted)?;
             if let Some(h) = &meta.history {
-                inner = crate::views::history_view(&ctx, inner, h, crate::sys::mentioned(&text)).await?; // (as `session_at` reads it)
+                inner = crate::views::history_view(&ctx, inner, h, sys_cols).await?; // (as `session_at` reads it)
             }
             ctx.deregister_table(table_ref(t))?;
-            ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(meta) }))?;
+            ctx.register_table(table_ref(t), Arc::new(WholeTable { inner, name: t.clone(), size: totals(&meta) }))?;
         }
     }
     {
@@ -537,16 +538,26 @@ async fn shared(lake: &Lake, s: &Slice) -> Result<(SessionContext, datafusion::p
         }
     }
     for p in &s.parts {
-        let meta: TableMeta = sys(crate::ext::meta(lake, &p.table).await?.context("no table")?);
         let (after, upto) = p.tail.unwrap_or((0, 0)); // (0, 0): no tail
-        let schema = crate::query::read_schema(&meta.columns)?;
-        let share = Some(totals(&meta));
-        // The whole table's ranges, not this slice's: every node has to plan the query alike.
-        let ranges = crate::manifest::ranges(&p.table, &crate::manifest::list(lake, &meta).await?, &meta.files, &schema);
+        // The whole table's facts (its schema, manifests, ranges and statistics), not this slice's: every node has to plan
+        // the query alike. A table of the lake is the catalog's entry (kept per version); an ext table's is made here.
+        let whole: Arc<TableMeta> = match crate::ext_names::is(&p.table) {
+            true => Arc::new(crate::ext::meta(lake, &p.table).await?.context("no table")?),
+            false => lake.cat.meta(&table_key(&p.table)).await?.context("no table")?,
+        };
+        let facts = match crate::ext_names::is(&p.table) {
+            true => Arc::new(crate::query::facts_once(lake, &whole, sys_cols).await?),
+            false => crate::query::facts(lake, &whole, sys_cols).await?,
+        };
+        let base = match sys_cols {
+            true => Arc::new(crate::sys::with_sys(&whole)),
+            false => whole,
+        };
+        let share = Some(totals(&base));
         let purges = if p.purged > 0 { vec![(p.purged, 0)] } else { vec![] };
-        let meta = TableMeta { files: p.files.clone(), tiered: after, purges, ..meta };
         // (a range's column is a stored name, as the files and the slice's scan know it: `ranges::named`)
-        let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), schema, share, ranges, range: p.range.clone(), stats: Default::default() };
+        let meta = Arc::new(TableMeta { files: p.files.clone(), tiered: after, purges, ..(*base).clone() });
+        let pruned = Pruned { lake: lake.arc(), name: p.table.clone(), meta: meta.clone(), facts, manifests: Some(p.manifests.clone()), upto: Some(upto), at: Some(s.upto), share, range: p.range.clone(), own: Default::default() };
         let table = crate::query::named(&ctx, Arc::new(pruned), &meta, deleted)?;
         ctx.deregister_table(table_ref(&p.table))?;
         ctx.register_table(table_ref(&p.table), table)?;
