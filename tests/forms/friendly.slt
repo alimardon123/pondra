@@ -1,0 +1,36 @@
+# Friendly SQL (friendly.rs), the same on every form: FROM first, GROUP BY ALL, ORDER BY ALL, EXCLUDE, FETCH FIRST,
+# list comprehensions and a select's alias in its WHERE.
+statement ok
+CREATE TABLE f (g TEXT, x INT)
+
+statement ok
+INSERT INTO f VALUES ('a', 1), ('a', 2), ('b', 5)
+
+query TI
+FROM f SELECT g, sum(x) GROUP BY ALL ORDER BY ALL
+----
+a 3
+b 5
+
+query T rowsort
+SELECT * EXCLUDE (x) FROM f
+----
+a
+a
+b
+
+query I
+SELECT x FROM f ORDER BY x DESC FETCH FIRST 2 ROWS ONLY
+----
+5
+2
+
+query T
+SELECT [y * 2 FOR y IN [1, 2, 3] IF y > 1]::text
+----
+[4, 6]
+
+query I
+SELECT x * 10 AS big FROM f WHERE big > 20 ORDER BY big
+----
+50

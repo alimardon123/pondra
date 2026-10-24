@@ -79,6 +79,13 @@ def records(path):
                     i += 1
             if not skip:
                 out.append((words[0], words[1:], "\n".join(body), expected, start))
+        elif words[0] == "put":  # (forms_check.py's: a file given to the form, its lines up to a blank line)
+            body = []
+            while i < len(lines) and lines[i].strip():
+                body.append(lines[i])
+                i += 1
+            if not skip:
+                out.append(("put", words[1:], "\n".join(body) + "\n", [], start))
         elif words[0] == "include":
             out.extend(records(os.path.join(os.path.dirname(path), words[1])))
         # (halt, control, hash-threshold, sleep, system: not run)
@@ -236,9 +243,14 @@ def plain(d, places, rounded=True):
 
 def answer(port, sql, spread, headers):
     """The query's rows as the file writes them, or raises with Pondra's error."""
-    import pyarrow as pa
     path = "/sql?format=arrow" + ("&spread=1" if spread else "")
-    data = harness.call(port, "POST", path, sql.encode(), timeout=A.timeout, headers=headers)
+    return printed(harness.call(port, "POST", path, sql.encode(), timeout=A.timeout, headers=headers))
+
+
+def printed(data):
+    """An answer's rows as the file writes them: `data` is its Arrow stream's bytes, or the JSON of a statement's
+    answer (`forms_check.py` judges every form's answers with it too)."""
+    import pyarrow as pa
     if isinstance(data, dict) and isinstance(data.get("rows", data.get("copied")), int):
         return [[str(data.get("rows", data.get("copied")))]]  # (rows written: DataFusion answers with their count)
     if isinstance(data, (dict, list)):
