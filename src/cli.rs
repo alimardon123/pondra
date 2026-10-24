@@ -2,6 +2,7 @@
 use crate::*;
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use std::io::Write;
 use std::sync::Arc;
 
 /// Pondra: a streamhouse in one binary. With no command, a SQL shell on a lake.
@@ -317,7 +318,28 @@ fn on_network(addr: &str, others: [&Option<String>; 3]) -> bool {
     !loopback(addr) || others.iter().any(|a| a.as_deref().is_some_and(|a| !loopback(a)))
 }
 
+/// SlateDB reports what its background work cannot do (the collector's passes, the compactor's) as `log`
+/// records, and the program installed no logger: those errors went nowhere. The command says them on
+/// stderr. A library's host owns its own logging, so `pondra.open()` and the C ABI set none.
+struct ErrorLines;
+
+impl ::log::Log for ErrorLines {
+    fn enabled(&self, record: &::log::Metadata) -> bool { record.level() == ::log::Level::Error }
+    fn log(&self, record: &::log::Record) {
+        if self.enabled(record.metadata()) {
+            // (not `eprintln!`: a closed stderr must not panic a SlateDB task)
+            let _ = writeln!(std::io::stderr(), "{}: {}", record.target(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static ERROR_LINES: ErrorLines = ErrorLines;
+
 pub fn main() {
+    if ::log::set_logger(&ERROR_LINES).is_ok() {
+        ::log::set_max_level(::log::LevelFilter::Error);
+    }
     if std::env::args().nth(1).as_deref() == Some("service") && std::env::args().nth(2).as_deref() == Some("run") {
         service::run_from_manager(); // (what a service manager starts: becomes the node)
     }
