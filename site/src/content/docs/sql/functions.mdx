@@ -709,8 +709,7 @@ A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3
   `hive_partitioning`.
 - `comment => '#'` (`read_csv`) skips the lines that start with it.
 - `new_line => '\r'` (`read_csv`) is only needed for files whose lines end in `\r`.
-- `all_varchar => true` (`read_csv`) reads every column as text, with no type inference. `COPY INTO` reads a CSV
-  this way, and casts each value to its column as it inserts it.
+- `all_varchar => true` (`read_csv`) reads every column as text, with no type inference.
 
 An option Pondra doesn't know is an error that lists the ones it does. A bare quoted name in
 `FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.
