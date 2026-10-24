@@ -189,18 +189,29 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
 /// What Postgres reads by a uuid's type, read so where SQL comes in, at every door (`types::rewrite`): a
 /// string compared with a uuid, or written into a uuid column (`VALUES`, `SET`), is a uuid (`id = 'A0EE…'`
 /// finds `a0ee…`, as the column holds it, and `SET id = 'A0EE…'` writes it so), and
-/// `pg_typeof(x)` of one is 'uuid' (the planner sees text). Only for a statement with such a string or
-/// a `pg_typeof`; whether it changed anything.
+/// `pg_typeof(x)` of one is 'uuid' (the planner sees text). A string compared with a jsonb column is read as
+/// jsonb's text (`doc = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`), and one that isn't JSON is refused 22P02.
+/// Only for a statement with such a string, a `pg_typeof`, a JSON maker or a `||`: for jsonb, a document (a string that
+/// starts with `{` or `[`, after JSON's spaces) compared by equality, so a scalar string such as `'1e2'` is left as
+/// written unless the statement is traced for another reason. Whether it changed anything.
 pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::types::uuid_of(s).is_ok());
+    // (a document compared by equality, `doc = '{…}'`, `'[…]' <> doc`, `doc IN ('{…}')`, as `text::names_a_type` lets in; a
+    // document written into a column is held as its column says, `defaults::fit`)
+    let document = |e: &Expr| string(e).is_some_and(|s| s.trim_start_matches(crate::pg_json::JSON_SPACE).starts_with(['{', '[']));
+    let compares_document = |e: &Expr| match e {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } | Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => document(left) || document(right),
+        Expr::InList { list, .. } => list.iter().any(document),
+        _ => false,
+    };
     let maker = |e: &Expr| matches!(e, Expr::Function(f) if MAKERS.contains(&object(&f.name).as_str()));
     let is_concat = |e: &Expr| matches!(e, Expr::BinaryOp { op: ast::BinaryOperator::StringConcat, .. });
     // (a `||` is read as jsonb's when JSON is in its text, or when a relation it names has a json or jsonb column: plain
     // text concatenation over other columns reads nothing more than the names it has)
     let (mut trigger, mut concatenates, mut json) = (false, false, false);
     let _ = ast::visit_expressions(stmt, |e| {
-        trigger |= asks(e) || spelled(e) || maker(e);
+        trigger |= asks(e) || spelled(e) || compares_document(e) || maker(e);
         concatenates |= is_concat(e);
         json |= visibly_json(e);
         ControlFlow::<()>::Continue(())
@@ -226,9 +237,11 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
     if let Some(refusal) = t.refused.into_inner() {
         return Err(refusal);
     }
+    // (read before anything changes, so a string that isn't JSON is refused with the statement as it was)
+    let jsonb = jsonb_texts(stmt, &t.jsonb_strings.into_inner())?;
     let (asked, compared) = (t.typeof_.into_inner(), t.strings.into_inner());
     let (wraps, rows, aggregates, concats) = (t.wraps.into_inner(), t.rows.into_inner(), t.aggregates.into_inner(), t.concats.into_inner());
-    if asked.is_empty() && compared.is_empty() && wraps.is_empty() && rows.is_empty() && aggregates.is_empty() && concats.is_empty() {
+    if asked.is_empty() && compared.is_empty() && jsonb.is_empty() && wraps.is_empty() && rows.is_empty() && aggregates.is_empty() && concats.is_empty() {
         return Ok(false);
     }
     // (`pg_typeof(id)` becomes 'uuid', whose own name would be `Utf8("uuid")`: `names_kept` names it as written)
@@ -239,7 +252,7 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
             let to = match asked.iter().find(|(p, _)| *p == place) {
                 Some((_, ty)) => Some(ty.name().to_string()),
                 None if compared.contains(&place) => string(e).and_then(|s| crate::types::uuid_of(s).ok()),
-                None => None,
+                None => jsonb.iter().find(|(p, _)| *p == place).map(|(_, text)| text.clone()),
             };
             if let Some(to) = to.filter(|to| string(e) != Some(to.as_str())) {
                 *e = Expr::value(Value::SingleQuotedString(to));
@@ -250,6 +263,22 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
         });
         changed
     }))
+}
+
+/// The jsonb text each string noted at `places` reads as (`pg_json_make::jsonb_text`), by place: what Postgres reads
+/// `j = '…'` as. A string that isn't JSON is refused (22P02, or 54001 past the depth limit), as Postgres refuses it.
+fn jsonb_texts(stmt: &Statement, places: &[usize]) -> anyhow::Result<Vec<(usize, String)>> {
+    if places.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut texts = vec![];
+    let _ = ast::visit_expressions(stmt, |e| {
+        if let Some(s) = string(e).filter(|_| places.contains(&at(e))) {
+            texts.push((at(e), crate::pg_json_make::jsonb_text(s).map_err(anyhow::Error::from)));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    texts.into_iter().map(|(place, text)| text.map(|text| (place, text))).collect()
 }
 
 /// Changes the expression at `place` as the JSON makers' notes say (`Trace::maker`) and as `||`'s note says (`Trace::concat`).
@@ -505,6 +534,8 @@ struct Trace<'a> {
     typeof_: RefCell<Vec<(usize, Ty)>>,
     /// The string literals read as uuids (compared with one, or written into one), by place.
     strings: RefCell<Vec<usize>>,
+    /// The string literals compared with a jsonb column (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`), by place: each is read as jsonb's text.
+    jsonb_strings: RefCell<Vec<usize>>,
     /// The JSON makers' JSON arguments, by place, with their type: each is wrapped as its type prints it.
     wraps: RefCell<Vec<(usize, Ty)>>,
     /// The JSON makers' whole-row arguments, by place: each becomes `pondra_row` of its relation's columns.
@@ -519,7 +550,7 @@ struct Trace<'a> {
 
 impl<'a> Trace<'a> {
     fn new(known: &'a Known) -> Self {
-        Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default(), wraps: Default::default(), rows: Default::default(), aggregates: Default::default(), concats: Default::default(), refused: Default::default() }
+        Trace { known, ctes: Default::default(), params: Default::default(), typeof_: Default::default(), strings: Default::default(), jsonb_strings: Default::default(), wraps: Default::default(), rows: Default::default(), aggregates: Default::default(), concats: Default::default(), refused: Default::default() }
     }
 
     /// The columns `stmt` answers: a query's, or a write's RETURNING.
@@ -802,7 +833,8 @@ impl<'a> Trace<'a> {
         same(rels.iter().filter(|r| q.is_none_or(|q| r.names.iter().any(|n| n == q))).filter_map(|r| r.cols.as_ref()?.iter().find(|(n, _)| n == c).map(|(_, t)| *t)))
     }
 
-    /// The parameters and strings a uuid is compared with in a condition: `c = $1`, `'…' <> c`, `c IN ($1, '…')`.
+    /// The parameters and strings a uuid is compared with in a condition: `c = $1`, `'…' <> c`, `c IN ($1, '…')`. The strings
+    /// a jsonb is compared with by equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`) are noted too (`jsonb_string`).
     fn compared(&self, e: &Expr, rels: &[Rel]) {
         use ast::BinaryOperator as Op;
         match e {
@@ -811,15 +843,32 @@ impl<'a> Trace<'a> {
                 self.compared(right, rels);
             }
             Expr::BinaryOp { left, op: Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq, right } | Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+                let equality = !matches!(e, Expr::BinaryOp { op: Op::Lt | Op::LtEq | Op::Gt | Op::GtEq, .. });
                 for (a, b) in [(left, right), (right, left)] {
-                    if (param(b).is_some() || string(b).is_some()) && self.expr(a, rels) == Some(Ty::Uuid) {
-                        self.uuid(b);
+                    if param(b).is_none() && string(b).is_none() {
+                        continue;
+                    }
+                    match self.expr(a, rels) {
+                        Some(Ty::Uuid) => self.uuid(b),
+                        Some(Ty::Jsonb) if equality => self.jsonb_string(b),
+                        _ => {}
                     }
                 }
             }
-            Expr::InList { expr, list, .. } if self.expr(expr, rels) == Some(Ty::Uuid) => list.iter().for_each(|e| self.uuid(e)),
+            Expr::InList { expr, list, .. } => match self.expr(expr, rels) {
+                Some(Ty::Uuid) => list.iter().for_each(|e| self.uuid(e)),
+                Some(Ty::Jsonb) => list.iter().for_each(|e| self.jsonb_string(e)),
+                _ => {}
+            },
             Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => self.compared(e, rels),
             _ => {}
+        }
+    }
+
+    /// A string compared with a jsonb column is noted, by place, to be read as jsonb's text (`rewritten`).
+    fn jsonb_string(&self, e: &Expr) {
+        if string(e).is_some() {
+            self.jsonb_strings.borrow_mut().push(at(e));
         }
     }
 
@@ -1466,6 +1515,28 @@ mod tests {
     #[test]
     fn a_statement_without_makers_stays_as_it_is() {
         assert_eq!(rewrite_text("SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL"), "SELECT name, id, doc FROM t WHERE name = 'x' AND doc IS NOT NULL");
+    }
+
+    /// A string a jsonb column is compared with is read as jsonb's text, on either side of `=`, `<>`, `IN` and `IS DISTINCT
+    /// FROM`: `b = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`, and a second rewrite changes nothing. A string that isn't
+    /// JSON is refused 22P02. A json column, a text column and an order comparison keep their strings as written.
+    #[test]
+    fn a_string_compared_with_a_jsonb_column_is_read_as_jsonb() {
+        let (doc, read) = ("'{ \"b\" : 1, \"a\" : 2 }'", "'{\"a\": 2, \"b\": 1}'");
+        for (sql, want) in [
+            (format!("SELECT id FROM s.o WHERE b = {doc}"), format!("SELECT id FROM s.o WHERE b = {read}")),
+            (format!("SELECT id FROM s.o WHERE {doc} = b"), format!("SELECT id FROM s.o WHERE {read} = b")),
+            (format!("SELECT id FROM s.o WHERE b <> {doc}"), format!("SELECT id FROM s.o WHERE b <> {read}")),
+            (format!("SELECT id FROM s.o WHERE b IN ({doc}, '[1]')"), format!("SELECT id FROM s.o WHERE b IN ({read}, '[1]')")),
+            (format!("SELECT id FROM s.o WHERE b IS DISTINCT FROM {doc}"), format!("SELECT id FROM s.o WHERE b IS DISTINCT FROM {read}")),
+        ] {
+            assert_eq!(rewrite_text(&sql), want, "{sql}");
+            assert_eq!(rewrite_text(&want), want, "{want}");
+        }
+        assert_eq!(refusal("SELECT id FROM s.o WHERE b = 'x'").0, "22P02");
+        for sql in ["SELECT id FROM s.o WHERE b < '{ \"a\" : 1 }'", "SELECT id FROM t WHERE doc = '{ \"b\" : 1, \"a\" : 2 }'", "SELECT id FROM t WHERE name = '{ \"b\" : 1 }'"] {
+            assert_eq!(rewrite_text(sql), sql);
+        }
     }
 
     /// `left || right` over `t AS x` (x.doc json, x.id uuid, x.name text) and `s.o AS o` (o.b jsonb): changed, or refused.

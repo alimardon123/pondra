@@ -185,6 +185,13 @@ pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("||") && TABLE_OR_JSON.is_match(sql) {
         return true;
     }
+    // (a document compared with a column, `doc = '{…}'`, `doc IN ('[…]')`, `'{…}' <> doc`: a jsonb column reads it as jsonb,
+    // `pg_types::rewrite`; a document written into a column isn't, so `VALUES (1, '{…}')` stays unparsed)
+    static DOCUMENT_COMPARED: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)(?:=|<>|!=|\bin\s*\(|\bdistinct\s+from)\s*'\s*[\[{]|'\s*[\[{](?:[^']|'')*'\s*(?:=|<>|!=)").expect("a regex"));
+    if DOCUMENT_COMPARED.is_match(sql) {
+        return true;
+    }
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
     const BUILT_IN: &[&str] = &["int", "integer", "bigint", "smallint", "tinyint", "int2", "int4", "int8", "hugeint", "ubigint", "uinteger", "usmallint", "utinyint", "float", "float4",
         "float8", "real", "double", "decimal", "numeric", "dec", "text", "varchar", "char", "character", "string", "bpchar", "bool", "boolean", "date", "time", "timestamp", "timestamptz",
@@ -280,6 +287,17 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         assert!(names_a_type("SELECT json_agg(x) FROM t") && names_a_type("SELECT * FROM generate_series(1, t.n)") && names_a_type("SELECT * FROM jsonb_each(t.doc)") && names_a_type("SELECT '{a}'::text[]"));
+    }
+
+    #[test]
+    fn a_document_compared_with_a_column_is_parsed_and_one_written_into_a_column_is_not() {
+        for sql in [r#"SELECT 1 FROM t WHERE doc = '{ "a" : 1 }'"#, r#"DELETE FROM t WHERE doc <> '[1]'"#, r#"SELECT 1 FROM t WHERE doc IN ('{"a":1}', 'x')"#,
+            r#"SELECT 1 FROM t WHERE '{"a": 1}' = doc"#, r#"SELECT 1 FROM t WHERE doc IS DISTINCT FROM '{}'"#] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        for sql in [r#"INSERT INTO t VALUES (1, '{"a": 1}')"#, r#"INSERT INTO t (id, doc) VALUES (1, '[1, 2]'), (2, '{}')"#, "SELECT 1 FROM t WHERE name = 'x'"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
     }
 
     #[test]

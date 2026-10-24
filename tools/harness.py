@@ -17644,6 +17644,33 @@ def jsons():
         info["WHERE with the operators: rows over HTTP, then the port"] = [http, port]
         return http == [1] and port == [1]
 
+    def jsonb_compared():
+        """A string compared with a jsonb column is read as jsonb's text, over HTTP and the port: `=` and `IN` find the row whose
+        jsonb is `{"a": 2, "b": 1}` for the strings written in another key order, `<>` finds none, and a DELETE of that document
+        leaves no row. A psycopg parameter (`%s`) of that string finds the row too."""
+        q("CREATE TABLE jc (id INT PRIMARY KEY, j JSONB)")
+        WHERES = ["j = '{ \"a\" : 2, \"b\" : 1 }'", "j IN ('{\"a\":2,\"b\":1}', '[1]')", "j <> '{\"b\":1,\"a\":2}'"]
+        DELETE = "DELETE FROM jc WHERE j = '{\"a\": 2,\"b\": 1}'"
+        q("INSERT INTO jc (id, j) VALUES (1, '{\"b\": 1, \"a\": 2}')")
+        http = [q(f"SELECT count(*) AS n FROM jc WHERE {w}")[0]["n"] for w in WHERES]
+        q(DELETE)
+        http_left = q("SELECT count(*) AS n FROM jc")[0]["n"]
+        writes = [pg_write("INSERT INTO jc (id, j) VALUES (2, '{\"b\": 1, \"a\": 2}')")]
+        port = [pg_rows(f"SELECT count(*) FROM jc WHERE {w}")[0][0] for w in WHERES]
+        writes.append(pg_write(DELETE))
+        port_left = pg_rows("SELECT count(*) FROM jc")[0][0]
+        writes.append(pg_write("INSERT INTO jc (id, j) VALUES (3, '{\"b\": 1, \"a\": 2}')"))
+        try:
+            with psycopg.connect(url, autocommit=True) as conn:
+                param = conn.execute("SELECT count(*) FROM jc WHERE j = %s", ('{ "a" : 2, "b" : 1 }',)).fetchone()[0]
+        except psycopg.Error as e:
+            param = f"{e.sqlstate}: {str(e)[:200]}"
+        q("DROP TABLE jc")
+        info["j = '{ \"a\" : 2, \"b\" : 1 }', IN and <> counts: over HTTP, then the port; rows left after the DELETE: over HTTP, then the "
+             "port; the writes' SQLSTATEs (None: went in); WHERE j = %s with that string as a psycopg parameter"] = [
+            http, port, http_left, port_left, writes, param]
+        return http == port == [1, 1, 0] and http_left == port_left == 0 and writes == [None, None, None] and param == 1
+
     try:
         node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
         check("CREATE TABLE j (doc JSON, docb JSONB): pg_attribute 114 and 3802, format_type json and jsonb, "
@@ -17692,6 +17719,8 @@ def jsons():
               grouping)
         check("the operators in a WHERE clause find the rows they name, over HTTP and the port (a JSON null and an IS NULL unparenthesised)",
               in_where)
+        check("a string compared with a jsonb column is read as jsonb: = and IN find the row written in another key order, <> finds none, "
+              "and a DELETE of that document leaves no row, over HTTP and the port, a parameter's string too", jsonb_compared)
         check("jsonb_contains, jsonb_contained, jsonb_exists, jsonb_exists_any, jsonb_exists_all, json_object_field, jsonb_object_field, "
               "json_array_element and jsonb_array_element answer as their operators do, over HTTP and the port", functions_by_name)
         check("a materialized view of doc -> 'a' and doc #>> '{b,0}' is filled, and follows an INSERT into its table", materialized)
