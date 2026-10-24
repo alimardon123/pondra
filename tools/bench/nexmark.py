@@ -107,7 +107,7 @@ def duck_rows(stream, start, end):
     """Rows `start` to `end` of a stream, by DuckDB, as Arrow."""
     import duckdb
     cols = ", ".join(f"{sql} AS {c}" for c, _, sql in columns(stream, Dialect(False)))
-    return duckdb.connect().execute(f"SELECT {cols} FROM range({start}, {end}) r(k)").arrow().read_all()
+    return duckdb.connect().execute(f"SELECT {cols} FROM range({start}, {end}) r(k)").to_arrow_table()
 
 
 CLOSE_MS = 10**8  # (the closing events come this much event time after the stream: a day and more)
