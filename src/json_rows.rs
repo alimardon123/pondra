@@ -278,7 +278,13 @@ mod tests {
             let got = (0..2).map(|row| array_value_to_string(b.column(0), row).unwrap()).collect::<Vec<_>>();
             assert_eq!(got, [max, "3"], "{t}");
             let err = from_json(format!("{{\"x\": {over}}}\n").as_bytes(), &s).unwrap_err();
-            assert!(format!("{err:#}").contains(&format!("value of {over} is out of range {t}")), "{t}: {err:#}");
+            let words = match t {
+                DataType::Int16 => "smallint out of range".to_string(),
+                DataType::Int32 => "integer out of range".to_string(),
+                DataType::Int64 => "bigint out of range".to_string(),
+                _ => format!("value of {over} is out of range {t}"), // (a width Postgres has no type for: Arrow's words)
+            };
+            assert!(format!("{err:#}").contains(&words), "{t}: {err:#}");
         }
         // 300 is out of a TINYINT, and in a SMALLINT
         let b = from_json(b"{\"x\": 300}\n", &table_of(&[("x", DataType::Int16)])).unwrap();
