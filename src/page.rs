@@ -5,7 +5,10 @@
 //! ASOF JOIN answer as on a node. A page with a node (`Options::node`) asks it for the tables the page doesn't have, with
 //! the rows of the page's own tables the query names (B5). `web/` wraps it for a browser.
 
-use crate::front::Host;
+use crate::expander::Routine;
+use crate::ext_names::Attached;
+use crate::front::{Host, Own};
+use crate::measures::Definition;
 use crate::request_body;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use anyhow::Context;
@@ -1263,14 +1266,34 @@ impl SchemaProvider for Overlay {
 
 /// What a page's SQL asks of where it runs (`front::Host`). The front runs the passes itself, as it does for a node: DuckDB's
 /// forms that ask the data (`PIVOT`, `COLUMNS`, `SUMMARIZE`) ask the page through `ask`, as a node asks its own. A page keeps
-/// no routines, attached lakes, views with measures or types, so the trait's defaults answer "none" for those; the columns
-/// are its tables' own.
+/// no statements, routines, attached lakes, views with measures or types of its own: their CREATEs are refused by name
+/// (`may`), so it answers each of those lookups with none, as a node that has none would. The columns are its tables' own.
 struct PageHost<'a>(&'a Page);
 
-// (a page keeps no routines, attached catalogs, views with measures or types of its own: the trait's defaults say so)
 impl Host for PageHost<'_> {
     fn name(&self) -> String {
         "page".to_string()
+    }
+
+    async fn own(&self, sql: &str) -> anyhow::Result<Own> {
+        Ok(Own::Go(sql.to_string()))
+    }
+
+    async fn routines(&self) -> anyhow::Result<Arc<HashMap<String, Routine>>> {
+        Ok(Arc::default())
+    }
+
+    async fn attached(&self) -> anyhow::Result<Vec<(String, Attached)>> {
+        Ok(vec![])
+    }
+
+    async fn measure_views(&self, _sql: &str) -> anyhow::Result<Arc<HashMap<String, Arc<Definition>>>> {
+        Ok(Arc::default())
+    }
+
+    // (the Postgres passes a node runs here move into the front itself: designs/l2-front-asks.md, F4)
+    async fn types(&self, _stmts: &mut [datafusion::sql::sqlparser::ast::Statement]) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
