@@ -15,14 +15,13 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::sql::sqlparser::ast::Value;
-use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 use crate::ext_names::{quoted, scheme};
-use crate::ext_names::{file_format, folders, hive_value, listed, part_of, read_files, schema_of};
+use crate::ext_names::{data_files, file_format, listed, schema_of};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -390,34 +389,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     let keys = crate::ext_names::keys(&found, spec, &hive_types, &columns)?;
     columns.extend(keys.iter().cloned());
     let hived = !keys.is_empty();
-    let parquet = spec.format == "parquet";
-    let stats: Vec<_> = found.into_iter().map(|hit| {
-        let (format, schema, state, as_stored) = (format.clone(), schema.clone(), state.clone(), as_stored.clone());
-        let part = if hived { folders(&hit.url, &hit.object) } else { vec![] };
-        async move {
-            let full = hit.full(); // (`file:///x`, `s3://b/x`)
-            let (store, o) = (hit.store, hit.object);
-            let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
-            let mut f = file(full, o.size, s.as_ref(), &schema);
-            f.stats.retain(|c, _| as_stored.contains(c));
-            if missing {
-                f.nulls = None; // (a column declared that the files don't hold is all NULL)
-            }
-            f.part = part_of(&part);
-            if parquet && hived {
-                let values = part.iter().map(|(k, v)| (k.clone(), hive_value(v))).collect();
-                f.outside = Some(Box::new(crate::scan::Outside { values, ..Default::default() })); // (its folders' values, as `scan::read` takes them)
-            }
-            for (k, v) in part {
-                match hive_value(&v) {
-                    Some(v) => _ = f.stats.insert(k, (v.clone(), v)),
-                    None => f.nulls.iter_mut().for_each(|n| n.push(k.clone())), // (a NULL's folder: `IS NULL` finds it)
-                }
-            }
-            anyhow::Ok(f)
-        }
-    }).collect();
-    let files = futures::stream::iter(stats).buffered(32).try_collect().await?;
+    let files = data_files(&state, &format, &schema, found, hived, &as_stored, missing).await?; // (the listing's files, as a page reads them too)
     Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
 }
 
@@ -434,29 +406,9 @@ pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, obj
     Ok(found.into_iter().map(|f| (f.full(), f.object)).collect())
 }
 
-/// A file as a table's `DataFile`: its rows and exact column ranges when its footer says.
-fn file(path: String, bytes: u64, s: Option<&datafusion::common::Statistics>, schema: &datafusion::arrow::datatypes::Schema) -> DataFile {
-    use datafusion::common::stats::Precision::Exact;
-    let Some(s) = s else { return DataFile { path, bytes, rows: bytes / 100, ..Default::default() } }; // (CSV, JSON: rows unknown; about 100 bytes each)
-    let (mut stats, mut nulls) = (BTreeMap::new(), Some(vec![]));
-    for (f, c) in schema.fields().iter().zip(&s.column_statistics) {
-        if let (Exact(lo), Exact(hi), false) = (&c.min_value, &c.max_value, f.data_type().is_floating()) {
-            if let (Some(lo), Some(hi)) = (crate::manifest::text(lo), crate::manifest::text(hi)) {
-                stats.insert(f.name().clone(), (lo, hi));
-            }
-        }
-        match (&c.null_count, nulls.as_mut()) {
-            (Exact(0), _) => {}
-            (Exact(_), Some(n)) => n.push(f.name().clone()),
-            _ => nulls = None,
-        }
-    }
-    let rows = match s.num_rows { Exact(n) => n as u64, _ => bytes / 100 };
-    DataFile { path, bytes, rows, stats, nulls, ..Default::default() }
-}
-
 /// The rows of `files` of an `ext:` table, as `schema`: DataFusion's own readers, without the hot
-/// columns (outside the lake, a file may change under the same name).
+/// columns (outside the lake, a file may change under the same name). Parquet and the other files
+/// are read by `ext_names::read`, the reader a page shares.
 pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files: &[&DataFile], schema: &datafusion::arrow::datatypes::SchemaRef, spec: &Spec, table: Option<&crate::scan::Table>) -> Result<datafusion::prelude::DataFrame> {
     if ["delta", "iceberg", "share"].contains(&spec.format.as_str()) {
         return crate::scan::read(ctx, files, schema, table).await; // (another engine's table, or a share: its partition values, its deletes)
@@ -464,11 +416,7 @@ pub async fn read(lake: &Lake, ctx: &datafusion::prelude::SessionContext, files:
     if spec.format == "kafka" {
         return crate::kafka_client::read(lake, ctx, files, schema).await; // (a topic)
     }
-    if spec.format == "parquet" {
-        return crate::scan::read(ctx, files, schema, None).await; // (as listed: no second look at each file before it is read)
-    }
-    let files: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.part.as_str())).collect();
-    read_files(ctx, &files, schema, spec).await
+    crate::ext_names::read(ctx, files, schema, spec).await
 }
 
 // ---------------------------------------------------------------- where they are

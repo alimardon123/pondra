@@ -1,4 +1,6 @@
-//! `ext:` names: files and other engines' tables as SQL names them (ADR-026), in every build. Reading them is `ext.rs`'s.
+//! `ext:` names: files and other engines' tables as SQL names them (ADR-026), in every build. A node and a page read
+//! them with the same listing, footers and reader (`data_files`, `read`); `ext.rs` adds the other engines' tables and the secrets.
+use crate::data_file::DataFile;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
@@ -8,7 +10,7 @@ use datafusion::execution::SessionState;
 use datafusion::object_store::{ObjectMeta, ObjectStore};
 use datafusion::prelude::{DataFrame, SessionContext};
 use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Value};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -489,6 +491,75 @@ pub async fn read_files(ctx: &SessionContext, files: &[(&str, &str)], schema: &S
         });
     }
     out.context("no files")
+}
+
+// ---------------------------------------------------------------- one footer, one reader for a node and a page
+
+/// A file as a table's `DataFile`: its rows and exact column ranges when its footer says.
+pub fn data_file(path: String, bytes: u64, s: Option<&datafusion::common::Statistics>, schema: &Schema) -> DataFile {
+    use datafusion::common::stats::Precision::Exact;
+    let Some(s) = s else { return DataFile { path, bytes, rows: bytes / 100, ..Default::default() } }; // (CSV, JSON: rows unknown; about 100 bytes each)
+    let (mut stats, mut nulls) = (BTreeMap::new(), Some(vec![]));
+    for (f, c) in schema.fields().iter().zip(&s.column_statistics) {
+        if let (Exact(lo), Exact(hi), false) = (&c.min_value, &c.max_value, f.data_type().is_floating()) {
+            if let (Some(lo), Some(hi)) = (crate::data_file::text(lo), crate::data_file::text(hi)) {
+                stats.insert(f.name().clone(), (lo, hi));
+            }
+        }
+        match (&c.null_count, nulls.as_mut()) {
+            (Exact(0), _) => {}
+            (Exact(_), Some(n)) => n.push(f.name().clone()),
+            _ => nulls = None,
+        }
+    }
+    let rows = match s.num_rows { Exact(n) => n as u64, _ => bytes / 100 };
+    DataFile { path, bytes, rows, stats, nulls, ..Default::default() }
+}
+
+/// Each file a listing found, as a table's `DataFile`. Parquet's footer gives its rows and column ranges (other
+/// formats give rows as an estimate from their bytes, and no ranges); `hived` makes its folders' values columns,
+/// which a NULL's folder gives no statistics for (DataFusion would take the column for one without NULLs).
+/// `as_stored` are the columns whose ranges are kept (a column read as another type keeps none), and `missing`
+/// says a declared column the files don't hold is all NULL.
+pub async fn data_files(state: &SessionState, format: &Arc<dyn FileFormat>, schema: &SchemaRef, found: Vec<Found>, hived: bool, as_stored: &[String], missing: bool) -> Result<Vec<DataFile>> {
+    let parquet = format.get_ext() == "parquet"; // (only a Parquet footer says rows and ranges)
+    let stats: Vec<_> = found.into_iter().map(|hit| {
+        let (format, schema, state, as_stored) = (format.clone(), schema.clone(), state.clone(), as_stored.to_vec());
+        let part = if hived { folders(&hit.url, &hit.object) } else { vec![] };
+        async move {
+            let full = hit.full(); // (`file:///x`, `s3://b/x`)
+            let (store, o) = (hit.store, hit.object);
+            let s = if parquet { Some(format.infer_stats(&state, &store, schema.clone(), &o).await?) } else { None };
+            let mut f = data_file(full, o.size, s.as_ref(), &schema);
+            f.stats.retain(|c, _| as_stored.contains(c));
+            if missing {
+                f.nulls = None; // (a column declared that the files don't hold is all NULL)
+            }
+            f.part = part_of(&part);
+            if parquet && hived {
+                let values = part.iter().map(|(k, v)| (k.clone(), hive_value(v))).collect();
+                f.outside = Some(Box::new(crate::scan::Outside { values, ..Default::default() })); // (its folders' values, as `scan::read` takes them)
+            }
+            for (k, v) in part {
+                match hive_value(&v) {
+                    Some(v) => _ = f.stats.insert(k, (v.clone(), v)),
+                    None => f.nulls.iter_mut().for_each(|n| n.push(k.clone())), // (a NULL's folder: `IS NULL` finds it)
+                }
+            }
+            anyhow::Ok(f)
+        }
+    }).collect();
+    futures::stream::iter(stats).buffered(32).try_collect().await
+}
+
+/// The rows of `files` of a spec, as `schema`: Parquet by `scan::read` (the footers' rows and ranges, the folders'
+/// values), every other format by DataFusion's listing tables (`read_files`).
+pub async fn read(ctx: &SessionContext, files: &[&DataFile], schema: &SchemaRef, spec: &Spec) -> Result<DataFrame> {
+    if spec.format == "parquet" {
+        return crate::scan::read(ctx, files, schema, None).await; // (as listed: no second look at each file before it is read)
+    }
+    let files: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.part.as_str())).collect();
+    read_files(ctx, &files, schema, spec).await
 }
 
 #[cfg(test)]
