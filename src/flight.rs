@@ -82,7 +82,7 @@ impl tower::Service<http::Request<tonic::body::Body>> for Gate {
             };
             if who.role == Role::None {
                 if !UNSIGNED.iter().any(|call| req.uri().path().ends_with(call)) {
-                    return Ok(Status::unauthenticated(SIGN_IN).into_http());
+                    return Ok(refused("28000", SIGN_IN).into_http());
                 }
                 req = req.map(|body| tonic::body::Body::new(http_body_util::Limited::new(body, 64 << 10)));
             }
@@ -100,7 +100,7 @@ fn grpc(code: &str) -> tonic::Code {
         "40001" => tonic::Code::Aborted,
         "42501" => tonic::Code::PermissionDenied,
         "28P01" | "28000" => tonic::Code::Unauthenticated,
-        "42P01" | "42703" | "42883" | "3F000" => tonic::Code::NotFound,
+        "42P01" | "42703" | "42883" | "3F000" | "34000" => tonic::Code::NotFound,
         "42P07" | "23505" => tonic::Code::AlreadyExists,
         "57014" => tonic::Code::DeadlineExceeded,
         "53100" | "53200" | "53300" => tonic::Code::ResourceExhausted,
@@ -120,13 +120,22 @@ fn status(e: impl Into<anyhow::Error>) -> Status {
     s
 }
 
+/// A refusal with its SQLSTATE, as a gRPC status (`status`).
+fn refused(code: &'static str, message: impl Into<String>) -> Status { status(crate::codes::coded(code, message)) }
+
+/// A permission check's refusal (`status`): 42501, unless it carries a code of its own.
+fn denied(e: impl Into<anyhow::Error>) -> Status {
+    let e = e.into();
+    status(match crate::codes::of(&e) { "XX000" => crate::codes::coded("42501", crate::ext::said(&e)), _ => e })
+}
+
 /// The caller's role (who it is: `Door` works it out); refused below `need`.
 fn allowed<T>(_: &App, _: &Request<T>, need: Role) -> Result<Role, Status> {
     let role = crate::auth::current().map_or(Role::None, |p| p.role);
     match role {
         _ if role >= need => Ok(role),
-        Role::None => Err(Status::unauthenticated(SIGN_IN)),
-        _ => Err(Status::permission_denied("this needs more rights than this token's or user's")),
+        Role::None => Err(refused("28000", SIGN_IN)),
+        _ => Err(refused("42501", "this needs more rights than this token's or user's")),
     }
 }
 
@@ -152,7 +161,7 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
                 crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token"));
             }
             if let Some(why) = why {
-                return Err(Status::unauthenticated(why));
+                return Err(refused("28000", why));
             }
             crate::auth::Principal::of(Role::None)
         }
@@ -184,13 +193,13 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<cr
     let ip = from.map(|a| a.ip());
     let by_token = crate::users::is_token(user, password);
     if !by_token && !peer.is_some_and(|p| p.may_send_password()) {
-        return Err(Status::unauthenticated(crate::tls::PASSWORD_PLAIN));
+        return Err(refused("28000", crate::tls::PASSWORD_PLAIN));
     }
     if let Some(wait) = crate::auth::guessing(ip, user) {
         let why = crate::auth::guessing_says(user, wait);
         crate::audit::refused(app, user, "flight", from, "sign in", &why);
         tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
-        return Err(Status::unauthenticated(why));
+        return Err(refused("28000", why));
     }
     match crate::users::sign_in(&app.lake, &app.auth, user, password).await {
         Some(p) if p.role > Role::None => Ok(Some(p)),
@@ -198,14 +207,14 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<cr
             if !by_token {
                 crate::auth::guessed(ip, user); // (a token isn't guessed: it is random)
             }
-            let why = match by_token {
-                true => crate::sso::why(&app.lake, password).await,
-                false => None,
+            // (a provider's refusal says why, 28000; a wrong password is 28P01, as Postgres says it)
+            let (code, why) = match if by_token { crate::sso::why(&app.lake, password).await } else { None } {
+                Some(why) => ("28000", why),
+                None => ("28P01", "wrong user name or password".to_string()),
             };
-            let why = why.unwrap_or_else(|| "wrong user name or password".into());
             crate::audit::refused(app, user, "flight", from, "sign in", &why);
             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
-            Err(Status::unauthenticated(why))
+            Err(refused(code, why))
         }
     }
 }
@@ -301,7 +310,7 @@ fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64
 /// query run now.
 async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
-        let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(Status::not_found("that answer was read already, or is gone")) };
+        let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
         let schema = Arc::new(first_announced(&batches));
         return Ok((schema.clone(), conform(&schema, batches).map_err(status)?));
     }
@@ -355,9 +364,9 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
         return Ok(0);
     }
     let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
-    let stmt = crate::write::parse(&sql).ok_or_else(|| Status::invalid_argument("not a write statement"))?;
+    let stmt = crate::write::parse(&sql).ok_or_else(|| refused("22023", "not a write statement"))?;
     let done = crate::audit::statement(app, &sql, async {
-        app.auth.allows(role, &stmt).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
+        app.auth.allows(role, &stmt).map_err(denied)?;
         crate::write::on_node(app, stmt, None).await.map_err(status)
     });
     Ok(done.await?["rows"].as_i64().unwrap_or(0))
@@ -419,9 +428,9 @@ fn unhandle(handle: &[u8]) -> (Option<&[u8]>, &[u8]) {
 /// Appends batches to `table` through the log, pipelined: each is queued as it arrives and
 /// answered with its ack when committed. `producer` + `first`: batch i is seq `first + i`.
 fn append(app: &App, table: String, producer: String, first: u64, batches: impl Stream<Item = Result<RecordBatch, Status>> + Send + 'static) -> Result<Out<PutResult>, Status> {
-    let log = app.log.clone().ok_or_else(|| Status::failed_precondition("read-only node"))?;
+    let log = app.log.clone().ok_or_else(|| refused("25006", "read-only node"))?;
     if !producer.is_empty() && first == 0 {
-        return Err(Status::invalid_argument(crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
+        return Err(refused("22023", crate::log::SEQ_FROM_1)); // (0 is "nothing yet": its batch would be taken for a retry)
     }
     let (lake, again, table2) = (app.lake.clone(), log.clone(), table.clone());
     let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
@@ -432,7 +441,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         let mut batches = std::pin::pin!(batches);
         let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
         let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::answer::schema(&m.logical_columns()).ok()?))) else { // (SQL's names: ADR-022)
-            let _ = acks_tx.send(Err(Status::not_found(format!("no table {table}")))).await;
+            let _ = acks_tx.send(Err(refused("42P01", format!("no table {table}")))).await;
             return;
         };
         // (a column the batch leaves out: its DEFAULT)
@@ -445,7 +454,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
         let named = crate::auth::catalog_name(&table);
         let load = |b: &RecordBatch| match &who {
-            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b).map_err(|e| Status::permission_denied(crate::ext::said(&e)))), // (said as the writer's scope says it: `shows_code`)
+            Some(w) => crate::auth::WHO.sync_scope(w.clone(), || crate::auth::check_load(m, &named, b).map_err(denied)), // (said as the writer's scope says it: `shows_code`)
             None => Ok(()),
         };
         let mut i = 0;
@@ -513,10 +522,10 @@ impl Json {
 /// A table's log as Flight data, from segment `after`: each commit's rows (just `columns`), then
 /// a message with `{"after": N}`.
 async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool) -> Result<Out<FlightData>, Status> {
-    let meta: TableMeta = app.lake.cat.get(&table_key(&table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
+    let meta: TableMeta = app.lake.cat.get(&table_key(&table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
     let pick: Vec<usize> = match &columns {
-        Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| Status::invalid_argument(format!("no column {c}")))).collect::<Result<_, _>>()?,
+        Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| refused("42703", format!("no column {c}")))).collect::<Result<_, _>>()?,
         None => (0..full.fields().len()).collect(),
     };
     let schema = Arc::new(full.project(&pick).map_err(status)?);
@@ -589,7 +598,7 @@ impl FlightSqlService for Sql {
         // (signed in by `Gate` already; here a token is handed back: the password when it is one, or
         // anything on a node nothing locks; a session when a user signed in)
         let password = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(basic).map(|(_, p)| p);
-        let Some(password) = password else { return Err(Status::unauthenticated("wrong user name or password")) };
+        let Some(password) = password else { return Err(refused("28P01", "wrong user name or password")) };
         let open = self.0.open().await;
         let token = match self.0.auth.token_role(&password) {
             Role::None if !open => match caller(&req) {
@@ -599,7 +608,7 @@ impl FlightSqlService for Sql {
                 }
                 .map_err(status)?
                 .0,
-                _ => return Err(Status::unauthenticated("wrong user name or password")),
+                _ => return Err(refused("28P01", "wrong user name or password")),
             },
             _ => password,
         };
@@ -665,7 +674,7 @@ impl FlightSqlService for Sql {
         let word = match EndTransaction::try_from(q.action) {
             Ok(EndTransaction::Commit) => "COMMIT",
             Ok(EndTransaction::Rollback) => "ROLLBACK",
-            _ => return Err(Status::invalid_argument("EndTransaction: commit or rollback")),
+            _ => return Err(refused("22023", "EndTransaction: commit or rollback")),
         };
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
@@ -698,31 +707,31 @@ impl FlightSqlService for Sql {
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
         let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (the row doors' one check)
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};
         let options = cmd.table_definition_options.unwrap_or_default();
         match (exists, IfThere::try_from(options.if_exists), IfNot::try_from(options.if_not_exist)) {
-            (true, Ok(IfThere::Fail), _) => return Err(Status::already_exists(format!("{table} exists (mode create): append to it, or replace it"))),
+            (true, Ok(IfThere::Fail), _) => return Err(refused("42P07", format!("{table} exists (mode create): append to it, or replace it"))),
             (true, Ok(IfThere::Replace), _) => {
                 if role < Role::Admin {
-                    return Err(Status::permission_denied("replacing a table needs the admin token"));
+                    return Err(refused("42501", "replacing a table needs the admin token"));
                 }
-                let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| Status::internal("DROP TABLE"))?;
+                let drop = crate::write::parse(&format!("DROP TABLE {}", crate::write::sql_name(&table))).ok_or_else(|| refused("XX000", "DROP TABLE"))?;
                 crate::write::on_node(&self.0, drop, None).await.map_err(status)?;
                 exists = false;
             }
-            (false, _, Ok(IfNot::Fail)) => return Err(Status::not_found(format!("no table {table} (mode append): create it first, or use create_append"))),
+            (false, _, Ok(IfNot::Fail)) => return Err(refused("42P01", format!("no table {table} (mode append): create it first, or use create_append"))),
             _ => {}
         }
         if !exists {
             // ADBC's create modes: a table from the stream's schema (strings as Utf8, times in µs).
             if role < Role::Admin {
-                return Err(Status::permission_denied("creating a table needs the admin token"));
+                return Err(refused("42501", "creating a table needs the admin token"));
             }
             let schema = match std::pin::Pin::new(&mut batches).peek().await {
                 Some(Ok(b)) => b.schema(),
-                _ => return Err(Status::invalid_argument("no rows to take the table's columns from")),
+                _ => return Err(refused("22023", "no rows to take the table's columns from")),
             };
             let columns: Vec<(String, String)> = schema.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
             crate::write::define(&self.0, &table, &serde_json::json!(columns).to_string()).await.map_err(status)?;
@@ -744,10 +753,10 @@ impl FlightSqlService for Sql {
         let path = first.map(|d| d.path).unwrap_or_default();
         let (table, producer, seq) = match &path[..] {
             [t] => (t.clone(), String::new(), 0),
-            [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| Status::invalid_argument("the first seq is a number"))?),
-            _ => return Err(Status::invalid_argument("DoPut to a path: [table] or [table, producer, first seq]")),
+            [t, p, s] => (t.clone(), p.clone(), s.parse().map_err(|_| refused("22023", "the first seq is a number"))?),
+            _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
-        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (the row doors' one check)
+        crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
         let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(Status::from);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }
@@ -870,13 +879,13 @@ impl FlightService for Door {
                 (Some(sql), _) => plan_schema(app, sql).await.map_err(status)?,
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
-                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
-                    let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
+                    crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(denied)?;
+                    let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
                     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
                     let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
                     if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
                 }
-                _ => return Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
+                _ => return Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             };
             let cmd = req.get_ref().cmd.to_vec();
             info(&schema, cmd, req.into_inner())
@@ -885,11 +894,11 @@ impl FlightService for Door {
 
     // (Not taken, refused by name: the protocol's default says only "Not yet implemented")
     async fn poll_flight_info(&self, _req: Request<FlightDescriptor>) -> Result<Response<PollInfo>, Status> {
-        Err(Status::unimplemented("PollFlightInfo: Pondra doesn't take it; GetFlightInfo answers at once"))
+        Err(refused("0A000", "PollFlightInfo: Pondra doesn't take it; GetFlightInfo answers at once"))
     }
 
     async fn get_schema(&self, _req: Request<FlightDescriptor>) -> Result<Response<SchemaResult>, Status> {
-        Err(Status::unimplemented("GetSchema: Pondra doesn't take it; GetFlightInfo gives a statement's or a table's schema"))
+        Err(refused("0A000", "GetSchema: Pondra doesn't take it; GetFlightInfo gives a statement's or a table's schema"))
     }
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
@@ -905,10 +914,10 @@ impl FlightService for Door {
                     Ok(Response::new(send(schema, batches)))
                 }
                 (None, Some(table)) => {
-                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?; // (a stream of rows: every column, as `/watch` needs)
+                    crate::auth::check_all(&crate::auth::catalog_name(&table)).map_err(denied)?; // (a stream of rows: every column, as `/watch` needs)
                     Ok(Response::new(log_stream(app.clone(), table, json.after, json.columns, json.follow).await?))
                 }
-                _ => Err(Status::invalid_argument("{\"sql\": …} or {\"table\": …}")),
+                _ => Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             }
         }).await
     }
@@ -922,7 +931,7 @@ impl FlightService for Door {
         // (refused here, before the protocol decodes the body: its own decoding answers a body it can't unpack INVALID_ARGUMENT)
         let action = req.get_ref().r#type.clone();
         if !ACTIONS.iter().any(|(name, _)| *name == action) {
-            return Err(Status::unimplemented(format!("DoAction {action}: Pondra doesn't take it (its actions: BeginTransaction, EndTransaction)")));
+            return Err(refused("0A000", format!("DoAction {action}: Pondra doesn't take it (its actions: BeginTransaction, EndTransaction)")));
         }
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move { self.0.do_action(req).await }).await
@@ -934,7 +943,7 @@ impl FlightService for Door {
     }
 
     async fn do_exchange(&self, _req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoExchangeStream>, Status> {
-        Err(Status::unimplemented("DoExchange: Pondra doesn't take it; DoGet and DoPut are its streams"))
+        Err(refused("0A000", "DoExchange: Pondra doesn't take it; DoGet and DoPut are its streams"))
     }
 }
 
