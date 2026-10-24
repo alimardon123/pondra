@@ -6,6 +6,7 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 mod fetch;
+mod heap;
 mod js;
 mod opfs;
 
