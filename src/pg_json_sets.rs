@@ -4,9 +4,9 @@
 //! comes in (`sets`), a call in a SELECT list becomes `unnest` of that list, a call in a FROM a derived table of its
 //! rows, and each place Postgres refuses a call is refused by Postgres's words and SQLSTATE before anything changes.
 use crate::codes::coded;
-use crate::pg_functions::{function, text_arg};
+use crate::pg_functions::function;
 use crate::pg_json::{answer, json_refusal, kind, opened, skip, JSON_SPACE};
-use crate::pg_json_make::fail;
+use crate::pg_json_make::{as_text, fail, is_null_at, text_at};
 use crate::text::names_kept;
 use datafusion::arrow::array::{ArrayRef, ListArray, StringArray, StructArray};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -111,16 +111,16 @@ impl Set {
     /// The rows of each document. A NULL document has no rows, except `to_record`'s: `jsonb_to_record(NULL)` is one row
     /// of NULLs, as Postgres answers it.
     fn rows(&self, a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
-        let docs = text_arg(&a[0])?;
+        let docs = as_text(&a[0])?;
         if self.pairs() {
-            let rows = (0..n).map(|i| docs[i].as_deref().map(|doc| self.pairs_of(doc)).transpose()).collect::<anyhow::Result<Vec<_>>>()?;
+            let rows = (0..n).map(|i| (!is_null_at(&docs, i)).then(|| self.pairs_of(text_at(&docs, i))).transpose()).collect::<anyhow::Result<Vec<_>>>()?;
             return pairs_array(&rows);
         }
         let rows = (0..n)
-            .map(|i| match docs[i].as_deref() {
-                Some(doc) => self.texts_of(doc).map(Some),
-                None if self.how == How::ToRecord => Ok(Some(vec![None])),
-                None => Ok(None),
+            .map(|i| match is_null_at(&docs, i) {
+                false => self.texts_of(text_at(&docs, i)).map(Some),
+                true if self.how == How::ToRecord => Ok(Some(vec![None])),
+                true => Ok(None),
             })
             .collect::<anyhow::Result<Vec<Option<Vec<Option<String>>>>>>()?;
         texts_array(&rows)

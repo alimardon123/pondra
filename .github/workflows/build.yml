@@ -354,7 +354,7 @@ jobs:
             cargo build --profile dist --target ${{ matrix.target }} --workspace
           fi
       - run: python tools/smoke.py "$BIN" # (on this OS: the shell, SQL, and memory read without /proc)
-      - name: The startup layout held # (a stale tools/startup.txt, or a build without the script: startup_order.py trace and mark it again)
+      - name: The startup layout held # (a stale tools/startup.txt, which startup.yml traces again each night the code changed, or a build without the script)
         if: matrix.platform == 'linux-x64' && needs.plan.outputs.event != 'pull_request'
         # (the program 26.6 MB on a0eae4f, 29.1-29.8 on main from dcf17f1 to d514755 as the list aged; a build without
         # the layout, about 95. The library, which the packages run, is reported until main has measured it: 29.5)
