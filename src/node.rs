@@ -519,6 +519,7 @@ impl Node {
 /// read-only node does: its leader's commit stream when that answers, and its own catalog view.
 pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyhow::Result<()> {
     let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
+    ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
     ddl::attach(home, name, dir, me, follow, follow).await
 }
 

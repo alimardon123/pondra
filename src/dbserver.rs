@@ -140,7 +140,11 @@ impl Server {
     /// port, and the mark of this use (it isn't stopped until that is dropped).
     /// `create`: make the lake if there is none (the default database, on first use).
     async fn node(&self, name: &str, create: bool) -> Result<(u16, u16, Busy)> {
-        crate::ddl::check(name)?;
+        // (a new database's name is checked for the server's own; one that is there is only looked up)
+        match create {
+            true => crate::ddl::database_name(name)?,
+            false => crate::ddl::check(name)?,
+        }
         if let Some(n) = self.nodes.lock().await.get_mut(name) {
             if n.child.try_wait()?.is_none() {
                 return Ok((n.http, n.pg, Busy::new(&n.activity)));
@@ -295,7 +299,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     Ok(())
 }
 
-fn error(status: StatusCode, e: anyhow::Error) -> Response { (status, crate::ext::said(&e)).into_response() }
+fn error(status: StatusCode, e: anyhow::Error) -> Response { crate::server::error_response(Some(status), &e) }
 
 /// The token a request carries, and its role on this server.
 fn role(s: &Server, req: &axum::http::HeaderMap) -> Role {

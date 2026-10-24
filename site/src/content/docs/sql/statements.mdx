@@ -634,7 +634,7 @@ A script's blocks, branches, loops, handlers and parallel statements are explain
 |---|---|
 | Create a schema | `CREATE SCHEMA [IF NOT EXISTS] s [AUTHORIZATION user]`: the `AUTHORIZATION` owner is accepted and not kept |
 | Drop a schema | `DROP SCHEMA [IF EXISTS] s [CASCADE]` |
-| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
+| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all. A name starting with `_` is refused (42602): the server keeps those for its own folder, `_pondra` |
 | Branch a database | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir'] CLONE base [WITH (schemas = (s, …))] [WITH NO DATA]`: a whole database as `base` is now, no data file copied ([branches](/pondra/guides/environments/)) |
 | Bring a branch's tables up to date | `ALTER DATABASE name REFRESH [t, …]`: those tables (a materialized view: the tables it reads; none named: every table the branch took from its base), and the views that follow them, as the base has them now, in one commit |
 | Protect a database | `ALTER DATABASE name SET (protected = true \| false)`: while protected, a project's objects change only by an apply; lifting it is an admin's and audited ([protected production](/pondra/guides/projects/#protected-production)) |

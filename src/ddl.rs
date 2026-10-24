@@ -66,6 +66,16 @@ pub fn check(part: &str) -> Result<()> {
     Err(crate::codes::coded("42602", format!("'{part}': names are letters, digits, _ and - (a dot separates schema and table){hint}")))
 }
 
+/// What a database may be called: `check`'s, and not a name starting with `_`. Those are the server's own: its `_pondra`
+/// folder (and the workspace there, ADR-054) sits beside the databases, so a database's folder must not take one.
+pub fn database_name(name: &str) -> Result<()> {
+    check(name)?;
+    match name.starts_with('_') {
+        true => Err(crate::codes::coded("42602", format!("'{name}': names starting with _ are the server's own (its _pondra folder), so name the database without the _"))),
+        false => Ok(()),
+    }
+}
+
 /// This lake's own name in three-part names: its folder's (or prefix's) last part (`mylake` of
 /// `D:\data\mylake` too).
 pub fn lake_name(lake: &Lake) -> String {
@@ -459,7 +469,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
         Ddl::Apply { claim, after, record } => crate::apply::keep(lake, claim, after, &record).await,
         Ddl::CreateDatabase { name, if_not_exists, dir, clone: None } => {
-            check(&name)?;
+            database_name(&name)?;
             let dir = dir.unwrap_or_else(|| beside(&lake.url, &name));
             if has_catalog(&full(&dir)?).await? {
                 ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name})");
@@ -544,7 +554,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
 /// Whether a database can be attached here as `name`: a name of its own (not this lake's, a
 /// schema's or another engine's tables'), and (`fresh`: one about to be made) no database's.
 pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
-    check(name)?;
+    database_name(name)?;
     ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
     ensure!(!has_schema(lake, name).await?, "a schema here is called {name}: attach the other under another name");
     ensure!(!crate::ext::is_attached(lake, name).await?, "{name} is attached already, as another engine's tables");
@@ -640,7 +650,7 @@ pub async fn lakes_in(folder: &str) -> Result<Vec<(String, String)>> {
             out
         }
     };
-    let mut out: Vec<(String, String)> = names.into_iter().filter(|n| check(n).is_ok()).map(|n| (n.clone(), format!("{folder}/{n}"))).collect();
+    let mut out: Vec<(String, String)> = names.into_iter().filter(|n| database_name(n).is_ok()).map(|n| (n.clone(), format!("{folder}/{n}"))).collect();
     out.sort();
     Ok(out)
 }
@@ -696,7 +706,7 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
     let mut found = vec![];
     for (name, dir) in lakes {
         let (name, Ok(dir)) = (name.to_lowercase(), full(&dir)) else { continue };
-        let taken = dir == home.url || check(&name).is_err() || name == lake_name(home)
+        let taken = dir == home.url || database_name(&name).is_err() || name == lake_name(home)
             || home.attached.read().unwrap().iter().any(|(n, _)| *n == name)
             || !matches!(home.cat.get::<Attachment>(&attachment_key(&name)).await, Ok(None))
             || has_schema(home, &name).await.unwrap_or(true);
@@ -1530,5 +1540,15 @@ mod tests {
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn a_database_name_is_not_the_servers_own() {
+        for name in ["_x", "_pondra", "_"] {
+            assert_eq!(crate::codes::of(&database_name(name).unwrap_err()), "42602", "{name}");
+        }
+        for name in ["x_", "a-b", "lake"] {
+            database_name(name).unwrap();
+        }
     }
 }

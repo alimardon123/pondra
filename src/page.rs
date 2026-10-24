@@ -408,7 +408,7 @@ impl Page {
     /// made. Without `If-Match` a path that is there is 409; with it, the file is replaced if it is still that version
     /// (quotes and all), and 412 if not.
     async fn put(&self, name: &str, headers: &[(String, String)], body: bytes::Bytes) -> anyhow::Result<Answer> {
-        let path = under_files(name);
+        let path = under_files(name)?;
         let mode = match request_header(headers, "if-match") {
             Some(version) => PutMode::Update(UpdateVersion { e_tag: Some(version.trim_matches('"').to_string()), version: None }),
             None => PutMode::Create,
@@ -430,7 +430,7 @@ impl Page {
         if param(query, "versions").is_some() || param(query, "version").is_some() {
             return Err(crate::codes::coded("0A000", "a page keeps no older versions: ?versions and ?version= are a node's"));
         }
-        let path = under_files(name);
+        let path = under_files(name)?;
         match self.files.get(&Path::from(path.as_str())).await {
             Ok(got) => {
                 let e_tag = got.meta.e_tag.clone().unwrap_or_default();
@@ -444,7 +444,7 @@ impl Page {
 
     /// `DELETE /files/{path}`: the file gone. A path no file is at is 404, as on a node.
     async fn delete(&self, name: &str) -> anyhow::Result<Answer> {
-        let path = under_files(name);
+        let path = under_files(name)?;
         let at = Path::from(path.as_str());
         match self.files.head(&at).await {
             Ok(_) => {}
@@ -488,7 +488,7 @@ fn located(url: &str) -> anyhow::Result<String> {
     } else if url.contains("://") {
         return Err(files_or_web(url));
     } else {
-        format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url)))
+        format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))?)
     };
     // (`Url::parse` takes `..` out of a path, so the name is judged once parsed: `mem:///files/../tables/t` is `/tables/t`)
     if !url::Url::parse(&made)?.path().starts_with(FILES) {
