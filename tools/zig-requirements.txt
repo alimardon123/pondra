@@ -1,0 +1,4 @@
+# The Linux builds' linker, zig through cargo-zigbuild: build.yml and startup.yml install exactly these, so the
+# startup list is traced with the linker main links it with (the 10-24 audit's L12). A bump makes the list due again.
+ziglang==0.17.0
+cargo-zigbuild==0.24.0

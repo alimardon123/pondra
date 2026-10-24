@@ -139,7 +139,7 @@ jobs:
             files=ALL
           fi
           has() { [ "$files" = ALL ] || grep -qE "$1" <<< "$files"; }
-          bin='^(src/|capi/|launcher/|brand/|build\.rs$|tools/startup_layout\.rs$|Cargo\.(toml|lock)$)' # (the program and the library, and their build scripts)
+          bin='^(src/|capi/|launcher/|brand/|build\.rs$|tools/(startup_layout\.rs|zig-requirements\.txt)$|Cargo\.(toml|lock)$)' # (the program and the library, their build scripts and linker; startup.yml's due paths)
           pkg='^(python/|js/|install\.(sh|ps1)$|tools/(package|smoke|package_check)\.py$|tools/(package_check\.mjs|try_packages\.sh|npm_publish\.sh|try_install\.ps1)$)' # (the packages, and what tries them)
           self='^\.github/workflows/build\.yml$'
           release=false
@@ -356,7 +356,7 @@ jobs:
           if [ "${{ needs.plan.outputs.profile }}" = release ]; then
             cargo build --release --workspace # (for this runner's glibc: a pull request's packages are tried here, never published)
           elif [ -n "${{ matrix.zig }}" ]; then
-            pip install ziglang cargo-zigbuild
+            pip install -r tools/zig-requirements.txt
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
             RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace --lib
             RUSTFLAGS="-A linker_messages" cargo zigbuild --profile dist --target ${{ matrix.zig }} --workspace
