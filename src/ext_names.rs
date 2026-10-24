@@ -32,6 +32,12 @@ fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to
 
 pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
 
+/// The `version` option as a number: the Delta version a read asks for, or None for its latest. Refused by name when it
+/// is not a number, so a node and a page say the same words.
+pub fn version(spec: &Spec) -> Result<Option<i64>> {
+    spec.options.get("version").map(|v| v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))).transpose()
+}
+
 /// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
 /// `read_csv('…', delim => ';')`, not its internal name.
 pub fn readable(text: &str) -> String {

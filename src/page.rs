@@ -752,7 +752,7 @@ impl Page {
     /// A Delta table (`read_delta`) at the version asked, or its latest: read from its log as a node reads it
     /// (`read_delta::resolve`, over this page's own `Reach`), its columns as SQL names them (`delta_table`).
     async fn delta(&self, overlay: &Overlay, name: &str, given: &crate::ext_names::Spec) -> anyhow::Result<()> {
-        let version = given.options.get("version").map(|v| v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))).transpose()?;
+        let version = crate::ext_names::version(given)?;
         let found = crate::read_delta::resolve(&PageReach(self), given.urls[0].trim_end_matches('/'), version).await?;
         overlay.own(name.to_string(), delta_table(&self.ctx, found).await?);
         Ok(())
@@ -1031,19 +1031,13 @@ impl crate::reach::Reach for PageReach<'_> {
 /// read under its physical name and renamed to its SQL name. A table with no files is empty, with its columns, as a
 /// node reads one.
 async fn delta_table(ctx: &SessionContext, found: crate::read_delta::Found) -> anyhow::Result<Arc<dyn TableProvider>> {
-    use datafusion::prelude::ident;
     if found.files.is_empty() {
         let columns: Vec<(String, String)> = found.columns.iter().map(|(c, t)| (found.names.get(c).unwrap_or(c).clone(), t.clone())).collect();
         return Ok(Arc::new(MemTable::try_new(crate::answer::schema(&columns)?, vec![vec![]])?));
     }
     let files: Vec<&crate::data_file::DataFile> = found.files.iter().collect();
     let df = crate::scan::read(ctx, &files, &crate::answer::schema(&found.columns)?, None).await?;
-    let select = found.columns.iter().map(|(c, _)| {
-        let name = found.names.get(c).map_or(c.as_str(), String::as_str);
-        // (a column named as it is is not aliased to itself: `query.rs` says why)
-        if name == c { ident(c) } else { ident(c).alias(name) }
-    }).collect::<Vec<_>>();
-    Ok(df.select(select)?.into_view())
+    Ok(crate::answer::renamed(df, |c| found.names.get(c).map_or(c, String::as_str).to_string(), |_| true)?.into_view())
 }
 
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for

@@ -355,13 +355,12 @@ fn shown<'a>(lake: &Lake, u: &'a str) -> &'a str {
 
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
-    let version = |k: &str| spec.options.get(k).map(|v| v.parse::<i64>().with_context(|| format!("{k} is a number, not {v}"))).transpose();
     match spec.format.as_str() {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
         "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
-                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, version("version")?).await?), None), // (a folder named relatively: from where the node runs)
+                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
                 _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
             };
             check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
