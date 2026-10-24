@@ -1804,9 +1804,14 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        let (status, told) = (crate::codes::http(code), crate::ext::said(&self.0)); // (the words its caller may see)
-        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        (status, [("x-pondra-sqlstate", code)], told).into_response()
+        let status = StatusCode::from_u16(crate::codes::http(crate::codes::of(&self.0))).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        error_response(status, &self.0)
     }
+}
+
+/// An error as a response with this status: its words are the body, and its SQLSTATE the `x-pondra-sqlstate` header, for
+/// any caller (a database server answers its own errors this way too).
+pub fn error_response(status: StatusCode, e: &anyhow::Error) -> Response {
+    let code = crate::codes::of(e); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
+    (status, [("x-pondra-sqlstate", code)], crate::ext::said(e)).into_response() // (the words its caller may see)
 }

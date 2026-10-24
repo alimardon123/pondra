@@ -267,10 +267,9 @@ pub fn blob_id(bytes: &[u8]) -> String {
 /// `'sales'` or `'files/sales'`: the folder of the workspace it names. The workspace itself, and the
 /// folders the platform keeps (versions, deploys), are refused.
 pub fn folder_of(name: &str) -> Result<String> {
-    // (the name as given, its leading `/` and all: `/Shared` is the workspace's, and `under_files` refuses it)
-    let folder = under_files(name.trim())?.trim_end_matches('/').to_string();
     let raw = name.trim().trim_matches('/');
     ensure!(!raw.is_empty() && raw != "files" && clean(raw), "{name}: a folder of the workspace ('sales'), not the workspace itself");
+    let folder = under_files(raw)?;
     ensure!(![VERSIONS, APPLIES].iter().any(|d| format!("{folder}/").starts_with(d)), "{name}: the workspace keeps its own versions and deploys there");
     Ok(folder)
 }

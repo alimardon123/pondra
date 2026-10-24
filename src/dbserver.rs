@@ -299,7 +299,7 @@ pub async fn serve(folder: String, addr: String, pg: Option<String>, default: Op
     Ok(())
 }
 
-fn error(status: StatusCode, e: anyhow::Error) -> Response { (status, crate::ext::said(&e)).into_response() }
+fn error(status: StatusCode, e: anyhow::Error) -> Response { crate::server::error_response(status, &e) }
 
 /// The token a request carries, and its role on this server.
 fn role(s: &Server, req: &axum::http::HeaderMap) -> Role {

@@ -3,14 +3,14 @@
 //! so a client written for one speaks to the other (ADR-061's request contract). No lake here: a page builds it.
 
 /// A path as `PUT /files/…` named it (`photos/a.jpg`), or as `files()` lists it (`files/photos/a.jpg`):
-/// the object's place in the lake either way. `~` and `/Shared` are the workspace's in 1.1 (ADR-054), beside the lakes,
-/// so they are refused here, before the leading `/` goes: a lake file can't take them.
+/// the object's place in the lake either way. A path whose first folder is `~` or `Shared` (with or without a leading `/`)
+/// is the workspace's in 1.1 (ADR-054), beside the lakes, so it is refused here: a lake file can't take one.
 pub fn under_files(path: &str) -> anyhow::Result<String> {
-    if path == "~" || path.starts_with("~/") || path == "/Shared" || path.starts_with("/Shared/") {
+    let rel = path.trim_start_matches('/');
+    if matches!(rel.split('/').next(), Some("~" | "Shared")) {
         return Err(crate::codes::coded("0A000", format!("{path}: paths like this are kept for the workspace each user gets in 1.1 (ADR-054), so put the file under another folder for now")));
     }
-    let path = path.trim_start_matches('/');
-    Ok(if path.starts_with("files/") { path.to_string() } else { format!("files/{path}") })
+    Ok(if rel.starts_with("files/") { rel.to_string() } else { format!("files/{rel}") })
 }
 
 /// What a file replaced since it was read says: `store::Changed`'s `Display` writes it.
@@ -53,17 +53,17 @@ mod tests {
     use super::under_files;
 
     #[test]
-    fn the_workspace_paths_are_refused_before_the_leading_slash_goes() {
-        for path in ["~", "~/a.sql", "/Shared", "/Shared/a"] {
+    fn a_first_folder_of_the_workspace_is_refused_with_or_without_a_slash() {
+        for path in ["~", "~/x", "/~/x", "Shared", "Shared/x", "/Shared/x", "//Shared/x"] {
             assert_eq!(crate::codes::of(&under_files(path).unwrap_err()), "0A000", "{path}");
         }
     }
 
     #[test]
     fn the_other_paths_are_lake_files_as_before() {
-        assert_eq!(under_files("Shared/a").unwrap(), "files/Shared/a");
+        assert_eq!(under_files("files/~/x").unwrap(), "files/~/x");
+        assert_eq!(under_files("etl/Shared/x").unwrap(), "files/etl/Shared/x");
+        assert_eq!(under_files("Sharedx/a").unwrap(), "files/Sharedx/a");
         assert_eq!(under_files("/etl/a.sql").unwrap(), "files/etl/a.sql");
-        assert_eq!(under_files("files/~/a").unwrap(), "files/~/a");
-        assert_eq!(under_files("/Sharedx/a").unwrap(), "files/Sharedx/a");
     }
 }

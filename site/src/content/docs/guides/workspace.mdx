@@ -10,7 +10,7 @@ import Ways from '../../../components/Ways.astro';
 
 The lake's own files are a workspace. A `.sql` file, a `.py` file or a notebook kept there (the
 console's Workspace, or `PUT /files/…`) runs as a job: with parameters, from any client, on a
-schedule, and each run is logged. That is an ETL pipeline with nothing else to install. A path of `~/…` or `/Shared/…` is refused with `0A000`: 1.1 keeps those for each user's files and the shared folder (ADR-054), so put the file under another folder for now.
+schedule, and each run is logged. That is an ETL pipeline with nothing else to install. A path whose first folder is `~` or `Shared` is refused with `0A000`: 1.1 keeps those folders for each user's files and the shared folder (ADR-054), so put the file under another folder for now.
 
 ## A file with parameters
 
