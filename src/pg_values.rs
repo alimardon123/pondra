@@ -4,6 +4,8 @@
 
 use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use pgwire::api::Type;
+use crate::pg_bytea;
+use crate::pg_text::{array_literal, interval_text, time_text};
 use std::ops::ControlFlow;
 
 // A parameter comes as its bytes, text or binary as the client chose. Binary is first written as the
@@ -24,7 +26,7 @@ pub(crate) fn value(t: &Type, raw: Option<&[u8]>, binary: bool) -> anyhow::Resul
 }
 
 fn utf8(raw: &[u8]) -> anyhow::Result<String> {
-    std::str::from_utf8(raw).map(str::to_string).map_err(|_| crate::codes::coded("22021", "invalid byte sequence for encoding \"UTF8\""))
+    crate::pg_bytea::utf8(raw).map_err(|e| crate::codes::coded(e.code, e.message))
 }
 
 /// The SQL literal of `text`, a value of type `t` as Postgres writes it. A typed value that doesn't
@@ -34,7 +36,7 @@ fn literal(t: &Type, text: &str) -> anyhow::Result<String> {
     Ok(match *t {
         Type::NUMERIC => sql_number(text).ok_or_else(|| bad("numeric", "22P02"))?,
         Type::UNKNOWN => sql_number(text).unwrap_or_else(|| quoted(text)), // (a number bare, anything else quoted)
-        Type::BYTEA => format!("X'{}'", hex_of(text).ok_or_else(|| bad("bytea", "22P02"))?),
+        Type::BYTEA => pg_bytea::sql(&pg_bytea::parse(text).map_err(|e| crate::codes::coded(e.code, e.message))?),
         Type::DATE => format!("DATE '{}'", date_of(text).ok_or_else(|| bad("date", "22007"))?.format("%Y-%m-%d")),
         Type::TIME => format!("TIME '{}'", time_of(text).ok_or_else(|| bad("time", "22007"))?.format("%H:%M:%S%.f")),
         Type::TIMESTAMP => format!("TIMESTAMP '{}'", timestamp_of(text).ok_or_else(|| bad("timestamp", "22007"))?.format("%Y-%m-%d %H:%M:%S%.f")),
@@ -106,12 +108,6 @@ fn sql_number(text: &str) -> Option<String> {
         t => t.to_string(),
     };
     Some(if negative { format!("(-{plain})") } else { plain })
-}
-
-/// `0x…` hex (Postgres's bytea text form) as lowercase hex digits; None for the other forms.
-fn hex_of(text: &str) -> Option<String> {
-    let hex = text.strip_prefix("\\x")?;
-    (hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hex.to_ascii_lowercase())
 }
 
 fn date_of(text: &str) -> Option<chrono::NaiveDate> { chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok() }
@@ -187,44 +183,11 @@ fn clock_micros(word: &str) -> Option<i64> {
     Some(if negative { -total } else { total })
 }
 
-/// An interval in Postgres's own text (`postgres` style): `1 year 2 mons 3 days 04:05:06.000004`.
-/// A negative clock after days shows its `+`, as Postgres writes it (`-1 days +00:00:03`).
-pub(crate) fn interval_text(months: i64, days: i64, micros: i64) -> String {
-    let unit = |n: i64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
-    let mut parts = vec![];
-    if months / 12 != 0 {
-        parts.push(unit(months / 12, "year"));
-    }
-    if months % 12 != 0 {
-        parts.push(unit(months % 12, "mon"));
-    }
-    if days != 0 {
-        parts.push(unit(days, "day"));
-    }
-    if micros != 0 || parts.is_empty() {
-        let sign = if micros < 0 { "-" } else if days < 0 { "+" } else { "" };
-        parts.push(format!("{sign}{}", clock(micros.unsigned_abs())));
-    }
-    parts.join(" ")
-}
-
 /// A timestamp as Postgres writes it in ISO style: `2026-01-01 00:00:00`, `…12:34:56.5`, and `+00` after
 /// an instant (always in UTC here).
 pub(crate) fn stamp_text(at: chrono::NaiveDateTime, zoned: bool) -> String {
     let micros = at.time().signed_duration_since(chrono::NaiveTime::MIN).num_microseconds().unwrap_or(0);
     format!("{} {}{}", at.format("%Y-%m-%d"), time_text(micros), if zoned { "+00" } else { "" })
-}
-
-/// A time of day as Postgres writes it: `12:34:56.789`, with no fraction for a whole second.
-pub(crate) fn time_text(us: i64) -> String { clock(us.unsigned_abs()) }
-
-/// `hh:mm:ss` and the fraction of a second that is left (`.789`, `.000004`; none for a whole second).
-fn clock(us: u64) -> String {
-    let fraction = match us % 1_000_000 {
-        0 => String::new(),
-        f => format!(".{f:06}").trim_end_matches('0').to_string(),
-    };
-    format!("{:02}:{:02}:{:02}{fraction}", us / 3_600_000_000, us / 60_000_000 % 60, us / 1_000_000 % 60)
 }
 
 /// Postgres's binary NUMERIC as its decimal text: base-10000 digits from weight, a sign and the
@@ -299,8 +262,8 @@ fn binary_text(t: &Type, raw: &[u8]) -> anyhow::Result<String> {
     let eight = || -> anyhow::Result<i64> { Ok(i64::from_be_bytes(raw.try_into().map_err(|_| short())?)) };
     let four = || -> anyhow::Result<i64> { Ok(i32::from_be_bytes(raw.try_into().map_err(|_| short())?).into()) };
     Ok(match *t {
-        // bytea's bytes, in the hex form the literal reads
-        Type::BYTEA => raw.iter().fold("\\x".to_string(), |s, b| format!("{s}{b:02x}")),
+        // bytea's bytes as Postgres writes them, which the literal reads back
+        Type::BYTEA => pg_bytea::text(raw),
         Type::NUMERIC => numeric_text(raw)?,
         // a float's bits, read as the text Rust writes it (which reads back to the same value)
         Type::FLOAT8 => f64::from_bits(eight()? as u64).to_string(),
@@ -355,84 +318,6 @@ pub(crate) fn substitute(sql: &str, values: &[String]) -> String {
 }
 
 // ---- Array literals: a string cast to an array type is read as Postgres reads it (`'{a,b}'::text[]`) ----
-
-/// Postgres's text array literal (`{a,"b,c",NULL}`): a bare NULL is a NULL element, a quoted one is text, a bare
-/// element is trimmed of its spaces, and `{}` has no elements. Nested braces are refused by name (0A000) for now.
-pub(crate) fn array_literal(s: &str) -> anyhow::Result<Vec<Option<String>>> {
-    let malformed = || crate::codes::coded("22P02", format!("malformed array literal: \"{s}\""));
-    let body = s.trim().strip_prefix('{').and_then(|b| b.strip_suffix('}')).ok_or_else(malformed)?;
-    let mut rest = body.trim_start();
-    let mut items = Vec::new();
-    if rest.is_empty() {
-        return Ok(items);
-    }
-    loop {
-        if rest.starts_with('{') {
-            return Err(crate::codes::coded("0A000", format!("nested array literals are not supported yet: \"{s}\"")));
-        }
-        let (item, after) = if rest.starts_with('"') { quoted_item(rest) } else { bare_item(rest) }.ok_or_else(malformed)?;
-        items.push(item);
-        let after = after.trim_start();
-        if after.is_empty() {
-            return Ok(items);
-        }
-        rest = after.strip_prefix(',').ok_or_else(malformed)?.trim_start();
-    }
-}
-
-/// A quoted element at the start of `s`, its escapes undone, and the text after its closing quote.
-fn quoted_item(s: &str) -> Option<(Option<String>, &str)> {
-    let mut out = String::new();
-    let mut chars = s[1..].char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '"' => return Some((Some(out), &s[2 + i..])),
-            '\\' => out.push(chars.next()?.1),
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-/// A bare element at the start of `s`: up to the next comma, trimmed, with `\x` read as `x`. A bare NULL is NULL,
-/// and an empty element (`{a,,b}`) is malformed.
-fn bare_item(s: &str) -> Option<(Option<String>, &str)> {
-    let mut end = s.len();
-    let mut chars = s.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            ',' => {
-                end = i;
-                break;
-            }
-            _ => {}
-        }
-    }
-    let raw = s[..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let item = if raw.eq_ignore_ascii_case("NULL") { None } else { Some(unescaped(raw)) };
-    Some((item, &s[end..]))
-}
-
-/// `s` with each `\x` read as `x`.
-fn unescaped(s: &str) -> String {
-    let mut out = String::new();
-    let mut escaped = false;
-    for c in s.chars() {
-        if c == '\\' && !escaped {
-            escaped = true;
-        } else {
-            out.push(c);
-            escaped = false;
-        }
-    }
-    out
-}
 
 /// Each string literal cast to an array type, read as Postgres reads an array literal and written as the array it
 /// names: `'{a,b}'::text[]`, `CAST('{1,2}' AS INT[])` and `TEXT[] '{a,b}'` become `CAST(make_array('a', 'b') AS TEXT[])`,
@@ -561,12 +446,14 @@ mod tests {
     }
 
     #[test]
-    fn bytea_is_hex_and_other_forms_are_refused() {
+    fn bytea_reads_both_of_postgres_forms() {
         assert_eq!(lit(Type::BYTEA, "\\xff0001"), "X'ff0001'");
         assert_eq!(lit(Type::BYTEA, "\\x"), "X''");
         assert_eq!(lit(Type::BYTEA, "\\xFF"), "X'ff'");
-        assert!(lit(Type::BYTEA, "ff00").starts_with("ERR 22P02"));
-        assert!(lit(Type::BYTEA, "\\x0").starts_with("ERR 22P02"));
+        // (no `\x`: the escape form, so the text's own bytes)
+        assert_eq!(lit(Type::BYTEA, "ff00"), "X'66663030'");
+        assert!(lit(Type::BYTEA, "\\x0").starts_with("ERR 22023"));
+        assert!(lit(Type::BYTEA, "a\\b").starts_with("ERR 22P02"));
     }
 
     #[test]
@@ -640,22 +527,6 @@ mod tests {
         assert!(e.to_string().contains("a inet parameter in binary isn't taken: send it as text"));
         assert_eq!(value(&Type::INET, Some(&b"10.0.0.1"[..]), false).unwrap(), Some("'10.0.0.1'".to_string()));
         assert_eq!(value(&Type::TEXT, None, true).unwrap(), None);
-    }
-
-    #[test]
-    fn interval_text_is_postgres_style() {
-        assert_eq!(interval_text(14, 3, 14_706_000_004), "1 year 2 mons 3 days 04:05:06.000004");
-        assert_eq!(interval_text(0, 0, 0), "00:00:00");
-        assert_eq!(interval_text(0, -1, 3_000_004), "-1 days +00:00:03.000004");
-        assert_eq!(interval_text(0, 1, -1_500_000), "1 day -00:00:01.5");
-    }
-
-    #[test]
-    fn time_text_cuts_the_fraction_as_postgres_does() {
-        assert_eq!(time_text(45_296_789_000), "12:34:56.789");
-        assert_eq!(time_text(45_296_000_000), "12:34:56");
-        assert_eq!(time_text(0), "00:00:00");
-        assert_eq!(time_text(86_399_999_999), "23:59:59.999999");
     }
 
     #[test]

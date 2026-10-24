@@ -299,7 +299,10 @@ EXCEPTIONS = {
     "names apart": "a SELECT list naming two items alike (`count(1), count(1)`, a call and its call over a cast), which DataFusion refuses and Pondra answers, naming the second apart (invariant 175)",
     "IN outside a WHERE": "`x IN (SELECT …)` and `EXISTS (…)` in a SELECT list, a CASE or an aggregate, which DataFusion can't run and Pondra answers with SQL's NULLs",
     "avg rounded": "`avg` over a DECIMAL rounds its last place, as Postgres and DuckDB do; DataFusion cuts it off",
+    "Postgres's base64": "`encode(…, 'base64')` writes its padding, as Postgres does (DataFusion leaves it off), and `decode(…, 'base64')` reads as Postgres does, refusing a short last group or padding inside a group, which DataFusion takes",
 }
+# Postgres 16's base64 refusals, by their words (src/pg_bytea.rs's unbase64).
+BASE64_WORDS = ("invalid base64 end sequence", "while decoding base64 sequence")
 RUNNER_FUNCTIONS = {"async_abs"}  # (async_udf.slt's: registered by the runner)
 MADE = re.compile(r"\s*(?:create\s+(?:or\s+replace\s+)?(?:(?:temp|temporary|external|unbounded|materialized)\s+)*(?:table|view)\s+(?:if\s+not\s+exists\s+)?|select\b.*?\binto\s+)(\"[^\"]+\"|[\w.]+)", re.I | re.S)
 
@@ -338,7 +341,17 @@ def exception(sql, why, made, pattern=""):
         return "microseconds"
     if why.startswith("answer differs (in another order)") and not re.search(r"\border\s+by\b", outermost(sql), re.I):
         return "an order not asked for"
+    if re.search(r"'base64", sql, re.I) and (why.startswith("answer differs") and only_padding(why) or any(w in why for w in BASE64_WORDS)):
+        return "Postgres's base64"
     return None
+
+
+def only_padding(why):
+    """Whether an answer differs from the one wanted only in its `=` characters: the two sides are equal once every
+    `=` is taken out of both, but not before (`encode(…, 'base64')`'s padding)."""
+    got, _, want = why.partition(", want ")
+    got = got.partition("got ")[2]
+    return bool(got) and bool(want) and got != want and got.replace("=", "") == want.replace("=", "")
 
 
 def twice(sql):

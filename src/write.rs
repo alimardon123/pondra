@@ -1114,6 +1114,9 @@ fn plain_values(query: &str) -> Option<ast::Values> {
     }
 }
 
+/// A query that is one row of `VALUES`: its rows can't hold a key twice (`change::merge` asks nothing more of them).
+pub(crate) fn one_row(query: &str) -> bool { plain_values(query).is_some_and(|v| v.rows.len() == 1) }
+
 /// The width of a query's rows, when the query fixes it: a plain `VALUES` whose rows share one width, or a query whose
 /// body is a SELECT (the leftmost of a set operation) with no `*`, `t.*` or `COLUMNS(…)` among its items. None for any
 /// other query, which takes the table's columns as they come.
@@ -1818,6 +1821,9 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory)
     }
+    if let Stmt::Insert(t, query) = &stmt {
+        crate::seq::check_every(&app.lake, t, rows_width(query)).await?; // (the columns it gives: an ALWAYS identity's refused among them, in a transaction too)
+    }
     // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
     // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
     if let Some(note) = Box::pin(crate::txn::ddl_at_once(app, &stmt)).await? {
@@ -1851,7 +1857,6 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            crate::seq::check_every(&app.lake, &t, rows_width(&query)).await?; // (the columns it gives: an ALWAYS identity's refused among them)
             if !is_there(&app.lake, &t).await? {
                 seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
                 if !is_there(&app.lake, &t).await? {
@@ -1997,7 +2002,8 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
     let meta = meta.expect("a table");
-    let batch = rows_of(lake, lake, &meta, &sql, None, files).await?;
+    // (each jsonb in its own form, so `RETURNING` answers what is held; the log checks the rows, as every door's)
+    let batch = crate::types::as_held(&meta, rows_of(lake, lake, &meta, &sql, None, files).await?, true)?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -2381,7 +2387,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
             let batch = rows_of(query, target, &m, &sql, None, files).await?; // (a DEFAULT's sequence is the attached lake's)
-            crate::defaults::check(&m, table, &batch)?; // (NOT NULL: as a node's own log checks its rows)
+            let batch = crate::defaults::fit(&m, table, batch)?; // (NOT NULL, and each jsonb in its own form: as a node's own log checks its rows)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)
@@ -2631,6 +2637,7 @@ mod tests {
         assert_eq!(rows_width("SELECT unnest(s) FROM t"), None);
         assert_eq!(rows_width("SELECT 1 UNION SELECT 2"), Some(1));
         assert_eq!(rows_width("VALUES (1) ORDER BY 1"), None);
+        assert!(one_row("VALUES (1, 'a')") && !one_row("VALUES (1), (2)") && !one_row("SELECT 1") && !one_row("VALUES (1) ORDER BY 1"));
         let names: Vec<String> = ["a", "b", "c"].iter().map(|n| n.to_string()).collect();
         assert_eq!(implicit(&names, Some(1)), ["a"]);
         assert_eq!(implicit(&names, Some(2)), ["a", "b"]);

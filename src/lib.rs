@@ -35,6 +35,22 @@ mod friendly;
 mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
+// Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_formats;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_functions;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_json;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_json_make;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_json_edit;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_json_sets;
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+mod pg_text;
+pub mod pg_bytea;
 mod optimize;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
@@ -126,16 +142,10 @@ mod read_delta;
 #[cfg(feature = "server")] mod past;
 #[cfg(feature = "server")] mod path;
 #[cfg(feature = "server")] mod pg_catalog;
-#[cfg(feature = "server")] mod pg_formats;
-#[cfg(feature = "server")] mod pg_functions;
-#[cfg(feature = "server")] mod pg_json;
-#[cfg(feature = "server")] mod pg_json_make;
-#[cfg(feature = "server")] mod pg_json_edit;
-#[cfg(feature = "server")] mod pg_json_sets;
 #[cfg(feature = "server")] mod pg_names;
-#[cfg(feature = "server")] mod pg_text;
 #[cfg(feature = "server")] mod pg_types;
 #[cfg(feature = "server")] mod pg_values;
+#[cfg(feature = "server")] mod pg_copy;
 #[cfg(feature = "server")] mod literals;
 #[cfg(feature = "server")] mod ci;
 #[cfg(feature = "server")] mod project;

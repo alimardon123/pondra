@@ -7,7 +7,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::format::{ExplainFormat, MetricCategory, MetricType};
 use datafusion::common::instant::Instant;
-use datafusion::common::{exec_err, internal_err, Result};
+use datafusion::common::{internal_err, Result};
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult};
@@ -52,8 +52,8 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
-    // `octet_length` is for text; bytes have their own (DataFusion's other byte functions —
-    // sha256, md5, encode, decode — take BINARY as they are; substr is below).
+    // `byte_length` is Pondra's own; `pg_bytea` gives Postgres's bytea functions (DataFusion's other byte
+    // functions, sha256 and md5, take BINARY as they are); substr is below.
     let bytes = |args: &[ColumnarValue]| {
         let arrays: Vec<ArrayRef> = args.iter().map(|a| match a {
             ColumnarValue::Array(a) => Ok(a.clone()),
@@ -66,6 +66,8 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     };
     ctx.register_udf(create_udf("byte_length", vec![DataType::Binary], DataType::Int64, Volatility::Immutable, Arc::new(bytes)));
     ctx.register_udf(substr().as_ref().clone());
+    let ctx = crate::pg_json::planned(ctx); // (Postgres's JSON: its operators ahead of the planners above, its functions)
+    crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
     ctx
 }
 
@@ -204,8 +206,8 @@ fn union_text(u: &UnionArray) -> datafusion::arrow::error::Result<StringArray> {
     Ok(StringArray::from(out))
 }
 
-/// `substr` and `SUBSTRING(… FROM … FOR …)` for bytes and text: planned here, ahead of
-/// DataFusion's own planner, which knows only the text one.
+/// `substr` and `SUBSTRING(… FROM … FOR …)`, and `POSITION(… IN …)`, for bytes and text: planned here, ahead of
+/// DataFusion's own planner, which knows only the text ones.
 fn substrings() -> Arc<dyn ExprPlanner> {
     Arc::new(Substrings)
 }
@@ -216,6 +218,10 @@ struct Substrings;
 impl ExprPlanner for Substrings {
     fn plan_substring(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
         Ok(PlannerResult::Planned(substr().call(args)))
+    }
+    // (DataFusion passes `(string, substring)`, which is strpos's order)
+    fn plan_position(&self, args: Vec<Expr>) -> Result<PlannerResult<Vec<Expr>>> {
+        Ok(PlannerResult::Planned(crate::pg_bytea::strpos().call(args)))
     }
 }
 
@@ -234,7 +240,7 @@ struct Substr {
     signature: Signature,
 }
 
-fn bytes(t: &DataType) -> bool {
+pub(crate) fn bytes(t: &DataType) -> bool {
     matches!(t, DataType::Binary | DataType::LargeBinary | DataType::BinaryView | DataType::FixedSizeBinary(_))
 }
 
@@ -277,7 +283,7 @@ impl ScalarUDFImpl for Substr {
             let (v, start) = (b.value(i), from.value(i));
             // As SQL's: characters before position 1 count against the length.
             let end = match count {
-                Some(c) if c.value(i) < 0 => return exec_err!("negative substring length not allowed"),
+                Some(c) if c.value(i) < 0 => return Err(crate::pg_json_make::refuse("22011", "negative substring length not allowed")),
                 Some(c) => start.saturating_add(c.value(i)),
                 None => i64::MAX,
             };

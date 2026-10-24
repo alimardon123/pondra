@@ -901,15 +901,14 @@ impl ObjectStore for ReadOnly {
     async fn copy_opts(&self, _: &Path, to: &Path, _: object_store::CopyOptions) -> object_store::Result<()> { Err(refused(&self.1, &to.to_string())) }
 }
 
-/// A session with every function a query's session has but what needs a lake: the engine's (`engine::session`),
-/// Postgres's JSON operators and functions, and the node's own. A node's sessions start from it (`Lake::made`), and so do
+/// A session with every function a query's session has but what needs a lake: the engine's (`engine::session`, with
+/// Postgres's JSON operators and functions), and the node's own. A node's sessions start from it (`Lake::made`), and so do
 /// the expressions a table keeps (`defaults.rs`: CHECK, DEFAULT and expectations), so a condition planned in a query plans
 /// there too.
 pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
-    let ctx = crate::pg_json::planned(crate::engine::session(config, rt)); // (Postgres's JSON operators and functions)
+    let ctx = crate::engine::session(config, rt);
     crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
     crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
-    crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
     crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
     ctx
 }

@@ -294,12 +294,13 @@ impl Log {
         if crate::backup::frozen(&self.lake) {
             return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
         }
-        if let Some(m) = self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
-            if crate::constraints::checked(&m) {
+        let batch = match self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+            Some(m) if crate::constraints::checked(&m) => {
                 return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), &m, table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
             }
-            crate::defaults::check(&m, &table, &batch)?; // (NOT NULL, whichever door the rows came in by)
-        }
+            Some(m) => crate::defaults::fit(&m, &table, batch)?, // (NOT NULL, and jsonb in its own form, whichever door the rows came in by)
+            None => batch,
+        };
         let (ack, rx) = oneshot::channel();
         crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
         self.tx.send(Append { table, src, batch, ack }).await.map_err(|_| anyhow!("log closed"))?;

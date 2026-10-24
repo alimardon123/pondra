@@ -4,11 +4,10 @@
 //! comes in (`sets`), a call in a SELECT list becomes `unnest` of that list, a call in a FROM a derived table of its
 //! rows, and each place Postgres refuses a call is refused by Postgres's words and SQLSTATE before anything changes.
 use crate::codes::coded;
-use crate::pg_catalog::{function, text_arg};
-use crate::pg_json::{answer, kind, opened, JSON_SPACE};
+use crate::pg_functions::{function, text_arg};
+use crate::pg_json::{answer, json_refusal, kind, opened, skip, JSON_SPACE};
 use crate::pg_json_make::fail;
-use crate::pg_types::names_kept;
-use crate::types::json_refusal;
+use crate::text::names_kept;
 use datafusion::arrow::array::{ArrayRef, ListArray, StringArray, StructArray};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
@@ -247,7 +246,7 @@ fn elements(doc: &str) -> Option<Vec<&str>> {
     let mut peek = jiter.known_array().ok()?;
     while let Some(p) = peek {
         let start = jiter.current_index();
-        jiter.known_skip(p).ok()?;
+        skip(&mut jiter, p).ok()?;
         out.push(doc.get(start..jiter.current_index())?.trim_matches(JSON_SPACE));
         peek = jiter.array_step().ok()?;
     }
@@ -263,7 +262,7 @@ fn members(doc: &str, jsonb: bool) -> Option<Vec<(String, &str)>> {
     while let Some(key) = next {
         let peek = jiter.peek().ok()?;
         let start = jiter.current_index();
-        jiter.known_skip(peek).ok()?;
+        skip(&mut jiter, peek).ok()?;
         out.push((key, doc.get(start..jiter.current_index())?.trim_matches(JSON_SPACE)));
         next = jiter.next_key().ok()?.map(str::to_string);
     }

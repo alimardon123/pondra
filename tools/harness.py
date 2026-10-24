@@ -4797,7 +4797,9 @@ def copies():
     """COPY over the Postgres protocol (ADR-021): `COPY … FROM STDIN` loads text (psycopg's
     write_row, NULLs included) and CSV with a header and quoted commas; `COPY … TO STDOUT` sends
     text, CSV and binary, each read back as the rows went in; the ADBC Postgres driver, which reads
-    every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow."""
+    every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
+    the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
+    in text and CSV; COPY TO piped back gives the rows."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
     lake, pg = new_lake(), A.port + 10
     node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
@@ -4841,13 +4843,46 @@ def copies():
     with adbc.connect(f"postgresql://u@127.0.0.1:{pg}/lake") as c, c.cursor() as cur:
         cur.execute("SELECT id, name, amount FROM ev ORDER BY id")
         arrow = cur.fetch_arrow_table()
+    # COPY FROM reads the text format as Postgres 16 does: escapes, octal and hex, an escaped delimiter, and bytea
+    # in text and CSV. What COPY TO writes, piped back into COPY FROM, gives the same rows. The data are copied as written.
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        cur.execute("CREATE TABLE cx (id INT, v BYTEA, s TEXT)")
+        cur.execute("CREATE TABLE cy (id INT, v BYTEA, s TEXT)")
+        with cur.copy("COPY cx FROM STDIN") as cp:
+            cp.write("1\t\\\\x01ff\ta\\|b\\101\\x41\\q\n3\t\\\\101\t\\N\n")
+        with cur.copy("COPY cx FROM STDIN WITH (DELIMITER '|')") as cp:
+            cp.write("7|\\\\x00|x\\|y\n")
+        with cur.copy("COPY cx FROM STDIN WITH (FORMAT csv)") as cp:
+            cp.write("8,\\x0a0b,plain\n")
+        read = "SELECT id, encode(v, 'hex') AS h, s FROM {} ORDER BY id"
+        text_rows = c.execute(read.format("cx")).fetchall()
+        with cur.copy("COPY cx TO STDOUT") as cp:
+            dumped = b"".join(cp)
+        with cur.copy("COPY cy FROM STDIN") as cp:
+            cp.write(dumped)
+        piped = c.execute(read.format("cy")).fetchall()
+        # each of these is refused with its code, and writes nothing
+        text_refusals = []
+        for copy_sql, data in [("COPY cx FROM STDIN", "2\tab\\\\c\tz\n"), ("COPY cx FROM STDIN", "2\t\\x80\tz\n"),
+                               ("COPY cx FROM STDIN", "2\t\\\\x01\n"), ("COPY cx FROM STDIN WITH (DELIMITER 'é')", "2\tz\n")]:
+            try:
+                with cur.copy(copy_sql) as cp:
+                    cp.write(data)
+                text_refusals.append("accepted")
+            except psycopg.Error as e:
+                text_refusals.append(e.sqlstate)
+        kept_text = c.execute("SELECT count(*) FROM cx").fetchone()[0]
+    text_ok = (text_rows == [(1, "01ff", "a|bAAq"), (3, "41", None), (7, "00", "x|y"), (8, "0a0b", "plain")]
+               and piped == text_rows and text_refusals == ["22P02", "22021", "22P04", "0A000"] and kept_text == 4)
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM a line of another width (22P04) or a value that isn't its type (22P02): refused, nothing written":
                   refused == {"one field too many": "22P04", "one field short": "22P04", "not a number": "22P02"} and kept == 2000,
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
-              "DECIMAL as NUMERIC, text and binary": numeric_ok}
+              "DECIMAL as NUMERIC, text and binary": numeric_ok,
+              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok}
     out = {"passed": all(checks.values()), "checks": checks}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
@@ -14106,6 +14141,14 @@ def sequences():
         totals == {"n": 1403, "ids": 1403, "given": 1403} and via_pg[0] == via_pg[1] and cli.returncode == 0
     checks["VALUES take their ids in the rows' order"] = all(r == sorted(r) for r in runs) and len(runs) == 20
     refused = [err(x) for x in ("INSERT INTO orders (id, node, k) VALUES (1, 1, 1)", "INSERT INTO orders VALUES (1, 1, 1)", "UPDATE orders SET id = 1 WHERE k = 1")]
+    with psycopg.connect(f"host=127.0.0.1 port={pg} user=x dbname=x", autocommit=True) as c:  # (a transaction's positional INSERT is checked too)
+        c.execute("BEGIN")
+        try:
+            c.execute("INSERT INTO orders VALUES (1, 1, 1)")
+            refused.append((None, None))
+        except psycopg.Error as e:
+            refused.append((str(e), e.sqlstate))
+        c.execute("ROLLBACK")
     q("CREATE TABLE kinds (a BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 100 INCREMENT BY 10), v INT)")
     q("CREATE TABLE ser (a SERIAL, v INT)")
     q("CREATE TABLE my (a BIGINT AUTO_INCREMENT, v INT)")
@@ -14116,8 +14159,8 @@ def sequences():
     kinds = {t: [r["a"] for r in q(f"SELECT a FROM {t} ORDER BY v")] for t in ("kinds", "ser", "my", "sf")}
     shown = q("SHOW CREATE TABLE kinds")[0]["definition"]
     info["kinds"] = [refused, kinds, shown]
-    checks["ALWAYS refuses a value given or set (428C9); BY DEFAULT, SERIAL, AUTO_INCREMENT and IDENTITY(5, 5) number from their start"] = \
-        [r[1] for r in refused] == ["428C9"] * 3 and kinds == {"kinds": [100, 110, 3, 120], "ser": [1, 2], "my": [1, 2], "sf": [5, 10]} \
+    checks["ALWAYS refuses a value given or set (428C9), in a transaction too; BY DEFAULT, SERIAL, AUTO_INCREMENT and IDENTITY(5, 5) number from their start"] = \
+        [r[1] for r in refused] == ["428C9"] * 4 and kinds == {"kinds": [100, 110, 3, 120], "ser": [1, 2], "my": [1, 2], "sf": [5, 10]} \
         and "GENERATED BY DEFAULT AS IDENTITY (INCREMENT BY 10 START WITH 100)" in shown
     # owned sequences live and die with their tables; what can't be is refused
     q("CREATE TABLE d (n BIGINT DEFAULT nextval('o2'), v INT)")
@@ -14663,7 +14706,7 @@ def ddlgaps():
 def sqla():
     """What SQLAlchemy's dialect suite and dbt send (`friendly.rs`, `defaults.rs`, `seq.rs`, `temp.rs`,
     `ddl.rs`): a number with an exponent as NUMERIC (`'1E-7'::numeric`); a bytea in its hex form
-    (`'\\xff00'::bytea`, a bad one 22P02); INSERT … DEFAULT VALUES (every column's default, a NOT NULL one
+    (`'\\xff00'::bytea`, a bad one 22023, as Postgres 16 has it); INSERT … DEFAULT VALUES (every column's default, a NOT NULL one
     without a default refused 23502); LIKE … ESCAPE '/' (ILIKE and NOT LIKE too, a pattern that isn't
     written out refused, literals joined by || taken); a table named with a quote refused, the message saying why; a temporary table's
     PRIMARY KEY (23505 for a repeat, 23502 for NULL, ON CONFLICT skips and replaces); a dropped table's
@@ -14701,12 +14744,12 @@ def sqla():
         Decimal(str(num["a"])) == Decimal("0.0000001") and Decimal(str(num["b"])) == Decimal("0.0000001") \
         and Decimal(str(num["c"])) == Decimal("2500") and Decimal(str(num["d"])) == Decimal("-150")
 
-    # '\xff00'::bytea is two bytes (its hex form); a bad hex form is 22P02; other strings keep their meaning
+    # '\xff00'::bytea is two bytes (its hex form); a bad hex form is 22023 (Postgres 16's code for it); other strings keep their meaning
     by = q(r"SELECT '\xff00'::bytea = decode('ff00', 'hex') AS hex, 'abc'::bytea = decode('616263', 'hex') AS plain")[0]
     bad_odd, bad_digit = err(r"SELECT '\xf'::bytea"), err(r"SELECT '\xfg'::bytea")
     info["bytea"] = [by, bad_odd[1:2], bad_digit[1:2]]
-    checks["'\\xff00'::bytea is its two bytes; an odd or non-hex digit is 22P02; 'abc'::bytea is as before"] = \
-        by["hex"] is True and by["plain"] is True and bad_odd[1] == "22P02" and bad_digit[1] == "22P02"
+    checks["'\\xff00'::bytea is its two bytes; an odd or non-hex digit is 22023; 'abc'::bytea is as before"] = \
+        by["hex"] is True and by["plain"] is True and bad_odd[1] == "22023" and bad_digit[1] == "22023"
 
     # INSERT INTO t DEFAULT VALUES: each column's default, identity included; NOT NULL without one is 23502
     q("CREATE TABLE dv (id INT GENERATED BY DEFAULT AS IDENTITY, v TEXT DEFAULT 'x')")
@@ -15141,6 +15184,90 @@ def colnames():
     if not ok:
         sys.exit(1)
     return f"{sum(checks.values())} of {len(checks)} column-name checks"
+
+
+def bytea():
+    """bytea's functions read their arguments as Postgres 16 does (a literal as a bytea, base64 strictly, length over
+    bytes, encode(12) refused): over HTTP and over the Postgres port. A string literal in a bytea function's first
+    argument is a bytea (`encode('\\x01ff', 'hex')` is 01ff, `get_byte('\\x0102', 1)` is 2, `convert_from('\\x6162',
+    'UTF8')` is ab); base64 is written with its padding (`encode('a', 'base64')` is YQ==) and read strictly
+    (`decode('invalid', 'base64')` is refused 22023, `YQ==YQ==` is two bytes); `length` over a bytea counts its bytes
+    (`length('\\xc328'::bytea)` is 2) and over text its characters (`length('é')` is 1); `encode(12, 'hex')` has no
+    function to take an integer, so it is refused 42883. The answers are Postgres 16's, checked by hand."""
+    import psycopg
+    lake = new_lake()
+    port, pg = A.port + 1, A.port + 10
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    # Postgres 16's answer to each statement: its first row's first value, as text.
+    ANSWERS = [
+        (r"SELECT encode('\x01ff', 'hex') AS h", "01ff"),
+        (r"SELECT get_byte('\x0102', 1) AS b", "2"),
+        (r"SELECT encode('abc', 'base64') AS b", "YWJj"),
+        (r"SELECT encode('a', 'base64') AS b", "YQ=="),
+        (r"SELECT length('\xc328'::bytea) AS n", "2"),
+        ("SELECT length('é') AS n", "1"),
+        (r"SELECT encode(decode('YQ==YQ==', 'base64'), 'hex') AS h", "6161"),
+        (r"SELECT convert_from('\x6162', 'UTF8') AS s", "ab"),
+    ]
+    # Postgres 16's refusal of each statement: its SQLSTATE.
+    REFUSALS = [
+        (r"SELECT decode('invalid', 'base64')", "22023"),
+        (r"SELECT encode(12, 'hex')", "42883"),
+    ]
+    checks, info = {}, {}
+    node = None
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def q(s):
+        return call(port, "POST", "/sql", s.encode(), timeout=120)
+
+    def err(s):
+        """(status, x-pondra-sqlstate, the whole body) of a POST /sql; (200, None, '') when it went through."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse()
+        data = r.read().decode()
+        c.close()
+        return (r.status, r.getheader("x-pondra-sqlstate"), data) if r.status != 200 else (200, None, "")
+
+    def pg_value(s):
+        with psycopg.connect(url, autocommit=True) as conn:
+            return str(conn.execute(s).fetchone()[0])
+
+    def pg_code(s):
+        """The SQLSTATE the Postgres port refuses `s` with, None when it answers."""
+        with psycopg.connect(url, autocommit=True) as conn:
+            try:
+                conn.execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+    try:
+        node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
+        for s, want in ANSWERS:
+            check(f"HTTP answers {s} with {want}", lambda s=s, want=want: str(next(iter(q(s)[0].values()))) == want)
+            check(f"the Postgres port answers {s} with {want}", lambda s=s, want=want: pg_value(s) == want)
+        for s, code in REFUSALS:
+            check(f"HTTP refuses {s} with {code}", lambda s=s, code=code: err(s)[1] == code)
+            check(f"the Postgres port refuses {s} with {code}", lambda s=s, code=code: pg_code(s) == code)
+    finally:
+        if node is not None:
+            node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"bytea": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} bytea checks"
+
+
 def remembered():
     """The Postgres port answers a repeated query as HTTP does (`App::remembers`): the same text at the same
     catalog version, from any connection, runs once (`pondra_queries_total`), and a commit makes the next one
@@ -16636,9 +16763,11 @@ def _jsons_spaces(check, over_http, over_port, info):
 
 def jsons():
     """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
-    holds the text as it was written, and every write door refuses a value that isn't JSON with 22P02, writing nothing:
-    SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM STDIN and `pondra sql`. A valid value is
-    taken and read back as written. The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
+    holds a json column's text as it was written, and a jsonb column's as jsonb writes it (keys sorted and once, Postgres's
+    spacing: `types::as_held`, which every write door runs through `defaults::fit`). Every write door refuses a value that
+    isn't JSON with 22P02, writing nothing: SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM
+    STDIN and `pondra sql`. A valid value is taken: a json value is read back as written, a jsonb value as Postgres prints
+    it, so DISTINCT and GROUP BY compare jsonb values as Postgres does (`jdoor_doors`). The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
     hands over dicts and lists, in text and binary cursors, for a column, RETURNING, a view and a literal cast alike, and
     takes psycopg's Json and Jsonb parameters. `'x'::json` is 22P02 (TRY_CAST NULL); pg_typeof says json and jsonb; the
     catalog says so too; SHOW CREATE TABLE says JSON and JSONB and runs again after a DROP; ADD COLUMN keeps the type; ALTER
@@ -17109,6 +17238,45 @@ def jsons():
         ported = [pg_same(f"{name}, the port", port_cells(as_text(sql)), name) for name, sql in queries]
         return all(http) and all(ported)
 
+    def jdoor_doors():
+        """A jsonb column holds jsonb's text whichever door wrote it (`types::as_held`, run by `defaults::fit`): written as text,
+        `{"b":2,"a":1}` reads back as Postgres 16 prints it, and DISTINCT and GROUP BY compare the values, not the texts. The
+        INSERT … SELECT takes the bulk path (only VALUES goes through the log), so each of the two sites is run: `fit` in the
+        plain INSERT's path and in the log's, and in a transaction's insert and its change."""
+        q("CREATE TABLE jdoor (id INT, j JSONB)")
+        doc = '{"b":2,"a":1}'  # (as written: keys out of order, no spaces)
+
+        def copy_jdoor(line):
+            """COPY FROM STDIN of one text line into jdoor: None when it went in, else the SQLSTATE."""
+            try:
+                with psycopg.connect(url, autocommit=True) as conn:
+                    with conn.cursor() as cur, cur.copy("COPY jdoor (id, j) FROM STDIN") as cp:
+                        cp.write(line)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate
+
+        q(f"INSERT INTO jdoor (id, j) VALUES (1, {lit(doc)})")
+        q(f"INSERT INTO jdoor (id, j) SELECT 2, {lit(doc)}")
+        appended = err(json.dumps({"id": 3, "j": doc}) + "\n", "/append/jdoor?producer=jdoor&seq=1")[0]
+        copied = copy_jdoor(f"4\t{doc}\n")
+        q("INSERT INTO jdoor (id, j) VALUES (5, NULL)")
+        q(f"UPDATE jdoor SET j = {lit(doc)} WHERE id = 5")
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute("BEGIN")
+            conn.execute(f"INSERT INTO jdoor (id, j) VALUES (6, {lit(doc)})")
+            conn.execute("INSERT INTO jdoor (id, j) VALUES (7, NULL)")
+            conn.execute(f"UPDATE jdoor SET j = {lit(doc)} WHERE id = 7")
+            conn.execute("COMMIT")
+        seven = [r["j"] for r in q("SELECT j FROM jdoor WHERE id <= 7 ORDER BY id")]
+        q("INSERT INTO jdoor (id, j) VALUES (8, '[1,  2]'), (9, '[1,2]')")
+        distinct = [r["n"] for r in q("SELECT count(DISTINCT j) AS n FROM jdoor")]
+        grouped = [[r["j"], r["n"]] for r in q("SELECT j, count(*) AS n FROM jdoor GROUP BY j ORDER BY 1")]
+        info["jdoor: the append's and COPY's statuses (200, None); the seven rows' texts; count(DISTINCT j); GROUP BY j"] = [
+            appended, copied, seven, distinct, grouped]
+        return (appended == 200 and copied is None and seven == ['{"a": 1, "b": 2}'] * 7 and distinct == [2]
+                and grouped == [["[1, 2]", 2], ['{"a": 1, "b": 2}', 7]])
+
     def wholes_nested():
         """A maker in a WHERE clause and one in a scalar subquery, over HTTP and the port, against Postgres 16's rows."""
         where = "SELECT id FROM d_json WHERE json_build_object('d', doc)::text <> '{}' ORDER BY id"
@@ -17539,6 +17707,7 @@ def jsons():
         check("json_object_agg and jsonb_object_agg, and json_agg of json_build_object, nest their documents as Postgres 16 does, over HTTP and the port", wholes_objects)
         check("PostgREST's coalesce(json_agg(...), '[]') answers its rows or '[]', nests in json_build_object, and is json (114) to psycopg", wholes_postgrest)
         check("a jsonb column with keys out of order and a duplicate key, nested by json_build_object, json_agg and jsonb_build_object, prints as jsonb does", wholes_jsonb)
+        check("a jsonb column holds jsonb's text from every door (VALUES, SELECT, an append, COPY, UPDATE, a transaction): DISTINCT and GROUP BY count as Postgres 16 does", jdoor_doors)
         check("a maker in a WHERE clause and in a scalar subquery answers Postgres 16's rows, over HTTP and the port", wholes_nested)
         check("a whole row Pondra can't make is refused by name: 0A000 for an unnamed item and a file's columns, 42883 for DISTINCT over json, 22023 for a json key", wholes_refusals)
         check("json_agg over 3,000 rows in seven groups, on three nodes (spread=1) and one (spread=0): equal to each other and to Postgres 16's text", wholes_spread)
@@ -23416,7 +23585,7 @@ SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "ba
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -23448,7 +23617,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -23461,7 +23630,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -15,6 +15,14 @@ use serde_json::{json, Value};
 /// stored. A delete marker (`_deleted`) carries only its key, and passes.
 pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> { check_named(meta, table, rows, true) }
 
+/// What a door runs on rows it is about to keep: written as the table holds them (`types::as_held`), then checked as
+/// `check` does, with each column as the table holds it.
+pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
+    let rows = crate::types::as_held(meta, rows, true)?;
+    check(meta, table, &rows)?;
+    Ok(rows)
+}
+
 fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: bool) -> Result<()> {
     if (meta.not_null.is_empty() && meta.checks.is_empty() && meta.enums.is_empty() && meta.sql_types.is_empty()) || rows.num_rows() == 0 {
         return Ok(());
@@ -103,6 +111,7 @@ pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Op
     let (schema, table) = (rows.schema(), table.to_string());
     let checked = rows.map(move |b| {
         let b = b?;
+        let b = crate::types::as_held(&meta, b, false).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
         check_named(&meta, &table, &b, false).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
         Ok(b)
     });
