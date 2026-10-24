@@ -1048,6 +1048,7 @@ text is the node's own, it is shown in code:
 | `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused: `a table's options go in WITH (name = value, …)` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/sql/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
+| `INSTALL x`, `LOAD x` of a DuckDB extension Pondra doesn't have built in, such as `INSTALL spatial` | refused, SQLSTATE `0A000`, naming it; the built-in names are listed in [SQL in Pondra](/pondra/sql/) |
 | `CREATE EXTERNAL TABLE … STORED AS AVRO` | refused: `Pondra reads Parquet, CSV, JSON (a value a line) and Arrow` |
 | `CREATE TABLE t` when `t` is there | refused (`42P07`); say `IF NOT EXISTS` or `OR REPLACE` |
 | `SET datafusion.runtime.…` | refused: the node's memory and caches are set as it starts, with `--memory-gb` |

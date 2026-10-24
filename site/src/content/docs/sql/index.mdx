@@ -16,6 +16,17 @@ INSERT INTO langs VALUES ('SQL', 1974), ('Python', 1991), ('Rust', 2010);
 FROM langs WHERE year > 1980 ORDER BY year;
 ```
 
+DuckDB scripts that begin with `INSTALL` and `LOAD` run as they are for the extensions Pondra has
+built in: `httpfs`, `parquet`, `json`, `icu`, `iceberg`, `delta` and `aws`. Pondra has nothing to
+install for them, so each statement answers with a notice (`httpfs is built into Pondra: nothing to
+install`) and does nothing else. Their limits: `httpfs` reads `s3://` files, and `http(s)://` files
+only when a secret covers the URL (`CREATE SECRET … TYPE http`); `json` reads newline-delimited JSON,
+not JSON arrays; `icu` gives `SET TimeZone` and `AT TIME ZONE`, not `timezone()`; `aws` reads `s3://`
+files with the AWS credential chain. `FORCE INSTALL` and `INSTALL … FROM` are read the same way. Any
+other name is refused by name with SQLSTATE `0A000`, since Pondra's own extensions come in 1.1
+(ADR-075), and so is a DuckDB extension file (`LOAD '…duckdb_extension'`), which is DuckDB's own
+native code.
+
 ## The reference
 
 | Page | What it covers |

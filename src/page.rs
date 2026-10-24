@@ -157,6 +157,8 @@ impl Page {
     /// the page's session (`statement`), with the files it names given to that copy alone (`given`). What a statement
     /// makes (a table) is the page's; nothing else it registers reaches the page or another statement.
     async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
+        let row = crate::extension::row(text).transpose()?; // (DuckDB's INSTALL and LOAD: a row naming what happened, `extension.rs`)
+        let text = row.as_deref().unwrap_or(text);
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
         let (ctx, overlay) = self.statement()?;
@@ -555,6 +557,16 @@ mod tests {
             // The page's tables are still there after it.
             assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM orders".into()).await.body, "n\n3\n");
         });
+    }
+
+    #[tokio::test]
+    async fn a_page_answers_an_extension_statement_with_a_row_naming_it() {
+        let page = Page::open(&Options::default());
+        let answered = page.request("POST", "/sql?format=csv", &[], "INSTALL httpfs".into()).await;
+        assert_eq!(answered.status, 200, "{:?}", answered.body);
+        assert_eq!(answered.body, "notice\nhttpfs is built into Pondra: nothing to install\n");
+        let refused = page.request("POST", "/sql", &[], "INSTALL spatial".into()).await;
+        assert_eq!(refused.header("x-pondra-sqlstate"), Some("0A000"));
     }
 
     #[tokio::test]
