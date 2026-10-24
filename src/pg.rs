@@ -340,7 +340,8 @@ fn copy_refused(given: &[String], e: datafusion::arrow::error::ArrowError) -> an
 }
 
 fn user_error(e: anyhow::Error) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), crate::codes::of(&e).into(), crate::ext::said(&e))))
+    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".into(), code.into(), words)))
 }
 
 impl Backend {

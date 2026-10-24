@@ -114,8 +114,8 @@ fn grpc(code: &str) -> tonic::Code {
 /// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`.
 fn status(e: impl Into<anyhow::Error>) -> Status {
     let e = e.into();
-    let code = crate::codes::of(&e);
-    let mut s = Status::new(grpc(code), crate::ext::said(&e));
+    let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code()); // (the code and words every door gives)
+    let mut s = Status::new(grpc(code), words);
     s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
     s
 }
