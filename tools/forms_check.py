@@ -10,7 +10,9 @@ each file on a lake (or a page) of its own:
 - `statement ok`, `statement count N`, and `query <types> [rowsort|valuesort]` with its answer;
 - `statement error <SQLSTATE> [words]` and `query error …`: the refusal's x-pondra-sqlstate, and words its message
   holds (a regular expression, as in slt_check.py);
-- `put <path>` and its lines up to a blank line: a file given as `PUT /files/<path>`, which every form reads by name.
+- `put <path>` and its lines up to a blank line: a file every form reads by that name, given where its caller reads a
+  relative name (designs/l2-p5-files.md): `PUT /files/<path>` for a client over the network (server, cluster, page),
+  and the working folder for the program that started the node (inprocess, memory: a fresh folder for each file).
 
 Every form is reached through the one request contract, request(method, path, headers, body):
 - server: a node over HTTP; cluster: three nodes on one lake, each query spread over them (`?spread=1`);
@@ -59,6 +61,12 @@ class Nodes:
         r = c.getresponse()
         return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
 
+    def put(self, path, text, session):
+        """A file a client over the network gives: `PUT /files/<path>`, read from the lake's files/."""
+        status, head, body = self.request("PUT", "/files/" + path, session, text.encode())
+        said = body.decode(errors="replace")
+        return None if status < 300 else (f"PUT /files/{path}: {status} {said[:300]}", head.get("x-pondra-sqlstate"), said)
+
     def close(self):
         [node.kill() for node in self.nodes]
         harness.clean_up()
@@ -68,12 +76,14 @@ class InProcess:
     """inprocess and memory: a node in this process (the library), on a fresh folder, or on `:memory:`, for each file."""
 
     def __init__(self, memory):
-        self.memory, self.spread, self.db, self.lake = memory, False, None, None
+        self.memory, self.spread, self.db, self.lake, self.home = memory, False, None, None, None
 
     def open(self):
         sys.path.insert(0, os.path.join(REPO, "python"))
         from pondra import inprocess
         self.lake = None if self.memory else tempfile.mkdtemp(prefix="pondra-forms-")
+        self.home, self.folder = os.getcwd(), tempfile.mkdtemp(prefix="pondra-forms-cwd-")
+        os.chdir(self.folder)  # (the program that started the node reads a relative name here: put writes into it)
         self.db = inprocess.connect(self.lake, python=False)
         if getattr(self.db, "_inproc", None) is None:  # (no library here: connect() started a node beside this process)
             raise RuntimeError(f"no library at {os.environ.get('PONDRA_LIBRARY')}: connect() gave a node beside this process, not in it")
@@ -85,10 +95,20 @@ class InProcess:
         except urllib.error.HTTPError as e:
             return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
 
+    def put(self, path, text, session):
+        """A file the program that started the node gives: written into its working folder."""
+        full = os.path.join(self.folder, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+
     def close(self):
-        self.db.close()
-        if self.lake:
-            shutil.rmtree(self.lake, ignore_errors=True)
+        if self.db:
+            self.db.close()
+        os.chdir(self.home)
+        for folder in (self.lake, self.folder):
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
 
 
 class Page(Nodes):
@@ -124,9 +144,7 @@ def wanted(header):
 def outcome(form, session, kind, header, text, expected):
     """None when the record passes on the form, else (why, the refusal's SQLSTATE or None, its words)."""
     if kind == "put":
-        status, head, body = form.request("PUT", "/files/" + header[0], session, text.encode())
-        said = body.decode(errors="replace")
-        return None if status < 300 else (f"PUT /files/{header[0]}: {status} {said[:300]}", head.get("x-pondra-sqlstate"), said)
+        return form.put(header[0], text, session)
     path = "/sql?format=arrow" + ("&spread=1" if kind == "query" and form.spread else "")
     status, head, body = form.request("POST", path, session, text.encode())
     refusal = header[:1] == ["error"]
@@ -202,6 +220,7 @@ def form_of(name):
 
 def main():
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
+    A.bin, A.lib, A.pkg = (os.path.abspath(p) for p in (A.bin, A.lib, A.pkg))  # (inprocess and memory leave this folder)
     harness.BIN = A.bin
     os.environ["PONDRA_LIBRARY"] = A.lib
     os.environ.setdefault("PONDRA_BIN", A.bin)  # (the library's launcher, as inprocess_check.py gives it)
