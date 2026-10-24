@@ -25,7 +25,7 @@ use datafusion::common::{exec_err, plan_err, Result, ScalarValue};
 use datafusion::logical_expr::{async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl}, ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDFImpl, Signature, TableType, Volatility};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
 
 const FETCHES: usize = 8; // objects read at once by file_read
@@ -36,6 +36,15 @@ pub fn register(ctx: &SessionContext, lake: Arc<Lake>) {
     ctx.register_udf(AsyncScalarUDF::new(Arc::new(FileRead { lake, signature: Signature::string(1, Volatility::Volatile) })).into_scalar_udf());
 }
 
+/// A path's refusal as DataFusion carries it: a coded one stays coded (`codes::of` finds it as the error's source), so the
+/// client gets its SQLSTATE and not an internal error.
+fn refusal(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    match e.downcast::<crate::codes::Coded>() {
+        Ok(coded) => datafusion::error::DataFusionError::External(Box::new(coded)),
+        Err(other) => datafusion::error::DataFusionError::External(other.into()),
+    }
+}
+
 /// The objects under a prefix: `files('photos/')`, or `files()` for everything under `files/`.
 #[derive(Debug)]
 struct Listing(Arc<Lake>);
@@ -44,7 +53,7 @@ impl TableFunctionImpl for Listing {
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         let prefix = match args {
             [] => "files/".to_string(),
-            [Expr::Literal(ScalarValue::Utf8(Some(p)) | ScalarValue::Utf8View(Some(p)), _)] => under_files(p),
+            [Expr::Literal(ScalarValue::Utf8(Some(p)) | ScalarValue::Utf8View(Some(p)), _)] => under_files(p).map_err(refusal)?,
             _ => return plan_err!("files('<prefix>')"),
         };
         Ok(Arc::new(Files { lake: self.0.clone(), prefix, schema: files_schema() }))
@@ -128,11 +137,14 @@ impl AsyncScalarUDFImpl for FileRead {
         };
         let paths = paths.as_string::<i32>();
         let read = |i: usize| async move {
-            let path = paths.is_valid(i).then(|| under_files(paths.value(i)))?;
-            let bytes = self.lake.object(&path).await.ok()?;
-            (bytes.len() <= BIGGEST).then_some(bytes)
+            if !paths.is_valid(i) {
+                return anyhow::Ok(None);
+            }
+            let path = under_files(paths.value(i))?; // (a path the workspace keeps is refused, not read as a missing file)
+            let bytes = self.lake.object(&path).await.ok();
+            anyhow::Ok(bytes.filter(|b| b.len() <= BIGGEST))
         };
-        let bytes: Vec<_> = futures::stream::iter((0..paths.len()).map(read)).buffered(FETCHES).collect().await;
+        let bytes: Vec<_> = futures::stream::iter((0..paths.len()).map(read)).buffered(FETCHES).try_collect().await.map_err(refusal)?;
         let mut out = BinaryBuilder::new();
         for b in bytes {
             out.append_option(b);

@@ -140,7 +140,11 @@ impl Server {
     /// port, and the mark of this use (it isn't stopped until that is dropped).
     /// `create`: make the lake if there is none (the default database, on first use).
     async fn node(&self, name: &str, create: bool) -> Result<(u16, u16, Busy)> {
-        crate::ddl::check(name)?;
+        // (a new database's name is checked for the server's own; one that is there is only looked up)
+        match create {
+            true => crate::ddl::database_name(name)?,
+            false => crate::ddl::check(name)?,
+        }
         if let Some(n) = self.nodes.lock().await.get_mut(name) {
             if n.child.try_wait()?.is_none() {
                 return Ok((n.http, n.pg, Busy::new(&n.activity)));

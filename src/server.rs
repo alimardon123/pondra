@@ -220,7 +220,7 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// if nobody replaced it meanwhile (412 if so; ADR-034). Each save is kept as a version too
 /// (`files::keep`, ADR-035 §8).
 async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
-    let (path, bytes) = (crate::lake_files::under_files(&path), body.len());
+    let (path, bytes) = (crate::lake_files::under_files(&path)?, body.len());
     let expect = headers.get("if-match").and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
     let done = match &expect {
         Some(v) => app.lake.replace(&path, body.to_vec(), v).await,
@@ -246,7 +246,7 @@ async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: Hea
 /// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content
 /// type by its name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes.
 async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
-    let path = crate::lake_files::under_files(&path);
+    let path = crate::lake_files::under_files(&path)?;
     if q.contains_key("versions") {
         let all = crate::files::versions(&app.lake, &path).await?;
         return Ok(Json(all.iter().map(|v| j!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect::<Vec<_>>()).into_response());
@@ -270,7 +270,7 @@ async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Qu
 
 /// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest).
 async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, E> {
-    let path = crate::lake_files::under_files(&path);
+    let path = crate::lake_files::under_files(&path)?;
     let id = q.get("restore").ok_or_else(|| E(anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)")))?;
     let bytes = crate::files::version(&app.lake, &path, id).await?;
     let version = match app.lake.version(&path).await {
@@ -286,7 +286,7 @@ async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q)
 
 /// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at: 404.
 async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    let path = crate::lake_files::under_files(&path);
+    let path = crate::lake_files::under_files(&path)?;
     match app.lake.remove_file(&path).await {
         Ok(()) => Ok(Json(j!({"removed": path})).into_response()),
         Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {

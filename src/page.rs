@@ -232,7 +232,7 @@ impl Page {
     /// made. Without `If-Match` a path that is there is 409; with it, the file is replaced if it is still that version
     /// (quotes and all), and 412 if not.
     async fn put(&self, name: &str, headers: &[(String, String)], body: bytes::Bytes) -> anyhow::Result<Answer> {
-        let path = under_files(name);
+        let path = under_files(name)?;
         let mode = match request_header(headers, "if-match") {
             Some(version) => PutMode::Update(UpdateVersion { e_tag: Some(version.trim_matches('"').to_string()), version: None }),
             None => PutMode::Create,
@@ -254,7 +254,7 @@ impl Page {
         if param(query, "versions").is_some() || param(query, "version").is_some() {
             return Err(crate::codes::coded("0A000", "a page keeps no older versions: ?versions and ?version= are a node's"));
         }
-        let path = under_files(name);
+        let path = under_files(name)?;
         match self.files.get(&Path::from(path.as_str())).await {
             Ok(got) => {
                 let e_tag = got.meta.e_tag.clone().unwrap_or_default();
@@ -268,7 +268,7 @@ impl Page {
 
     /// `DELETE /files/{path}`: the file gone. A path no file is at is 404, as on a node.
     async fn delete(&self, name: &str) -> anyhow::Result<Answer> {
-        let path = under_files(name);
+        let path = under_files(name)?;
         let at = Path::from(path.as_str());
         match self.files.head(&at).await {
             Ok(_) => {}
@@ -309,7 +309,7 @@ fn located(url: &str) -> anyhow::Result<String> {
     if url.contains("://") {
         return Err(crate::codes::coded("0A000", format!("{url}: a page reads the files given to it (PUT /files/{{path}}); URLs come later")));
     }
-    Ok(format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))))
+    Ok(format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))?))
 }
 
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for

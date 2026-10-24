@@ -327,6 +327,7 @@ console's Workspace shows them and edits them in place.
   the next `If-Match` needs. A `GET` of a path with no file is `404`.
 - **The answer to `DELETE`** is `{"removed": "files/{path}"}`. `POST ?restore=` answers
   `{"path", "version", "restored"}`, with the version it made the file again.
+- **A reserved path:** a path that is `~` or starts with `~/`, or is `/Shared` or starts with `/Shared/`, is refused with `0A000`. 1.1 keeps those for each user's files and the shared folder beside the lakes (ADR-054), so put the file under another folder for now.
 - **Every node reads a replaced file's new bytes** at its next statement: nothing caches `files/`
   (not the SSD tier either). The rest of the lake is never overwritten, so it is cached.
 - **Every save is kept as a version**, with who made it and when, in `files/.versions/` (which
