@@ -142,7 +142,7 @@ if engine.startswith("duckdb"):
     print(json.dumps({"load": time.time() - t0, "version": duckdb.__version__}), flush=True)
     qs = json.load(open(os.path.join(repos, "sql.json")))
     for q in queries:
-        report(q, lambda: con.execute(qs[str(q)]).fetch_arrow_table())
+        report(q, lambda: con.execute(qs[str(q)]).to_arrow_table())
 
 elif engine.startswith("clickhouse"):
     import re, shutil, subprocess, tempfile, pyarrow as pa, pyarrow.parquet as pq
