@@ -699,7 +699,7 @@ A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3
 | Function | Options |
 |---|---|
 | `read_parquet`, `read_json` | `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
-| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `comment`, `new_line`, `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
+| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `comment`, `new_line`, `all_varchar`, `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
 | `read_delta` | `version` |
 | `read_iceberg` | `version`, `snapshot_from_id`, `snapshot_from_timestamp`, `allow_moved_paths` |
 
@@ -709,6 +709,7 @@ A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3
   `hive_partitioning`.
 - `comment => '#'` (`read_csv`) skips the lines that start with it.
 - `new_line => '\r'` (`read_csv`) is only needed for files whose lines end in `\r`.
+- `all_varchar => true` (`read_csv`) reads every column as text, with no type inference.
 
 An option Pondra doesn't know is an error that lists the ones it does. A bare quoted name in
 `FROM` (`FROM 'sales.csv'`) picks the reader from the file's extension.

@@ -1480,7 +1480,8 @@ pub(crate) async fn sent(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.g
 pub fn in_order(ctx: &SessionContext) { ctx.state_ref().write().config_mut().options_mut().optimizer.enable_round_robin_repartition = false; }
 
 /// `df`'s rows written as Parquet into the table's folder, by position as the table's columns (or,
-/// for a new table, the query's, with plain Utf8 strings): the columns, and the files.
+/// for a new table, the query's, with plain Utf8 strings): the columns, and the files. A value the query gives is cast
+/// to its column's type as INSERT casts it, so a bulk INSERT, COPY INTO and a share refuse what INSERT refuses (`cast_given`).
 pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: datafusion::prelude::DataFrame, stamp: Option<crate::log::Reserved>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::prelude::{cast as cast_to, Expr};
@@ -1503,21 +1504,49 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
             None => Ok(null()),
         }
     };
-    let exprs = target.iter().enumerate().map(|(i, (name, t))| Ok(cast_to(match given.get(i) {
+    // (the plan selects a given column as it comes, and cast_given casts it batch by batch: the same types, and the stream's
+    // schema is the one the casts give, so the names and nullability stay as written)
+    let picks = target.iter().enumerate().map(|(i, (name, t))| Ok(match given.get(i) {
+        Some(c) => Expr::Column(c.clone()).alias(name),
+        None => cast_to(default(name)?, t.clone()).alias(name),
+    })).collect::<Result<Vec<_>>>()?;
+    let casts = target.iter().enumerate().map(|(i, (name, t))| Ok(cast_to(match given.get(i) {
         Some(c) => Expr::Column(c.clone()),
         None => default(name)?,
     }, t.clone()).alias(name))).collect::<Result<Vec<_>>>()?;
-    let df = df.select(exprs)?;
+    let schema: SchemaRef = Arc::new(df.clone().select(casts)?.schema().as_arrow().clone());
+    let given_n = given.len();
+    let df = df.select(picks)?;
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
     let partition = meta.as_ref().and_then(|m| m.partition.clone());
     let next = Arc::new(std::sync::atomic::AtomicU64::new(0)); // (the streams share one block of ids)
-    let streams = df.execute_stream_partitioned().await?.into_iter().map(|rows| crate::defaults::checked(rows, &meta, table)).map(|rows| match stamp {
+    let streams = df.execute_stream_partitioned().await?.into_iter().map(|rows| cast_given(rows, schema.clone(), given_n)).map(|rows| crate::defaults::checked(rows, &meta, table)).map(|rows| match stamp {
         Some(reserved) => crate::sys::stamp_stream(rows, next.clone(), reserved),
         None => Ok(rows),
     });
     // (files of up to 4M rows, as a merge writes them: `maintain` leaves them alone)
     let writes = streams.collect::<Result<Vec<_>>>()?.into_iter().map(|rows| crate::tier::write_stream(lake, table, rows, 4_000_000, &[], true, partition.as_deref()));
     Ok((columns, futures::future::try_join_all(writes).await?.concat()))
+}
+
+/// `rows` with its first `given` columns cast to the table's types, batch by batch, by `query::strict`, the cast INSERT
+/// makes of a value: a value that won't go is the stream's error, with Postgres's words and SQLSTATE. The columns after
+/// them are already of their types (a DEFAULT, or NULL, cast in the plan). `schema` is the stream's: every column's type.
+fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: SchemaRef, given: usize) -> datafusion::execution::SendableRecordBatchStream {
+    use futures::StreamExt;
+    let out = schema.clone();
+    let cast = rows.map(move |b| -> datafusion::error::Result<RecordBatch> {
+        let mut columns = b?.columns().to_vec();
+        for (column, field) in columns.iter_mut().zip(schema.fields()).take(given) {
+            // (a refusal is the DataFusion error `casts::into` made, kept as it is: `codes::of` finds its code)
+            *column = crate::query::strict(column, field.data_type()).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
+                Ok(d) => d,
+                Err(e) => datafusion::error::DataFusionError::External(e.into()),
+            })?;
+        }
+        Ok(RecordBatch::try_new(schema.clone(), columns)?)
+    });
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(out, cast))
 }
 
 /// Leader: record an INSERT's files in one commit through the log (`adopt::file`), creating the

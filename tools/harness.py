@@ -575,6 +575,40 @@ def loads():
     seen = as_user(ann_auth, "SELECT name, file FROM pondra.loads WHERE name = 'orders'")
     checks["7b. a user without SELECT on orders gets none of its loads (or a refusal by name); granted SELECT, it lists them"] = (
         (unseen == [] or "permission denied" in unseen) and isinstance(seen, list) and len(seen) == 4)
+    # Files with no rows load nothing: an empty file, or one of blank lines, is listed with 0 rows on every run and recorded
+    # nowhere. A value that won't go into its column is refused with Postgres's SQLSTATE and words (the header and body).
+    def answer(s):  # (status, SQLSTATE, body): the answer, or the refusal, as the node sends it
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {"x-pondra-owner": owner_key})
+        r = c.getresponse()
+        body = r.read().decode(errors="replace")
+        c.close()
+        return r.status, r.getheader("x-pondra-sqlstate"), body
+    write("empty/a.csv", "")
+    write("empty/b.csv", "\n\n")
+    write("ints/big.csv", "99999999999\n")
+    write("ints/abc.csv", "abc\n")
+    run("CREATE TABLE empties (id BIGINT, amount BIGINT)")
+    run("CREATE TABLE ints (n INTEGER)")
+    empty = answer(f"COPY INTO empties FROM '{d}/empty/' (FORMAT csv, HEADER false)")
+    empty_again = answer(f"COPY INTO empties FROM '{d}/empty/' (FORMAT csv, HEADER false)")
+    big = answer(f"COPY INTO ints FROM '{d}/ints/big.csv' (FORMAT csv, HEADER false)")
+    abc = answer(f"COPY INTO ints FROM '{d}/ints/abc.csv' (FORMAT csv, HEADER false)")
+    literal = answer("INSERT INTO ints VALUES (99999999999)")
+    selected = answer("INSERT INTO ints SELECT '99999999999'")
+    cast = answer("SELECT CAST(12345 AS DECIMAL(3,1))")
+    empty_loads = run("SELECT count(*) AS n FROM pondra.loads WHERE name = 'empties'")
+    empty_body, empty_again_body = json.loads(empty[2]), json.loads(empty_again[2])
+    checks["14. an empty file or one of blank lines loads nothing: 200, both files listed with 0 rows on each run, none recorded; values that won't go are refused with their SQLSTATE and words"] = (
+        empty[0] == 200 and empty_body["rows"] == 0 and [l["rows"] for l in empty_body["loaded"]] == [0, 0]
+        and empty_again[0] == 200 and [l["rows"] for l in empty_again_body["loaded"]] == [0, 0]
+        and empty_loads == [{"n": 0}] and count("empties") == {"n": 0, "s": 0}
+        and big[0] == 400 and big[1] == "22003" and "integer out of range" in big[2]
+        and abc[0] == 400 and abc[1] == "22P02" and 'invalid input syntax for type integer: "abc"' in abc[2]
+        and literal[0] == 400 and literal[1] == "22003" and "integer out of range" in literal[2]
+        and selected[0] == 400 and selected[1] == "22003"
+        and cast[0] == 400 and cast[1] == "22003")
+
     # Check 8: a node that keeps records for two seconds (PONDRA_LOAD_RETENTION_SECS, read once): past
     # it, a load's record goes, and its old file (last changed before the window) isn't loaded again
     lake8 = new_lake()
@@ -8089,7 +8123,7 @@ def found():
         and q("SELECT count(DISTINCT tag) AS n FROM acct") == [{"n": 8}] and q("SELECT v, count(*) AS n FROM big GROUP BY v ORDER BY v") == [{"v": "d", "n": 2}, {"v": "x", "n": 5}]
     checks["NOT NULL refused by name on every door (a key's columns too); a bad DEFAULT refused at CREATE; ADD COLUMN … DEFAULT refused"] = \
         all("is NOT NULL" in v for v in null_refused.values()) and "acct.id is NOT NULL" in null_refused["a NULL key"] and q("SELECT count(*) AS n FROM acct") == [{"n": 8}] \
-        and "Cannot cast" in fails("CREATE TABLE bad (a BIGINT DEFAULT 'abc')") and "nope" in fails("CREATE TABLE bad (a BIGINT DEFAULT nope())") \
+        and "invalid input syntax for type bigint" in fails("CREATE TABLE bad (a BIGINT DEFAULT 'abc')") and "nope" in fails("CREATE TABLE bad (a BIGINT DEFAULT nope())") \
         and "rows already there" in fails("ALTER TABLE acct ADD COLUMN z BIGINT DEFAULT 3")
     _short_rows(q, pgport, checks, seen)
     # DEFAULT as the column's default in upserts, MERGE, UPDATE and VALUES (Postgres 16's answers): `_default_words`.

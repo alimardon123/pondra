@@ -231,7 +231,7 @@ pub enum Source {
 }
 
 /// The options `COPY INTO` takes: the reader's own (`read_*`'s names) and FORCE.
-const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "force"];
+const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "all_varchar", "force"];
 
 /// How long a file's load record is kept, and so how old a file may be and still be loaded again
 /// without FORCE: a file last changed before this window is skipped, as its record may be gone
@@ -276,6 +276,12 @@ pub struct Entry {
 /// column the table lacks is refused by name; a table column the file lacks is NULL or its DEFAULT,
 /// as INSERT does it. Refused: a view, a keyed table, a table of another lake.
 ///
+/// A CSV file is read as `read_csv` reads it: a line `\.` is data, as DuckDB and Postgres 18 read a file (the end
+/// marker is COPY FROM STDIN's); a blank line is no row (Postgres and DuckDB read one as a NULL in a one-column file);
+/// a file with no rows loads nothing. Such a file is listed in the answer with 0 rows, and nothing is recorded for it:
+/// each later run lists it again with 0 rows, FORCE changes nothing, and `pondra.loads` doesn't show it. A value that
+/// won't go into its column is refused with Postgres's words and SQLSTATE (`casts::into`).
+///
 /// Invariant 337: a file is loaded into a table once a version (`copy::copy_into`, `adopt::file`):
 /// its load is a bulk INSERT whose job names the table's folder, the file and its version, so a
 /// retry, a second statement at once or a failover records it once; its record (`ld/{folder}/`)
@@ -312,6 +318,11 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
             continue;
         }
         let names = columns_of(lake, &p.query, positional, &cols, table, &p.url).await?;
+        if names.is_empty() {
+            // (a file with no rows: an empty one, or of blank lines, reads no columns; nothing is written or recorded for it)
+            loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": 0}));
+            continue;
+        }
         let load = Load { folder: folder.clone(), file: p.url.clone(), version: p.version.clone(), run: run.clone() };
         let out = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, p.query), Some(job_of(&load)), owner()).await?;
         if let Some(rows) = out["rows"].as_u64() {
