@@ -317,14 +317,6 @@ pub fn as_held(meta: &TableMeta, rows: RecordBatch, sql_names: bool) -> Result<R
     crate::rules::typed::as_held(&meta.to_rules()?, rows, sql_names)
 }
 
-/// `rules::typed::check` over the entry's rules (`to_rules`), for an entry with an enum or a held column.
-pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn Fn(usize) -> bool) -> Result<()> {
-    if meta.enums.is_empty() && meta.sql_types.is_empty() {
-        return Ok(());
-    }
-    crate::rules::typed::check(&meta.to_rules()?, rows, sql_names, marker)
-}
-
 /// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
 /// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
 /// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
