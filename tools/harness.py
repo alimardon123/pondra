@@ -21942,13 +21942,34 @@ def dialects():
     return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
 
 
+def _delta_commits(lake, table):
+    """A Delta table's JSON commits, as {version: [action, ...]}, each line of a commit as the log writes it."""
+    import open_check
+    return {int(key.rsplit("/", 1)[1].split(".")[0]): [json.loads(line) for line in open_check.read_object(lake, key).decode().splitlines() if line]
+            for key in lake_objects(lake, f"data/{table}/_delta_log/") if key.endswith(".json")}
+
+
+def _live_adds(commits):
+    """The files a Delta log has live at its newest version: every add, less the ones a later commit removed."""
+    live = {}
+    for v in sorted(commits):
+        for action in commits[v]:
+            if "add" in action:
+                live[action["add"]["path"]] = action["add"]
+            if "remove" in action:
+                live.pop(action["remove"]["path"], None)
+    return live
+
+
 def publishing():
     """What can't be published as Delta or Iceberg is refused by name, never written wrong or
     skipped quietly: asked for, a column the format has no type for, a materialized view finished
     as it is read (its files hold partial rows) and a history view are refused, and so is sharing
     one, or adding such a column to a published table; under the node's --publish they are made,
     left out of that format, and the statement says so; and nothing of theirs is written as Delta or
-    Iceberg (a finished view's partial rows were, before)."""
+    Iceberg (a finished view's partial rows were, before). Then the files' ranges: the formats carry
+    each file's min and max and NULLs, so every reader (Pondra, DuckDB, delta-rs, PyIceberg) answers
+    a filter as the model does, and a reader skips the files a filter rules out."""
     import urllib.request
     lake = new_lake()
     node = Node(lake, A.port, tier_secs=0.5, publish="delta,iceberg").start()
@@ -21982,6 +22003,147 @@ def publishing():
         checks["…the others never: no Iceberg or Delta of them"] = not any(iceberg(t) for t in ("spans", "avgs", "hist")) and (A.s3 or not any(
             os.path.exists(os.path.join(lake, "data", t, d)) for t in ("spans", "avgs", "hist") for d in ("_delta_log", "metadata")))
         checks["…and read as before"] = q("SELECT g, a FROM avgs ORDER BY g") == [{"g": "a", "a": 3.0}, {"g": "b", "a": 6.0}] and q("SELECT count(*) AS n FROM spans") == [{"n": 1}]
+        # The ranges the open formats carry (`delta.rs` `stats`, `iceberg.rs` `entry`): each file's min and max and its NULLs,
+        # so a reader skips the files a filter rules out. Each batch is one file (a CHECKPOINT after each INSERT: small files merge
+        # only 8 at a time), and every reader answers each filter as the model does.
+        import datetime as dt, decimal, io, struct, deltalake, pyarrow as pa, pyarrow.parquet as pq
+        from deltalake import QueryBuilder
+        from pyiceberg.expressions import And, EqualTo, GreaterThan, GreaterThanOrEqual, IsNull, LessThan, LessThanOrEqual
+        from pyiceberg.table import StaticTable
+        import open_check
+        batch_range = lambda k: (25 * k - 24, 25 * k)  # (batch k holds ids 25k-24 … 25k)
+        batch_of = lambda lo: (lo - 1) // 25 + 1
+        q("CREATE TABLE ranged (id BIGINT, name VARCHAR, d DATE, ts TIMESTAMP, price DECIMAL(10,2), note VARCHAR)")
+        model = []
+        for k in range(1, 5):  # (batch k: its own day, timestamps with sub-millisecond digits, prices k * 1.25; NULL notes in the first batch only)
+            batch = [{"id": 25 * (k - 1) + j + 1, "d": dt.date(2026, 1, k), "ts": dt.datetime(2026, 1, k, 8, 0, j, 100000 + j * 1000 + (j * 37) % 999 + 1),
+                      "price": decimal.Decimal(f"{k * 1.25:.2f}"), "note": None if k == 1 else f"m{25 * (k - 1) + j + 1}", "batch": k} for j in range(25)]
+            model += batch
+            values = ", ".join(f"({r['id']}, 'n{r['id']}', DATE '{r['d']}', TIMESTAMP '{r['ts'].isoformat(sep=' ', timespec='microseconds')}', {r['price']}, {'NULL' if r['note'] is None else repr(r['note'])})" for r in batch)
+            q(f"INSERT INTO ranged VALUES {values}")
+            q("CHECKPOINT")
+
+        def ranged_version():
+            try:
+                return max(_delta_commits(lake, "ranged"))
+            except ValueError:  # (no commit yet)
+                return -1
+
+        def ice_table():
+            return StaticTable.from_metadata(open_check.iceberg_metadata(lake, "ranged"), properties=open_check.iceberg_props(lake))
+
+        def named():  # the files each format names now: Delta's live adds, Iceberg's current snapshot's
+            try:
+                return len(_live_adds(_delta_commits(lake, "ranged"))), ice_table().inspect.files().num_rows
+            except Exception:
+                return 0, 0
+
+        checks["four batches, one file each: both formats name 4 or more files"] = until(lambda: min(named()) >= 4, True, 90)
+        commits = _delta_commits(lake, "ranged")
+        live = _live_adds(commits)
+        newest = max(v for v, acts in commits.items() if any("add" in a for a in acts))
+        newest_stats = [json.loads(a["add"]["stats"]) for a in commits[newest] if "add" in a]
+        checks["the newest Delta commit's adds carry minValues.id and maxValues.id of one batch's range, and its rows"] = bool(newest_stats) and all(
+            (s["minValues"]["id"], s["maxValues"]["id"], s["numRecords"]) == (*batch_range(batch_of(s["minValues"]["id"])), 25) for s in newest_stats)
+        live_stats = [json.loads(a["stats"]) for a in live.values()]
+        checks["tight bounds; nullCount.note is 0 in the batches with no NULL note, and no range or count for note in the first"] = len(live_stats) == 4 and all(
+            s["tightBounds"] is True and (("note" not in s["nullCount"] and "note" not in s["minValues"]) if batch_of(s["minValues"]["id"]) == 1 else s["nullCount"].get("note") == 0)
+            for s in live_stats)
+        def ice_bound(f, key, field):  # an entry's bound of a field, decoded as the int64 it is (None: not kept)
+            value = dict(f[key] or []).get(field)
+            return None if value is None else struct.unpack("<q", value)[0]
+        ice = ice_table().inspect.files().to_pylist()
+        entries = sorted((ice_bound(f, "lower_bounds", 1), ice_bound(f, "upper_bounds", 1), dict(f["null_value_counts"] or []).get(6)) for f in ice)
+        checks["PyIceberg's manifest entries: id's bounds (field id 1) decode to each batch's range; note's null count (field id 6) is 0 but in the first batch"] = entries == [
+            (*batch_range(k), None if k == 1 else 0) for k in range(1, 5)]
+        # Pondra's own readers of the folder: a path on the node's disk is read only by the program that started the node (its owner),
+        # so a reader node on the same lake, started with the owner's key, does them (and its /metrics count them).
+        owner = uuid.uuid4().hex
+        signed = {"x-pondra-owner": owner}
+        reader = Node(lake, A.port + 3, reader=True, env={"PONDRA_OWNER_KEY": owner}).start()
+        rq = lambda s: call(reader.port, "POST", "/sql", s.encode(), headers=signed)
+        duck = open_check.duck(lake)
+        opts = {"AWS_ENDPOINT_URL": os.environ["AWS_ENDPOINT"], "AWS_ACCESS_KEY_ID": os.environ["AWS_ACCESS_KEY_ID"], "AWS_SECRET_ACCESS_KEY": os.environ["AWS_SECRET_ACCESS_KEY"],
+                "AWS_REGION": "auto", "AWS_S3_ALLOW_UNSAFE_RENAME": "true"} if A.s3 else None
+
+        def count(f):
+            try:
+                return int(f())
+            except Exception as e:
+                return f"error: {str(e)[:120]}"
+
+        def readers(where, expr):  # the rows a filter keeps, as each reader counts them
+            return {
+                "Pondra's table": count(lambda: q(f"SELECT count(*) AS n FROM ranged WHERE {where}")[0]["n"]),
+                "Pondra read_delta": count(lambda: rq(f"SELECT count(*) AS n FROM read_delta('{lake}/data/ranged') WHERE {where}")[0]["n"]),
+                "Pondra read_iceberg": count(lambda: rq(f"SELECT count(*) AS n FROM read_iceberg('{lake}/data/ranged') WHERE {where}")[0]["n"]),
+                "DuckDB delta_scan": count(lambda: duck.execute(f"SELECT count(*) FROM delta_scan('{lake}/data/ranged') WHERE {where}").fetchone()[0]),
+                "DuckDB iceberg_scan": count(lambda: duck.execute(f"SELECT count(*) FROM iceberg_scan('{open_check.iceberg_metadata(lake, 'ranged')}') WHERE {where}").fetchone()[0]),
+                "delta-rs": count(lambda: pa.table(QueryBuilder().register("t", deltalake.DeltaTable(f"{lake}/data/ranged", storage_options=opts)).execute(f"SELECT count(*) AS n FROM t WHERE {where}").read_all())["n"][0].as_py()),
+                "PyIceberg scan(row_filter)": count(lambda: ice_table().scan(row_filter=expr).to_arrow().num_rows),
+            }
+
+        b2 = max(r["ts"] for r in model if r["batch"] == 2)
+        filters = [  # (SQL, PyIceberg's expression, the model's test)
+            ("id = 30", EqualTo("id", 30), lambda r: r["id"] == 30),
+            ("id BETWEEN 25 AND 26", And(GreaterThanOrEqual("id", 25), LessThanOrEqual("id", 26)), lambda r: 25 <= r["id"] <= 26),
+            ("d = DATE '2026-01-03'", EqualTo("d", dt.date(2026, 1, 3)), lambda r: r["d"] == dt.date(2026, 1, 3)),
+            ("ts > TIMESTAMP '2026-01-02 12:00:00'", GreaterThan("ts", dt.datetime(2026, 1, 2, 12)), lambda r: r["ts"] > dt.datetime(2026, 1, 2, 12)),
+            (f"ts >= TIMESTAMP '{b2.isoformat(sep=' ', timespec='microseconds')}'", GreaterThanOrEqual("ts", b2), lambda r: r["ts"] >= b2),
+            ("price < 1.00", LessThan("price", decimal.Decimal("1.00")), lambda r: r["price"] < decimal.Decimal("1.00")),
+            ("price < 2.00", LessThan("price", decimal.Decimal("2.00")), lambda r: r["price"] < decimal.Decimal("2.00")),
+            ("note IS NULL", IsNull("note"), lambda r: r["note"] is None),
+        ]
+        for where, expr, keep in filters:
+            want = sum(1 for r in model if keep(r))
+            got = readers(where, expr)
+            checks[f"{where}: {want} rows in every reader"] = all(v == want for v in got.values())
+            if not checks[f"{where}: {want} rows in every reader"]:
+                print(f"publishing: {where}: the readers said {got}")
+        # A schema change is a commit of its own (no rows): the log's versions are counted to 10, where Delta writes a checkpoint.
+        def alter_and_wait(stmt):
+            before = ranged_version()
+            q(stmt)
+            q("CHECKPOINT")
+            until(lambda: ranged_version() > before, True, 60)
+        alter_and_wait("ALTER TABLE ranged ADD COLUMN extra INT")
+        pads = 0
+        while ranged_version() % 10 != 0 and pads < 12:
+            pads += 1
+            alter_and_wait(f"ALTER TABLE ranged ADD COLUMN pad{pads} INT")
+        last = f"pad{pads}" if pads else "extra"
+        until(lambda: last in [f.name for f in ice_table().schema().fields], True, 60)
+        extra = readers("extra IS NULL", IsNull("extra"))
+        checks["extra IS NULL counts 100 in every reader (a column added after its files were written)"] = all(v == 100 for v in extra.values())
+        if not checks["extra IS NULL counts 100 in every reader (a column added after its files were written)"]:
+            print(f"publishing: extra IS NULL: the readers said {extra}")
+        commits = _delta_commits(lake, "ranged")
+        cks = sorted(k for k in lake_objects(lake, "data/ranged/_delta_log/") if k.endswith(".checkpoint.parquet"))
+        ck_adds = [a for a in pq.read_table(io.BytesIO(open_check.read_object(lake, cks[-1])), columns=["add"]).column("add").to_pylist() if a] if cks else []
+        def as_written(s):  # a file's statistics as the batch checks above want them
+            lo = s["minValues"]["id"]
+            return s["tightBounds"] is True and (s["minValues"]["id"], s["maxValues"]["id"]) == batch_range(batch_of(lo)) and (
+                "note" not in s["nullCount"] if batch_of(lo) == 1 else s["nullCount"].get("note") == 0)
+        checks["a Delta checkpoint at version 10 carries the files' adds with their ranges"] = bool(cks) and cks[-1].split("/")[-1].startswith(f"{10:020}") and len(ck_adds) == 4 and all(
+            as_written(json.loads(a["stats"])) for a in ck_adds)
+        all_stats = [json.loads(a["add"]["stats"]) for acts in commits.values() for a in acts if "add" in a] + [json.loads(a["stats"]) for a in ck_adds]
+        checks["no add in any commit or the checkpoint has a count or range for extra"] = all("extra" not in s["nullCount"] and "extra" not in s["minValues"] and "extra" not in s["maxValues"] for s in all_stats)
+        q("CREATE TABLE wide (id BIGINT, big DECIMAL(20,2))")
+        q("INSERT INTO wide VALUES (1, 1234567890123456.78), (2, 1234567890123456.79), (3, 1234567890123457.00)")  # (18 digits: past a JSON number's 15)
+        q("CHECKPOINT")
+        q("INSERT INTO wide VALUES (4, 1.00), (5, 2.50)")
+        q("CHECKPOINT")
+        until(lambda: len(_live_adds(_delta_commits(lake, "wide"))) == 2, True, 60)
+        wide = {json.loads(a["stats"])["numRecords"]: json.loads(a["stats"]) for a in _live_adds(_delta_commits(lake, "wide")).values()}
+        checks["a DECIMAL(20,2) of 18 digits: no min or max in its file's stats; a file of small ones has them (1.0, 2.5)"] = (
+            3 in wide and "big" not in wide[3]["minValues"] and "big" not in wide[3]["maxValues"]
+            and wide.get(2, {}).get("minValues", {}).get("big") == 1.0 and wide.get(2, {}).get("maxValues", {}).get("big") == 2.5)
+        before = metrics_of(reader.port, signed)["pondra_files_skipped_total"]
+        one = rq(f"SELECT count(*) AS n FROM read_delta('{lake}/data/ranged') WHERE id = 30")
+        skipped = metrics_of(reader.port, signed)["pondra_files_skipped_total"] - before
+        checks["a node reading the table's folder skips the 3 files a filter on id rules out (pondra_files_skipped_total)"] = one == [{"n": 1}] and skipped >= 3
+        print(f"publishing: files skipped by read_delta WHERE id = 30: {skipped:g}")
+        reader.kill()
     finally:
         node.kill()
     for name, good in checks.items():

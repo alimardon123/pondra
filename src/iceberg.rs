@@ -8,7 +8,9 @@
 //! sequence number N; a version an earlier attempt wrote but never recorded is skipped, never
 //! rewritten. Pondra's Parquet files carry no Iceberg field ids, so columns are mapped by name
 //! (`schema.name-mapping.default`).
+use crate::delta::{columns, file_ranges, Column, Range};
 use crate::store::*;
+use crate::write_outside::bound_bytes;
 use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use object_store::{path::Path, ObjectStoreExt};
@@ -186,6 +188,7 @@ impl Layout {
 pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&Named<'_>>) -> Result<Option<(String, Vec<u8>)>> {
     let Some(fields) = fields(meta) else { return Ok(None) }; // a type Iceberg can't carry
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
+    let cols = columns(meta);
     let key = format!("i/{table}");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
     let here = lake.full(&format!("data/{}", meta.folder(table)));
@@ -227,7 +230,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let (mut written, mut since) = (vec![], BTreeMap::new());
     let mut write = async |of: Option<String>, files: &[DataFile]| -> Result<()> {
         for content in [0, 1].into_iter().filter(|c| *c == 0 || files.iter().any(|f| !f.deletes.is_empty())) {
-            let (a, entries) = write_manifest(lake, &dir, &schema, &layout, (v, id), files, content, &earlier).await?;
+            let (a, entries) = write_manifest(lake, &dir, &schema, &layout, &cols, (v, id), files, content, &earlier).await?;
             if of.is_none() {
                 since.extend(entries);
             }
@@ -346,13 +349,14 @@ pub async fn elsewhere(lake: &Lake) -> bool {
 /// listed (`earlier`) is listed as existing, as that version added it; the others as added now.
 /// The manifest, and its entries' names with the sequence number and snapshot of each.
 #[allow(clippy::too_many_arguments)]
-async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, layout: &Layout, (v, id): (u64, i64), files: &[DataFile], content: i32, earlier: &BTreeMap<String, (u64, i64)>) -> Result<(Avro, Vec<(String, (u64, i64))>)> {
-    let mut listed: BTreeMap<String, (String, u64, u64)> = BTreeMap::new(); // path -> (partition, rows, bytes)
+async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, layout: &Layout, cols: &[Column], (v, id): (u64, i64), files: &[DataFile], content: i32, earlier: &BTreeMap<String, (u64, i64)>) -> Result<(Avro, Vec<(String, (u64, i64))>)> {
+    // path -> (partition, rows, bytes, and a data file's record: its statistics go in its entry)
+    let mut listed: BTreeMap<String, (String, u64, u64, Option<&DataFile>)> = BTreeMap::new();
     for f in files {
         match content {
-            0 => drop(listed.insert(f.path.clone(), (f.part.clone(), f.rows, f.bytes))),
+            0 => drop(listed.insert(f.path.clone(), (f.part.clone(), f.rows, f.bytes, Some(f)))),
             _ => f.deletes.iter().filter_map(|d| match d {
-                crate::scan::Delete::Positions { path, rows, bytes, .. } => Some((path.clone(), (f.part.clone(), *rows, *bytes))),
+                crate::scan::Delete::Positions { path, rows, bytes, .. } => Some((path.clone(), (f.part.clone(), *rows, *bytes, None))),
                 _ => None,
             }).for_each(|(p, x)| {
                 listed.entry(p).or_insert(x);
@@ -360,7 +364,7 @@ async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, layout: &Layout,
         }
     }
     let (mut entries, mut named, mut added, mut min_seq) = (vec![], vec![], (0, 0), v);
-    for (p, (part, rows, bytes)) in &listed {
+    for (p, (part, rows, bytes, file)) in &listed {
         let full = lake.full(p);
         let at = earlier.get(&full).copied();
         let (seq, by) = at.unwrap_or((v, id));
@@ -368,7 +372,8 @@ async fn write_manifest(lake: &Lake, dir: &str, schema: &Value, layout: &Layout,
             added = (added.0 + 1, added.1 + rows);
         }
         min_seq = min_seq.min(seq);
-        entries.push(entry(at.is_none(), content, seq, by, &full, &layout.record(part)?, *rows, *bytes));
+        let ranges = file.map(|f| file_ranges(cols, f)).unwrap_or_default();
+        entries.push(entry(at.is_none(), content, seq, by, &full, &layout.record(part)?, *rows, *bytes, &ranges));
         named.push((full, (seq, by)));
     }
     let spec_id = if layout.partition.is_some() { 1 } else { 0 };
@@ -508,9 +513,12 @@ fn ocf(schema: &str, meta: &[(&str, String)], records: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// A manifest entry for a file (status 1 = added by this snapshot, 0 = existing): a data file
-/// (`content` 0) or a position-delete file (1), its partition record as encoded (`Layout::record`).
+/// (`content` 0) or a position-delete file (1), its partition record as encoded (`Layout::record`),
+/// and its ranges (`file_ranges`; a delete file has none). A manifest is written once, so after a
+/// column is widened (INT to BIGINT) an older manifest keeps 4-byte bounds for it, as Iceberg's
+/// spec allows: readers promote them.
 #[allow(clippy::too_many_arguments)]
-fn entry(added: bool, content: i32, seq: u64, id: i64, path: &str, partition: &[u8], rows: u64, size: u64) -> Vec<u8> {
+fn entry(added: bool, content: i32, seq: u64, id: i64, path: &str, partition: &[u8], rows: u64, size: u64, ranges: &[Range]) -> Vec<u8> {
     let mut b = vec![];
     long(&mut b, added as i64); // (status: 1 added, 0 existing)
     for v in [id, seq as i64, seq as i64] {
@@ -523,8 +531,54 @@ fn entry(added: bool, content: i32, seq: u64, id: i64, path: &str, partition: &[
     b.extend(partition);
     long(&mut b, rows as i64);
     long(&mut b, size as i64);
-    b.extend([0; 10]); // the ten optional fields (column stats, split offsets…): null
+    // The ten optional fields in the schema's order: column sizes and value counts (null), null
+    // value counts, NaN counts (null), lower and upper bounds, then key metadata, split offsets,
+    // equality ids and sort order (null).
+    b.extend([0, 0]);
+    b.extend(null_counts(ranges));
+    b.push(0);
+    b.extend(bounds(ranges, false));
+    b.extend(bounds(ranges, true));
+    b.extend([0; 4]);
     b
+}
+
+/// An optional Avro map field of (key, encoded value) pairs: null when it has none (the union's
+/// first branch), else the second branch and an array of `{key, value}` records.
+fn map_field(items: Vec<(i64, Vec<u8>)>) -> Vec<u8> {
+    let mut b = vec![];
+    if items.is_empty() {
+        long(&mut b, 0);
+        return b;
+    }
+    long(&mut b, 1);
+    long(&mut b, items.len() as i64);
+    for (key, value) in items {
+        long(&mut b, key);
+        b.extend(value);
+    }
+    long(&mut b, 0); // (the array's end)
+    b
+}
+
+/// Null value counts: 0 for each column the file holds no NULL in. Any other column is left out,
+/// as unknown: a column added after the file was written is all NULL there, and has no count.
+fn null_counts(ranges: &[Range]) -> Vec<u8> {
+    map_field(ranges.iter().filter(|r| r.no_nulls).map(|r| {
+        let mut zero = vec![];
+        long(&mut zero, 0);
+        ((r.i + 1) as i64, zero)
+    }).collect())
+}
+
+/// Lower or upper bounds, keyed by field id (`i + 1`), as bytes; a value `bound_bytes` refuses is left out.
+fn bounds(ranges: &[Range], max: bool) -> Vec<u8> {
+    map_field(ranges.iter().filter_map(|r| {
+        let hex = bound_bytes(if max { r.hi.as_ref() } else { r.lo.as_ref() }?)?;
+        let mut value = vec![];
+        bytes(&mut value, &crate::avro::unhex(&hex).ok()?);
+        Some(((r.i + 1) as i64, value))
+    }).collect())
 }
 
 /// A manifest list entry for one of the snapshot's manifests (`content` 0: data, 1: deletes).
