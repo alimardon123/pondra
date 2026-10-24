@@ -991,7 +991,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
 
 /// A table's current version, as the catalog answers it (`metadata-location`, `metadata`).
 async fn loaded(lake: &Lake, table: &str) -> Result<Value> {
-    let st: Published = lake.cat.get(&format!("i/{table}")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
+    let st: Published = lake.cat.get(&crate::delta::state_key(table, "iceberg")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
     let path = format!("data/{}/metadata/v{}.metadata.json", crate::store::folder_of(lake, table).await?, st.version);
     let metadata: Value = serde_json::from_slice(&lake.object(&path).await?)?;
     Ok(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}}))
@@ -1417,7 +1417,7 @@ fn requirements(meta: &Value, asked: &Value) -> Result<(), Refusal> {
 
 /// Does the table still stand as the writer read it (its uuid, and main's snapshot)?
 async fn check(lake: &Lake, c: &Commit) -> Result<()> {
-    let st: Published = lake.cat.get(&format!("i/{}", c.table)).await?.unwrap_or_default();
+    let st: Published = lake.cat.get(&crate::delta::state_key(&c.table, "iceberg")).await?.unwrap_or_default();
     anyhow::ensure!(c.uuid.as_ref().is_none_or(|u| *u == st.uuid), "{CONFLICT}: it is another table now (a new uuid)");
     let main = st.snapshots.last().and_then(|(s, _)| s["snapshot-id"].as_i64());
     let snapshot = |s: Option<i64>| s.map_or("none".to_string(), |s| s.to_string());
