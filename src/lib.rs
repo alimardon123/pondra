@@ -131,6 +131,7 @@ mod read_delta;
 #[cfg(feature = "server")] mod oom;
 #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] mod jemalloc;
 #[cfg(feature = "server")] mod once;
+#[cfg(feature = "server")] mod origins;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;
 #[cfg(feature = "server")] pub mod library;

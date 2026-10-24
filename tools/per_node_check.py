@@ -72,6 +72,7 @@ PROCESS = {
     "metrics.rs:WAITING": "a gauge of the process's queries waiting for a turn, as RUNNING",
     "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
     "optimize.rs:NEXT": COUNTER,
+    "origins.rs:ORIGINS": SETTING + " (PONDRA_WEB_ORIGINS)",
     "panics.rs:NEXT": COUNTER,
     "panics.rs:R": "the queries' runtime and the memory watch's, one each a process (ADR-061 §4): the node's tasks on them end with the node, the runtimes don't",
     "path.rs:HEADS": "regexes and constants",

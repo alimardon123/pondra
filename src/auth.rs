@@ -133,6 +133,11 @@ pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: 
     let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_ascii_lowercase);
     let host = header("host").unwrap_or_default();
     let away = "a page from another site may not use this node through your browser: open the node's own console, or give the node a token (--admin-token)";
+    // (a page from an origin the operator named, `origins.rs`, is from another site by that choice: the two checks
+    // that refuse other sites skip it, and the DNS check below still runs. `listed` reads only the names, never `*`)
+    if header("origin").is_some_and(|o| crate::origins::listed(&o)) {
+        return rebinding(&host, from, own);
+    }
     let navigated = (method == axum::http::Method::GET || method == axum::http::Method::HEAD) && header("sec-fetch-mode").is_some_and(|m| m == "navigate");
     if !navigated && header("sec-fetch-site").is_some_and(|s| s != "same-origin" && s != "none") {
         return Some(away.into());
@@ -144,7 +149,13 @@ pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: 
             return Some(away.into());
         }
     }
-    let name = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host.as_str(), |(n, _)| n);
+    rebinding(&host, from, own)
+}
+
+/// A request from this machine by a name that isn't this machine's: a page may have pointed its name here (DNS
+/// rebinding). An address, `localhost` or this machine's own name is fine.
+fn rebinding(host: &str, from: Option<std::net::SocketAddr>, own: &str) -> Option<String> {
+    let name = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host, |(n, _)| n);
     let name = name.trim_start_matches('[').trim_end_matches(']');
     let ours = name.is_empty()
         || name.parse::<std::net::IpAddr>().is_ok()
