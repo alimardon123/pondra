@@ -23,6 +23,7 @@ use crate::auth::Role;
 use crate::server::App;
 use crate::store::{table_key, TableMeta};
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
@@ -111,6 +112,23 @@ fn grpc(code: &str) -> tonic::Code {
     }
 }
 
+/// The SQLSTATE a gRPC code is answered with when its status has none (`grpc`, the other way round).
+fn sqlstate(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Aborted => "40001",
+        tonic::Code::PermissionDenied => "42501",
+        tonic::Code::Unauthenticated => "28000",
+        tonic::Code::NotFound => "42P01",
+        tonic::Code::AlreadyExists => "42P07",
+        tonic::Code::DeadlineExceeded => "57014",
+        tonic::Code::ResourceExhausted => "53000",
+        tonic::Code::Unimplemented => "0A000",
+        tonic::Code::FailedPrecondition => "55000",
+        tonic::Code::InvalidArgument => "22023",
+        _ => "XX000",
+    }
+}
+
 /// An error as a gRPC status: the nearest code to its SQLSTATE, which rides along in `x-pondra-sqlstate`.
 fn status(e: impl Into<anyhow::Error>) -> Status {
     let e = e.into();
@@ -118,6 +136,29 @@ fn status(e: impl Into<anyhow::Error>) -> Status {
     let mut s = Status::new(grpc(code), crate::ext::said(&e));
     s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
     s
+}
+
+/// A status with no SQLSTATE of its own gets the one its gRPC code is answered with (`sqlstate`); one that has it is returned as it is.
+fn coded(mut s: Status) -> Status {
+    if !s.metadata().contains_key("x-pondra-sqlstate") {
+        let code = sqlstate(s.code());
+        s.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static(code));
+    }
+    s
+}
+
+/// A stream's error as a gRPC status with its SQLSTATE: a status is `coded`, an Arrow error is `status` (its code from its words), and any other is `status` of its message.
+fn stream_status(e: FlightError) -> Status {
+    match e {
+        FlightError::Tonic(s) => coded(*s),
+        FlightError::Arrow(e) => status(e),
+        e => status(anyhow::anyhow!("{e}")),
+    }
+}
+
+/// A protocol default's stream with each of its errors coded (`coded`), and its refusal too.
+fn coded_stream<T: Send + 'static>(answer: Result<Response<Out<T>>, Status>) -> Result<Response<Out<T>>, Status> {
+    answer.map(|r| r.map(|s| Box::pin(s.map_err(coded)) as Out<T>)).map_err(coded)
 }
 
 /// A refusal with its SQLSTATE, as a gRPC status (`status`).
@@ -227,7 +268,7 @@ fn caller<T>(req: &Request<T>) -> crate::auth::Principal {
 /// Batches as a Flight stream (the schema first, so an empty result still has columns).
 fn send(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
     let stream = futures::stream::iter(batches.into_iter().map(|b| Ok(crate::answer::compact(b))));
-    Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(Status::from))
+    Box::pin(FlightDataEncoderBuilder::new().with_schema(schema).build(stream).map_err(stream_status))
 }
 
 /// The schema Flight announces for a statement and streams its batches in: each field as the encoder sends
@@ -531,7 +572,7 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
     let schema = Arc::new(full.project(&pick).map_err(status)?);
     let after = after.unwrap_or_else(|| app.lake.visible());
     let hwm = app.lake.hwm.subscribe();
-    let first = FlightDataEncoderBuilder::new().with_schema(schema.clone()).build(futures::stream::empty()).map_err(Status::from);
+    let first = FlightDataEncoderBuilder::new().with_schema(schema.clone()).build(futures::stream::empty()).map_err(stream_status);
     let chunks = futures::stream::unfold((app, hwm, after, false), move |(app, mut hwm, mut after, done)| {
         let (table, schema, pick) = (table.clone(), schema.clone(), pick.clone());
         async move {
@@ -705,7 +746,7 @@ impl FlightSqlService for Sql {
             Some(schema) if !schema.is_empty() => crate::text::join(schema, &cmd.table), // (ADBC's db_schema_name)
             _ => cmd.table.clone(),
         };
-        let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(Status::from).peekable();
+        let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
         let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
         crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
@@ -757,7 +798,7 @@ impl FlightSqlService for Sql {
             _ => return Err(refused("22023", "DoPut to a path: [table] or [table, producer, first seq]")),
         };
         crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
-        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(Status::from);
+        let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(input.map_err(Into::into)).map_err(stream_status);
         Ok(Response::new(append(&self.0, table, producer, seq, batches)?))
     }
 
@@ -872,7 +913,7 @@ impl FlightService for Door {
     async fn get_flight_info(&self, req: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
-            let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await };
+            let Some(json) = Json::parse(&req.get_ref().cmd) else { return self.0.get_flight_info(req).await.map_err(coded) };
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             let schema = match (&json.sql, &json.table) {
@@ -904,7 +945,7 @@ impl FlightService for Door {
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let who = caller(&req);
         crate::auth::WHO.scope(who, async move {
-            let Some(json) = Json::parse(&req.get_ref().ticket) else { return self.0.do_get(req).await };
+            let Some(json) = Json::parse(&req.get_ref().ticket) else { return coded_stream(self.0.do_get(req).await) };
             let app = &self.0 .0;
             allowed(app, &req, Role::Read)?;
             match (json.sql, json.table) {
@@ -924,7 +965,7 @@ impl FlightService for Door {
 
     async fn do_put(&self, req: Request<Streaming<FlightData>>) -> Result<Response<Self::DoPutStream>, Status> {
         let who = caller(&req);
-        crate::auth::WHO.scope(who, async move { self.0.do_put(req).await }).await
+        crate::auth::WHO.scope(who, async move { coded_stream(self.0.do_put(req).await) }).await
     }
 
     async fn do_action(&self, req: Request<Action>) -> Result<Response<Self::DoActionStream>, Status> {
@@ -1013,5 +1054,21 @@ mod tests {
         let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
         assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&announced(&schema)));
         Ok(())
+    }
+
+    #[test]
+    fn coded_gives_a_status_its_sqlstate_by_its_code_and_keeps_its_own() {
+        let header = |s: Status| s.metadata().get("x-pondra-sqlstate").unwrap().to_str().unwrap().to_string();
+        assert_eq!(header(coded(Status::unimplemented("no"))), "0A000");
+        assert_eq!(header(coded(Status::permission_denied("no"))), "42501");
+        let mut own = Status::unimplemented("no");
+        own.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static("42P01"));
+        assert_eq!(header(coded(own)), "42P01");
+    }
+
+    #[test]
+    fn stream_status_of_an_arrow_error_carries_a_sqlstate() {
+        let e = FlightError::Arrow(datafusion::arrow::error::ArrowError::ComputeError("no".into()));
+        assert!(stream_status(e).metadata().contains_key("x-pondra-sqlstate"));
     }
 }

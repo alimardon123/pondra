@@ -3951,7 +3951,8 @@ def flight_protocol(fport):
     Pondra takes and no others; any other action, with any body, is refused UNIMPLEMENTED naming it
     (never INVALID_ARGUMENT); GetSchema, PollFlightInfo and DoExchange are UNIMPLEMENTED, naming them;
     BeginTransaction gives an id that EndTransaction ends, and a body an action can't read is its own
-    INVALID_ARGUMENT. Returns the checks."""
+    INVALID_ARGUMENT; a Flight SQL command the JSON commands don't take is UNIMPLEMENTED, with 0A000 in
+    x-pondra-sqlstate. Returns the checks."""
     import grpc
     ident, svc, auth = (lambda b: b), "/arrow.flight.protocol.FlightService/", (("authorization", "Bearer r"),)  # (flight()'s read token)
     def varint(n):
@@ -4011,12 +4012,18 @@ def flight_protocol(fport):
     tid = get(get(get(begun[1][0], 1), 2), 1) if begun[0] == "ok" and begun[1] else b""  # (Result → Any → ActionBeginTransactionResult)
     ended = outcome(lambda: do_action("EndTransaction", any_of(b"ActionEndTransactionRequest", ld(1, tid) + varint(2 << 3) + varint(2))))  # ROLLBACK
     unread = outcome(lambda: do_action("EndTransaction", b"not protobuf"))
+    xdbc = None  # (a Flight SQL command the JSON commands don't take: the protocol's default refuses it, and the status names its SQLSTATE)
+    try:
+        ch.unary_unary(svc + "GetFlightInfo", request_serializer=ident, response_deserializer=ident)(varint(1 << 3) + varint(2) + ld(2, any_of(b"CommandGetXdbcTypeInfo", b"")), metadata=auth)
+    except grpc.RpcError as e:
+        xdbc = e.code().name, dict(list(e.initial_metadata() or ()) + list(e.trailing_metadata() or ())).get("x-pondra-sqlstate")
     ch.close()
     return {
         "ListActions lists the actions Pondra takes, and no others": names == ["BeginTransaction", "EndTransaction"],
         "an action Pondra doesn't take is UNIMPLEMENTED, naming it, whatever its body (never INVALID_ARGUMENT)": all(refused) and len(refused) == 14,
         "GetSchema, PollFlightInfo and DoExchange are UNIMPLEMENTED, naming them": all(s[0] == "UNIMPLEMENTED" and m in s[1] for s, m in ((schema, "GetSchema"), (poll, "PollFlightInfo"), (exchange, "DoExchange"))),
         "BeginTransaction gives an id that EndTransaction ends; a body it can't read is INVALID_ARGUMENT": begun[0] == "ok" and tid.startswith(b"fl-") and ended[0] == "ok" and unread[0] == "INVALID_ARGUMENT",
+        "a Flight SQL command the JSON commands don't take is UNIMPLEMENTED, its status carrying 0A000 in x-pondra-sqlstate": xdbc == ("UNIMPLEMENTED", "0A000"),
     }
 
 
