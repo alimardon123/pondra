@@ -869,13 +869,12 @@ pub fn columns_sql(columns: &[ast::ColumnDef]) -> String {
 
 async fn declared_of(columns: &[ast::ColumnDef]) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> { declared(&columns_sql(columns)).await }
 
-/// Columns as SQL declares them (`"id" BIGINT, "name" VARCHAR`): their Arrow fields, as
-/// DataFusion types them.
+/// Columns as a node declares them (`ext_names::declared`), in the node's own session: its config and its settings'
+/// dialect, so DuckDB's `STRUCT(a INT)` reads here as it does in a query.
 pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
     let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
     let ctx = crate::settings::apply(ctx).await?; // (the session's dialect: DuckDB's STRUCT(a INT), …)
-    ctx.sql(&format!("CREATE TABLE t ({cols})")).await.with_context(|| format!("the columns ({cols})"))?;
-    Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
+    crate::ext_names::declared(ctx, cols).await
 }
 
 /// The `sql_types` of a table made from `sql`, whose columns are `names`: the query's output columns in its order, as
