@@ -12,7 +12,7 @@ use crate::pg_json::{is_text, json_refusal};
 use crate::pg_bytea;
 use crate::pg_text::{interval_text, time_text};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, GenericListArray, OffsetSizeTrait, StringBuilder};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type, Field, FieldRef, Float32Type, Float64Type, Int16Type, Int32Type,
@@ -313,6 +313,25 @@ pub(crate) fn as_text(a: &ArrayRef) -> Result<ArrayRef> {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => a.clone(),
         _ => cast(a, &DataType::Utf8)?,
     })
+}
+
+/// Whether `a` holds the same non-NULL value in each of its first `n` rows; false when `n` is 0. Text is compared as
+/// text, a list by its values. Any other type is false, so its rows are read one at a time.
+pub(crate) fn same_in_every_row(a: &ArrayRef, n: usize) -> bool {
+    if n == 0 {
+        return false;
+    }
+    match a.data_type() {
+        t if is_text(t) => (0..n).all(|i| !is_null_at(a, i) && text_at(a, i) == text_at(a, 0)),
+        DataType::List(_) => same_list(a.as_list::<i32>(), n),
+        DataType::LargeList(_) => same_list(a.as_list::<i64>(), n),
+        _ => false,
+    }
+}
+
+/// `same_in_every_row` for a list column: each of the first `n` rows is non-NULL and holds the values of row 0.
+fn same_list<O: OffsetSizeTrait>(list: &GenericListArray<O>, n: usize) -> bool {
+    (0..n).all(|i| !list.is_null(i) && list.value(i) == list.value(0))
 }
 
 /// Writes row `i` of `a` as JSON text, as Postgres 16's `to_json` writes a value (`json.c`'s `datum_to_json`). `json`
@@ -978,7 +997,7 @@ fn number_into(out: &mut String, json: &str) -> Option<()> {
 
 /// A JSON number's text as Postgres's `numeric` prints it: plain digits, never an exponent. Its scale is the digits
 /// after the point less the exponent, never below 0 (`1.50e-1` is `0.150`, `1e2` is `100`), and a zero has no sign.
-fn numeric(json: &str) -> Option<String> {
+pub(crate) fn numeric(json: &str) -> Option<String> {
     let (negative, unsigned) = match json.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, json),
