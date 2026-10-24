@@ -16,6 +16,7 @@
 //! replaces or deletes, so an UPDATE or an upsert of a key still replaces its row, and the loading
 //! doors keep doing so, which is what a keyed stream is.
 use crate::log::{Ack, Append, Outcome, Sequencer, Src, To};
+use crate::rules::keys::{once, shown, twice, violated};
 use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Result};
 use datafusion::arrow::array::{Array, RecordBatch};
@@ -23,6 +24,8 @@ use datafusion::sql::sqlparser::ast;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::sync::{Arc, Weak};
+
+pub use crate::rules::keys::absent;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Constraint {
@@ -199,10 +202,8 @@ pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&Reco
     Ok(())
 }
 
-/// The 23505 a duplicate gives, with Postgres's words.
-fn violated(name: &str, columns: &[String], key: String) -> anyhow::Error {
-    crate::codes::coded("23505", format!("duplicate key value violates unique constraint \"{name}\": Key ({})=({key}) already exists", columns.join(", ")))
-}
+/// The primary key's columns in SQL's names, as `logical` gives them.
+fn sql_key(meta: &TableMeta) -> Vec<String> { meta.key.iter().map(|c| meta.name_of(c).to_string()).collect() }
 
 /// The PRIMARY KEY of a plain INSERT, or of a transaction's changes at COMMIT (`check`, `txn.rs`):
 /// two new rows of one key are refused, and so is a new key a live row of the table holds (`held`).
@@ -214,7 +215,7 @@ pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&
     let kept: Vec<Option<bool>> = match old.filter(|o| o.num_rows() > 0) {
         None => vec![None; new.num_rows()], // (a plain INSERT's: nothing taken away, and no key's text to make)
         Some(o) => {
-            let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect();
+            let key = sql_key(meta);
             let gone: std::collections::HashSet<String> = crate::txn::key_texts(o, &key)?.into_iter().collect();
             crate::txn::key_texts(new, &key)?.iter().map(|k| gone.contains(k).then_some(false)).collect()
         }
@@ -222,25 +223,15 @@ pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&
     key_check_over(lake, table, meta, new, &kept).await
 }
 
-/// The key's name and its columns in SQL's names, after checking that no two of `new`'s rows share a key: refused as a plain
-/// INSERT's are (23505 with `{table}_pkey` and Postgres's words).
-fn key_once(table: &str, meta: &TableMeta, new: &RecordBatch) -> Result<(String, Vec<String>)> {
-    let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
-    let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (SQL's names, as `logical` gives them)
-    if let Some(found) = twice(new, &key, &[])? {
-        return Err(violated(&name, &key, found));
-    }
-    Ok((name, key))
-}
-
-/// A change's new rows of one key are refused as a plain INSERT's are (`key_once`). `change::run` calls it for a MERGE whose
+/// A change's new rows of one key are refused as a plain INSERT's are (`once`). `change::run` calls it for a MERGE whose
 /// inserts match on the key alone: those are not looked up, so this is their only check.
 pub fn distinct_keys(meta: &TableMeta, table: &str, new: &[RecordBatch]) -> Result<()> {
     let rows: Vec<&RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).collect();
     let Some(first) = rows.first() else { return Ok(()) };
     let schema = first.schema(); // (an update's rows carry their ids and an insert's don't: conformed to one schema)
     let all = datafusion::arrow::compute::concat_batches(&schema, &rows.iter().map(|b| crate::query::conform(b, &schema)).collect::<Result<Vec<_>>>()?)?;
-    key_once(table, meta, &all).map(|_| ())
+    let key = sql_key(meta);
+    once(table, &key, &all).map(|_| ())
 }
 
 /// `key_check`, told what the writer kept of the table for each new row's key (`kept`, as `txn::ByKey::kept` answers): Some(true) a
@@ -249,7 +240,8 @@ pub fn distinct_keys(meta: &TableMeta, table: &str, new: &[RecordBatch]) -> Resu
 /// so a SAVEPOINT can roll the refusal back. Under READ COMMITTED its keys are its locks by then, so a key another transaction
 /// committed while it waited is held; COMMIT checks every key again either way.
 pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &RecordBatch, kept: &[Option<bool>]) -> Result<()> {
-    let (name, key) = key_once(table, meta, new)?;
+    let key = sql_key(meta);
+    let (name, key) = once(table, &key, new)?;
     let columns = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
     if let Some(i) = kept.iter().position(|k| *k == Some(true)) {
         return Err(violated(&name, &key, shown(&columns, i)));
@@ -263,20 +255,6 @@ pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &Re
         }
     }
     Ok(())
-}
-
-/// For each row of `of`: is its key (the columns `key`) absent from `among`'s rows? `among`'s key
-/// columns are cast to `of`'s types first. A change uses it to tell which old rows a new version
-/// replaces: by key, so an UPDATE that moves a key frees the old one, and a DELETE and INSERT of one
-/// key in one change keep the key's new row.
-pub fn absent(of: &RecordBatch, among: &RecordBatch, key: &[String]) -> Result<datafusion::arrow::array::BooleanArray> {
-    use datafusion::arrow::row::{RowConverter, SortField};
-    let columns = |b: &RecordBatch| key.iter().map(|c| b.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>();
-    let mine = columns(of)?;
-    let converter = RowConverter::new(mine.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
-    let theirs = columns(among)?.iter().zip(&mine).map(|(a, m)| datafusion::arrow::compute::cast(a, m.data_type())).collect::<std::result::Result<Vec<_>, _>>()?;
-    let held: std::collections::HashSet<Vec<u8>> = converter.convert_columns(&theirs)?.iter().map(|r| r.as_ref().to_vec()).collect();
-    Ok(datafusion::arrow::array::BooleanArray::from(converter.convert_columns(&mine)?.iter().map(|r| Some(!held.contains(r.as_ref()))).collect::<Vec<_>>()))
 }
 
 /// Is one of these keys (`keys`: the key columns in the table's key order, named as SQL names them, one
@@ -313,71 +291,6 @@ fn is_point_type(stored: &str) -> bool {
     matches!(stored, "Int8" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" | "Utf8")
 }
 
-/// A value of `columns` two new rows give (of two keys, in a keyed table: one key's rows are its
-/// versions), as Postgres's DETAIL writes it; None if there's none. The rows are hashed a column at a
-/// time, as a hash join hashes its keys, and only rows of one hash are compared (`hashed`); a type
-/// that can't be hashed or compared so, or two values sharing a 64-bit hash, goes the exact way.
-fn twice(new: &RecordBatch, columns: &[String], key: &[String]) -> Result<Option<String>> {
-    let pick = |names: &[String]| names.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>();
-    let (values, keys) = (pick(columns)?, pick(key)?);
-    hashed(&values, &keys).or_else(|_| exactly(&values, &keys))
-}
-
-/// `twice` by each row's hash: a million new keys take tens of milliseconds, where hashing each
-/// row's bytes in turn (`exactly`) took a fifth of a second. Errs when it can't decide.
-fn hashed(values: &[datafusion::arrow::array::ArrayRef], keys: &[datafusion::arrow::array::ArrayRef]) -> Result<Option<String>> {
-    use datafusion::arrow::array::{make_comparator, DynComparator};
-    use datafusion::common::hash_utils::{create_hashes, RandomState};
-    let n = values.first().map_or(0, |v| v.len());
-    let mut hashes = vec![0u64; n];
-    create_hashes(values, &RandomState::with_seed(0), &mut hashes)?;
-    let comparators = |columns: &[datafusion::arrow::array::ArrayRef]| {
-        columns.iter().map(|c| make_comparator(c.as_ref(), c.as_ref(), Default::default())).collect::<std::result::Result<Vec<DynComparator>, _>>()
-    };
-    let (value, key) = (comparators(values)?, comparators(keys)?);
-    let equal = |columns: &[DynComparator], i: usize, j: usize| columns.iter().all(|c| c(i, j).is_eq());
-    let mut first = std::collections::HashMap::with_capacity_and_hasher(n, RandomState::with_seed(0)); // (each hash's first row)
-    for i in 0..n {
-        if values.iter().any(|v| v.is_null(i)) {
-            continue;
-        }
-        let j = *first.entry(hashes[i]).or_insert(i);
-        if j == i {
-            continue;
-        }
-        ensure!(equal(&value, i, j), "two values share a hash"); // (rare enough to go over every row again)
-        if keys.is_empty() || !equal(&key, i, j) {
-            return Ok(Some(shown(values, i)));
-        }
-    }
-    Ok(None)
-}
-
-/// `twice` by each row's bytes (`RowConverter`), for what `hashed` can't decide.
-fn exactly(values: &[datafusion::arrow::array::ArrayRef], keys: &[datafusion::arrow::array::ArrayRef]) -> Result<Option<String>> {
-    use datafusion::arrow::row::{RowConverter, SortField};
-    let converter = |a: &[datafusion::arrow::array::ArrayRef]| RowConverter::new(a.iter().map(|a| SortField::new(a.data_type().clone())).collect());
-    let rows = converter(values)?.convert_columns(values)?;
-    let key_rows = match keys.is_empty() {
-        true => None,
-        false => Some(converter(keys)?.convert_columns(keys)?),
-    };
-    // (rows held as references into the converted buffers: a Vec made for each row took a million-row INSERT's check 0.5–0.9 s)
-    let mut seen = std::collections::HashMap::with_capacity(rows.num_rows());
-    for i in 0..rows.num_rows() {
-        if values.iter().any(|v| v.is_null(i)) {
-            continue;
-        }
-        let k = key_rows.as_ref().map(|k| k.row(i));
-        if let Some(before) = seen.insert(rows.row(i), k) {
-            if key_rows.is_none() || before != k {
-                return Ok(Some(shown(values, i)));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// A value of `columns` a new row gives that a row the table keeps has already. `plain`: the new rows
 /// are a plain INSERT's, which replace no row of their keys, so those rows count too.
 async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], old: Option<&RecordBatch>, new: &RecordBatch, plain: bool) -> Result<Option<String>> {
@@ -401,11 +314,6 @@ async fn kept(lake: &Lake, table: &str, meta: &TableMeta, columns: &[String], ol
     }
     let found = crate::engine::sql(&ctx, &sql).await?.collect().await?;
     Ok(found.iter().find(|b| b.num_rows() > 0).map(|b| shown(b.columns(), 0)))
-}
-
-/// Row `i` of these columns, as Postgres's DETAIL writes a key: `a@b.c, 2`.
-fn shown(columns: &[datafusion::arrow::array::ArrayRef], i: usize) -> String {
-    columns.iter().map(|c| datafusion::arrow::util::display::array_value_to_string(c, i).unwrap_or_default()).collect::<Vec<_>>().join(", ")
 }
 
 // ---------------------------------------------------------------- ALTER TABLE … ADD / DROP CONSTRAINT
@@ -673,33 +581,4 @@ pub fn decode(body: bytes::Bytes) -> Result<(String, Src, RecordBatch)> {
     let rows = crate::log::decode(body.get(4 + n..).ok_or_else(|| anyhow::anyhow!("an append cut short"))?)?;
     let batch = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("an append with no rows"))?;
     Ok((table, src, batch))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
-
-    fn ints(v: &[Option<i64>]) -> ArrayRef {
-        Arc::new(Int64Array::from(v.to_vec()))
-    }
-
-    #[test]
-    fn two_rows_of_one_value_are_found_by_their_hash_as_by_their_bytes() {
-        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), Some("b"), None, Some("a")]));
-        let cases: Vec<(Vec<ArrayRef>, Vec<ArrayRef>, Option<&str>)> = vec![
-            (vec![ints(&[Some(1), Some(2), Some(3)])], vec![], None),
-            (vec![ints(&[Some(1), Some(2), Some(1)])], vec![], Some("1")),
-            (vec![ints(&[None, Some(2), None])], vec![], None), // (NULLs never meet)
-            (vec![names.clone()], vec![], Some("a")),
-            (vec![ints(&[Some(1), Some(1), Some(2), Some(2)]), names.clone()], vec![], None), // (two columns: each pair differs)
-            (vec![ints(&[Some(7), Some(7)])], vec![ints(&[Some(1), Some(1)])], None), // (UNIQUE: one key's versions)
-            (vec![ints(&[Some(7), Some(7)])], vec![ints(&[Some(1), Some(2)])], Some("7")), // (UNIQUE: two keys)
-        ];
-        for (values, keys, want) in cases {
-            let by_hash = hashed(&values, &keys).expect("decided");
-            assert_eq!(by_hash, exactly(&values, &keys).expect("decided"), "{values:?} {keys:?}");
-            assert_eq!(by_hash.as_deref(), want, "{values:?} {keys:?}");
-        }
-    }
 }

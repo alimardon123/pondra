@@ -13,6 +13,7 @@
 //! table and gone with it (`DROP TABLE … PURGE`; a table kept to be undropped keeps it), and not
 //! an object of its own. `ALWAYS` refuses a value given for it, and an UPDATE of it.
 use crate::log::{Ack, Outcome};
+use crate::rules::keys::Said;
 use crate::store::{json, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{bail, ensure, Context};
@@ -490,25 +491,16 @@ pub fn serial_type(t: &ast::DataType) -> Option<&'static str> {
     }
 }
 
-/// The columns (as SQL names them) of a table's ALWAYS identities. `meta` as stored or `logical()`.
-fn always(meta: &TableMeta) -> impl Iterator<Item = &str> {
-    meta.live().filter(|(s, _, _)| meta.identity.get(*s).is_some_and(|i| i.always)).map(|(_, n, _)| n)
-}
-
-/// `INSERT` giving `columns` (as SQL names them): refused if one is an ALWAYS identity (428C9).
+/// `INSERT` giving `columns` (as SQL names them): refused if one is an ALWAYS identity (428C9). `meta` as stored or `logical()`.
 pub fn check_given(meta: &TableMeta, table: &str, columns: &[String]) -> Result<()> {
-    match always(meta).find(|n| columns.iter().any(|c| c == n)) {
-        Some(name) => bail!("cannot insert a non-DEFAULT value into column \"{name}\" of {table}: it is an identity column defined as GENERATED ALWAYS (leave it out, or say DEFAULT)"),
-        None => Ok(()),
-    }
+    if !meta.identity.values().any(|i| i.always) { return Ok(()) }
+    crate::rules::keys::given(&meta.to_rules()?, table, columns, Said::Named)
 }
 
-/// `UPDATE` setting `columns`: refused if one is an ALWAYS identity (428C9).
+/// `UPDATE` setting `columns`: refused if one is an ALWAYS identity (428C9). `meta` as stored or `logical()`.
 pub fn check_set(meta: &TableMeta, columns: &[String]) -> Result<()> {
-    match always(meta).find(|n| columns.iter().any(|c| c == n)) {
-        Some(name) => bail!("column \"{name}\" can only be updated to DEFAULT: it is an identity column defined as GENERATED ALWAYS"),
-        None => Ok(()),
-    }
+    if !meta.identity.values().any(|i| i.always) { return Ok(()) }
+    crate::rules::keys::set(&meta.to_rules()?, columns)
 }
 
 /// Does `sql` call `nextval` or `setval`? (A materialized view can't: its fill and every write
@@ -523,14 +515,11 @@ pub fn calls(sql: &str) -> bool {
 pub async fn check_every(lake: &Lake, table: &str, width: Option<usize>) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };
-    let Some(meta) = other.as_deref().unwrap_or(lake).cat.get::<TableMeta>(&crate::store::table_key(&name)).await? else { return Ok(()) };
-    let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted").collect();
+    let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&crate::store::table_key(&name)).await? else { return Ok(()) };
+    let t = meta.rules()?;
+    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
     let given = crate::write::implicit(&columns, width);
-    let first = always(&meta).find(|n| given.iter().any(|c| c == n)).map(str::to_string);
-    match first {
-        Some(name) => bail!("cannot insert a non-DEFAULT value into column \"{name}\" of {table}: it is an identity column defined as GENERATED ALWAYS (name the columns you give, or say DEFAULT)"),
-        None => Ok(()),
-    }
+    crate::rules::keys::given(&t, table, given, Said::Positional)
 }
 
 static NAMED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bnextval\s*\(\s*'((?:[^']|'')*)'\s*\)").expect("a regex"));
