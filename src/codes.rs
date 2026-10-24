@@ -56,10 +56,11 @@ pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
-/// refuses, invariant 188). The first words stay, so `codes::of` still reads them.
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. Spilling is off on a page too (it has no
+/// disk), so the words for it are true of both.
 const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
-    ("(DiskManager is disabled)", "(PONDRA_SPILL_GB is 0: nothing spills)"),
+    ("(DiskManager is disabled)", "(nothing spills to disk: PONDRA_SPILL_GB is 0, or this is a page)"),
 ];
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
@@ -198,6 +199,7 @@ pub fn http(code: &str) -> u16 {
         "42P07" | "23505" => 409,                                         // already exists, duplicate key
         "53300" => 429,                                                   // too many of a user's queries at once (a quota)
         "0A000" => 501,                                                   // feature_not_supported
+        "54000" => 413,                                                   // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
@@ -299,6 +301,7 @@ mod tests {
         assert_eq!(h("P0001"), 400); // raise_exception (a procedure's RAISE)
         assert_eq!(h("53300"), 429); // too many of a user's queries at once
         assert_eq!(h("0A000"), 501); // feature_not_supported
+        assert_eq!(h("54000"), 413); // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB)
         assert_eq!(h("57014"), 503); // query_canceled (timeout)
         assert_eq!(h("57P03"), 503); // cannot_connect_now (catching up / cut off)
         assert_eq!(h("58030"), 503); // io_error (bucket or node silent)

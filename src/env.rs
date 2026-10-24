@@ -127,6 +127,8 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_TXN_IDLE_SECS", Node),
     ("PONDRA_USER_QUERIES", Node),
     ("PONDRA_USER_TIMEOUT", Node),
+    ("PONDRA_WEB_ORIGINS", Node),
+    ("PONDRA_WEB_SEND_MB", Node),
     ("PONDRA_WORKER_IDLE_SECS", Node),
     ("PONDRA_WORKER_MB", Node),
     ("PONDRA_WORKER_START_SECS", Node),
@@ -216,6 +218,12 @@ pub fn parse<T: FromStr>(name: &str) -> Option<T> {
 /// A setting read as a `T`, else `default`.
 pub fn or<T: FromStr>(name: &str, default: T) -> T {
     parse(name).unwrap_or(default)
+}
+
+/// A setting in GB (fractions too) as bytes of 2^30, or None when it isn't set: the one conversion every memory setting
+/// shares, so `PONDRA_MEMORY_GB=2` is the same 2 GiB wherever it is read.
+pub fn gib(name: &str) -> Option<usize> {
+    parse::<f64>(name).map(|gb| (gb * (1u64 << 30) as f64) as usize)
 }
 
 /// A setting in seconds (fractions too), else `default`: one that is negative or not a number is the

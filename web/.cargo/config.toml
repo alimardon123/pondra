@@ -3,4 +3,7 @@
 target = "wasm32-unknown-unknown"
 
 [target.wasm32-unknown-unknown]
-rustflags = ['--cfg', 'getrandom_backend="wasm_js"'] # (getrandom 0.3 and 0.4 read the browser's crypto only with this)
+# Two cfgs. getrandom 0.3 and 0.4 read the browser's crypto only with `wasm_js`. DataFusion's cooperative streams yield every
+# 128 batches with `per_stream`: a page has no tokio runtime, so tokio's budget never makes a query yield, and the whole query
+# would be one poll, where the page's memory watch could not look (`page.rs`, `watched`).
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"', '--cfg', 'datafusion_coop="per_stream"']

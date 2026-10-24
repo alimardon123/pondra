@@ -1,0 +1,36 @@
+# Numbers on write and read: 1e15 into a DOUBLE, rounding into integers as Postgres rounds (half away from zero)
+# (form-parity P2, D3).
+statement ok
+CREATE TABLE n (x DOUBLE, i INT, b BIGINT)
+
+statement ok
+INSERT INTO n VALUES (1e15, 2.5, 1e15)
+
+statement ok
+INSERT INTO n VALUES (-1.5, -2.5, 3.49)
+
+query RII rowsort
+SELECT x, i, b FROM n
+----
+-1.5 -3 3
+1000000000000000 3 1000000000000000
+
+query III
+SELECT CAST(2.5 AS INT), CAST(-2.5 AS INT), CAST(0.5 AS INT)
+----
+3 -3 1
+
+query R
+SELECT 1e15
+----
+1000000000000000
+
+query R
+SELECT 7 / 2.0
+----
+3.5
+
+query I
+SELECT 7 / 2
+----
+3

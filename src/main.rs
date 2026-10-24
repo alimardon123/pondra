@@ -8,6 +8,9 @@
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[export_name = "_rjem_malloc_conf"]
+static MALLOC_CONF: pondra::JemallocConf = pondra::JEMALLOC_CONF; // (jemalloc's options: `jemalloc::CONF`)
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;

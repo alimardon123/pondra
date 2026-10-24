@@ -1,0 +1,22 @@
+# Variables: DECLARE $x, used in a query and in a write, its value as a literal's (form-parity D3: 1e15).
+statement ok
+DECLARE $big = 1e15
+
+statement ok
+DECLARE $mode = 'full'
+
+query RT
+SELECT $big, $mode
+----
+1000000000000000 full
+
+statement ok
+CREATE TABLE v (x DOUBLE, m TEXT)
+
+statement ok
+INSERT INTO v VALUES ($big, $mode)
+
+query RT
+SELECT x, m FROM v
+----
+1000000000000000 full

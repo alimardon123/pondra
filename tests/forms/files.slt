@@ -1,0 +1,35 @@
+# A file put by name is read by that name on every form: CSV and JSON, read_csv, and a missing one
+# refused alike (form-parity P5, designs/l2-p5-files.md: a relative name is read where the caller is).
+put orders.csv
+id,qty
+1,2
+2,5
+
+query I
+SELECT sum(qty) FROM 'orders.csv'
+----
+7
+
+query I
+SELECT sum(qty) FROM './orders.csv'
+----
+7
+
+query II
+SELECT id, qty FROM read_csv('orders.csv', header => true) ORDER BY id
+----
+1 2
+2 5
+
+put events.json
+{"k": "a", "n": 1}
+{"k": "b", "n": 2}
+
+query TI
+SELECT k, n FROM 'events.json' ORDER BY k
+----
+a 1
+b 2
+
+statement error 42P01
+SELECT * FROM 'nope.csv'

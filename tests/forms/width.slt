@@ -1,0 +1,18 @@
+# A row wider than its table, or than the columns it names, is refused (42601); one narrower takes its table's
+# defaults for the rest, as in Postgres (form-parity P2). A keyed table's: keys.slt.
+statement ok
+CREATE TABLE w (a INT, b INT)
+
+statement error 42601
+INSERT INTO w VALUES (1, 2, 3)
+
+statement error 42601
+INSERT INTO w (a) VALUES (1, 2)
+
+statement ok
+INSERT INTO w VALUES (1)
+
+query II
+SELECT a, b FROM w
+----
+1 NULL

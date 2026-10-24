@@ -1,0 +1,6 @@
+# Computed columns (GENERATED ALWAYS AS (…) STORED): no form takes them yet, and each refuses them alike (42P16).
+statement error 42P16 computed columns
+CREATE TABLE g (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)
+
+statement error 42P01
+INSERT INTO g (a) VALUES (1)
