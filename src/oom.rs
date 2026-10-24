@@ -50,11 +50,11 @@ pub fn line() -> Option<usize> {
     if crate::library::on() {
         return None;
     }
-    let bytes = match crate::env::parse::<f64>("PONDRA_MEMORY_MAX_GB") {
-        Some(gb) => gb * (1u64 << 30) as f64,
-        None => crate::store::ram()? as f64 * 0.85,
+    let bytes = match crate::env::gib("PONDRA_MEMORY_MAX_GB") {
+        Some(bytes) => bytes,
+        None => (crate::store::ram()? as f64 * 0.85) as usize,
     };
-    (bytes >= 1.0).then_some(bytes as usize)
+    (bytes >= 1).then_some(bytes)
 }
 
 /// The resident memory the watch read last (0 before its first look). While the watch waits it is

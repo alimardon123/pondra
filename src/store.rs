@@ -642,8 +642,7 @@ impl std::fmt::Debug for Lake {
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
 pub fn memory_limit() -> usize {
-    let gb = crate::env::parse::<f64>("PONDRA_MEMORY_GB");
-    gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
+    crate::env::gib("PONDRA_MEMORY_GB").or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a

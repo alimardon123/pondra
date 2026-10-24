@@ -6,6 +6,7 @@ use crate::ext_names::Attached;
 use crate::expander::{Expander, Kind, Routine};
 use crate::measures::Definition;
 use anyhow::Result;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
 use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
@@ -41,6 +42,9 @@ pub trait Host: Sync {
     /// `COLUMNS(…)` and `SUMMARIZE` read), planned as the host plans a user's query, after its front. Its rows are
     /// read only if the pass needs them.
     fn ask(&self, sql: &str) -> impl Future<Output = Result<DataFrame>> + Send;
+    /// The rows of a frame `ask` gave, collected as the host collects a query's rows (a page stops the query that grows it
+    /// past its memory line, `page::watched`).
+    fn collect(&self, frame: DataFrame) -> impl Future<Output = Result<Vec<RecordBatch>>> + Send;
 }
 
 /// What the host's own statements made of one: a query to run in its place, or the text to go on with.

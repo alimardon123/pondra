@@ -11,7 +11,8 @@
 // its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
-// (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name.
+// (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name, and a page past its
+// memory line is checked in a child process of its own (`memoryChecks`).
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
@@ -374,6 +375,66 @@ async function keptRefused(Page) {
     console.error(`Page.kept() in Node: ${refused ?? 'it was not refused'}`);
   }
   report.kept = 'left out: Node has no OPFS';
+}
+
+// A page's query past its memory line is stopped (SQLSTATE 53200), and the page answers the next query. The settings are fixed
+// once per module, so this runs in a child process of its own, given `memory_max_gb` 0.1 and a query pool (`memory_gb`) above
+// it, so the watch stops the query, not the pool; the child answers as JSON. Its first query grows the page past the line
+// (array_agg over 50 M values, between whose batches the page's query yields), and the child is killed after 60 s, however
+// it ends.
+async function memoryChecks() {
+  const module = pathToFileURL(join(pkg, 'pondra_web.js')).href;
+  const code = `
+    import { readFile } from 'node:fs/promises';
+    const { default: init, Page } = await import(${JSON.stringify(module)});
+    await init({ module_or_path: await readFile(${JSON.stringify(join(pkg, 'pondra_web_bg.wasm'))}) });
+    const page = new Page({ memory_max_gb: 0.1, memory_gb: 1 });
+    const answer = async (sql) => {
+      const a = await page.request('POST', '/sql?format=csv', {}, sql);
+      return { status: a.status, headers: a.headers, text: new TextDecoder().decode(a.body) };
+    };
+    const past = await answer('SELECT array_agg(value) AS a FROM range(50000000)');
+    const after = await answer('SELECT 1 AS n');
+    process.stdout.write(JSON.stringify({ past, after }));
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  let errors = '';
+  child.stdout.on('data', (chunk) => {
+    out += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    errors = (errors + chunk).slice(-2048);
+  });
+  const timer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) process.kill(child.pid, 'SIGKILL');
+  }, 60_000);
+  try {
+    await once(child, 'exit');
+  } catch (e) {
+    failed.push('memory');
+    console.error(`memory: the page's child did not run: ${e}`);
+    return;
+  } finally {
+    clearTimeout(timer);
+  }
+  let answers = null;
+  try {
+    answers = JSON.parse(out);
+  } catch {
+    failed.push('memory');
+    console.error(`memory: the page's child did not answer: ${JSON.stringify(out)} ${errors}`);
+    return;
+  }
+  const before = failed.length;
+  const as = (a) => ({ status: a.status, headers: a.headers, body: enc.encode(a.text) });
+  judge('memory: a query past its line', as(answers.past), { status: 503, sqlstate: '53200', says: 'memory_max_gb' });
+  // (the next query is checked without a judge of its own: the memory check is one check)
+  if (answers.after.status !== 200 || answers.after.text !== 'n\n1\n') {
+    failed.push('memory: the next query');
+    console.error(`memory: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
+  }
+  if (failed.length === before) report.memory = 'a query past its 0.1 GB line stopped with 53200, and the next one answered';
 }
 
 // The kept page in Chromium (`Page.kept`): its files and tables are kept in the origin's private file system, so they are
@@ -1154,7 +1215,10 @@ try {
   if (IN_BROWSER) {
     await keptChecks(target.page, lake);
     await demoChecks(target.page);
-  } else await keptRefused(target.Page);
+  } else {
+    await keptRefused(target.Page);
+    await memoryChecks();
+  }
   if (NODE_BIN) await nodeRun(target);
   else report.node = 'left out: no --node-bin';
 } finally {

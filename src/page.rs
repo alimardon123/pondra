@@ -24,6 +24,8 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::{source_as_provider, MemTable, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::dml::{InsertOp, WriteOp};
@@ -36,6 +38,7 @@ use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, OnceLock, PoisonError};
+use std::task::Poll;
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
@@ -50,9 +53,15 @@ const DEFAULT_KEY: &str = "pondra.default";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
+/// A page's memory line when `PONDRA_MEMORY_MAX_GB` isn't set: 3 GiB, a quarter below the 4 GiB a wasm32 memory ends at. The
+/// live bytes are what the program asked for, so that quarter is the room for the allocator's own footprint and for a last
+/// step that grows within one poll.
+const LINE: usize = 3 << 30;
+/// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
+const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
 /// How a page's session is made: its target partitions (a page in a browser has one), where it keeps its files and its
-/// tables, and how it reaches the web.
+/// tables, how it reaches the web, and how it watches its memory.
 pub struct Options {
     pub partitions: usize,
     /// The store a page keeps its files and its tables in: a browser gives its origin's private file system (OPFS), so
@@ -64,6 +73,19 @@ pub struct Options {
     /// The page's node (B5): asked for the tables the page doesn't have, with the rows of its own tables a query names.
     /// None asks no node: a query over a table the page lacks is 42P01, as it is on a page with no node.
     pub node: Option<Node>,
+    /// The page's live heap bytes, read by the program that runs the page (`web/` counts its allocator's). The watch reads
+    /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
+    pub memory: Option<Memory>,
+}
+
+/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
+pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
+/// (`watched`). A page's line is set by `PONDRA_MEMORY_MAX_GB` (`memory_line`).
+struct Watch {
+    live: Memory,
+    line: usize,
 }
 
 /// A page's way to the web: a store for an origin. The program that runs the page gives it, so the core holds no
@@ -89,7 +111,7 @@ pub struct Sent {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { partitions: 1, store: None, web: None, node: None }
+        Options { partitions: 1, store: None, web: None, node: None, memory: None }
     }
 }
 
@@ -110,6 +132,7 @@ pub struct Page {
     // would wait on the statement that asked.
     keeping: futures::lock::Mutex<()>,
     node: Option<Node>,
+    watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
 }
 
 /// What a write to a page table found there, for `undo` to put back: the table and its rows, partition by partition.
@@ -196,14 +219,25 @@ impl Page {
     }
 
     /// A page with no tables, its session a node's (`engine::session`) with the partitions asked for. Its files are the
-    /// store's, as they are kept there; with no store given they are in memory.
+    /// store's, as they are kept there; with no store given they are in memory. Its memory is watched when it was given a
+    /// `memory`, against the line its settings give (`memory_line`).
     pub fn open(options: &Options) -> Page {
+        let watch = options.memory.as_ref().zip(memory_line()).map(|(live, line)| Watch { live: live.clone(), line });
+        Page::with_watch(options, watch)
+    }
+
+    /// `open`, with its memory watch given: `open` reads the line from the settings, and a test gives a small one.
+    fn with_watch(options: &Options, watch: Option<Watch>) -> Page {
         let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1));
         // A page's Parquet strings are plain, as the files hold them: views were no faster in a page and held 230 MB
         // more at SF1 (measured in web-4g). The session's Parquet options are the ones a file read takes (`ext_names::file_format`).
         config.options_mut().execution.parquet.schema_force_view_types = false;
+        // A greedy pool, not a fair one: with no disk, every sort and aggregate can spill, so a fair pool would give each of
+        // them a fraction. Nothing spills, since a page has no disk to spill to: an operator past the pool is refused (53200).
         let runtime = RuntimeEnvBuilder::new()
             .with_cache_manager(CacheManagerConfig::default().with_list_files_cache_limit(0)) // (a file put again is listed again)
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(query_memory())))
+            .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
             .build_arc()
             .expect("a runtime");
         let ctx = crate::engine::session(config, runtime);
@@ -213,7 +247,7 @@ impl Page {
         };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()) }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -270,7 +304,7 @@ impl Page {
             Some(name) => self.write(&ctx, plan, &name).await?,
             None => {
                 drop(turn); // (a read runs on its own: it changes nothing, so the next statement may plan)
-                rows_of(&ctx, plan).await?
+                rows_of(&ctx, plan, self.watch.as_ref()).await?
             }
         };
         let batches = if explained { crate::explain::answered(batches)? } else { batches };
@@ -466,13 +500,15 @@ impl Page {
         Ok((crate::engine::run(&ctx, plan).await?, changed))
     }
 
-    /// A write to a page table, run and kept before the next statement is planned (`keeping`). A page that keeps its
-    /// tables takes the table as the write found it, so a write that fails is undone (`undone`): one that fails as it
-    /// runs keeps its own words, and one the store refuses (`written`: a full store, say) says the page couldn't keep it.
-    /// A page in memory keeps nothing, so it has nothing to undo.
+    /// A write to a page table, run and kept before the next statement is planned (`keeping`). Every page takes the table as
+    /// the write found it, kept or not, so a write that fails is undone (`undone`): one the watch stops (53200), one that
+    /// fails as it runs (its own words), and one the store refuses (`written`: a full store, say; that one says the page
+    /// couldn't keep it). An INSERT appends its rows only once it has them all, and a DELETE or UPDATE rewrites the table in
+    /// one step, so a stop leaves those as they were; but a CREATE OR REPLACE TABLE … AS takes the old table away before it
+    /// collects, and taking `before` copies no rows, so it is taken for every write.
     async fn write(&self, ctx: &SessionContext, plan: LogicalPlan, name: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        let before = if self.keeps { Some(self.before(name).await?) } else { None };
-        let batches = match rows_of(ctx, plan).await {
+        let before = self.before(name).await?;
+        let batches = match rows_of(ctx, plan, self.watch.as_ref()).await {
             Ok(batches) => batches,
             Err(e) => return Err(self.undone(name, before, e, "").await),
         };
@@ -483,9 +519,8 @@ impl Page {
     }
 
     /// A failed write's error, once the write is undone (`undo`) to what it found (`before`), with `why` after the words
-    /// saying so. A page in memory found nothing to keep (None): its error is as it was.
-    async fn undone(&self, name: &str, before: Option<Before>, e: anyhow::Error, why: &str) -> anyhow::Error {
-        let Some(before) = before else { return e };
+    /// saying so.
+    async fn undone(&self, name: &str, before: Before, e: anyhow::Error, why: &str) -> anyhow::Error {
         match self.undo(name, before).await {
             Ok(()) => e.context(format!("{name}: the write was undone{why}")),
             Err(u) => e.context(format!("{name}: the write couldn't be undone ({u:#})")),
@@ -493,7 +528,7 @@ impl Page {
     }
 
     /// The table `name` is now, with its rows, for `undo` to put back if the write to it can't be kept. Taken before the
-    /// write runs.
+    /// write runs, on every page: its partitions are `Arc`s of batches, so no rows are copied.
     async fn before(&self, name: &str) -> anyhow::Result<Before> {
         let (_, page) = self.default_schema()?;
         let Some(table) = page.table(name).await? else { return Ok(None) };
@@ -503,8 +538,9 @@ impl Page {
 
     /// Puts the page table `name` back as `before` found it, after a write the page couldn't keep: the table the write
     /// made or changed is taken away, and the table it was (if there was one) is registered again with its rows put
-    /// back. INSERT, UPDATE and DELETE change a memory table in place, so its partitions are written back; a DROP or a
-    /// CREATE OR REPLACE left the old table as it was, so registering it again is all it takes.
+    /// back. INSERT, UPDATE and DELETE change a memory table in place, so its partitions are written back; a DROP, or a
+    /// CREATE OR REPLACE that took the old table away before it collected, left the old table itself as it was, so
+    /// registering it again is all it takes.
     async fn undo(&self, name: &str, before: Before) -> anyhow::Result<()> {
         let (_, page) = self.default_schema()?;
         page.deregister_table(name)?; // (a name with no table is no error; the register below refuses a name that is there)
@@ -801,9 +837,54 @@ fn kept_at(name: &str) -> Path {
     Path::from_iter([TABLES, format!("{name}.arrow").as_str()])
 }
 
-/// A planned statement run, and its rows collected.
-async fn rows_of(ctx: &SessionContext, plan: LogicalPlan) -> anyhow::Result<Vec<RecordBatch>> {
-    crate::engine::collect(crate::engine::run(ctx, plan).await?).await
+/// A planned statement run, and its rows collected, held to the page's memory watch (`watched`). A CREATE TABLE … AS
+/// collects inside its run, so the run and the collection are one future.
+async fn rows_of(ctx: &SessionContext, plan: LogicalPlan, watch: Option<&Watch>) -> anyhow::Result<Vec<RecordBatch>> {
+    watched(watch, async move { crate::engine::collect(crate::engine::run(ctx, plan).await?).await }).await
+}
+
+/// `inner`, held to the page's memory watch: at each poll, before `inner` is polled, a page past its line and grown by a
+/// tenth of the line since the first poll is stopped. The query is answered 53200 and its future dropped, so its memory goes
+/// with it, while the page answers the rest. Growth is what the query did, not what the page holds: a query that starts past
+/// the line and grows nothing is not stopped. A page's query yields between batches (DataFusion's cooperative streams, which
+/// `web/`'s build turns on), so the watch gets to look between them. With no watch, `inner` runs as it is.
+async fn watched<T>(watch: Option<&Watch>, inner: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    let Some(watch) = watch else { return inner.await };
+    let margin = watch.line / 10; // (`oom::pick`'s margin, a node's)
+    let mut inner = Some(Box::pin(inner));
+    let mut started = None; // (the reading at the first poll: what the query grew from)
+    std::future::poll_fn(move |cx| {
+        let now = (watch.live)();
+        let from = *started.get_or_insert(now);
+        if now >= watch.line && now.saturating_sub(from) >= margin {
+            inner = None; // (the query's memory goes with its future, before anything else is read)
+            return Poll::Ready(Err(stopped()));
+        }
+        match inner.as_mut() {
+            Some(future) => future.as_mut().poll(cx),
+            None => Poll::Ready(Err(stopped())), // (never polled once it has answered: an answer is the stop's)
+        }
+    })
+    .await
+}
+
+/// The answer to a query the watch stopped (`watched`).
+fn stopped() -> anyhow::Error {
+    crate::codes::coded("53200", PAGE_OOM)
+}
+
+/// The page's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, 3 GiB by default (`LINE`), and None when it is 0 (the watch is off,
+/// as on a node).
+fn memory_line() -> Option<usize> {
+    let bytes = crate::env::gib("PONDRA_MEMORY_MAX_GB").unwrap_or(LINE);
+    (bytes > 0).then_some(bytes)
+}
+
+/// The most query memory a page's pool holds: `PONDRA_MEMORY_GB`, else two thirds of the line (of the default line when the
+/// watch is off, so the pool is never empty). What DataFusion counts is the big hash tables and sort buffers, so the rest of
+/// the line is for what it doesn't count.
+fn query_memory() -> usize {
+    crate::env::gib("PONDRA_MEMORY_GB").unwrap_or_else(|| memory_line().unwrap_or(LINE) / 3 * 2)
 }
 
 /// A table's batches, partition by partition, as its memory table holds them (`inner`); None for another provider's table.
@@ -1311,6 +1392,11 @@ impl Host for PageHost<'_> {
     fn ask(&self, sql: &str) -> impl Future<Output = anyhow::Result<DataFrame>> + Send {
         // (it only reads: the page table a statement would change is none of its business)
         self.0.plan(sql).map_ok(|(frame, _)| frame)
+    }
+
+    // (a PIVOT's values are collected here, so the page's watch holds them as it holds a query's rows)
+    fn collect(&self, frame: DataFrame) -> impl Future<Output = anyhow::Result<Vec<RecordBatch>>> + Send {
+        watched(self.0.watch.as_ref(), async move { Ok(frame.collect().await?) })
     }
 }
 
@@ -2488,6 +2574,85 @@ mod tests {
         }
         let again = Page::kept(&options).await.unwrap();
         assert_eq!(again.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n20\n");
+    }
+
+    /// A memory reading for a test: a look answers 0 while fewer than `calm` looks have been made, and `usize::MAX` (past any
+    /// line) after. A test sets `calm` to the looks made so far plus one, so the query it runs looks 0 at its first poll,
+    /// where the watch notes its start, and past the line at its next; `calm` at `usize::MAX` keeps every look at 0.
+    fn stepped(looks: Arc<AtomicUsize>, calm: Arc<AtomicUsize>) -> Memory {
+        Arc::new(move || match looks.fetch_add(1, Ordering::SeqCst) < calm.load(Ordering::SeqCst) {
+            true => 0,
+            false => usize::MAX,
+        })
+    }
+
+    /// A page watched with `live` against a line of `line` (the test's own: `Page::open` would read the settings').
+    fn watched_page(store: Option<Arc<dyn ObjectStore>>, live: Memory, line: usize) -> Page {
+        Page::with_watch(&Options { store, ..Default::default() }, Some(Watch { live, line }))
+    }
+
+    /// A query that grows a page past its line is stopped at its next poll, after its first batches (`range` has more than
+    /// 128 batches, so the query yields to the watch): 503 and 53200, the words naming the setting, and the next query answers
+    /// with the table as it was.
+    #[tokio::test]
+    async fn a_query_that_grows_a_page_past_its_line_is_stopped() {
+        let (looks, calm) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(usize::MAX)));
+        let page = watched_page(None, stepped(looks.clone(), calm.clone()), 1 << 30);
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
+        calm.store(looks.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) FROM range(2000000)".into()).await;
+        let words = String::from_utf8_lossy(&got.body).to_string();
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (503, Some("53200")), "{words}");
+        assert!(words.contains("memory_max_gb"), "{words}");
+        calm.store(usize::MAX, Ordering::SeqCst);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT id FROM t".into()).await.body, "id\n1\n");
+    }
+
+    /// A query that starts past its line and grows nothing is not stopped: with the page past its line from the start, a
+    /// `SELECT 1`, a count and a DROP all answer 200, since the watch stops only a query that grew.
+    #[tokio::test]
+    async fn a_query_that_starts_past_its_line_is_stopped_only_if_it_grows() {
+        let page = watched_page(None, Arc::new(|| usize::MAX), 1 << 30);
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
+        for sql in ["SELECT 1 AS n", "SELECT count(*) FROM range(2000000)", "DROP TABLE t"] {
+            assert_eq!(page.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
+        }
+    }
+
+    /// A write the watch stops leaves its table as it was. An INSERT appends as it runs, and a CREATE OR REPLACE takes the old
+    /// table away before it collects: both are undone, on a page in memory and on a kept page, whose old file is kept too.
+    #[tokio::test]
+    async fn a_write_the_watch_stops_leaves_its_table_as_it_was() {
+        for sql in ["INSERT INTO t SELECT * FROM range(2000000)", "CREATE OR REPLACE TABLE t AS SELECT * FROM range(2000000)"] {
+            for store in [None, Some(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>)] {
+                let (looks, calm) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(usize::MAX)));
+                let page = watched_page(store.clone(), stepped(looks.clone(), calm.clone()), 1 << 30);
+                let made = "CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) AS v(id)";
+                assert_eq!(page.request("POST", "/sql", &[], made.into()).await.status, 200);
+                calm.store(looks.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let got = page.request("POST", "/sql", &[], sql.into()).await;
+                assert_eq!((got.status, got.header("x-pondra-sqlstate")), (503, Some("53200")), "{sql}");
+                calm.store(usize::MAX, Ordering::SeqCst);
+                let count = "SELECT count(*) AS n FROM t";
+                assert_eq!(page.request("POST", "/sql?format=csv", &[], count.into()).await.body, "n\n3\n", "{sql}");
+                if store.is_some() {
+                    let again = Page::kept(&Options { store, ..Default::default() }).await.unwrap();
+                    assert_eq!(again.request("POST", "/sql?format=csv", &[], count.into()).await.body, "n\n3\n", "{sql}");
+                }
+            }
+        }
+    }
+
+    /// A PIVOT's values are collected by the front, and the page's watch holds that collection too: a PIVOT over two million
+    /// rows, grown past the line while its values are read, answers 53200.
+    #[tokio::test]
+    async fn a_pivots_values_are_watched_too() {
+        let (looks, calm) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(usize::MAX)));
+        let page = watched_page(None, stepped(looks.clone(), calm.clone()), 1 << 30);
+        calm.store(looks.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        let pivot = "PIVOT (SELECT x % 500 AS k, x FROM range(2000000) AS r(x)) ON k USING sum(x)";
+        let got = page.request("POST", "/sql?format=csv", &[], pivot.into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (503, Some("53200")), "{}", String::from_utf8_lossy(&got.body));
     }
 
     /// A node for the tests: it keeps each request it is sent, and answers what `answer` gives, as a node would.

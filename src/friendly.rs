@@ -502,7 +502,7 @@ async fn answered<H: crate::front::Host>(host: &H, ask: Ask) -> Result<Vec<Colum
         return Ok(df.schema().iter().map(|(q, f)| Column { table: q.map(|q| q.table().to_string()), name: f.name().clone(), numeric: f.data_type().is_numeric(), sql_type: sql_type(f.data_type()) }).collect());
     }
     let mut out = Vec::new();
-    for b in df.collect().await? {
+    for b in host.collect(df).await? {
         let col = datafusion::arrow::compute::cast(b.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
         let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().context("a pivot's values as text")?;
         out.extend(col.iter().flatten().map(|v| Column { table: None, name: v.to_string(), numeric: false, sql_type: String::new() }));

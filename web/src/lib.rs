@@ -182,12 +182,14 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
 }
 
 /// A page's options: it reads the web through `fetch` (`fetch.rs`), asks `node` (`node.rs`) for the tables it doesn't
-/// have, and keeps its files and tables in `store` (none is memory, as `new` has it; OPFS is `kept`'s).
+/// have, keeps its files and tables in `store` (none is memory, as `new` has it; OPFS is `kept`'s), and watches the bytes
+/// its allocator holds (`heap::live`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
     pondra::page::Options {
         web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
         store,
         node,
+        memory: Some(Arc::new(heap::live)),
         ..Default::default()
     }
 }
