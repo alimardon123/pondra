@@ -4197,6 +4197,25 @@ def flight():
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
     checks["the FlightInfo schema of SELECT 1e15 AS x is decimal(16, 0), the type its rows come back with"] = \
         str(exp_info.schema.field("x").type) == str(exp_rows.schema.field("x").type) == "decimal128(16, 0)" and [str(v) for v in exp_rows.column("x").to_pylist()] == ["1000000000000000"]
+    # A refusal carries its SQLSTATE in x-pondra-sqlstate, on its gRPC status: a read token's DoPut is PermissionDenied (42501),
+    # a DoGet of a table that isn't there is NotFound (42P01). Read from the call's own metadata, as flight_protocol reads its status.
+    import grpc
+    def refusal(call):
+        try:
+            list(call())
+            return None
+        except grpc.RpcError as e:
+            return e.code(), dict(list(e.initial_metadata() or ()) + list(e.trailing_metadata() or ())).get("x-pondra-sqlstate")
+    rpc = grpc.insecure_channel(f"127.0.0.1:{fport}")
+    ident, svc, auth = (lambda b: b), "/arrow.flight.protocol.FlightService/", (("authorization", "Bearer r"),)
+    ld = lambda num, data: bytes([num << 3 | 2, len(data)]) + data  # (a length-delimited protobuf field; short data only)
+    path_desc = bytes([8, 1]) + ld(3, b"ev")  # a FlightDescriptor of the path [ev]: type PATH, then the path
+    put_as_reader = lambda: rpc.stream_stream(svc + "DoPut", request_serializer=ident, response_deserializer=ident)(iter([ld(1, path_desc)]), metadata=auth)
+    get_missing = lambda: rpc.unary_stream(svc + "DoGet", request_serializer=ident, response_deserializer=ident)(ld(1, json.dumps({"table": "no_such_table"}).encode()), metadata=auth)
+    put_refusal, get_refusal = refusal(put_as_reader), refusal(get_missing)
+    rpc.close()
+    checks["a refusal carries its SQLSTATE in x-pondra-sqlstate: a read token's DoPut is PermissionDenied (42501), a DoGet of no table NotFound (42P01)"] = \
+        put_refusal == (grpc.StatusCode.PERMISSION_DENIED, "42501") and get_refusal == (grpc.StatusCode.NOT_FOUND, "42P01")
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None

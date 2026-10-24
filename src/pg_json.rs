@@ -6,7 +6,7 @@
 //! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
 use crate::pg_functions::{follows_json, function, marked, text_arg, texts_out, MARK};
-use crate::pg_json_make::{fail, jsonb_text, refuse};
+use crate::pg_json_make::{self, as_text, fail, is_null_at, jsonb_text, parse, refuse, same_in_every_row, text_at, Node};
 use crate::pg_text::array_literal;
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
@@ -21,7 +21,6 @@ use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitMut, VisitorMut
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use jiter::{Jiter, Peek};
-use serde_json::Value;
 use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
@@ -210,12 +209,6 @@ pub fn register(ctx: &SessionContext) {
     crate::pg_json_sets::register(ctx);
 }
 
-/// `s` parsed, for containment and existence: a document that isn't JSON is refused (22P02, in `json_of`'s words).
-fn document(s: &str) -> anyhow::Result<Value> {
-    json_of(s)?;
-    Ok(serde_json::from_str(s)?)
-}
-
 /// A path or a list of keys, one per row: a text-array literal (`'{b,0}'`) or a list (`ARRAY['b', '0']`). None where
 /// the argument is NULL, and a NULL element is None inside the list.
 pub(crate) fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String>>>>> {
@@ -228,6 +221,33 @@ pub(crate) fn lists(a: &ArrayRef) -> anyhow::Result<Vec<Option<Vec<Option<String
         (!items.is_null(i)).then(|| items.value(i).as_string::<i32>().iter().map(|s| s.map(str::to_string)).collect::<Vec<_>>())
     });
     Ok(rows.collect())
+}
+
+/// A path or a list of keys, for each row, read as `lists` reads a batch. A literal (a text that is the same in every row,
+/// as `'{name}'` is, or a list that is) is read once: `lists` over the batch copied and read it a row at a time, a sixth of
+/// jsonb_set's time.
+pub(crate) struct Lists {
+    once: Option<Option<Vec<Option<String>>>>,
+    rows: Vec<Option<Vec<Option<String>>>>,
+}
+
+impl Lists {
+    /// The lists of the `n` rows of `a`, read once when `a` is the same in every row (`same_in_every_row`).
+    pub(crate) fn of(a: &ArrayRef, n: usize) -> Result<Lists> {
+        if same_in_every_row(a, n) {
+            let once = lists(&a.slice(0, 1)).map_err(fail)?;
+            return Ok(Lists { once: once.into_iter().next(), rows: Vec::new() });
+        }
+        Ok(Lists { once: None, rows: lists(a).map_err(fail)? })
+    }
+
+    /// The path or the keys of row `i`: None where the argument is NULL.
+    pub(crate) fn at(&self, i: usize) -> &Option<Vec<Option<String>>> {
+        match &self.once {
+            Some(once) => once,
+            None => &self.rows[i],
+        }
+    }
 }
 
 pub(crate) const JSON_SPACE: &[char] = &[' ', '\t', '\n', '\r'];
@@ -244,17 +264,20 @@ enum Step<'a> {
 
 /// `#>` (`text` false) and `#>>` (true): what the path reaches in each document, NULL where it reaches nothing.
 fn path(a: &[ArrayRef], n: usize, text: bool) -> anyhow::Result<ArrayRef> {
-    let (docs, paths) = (text_arg(&a[0])?, lists(&a[1])?);
-    reached(&docs, paths, n, text, false)
+    let (docs, paths) = (as_text(&a[0])?, Lists::of(&a[1], n)?);
+    reached(&docs, &paths, n, text, false)
 }
 
-/// What each row's path reaches in its document: `paths[i]` is the path's steps (None where it is NULL, and a NULL step
-/// makes the answer NULL). `text` and `jsonb` answer as `answer` says.
-fn reached(docs: &[Option<String>], paths: Vec<Option<Vec<Option<String>>>>, n: usize, text: bool, jsonb: bool) -> anyhow::Result<ArrayRef> {
+/// What each row's path reaches in its document: `paths.at(i)` holds the path's steps (None where it is NULL, and a NULL
+/// step makes the answer NULL). `text` and `jsonb` answer as `answer` says.
+fn reached(docs: &ArrayRef, paths: &Lists, n: usize, text: bool, jsonb: bool) -> anyhow::Result<ArrayRef> {
     let out = (0..n).map(|i| -> anyhow::Result<Option<String>> {
-        let (Some(doc), Some(elements)) = (&docs[i], &paths[i]) else { return Ok(None) };
+        if is_null_at(docs, i) {
+            return Ok(None);
+        }
+        let Some(elements) = paths.at(i) else { return Ok(None) };
         let Some(steps) = elements.iter().map(|e| e.as_deref().map(Step::Path)).collect::<Option<Vec<_>>>() else { return Ok(None) };
-        match find(doc, &steps) {
+        match find(text_at(docs, i), &steps) {
             Some(raw) => answer(raw, text, jsonb),
             None => Ok(None),
         }
@@ -326,10 +349,20 @@ fn extract(name: &str, a: &[ArrayRef], n: usize, text: bool, jsonb: bool) -> any
     if a.len() < 2 {
         return Err(crate::codes::coded("42883", format!("function {name}(unknown) does not exist")));
     }
-    let docs = text_arg(&a[0])?;
-    let keys = a[1..].iter().map(text_arg).collect::<datafusion::common::Result<Vec<_>>>()?;
-    let paths = (0..n).map(|i| Some(keys.iter().map(|key| key[i].clone()).collect())).collect();
-    reached(&docs, paths, n, text, jsonb)
+    let docs = as_text(&a[0])?;
+    reached(&docs, &keys_path(&a[1..], n)?, n, text, jsonb)
+}
+
+/// The keys of `json_extract_path` and kin, as the path of each row. Read once when every key is the same text in every
+/// row; else a path per row, where a NULL key is a NULL step.
+fn keys_path(keys: &[ArrayRef], n: usize) -> anyhow::Result<Lists> {
+    if keys.iter().all(|key| is_text(key.data_type()) && same_in_every_row(key, n)) {
+        let path = keys.iter().map(|key| Some(text_at(key, 0).to_string())).collect();
+        return Ok(Lists { once: Some(Some(path)), rows: Vec::new() });
+    }
+    let keys = keys.iter().map(as_text).collect::<datafusion::common::Result<Vec<_>>>()?;
+    let rows = (0..n).map(|i| Some(keys.iter().map(|key| (!is_null_at(key, i)).then(|| text_at(key, i).to_string())).collect())).collect();
+    Ok(Lists { once: None, rows })
 }
 
 /// `->`, and `json_array_element` and its kin: the value at a text key of an object or an integer index of an array,
@@ -551,16 +584,36 @@ fn unquoted(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
-/// `@>` and `<@`: does the left document contain the right?
+/// `@>` and `<@`: does the left document contain the right? A side the same in every row is read once, by the first row
+/// that has both sides, and each row borrows it; the other side is read row by row. The left side is read first in every
+/// row, so a row where both are bad quotes the left, as it always has.
 fn contains_all(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
-    let (lefts, rights) = (text_arg(&a[0])?, text_arg(&a[1])?);
-    let out = (0..n).map(|i| -> anyhow::Result<Option<bool>> {
-        match (&lefts[i], &rights[i]) {
-            (Some(left), Some(right)) => Ok(Some(contains(&document(left)?, &document(right)?, true))),
-            _ => Ok(None),
+    let (lefts, rights) = (as_text(&a[0])?, as_text(&a[1])?);
+    let (once_left, once_right) = (same_in_every_row(&lefts, n), same_in_every_row(&rights, n));
+    let (mut kept_left, mut kept_right): (Option<Node>, Option<Node>) = (None, None);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if is_null_at(&lefts, i) || is_null_at(&rights, i) {
+            out.push(None);
+            continue;
         }
-    });
-    Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
+        let left = document_at(&lefts, i, once_left, &mut kept_left)?;
+        let right = document_at(&rights, i, once_right, &mut kept_right)?;
+        out.push(Some(contains(&left, &right, true)?));
+    }
+    Ok(Arc::new(BooleanArray::from(out)))
+}
+
+/// Row `i` of a column of documents, read as JSON. When the column is `once` (the same in every row), the document is read
+/// the first time a row asks for it, into `kept`, and every row borrows it.
+fn document_at<'d, 'k>(docs: &'d ArrayRef, i: usize, once: bool, kept: &'k mut Option<Node<'d>>) -> anyhow::Result<Cow<'k, Node<'d>>> {
+    if !once {
+        return Ok(Cow::Owned(parse(text_at(docs, i))?));
+    }
+    if kept.is_none() {
+        *kept = Some(parse(text_at(docs, i))?);
+    }
+    Ok(Cow::Borrowed(kept.as_ref().expect("read just above")))
 }
 
 /// `<@`, which is `@>` with its sides swapped (`jsonb_contained(a, b)` is `jsonb_contains(b, a)`).
@@ -568,57 +621,96 @@ fn contained(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> { contains_al
 
 /// Does `have` contain `want`? Objects by their keys, arrays by each element of `want` lying in some element of
 /// `have`. Only at the top does an array also contain a scalar equal to one of its elements.
-fn contains(have: &Value, want: &Value, top: bool) -> bool {
+fn contains(have: &Node, want: &Node, top: bool) -> anyhow::Result<bool> {
     match (have, want) {
-        (Value::Object(h), Value::Object(w)) => w.iter().all(|(k, wv)| h.get(k).is_some_and(|hv| contains(hv, wv, false))),
-        (Value::Array(h), Value::Array(w)) => w.iter().all(|wv| h.iter().any(|hv| contains(hv, wv, false))),
-        (Value::Array(h), w) if top && is_scalar(w) => h.iter().any(|hv| same_scalar(hv, w)),
+        (Node::Object(h), Node::Object(w)) => {
+            for (key, wv) in w {
+                match pg_json_make::find(h, key) {
+                    Ok(at) if contains(&h[at].1, wv, false)? => {}
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
+        }
+        (Node::List(h), Node::List(w)) => {
+            for wv in w {
+                if !any_item(h, |hv| contains(hv, wv, false))? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Node::List(h), w) if top && is_scalar(w) => any_item(h, |hv| same_scalar(hv, w)),
         _ => same_scalar(have, want),
     }
 }
 
-fn is_scalar(v: &Value) -> bool { !matches!(v, Value::Array(_) | Value::Object(_)) }
+/// Whether `test` holds for one of `items`.
+fn any_item<T>(items: &[T], mut test: impl FnMut(&T) -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    for item in items {
+        if test(item)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_scalar(v: &Node) -> bool { !matches!(v, Node::List(_) | Node::Object(_)) }
 
 /// Two scalars are the same: numbers as numbers (`1` is `1.0`), strings, booleans and null by value.
-fn same_scalar(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => same_number(x, y),
-        (Value::String(x), Value::String(y)) => x == y,
-        (Value::Bool(x), Value::Bool(y)) => x == y,
-        (Value::Null, Value::Null) => true,
+fn same_scalar(a: &Node, b: &Node) -> anyhow::Result<bool> {
+    Ok(match (a, b) {
+        (Node::Number(x), Node::Number(y)) => same_number(x, y)?,
+        (Node::Text(x), Node::Text(y)) => x == y,
+        (Node::Bool(x), Node::Bool(y)) => x == y,
+        (Node::Null, Node::Null) => true,
         _ => false,
+    })
+}
+
+/// Two numbers, as their text, are the same as Postgres's `numeric` compares them: exactly (`9007199254740993` is not
+/// `9007199254740992`, `0.1000000000000000001` is not `0.1`, `1` is `1.0`). Two integers are compared as i64; two
+/// numbers a float tells apart differ, since equal numbers make the same float. Only numbers a float can't tell apart,
+/// or can't hold (`1e400`), are compared as `numeric` writes them.
+fn same_number(x: &str, y: &str) -> anyhow::Result<bool> {
+    if x == y {
+        return Ok(true);
+    }
+    if let (Ok(a), Ok(b)) = (x.parse::<i64>(), y.parse::<i64>()) {
+        return Ok(a == b);
+    }
+    match (x.parse::<f64>(), y.parse::<f64>()) {
+        (Ok(a), Ok(b)) if a.is_finite() && b.is_finite() && a != b => Ok(false),
+        _ => Ok(exact(x)? == exact(y)?),
     }
 }
 
-/// Integers are compared exactly, as Postgres compares them (`9007199254740993` is not `9007199254740992`); anything
-/// else as a float.
-fn same_number(x: &serde_json::Number, y: &serde_json::Number) -> bool {
-    match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
-        (Some(a), Some(b), _, _) => a == b,
-        (_, _, Some(a), Some(b)) => a == b,
-        _ => x.as_f64() == y.as_f64(),
-    }
+/// A number as `numeric` writes it, its zeros after the point and the point taken off, so the same number is the same
+/// text. A number past numeric's range is refused, as Postgres refuses it.
+fn exact(number: &str) -> anyhow::Result<String> {
+    let text = pg_json_make::numeric(number).ok_or_else(|| crate::codes::coded("22003", "value overflows numeric format"))?;
+    Ok(if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text })
 }
 
 /// `?`: does the key exist? A key of an object, a string element of an array, or the document itself when it is a
 /// string (Postgres treats a scalar string as an array of one element); any other scalar holds none.
-fn has_key(doc: &Value, key: &str) -> bool {
+fn has_key(doc: &Node, key: &str) -> bool {
     match doc {
-        Value::Object(map) => map.contains_key(key),
-        Value::Array(items) => items.iter().any(|v| v.as_str() == Some(key)),
-        Value::String(s) => s == key,
+        Node::Object(members) => pg_json_make::find(members, key).is_ok(),
+        Node::List(items) => items.iter().any(|v| matches!(v, Node::Text(s) if s == key)),
+        Node::Text(s) => s == key,
         _ => false,
     }
 }
 
 /// `?`, one key.
 fn exists(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
-    let (docs, keys) = (text_arg(&a[0])?, text_arg(&a[1])?);
+    let (docs, keys) = (as_text(&a[0])?, as_text(&a[1])?);
     let out = (0..n).map(|i| -> anyhow::Result<Option<bool>> {
-        match (&docs[i], &keys[i]) {
-            (Some(doc), Some(key)) => Ok(Some(has_key(&document(doc)?, key))),
-            _ => Ok(None),
+        if is_null_at(&docs, i) || is_null_at(&keys, i) {
+            return Ok(None);
         }
+        Ok(Some(has_key(&parse(text_at(&docs, i))?, text_at(&keys, i))))
     });
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
@@ -626,16 +718,15 @@ fn exists(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
 /// `?|` (`all` false) and `?&` (`all` true): any or all of a list of keys. A NULL key is left out, as Postgres
 /// leaves it out: `?|` of no keys is false and `?&` of none is true.
 fn any_all(a: &[ArrayRef], n: usize, all: bool) -> anyhow::Result<ArrayRef> {
-    let (docs, keys) = (text_arg(&a[0])?, lists(&a[1])?);
+    let (docs, keys) = (as_text(&a[0])?, Lists::of(&a[1], n)?);
     let out = (0..n).map(|i| -> anyhow::Result<Option<bool>> {
-        match (&docs[i], &keys[i]) {
-            (Some(doc), Some(keys)) => {
-                let doc = document(doc)?;
-                let mut found = keys.iter().flatten().map(|k| has_key(&doc, k));
-                Ok(Some(if all { found.all(|f| f) } else { found.any(|f| f) }))
-            }
-            _ => Ok(None),
+        if is_null_at(&docs, i) {
+            return Ok(None);
         }
+        let Some(row) = keys.at(i) else { return Ok(None) };
+        let doc = parse(text_at(&docs, i))?;
+        let mut found = row.iter().flatten().map(|k| has_key(&doc, k));
+        Ok(Some(if all { found.all(|f| f) } else { found.any(|f| f) }))
     });
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
@@ -1031,11 +1122,19 @@ mod tests {
 
     #[test]
     fn containment_compares_integers_exactly() {
-        let c = |have: &str, want: &str| contains(&document(have).unwrap(), &document(want).unwrap(), true);
+        let c = |have: &str, want: &str| contains(&parse(have).unwrap(), &parse(want).unwrap(), true).unwrap();
         assert!(!c(r#"{"x": 9007199254740993}"#, r#"{"x": 9007199254740992}"#), "exact integers differ past 2^53");
         assert!(c(r#"{"x": 9007199254740993}"#, r#"{"x": 9007199254740993}"#));
         assert!(c("1", "1.0"), "an integer and a float with the same value");
         assert!(!c("-1", "18446744073709551615"), "a negative and a big positive integer");
+        assert!(c("[1, 2.0]", "[2]"), "a float 2.0 contains the integer 2");
+        assert!(!c("[1e400]", "[1e401]"), "numbers no float holds are compared as numeric writes them");
+        assert!(c("[1e400]", "[1e400]"));
+        assert!(c("[1.50e400]", "[1.5e400]"), "the zeros after a point don't change a number");
+        assert!(!c("[1e-400]", "[0]"), "a number too small for a float is still no zero");
+        assert!(!c("[0.1000000000000000001]", "[0.1]"), "decimals one float holds are told apart");
+        assert!(!c("[123456789012345678901234567890]", "[123456789012345678901234567891]"));
+        assert!(c("[100]", "[1e2]") && c("[-0]", "[0]") && c("[0.50]", "[0.5]"));
     }
 
     #[test]
@@ -1056,7 +1155,7 @@ mod tests {
 
     #[test]
     fn containment_as_postgres() {
-        let c = |have: &str, want: &str| contains(&document(have).unwrap(), &document(want).unwrap(), true);
+        let c = |have: &str, want: &str| contains(&parse(have).unwrap(), &parse(want).unwrap(), true).unwrap();
         let doc = r#"{"a":"x","b":[1,2],"c":{"d":null}}"#;
         assert!(c(doc, r#"{"a":"x"}"#));
         assert!(c(doc, r#"{"c":{"d":null}}"#));
@@ -1084,13 +1183,15 @@ mod tests {
         assert!(!c(r#"{"a":"1"}"#, r#"{"a":1}"#), "a string is no number");
         assert!(c("[1,1]", "[1,1,1]"), "repeated elements");
         assert!(c(r#"{"a":1,"a":2}"#, r#"{"a":2}"#), "a duplicate key's last value");
+        assert!(!c(r#"{"a":1,"a":2}"#, r#"{"a":1}"#), "the duplicate's first value is gone");
         assert!(c(r#""x""#, r#""x""#));
         assert!(!c(r#""a""#, r#"["a"]"#), "a scalar contains no array");
     }
 
     #[test]
     fn existence_as_postgres() {
-        let e = |doc: &str, key: &str| has_key(&document(doc).unwrap(), key);
+        let e = |doc: &str, key: &str| has_key(&parse(doc).unwrap(), key);
+        assert!(e(r#"{"a":1,"a":2}"#, "a"), "a duplicate key still exists");
         assert!(e(r#"["foo", "bar"]"#, "foo"));
         assert!(!e(r#"["foo", ["bar"]]"#, "bar"), "not in a nested array");
         assert!(e(r#"[1, "1"]"#, "1"), "a string element, not a number");
@@ -1103,7 +1204,7 @@ mod tests {
         assert!(!e("5", "5"), "a scalar number holds no key");
         // ?| and ?& over lists: an empty list, and NULL keys, left out
         let any_all = |doc: &str, keys: &[Option<&str>], all: bool| {
-            let doc = document(doc).unwrap();
+            let doc = parse(doc).unwrap();
             let keys: Vec<Option<String>> = keys.iter().map(|k| k.map(str::to_string)).collect();
             let mut found = keys.iter().flatten().map(|k| has_key(&doc, k));
             if all { found.all(|f| f) } else { found.any(|f| f) }
@@ -1116,6 +1217,93 @@ mod tests {
         assert!(!any_all(r#"{"a":1}"#, &[Some("a"), Some("x")], true));
         assert!(!any_all(r#"{"a":1}"#, &[None], false));
         assert!(any_all(r#"{"a":1}"#, &[None], true));
+    }
+
+    /// `@>` over one row of two documents, as the function answers it (the answer, or its refusal).
+    fn contains_one(left: &str, right: &str) -> anyhow::Result<Option<bool>> {
+        let docs: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![left])), Arc::new(StringArray::from(vec![right]))];
+        Ok(contains_all(&docs, 1)?.as_boolean().iter().next().flatten())
+    }
+
+    /// `?` over one row, as the function answers it (the answer, or its refusal).
+    fn exists_one(doc: &str, key: &str) -> anyhow::Result<Option<bool>> {
+        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![doc])), Arc::new(StringArray::from(vec![key]))];
+        Ok(exists(&cols, 1)?.as_boolean().iter().next().flatten())
+    }
+
+    #[test]
+    fn containment_and_existence_read_documents_nested_past_128_levels() {
+        // (serde's Value stopped at 128 levels, and a column takes 10,000)
+        let nested = |n: usize| format!("{}1{}", "[".repeat(n), "]".repeat(n));
+        let deep = format!(r#"{{"a": {}, "b": 2}}"#, nested(300));
+        assert_eq!(contains_one(&deep, &format!(r#"{{"a": {}}}"#, nested(300))).unwrap(), Some(true), "a 300-level value contains itself");
+        assert_eq!(contains_one(&deep, r#"{"b": 2}"#).unwrap(), Some(true));
+        assert_eq!(contains_one(&deep, r#"{"a": [1]}"#).unwrap(), Some(false), "not the value it holds");
+        assert_eq!(exists_one(&deep, "a").unwrap(), Some(true));
+        assert_eq!(exists_one(&deep, "c").unwrap(), Some(false));
+        assert!(!has_key(&parse(&nested(300)).unwrap(), "a"), "an array of arrays holds no key");
+    }
+
+    #[test]
+    fn containment_and_existence_refuse_what_is_not_json_as_postgres_does() {
+        let too_deep = format!("{}{}", "[".repeat(crate::pg_json_make::MAX_DEPTH + 1), "]".repeat(crate::pg_json_make::MAX_DEPTH + 1));
+        assert_eq!(code(&contains_one("[1,", "[1]").unwrap_err()), "22P02");
+        assert_eq!(code(&contains_one("[1]", "[1,").unwrap_err()), "22P02", "the right side is read too");
+        assert_eq!(code(&contains_one(&too_deep, "[1]").unwrap_err()), "54001");
+        assert_eq!(code(&contains_one("[1]", &too_deep).unwrap_err()), "54001");
+        assert_eq!(code(&exists_one("[1,", "a").unwrap_err()), "22P02");
+        assert_eq!(code(&exists_one(&too_deep, "a").unwrap_err()), "54001");
+        // (a lone surrogate's escape is refused as jsonb refuses it, in a document and in a text the key is read from)
+        assert_eq!(code(&contains_one(r#"["\ud800"]"#, "[1]").unwrap_err()), "22P02");
+        assert_eq!(code(&exists_one(r#"["\ud800"]"#, "a").unwrap_err()), "22P02");
+        // (a row where both sides are bad quotes the left, as Postgres reads the left first)
+        assert!(contains_one("[1,", "{").unwrap_err().to_string().contains(r#"type json: "[1,""#));
+        // (a batch of NULLs answers NULL, and a bad constant is never read)
+        let nulls: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![None::<&str>, None])), Arc::new(StringArray::from(vec!["[1,", "[1,"]))];
+        assert_eq!(contains_all(&nulls, 2).unwrap().as_boolean().iter().collect::<Vec<_>>(), vec![None, None]);
+    }
+
+    /// The answers of a query's one boolean column (NULL as None).
+    async fn flags(sql: &str) -> Vec<Option<bool>> {
+        let ctx = SessionContext::new();
+        register(&ctx);
+        let mut out = vec![];
+        for batch in ctx.sql(sql).await.unwrap().collect().await.unwrap() {
+            out.extend(batch.column(0).as_boolean().iter());
+        }
+        out
+    }
+
+    /// The SQLSTATE of the error `sql` is refused with.
+    async fn refused_with(sql: &str) -> &'static str {
+        let ctx = SessionContext::new();
+        register(&ctx);
+        let e = match ctx.sql(sql).await {
+            Err(e) => e,
+            Ok(df) => df.collect().await.err().expect("should be refused"),
+        };
+        crate::codes::of(&anyhow::Error::new(e))
+    }
+
+    #[tokio::test]
+    async fn a_constant_side_answers_as_a_column_side_does() {
+        // (a constant is the same in every row, so it is read once; a column whose rows differ is read row by row)
+        let docs = r#"(VALUES ('{"tag": "t3"}'), ('{"tag": "t4"}'), (CAST(NULL AS VARCHAR))) AS t(d)"#;
+        let constant = flags(&format!(r#"SELECT jsonb_contains(d, '{{"tag": "t3"}}') FROM {docs}"#)).await;
+        assert_eq!(constant, vec![Some(true), Some(false), None]);
+        let column = flags(r#"SELECT jsonb_contains(d, k) FROM (VALUES ('{"tag": "t3"}', '{"tag": "t3"}'), ('{"tag": "t4"}', '{"tag":"t3"}'), (CAST(NULL AS VARCHAR), '{ "tag": "t3" }')) AS t(d, k)"#).await;
+        assert_eq!(column, constant);
+        let contained = flags(&format!(r#"SELECT jsonb_contained('{{"tag": "t3"}}', d) FROM {docs}"#)).await;
+        assert_eq!(contained, constant, "`<@` with a constant on its left");
+        // ?| and ?& with a list the same in every row, and with one that differs from row to row
+        let rows = r#"(VALUES ('{"tag": 1}'), ('{"x": 1, "tag": 2}'), (CAST(NULL AS VARCHAR))) AS t(d)"#;
+        assert_eq!(flags(&format!("SELECT jsonb_exists_any(d, ARRAY['x', 'tag']) FROM {rows}")).await, vec![Some(true), Some(true), None]);
+        assert_eq!(flags(&format!("SELECT jsonb_exists_all(d, ARRAY['x', 'tag']) FROM {rows}")).await, vec![Some(false), Some(true), None]);
+        let per_row = r#"(VALUES ('{"tag": 1}', 'tag'), ('{"x": 1, "tag": 2}', 'tag'), (CAST(NULL AS VARCHAR), 'x')) AS t(d, k)"#;
+        assert_eq!(flags(&format!("SELECT jsonb_exists_any(d, make_array('x', k)) FROM {per_row}")).await, vec![Some(true), Some(true), None]);
+        assert_eq!(flags(&format!("SELECT jsonb_exists_all(d, make_array('x', k)) FROM {per_row}")).await, vec![Some(false), Some(true), None]);
+        // (a lone surrogate's escape, as the SQL text has it: one backslash)
+        assert_eq!(refused_with(r#"SELECT jsonb_exists('["\ud800"]', 'a')"#).await, "22P02");
     }
 
     #[test]

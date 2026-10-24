@@ -7,7 +7,7 @@
 //! integer where an array is, or a path into a scalar, is refused. `pg_json::operator` plans `-` and `#-` onto these.
 use crate::codes::coded;
 use crate::pg_functions::{function, marked};
-use crate::pg_json::{index_of, is_integer, is_text, json_refusal, lists, skip, JSON_SPACE};
+use crate::pg_json::{index_of, is_integer, json_refusal, skip, Lists, JSON_SPACE};
 use crate::pg_json_make::{as_text, depth_check, fail, find, in_jsonb_order, is_null_at, json_string, parse, per_row, refuse, text_at, write, Node};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
@@ -160,32 +160,6 @@ fn flags(a: &[ArrayRef], at: usize, n: usize, default: bool) -> Result<Vec<Optio
     match a.get(at) {
         None => Ok(vec![Some(default); n]),
         Some(flag) => Ok(cast(flag, &DataType::Boolean)?.as_boolean().iter().collect()),
-    }
-}
-
-/// A path, or a list of keys, for each row, read as `lists` reads a batch. A literal (text that is the same in every row,
-/// as `'{name}'` is) is read once: `lists` over the batch copied and read it a row at a time, a sixth of jsonb_set's time.
-struct Lists {
-    once: Option<Option<Vec<Option<String>>>>,
-    rows: Vec<Option<Vec<Option<String>>>>,
-}
-
-impl Lists {
-    fn of(a: &ArrayRef, n: usize) -> Result<Lists> {
-        let text = is_text(a.data_type());
-        if text && n > 0 && (0..n).all(|i| !is_null_at(a, i) && text_at(a, i) == text_at(a, 0)) {
-            let once = lists(&a.slice(0, 1)).map_err(fail)?;
-            return Ok(Lists { once: once.into_iter().next(), rows: Vec::new() });
-        }
-        Ok(Lists { once: None, rows: lists(a).map_err(fail)? })
-    }
-
-    /// The path or the keys of row `i`: None where the argument is NULL.
-    fn at(&self, i: usize) -> &Option<Vec<Option<String>>> {
-        match &self.once {
-            Some(once) => once,
-            None => &self.rows[i],
-        }
     }
 }
 
