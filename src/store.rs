@@ -1260,12 +1260,9 @@ impl Lake {
     /// catalogs of its own, so the tables a query registers are its alone.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
         spill_room(); // (the spill disk's room as it is now: `spill_disk` looked at it once, when the lake opened)
-        let mut state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
-        let catalogs = datafusion::catalog::MemoryCatalogProviderList::new();
+        let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
         let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
-        datafusion::catalog::CatalogProviderList::register_catalog(&catalogs, state.config().options().catalog.default_catalog.clone(), Arc::new(catalog));
-        state.register_catalog_list(Arc::new(catalogs));
-        let ctx = SessionContext::new_with_state(state);
+        let ctx = crate::engine::with_catalog(state, Arc::new(catalog));
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
         crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
         crate::ext::register_secrets(&ctx, self.arc()); // secrets()
