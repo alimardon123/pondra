@@ -51,10 +51,10 @@ The owner's design principles, which every change must respect:
    the product, is flexible and easy to change and maintain. Each thing is defined once (one
    registry, one table of names, one check at every door), so a change made in that one place
    applies everywhere, with no copies to chase. Users customize and extend the whole product
-   (their own objects, functions, settings, extensions) as fully as the core does. Reliability,
-   simplicity, performance and efficiency stay the bar, and every review holds a change to this.
-   The owner, 2026-10-10: code any developer can read, change, extend and maintain later; the
-   simple shape first, plain names, and no cleverness a newcomer would have to decode.
+   (their own objects, functions, settings, extensions: ADR-075) as fully as the core does.
+   Reliability, simplicity, performance and efficiency stay the bar, and every review holds a change
+   to this. The owner, 2026-10-10: code any developer can read, change, extend and maintain later;
+   the simple shape first, plain names, and no cleverness a newcomer would have to decode.
 10. **Every feature through every door** (the owner, 2026-10-09): what Pondra can do, it can do from
    SQL, Python, JavaScript, the command line, HTTP, Flight, the Postgres port, MCP and the console,
    as far as a door allows (Kafka's protocol carries rows, not statements). A door that can't take
@@ -3418,7 +3418,7 @@ round: the engine first (this), then the console and `--server` (round 26).
   - ADR-029 comes after that: phase 1 in round 27, phase 2 in round 28. Security moves to round
     29.
   - "Our extension framework" means DuckDB-style `INSTALL`/`LOAD`. Nothing was designed before;
-    ADR-031 (proposed) designs it, and its round is still open.
+    ADR-031 designed it; ADR-075 (accepted 2026-10-24) replaces it, built from 1.1.
   - pyarrow stays optional ("we might make it required in the future, but not now").
 
 **R2 test buckets.** There are two:
@@ -3715,5 +3715,5 @@ lane's files (the project's `designs/one-month-to-1-0.md` lists them and each la
   - A part takes its owner's verbs (`ALTER … ADD | DROP`, `COMMENT ON`), rights and life cycle,
     shows in its owner's `SHOW CREATE`, and passes checks 1, 2 and 6 to 10.
   - A pattern passes 1, 2 and 10.
-  - A plugin's entries also name their origin, live under `pl/{plugin}/`, and may not take a word
-    already used.
+  - An extension's entries also name their origin and live under `xt/{extension}/`, its files under
+    `ext/{extension}/{version}/` (ADR-075), and may not take a word already used.

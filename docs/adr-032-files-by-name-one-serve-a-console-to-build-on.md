@@ -194,7 +194,7 @@ to search and list the directory each time".
   - attachments every database sees;
   - secrets;
   - users and roles (Postgres's roles are the server's, not a database's);
-  - installed extensions (ADR-031);
+  - installed extensions (ADR-075);
   - default settings.
 - **What it costs.** Nothing on the query path:
   - the server reads it at start and keeps it in memory;
