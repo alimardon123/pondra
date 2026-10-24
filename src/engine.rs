@@ -68,6 +68,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     ctx.register_udf(substr().as_ref().clone());
     let ctx = crate::pg_json::planned(ctx); // (Postgres's JSON: its operators ahead of the planners above, its functions)
     crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
+    crate::pg_casts::register(&ctx); // gen_random_uuid(), uuidv7(), pondra_uuid(x), pg_typeof(x): the casts' functions, every session's
     ctx
 }
 

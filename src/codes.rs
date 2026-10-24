@@ -56,10 +56,11 @@ pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
-/// refuses, invariant 188). The first words stay, so `codes::of` still reads them.
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. Spilling is off on a page too (it has no
+/// disk), so the words for it are true of both.
 const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
-    ("(DiskManager is disabled)", "(PONDRA_SPILL_GB is 0: nothing spills)"),
+    ("(DiskManager is disabled)", "(nothing spills to disk: PONDRA_SPILL_GB is 0, or this is a page)"),
 ];
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it

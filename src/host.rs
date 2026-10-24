@@ -40,6 +40,9 @@ impl Host for Lake {
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { types_of(self, stmts) }
 
     fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(self, sql) }
+
+    // (a node's watch is its own, `oom.rs`: the frame is collected as it is)
+    async fn collect(&self, frame: datafusion::prelude::DataFrame) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> { Ok(frame.collect().await?) }
 }
 
 async fn types_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::types::rewrite(lake, stmts).await }

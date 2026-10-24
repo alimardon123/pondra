@@ -28,6 +28,40 @@ pub fn first_word(sql: &str) -> &str {
     }
 }
 
+/// The first `n` words of `sql` past its leading comments, upper-cased, with a `;` at its end taken off: the words
+/// `control` reads, so a word is whole (`merged` is not `MERGE`).
+pub fn first_words(sql: &str, n: usize) -> Vec<String> {
+    first_word(sql).trim_end_matches(';').split_whitespace().take(n).map(|w| w.to_uppercase()).collect()
+}
+
+/// The words a `BEGIN` may take after its first (`control`).
+const BEGIN_WORDS: [&str; 14] = ["WORK", "TRANSACTION", "ISOLATION", "LEVEL", "READ", "WRITE", "ONLY", "REPEATABLE", "SERIALIZABLE", "COMMITTED", "UNCOMMITTED", "SNAPSHOT", "DEFERRABLE", "NOT"];
+
+/// Is a ROLLBACK's first words `[WORK | TRANSACTION] TO`? (`words` holds at most three.)
+fn to_point(words: &[String]) -> bool {
+    let at = |i: usize| words.get(i).map(String::as_str);
+    at(1) == Some("TO") || (matches!(at(1), Some("WORK" | "TRANSACTION")) && at(2) == Some("TO"))
+}
+
+/// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
+/// (`SET TRANSACTION` is `settings.rs`'s.)
+pub fn control(sql: &str) -> Option<&'static str> {
+    // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
+    let words = first_words(sql, 3);
+    let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
+    match words.first().map(String::as_str) {
+        Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
+        Some("START") if words.get(1).map(String::as_str) == Some("TRANSACTION") => Some("BEGIN"),
+        Some("COMMIT" | "END") if rest_ok(1) => Some("COMMIT"),
+        // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name: a savepoint's, not the transaction's
+        Some("ROLLBACK") if to_point(&words) => Some("ROLLBACK TO"),
+        Some("ROLLBACK" | "ABORT") if rest_ok(1) => Some("ROLLBACK"),
+        Some("SAVEPOINT") => Some("SAVEPOINT"),
+        Some("RELEASE") => Some("RELEASE"),
+        _ => None,
+    }
+}
+
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
@@ -181,7 +215,7 @@ pub fn makes_json(sql: &str) -> bool {
 /// call and a `||` that may meet a jsonb document are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("[]") {
-        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
+        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_text::array_literals`)
     }
     // (a set function: one in a FROM that reads a column is LATERAL's, `lateral::functions`; JSON's give a document's
     // rows, `pg_json_sets::sets`)
