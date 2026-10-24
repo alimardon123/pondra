@@ -47,7 +47,7 @@ fn to_point(words: &[String]) -> bool {
 /// (`SET TRANSACTION` is `settings.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
     // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
-    let words: Vec<String> = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().take(3).map(|w| w.to_uppercase()).collect();
+    let words = first_words(sql, 3);
     let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
     match words.first().map(String::as_str) {
         Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
