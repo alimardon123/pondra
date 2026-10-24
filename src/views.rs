@@ -821,7 +821,7 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     if seen < meta.tiered {
         // (rows went into files since: their ranges say how new they were)
         let s = crate::answer::schema(&meta.columns)?;
-        let ranges = crate::manifest::ranges(table, &crate::manifest::list(lake, &meta).await?, &meta.files, &s);
+        let ranges = crate::manifest::ranges(&crate::manifest::list(lake, &meta).await?, &meta.files, &s);
         if let Some((_, hi)) = ranges.get(&stored) {
             if let ScalarValue::TimestampMicrosecond(v, _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
                 newest = newest.max(v);

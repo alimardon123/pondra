@@ -350,19 +350,19 @@ async fn read_files(lake: &Lake, ctx: &SessionContext, files: Vec<&DataFile>, me
     if !lake.hot.on() {
         return files_once(lake, ctx, &files, meta, schema).await;
     }
-    Ok(ctx.read_table(Arc::new(hot_files(lake, files, meta, schema, Default::default())))?)
+    Ok(ctx.read_table(Arc::new(hot_files(lake, files.into_iter().cloned().collect(), meta, schema, Default::default())))?)
 }
 
-fn hot_files(lake: &Lake, files: Vec<&DataFile>, meta: &TableMeta, schema: &SchemaRef, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> crate::hot::HotFiles {
+fn hot_files(lake: &Lake, files: Vec<DataFile>, meta: &TableMeta, schema: &SchemaRef, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> crate::hot::HotFiles {
     let meta = TableMeta { columns: meta.columns.clone(), names: meta.names.clone(), key: meta.key.clone(), ..Default::default() }; // (what reading a file takes of its table)
-    crate::hot::HotFiles { lake: lake.arc(), files: files.into_iter().cloned().collect(), schema: schema.clone(), meta, known }
+    crate::hot::HotFiles { lake: lake.arc(), files, schema: schema.clone(), meta, known }
 }
 
 /// An append table that never changed, read through the hot columns, as a plan: its log tail and
 /// its files side by side, as `raw` reads them. Planned here, not as a query of its own: that
 /// query's optimizer passes are the ones the whole query runs over it again anyway, and they were
 /// a sixth of a dashboard query's time while rows streamed in.
-async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name: &str, meta: &TableMeta, files: Vec<DataFile>, upto: Option<u64>, projection: Option<&Vec<usize>>, known: Arc<std::collections::HashMap<String, crate::hot::Known>>) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
     use datafusion::datasource::memory::MemorySourceConfig;
     let schema = read_schema(&meta.columns)?;
     let sys = meta.columns.iter().any(|(c, _)| c == crate::text::ROW_ID);
@@ -371,8 +371,8 @@ async fn plain_scan(lake: &Lake, state: &dyn datafusion::catalog::Session, name:
     if !tail.is_empty() {
         parts.push(MemorySourceConfig::try_new_exec(&[tail], schema.clone(), projection.cloned())?);
     }
-    if !meta.files.is_empty() {
-        parts.push(hot_files(lake, meta.files.iter().collect(), meta, &schema, known).scan(state, projection, &[], None).await?);
+    if !files.is_empty() {
+        parts.push(hot_files(lake, files, meta, &schema, known).scan(state, projection, &[], None).await?);
     }
     if parts.is_empty() {
         parts.push(MemorySourceConfig::try_new_exec(&[vec![]], schema, projection.cloned())?);
@@ -569,24 +569,133 @@ impl TableProvider for Table {
 pub fn names_deleted(text: &str) -> bool { text.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "_deleted") }
 
 /// A table as its users see it: append tables as files + log; keyed tables their current rows.
-/// `upto`: the log only that far (a distributed query reads every node's copy at one snapshot).
-pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+/// `sys`: with its system columns (`sys::with_sys`). `upto`: the log only that far (a distributed query reads every
+/// node's copy at one snapshot).
+pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+    let facts = match meta.key.is_empty() {
+        true => Some(facts(lake, meta, sys).await?), // (kept for every query that plans this version of the table)
+        false => None,
+    };
+    view(lake, ctx, name, meta, sys, facts, upto).await
+}
+
+/// `table_view` for a meta that is not the catalog's, or not one a query keeps (an ext table's, a copy made for the
+/// call): its facts are worked out for this call and not kept.
+pub async fn table_view_once(lake: &Lake, ctx: &SessionContext, name: &str, meta: Arc<TableMeta>, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+    let facts = match meta.key.is_empty() {
+        true => Some(Arc::new(facts_once(lake, &meta, false).await?)),
+        false => None,
+    };
+    view(lake, ctx, name, &meta, false, facts, upto).await
+}
+
+/// A table's view, over its facts (an append table's; none for a keyed one).
+async fn view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Arc<TableMeta>, sys: bool, facts: Option<Arc<Facts>>, upto: Option<u64>) -> Result<Arc<dyn TableProvider>> {
+    let meta = match sys {
+        true => Arc::new(crate::sys::with_sys(meta)), // (a copy only when the query names system columns)
+        false => meta.clone(),
+    };
     if !meta.key.is_empty() && meta.merge.is_empty() && meta.order.is_none() {
-        return upsert_view(lake, ctx, name, meta, upto).await; // (by event time: every source's rows grouped by key, below)
+        return upsert_view(lake, ctx, name, &meta, upto).await; // (by event time: every source's rows grouped by key, below)
     }
-    if meta.key.is_empty() {
-        let schema = read_schema(&meta.columns)?;
-        let ranges = crate::manifest::ranges(name, &crate::manifest::list(lake, meta).await?, &meta.files, &schema);
-        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta: meta.clone(), manifests: None, upto, at: upto, schema, share: None, ranges, range: None, stats: Default::default() }));
+    if let Some(facts) = facts {
+        return Ok(Arc::new(Pruned { lake: lake.arc(), name: name.into(), meta, facts, manifests: None, upto, at: upto, share: None, range: None, own: Default::default() }));
     }
-    let df = raw(lake, ctx, name, meta, upto).await?;
+    let df = raw(lake, ctx, name, &meta, upto).await?;
     let aux = lake.session();
     aux.register_table("__raw", df.into_view())?;
-    let current = aux.sql(&current_sql(meta, "__raw", upto.unwrap_or(lake.visible()))).await?;
+    let current = aux.sql(&current_sql(&meta, "__raw", upto.unwrap_or(lake.visible()))).await?;
     match &meta.finish {
         None => Ok(current.into_view()),
         Some(f) => crate::finish::finished(&aux, current, f).await, // (avg, HAVING, …: worked out as it is read)
     }
+}
+
+/// What a version of an append table gives every query that plans it, worked out once (`facts`): its read schema, its
+/// manifests, the ranges of its whole contents, its statistics (`Pruned::sized`) and what `hot::known` makes of them.
+pub struct Facts {
+    pub schema: SchemaRef,
+    pub manifests: Vec<crate::manifest::Manifest>,
+    pub ranges: crate::manifest::Stats,
+    pub count: datafusion::common::Statistics,
+    pub known: Arc<std::collections::HashMap<String, crate::hot::Known>>,
+}
+
+/// Each append table version's `Facts`, by the address of its parsed entry and whether its system columns are in. A key is
+/// a hit only while its `Weak` upgrades to the same `Arc`: the `Weak` holds the allocation, so no other entry takes its
+/// address while it is held, and a changed entry is never this one (`Arc::make_mut`, `Arc::try_unwrap` and
+/// `Arc::unwrap_or_clone` either give it a new allocation or cut the `Weak` off). At most 256, and on insert the entries
+/// whose entry is gone leave: each tiering round makes a new version, and a dead one's manifests must not wait for 256 newer.
+struct FactsMemo(lru::LruCache<(usize, bool), (std::sync::Weak<TableMeta>, Arc<Facts>)>);
+
+impl FactsMemo {
+    fn get(&mut self, meta: &Arc<TableMeta>, sys: bool) -> Option<Arc<Facts>> {
+        let (held, facts) = self.0.get(&(Arc::as_ptr(meta) as usize, sys))?;
+        let same = held.upgrade().is_some_and(|m| Arc::ptr_eq(&m, meta));
+        same.then(|| facts.clone())
+    }
+
+    fn put(&mut self, meta: &Arc<TableMeta>, sys: bool, facts: &Arc<Facts>) {
+        let gone: Vec<(usize, bool)> = self.0.iter().filter(|(_, (held, _))| held.strong_count() == 0).map(|(k, _)| *k).collect();
+        for k in gone {
+            self.0.pop(&k);
+        }
+        self.0.put((Arc::as_ptr(meta) as usize, sys), (Arc::downgrade(meta), facts.clone()));
+    }
+}
+
+crate::per_node!(static FACTS: std::sync::Mutex<FactsMemo> = std::sync::Mutex::new(FactsMemo(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).0.clear());
+
+/// An append table version's `Facts` as its queries plan it, kept per version of its entry (`FactsMemo`): a table that has
+/// not changed is planned from the same facts by every query.
+pub async fn facts(lake: &Lake, meta: &Arc<TableMeta>, sys: bool) -> Result<Arc<Facts>> {
+    if let Some(facts) = FACTS.lock().unwrap().get(meta, sys) {
+        return Ok(facts);
+    }
+    let facts = Arc::new(facts_once(lake, meta, sys).await?);
+    FACTS.lock().unwrap().put(meta, sys, &facts);
+    Ok(facts)
+}
+
+/// `facts` worked out for this call (`sys`: with the system columns, as `sys::with_sys` gives them).
+pub async fn facts_once(lake: &Lake, meta: &TableMeta, sys: bool) -> Result<Facts> {
+    let columns = match sys {
+        true => crate::sys::with_sys(meta).columns,
+        false => meta.columns.clone(),
+    };
+    let schema = read_schema(&columns)?;
+    let manifests = crate::manifest::list(lake, meta).await?;
+    let ranges = crate::manifest::ranges(&manifests, &meta.files, &schema);
+    let statistics = count(meta, &schema, &ranges, None);
+    let known = Arc::new(crate::hot::known(&statistics, &schema));
+    Ok(Facts { schema, manifests, ranges, count: statistics, known })
+}
+
+/// A table's statistics for planning (`Pruned::sized`): its rows and bytes (a slice's `share`, else the entry's: its
+/// sealed manifests' totals and its files'), and each column's range and distinct values (`sketch.rs`, no more than its
+/// range or its rows could hold).
+fn count(meta: &TableMeta, schema: &SchemaRef, ranges: &crate::manifest::Stats, share: Option<(u64, u64)>) -> datafusion::common::Statistics {
+    use datafusion::common::stats::Precision;
+    let (rows, bytes) = share.unwrap_or_else(|| {
+        let sealed = meta.sealed.clone().unwrap_or_default();
+        let (rows, bytes) = meta.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
+        (sealed.rows + rows, sealed.bytes + bytes)
+    });
+    let mut stats = datafusion::common::Statistics::new_unknown(schema);
+    (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
+    for (i, f) in schema.fields().iter().enumerate() {
+        let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
+        let range = ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)));
+        // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range could hold, nor than its rows.
+        let sketched = meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
+        if let Some(n) = crate::sketch::distinct(sketched, range.as_ref().map(|(lo, hi)| (lo, hi)), rows) {
+            stats.column_statistics[i].distinct_count = Precision::Inexact(n);
+        }
+        if let Some((lo, hi)) = range {
+            (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
+        }
+    }
+    stats
 }
 
 /// An append table (or a distributed query's slice of one) that picks its files per query: those
@@ -595,15 +704,14 @@ pub async fn table_view(lake: &Lake, ctx: &SessionContext, name: &str, meta: &Ta
 pub struct Pruned {
     pub lake: Arc<Lake>,
     pub name: String,
-    pub meta: TableMeta,
-    pub manifests: Option<Vec<crate::manifest::Manifest>>, // a slice's share; None: the table's list
+    pub meta: Arc<TableMeta>,
+    pub facts: Arc<Facts>,                                  // the whole table's: its schema, manifests, ranges and statistics (`facts`)
+    pub manifests: Option<Vec<crate::manifest::Manifest>>, // a slice's share; None: the table's list (in `facts`)
     pub upto: Option<u64>,                                  // the log up to this segment (None: the latest)
     pub at: Option<u64>,                                    // the commit the query reads as of (a slice: its coordinator's; None: the latest)
-    pub schema: SchemaRef,
     pub share: Option<(u64, u64)>, // a distributed query's slice of it, and the whole table's (rows, bytes)
-    pub ranges: Arc<crate::manifest::Stats>, // every column's min and max over the whole table
     pub range: Option<crate::ranges::Range>, // a distributed query's slice by a key's range: only its rows
-    pub stats: std::sync::OnceLock<datafusion::common::Statistics>, // (worked out once: the join order asks for them per input it costs)
+    pub own: std::sync::OnceLock<(datafusion::common::Statistics, Arc<std::collections::HashMap<String, crate::hot::Known>>)>, // a slice's own, worked out once (`sized`)
 }
 
 impl std::fmt::Debug for Pruned {
@@ -611,29 +719,17 @@ impl std::fmt::Debug for Pruned {
 }
 
 impl Pruned {
-    fn count(&self) -> datafusion::common::Statistics {
-        use datafusion::common::stats::Precision;
-        let (rows, bytes) = self.share.unwrap_or_else(|| {
-            let sealed = self.meta.sealed.clone().unwrap_or_default();
-            let (rows, bytes) = self.meta.files.iter().fold((0, 0), |(r, b), f| (r + f.rows, b + f.bytes));
-            (sealed.rows + rows, sealed.bytes + bytes)
-        });
-        let mut stats = datafusion::common::Statistics::new_unknown(&self.schema);
-        (stats.num_rows, stats.total_byte_size) = (Precision::Inexact(rows as usize), Precision::Inexact(bytes as usize));
-        for (i, f) in self.schema.fields().iter().enumerate() {
-            let parse = |v: &String| datafusion::common::ScalarValue::try_from_string(v.clone(), f.data_type()).ok();
-            let range = self.ranges.get(f.name()).and_then(|(lo, hi)| Some((parse(lo)?, parse(hi)?)));
-            // Distinct values: what the table's sketch saw (`sketch.rs`), no more than its range
-            // could hold, nor than its rows.
-            let sketched = self.meta.sketch.get(f.name()).and_then(|s| crate::sketch::estimate(s));
-            if let Some(n) = crate::sketch::distinct(sketched, range.as_ref().map(|(lo, hi)| (lo, hi)), rows) {
-                stats.column_statistics[i].distinct_count = Precision::Inexact(n);
-            }
-            if let Some((lo, hi)) = range {
-                (stats.column_statistics[i].min_value, stats.column_statistics[i].max_value) = (Precision::Inexact(lo), Precision::Inexact(hi));
-            }
+    /// The statistics a scan plans with, and `hot::known` of them: the whole table's (from `facts`) for a scan of all of it;
+    /// a slice's own, its rows the whole table's (`share`), worked out once here (the join order asks for them per input it costs).
+    fn sized(&self) -> (datafusion::common::Statistics, Arc<std::collections::HashMap<String, crate::hot::Known>>) {
+        match self.share {
+            None => (self.facts.count.clone(), self.facts.known.clone()),
+            Some(_) => self.own.get_or_init(|| {
+                let stats = count(&self.meta, &self.facts.schema, &self.facts.ranges, self.share);
+                let known = Arc::new(crate::hot::known(&stats, &self.facts.schema));
+                (stats, known)
+            }).clone(),
         }
-        stats
     }
 
     /// Any other table's rows, planned as a query of their own.
@@ -653,14 +749,14 @@ impl Pruned {
             Some(r) => df.filter(r)?, // (reaches the Parquet reader: row groups outside it are skipped)
             None => df,
         };
-        let df = df.select_columns(&projection.iter().map(|&i| self.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
+        let df = df.select_columns(&projection.iter().map(|&i| self.facts.schema.field(i).name().as_str()).collect::<Vec<_>>())?;
         df.create_physical_plan().await
     }
 }
 
 #[async_trait::async_trait]
 impl TableProvider for Pruned {
-    fn schema(&self) -> SchemaRef { self.schema.clone() }
+    fn schema(&self) -> SchemaRef { self.facts.schema.clone() }
     fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Base }
 
     fn supports_filters_pushdown(&self, filters: &[&Expr]) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
@@ -673,39 +769,44 @@ impl TableProvider for Pruned {
     /// alike. The log tail isn't counted — it is bounded by a tiering round, and this is for
     /// choosing a join order (`optimize::JoinOrder`), not for counting rows.
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        Some(self.stats.get_or_init(|| self.count()).clone())
+        Some(self.sized().0)
     }
 
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], _: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let e = |e: anyhow::Error| datafusion::error::DataFusionError::External(e.into());
         let range = match &self.range {
-            Some(r) => Some(r.expr(self.schema.field_with_name(&r.column)?.data_type()).map_err(e)?),
+            Some(r) => Some(r.expr(self.facts.schema.field_with_name(&r.column)?.data_type()).map_err(e)?),
             None => None,
         };
         let filters: Vec<Expr> = filters.iter().cloned().chain(range.clone()).collect();
-        let files = crate::manifest::pruned(&self.lake, &self.meta, self.manifests.as_deref(), &filters, &self.schema).await.map_err(e)?;
-        let mut meta = TableMeta { files, sealed: None, ..self.meta.clone() };
+        let listed = self.manifests.as_deref().unwrap_or(self.facts.manifests.as_slice());
+        let files = crate::manifest::pruned(&self.lake, &self.meta, Some(listed), &filters, &self.facts.schema).await.map_err(e)?;
         // The log's end is fixed first, then the table asked whether it changed since its entry was
         // read: a change makes `{t}$deleted` in or before its commit, so one not there now means no
         // row up to `upto` is a change's. (An entry read before a table's first UPDATE, its log read
         // past it, kept both versions of the row: `harness.py attached`.)
         let upto = Some(self.upto.unwrap_or_else(|| self.lake.visible()));
-        if !meta.changed && meta.key.is_empty() && meta.ext.is_none() {
-            meta.changed = self.lake.cat.get_raw(&crate::store::table_key(&crate::sys::deleted(&self.name))).await.map_err(e)?.is_some();
+        let mut changed = self.meta.changed;
+        if !changed && self.meta.key.is_empty() && self.meta.ext.is_none() {
+            changed = self.lake.cat.get_raw(&crate::store::table_key(&crate::sys::deleted(&self.name))).await.map_err(e)?.is_some();
         }
-        let all: Vec<usize> = (0..self.schema.fields().len()).collect();
-        let plain = !meta.changed && range.is_none() && meta.key.is_empty() && meta.ext.is_none() && self.lake.hot.on();
+        let all: Vec<usize> = (0..self.facts.schema.fields().len()).collect();
+        let plain = !changed && range.is_none() && self.meta.key.is_empty() && self.meta.ext.is_none() && self.lake.hot.on();
         let plan = match plain {
             true => {
-                let known = Arc::new(crate::hot::known(self.stats.get_or_init(|| self.count()), &self.schema));
-                plain_scan(&self.lake, state, &self.name, &meta, upto, projection, known).await.map_err(e)?
+                let known = self.sized().1;
+                plain_scan(&self.lake, state, &self.name, &self.meta, files, upto, projection, known).await.map_err(e)?
             }
-            false => self.planned(&meta, range, projection.unwrap_or(&all), upto).await?,
+            false => {
+                let meta = TableMeta { files, sealed: None, changed, ..(*self.meta).clone() };
+                self.planned(&meta, range, projection.unwrap_or(&all), upto).await?
+            }
         };
         let Some((rows, bytes)) = self.share else { return Ok(plan) };
         // (with each column's distinct values and range, from the catalog: an aggregate over a
         // slice then knows it puts out a few groups, not a row per row — `guard.rs` weighs that)
-        let columns = self.statistics().map(|s| projection.unwrap_or(&all).iter().map(|&i| s.column_statistics[i].clone()).collect());
+        let stats = self.sized().0;
+        let columns = Some(projection.unwrap_or(&all).iter().map(|&i| stats.column_statistics[i].clone()).collect());
         Ok(Arc::new(crate::spmd::ShareExec::new(plan, &self.name, rows, bytes, self.range.as_ref().map(|r| r.column.clone()), columns)?))
     }
 }
@@ -1145,7 +1246,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    let sys = |m: &TableMeta| -> TableMeta { if crate::sys::mentioned(&text) { crate::sys::with_sys(m) } else { m.clone() } }; // (named: the tables get their system columns)
+    let named_sys = crate::sys::mentioned(&text); // (named: the tables get their system columns)
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
@@ -1160,7 +1261,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if name != except && (staged || !crate::sys::hidden(name) && (listing || mentions(&text, name))) {
             let meta = lake.cat.parsed(&key, &raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
-            let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(&meta) }, upto).await?;
+            let view = table_view(lake, &ctx, name, &meta, touched || named_sys, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
             if touched {
                 t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
@@ -1177,11 +1278,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let metas = futures::future::join_all(names.iter().map(|n| crate::ext::meta(lake, n))).await; // (listed at once)
     for (name, meta) in names.into_iter().zip(metas) {
         let meta = match meta {
-            Ok(m) => m.expect("files"), // (files anywhere: `ext.rs`)
+            Ok(m) => Arc::new(m.expect("files")), // (files anywhere: `ext.rs`)
             Err(_) if listing && !direct.contains(&name) => continue, // (a view's files this caller can't read, or that are gone: a listing shows the rest)
             Err(e) => return Err(e),
         };
-        let view = table_view(lake, &ctx, &name, &meta, upto).await?;
+        let view = table_view_once(lake, &ctx, &name, meta.clone(), upto).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
     for name in crate::past_names::names(&text) {
@@ -1213,7 +1314,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
                 continue;
             }
             let meta = other.cat.parsed(&key, &raw)?;
-            let view = named(&ctx, table_view(&other, &ctx, name, &sys(&meta), upto).await?, &meta, names_deleted(&text))?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &meta, named_sys, upto).await?, &meta, names_deleted(&text))?;
             let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
@@ -1231,14 +1332,14 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             system.register_table(name.into(), table)?;
         }
         let runs = match lake.cat.meta(&crate::store::table_key(crate::runs::TABLE)).await? {
-            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &sys(&meta), upto).await?, &meta, false)?,
+            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
             None => crate::runs::no_runs()?,
         };
         system.register_table("runs".into(), runs)?;
         if crate::audit::check(&text)? {
             // (a superuser's only: `audit.rs`)
             let audit = match lake.cat.meta(&crate::store::table_key(crate::audit::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &sys(&meta), upto).await?, &meta, false)?,
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
                 None => crate::audit::empty()?,
             };
             system.register_table("audit".into(), audit)?;
@@ -1246,7 +1347,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if text.to_lowercase().contains("pondra.history") || text.to_lowercase().contains("pondra.learned") {
             // (every statement's row: an admin's all, anyone else's their own: `history.rs`; what they learned, `learned.rs`)
             let history = match lake.cat.meta(&crate::store::table_key(crate::history::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &sys(&meta), upto).await?, &meta, false)?,
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &meta, named_sys, upto).await?, &meta, false)?,
                 None => crate::history::empty()?,
             };
             let history = crate::history::visible(&ctx, history)?;
@@ -1258,7 +1359,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         if text.to_lowercase().contains("pondra.flows") || text.to_lowercase().contains("pondra.expectations") {
             // (a materialized view's flow and its expectations: `views::system`)
             let counts = match lake.cat.meta(&crate::store::table_key(crate::views::EXPECTED)).await? {
-                Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, upto).await?)?.collect().await?,
+                Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, false, upto).await?)?.collect().await?,
                 None => vec![],
             };
             for (name, table) in crate::views::system(lake, counts).await? {
@@ -1417,8 +1518,60 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::exhausted;
+    use super::{exhausted, Facts, FactsMemo};
+    use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
+    use std::sync::Arc;
+
+    /// A version's facts, told apart by their row count.
+    fn facts(rows: usize) -> Arc<Facts> {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::empty());
+        let mut count = datafusion::common::Statistics::new_unknown(&schema);
+        count.num_rows = datafusion::common::stats::Precision::Exact(rows);
+        Arc::new(Facts { schema, manifests: vec![], ranges: Default::default(), count, known: Default::default() })
+    }
+
+    fn rows(facts: Option<Arc<Facts>>) -> Option<usize> { facts?.count.num_rows.get_value().copied() }
+
+    fn memo() -> FactsMemo { FactsMemo(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())) }
+
+    #[test]
+    fn the_same_entry_hits_and_its_system_columns_version_is_its_own() {
+        let mut memo = memo();
+        let entry = Arc::new(TableMeta::default());
+        assert!(memo.get(&entry, false).is_none(), "nothing kept yet");
+        memo.put(&entry, false, &facts(1));
+        assert_eq!(rows(memo.get(&entry, false)), Some(1), "the same Arc: the facts kept for it");
+        memo.put(&entry, true, &facts(2));
+        assert_eq!(rows(memo.get(&entry, true)), Some(2), "with system columns: facts of their own");
+        assert_eq!(rows(memo.get(&entry, false)), Some(1), "and without them, still the first");
+    }
+
+    #[test]
+    fn a_dropped_entry_misses_and_a_copy_made_by_unwrap_or_clone_misses() {
+        let mut memo = memo();
+        let entry = Arc::new(TableMeta::default());
+        memo.put(&entry, false, &facts(3));
+        let held = entry.clone();
+        let copy = Arc::new(Arc::unwrap_or_clone(entry)); // (`held` still holds the entry, so this clones it)
+        assert!(memo.get(&copy, false).is_none(), "a copy is another entry");
+        assert_eq!(rows(memo.get(&held, false)), Some(3), "the entry itself still hits");
+        drop(held);
+        let next = Arc::new(TableMeta::default());
+        assert!(memo.get(&next, false).is_none(), "an entry that is gone is never hit by another one");
+    }
+
+    #[test]
+    fn dead_entries_leave_on_insert() {
+        let mut memo = memo();
+        let gone = Arc::new(TableMeta::default());
+        memo.put(&gone, false, &facts(4));
+        drop(gone);
+        let next = Arc::new(TableMeta::default());
+        memo.put(&next, false, &facts(5));
+        assert_eq!(memo.0.len(), 1, "the dead entry left when the next one came in");
+        assert_eq!(rows(memo.get(&next, false)), Some(5));
+    }
 
     #[test]
     fn only_memory_runs_out_is_retried_frugally() {

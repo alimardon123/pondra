@@ -306,8 +306,8 @@ pub async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, o: &
         return Ok(());
     }
     let ctx = crate::query::session(lake, "", "").await?;
-    let meta: TableMeta = lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?;
-    let open = crate::query::table_view(lake, &ctx, view, &meta, None).await?;
+    let meta: Arc<TableMeta> = Arc::new(lake.cat.get(&table_key(view)).await?.with_context(|| format!("no table {view}"))?);
+    let open = crate::query::table_view_once(lake, &ctx, view, meta.clone(), None).await?;
     ctx.register_table("__open", crate::query::named(&ctx, open, &meta, false)?)?;
     use datafusion::prelude::{ident, lit};
     let g = ident(&o.column);
