@@ -253,13 +253,11 @@ impl Opened {
         anyhow::ensure!(SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_none(), "a node is open in this process already: close it first (one at a time)");
         crate::env::give(o.into_iter().map(|(k, v)| (if k == "launcher" { "PONDRA_LAUNCHER".into() } else { k }, text(v))))?;
         crate::tls::init()?; // (a certificate that can't be read: said now)
-        let set = crate::env::get;
-        let auth = crate::auth::Auth::new(set("PONDRA_READ_TOKEN"), set("PONDRA_WRITE_TOKEN"), set("PONDRA_ADMIN_TOKEN"));
         let mut options = Options::local(&lake, &addr);
         options.python = python;
         options.attach = attach;
         // (its loopback door answers only its host, with the key, as a node `connect()` starts beside its program does: S21)
-        options.auth = Arc::new(auth.owned_by(Some(owner.clone())));
+        options.auth = Arc::new(crate::auth::Auth::from_env().owned_by(Some(owner.clone())));
         let mut opened = Opened::open(options)?;
         opened.owner = Some(owner);
         Ok(opened)
@@ -281,16 +279,7 @@ impl Opened {
             let headers = vec![("x-pondra-sqlstate".into(), "57P03".into()), ("content-type".into(), "text/plain; charset=utf-8".into())];
             return Ok(futures::future::ready(Ok(Answer { status: 503, headers, body: Body::whole(why.into()) })).boxed());
         };
-        let mut req = http::Request::builder().method(method).uri(path);
-        for (k, v) in headers {
-            req = req.header(k.as_str(), v.as_str());
-        }
-        if let Some(key) = &self.owner {
-            req = req.header("x-pondra-owner", key.as_str());
-        }
-        let mut req = req.body(axum::body::Body::from(body))?;
-        let from = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-        req.extensions_mut().insert(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, tls: false, signed: false, local: true }));
+        let req = crate::node::request(method, path, headers, body, self.owner.as_deref())?;
         let (head, headed) = futures::channel::oneshot::channel();
         let (pieces, body) = mpsc::channel(2);
         runtime().spawn(answer(router, req, head, pieces));

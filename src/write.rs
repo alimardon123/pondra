@@ -4,7 +4,7 @@
 //! to record the result: one small commit, the leader's job (`Request`, `handle`). A machine that
 //! isn't a node reaches the leader over HTTP, through the bucket when it can't (`inbox.rs`), or
 //! leads for a moment itself when nobody does.
-use crate::cluster::{alive, claim, http, latest, mark_alive, release};
+use crate::cluster::{alive, claim, http, latest, release};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::session;
 use crate::answer::schema;
@@ -2387,12 +2387,18 @@ pub async fn ddl_here(lake: &Lake, seq: &crate::log::Sequencer, lock: &Mutex<()>
     }
 }
 
+/// The refusal for a write to a lake attached here read-only, with a key that only reads it (`across`, and a guest
+/// that writes: `Node::start`).
+pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
+    anyhow::anyhow!("{dir} is attached here read-only, with a key that only reads it: write it through its own server")
+}
+
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
 async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
     let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
-        bail!("{dir} is attached here read-only, with a key that only reads it: write it through its own server");
+        return Err(read_only_refused(dir));
     };
     // (never sent without one: this server's own key, or its user's token, must not go to another
     // server; only a branch's own `pb_` key is meant for its base's leader)
@@ -2476,26 +2482,20 @@ fn fenced(e: &anyhow::Error) -> bool {
 }
 
 /// How many times this command has already started over (it runs itself again, keeping its job).
-fn tries() -> u32 {
+pub(crate) fn tries() -> u32 {
     crate::env::or("PONDRA_TRIES", 0)
 }
 
 /// This `pondra sql`'s job, the same for every statement it records: a run started over takes the
 /// job of the run before (`PONDRA_JOB`), so whoever wins the race records it once.
-fn job() -> &'static str {
+pub(crate) fn job() -> &'static str {
     static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.
 async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>, stmt: &Stmt, job: &str) -> Result<Value> {
-    let s = store.clone();
-    let marks = crate::panics::task(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let _ = mark_alive(&s, term).await;
-        }
-    });
+    let marks = crate::cluster::mark_every(store.clone(), term);
     let lake = Lake::open(dir, true, false).await?; // (the catalog's writer: fences any older one)
     crate::replica::recover(&lake, "", term, None).await?;
     let (seq, lock) = (Sequencer::start(lake.clone(), None).await?, Mutex::new(()));
