@@ -270,20 +270,19 @@ impl TableMeta {
     }
 
     /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
-    /// statistics. Names are SQL's, as `logical()` gives them, and its rule fields go through the same mapping.
+    /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
+    /// stored name, as the entry keeps them.
     pub fn to_rules(&self) -> Result<crate::rules::Table> {
-        let (not_null, defaults, identity) = (self.in_sql_list(&self.not_null), self.in_sql(&self.defaults), self.in_sql(&self.identity));
-        let (enums, sql_types) = (self.in_sql(&self.enums), self.in_sql(&self.sql_types));
         let columns = self
             .live()
             .map(|(stored, name, _)| crate::rules::Column {
                 name: name.to_string(),
                 stored: stored.to_string(),
-                not_null: not_null.iter().any(|c| c == name),
-                default: defaults.get(name).cloned(),
-                always: identity.get(name).is_some_and(|i| i.always),
-                held: sql_types.get(name).cloned(),
-                labels: enums.get(name).map(|e| (e.of.clone(), e.labels.clone())),
+                not_null: self.not_null.iter().any(|c| c == stored),
+                default: self.defaults.get(stored).cloned(),
+                always: self.identity.get(stored).is_some_and(|i| i.always),
+                held: self.sql_types.get(stored).cloned(),
+                labels: self.enums.get(stored).map(|e| (e.of.clone(), e.labels.clone())),
             })
             .collect();
         Ok(crate::rules::Table {
