@@ -211,15 +211,17 @@ fn delta_stats(w: &Written) -> Value {
 }
 
 /// A bound as Delta's statistics hold it: numbers as numbers, dates as text, timestamps to the
-/// millisecond (a max rounded up), text as is. None: not kept (floats: NaN).
-fn stat_json(v: &ScalarValue, max: bool) -> Option<Value> {
+/// millisecond (a max rounded up), text as is. None: not kept (floats: NaN). Shared with the
+/// tables Pondra publishes (`delta.rs`), so both write the same bounds.
+pub(crate) fn stat_json(v: &ScalarValue, max: bool) -> Option<Value> {
     Some(match v {
         ScalarValue::Int8(Some(x)) => json!(x),
         ScalarValue::Int16(Some(x)) => json!(x),
         ScalarValue::Int32(Some(x)) => json!(x),
         ScalarValue::Int64(Some(x)) => json!(x),
         ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => json!(s),
-        ScalarValue::Date32(Some(_)) | ScalarValue::Decimal128(Some(_), ..) => serde_json::from_str::<Value>(&crate::manifest::text(v)?).unwrap_or_else(|_| json!(crate::manifest::text(v))),
+        ScalarValue::Date32(Some(_)) => serde_json::from_str::<Value>(&crate::manifest::text(v)?).unwrap_or_else(|_| json!(crate::manifest::text(v))),
+        ScalarValue::Decimal128(Some(_), ..) => decimal_json(&crate::manifest::text(v)?)?,
         ScalarValue::TimestampMicrosecond(Some(us), tz) => {
             let ms = if max { us.div_euclid(1000) + (us.rem_euclid(1000) > 0) as i64 } else { us.div_euclid(1000) };
             let t = chrono::DateTime::from_timestamp_millis(ms)?;
@@ -227,6 +229,15 @@ fn stat_json(v: &ScalarValue, max: bool) -> Option<Value> {
         }
         _ => return None,
     })
+}
+
+/// A decimal's text as a JSON number, or None past 15 significant digits (a reader's f64 would round it, and a rounded-up min skips rows).
+fn decimal_json(text: &str) -> Option<Value> {
+    let significant = text.chars().filter(char::is_ascii_digit).skip_while(|c| *c == '0').count();
+    if significant > 15 {
+        return None;
+    }
+    serde_json::from_str(text).ok()
 }
 
 /// A partition column's values as text, as Delta's log and Hive's folders spell them.
@@ -588,7 +599,7 @@ fn murmur3(data: &[u8]) -> u32 {
 }
 
 /// A bound in Iceberg's single-value form (hex, as `avro.rs` writes bytes), or None.
-fn bound_bytes(v: &ScalarValue) -> Option<String> {
+pub(crate) fn bound_bytes(v: &ScalarValue) -> Option<String> {
     let b = match v {
         ScalarValue::Int32(Some(x)) | ScalarValue::Date32(Some(x)) => x.to_le_bytes().to_vec(),
         ScalarValue::Int64(Some(x)) | ScalarValue::TimestampMicrosecond(Some(x), _) => x.to_le_bytes().to_vec(),

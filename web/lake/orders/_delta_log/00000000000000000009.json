@@ -1,0 +1,9 @@
+{"remove":{"path":"10eb524c-5174-42ee-b0bd-08bb743b9316.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"211731aa-f9c8-4c7e-92ed-a2d20ca1f068.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"306c6095-fe8d-4b64-b6ed-deab59bbf576.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"32bcf70e-c8f6-496f-9706-01fed9e9c5fc.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"463fb879-c9ef-4e54-98db-fefe96ab6fd0.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"4951bc6f-8fdc-4dea-90a6-5e8fe3b764b4.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"a9f2cdd7-ec57-4c69-a8c9-0eaff0ab8802.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"remove":{"path":"c49cef7b-4c27-41db-ae40-7378506025d8.parquet","deletionTimestamp":1792803224380,"dataChange":false}}
+{"add":{"path":"b07e1cc6-4abd-48f6-85e8-77adb38d5806.parquet","partitionValues":{},"size":2402,"modificationTime":1792803224380,"dataChange":false,"stats":"{\"numRecords\":41,\"minValues\":{\"id\":1,\"name\":\"item-1\",\"qty\":10},\"maxValues\":{\"id\":41,\"name\":\"item-9\",\"qty\":410},\"nullCount\":{\"id\":0,\"name\":0,\"qty\":0},\"tightBounds\":true}"}}
