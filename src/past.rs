@@ -35,7 +35,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
     let spec = Spec::of(name)?;
     let t = &spec.table;
-    let meta: TableMeta = lake.cat.get(&table_key(t)).await?.ok_or_else(|| anyhow!("no table {t}"))?;
+    let meta = lake.cat.meta(&table_key(t)).await?.ok_or_else(|| anyhow!("no table {t}"))?;
     ensure!(meta.key.is_empty(), "{t} AT (…): a keyed table keeps only each key's newest version, so only append tables are read as they were");
     ensure!(meta.history.is_none(), "{t} AT (…): a history view keeps every version already (__start_at, __end_at)");
     let at = when(lake, &spec).await?;
@@ -68,7 +68,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     let mut out = rows.filter(made)?.select(shown(system()))?;
     let deleted = crate::sys::deleted(t);
     let dmeta = match meta.changed {
-        true => lake.cat.get::<TableMeta>(&table_key(&deleted)).await?,
+        true => lake.cat.meta(&table_key(&deleted)).await?,
         false => None,
     };
     if let Some(dmeta) = dmeta {

@@ -589,7 +589,7 @@ impl Backend {
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
-        let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.logical();
+        let meta = self.app.lake.cat.meta(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.logical();
         // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
         crate::auth::check_changes(&table, !meta.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
         let n = if c.columns.is_empty() { meta.columns.iter().filter(|(c, _)| c != "_deleted").count() } else { c.columns.len() };
@@ -615,7 +615,7 @@ impl Backend {
         let err = |e: anyhow::Error| user_error(e);
         // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
-        let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
+        let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let table = crate::answer::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
         let uuids = meta.logical().sql_types;
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)

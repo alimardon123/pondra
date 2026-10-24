@@ -276,9 +276,9 @@ fn indexes(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                 if crate::auth::limited().is_some_and(|a| !a.may("select", &if name == here { i.table.clone() } else { format!("{name}.{}", i.table) })) {
                     continue;
                 }
-                let meta = l.cat.get::<TableMeta>(&table_key(&i.table)).await?;
+                let meta = l.cat.meta(&table_key(&i.table)).await?;
                 let lake_part = if name == here { String::new() } else { format!("{}.", ident(&name)) };
-                let def = crate::index::create_sql(&ident(crate::text::split(&k[3..]).1), &format!("{lake_part}{}", name_sql(&i.table)), &i, meta.as_ref());
+                let def = crate::index::create_sql(&ident(crate::text::split(&k[3..]).1), &format!("{lake_part}{}", name_sql(&i.table)), &i, meta.as_deref());
                 all.push(Object::new("index", &name, &k[3..], Some(def)));
             }
         }
@@ -657,7 +657,7 @@ async fn share_sql(lake: &Lake, name: &str, s: &crate::shares::Share) -> Result<
     for t in &s.tables {
         let mut add = format!("ALTER SHARE {} ADD TABLE {}", ident(name), name_sql(&t.table));
         if !t.partitions.is_empty() {
-            let column = lake.cat.get::<TableMeta>(&table_key(&t.table)).await?.and_then(|m| m.logical().partition).unwrap_or_default();
+            let column = lake.cat.meta(&table_key(&t.table)).await?.and_then(|m| m.logical().partition).unwrap_or_default();
             add += &format!(" PARTITION {}", t.partitions.iter().map(|v| format!("({} = {})", ident(&column), literal(v))).collect::<Vec<_>>().join(", "));
         }
         if (t.schema.as_str(), t.name.as_str()) != split(&t.table) {
@@ -1056,7 +1056,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         script.push(format!("COMMENT ON {word} {named} IS {}", literal(c)));
     }
     if o.family() == "relation" && o.lake == here {
-        let meta = lake.cat.get::<TableMeta>(&table_key(&o.local())).await?;
+        let meta = lake.cat.meta(&table_key(&o.local())).await?;
         let view = match meta {
             None => view_columns(lake, &o.local()).await?,
             Some(_) => None,

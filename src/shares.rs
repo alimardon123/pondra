@@ -402,7 +402,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
 async fn shareable(lake: &Lake, table: &str) -> Result<(String, TableMeta)> {
     let t = crate::ddl::local(lake, table).with_context(|| format!("{table}: a table of this lake (an attached lake's tables are shared by that lake)"))?;
     ensure!(!crate::sys::hidden(&t), "{table} is Pondra's own");
-    let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&t)).await? else {
+    let Some(meta) = lake.cat.meta(&table_key(&t)).await? else {
         bail!("no table {table} (a share hands out files: a view is shared as a materialized view of it, CREATE MATERIALIZED VIEW … AS …)");
     };
     ensure!(meta.ext.is_none() && meta.shares.is_empty(), "{table} is a clone, whose files are partly another table's: share the table it was cloned from, or a copy (CREATE TABLE … AS SELECT * FROM {table})");
@@ -410,7 +410,7 @@ async fn shareable(lake: &Lake, table: &str) -> Result<(String, TableMeta)> {
         bail!("{table} can't be shared: a share hands out its Delta log, and {why}"); // (one check: `delta::refused`)
     }
     ensure!(meta.merge.is_empty() && meta.order.is_none(), "{table}'s rows combine as they are read (merge, order_by), which files can't carry: share a materialized view of it");
-    Ok((t, meta))
+    Ok((t, Arc::unwrap_or_clone(meta)))
 }
 
 /// `PARTITION (col = 'v'), …`: values of the table's own `partition_by` column, whose files each

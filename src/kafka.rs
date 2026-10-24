@@ -368,7 +368,7 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
     let mut topics: Vec<(String, Vec<(i32, BoxFuture<'static, Outcome>)>)> = vec![];
     for _ in 0..r.len()? {
         let name = r.str()?;
-        let meta: Option<TableMeta> = app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
+        let meta: Option<TableMeta> = app.lake.cat.meta(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
         let allowed = who.role >= Role::Write && crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_rows(&crate::auth::catalog_name(&name))).is_ok(); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
@@ -697,7 +697,7 @@ async fn list_offsets(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     w.put_i32(n as i32);
     for _ in 0..n {
         let name = r.str()?;
-        let exists = app.lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some();
+        let exists = app.lake.cat.meta(&table_key(&name)).await?.is_some();
         put_str(&mut w, &name);
         let parts = r.len()?;
         w.put_i32(parts as i32);
@@ -802,7 +802,7 @@ async fn fetch(app: &App, ver: i16, req: FetchReq, who: &crate::auth::Principal)
         let (visible, first) = (app.lake.visible(), first_segment(app).await?);
         let (mut answers, mut budget, mut any) = (vec![], req.max_bytes, false);
         for (name, parts) in &req.topics {
-            let meta: Option<TableMeta> = app.lake.cat.get(&table_key(name)).await?;
+            let meta = app.lake.cat.meta(&table_key(name)).await?;
             let mut out = vec![];
             for &(index, offset, limit) in parts {
                 // An offset before the oldest segment still kept reads from that one: its rows went
@@ -1432,7 +1432,7 @@ async fn offset_commit(app: &App, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     w.put_i32(topics as i32);
     for _ in 0..topics {
         let name = r.str()?;
-        let meta: Option<TableMeta> = app.lake.cat.get(&table_key(&name)).await?;
+        let meta = app.lake.cat.meta(&table_key(&name)).await?;
         put_str(&mut w, &name);
         let parts = r.len()?;
         w.put_i32(parts as i32);

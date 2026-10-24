@@ -1,6 +1,6 @@
 # ADR-031: Extensions: `INSTALL` and `LOAD`, as WebAssembly components
 
-**Date:** 2026-09-29 · **Status:** proposed (the owner's request; the round is the owner's choice) · **Builds on:** ADR-013 (functions over Arrow Flight), ADR-026 (connectors in the binary), ADR-027 (functions and procedures in SQL and Python)
+**Date:** 2026-09-29 · **Status:** replaced by ADR-075 (2026-10-24), which keeps its WebAssembly components and grants (the owner's request; the round is the owner's choice) · **Builds on:** ADR-013 (functions over Arrow Flight), ADR-026 (connectors in the binary), ADR-027 (functions and procedures in SQL and Python)
 
 ## Context
 

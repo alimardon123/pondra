@@ -24,8 +24,9 @@ pub const NO_SESSION: &str = "a setting or a prepared statement is a session's: 
 /// Is this one of the statements kept here? (`USE`, too: the session's search path, `path.rs`.)
 pub fn is(sql: &str) -> bool {
     let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
-    matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
-        && crate::runs::execute_of(sql).is_none() // (EXECUTE TASK: the leader's)
+    (matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
+        && crate::runs::execute_of(sql).is_none()) // (EXECUTE TASK: the leader's)
+        || crate::extension::statement(sql).is_some() // (DuckDB's INSTALL, FORCE INSTALL and LOAD: `extension.rs`)
 }
 
 /// What Postgres's tools send that has nothing to do here (dbt and BI tools send both): `ANALYZE
@@ -62,6 +63,11 @@ pub enum Done {
 
 /// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session.
 pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
+    if let Some(said) = crate::extension::statement(sql) {
+        let said = said?; // (DuckDB's INSTALL and LOAD: no session needed; the notice goes to the client as the others do)
+        crate::routines::heard(&said.notice);
+        return Ok(Done::Said(said.tag));
+    }
     if let Some(done) = current(lake, sql).await? {
         return Ok(done);
     }

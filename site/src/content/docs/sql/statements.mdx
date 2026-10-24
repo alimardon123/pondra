@@ -634,7 +634,7 @@ A script's blocks, branches, loops, handlers and parallel statements are explain
 |---|---|
 | Create a schema | `CREATE SCHEMA [IF NOT EXISTS] s [AUTHORIZATION user]`: the `AUTHORIZATION` owner is accepted and not kept |
 | Drop a schema | `DROP SCHEMA [IF EXISTS] s [CASCADE]` |
-| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all |
+| Make a new lake | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir']`: a lake beside this one, attached. On a [folder of lakes](/pondra/guides/server/) it makes a new served database, and `DROP DATABASE name` drops one, folder and all. A name starting with `_` is refused (42602): the server keeps those for its own folder, `_pondra` |
 | Branch a database | `CREATE DATABASE [IF NOT EXISTS] name [LOCATION 'dir'] CLONE base [WITH (schemas = (s, …))] [WITH NO DATA]`: a whole database as `base` is now, no data file copied ([branches](/pondra/guides/environments/)) |
 | Bring a branch's tables up to date | `ALTER DATABASE name REFRESH [t, …]`: those tables (a materialized view: the tables it reads; none named: every table the branch took from its base), and the views that follow them, as the base has them now, in one commit |
 | Protect a database | `ALTER DATABASE name SET (protected = true \| false)`: while protected, a project's objects change only by an apply; lifting it is an admin's and audited ([protected production](/pondra/guides/projects/#protected-production)) |
@@ -1048,6 +1048,7 @@ text is the node's own, it is shown in code:
 | `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused: `a table's options go in WITH (name = value, …)` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/sql/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
+| `INSTALL x`, `LOAD x` of a DuckDB extension Pondra doesn't have built in, such as `INSTALL spatial` | refused, SQLSTATE `0A000`, naming it; the built-in names are listed in [SQL in Pondra](/pondra/sql/) |
 | `CREATE EXTERNAL TABLE … STORED AS AVRO` | refused: `Pondra reads Parquet, CSV, JSON (a value a line) and Arrow` |
 | `CREATE TABLE t` when `t` is there | refused (`42P07`); say `IF NOT EXISTS` or `OR REPLACE` |
 | `SET datafusion.runtime.…` | refused: the node's memory and caches are set as it starts, with `--memory-gb` |

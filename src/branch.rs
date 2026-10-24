@@ -195,7 +195,7 @@ pub async fn load(lake: &Lake) -> Result<()> {
 
 /// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock).
 pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf) -> Result<Value> {
-    crate::ddl::check(name)?;
+    crate::ddl::database_name(name)?;
     let (base, inherited) = base(lake, &of.from).await?;
     let away = crate::store::reach_of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;

@@ -334,7 +334,7 @@ async fn changes(app: &App, table: &str, after: Option<u64>) -> Result<Value> {
     if !prefix.is_empty() {
         crate::users::across(&lake, prefix.trim_end_matches('.')).await?; // (an attached lake that signs in on its own: its own sign-in, as queries use)
     }
-    if lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await?.is_none() {
+    if lake.cat.meta(&crate::store::table_key(&name)).await?.is_none() {
         return Err(crate::codes::coded("42P01", format!("no table {table}")));
     }
     let now = lake.visible();
