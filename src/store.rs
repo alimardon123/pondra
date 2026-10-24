@@ -414,7 +414,7 @@ pub fn table_key(t: &str) -> String { format!("t/{t}") }
 
 /// The folder table `t`'s files are in, under `data/` (its name, unless it was renamed).
 pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
-    Ok(lake.cat.get::<TableMeta>(&table_key(t)).await?.and_then(|m| m.folder).unwrap_or_else(|| t.to_string()))
+    Ok(lake.cat.meta(&table_key(t)).await?.and_then(|m| m.folder.clone()).unwrap_or_else(|| t.to_string()))
 }
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
@@ -1505,9 +1505,7 @@ impl Lake {
             }
         }
         let rows: Rows = Arc::new(rows);
-        #[derive(Deserialize)]
-        struct Tiered { tiered: u64 }
-        let tiered = self.cat.get::<Tiered>(&table_key(table)).await?.map_or(0, |t| t.tiered);
+        let tiered = self.cat.meta(&table_key(table)).await?.map_or(0, |t| t.tiered);
         let mut c = self.tail.lock().unwrap();
         c.forget(table, tiered);
         if n > tiered {
@@ -1520,7 +1518,7 @@ impl Lake {
     /// they were then, with their system columns (stored names), from the `from`-th on and `rows`
     /// of them at most; `removed`: the rows of the files it took out.
     pub async fn filed_rows(&self, seg: &Segment, table: &str, removed: bool, from: u64, rows: u64) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
         let schema = crate::answer::schema(&meta.columns)?;
         let (ctx, end, mut at, mut out) = (self.session(), from.saturating_add(rows), 0u64, vec![]);
@@ -1540,7 +1538,7 @@ impl Lake {
     /// Rows of `table` a file commit deleted by position (`Filed::deleted`), with their system
     /// columns (stored names): each file's rows at the places its new deletes name.
     pub async fn deleted_rows(&self, seg: &Segment, table: &str) -> Result<Vec<RecordBatch>> {
-        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.get::<TableMeta>(&table_key(table)).await?) else { return Ok(vec![]) };
+        let (Some(filed), Some(meta)) = (seg.files.get(table), self.cat.meta(&table_key(table)).await?) else { return Ok(vec![]) };
         let meta = crate::sys::with_sys(&meta);
         let schema = crate::answer::schema(&meta.columns)?;
         let mut out = vec![];
@@ -1556,6 +1554,50 @@ impl Lake {
         }
         self.store.delete(&Path::from(path)).await.ok();
     }
+}
+
+/// Tables' entries as parsed (`Catalog::parsed`), by key, each with the raw bytes it was parsed from.
+/// Bounded by count and by those bytes: an entry of 128 files' statistics is large, and every query fills
+/// the cache, so the least recently used go first.
+struct Parsed {
+    by_key: lru::LruCache<String, (Bytes, Arc<TableMeta>)>, // (unbounded: `put` trims it)
+    bytes: usize,                                           // the raw bytes the entries hold
+}
+
+const PARSED_COUNT: usize = 256;
+const PARSED_BYTES: usize = 16 << 20;
+
+impl Parsed {
+    fn new() -> Self { Parsed { by_key: lru::LruCache::unbounded(), bytes: 0 } }
+
+    /// The entry parsed from these bytes, if it was parsed from bytes that are these.
+    fn get(&mut self, key: &str, raw: &Bytes) -> Option<Arc<TableMeta>> {
+        let (held, m) = self.by_key.get(key)?;
+        same_bytes(held, raw).then(|| m.clone())
+    }
+
+    /// Keeps `m`, parsed from `raw`, unless `raw` alone is larger than the byte bound.
+    fn put(&mut self, key: &str, raw: &Bytes, m: &Arc<TableMeta>) {
+        if let Some((old, _)) = self.by_key.pop(key) {
+            self.bytes -= old.len();
+        }
+        if raw.len() > PARSED_BYTES {
+            return;
+        }
+        self.by_key.put(key.to_string(), (raw.clone(), m.clone()));
+        self.bytes += raw.len();
+        while self.by_key.len() > PARSED_COUNT || self.bytes > PARSED_BYTES {
+            let Some((_, (old, _))) = self.by_key.pop_lru() else { break };
+            self.bytes -= old.len();
+        }
+    }
+}
+
+/// Whether two buffers hold the same bytes. A buffer held by `Parsed` is never freed, and `Bytes` never
+/// change, so the same start and length is the same content; any other pair is compared, which is cheap
+/// next to a parse.
+fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
 
 /// The catalog is a SlateDB key-value store inside the lake.
@@ -1589,7 +1631,7 @@ pub struct Catalog {
     upkeep: Option<Upkeep>,       // leader: the catalog's compactor and collector, stopped by `close`
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
-    metas: Mutex<lru::LruCache<String, (u64, Arc<TableMeta>)>>, // tables' entries as parsed, by the commit that wrote them (`meta`)
+    metas: Mutex<Parsed>,         // tables' entries as parsed (`parsed`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
     flush_now: bool,              // a local lake's writer: each write's WAL flushed at once (`write`)
@@ -1978,7 +2020,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("nonzero"))), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
+        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(Parsed::new()), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -2199,24 +2241,26 @@ impl Catalog {
         self.get_raw(key).await?.map(|v| serde_json::from_slice(&v).context(key.to_string())).transpose()
     }
 
-    /// A table's entry (`t/…`), parsed once for each write of it where the catalog is in memory
-    /// (the leader's always is): every append and every flush reads its table's, and parsing an
-    /// entry of 128 files' statistics each time was most of a small commit's allocations. Elsewhere,
-    /// read and parsed as `get` does.
+    /// A table's entry (`t/…`) as parsed, for a read that runs per query or request: see `parsed`.
     pub async fn meta(&self, key: &str) -> Result<Option<Arc<TableMeta>>> {
-        let held = if self.mirror.load(Relaxed) { self.overlay.lock().unwrap().get(key).cloned() } else { None };
-        let Some((at, raw)) = held else {
-            return Ok(self.get::<TableMeta>(key).await?.map(Arc::new));
+        let raw = if self.mirror.load(Relaxed) {
+            self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()) // (the overlay holds the whole catalog)
+        } else {
+            self.get_raw(key).await?
         };
-        let Some(raw) = raw else { return Ok(None) };
-        if let Some((seen, m)) = self.metas.lock().unwrap().get(key) {
-            if *seen == at {
-                return Ok(Some(m.clone()));
-            }
+        raw.map(|raw| self.parsed(key, &raw)).transpose()
+    }
+
+    /// The table entry `raw` (read for `key`) as parsed: the copy kept from the last parse when these
+    /// are the bytes it was parsed from, else a new parse, which is kept. An entry of 128 files'
+    /// statistics is large, and every query reads the entries of the tables it names.
+    pub fn parsed(&self, key: &str, raw: &Bytes) -> Result<Arc<TableMeta>> {
+        if let Some(m) = self.metas.lock().unwrap().get(key, raw) {
+            return Ok(m);
         }
-        let m = Arc::new(serde_json::from_slice::<TableMeta>(&raw).context(key.to_string())?);
-        self.metas.lock().unwrap().put(key.to_string(), (at, m.clone()));
-        Ok(Some(m))
+        let m = Arc::new(serde_json::from_slice::<TableMeta>(raw).context(key.to_string())?);
+        self.metas.lock().unwrap().put(key, raw, &m);
+        Ok(m)
     }
 
     /// `key` from this node's own view of the bucket, past the mirror: for what a follower needs
@@ -2528,6 +2572,42 @@ mod tests {
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A table entry is parsed once for its bytes: the same bytes (in the same buffer or another) give the
+    /// same parse, changed bytes a new one, and what is kept stays under its count and byte bounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
+        let raw = entry("x")?;
+        let first = cat.parsed("t/a", &raw)?;
+        assert!(Arc::ptr_eq(&first, &cat.parsed("t/a", &raw)?), "the same bytes: the same parse");
+        assert!(Arc::ptr_eq(&first, &cat.parsed("t/a", &Bytes::copy_from_slice(&raw))?), "equal bytes in another buffer: no parse");
+        let second = cat.parsed("t/a", &entry("y")?)?;
+        assert!(!Arc::ptr_eq(&first, &second) && second.folder.as_deref() == Some("y"), "changed bytes: a new parse");
+        assert!(cat.parsed("t/a", &Bytes::from_static(b"not an entry")).is_err(), "bytes that aren't an entry are an error");
+        // Entries of 1 MiB: 16 MiB of raw bytes stay at most, the least recently used out first; one of
+        // more than 16 MiB is parsed for its caller and not kept.
+        let big = |n: usize| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(format!("{n}{}", "f".repeat(1 << 20))), ..Default::default() })?)) };
+        for n in 0..40 {
+            cat.parsed(&format!("t/big{n}"), &big(n)?)?;
+        }
+        let kept = |cat: &Catalog, key: &str| cat.metas.lock().unwrap().by_key.contains(key);
+        assert!(cat.metas.lock().unwrap().bytes <= PARSED_BYTES, "the raw bytes kept are within the bound");
+        assert!(kept(&cat, "t/big39") && !kept(&cat, "t/big0"), "the least recently used went first");
+        let before = cat.metas.lock().unwrap().bytes;
+        cat.parsed("t/huge", &Bytes::from(serde_json::to_vec(&TableMeta { folder: Some("h".repeat(PARSED_BYTES + 1)), ..Default::default() })?))?;
+        assert!(!kept(&cat, "t/huge") && cat.metas.lock().unwrap().bytes == before, "an entry over the bound is not kept");
+        for n in 0..300 {
+            cat.parsed(&format!("t/small{n}"), &entry(&n.to_string())?)?;
+        }
+        assert!(cat.metas.lock().unwrap().by_key.len() <= PARSED_COUNT, "the count bound holds");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

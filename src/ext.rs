@@ -236,7 +236,7 @@ pub fn local(table: &str) -> bool { spec(table).is_some_and(|s| s.format == "sha
 /// A table by name: this lake's, or the files an `ext:` name reads (checked: see `check`).
 pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
     if !is(table) {
-        return lake.cat.get::<TableMeta>(&crate::store::table_key(table)).await;
+        return lake.cat.meta(&crate::store::table_key(table)).await.map(|m| m.map(Arc::unwrap_or_clone));
     }
     let spec = spec(table).context("not a table of files")?;
     check(lake, &spec).await?;

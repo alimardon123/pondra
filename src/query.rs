@@ -85,7 +85,7 @@ fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
 /// With `ord`, each row gets `_ord` (`log::ord`: its segment, then its position), so later versions sort last.
 pub async fn tail(lake: &Lake, table: &str, after: u64, upto: Option<u64>, ord: bool) -> Result<Vec<RecordBatch>> {
     let rows = tail_of(lake, table, after, upto, ord, false, true).await?;
-    match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+    match lake.cat.meta(&table_key(table)).await? {
         Some(m) if m.mapped() => rows.iter().map(|b| m.to_logical(b)).collect(),
         _ => Ok(rows),
     }
@@ -120,7 +120,7 @@ async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, 
         anyhow::Ok(rows)
     }).collect();
     let fetched: Vec<Vec<(RecordBatch, bool)>> = futures::stream::iter(fetches).buffered(32).try_collect().await?;
-    let target = match lake.cat.get::<TableMeta>(&table_key(table)).await? {
+    let target = match lake.cat.meta(&table_key(table)).await? {
         Some(m) if sys => Some(schema(&crate::sys::with_sys(&m).columns)?),
         Some(m) => Some(schema(&m.columns)?),
         None => None,
@@ -295,7 +295,7 @@ async fn dead(lake: &Lake, ctx: &SessionContext, name: &str, meta: &TableMeta, a
     use crate::text::{ROW_ID, VERSION};
     use datafusion::arrow::array::AsArray;
     let deleted = crate::sys::deleted(name);
-    let Some(dmeta) = lake.cat.get::<TableMeta>(&table_key(&deleted)).await? else { return Ok(vec![]) };
+    let Some(dmeta) = lake.cat.meta(&table_key(&deleted)).await? else { return Ok(vec![]) };
     let within = col(VERSION).gt(lit(meta.purged() as i64)).and(col(VERSION).lt_eq(lit(at.unwrap_or(u64::MAX >> 1) as i64)));
     let dmeta = with_sys(&dmeta);
     let files = crate::manifest::pruned(lake, &dmeta, None, &[within.clone()], &schema(&dmeta.columns)?).await?;
@@ -1145,7 +1145,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    let sys = |m: TableMeta| if crate::sys::mentioned(&text) { crate::sys::with_sys(&m) } else { m }; // (named: the tables get their system columns)
+    let sys = |m: &TableMeta| -> TableMeta { if crate::sys::mentioned(&text) { crate::sys::with_sys(m) } else { m.clone() } }; // (named: the tables get their system columns)
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
         default.register_schema(&s, Arc::new(MemorySchemaProvider::new()))?;
@@ -1158,9 +1158,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
         let staged = crate::sys::staged_for(name).is_some() && text.contains(&format!("\"{name}\""));
         if name != except && (staged || !crate::sys::hidden(name) && (listing || mentions(&text, name))) {
-            let meta: TableMeta = serde_json::from_slice(&raw)?; // (only the tables it names: decoding every one was half of a small query's time)
+            let meta = lake.cat.parsed(&key, &raw)?; // (only the tables it names: decoding every one was half of a small query's time)
             let touched = crate::txn::touched(name);
-            let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(meta.clone()) }, upto).await?;
+            let view = table_view(lake, &ctx, name, &if touched { crate::sys::with_sys(&meta) } else { sys(&meta) }, upto).await?;
             let mut t = named(&ctx, view, &meta, names_deleted(&text))?;
             if touched {
                 t = crate::txn::overlaid(&ctx, name, &meta.logical().key, t, crate::sys::mentioned(&text))?;
@@ -1212,8 +1212,8 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if crate::sys::hidden(name) || !(listing || mentions(&text, name)) {
                 continue;
             }
-            let meta: TableMeta = serde_json::from_slice(&raw)?;
-            let view = named(&ctx, table_view(&other, &ctx, name, &sys(meta.clone()), upto).await?, &meta, names_deleted(&text))?;
+            let meta = other.cat.parsed(&key, &raw)?;
+            let view = named(&ctx, table_view(&other, &ctx, name, &sys(&meta), upto).await?, &meta, names_deleted(&text))?;
             let Some(view) = across(&format!("{ns}.{name}"), view, listing, &locked) else { continue };
             let (s, t) = split(name);
             if old && s == PUBLIC {
@@ -1230,23 +1230,23 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?).chain(crate::copy::tables(lake, &text).await?) {
             system.register_table(name.into(), table)?;
         }
-        let runs = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::runs::TABLE)).await? {
-            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+        let runs = match lake.cat.meta(&crate::store::table_key(crate::runs::TABLE)).await? {
+            Some(meta) => named(&ctx, table_view(lake, &ctx, crate::runs::TABLE, &sys(&meta), upto).await?, &meta, false)?,
             None => crate::runs::no_runs()?,
         };
         system.register_table("runs".into(), runs)?;
         if crate::audit::check(&text)? {
             // (a superuser's only: `audit.rs`)
-            let audit = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::audit::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+            let audit = match lake.cat.meta(&crate::store::table_key(crate::audit::TABLE)).await? {
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::audit::TABLE, &sys(&meta), upto).await?, &meta, false)?,
                 None => crate::audit::empty()?,
             };
             system.register_table("audit".into(), audit)?;
         }
         if text.to_lowercase().contains("pondra.history") || text.to_lowercase().contains("pondra.learned") {
             // (every statement's row: an admin's all, anyone else's their own: `history.rs`; what they learned, `learned.rs`)
-            let history = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::history::TABLE)).await? {
-                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &sys(meta.clone()), upto).await?, &meta, false)?,
+            let history = match lake.cat.meta(&crate::store::table_key(crate::history::TABLE)).await? {
+                Some(meta) => named(&ctx, table_view(lake, &ctx, crate::history::TABLE, &sys(&meta), upto).await?, &meta, false)?,
                 None => crate::history::empty()?,
             };
             let history = crate::history::visible(&ctx, history)?;
@@ -1257,7 +1257,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
         if text.to_lowercase().contains("pondra.flows") || text.to_lowercase().contains("pondra.expectations") {
             // (a materialized view's flow and its expectations: `views::system`)
-            let counts = match lake.cat.get::<TableMeta>(&crate::store::table_key(crate::views::EXPECTED)).await? {
+            let counts = match lake.cat.meta(&crate::store::table_key(crate::views::EXPECTED)).await? {
                 Some(meta) => ctx.read_table(table_view(lake, &ctx, crate::views::EXPECTED, &meta, upto).await?)?.collect().await?,
                 None => vec![],
             };

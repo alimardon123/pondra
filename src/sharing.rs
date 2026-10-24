@@ -176,7 +176,7 @@ async fn all_tables(State(app): State<App>, c: Caller, Path(share): Path<String>
 /// The table's folder and its Delta log at a version (the newest if none).
 async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, Arc<Log>), Fail> {
     let lake = &app.lake;
-    let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone from the lake", t.schema, t.name)))?;
+    let meta = lake.cat.meta(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone from the lake", t.schema, t.name)))?;
     let folder = format!("data/{}", meta.folder(&t.table));
     let root = format!("{}/{folder}", lake.url.trim_end_matches('/'));
     let log = crate::read_delta::replay(lake, &root, version).await.map_err(|e| match version {
@@ -188,7 +188,7 @@ async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, 
 
 /// The versions of a table's log and when each was written (ms), oldest first.
 async fn times(app: &App, t: &Shared) -> Result<Vec<(i64, u64)>, Fail> {
-    let meta = app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone", t.schema, t.name)))?;
+    let meta = app.lake.cat.meta(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone", t.schema, t.name)))?;
     let dir = format!("data/{}/_delta_log/", meta.folder(&t.table));
     let listed: Vec<_> = futures::TryStreamExt::try_collect(app.lake.store.list(Some(&object_store::path::Path::from(dir)))).await.map_err(|e| internal(e.into()))?;
     let mut out: Vec<(i64, u64)> = listed.iter().filter_map(|o| {
@@ -352,7 +352,7 @@ async fn files(app: &App, c: &Caller, t: &Shared, folder: &str, log: &Log, delta
 
 /// Every file of the table (current, and replaced but kept), by key, with its partition value.
 async fn partitions(app: &App, t: &Shared) -> anyhow::Result<HashMap<String, String>> {
-    let meta = app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&t.table)).await?.unwrap_or_default();
+    let meta = app.lake.cat.meta(&crate::store::table_key(&t.table)).await?.unwrap_or_default();
     let mut all: Vec<crate::store::DataFile> = meta.files.iter().chain(&meta.replaced).cloned().collect();
     for m in crate::manifest::list(&app.lake, &meta).await? {
         all.extend(crate::manifest::files(&app.lake, &m).await?);
