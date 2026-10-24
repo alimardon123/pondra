@@ -39,6 +39,21 @@ pub fn words(e: &anyhow::Error) -> String {
     crate::ext_names::readable(&SPILL_SAYS.iter().fold(out, |out, (from, to)| out.replace(from, to))) // (DataFusion's words for spilling, in the setting Pondra asks for; files as SQL named them)
 }
 
+/// An error in words for whoever sent the statement (`words`), a Python routine's quoted lines cut when the caller
+/// may not see its code (S27: `unquoted`).
+pub fn told(e: &anyhow::Error, shows_code: bool) -> String {
+    match shows_code {
+        true => words(e),
+        false => unquoted(&words(e)),
+    }
+}
+
+/// An error as every door answers it: the HTTP status its SQLSTATE takes, the SQLSTATE, and its words (`told`).
+pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String) {
+    let code = of(e);
+    (http(code), code, told(e, shows_code))
+}
+
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
 /// refuses, invariant 188). The first words stay, so `codes::of` still reads them.
@@ -271,5 +286,24 @@ mod tests {
         let said = "ZeroDivisionError: division by zero\n  line 2: total = secret_rate / 0\n  line 5: return helper(x)";
         assert_eq!(super::unquoted(said), "ZeroDivisionError: division by zero\n  line 2\n  line 5");
         assert_eq!(super::unquoted("ValueError: a line: with a colon"), "ValueError: a line: with a colon");
+    }
+
+    #[test]
+    fn answer_gives_the_status_the_code_and_the_words_together() {
+        assert_eq!(super::answer(&super::coded("23505", "x"), true), (409, "23505", "x".to_string()));
+        assert_eq!(super::answer(&super::coded("42P01", "no file here"), true), (404, "42P01", "no file here".to_string()));
+    }
+
+    #[test]
+    fn told_cuts_a_quoted_line_only_for_a_caller_not_shown_the_code() {
+        let e = anyhow::anyhow!("ZeroDivisionError: division by zero\n  line 2: total = rate / 0");
+        assert_eq!(super::told(&e, true), "ZeroDivisionError: division by zero\n  line 2: total = rate / 0");
+        assert_eq!(super::told(&e, false), "ZeroDivisionError: division by zero\n  line 2");
+    }
+
+    #[test]
+    fn a_quoted_line_never_picks_the_code() {
+        let e = anyhow::anyhow!("ValueError: bad row\n  line 3: raise ValueError('duplicate key value violates unique constraint')");
+        assert_eq!(super::of(&e), "XX000");
     }
 }

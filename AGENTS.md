@@ -2442,7 +2442,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    remembered answer. `harness.py find`: "a user granted one table…", "a user granted some columns…",
    "never a remembered answer…".
 346. **A measure is worked out at the query's own grain, from the view's base rows, never from its default
-   form's** (`measures::rewrite_with`, first in `routines::expand_with`'s tree stage): a query naming a measure
+   form's** (`measures::rewrite_with`, first in `front::expand`'s tree stage): a query naming a measure
    reads the view's FROM and WHERE with the dimensions it uses and each column its measures read, and each
    measure is its expression over those, grouped by the query's GROUP BY; the base is then written in place
    (`measures::flattened`) unless that could change a name's meaning. Everything after it sees a plain
@@ -2751,9 +2751,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `ask_oauth` and `oauth_step`, `sso::oauth_for`, ADR-074 §4a). With `POSTGRES 'oauth'`, the Postgres
    port asks a user with no password for `OAUTHBEARER` (RFC 7628), then `SCRAM-SHA-256` only so that an
    older client, which takes it, is refused naming the way out (psql 18 with the issuer, or `POSTGRES
-   'password'`): such a user has no password, so SCRAM never signs it in. This happens when the first
-   provider by name that says so would sign that user in: a user made here, or any name for a `USERS
-   'any'` provider.
+   'password'`): such a user has no password, so SCRAM never signs it in. It is asked so through the first
+   provider by name that says so, and a name no user has is asked the same way (through a `USERS 'any'`
+   provider first), so what the port offers never says whether a user of that name is here.
    - With no token, the client is told the provider's discovery document and scopes, then refused 28000.
    - A token is checked as every token is (invariants 409, 410), and the next message is
      `AuthenticationOk`, never a `SASLFinal` (libpq refuses one).

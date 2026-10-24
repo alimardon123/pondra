@@ -835,7 +835,7 @@ impl App {
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::holds_secrets() || crate::past::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -1500,9 +1500,9 @@ impl App {
     pub(crate) async fn remembers(&self, query: &str) -> Option<u64> {
         let asks = |text: &str| {
             // (AT (OFFSET => -n) is n seconds before now: a moment that moves. Expanded, a table as it was
-            // is named `"at:…"`, which holds its AT (…) as written: `past::spelled`)
+            // is named `"at:…"`, which holds its AT (…) as written: `past_names::spelled`)
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
-            let text = &format!("{text} {}", crate::past::spelled(text));
+            let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
             OFFSET.is_match(text) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         };
@@ -1787,8 +1787,7 @@ impl std::fmt::Display for E {
 }
 impl IntoResponse for E {
     fn into_response(self) -> Response {
-        let code = crate::codes::of(&self.0); // (Postgres's SQLSTATE, for any client: ADR-036 §4)
-        let (status, told) = (crate::codes::http(code), crate::ext::said(&self.0)); // (the words its caller may see)
+        let (status, code, told) = crate::codes::answer(&self.0, crate::auth::shows_code()); // (Postgres's SQLSTATE, for any client: ADR-036 §4; the words its caller may see)
         let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status, [("x-pondra-sqlstate", code)], told).into_response()
     }

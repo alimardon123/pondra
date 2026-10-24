@@ -175,7 +175,7 @@ async fn all_tables(State(app): State<App>, c: Caller, Path(share): Path<String>
 
 /// The table's folder and its Delta log at a version (the newest if none).
 async fn log_of(app: &App, t: &Shared, version: Option<i64>) -> Result<(String, Arc<Log>), Fail> {
-    let lake = &app.lake;
+    let lake: &crate::store::Lake = &app.lake; // (an `&Arc<Lake>` doesn't deref to the `&impl Reach` replay takes)
     let meta = lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&t.table)).await.map_err(internal)?.ok_or_else(|| missing(format!("{}.{} is gone from the lake", t.schema, t.name)))?;
     let folder = format!("data/{}", meta.folder(&t.table));
     let root = format!("{}/{folder}", lake.url.trim_end_matches('/'));
@@ -480,7 +480,7 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         add
     }).collect();
     lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links));
-    crate::read_delta::table(endpoint, &protocol, &metadata, adds.iter())
+    crate::read_delta::table(endpoint, &protocol, &metadata, adds.iter()).map(crate::ext::table_meta)
 }
 
 /// The files a provider links to (`share://files/<link, base64url>`): read with a GET of the link

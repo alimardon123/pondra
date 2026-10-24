@@ -392,10 +392,10 @@ pub async fn files_once(lake: &Lake, ctx: &SessionContext, files: &[&DataFile], 
         parts.push(ctx.read_parquet(own.iter().map(|f| lake.full(&f.path)).collect::<Vec<_>>(), ParquetReadOptions::default().schema(schema)).await?);
     }
     if !deleted.is_empty() {
-        parts.push(crate::scan::with_deletes(lake, ctx, &deleted, schema).await?);
+        parts.push(crate::lake_scan::with_deletes(lake, ctx, &deleted, schema).await?);
     }
     if !adopted.is_empty() {
-        parts.push(crate::scan::adopted(lake, ctx, &adopted, meta, schema).await?);
+        parts.push(crate::lake_scan::adopted(lake, ctx, &adopted, meta, schema).await?);
     }
     union_all(parts)
 }
@@ -1131,7 +1131,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         let view = table_view(lake, &ctx, &name, &meta, upto).await?;
         ctx.register_table(datafusion::common::TableReference::bare(name.clone()), named(&ctx, view, &meta, false)?)?; // (another engine's names for its columns)
     }
-    for name in crate::past::names(&text) {
+    for name in crate::past_names::names(&text) {
         let (table, t) = crate::past::table(lake, &ctx, &name, upto, crate::sys::mentioned(&text)).await?; // (`t AT (…)`: ADR-043)
         if let Some(t) = guarded(&table, t, false) {
             ctx.register_table(datafusion::common::TableReference::bare(name), t)?;

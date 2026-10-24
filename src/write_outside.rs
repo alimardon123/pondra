@@ -190,7 +190,7 @@ async fn previous_ict(lake: &Lake, root: &str, version: i64) -> Result<u64> {
     if version < 0 {
         return Ok(0);
     }
-    let body = crate::ext::get(lake, &format!("{root}/_delta_log/{version:020}.json")).await?;
+    let body = crate::reach::get(lake, &format!("{root}/_delta_log/{version:020}.json")).await?;
     let first: Value = serde_json::from_slice(body.split(|b| *b == b'\n').next().unwrap_or_default()).unwrap_or_default();
     Ok(first["commitInfo"]["inCommitTimestamp"].as_u64().unwrap_or(0))
 }
@@ -427,7 +427,7 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
         let current = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0);
         let snapshot = |id: i64| meta["snapshots"].as_array().into_iter().flatten().find(|s| s["snapshot-id"].as_i64() == Some(id)).cloned();
         let mut list = match current.and_then(snapshot).filter(|_| !replace) {
-            Some(s) => crate::avro::records(&crate::ext::get(lake, s["manifest-list"].as_str().context("a snapshot without its manifest list")?).await?)?,
+            Some(s) => crate::avro::records(&crate::reach::get(lake, s["manifest-list"].as_str().context("a snapshot without its manifest list")?).await?)?,
             None => vec![],
         };
         list.push(json!({"manifest_path": manifest_path, "manifest_length": manifest_len, "partition_spec_id": spec_id, "content": 0, "sequence_number": seq, "min_sequence_number": seq,

@@ -775,15 +775,20 @@ def drain_check(new_bin, work, port):
     checks["/healthz and /ready answer 200, without a token"] = n.plain("GET", "/healthz")[0] == 200 and n.plain("GET", "/ready")[0] == 200
     # A query that takes a few seconds here (each size its own: no remembered answer).
     long = lambda rows: f"SELECT sum(value % 7) AS s FROM range(0, {rows})"
-    rows = 20_000_000
-    for _ in range(8):
+    def timed(rows):
         t0 = time.time()
         n.q(long(rows))
-        secs = time.time() - t0
+        return time.time() - t0
+
+    rows = 20_000_000
+    for _ in range(8):
+        # (the faster of two runs: one that stalled alone sized the query too small to be running still when the
+        # node was told to stop, and the node, with nothing in flight, stopped before it was asked anything)
+        secs = min(timed(rows), timed(rows + 1))
         if secs > 2:
             break
         rows = int(rows * min(10, 3 / max(secs, 0.05)))
-    rows += 1
+    rows += 2
     info["a query of"] = {"rows": rows, "seconds": round(secs, 1)}
     got = {}
 

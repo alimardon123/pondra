@@ -4,7 +4,7 @@
 //! holds what the writer's manifest says and fits the table, and to keep its columns' ranges for
 //! skipping. The leader commits the files through the log (`file`): recorded with their lineage
 //! where they need one (a block of row ids, the commit, its time), from which reads give their
-//! rows' system columns (`scan::adopted`) until a merge writes them out; named by the commit's
+//! rows' system columns (`lake_scan::adopted`) until a merge writes them out; named by the commit's
 //! segment, for the log's readers; and followed by the table's views in the same commit.
 use crate::store::{json, table_key, DataFile, Lake, Lineage, TableMeta};
 use anyhow::{ensure, Context, Result};
@@ -255,15 +255,15 @@ async fn rows(lake: &Lake, meta: &TableMeta, files: &[DataFile], old: bool) -> R
 /// The rows of file `f`, as it was, at the places `deletes` name (the rows they delete), as
 /// `schema`: its columns and system columns, by their stored names.
 pub async fn rows_deleted(lake: &Lake, meta: &TableMeta, f: &DataFile, deletes: &[crate::scan::Delete], schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<Vec<RecordBatch>> {
-    let mut at = crate::scan::deleted_rows(lake, &DataFile { deletes: deletes.to_vec(), ..f.clone() }).await?;
+    let mut at = crate::lake_scan::deleted_rows(lake, &DataFile { deletes: deletes.to_vec(), ..f.clone() }).await?;
     if !f.deletes.is_empty() {
-        let before: std::collections::HashSet<u64> = crate::scan::deleted_rows(lake, f).await?.into_iter().collect();
+        let before: std::collections::HashSet<u64> = crate::lake_scan::deleted_rows(lake, f).await?.into_iter().collect();
         at.retain(|p| !before.contains(p)); // (deleted already)
     }
     if at.is_empty() {
         return Ok(vec![]);
     }
-    Ok(crate::scan::file_rows(lake, &lake.session(), f, meta, schema, crate::scan::Pick::At(std::sync::Arc::new(at))).await?.collect().await?)
+    Ok(crate::lake_scan::file_rows(lake, &lake.session(), f, meta, schema, crate::lake_scan::Pick::At(std::sync::Arc::new(at))).await?.collect().await?)
 }
 
 /// A writer's change to files Pondra rewrote since it read the table (merged, or rewritten once
@@ -272,7 +272,8 @@ pub async fn rows_deleted(lake: &Lake, meta: &TableMeta, f: &DataFile, deletes: 
 /// Pondra's own upkeep then never fails another engine's commit; a row changed since does (409).
 /// The files it takes out and the positions it deletes, as the table has them now.
 async fn carry(lake: &Lake, table: &str, meta: &TableMeta, c: &FileCommit) -> Result<(Vec<String>, Vec<(String, crate::scan::Delete, u64)>)> {
-    use crate::scan::{deleted_rows, Delete};
+    use crate::lake_scan::deleted_rows;
+    use crate::scan::Delete;
     let mut live = meta.files.clone();
     for m in crate::manifest::list(lake, meta).await? {
         live.extend(crate::manifest::files(lake, &m).await?.iter().cloned());

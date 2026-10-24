@@ -8,12 +8,16 @@ marks each PR merged by itself. A red run is retried once, then the train is hal
 tested alone), so one PR can't hold the others for long. `riding` marks the PRs in the train now; only
 this script adds or removes it.
 
-  python3 tools/train.py step [--dry-run]
+  python3 tools/train.py step [--dry-run] [--wait MINUTES]
 
-Each call looks at GitHub, does the one next thing and exits, so running it twice in a row is safe.
-The workflow (.github/workflows/train.yml) runs it on a lane's label, at the end of every build run and
-every 15 minutes. --dry-run prints each write it would make (labels, comments, the PATCH, pushes,
-dispatches, reruns) and makes none. tools/train_test.py runs these rules against a fake GitHub.
+Each step looks at GitHub and does the one next thing, so running it twice in a row is safe. With --wait,
+while the train waits on its own run (not listed yet, going, its failed jobs rerun) it steps again each
+minute, so a green run lands within a minute of its end; when the minutes run out it starts train.yml once
+more to go on waiting. The workflow (.github/workflows/train.yml) runs it on a lane's label, at the end of
+every build run and every 15 minutes, but the train's own run ends without starting it (GitHub starts no
+workflow_run for a run the workflow's token began) and the schedule can lag by hours: the wait is what moves
+the train. --dry-run prints each write it would make (labels, comments, the PATCH, pushes, dispatches,
+reruns) and makes none, and steps once. tools/train_test.py runs these rules against a fake GitHub.
 """
 import argparse
 import json
@@ -30,6 +34,7 @@ WORKFLOW_NOTE = ("This pull request's workflows aren't main's (it changes one, o
                  "branched), and the workflow's token may not push a workflow: merge main into it and label it train "
                  "again, or label it ci if it changes a workflow.")
 RED = ("failure", "timed_out", "startup_failure")  # job conclusions that count against the train
+POLL = 60  # seconds between the steps of a wait
 
 
 class GitHubError(Exception):
@@ -65,6 +70,10 @@ class GitHub:
     def dispatch(self, ref, mode):
         self._gh(["workflow", "run", "build.yml", "--repo", self.repo, "--ref", ref, "-f", f"mode={mode}"])
 
+    def step_later(self):
+        """Starts train.yml on main: the next step, once this one's run ends (they take turns)."""
+        self._gh(["workflow", "run", "train.yml", "--repo", self.repo, "--ref", "main"])
+
 
 @dataclass
 class PR:
@@ -89,6 +98,11 @@ def now():
     return time.time()
 
 
+def pause(seconds):
+    """A wait's sleep, in its own function so a test can make time pass."""
+    time.sleep(seconds)
+
+
 def say(line):
     """One line of what was done: stdout, and GitHub's step summary when the workflow has one."""
     print(line, flush=True)
@@ -99,10 +113,12 @@ def say(line):
 
 
 class Train:
-    """One call of `step`. With `dry` every write is printed instead of made; the reads still happen."""
+    """One call of `step`. With `dry` every write is printed instead of made; the reads still happen. `waiting`
+    says, after it, whether the train waits on its own run (one going, rerun or just dispatched)."""
 
     def __init__(self, gh, dry=False):
         self.gh, self.dry, self.repo = gh, dry, gh.repo
+        self.waiting = False
 
     def open_prs(self):
         """Open PRs against main that may ride: no forks, no drafts."""
@@ -147,15 +163,28 @@ class Train:
 
     def train_merges(self, tip):
         """The train's merges as (PR number, PR head sha), oldest first, and the main it was cut on. Both are
-        written in the commits (Train-Head, Train-Base), so the train keeps no state of its own."""
+        written in the commits (Train-Head, Train-Base), so the train keeps no state of its own. ([], None) unless
+        the tip is exactly what a cut makes, which is what lands on main: from the base, one merge a PR, each the
+        clean merge of the commit before it and the head it names. A push to `train` from anywhere else (another
+        commit, or a merge carrying more than its PR) never lands: the train is cut again."""
         base = re.search(r"^Train-Base: ([0-9a-f]{40})$", git("log", "-1", "--format=%B", tip), re.M)
         if not base:
+            say(f"the train's tip isn't what a cut makes ({tip[:7]} names no base): cutting it again")
             return [], None
-        merges = []
-        for body in git("log", "--first-parent", "--reverse", "--format=%B%x00", f"{base[1]}..{tip}").split("\0"):
+        merges, before = [], base[1]
+        for row in git("log", "--first-parent", "--reverse", "--format=%H %T %P%x01%B%x00", f"{base[1]}..{tip}").split("\0"):
+            if not row.strip():
+                continue
+            shas, body = row.strip().split("\x01", 1)
+            sha, tree, *parents = shas.split()
             head = re.search(r"^Train-Head: (\d+) ([0-9a-f]{40})$", body, re.M)
-            if head:
-                merges.append((int(head[1]), head[2]))
+            if not head or parents != [before, head[2]] or f"Train-Base: {base[1]}" not in body \
+                    or subprocess.run(["git", "merge-tree", "--write-tree", before, head[2]],
+                                      capture_output=True, text=True).stdout.split("\n")[0] != tree:
+                say(f"the train's tip isn't what a cut makes ({sha[:7]}): cutting it again")
+                return [], None
+            merges.append((int(head[1]), head[2]))
+            before = sha
         return merges, base[1]
 
     def tip_age(self, tip):
@@ -217,6 +246,7 @@ class Train:
         prs = [by_number[n] for n, _ in merges]
         heads = dict(merges)
         run = self.train_run(tip)
+        self.waiting = True   # until the run is judged below
         if run is None:
             # A run takes up to a minute to be listed, and a dispatch can be lost: only an old tip is dispatched again.
             if self.tip_age(tip) <= 600:
@@ -225,6 +255,7 @@ class Train:
             return self.dispatch("train", "train")
         if run["status"] != "completed":
             return say("waiting: run going")
+        self.waiting = False
         if run["conclusion"] == "success":
             return self.land(prs, heads, run, tip)
         failed = self.failed_jobs(run["id"])
@@ -233,8 +264,10 @@ class Train:
         if run["run_attempt"] == 1:
             # One rerun before blaming anyone: a flaky job isn't the train's fault.
             self.write("POST", f"repos/{self.repo}/actions/runs/{run['id']}/rerun-failed-jobs")
+            self.waiting = True
             return say(f"rerun the train's failed jobs: {', '.join(failed)}")
         if set(failed) & self.main_failed():
+            # Not a wait on the train's own run: main's next run, which a merge starts, steps again when it ends.
             return say(f"waiting: main fails the same way: {', '.join(failed)}")
         if git("rev-parse", "origin/main") != base:
             # Main moved since the cut, and may carry the fix: the same riders are cut again on it before anyone is
@@ -301,6 +334,7 @@ class Train:
             return
         self.push()
         self.dispatch("train", "train")
+        self.waiting = True
         say(f"cut {' '.join(f'#{n}' for n in merged)} onto {base[:7]}")
 
     def merge(self, p, base, merged):
@@ -351,17 +385,34 @@ class Train:
                 self.write("POST", f"repos/{self.repo}/issues/{p.number}/labels", {"labels": ["riding"]})
 
 
+def conduct(gh, dry=False, minutes=0):
+    """Steps, and steps again each POLL seconds while the train waits on its own run, for up to `minutes`. When
+    they run out with the train still waiting, train.yml is started once more to go on. A dry run steps once."""
+    end = now() + minutes * 60
+    while True:
+        train = Train(gh, dry)
+        train.step()
+        if dry or not train.waiting or not minutes:
+            return
+        if now() + POLL > end:
+            say(f"waited {minutes} minutes: train.yml goes on waiting")
+            return gh.step_later()
+        pause(POLL)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="The merge train's conductor (see the module docstring).")
     ap.add_argument("command", choices=["step"])
     ap.add_argument("--dry-run", action="store_true", help="print each write instead of making it")
+    ap.add_argument("--wait", type=int, default=0, metavar="MINUTES",
+                    help="step again each minute while the train waits on its own run, for up to MINUTES")
     args = ap.parse_args(argv)
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not repo:
         print("train: GITHUB_REPOSITORY is not set (owner/name of this repository)", file=sys.stderr)
         return 1
     try:
-        Train(GitHub(repo), dry=args.dry_run).step()
+        conduct(GitHub(repo), dry=args.dry_run, minutes=args.wait)
     except (GitHubError, RuntimeError, subprocess.CalledProcessError) as e:
         print(f"train: {e}\n{getattr(e, 'stderr', '') or ''}".rstrip(), file=sys.stderr)
         return 1

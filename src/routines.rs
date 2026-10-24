@@ -224,7 +224,7 @@ fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routin
     ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
     ensure!(!rest || r.language == "sql", "a Python procedure's body is a string: LANGUAGE python AS $$ … $$");
     ensure!(procedure || r.returns.is_some() || r.language == "sql", "a Python function says what it returns: RETURNS TYPE, or RETURNS TABLE (c TYPE, …)");
-    ensure!(r.returns.as_deref().is_none_or(|t| !crate::text::loose(Some(t)) || crate::text::is_json(Some(t))), "RETURNS ANY: say the type it returns (VARIANT for any JSON value)");
+    ensure!(r.returns.as_deref().is_none_or(|t| !crate::text::loose(Some(t)) || crate::text::is_json_type(Some(t))), "RETURNS ANY: say the type it returns (VARIANT for any JSON value)");
     ensure!(!r.with.vectorized || (r.python() && r.kind == Kind::Macro), "vectorized: a Python function returning a value (not a table, or a procedure)");
     ensure!(r.python() || (r.with.packages.is_empty() && r.with.entry.is_empty()), "packages and entry: a Python routine's");
     ensure!(r.with.cache.is_none() || (r.python() && !procedure), "cache: a Python function's (a SQL function is part of its query, whose answers the result cache keeps; a procedure is called for what it does)");
@@ -293,7 +293,7 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
     }
     let short = crate::text::split(name).1;
     let state = lake.session().state();
-    let types = r.params.iter().filter_map(|p| p.ty.as_deref()).chain(r.returns.as_deref().filter(|t| !t.starts_with("TABLE"))).filter(|t| !crate::text::loose(Some(t)) || crate::text::is_json(Some(t)));
+    let types = r.params.iter().filter_map(|p| p.ty.as_deref()).chain(r.returns.as_deref().filter(|t| !t.starts_with("TABLE"))).filter(|t| !crate::text::loose(Some(t)) || crate::text::is_json_type(Some(t)));
     for t in types {
         crate::pyfn::arrow_of(t).await.with_context(|| format!("{name}: the type {t}"))?;
     }
@@ -439,7 +439,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
     if !sql.contains('$') && !getvariable || makes_code(sql) {
         return Ok(sql.to_string()); // (a task's or a routine's `$day`: its own, each time it runs)
     }
-    if let Some((head, moment)) = crate::past::restore_moment(sql) {
+    if let Some((head, moment)) = crate::past_names::restore_moment(sql) {
         // (`RESTORE TABLE t TO TIMESTAMP AS OF $before`: its moment bound as a query's column, the rest as written)
         let one = bind_as(&format!("SELECT {moment} AS __moment"), params, numbered)?;
         let moment = one.strip_prefix("SELECT ").and_then(|m| m.strip_suffix(" AS __moment")).context("a RESTORE's moment")?;
@@ -1194,7 +1194,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
     })?;
     let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
     let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
-    let json: Vec<bool> = r.params.iter().map(|p| crate::text::is_json(p.ty.as_deref())).collect();
+    let json: Vec<bool> = r.params.iter().map(|p| crate::text::is_json_type(p.ty.as_deref())).collect();
     let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});
     let limit = r.with.timeout.and_then(|s| std::time::Duration::try_from_secs_f64(s).ok());
     let kind = crate::python::Use::Procedure { nested: crate::python::holding() }; // (called by a procedure that holds a slot: it takes none)
