@@ -1009,7 +1009,6 @@ impl ObjectStore for ReadOnly {
 pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let ctx = crate::engine::session(config, rt);
     crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-    crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
     crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
     ctx
 }

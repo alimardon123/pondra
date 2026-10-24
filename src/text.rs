@@ -181,7 +181,7 @@ pub fn makes_json(sql: &str) -> bool {
 /// call and a `||` that may meet a jsonb document are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("[]") {
-        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
+        return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_text::array_literals`)
     }
     // (a set function: one in a FROM that reads a column is LATERAL's, `lateral::functions`; JSON's give a document's
     // rows, `pg_json_sets::sets`)

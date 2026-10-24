@@ -52,6 +52,10 @@ mod pg_json_edit;
 mod pg_json_sets;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_text;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
+mod pg_oids;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the visitor that rewrites a statement's casts is a node's until the front runs it)
+mod pg_casts;
 pub mod pg_bytea;
 mod optimize;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
