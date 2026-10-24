@@ -812,7 +812,13 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
-        return Ok((dir.clone(), Arc::new(Counted(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))), None));
+        // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
+        // overwrites, and a folder that refuses them never deletes those files. The soak of one local lake
+        // for 5 hours grew its catalog from 206 to 13,373 objects, and commits' p95 from 0.4 to 5.2 ms. The
+        // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
+        // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
+        // and a writer fenced by a newer one restarts (`fatal`).)
+        return Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None));
     };
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
@@ -915,6 +921,52 @@ impl object_store::MultipartUpload for CountedParts {
         self.0.complete().await
     }
     async fn abort(&mut self) -> object_store::Result<()> { self.0.abort().await }
+}
+
+/// A local folder's store. `LocalFileSystem` refuses a conditional overwrite (`PutMode::Update`), and
+/// SlateDB's collector advances its boundary files with one: from the collector's second pass on, its
+/// manifest and compactions passes failed and deleted nothing. So an `Update` here is a head and an
+/// overwrite with the e-tag checked between them (a folder's version is its e-tag alone: `version` is
+/// None there); every other call is the folder's own.
+#[derive(Debug)]
+pub(crate) struct Local(pub(crate) LocalFileSystem);
+
+/// One process's conditional updates of a folder take turns here, so a check and the overwrite after it
+/// never interleave. (Not `Lake::replace`'s `ONE`, which is held across its own put.)
+static UPDATES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+impl std::fmt::Display for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Local {
+    async fn put_opts(&self, at: &Path, body: object_store::PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
+        let PutMode::Update(version) = &opts.mode else { return self.0.put_opts(at, body, opts).await };
+        let _turn = UPDATES.lock().await;
+        let refused = |why: String| object_store::Error::Precondition { path: at.to_string(), source: why.into() };
+        let current = match self.0.head(at).await {
+            Ok(meta) => meta.e_tag,
+            Err(object_store::Error::NotFound { .. }) => return Err(refused("there is no object to update".into())),
+            Err(e) => return Err(e),
+        };
+        if current != version.e_tag {
+            return Err(refused(format!("its e-tag is {current:?}, not {:?}", version.e_tag)));
+        }
+        // (the attributes stay: LocalFileSystem refuses them by name, before it writes anything)
+        self.0.put_opts(at, body, PutOptions { mode: PutMode::Overwrite, ..opts }).await
+    }
+    async fn put_multipart_opts(&self, at: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(at, opts).await
+    }
+    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> { self.0.get_opts(at, opts).await }
+    async fn get_ranges(&self, at: &Path, ranges: &[std::ops::Range<u64>]) -> object_store::Result<Vec<bytes::Bytes>> { self.0.get_ranges(at, ranges).await }
+    fn delete_stream(&self, at: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> { self.0.delete_stream(at) }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> { self.0.list(prefix) }
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> { self.0.list_with_offset(prefix, offset) }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> { self.0.list_with_delimiter(prefix).await }
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: object_store::CopyOptions) -> object_store::Result<()> { self.0.copy_opts(from, to, opts).await }
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: object_store::RenameOptions) -> object_store::Result<()> { self.0.rename_opts(from, to, opts).await }
 }
 
 /// What a node still catching up with its leader answers (57P03: it ran nothing, ask again or
@@ -1405,7 +1457,7 @@ impl Lake {
             Ok(r) => r,
             Err(object_store::Error::Precondition { .. }) => return Err(Changed.into()),
             Err(object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. }) => {
-                self.store.put_opts(&at, bytes.into(), opts(PutMode::Overwrite)).await? // (a local disk: checked just above)
+                self.store.put_opts(&at, bytes.into(), opts(PutMode::Overwrite)).await? // (a store with no conditional put: checked just above)
             }
             Err(e) => return Err(e.into()),
         };
@@ -1920,8 +1972,9 @@ impl Catalog {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints.
         let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
-        // Every commit is a write-ahead-log object: clear those (and old manifests) every minute
-        // once a minute old, not SlateDB's every 10 minutes — thousands would sit in the bucket.
+        // Every commit is a write-ahead-log object: clear those, and the old manifests and compaction
+        // records, every minute once a minute old, not SlateDB's every 10 minutes — thousands would sit
+        // in the bucket. (On a bucket that is one more LIST a minute for the compaction records.)
         // (What a reader's checkpoint still needs stays.)
         // On a local disk, where listing costs nothing, the WAL goes every 5 s and the compactor's
         // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
@@ -1931,7 +1984,7 @@ impl Catalog {
         let gc = crate::env::parse("PONDRA_GC_SECS");
         let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
         let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
-        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
+        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compactions_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
         // (the compactor and the garbage collector start once the node serves: their first reads
         // were most of a cold start's, C5; `upkeep`)
         let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
@@ -2590,12 +2643,58 @@ mod tests {
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
-        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
         let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A folder's store takes the conditional overwrites SlateDB's collector makes (`Local`): an update with the
+    /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
+    /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
+    /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_folder_takes_conditional_overwrites() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
+        let at = Path::from("catalog/gc/manifest.boundary");
+        let bytes = |b: &'static [u8]| object_store::PutPayload::from_static(b);
+        let update = |e_tag: &str| PutOptions { mode: PutMode::Update(object_store::UpdateVersion { e_tag: Some(e_tag.into()), version: None }), ..Default::default() };
+        let refused = |r: object_store::Result<object_store::PutResult>| matches!(r, Err(object_store::Error::Precondition { .. }));
+
+        let created = store.put_opts(&at, bytes(b"1"), PutOptions { mode: PutMode::Create, ..Default::default() }).await?;
+        let again = store.put_opts(&at, bytes(b"x"), PutOptions { mode: PutMode::Create, ..Default::default() }).await;
+        assert!(matches!(again, Err(object_store::Error::AlreadyExists { .. })), "a create over an object: already there");
+        let first = created.e_tag.expect("an e-tag");
+        assert_eq!(store.head(&at).await?.e_tag.as_deref(), Some(first.as_str()), "a put's e-tag is the one a head gives");
+
+        let second = store.put_opts(&at, bytes(b"2"), update(&first)).await?;
+        assert_eq!(second.e_tag, store.head(&at).await?.e_tag, "an update's e-tag is the new object's");
+        let second = second.e_tag.expect("an e-tag");
+        let third = store.put_opts(&at, bytes(b"3"), update(&second)).await?.e_tag.expect("an e-tag");
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"3"), "the second update went through");
+
+        assert!(refused(store.put_opts(&at, bytes(b"4"), update(&first)).await), "an old e-tag: a precondition");
+        let missing = Path::from("catalog/gc/none.boundary");
+        assert!(refused(store.put_opts(&missing, bytes(b"5"), update("any")).await), "a missing object: a precondition");
+        assert!(store.head(&missing).await.is_err(), "and nothing was created");
+
+        let mut attributes = object_store::Attributes::new();
+        attributes.insert(object_store::Attribute::ContentType, "text/plain".into());
+        let tagged = PutOptions { attributes, ..update(&third) };
+        assert!(matches!(store.put_opts(&at, bytes(b"6"), tagged).await, Err(object_store::Error::NotImplemented { .. })), "an update with an attribute: refused by name");
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"3"), "and nothing changed");
+
+        let (a, b) = tokio::join!(store.put_opts(&at, bytes(b"7"), update(&third)), store.put_opts(&at, bytes(b"8"), update(&third)));
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(), 1, "of two updates on one e-tag, one is made");
+        assert!(refused(if a.is_err() { a } else { b }), "the other is a precondition");
+        store.put_opts(&at, bytes(b"9"), PutOptions::default()).await?;
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"9"), "an overwrite is as it was");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2606,7 +2705,7 @@ mod tests {
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
-        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
         let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
