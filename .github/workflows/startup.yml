@@ -1,0 +1,110 @@
+name: startup
+
+# The startup list traced again in CI, never by hand (the 10-18 audit's L13). tools/startup.txt names the functions a
+# node runs to its first answer and 5 s idle; the Linux builds that ship place them together (tools/startup_layout.rs),
+# so an idle node keeps about 20 MB of code resident instead of 60–100. The list goes stale by a few MB a merge as
+# functions are renamed and added (designs/l2-startup-layout.md in the project's files), and main's build only fails
+# once it passes 31 MB (build.yml, `The startup layout held`).
+# Each night that the code changed since the commit the list names, this builds the program and the library as
+# linux-x64 ships them (a dist zigbuild: main's cache, the same flags), but unstripped and with the program's objects
+# kept (`-C save-temps`, on the last two crates only, so no dependency is built again). It traces both under callgrind
+# (tools/startup_order.py trace), marks the functions LLVM made cold (mark), and when the list changed puts it on the
+# branch `startup-list` with a pull request labeled `train`: the train merges it once its run is green, like a lane's.
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: startup
+  cancel-in-progress: false
+
+jobs:
+  trace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: write # (the branch `startup-list`)
+      pull-requests: write # (its pull request, labeled `train`)
+    env:
+      ZIG_TARGET: x86_64-unknown-linux-gnu.2.17 # (main's linux-x64, build.yml's matrix)
+      OUT: target/x86_64-unknown-linux-gnu/dist
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # (the commit the list was traced on, to tell whether the code changed since)
+      - name: Whether the code changed since the list was traced
+        id: due
+        run: |
+          at=$(sed -n 's/^# Traced on \([0-9a-f]\{40\}\)\.$/\1/p' tools/startup.txt)
+          if [ -n "$at" ] && git cat-file -e "$at^{commit}" 2>/dev/null && git diff --quiet "$at" HEAD -- src capi Cargo.toml Cargo.lock build.rs; then
+            echo "The list was traced on $at, and the code hasn't changed since."
+            echo "due=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "due=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Room for the build's kept objects # (several copies of the program's bitcode: tools nobody here uses go)
+        if: steps.due.outputs.due == 'true'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        if: steps.due.outputs.due == 'true'
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.due.outputs.due == 'true'
+        with:
+          shared-key: build # (main's dist dependencies, as build.yml keeps them)
+          save-if: false
+      - uses: actions/setup-python@v6
+        if: steps.due.outputs.due == 'true'
+        with:
+          python-version: "3.11"
+      - name: Build, unstripped, the program's objects kept
+        if: steps.due.outputs.due == 'true'
+        env:
+          RUSTFLAGS: -A linker_messages # (build.yml's, so main's cached dependencies are this build's)
+        run: |
+          sudo apt-get install -y valgrind
+          pip install ziglang cargo-zigbuild
+          # (`-C strip=none` after the profile's own strip: these two crates keep their names, the rest is cached)
+          cargo-zigbuild rustc --profile dist --target "$ZIG_TARGET" -p pondra-capi --lib -- -C strip=none
+          cargo-zigbuild rustc --profile dist --target "$ZIG_TARGET" -p pondra --bin pondra -- -C strip=none -C save-temps
+      - name: Trace and mark
+        if: steps.due.outputs.due == 'true'
+        run: |
+          cp tools/startup.txt "$RUNNER_TEMP/before.txt"
+          python tools/startup_order.py trace --bin "$OUT/pondra" --lib "$OUT/libpondra_lib.so"
+          python tools/startup_order.py mark --objects "$OUT/deps"
+      - name: The new list on the train
+        if: steps.due.outputs.due == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          names() { grep -v '^#' "$1" | sed 's/^unlikely\.//' | sort; }
+          new=$(comm -13 <(names "$RUNNER_TEMP/before.txt") <(names tools/startup.txt) | wc -l)
+          gone=$(comm -23 <(names "$RUNNER_TEMP/before.txt") <(names tools/startup.txt) | wc -l)
+          if [ "$new" = 0 ] && [ "$gone" = 0 ]; then
+            echo "The list holds what the program and the library run: nothing to change."
+            exit 0
+          fi
+          at=$(git rev-parse HEAD)
+          git switch -c startup-list
+          git add tools/startup.txt
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "The startup list traced again on ${at:0:7}: $new functions it was missing, $gone gone"
+          git push -f origin startup-list
+          total=$(names tools/startup.txt | wc -l)
+          cold=$(grep -c '^unlikely\.' tools/startup.txt || true)
+          printf '%s\n\n%s\n' \
+            "Before: tools/startup.txt was traced on an older main, and $new of the functions a node now runs to its first answer and 5 s idle weren't in it, so the Linux builds that ship kept them spread through the program's code." \
+            "After: it lists the $total functions the program and the library run, traced on $at ($gone gone; $cold marked cold). Made by .github/workflows/startup.yml; main's build reports the resident code it gives (\`The startup layout held\`)." > "$RUNNER_TEMP/body.md"
+          title="The startup list traced again on ${at:0:7}"
+          open=$(gh pr list --head startup-list --state open --json number --jq '.[].number')
+          if [ -n "$open" ]; then
+            gh pr edit "$open" --title "$title" --body-file "$RUNNER_TEMP/body.md" # (its branch is this night's list now)
+          else
+            gh pr create --head startup-list --base main --label train --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          fi
