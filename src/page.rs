@@ -1146,9 +1146,9 @@ mod tests {
     }
 
     /// A web server over memory: it reads every object, and lists nothing as a web server does, so a test passes only if
-    /// no read lists.
+    /// no read lists. It keeps the names of the objects it was asked for.
     #[derive(Debug)]
-    struct NoList(Arc<InMemory>);
+    struct NoList(Arc<InMemory>, Arc<std::sync::Mutex<BTreeSet<String>>>);
 
     impl std::fmt::Display for NoList {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("NoList") }
@@ -1158,7 +1158,10 @@ mod tests {
     impl ObjectStore for NoList {
         async fn put_opts(&self, l: &Path, p: PutPayload, o: PutOptions) -> datafusion::object_store::Result<datafusion::object_store::PutResult> { self.0.put_opts(l, p, o).await }
         async fn put_multipart_opts(&self, l: &Path, o: datafusion::object_store::PutMultipartOptions) -> datafusion::object_store::Result<Box<dyn datafusion::object_store::MultipartUpload>> { self.0.put_multipart_opts(l, o).await }
-        async fn get_opts(&self, l: &Path, o: datafusion::object_store::GetOptions) -> datafusion::object_store::Result<datafusion::object_store::GetResult> { self.0.get_opts(l, o).await }
+        async fn get_opts(&self, l: &Path, o: datafusion::object_store::GetOptions) -> datafusion::object_store::Result<datafusion::object_store::GetResult> {
+            self.1.lock().unwrap().insert(l.to_string());
+            self.0.get_opts(l, o).await
+        }
         fn delete_stream(&self, l: futures::stream::BoxStream<'static, datafusion::object_store::Result<Path>>) -> futures::stream::BoxStream<'static, datafusion::object_store::Result<Path>> { self.0.delete_stream(l) }
         fn list(&self, _: Option<&Path>) -> futures::stream::BoxStream<'static, datafusion::object_store::Result<datafusion::object_store::ObjectMeta>> { futures::StreamExt::boxed(futures::stream::once(async { Err(StoreError::NotSupported { source: "a web server lists nothing".into() }) })) }
         async fn list_with_delimiter(&self, _: Option<&Path>) -> datafusion::object_store::Result<datafusion::object_store::ListResult> { Err(StoreError::NotSupported { source: "a web server lists nothing".into() }) }
@@ -1184,9 +1187,10 @@ mod tests {
         body
     }
 
-    /// A `add` action of a file with `rows` rows, `size` bytes.
-    fn add(path: &str, rows: u64, size: u64) -> serde_json::Value {
-        json!({"add": {"path": path, "partitionValues": {}, "size": size, "modificationTime": 0, "dataChange": true, "stats": json!({"numRecords": rows}).to_string()}})
+    /// A `add` action of a file with `rows` rows, `size` bytes, its ids from `ids.0` to `ids.1`.
+    fn add(path: &str, rows: u64, size: u64, ids: (i64, i64)) -> serde_json::Value {
+        let stats = json!({"numRecords": rows, "minValues": {"id": ids.0}, "maxValues": {"id": ids.1}});
+        json!({"add": {"path": path, "partitionValues": {}, "size": size, "modificationTime": 0, "dataChange": true, "stats": stats.to_string()}})
     }
 
     /// The Delta table of the tests, put under `lake/orders` in `memory` as a node publishes one: three Parquet files and
@@ -1207,12 +1211,12 @@ mod tests {
         ]});
         let metadata = json!({"metaData": {"id": "orders", "format": {"provider": "parquet", "options": {}}, "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {"delta.columnMapping.mode": "name"}}});
         let bitmap = crate::scan::roaring_bytes(&[1]);
-        let mut deleted = add("a.parquet", 2, a);
+        let mut deleted = add("a.parquet", 2, a, (1, 2));
         deleted["add"]["deletionVector"] = json!({"storageType": "i", "pathOrInlineDv": crate::scan::z85_of(&bitmap), "sizeInBytes": bitmap.len(), "cardinality": 1});
         let commits = [
-            vec![protocol, metadata, add("a.parquet", 2, a), add("b.parquet", 1, b)],
+            vec![protocol, metadata, add("a.parquet", 2, a, (1, 2)), add("b.parquet", 1, b, (3, 3))],
             vec![json!({"remove": {"path": "a.parquet", "deletionTimestamp": 0, "dataChange": true}}), deleted],
-            vec![add("c.parquet", 1, c)],
+            vec![add("c.parquet", 1, c, (4, 4))],
         ];
         for (v, actions) in commits.iter().enumerate() {
             let body: String = actions.iter().map(|a| format!("{a}\n")).collect();
@@ -1224,12 +1228,17 @@ mod tests {
     }
 
     /// A page whose program gives it the origin `https://lake.test`: a store over `memory` that lists nothing.
-    fn web_page(memory: Arc<InMemory>) -> Page {
+    fn web_page(memory: Arc<InMemory>) -> Page { web_page_asked(memory).0 }
+
+    /// The same page, and the names of the objects its store is asked for.
+    fn web_page_asked(memory: Arc<InMemory>) -> (Page, Arc<std::sync::Mutex<BTreeSet<String>>>) {
+        let asked = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+        let kept = asked.clone();
         let web: Web = Arc::new(move |origin: &str| {
             assert_eq!(origin, "https://lake.test");
-            Arc::new(NoList(memory.clone())) as Arc<dyn ObjectStore>
+            Arc::new(NoList(memory.clone(), kept.clone())) as Arc<dyn ObjectStore>
         });
-        Page::open(&Options { web: Some(web), ..Default::default() })
+        (Page::open(&Options { web: Some(web), ..Default::default() }), asked)
     }
 
     /// A Delta table over the web reads as a node reads it: its latest version without the deleted row, its renamed
@@ -1247,6 +1256,23 @@ mod tests {
         assert_eq!(zero.body, "id,label\n1,a\n2,b\n3,c\n");
         let one = page.request("POST", "/sql?format=csv", &[], read(", version => 1").into()).await;
         assert_eq!(one.body, "id,label\n1,a\n3,c\n");
+    }
+
+    /// A filter on a column whose range the log gives for each file opens only the files that can hold its rows: over the
+    /// web, every file opened is a request for its footer.
+    #[tokio::test]
+    async fn a_delta_table_over_the_web_opens_only_the_files_a_filter_can_match() {
+        let memory = Arc::new(InMemory::new());
+        put_delta_table(&memory).await;
+        let (page, asked) = web_page_asked(memory);
+        let got = page.request("POST", "/sql?format=csv", &[], format!("SELECT label FROM read_delta('{DELTA_ROOT}') WHERE id = 3").into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{:?}", got.body);
+        assert_eq!(got.body, "label\nc\n");
+        let opened: Vec<String> = asked.lock().unwrap().iter().filter(|p| p.ends_with(".parquet")).cloned().collect();
+        assert_eq!(opened, ["lake/orders/b.parquet"]);
+        let none = page.request("POST", "/sql?format=csv", &[], format!("SELECT label FROM read_delta('{DELTA_ROOT}') WHERE id > 9").into()).await;
+        assert_eq!(none.body, "label\n");
+        assert_eq!(asked.lock().unwrap().iter().filter(|p| p.ends_with(".parquet")).count(), 1);
     }
 
     /// A file over the web is read by its name, as a file given to a page is; a file that isn't there is 42P01 by the

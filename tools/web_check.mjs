@@ -357,13 +357,15 @@ if (series) judge('generate_series of 10M rows', series, { status: 200, sqlstate
 // listed (a folder, a path ending in `/`, a name not there: 404). It counts the requests it answers, and the CORS
 // preflights apart from them. Its answers allow any origin, and no browser keeps one (Chromium would keep one from
 // Last-Modified). `hidden` is a server whose page can't see its Content-Range: it exposes none of its headers, and
-// `sendsRange` false leaves the Content-Range out of its 206s, as a server that sends none does.
+// `sendsRange` false leaves the Content-Range out of its 206s, as a server that sends none does. It keeps the paths
+// asked for, so a check can tell which files a read opened.
 async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
   const started = new Date().toUTCString();
   const cors = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
   if (!hidden) cors['Access-Control-Expose-Headers'] = 'Content-Range, ETag, Last-Modified';
   let requests = 0;
   let preflights = 0;
+  const paths = new Set();
   const server = createServer(async (req, res) => {
     if (req.method === 'OPTIONS') {
       preflights++;
@@ -371,6 +373,7 @@ async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
       return answerPreflight(res, cors);
     }
     requests++;
+    paths.add(decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname));
     for (const [name, value] of Object.entries(cors)) res.setHeader(name, value);
     try {
       await answerFile(root, started, req, res, sendsRange);
@@ -379,7 +382,7 @@ async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
     }
   });
   await new Promise((listening) => server.listen(0, '127.0.0.1', listening));
-  return { server, port: server.address().port, served: () => requests, preflights: () => preflights };
+  return { server, port: server.address().port, served: () => requests, preflights: () => preflights, paths: () => [...paths] };
 }
 
 // A CORS preflight, which a browser sends before a request CORS doesn't let through alone (a suffix Range is one).
@@ -445,6 +448,11 @@ function rangeOf(header, size) {
   return { start, end: m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1) };
 }
 
+// Whether a path the lake's server was asked for is one of the table's data files (not its log's).
+function isData(path) {
+  return path.endsWith('.parquet') && !path.includes('/_delta_log/');
+}
+
 // A port nothing listens on: one the system gave a server that is closed again.
 async function closedPort() {
   const server = createServer();
@@ -477,15 +485,29 @@ async function lakeChecks(dir) {
   const at = `http://127.0.0.1:${web.port}/orders`;
   const { versions, file } = expected;
   const order = ['latest', ...Object.keys(versions).filter((k) => k !== 'latest')];
-  let latest_requests = 0;
+  let [latest_requests, latest_files] = [0, 0];
   for (const key of order) {
     const from = web.served();
     const clause = key === 'latest' ? '' : `, version => ${key}`;
     const answer = await ask(`lake ${key}`, 'POST', '/sql?format=csv', undefined, `SELECT * FROM read_delta('${at}'${clause}) ORDER BY id`);
-    if (key === 'latest') latest_requests = web.served() - from;
+    if (key === 'latest') [latest_requests, latest_files] = [web.served() - from, web.paths().filter(isData).length];
     const want = versions[key];
     if (answer) judge(`lake ${key}`, answer, typeof want === 'string' ? { status: 200, sqlstate: null, out: want } : { error: true });
   }
+  // A filter on one id opens the one file whose range holds it: the others are skipped by the ranges the log gives
+  // (delta.rs `stats`), never fetched. Read from a server of its own, the folder one level up, so the files' paths are
+  // new to the page too (a file's footer is kept by its path) and nothing it kept is reused.
+  const fresh = await serveFolder(dirname(dir));
+  const one = await ask('lake one id, one file opened', 'POST', '/sql?format=csv', undefined,
+    `SELECT id, amount FROM read_delta('http://127.0.0.1:${fresh.port}/${basename(dir)}/orders') WHERE id = 3`);
+  const opened = fresh.paths().filter(isData);
+  if (one) judge('lake one id, one file opened', one, { status: 200, sqlstate: null, out: 'id,amount\n3,30\n' });
+  if (opened.length !== 1) {
+    failed.push('lake one id, one file opened');
+    console.error(`lake one id, one file opened: it opened ${opened.length}: ${opened.join(', ')}`);
+  }
+  report.lake_files = `${opened.length} of ${latest_files} for one id`;
+  await stop(fresh);
   const counted = await ask('lake file', 'POST', '/sql?format=csv', undefined, `SELECT count(*) AS n FROM '${at}/${file.name}'`);
   if (counted) judge('lake file', counted, { status: 200, sqlstate: null, out: file.out });
   const refusals = [

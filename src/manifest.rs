@@ -21,11 +21,9 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::parquet::file::metadata::ParquetMetaData;
 use datafusion::common::pruning::PruningStatistics;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
 use datafusion::logical_expr::{Accumulator, Expr};
-use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -177,18 +175,7 @@ fn union(parts: &[&Stats], schema: &SchemaRef) -> Stats {
 /// Which of the containers (files or manifests, by their stats) can hold rows matching all of
 /// `filters`. Anything the stats can't decide is kept.
 pub fn keep(stats: &[&Stats], filters: &[Expr], schema: &SchemaRef) -> Vec<bool> {
-    let all = vec![true; stats.len()];
-    let Some(expr) = filters.iter().cloned().reduce(Expr::and) else { return all };
-    let unqualified = expr.transform(|e| Ok(match e {
-        Expr::Column(c) => Transformed::yes(Expr::Column(Column::new_unqualified(c.name))),
-        e => Transformed::no(e),
-    }));
-    let pruned = || -> Result<Vec<bool>> {
-        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
-        let phys = datafusion::physical_expr::create_physical_expr(&unqualified?.data, &df_schema, &Default::default(), &Default::default())?;
-        Ok(PruningPredicateBuilder::new().with_file_schema(schema.clone()).try_build(phys)?.prune(&View { stats, schema })?)
-    };
-    pruned().unwrap_or(all)
+    crate::scan::may_match(&View { stats, schema }, filters, schema)
 }
 
 struct View<'a> {
