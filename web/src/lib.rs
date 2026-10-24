@@ -20,7 +20,8 @@ pub struct Page(pondra::page::Page);
 #[wasm_bindgen]
 impl Page {
     /// A page with no tables, on one partition (a page runs on one thread). It reads the web through `fetch` (`fetch.rs`):
-    /// a web server must allow the page's origin (CORS) and expose `Content-Range` and `ETag`.
+    /// a web server must allow the page's origin (CORS), and expose `Content-Range` only if a read from the end of an
+    /// object needs it (an `ETag` it hides is only left out of the object's meta).
     #[wasm_bindgen(constructor)]
     pub fn new() -> Page {
         static HOOK: std::sync::Once = std::sync::Once::new();

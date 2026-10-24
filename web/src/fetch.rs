@@ -1,6 +1,11 @@
 //! A web origin's objects, read with `fetch` (the page's store for one origin, designs/l2-b4-web.md section 4i): a `GET`
 //! with a `Range`, and a `HEAD`. A web server lists and writes nothing, so those are refused by name. Options other than
 //! `head` and `range` (`if_match`, `version`, …) are not sent: DataFusion asks for none of them.
+//!
+//! A web server on another origin must allow the page's origin (CORS). A page sees only the response headers CORS lets
+//! it read, so the server exposes `Content-Range` only for a read from the end of an object (a suffix range); a part
+//! whose content-range the page can't see is read from the range asked (`unranged`). An `ETag` the server hides is
+//! only left out of the object's meta.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -248,7 +253,7 @@ fn object_from(location: &Path, url: &Url, answer: Fetched, wanted: Option<&GetR
     let Fetched { status, content_length, content_range, etag, last_modified, body } = answer;
     let (range, size, body) = match status {
         200 => whole(url, head, content_length.as_deref(), body, wanted)?,
-        206 => partial(url, content_range.as_deref(), body)?,
+        206 => partial(url, content_range.as_deref(), body, wanted)?,
         404 | 403 => {
             return Err(Error::NotFound {
                 path: location.to_string(),
@@ -295,12 +300,54 @@ fn whole(
     Ok((range, size, part))
 }
 
-/// A part of an object (a 206): its range and the object's size, both from its content-range.
-fn partial(url: &Url, content_range: Option<&str>, body: Vec<u8>) -> StoreResult<(Range<u64>, u64, Bytes)> {
-    let text = content_range.ok_or_else(|| generic(format!("{url} answered a part with no content-range")))?;
+/// A part of an object (a 206): its range and the object's size, both from its content-range when the page can see it.
+/// When it can't (the server sent none, or CORS hides it), the range asked gives them (`unranged`).
+fn partial(
+    url: &Url,
+    content_range: Option<&str>,
+    body: Vec<u8>,
+    wanted: Option<&GetRange>,
+) -> StoreResult<(Range<u64>, u64, Bytes)> {
+    let Some(text) = content_range else {
+        return unranged(url, body, wanted);
+    };
     let (range, size) =
         parse_content_range(text).ok_or_else(|| generic(format!("{url} sent an unreadable content-range: {text}")))?;
     Ok((range, size, Bytes::from(body)))
+}
+
+/// A part whose content-range the page can't see. Its body starts at the range asked: a bounded range's part is
+/// `start..start + len`, and an offset's runs to the object's end, so its size is `offset + len`. A suffix has no
+/// start to read from, and a part for no range asked is no read the page makes: both are refused, with the cure.
+fn unranged(url: &Url, body: Vec<u8>, wanted: Option<&GetRange>) -> StoreResult<(Range<u64>, u64, Bytes)> {
+    let len = body.len() as u64;
+    let (start, size) = match wanted {
+        Some(GetRange::Bounded(r)) => bounded(url, r, len)?,
+        Some(GetRange::Offset(from)) => (*from, from.saturating_add(len)),
+        Some(GetRange::Suffix(_)) | None => {
+            return Err(generic(format!(
+                "{url} answered a part whose content-range isn't visible to this page: a read from the end of an \
+                 object needs it, and a server on another origin must expose it \
+                 (Access-Control-Expose-Headers: Content-Range)"
+            )))
+        }
+    };
+    if len == 0 {
+        return Err(generic(format!("{url} answered a part with no bytes")));
+    }
+    Ok((start..start.saturating_add(len), size, Bytes::from(body)))
+}
+
+/// A bounded range's start, and the object's size, from a body of `len` bytes: a body longer than the range is an
+/// error. A shorter body ends the object there; a full one says only that the object is at least the range's end (all
+/// that is known of its size).
+fn bounded(url: &Url, r: &Range<u64>, len: u64) -> StoreResult<(u64, u64)> {
+    let asked = r.end.saturating_sub(r.start);
+    if len > asked {
+        return Err(generic(format!("{url} answered {len} bytes to a range of {asked}")));
+    }
+    let size = if len < asked { r.start.saturating_add(len) } else { r.end };
+    Ok((r.start, size))
 }
 
 /// `bytes first-last/size` as the range and the size. A size of `*` is not known: the object ends at `last`.
