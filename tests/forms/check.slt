@@ -1,0 +1,14 @@
+# CHECK: a row that breaks it is refused (23514), and nothing of its statement is written (form-parity P1).
+statement ok
+CREATE TABLE c (id INT, qty INT CHECK (qty > 0))
+
+statement ok
+INSERT INTO c VALUES (1, 5)
+
+statement error 23514
+INSERT INTO c VALUES (2, 7), (3, 0)
+
+query II
+SELECT id, qty FROM c
+----
+1 5

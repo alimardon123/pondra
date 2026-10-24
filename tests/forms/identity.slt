@@ -1,0 +1,29 @@
+# Identity columns: numbered by the table, and a value given to GENERATED ALWAYS refused (428C9), in a statement or
+# a transaction (form-parity P1, D3).
+statement ok
+CREATE TABLE i (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)
+
+statement ok
+INSERT INTO i (v) VALUES ('a'), ('b')
+
+statement error 428C9
+INSERT INTO i (id, v) VALUES (10, 'c')
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT INTO i (id, v) VALUES (11, 'd')
+
+statement ok
+ROLLBACK
+
+statement ok
+INSERT INTO i (v) VALUES ('c')
+
+query IT
+SELECT id, v FROM i ORDER BY id
+----
+1 a
+2 b
+3 c
