@@ -13,6 +13,34 @@ pub fn under_files(path: &str) -> anyhow::Result<String> {
     Ok(if rel.starts_with("files/") { rel.to_string() } else { format!("files/{rel}") })
 }
 
+/// Does a name leave the folder it is read from? A `.` or `..` segment does, and so does its escaped form (`%2e`, in
+/// either case): the url crate and DataFusion collapse both, so a name with either reaches outside `files/`. A backslash
+/// separates segments too, as a Windows path writes them.
+pub fn leaves(path: &str) -> bool {
+    path.replace("%2e", ".").replace("%2E", ".").split(['/', '\\']).any(|p| p == "." || p == "..")
+}
+
+/// A name a client or a page writes in SQL (`'orders.csv'`, `'./d/*.parquet'`), as a URL in a folder's own files: `root`
+/// (ending in `/`: the lake's URL, or a page's `mem:///`) then `files/`. None for a name that already says where it is:
+/// one with a scheme (`s3://`, `https://`) or an absolute path (`/x`, `\x`, `C:/x`), which the caller reads as it always
+/// did. A name that leaves its folder is refused: a file is read where the caller is, and never outside `files/`.
+pub fn relative(root: &str, name: &str) -> Option<anyhow::Result<String>> {
+    if name.contains("://") || is_absolute(name) {
+        return None;
+    }
+    let name = name.strip_prefix("./").unwrap_or(name);
+    if leaves(name) {
+        return Some(Err(crate::codes::coded("0A000", format!("{name}: a relative name is read from the lake's files, so it may not leave them"))));
+    }
+    Some(under_files(name).map(|p| format!("{root}{p}")))
+}
+
+/// A path that starts at a disk's root: `/x`, `\x`, or a drive's `C:\x` or `C:/x`.
+fn is_absolute(name: &str) -> bool {
+    let b = name.as_bytes();
+    name.starts_with(['/', '\\']) || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+}
+
 /// What a file replaced since it was read says: `store::Changed`'s `Display` writes it.
 pub const CHANGED: &str = "the file changed since it was opened: open it again, or save under another name";
 
@@ -65,5 +93,20 @@ mod tests {
         assert_eq!(under_files("etl/Shared/x").unwrap(), "files/etl/Shared/x");
         assert_eq!(under_files("Sharedx/a").unwrap(), "files/Sharedx/a");
         assert_eq!(under_files("/etl/a.sql").unwrap(), "files/etl/a.sql");
+    }
+
+    #[test]
+    fn a_relative_name_is_a_file_of_the_lake_and_a_name_that_says_where_it_is_is_not() {
+        let root = "mem:///";
+        for (name, want) in [("orders.csv", "mem:///files/orders.csv"), ("./d/*.parquet", "mem:///files/d/*.parquet"), ("files/x.csv", "mem:///files/x.csv"), ("d/**/*.parquet", "mem:///files/d/**/*.parquet")] {
+            assert_eq!(super::relative(root, name).unwrap().unwrap(), want, "{name}");
+        }
+        for name in ["../t", ".%2e/t", "d\\..\\t", "~/x"] {
+            let err = super::relative(root, name).unwrap().unwrap_err();
+            assert_eq!(crate::codes::of(&err), "0A000", "{name}");
+        }
+        for name in ["/abs/x", "C:/x", "C:\\x", "s3://b/x", "https://h/x"] {
+            assert!(super::relative(root, name).is_none(), "{name}");
+        }
     }
 }
