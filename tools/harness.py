@@ -4818,7 +4818,8 @@ def copies():
     text, CSV and binary, each read back as the rows went in; the ADBC Postgres driver, which reads
     every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
     the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
-    in text and CSV; COPY TO piped back gives the rows."""
+    in text and CSV; COPY TO piped back gives the rows. The end marker `\\.` ends the data in any chunk, a blank CSV
+    line is a row, and a number out of its type's range is 22003."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
     lake, pg = new_lake(), A.port + 10
     node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
@@ -4894,15 +4895,59 @@ def copies():
         kept_text = c.execute("SELECT count(*) FROM cx").fetchone()[0]
     text_ok = (text_rows == [(1, "01ff", "a|bAAq"), (3, "41", None), (7, "00", "x|y"), (8, "0a0b", "plain")]
                and piped == text_rows and text_refusals == ["22P02", "22021", "22P04", "0A000"] and kept_text == 4)
+    # The end marker, blank lines and out-of-range values, each case with Postgres 16's answer: its rows, or its SQLSTATE
+    # and no row written. Then 10 rows, the marker, and 34 MB more, sent after a 32 MB chunk has been loaded.
+    shapes = {"text": "COPY {t} FROM STDIN", "csv": "COPY {t} FROM STDIN WITH (FORMAT csv)", "csv header": "COPY {t} FROM STDIN WITH (FORMAT csv, HEADER true)"}
+    cases = [("a text", "text", "\n\n", [("",), ("",)]), ("a text", "text", ".\n", [(".",)]), ("a text", "text", "\\.\n", []),
+             ("a text", "text", "", []), ("a text", "text", "1\n\\.\n2\n", [("1",)]), ("a text", "text", "1\\.\n2\n", [("1",)]),
+             ("a text", "text", "a\\\n\\.\nb\n", [("a\n",)]), ("a text", "text", "1\n\\\\.\n2\n", [("1",), ("\\.",), ("2",)]),
+             ("a text", "text", "1\\.x\n2\n", "22P04"), ("a text, b text", "text", " \n", "22P04"),
+             ("a text", "csv", "\n\n", [(None,), (None,)]), ("a text", "csv", "a\n\\.\n", [("a",)]),
+             ("a text", "csv", "a\n\\.\nb\n", [("a",)]), ("a text", "csv", "a\r\n\\.\r\nb\n", [("a",)]), ("a text", "csv", "", []),
+             ("a text", "csv", "a\n\\.x\nb\n", [("a",), ("\\.x",), ("b",)]), ("a text", "csv", " \\.\nb\n", [(" \\.",), ("b",)]),
+             ("a text", "csv", '"a\n\\.\nb"\nc\n', [("a\n\\.\nb",), ("c",)]), ("a text", "csv header", "h\n\nx\n", [(None,), ("x",)]),
+             ("a text, b text", "csv", "\n", "22P04"), ("a int", "text", "99999999999\n", "22003"), ("a int", "text", "abc\n", "22P02"),
+             ("a smallint", "text", "40000\n", "22003"), ("a bigint", "csv", "99999999999999999999\n", "22003"),
+             ("a numeric(3,1)", "text", "12345\n", "22003")]
+    mismatched, edge_ok = [], True
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        for i, (ecols, eform, edata, expect) in enumerate(cases):
+            t = f"ed{i}"
+            cur.execute(f"CREATE TABLE {t} ({ecols})")
+            try:
+                with cur.copy(shapes[eform].format(t=t)) as cp:
+                    cp.write(edata)
+                answer = sorted(map(repr, c.execute(f"SELECT * FROM {t}").fetchall()))
+                same = isinstance(expect, list) and answer == sorted(map(repr, expect))
+            except psycopg.Error as e:
+                same = expect == e.sqlstate and c.execute(f"SELECT count(*) FROM {t}").fetchone()[0] == 0
+                answer = e.sqlstate
+            if not same:
+                mismatched.append({"case": f"{ecols} | {eform} | {edata!r}", "want": expect, "got": answer})
+            edge_ok = edge_ok and same
+        cur.execute("CREATE TABLE big (a text)")
+        filler = (b"x" * 999 + b"\n") * 34000
+        with cur.copy("COPY big FROM STDIN") as cp:
+            cp.write("".join(f"row {i}\n" for i in range(10)) + "\\.\n")
+            for i in range(0, len(filler), 1 << 20):
+                cp.write(filler[i:i + (1 << 20)])
+        big_rows = sorted(r[0] for r in c.execute("SELECT a FROM big").fetchall())
+    big_ok = big_rows == sorted(f"row {i}" for i in range(10))
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
+              "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
+              "COPY FROM over 32 MB: the 10 rows before \\. only, the rows after the marker in later chunks not read": big_ok,
               "COPY FROM a line of another width (22P04) or a value that isn't its type (22P02): refused, nothing written":
                   refused == {"one field too many": "22P04", "one field short": "22P04", "not a number": "22P02"} and kept == 2000,
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
               "DECIMAL as NUMERIC, text and binary": numeric_ok,
               "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok}
-    out = {"passed": all(checks.values()), "checks": checks}
+    out = {"passed": all(checks.values()), "checks": checks,
+           "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
+                                "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
