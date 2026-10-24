@@ -1,0 +1,34 @@
+# A PRIMARY KEY: a key given twice is refused (23505), in a statement or a transaction; ON CONFLICT updates the row
+# it names; a row too wide is refused (42601) and writes nothing (form-parity P1, P2, D3).
+statement ok
+CREATE TABLE k (id INT PRIMARY KEY, v TEXT)
+
+statement count 2
+INSERT INTO k VALUES (1, 'a'), (2, 'b')
+
+statement error 23505
+INSERT INTO k VALUES (1, 'again')
+
+statement error 23505
+INSERT INTO k VALUES (3, 'x'), (3, 'y')
+
+statement ok
+INSERT INTO k VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+statement error 42601
+INSERT INTO k VALUES (4, 'w', 3)
+
+statement ok
+BEGIN
+
+statement error 23505
+INSERT INTO k VALUES (2, 'twice')
+
+statement ok
+ROLLBACK
+
+query IT rowsort
+SELECT id, v FROM k
+----
+1 new
+2 b

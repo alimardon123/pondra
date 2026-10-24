@@ -1,0 +1,25 @@
+# DEFAULT and NOT NULL: a column left out takes its default; NULL into NOT NULL is refused (23502) (form-parity P2).
+statement ok
+CREATE TABLE d (id INT NOT NULL, status TEXT DEFAULT 'new', n INT DEFAULT 7)
+
+statement ok
+INSERT INTO d (id) VALUES (1)
+
+statement ok
+INSERT INTO d VALUES (2, 'old', 3)
+
+statement ok
+INSERT INTO d (id, status) VALUES (3, DEFAULT)
+
+statement error 23502
+INSERT INTO d (status) VALUES ('x')
+
+statement error 23502
+INSERT INTO d VALUES (NULL, 'y', 1)
+
+query ITI
+SELECT id, status, n FROM d ORDER BY id
+----
+1 new 7
+2 old 3
+3 new 7

@@ -157,6 +157,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           written, spread), sim_gcs.py and sim_iceberg_rest.py (a local GCS and an Iceberg REST catalog),
           bench/files_tpch.py (TPC-H from files outside the lake against the lake's tables),
           files_s3_check.py (files in a real bucket), slt_check.py (DataFusion's sqllogictest files: D1),
+          forms_check.py (tests/forms/ on every form: each answers as a node does, or refuses as docs/forms.json lists),
           bench/nexmark.py (Nexmark's 20 queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
           Python mixed every way), spark_check.py (pondra.spark == PySpark), bench/tpch_frames.py (TPC-H as
           SQL, frames and PySpark code), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
@@ -2990,6 +2991,7 @@ python3 tools/per_node_check.py         # every static per_node! or said to outl
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
 python3 tools/inprocess_check.py --lib <pondra_lib> --bin <pondra> [--bench]   # pondra.open() in Python and open() in Node and Bun: every way in, 50 opens, a fork, a process gone without close; --bench: open, idle memory, 10 M rows into pandas against local() and DuckDB
+python3 tools/forms_check.py [--form page,memory] [--only keys] --bin <pondra> --lib <pondra_lib>   # tests/forms/*.slt on the server, three nodes, in process on a folder and in memory, and the page (web/pkg): the same answers, or a refusal docs/forms.json lists
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load
