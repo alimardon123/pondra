@@ -110,7 +110,7 @@ impl<'a> Reader<'a> {
     fn string(&mut self) -> Result<String> { Ok(String::from_utf8(self.bytes()?.to_vec())?) }
 
     fn value(&mut self, s: &Value, names: &HashMap<String, Value>) -> Result<Value> {
-        let hex = |b: &[u8]| Value::String(b.iter().map(|x| format!("{x:02x}")).collect());
+        let hex = |b: &[u8]| Value::String(crate::text::hex(b));
         Ok(match s {
             Value::String(t) => match t.as_str() {
                 "null" => Value::Null,

@@ -590,7 +590,7 @@ changed since, with `412`.
 | `files()` | a table of every file: `path`, `size`, `written` |
 | `files('dir/')` | the same, for the paths that start with the prefix. `files('files/dir/')` is the same |
 | `file_read(path)` | the file's bytes as `BINARY`, or `NULL` if there is no such file. `file_read('files/dir/a.txt')` is the same as `file_read('dir/a.txt')` |
-| `byte_length(bytes)` | the number of bytes in a `BINARY` value, as a `BIGINT` |
+| `byte_length(bytes)` | the number of bytes in a `BINARY` value, as an `INT` |
 
 ```bash
 curl -s -X PUT http://localhost:8080/files/docs/hello.txt --data-binary 'hello world'

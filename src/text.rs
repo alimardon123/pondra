@@ -152,6 +152,17 @@ pub fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.bytes().enumerate().all(|(i, b)| if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_digit() || (b'a'..=b'f').contains(&b) })
 }
 
+/// The hex digits of `bytes`, two a byte, in lower case.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 15)]));
+    }
+    out
+}
+
 /// The functions that make JSON: the Postgres port traces their arguments (`pg_types`), so a JSON or
 /// whole-row argument is written as JSON.
 pub const JSON_MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_build_object", "jsonb_build_object", "json_build_array",
@@ -276,6 +287,13 @@ mod tests {
     fn one(sql: &str) -> Option<Statement> {
         let mut parsed = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
         (parsed.len() == 1).then(|| parsed.pop()).flatten()
+    }
+
+    #[test]
+    fn hex_writes_two_lower_case_digits_a_byte() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x0f]), "0f");
+        assert_eq!(hex(&[0xab, 0x00]), "ab00");
     }
 
     #[test]

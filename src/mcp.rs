@@ -172,7 +172,10 @@ async fn call(app: &App, role: Role, params: &Value) -> Result<Value, Value> {
     };
     let (text, error) = match out {
         Ok(v) => (v.to_string(), false),
-        Err(e) => (format!("SQLSTATE {}: {}", crate::codes::of(&e), crate::ext::said(&e)), true), // (a tool error, which the agent sees and can act on: with Postgres's code, said as every door says it: `ext::said` (files by their SQL names, a routine's code cut for a user who may not see it))
+        Err(e) => {
+            let (_, code, words) = crate::codes::answer(&e, crate::auth::shows_code());
+            (format!("SQLSTATE {code}: {words}"), true) // (a tool error, which the agent sees and can act on: with Postgres's code, said as every door says it: `codes::answer` (files by their SQL names, a routine's code cut for a user who may not see it))
+        }
     };
     Ok(json!({"content": [{"type": "text", "text": text}], "isError": error}))
 }

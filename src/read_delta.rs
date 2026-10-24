@@ -455,7 +455,7 @@ pub fn unescape(p: &str) -> String { url::form_urlencoded::parse(format!("x={}",
 /// written. Another length is refused by name, since it isn't a UUID at all.
 fn uuid_text(bytes: &[u8]) -> Result<String> {
     ensure!(bytes.len() == 16, "a deletion vector's id of {} bytes, not the 16 of a UUID", bytes.len());
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = crate::text::hex(bytes);
     Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
 }
 
