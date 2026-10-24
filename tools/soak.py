@@ -14,8 +14,8 @@ and then, and what drifts over time measured.
   follower killed; it starts again a moment later (by default 8 times a run, at most hourly).
 
   Each minute it writes a line to --timeline: every node's resident memory (and its anonymous memory by
-  kind of mapping: glibc's heaps, thread stacks, the rest; with jemalloc's statistics built in, its
-  count), its queries (running, waiting, finished, failed) and the query memory they hold, the
+  kind of mapping: glibc's heaps, thread stacks, the rest, and the rest's huge and lazily freed pages and
+  largest mappings; with jemalloc's statistics built in, its count), its threads, its queries (running, waiting, finished, failed) and the query memory they hold, the
   leader's rows not yet tiered and its commit times, the longest a batch waited for its
   acknowledgement, the lake's objects (a folder's; a bucket's every 30 minutes).
 
@@ -50,36 +50,47 @@ from prices import LABEL, OPS, PRICES, dollars_a_month  # noqa: E402  (what the 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
+def status_of(n, key):
+    """A field of a node's /proc status (Linux) as a number (kB for a size), or None."""
+    try:
+        with open(f"/proc/{n.p.pid}/status") as f:
+            return next(int(l.split()[1]) for l in f if l.startswith(key + ":"))
+    except (OSError, StopIteration, AttributeError):
+        return None
+
+
 def rss_mb(n, kind="VmRSS"):
     """A node's resident memory (Linux), or None; `RssAnon`: its own, without the pages of the
     binary's code, which the kernel maps from the file (about 130 MB once the paths have run)."""
-    try:
-        with open(f"/proc/{n.p.pid}/status") as f:
-            return next(int(l.split()[1]) // 1024 for l in f if l.startswith(kind + ":"))
-    except (OSError, StopIteration, AttributeError):
-        return None
+    kb = status_of(n, kind)
+    return None if kb is None else kb // 1024
 
 
 def maps_mb(n):
     """A node's anonymous memory by kind of mapping (Linux), or None: glibc's (its main heap, and the arenas it
     reserves 64 MB at a time, aligned to 64 MB: what C libraries such as aws-lc and zstd allocate), thread
     stacks (8 MB each) and the rest (jemalloc's, mostly). jemalloc's heap profile sees only the rest: on R2 a
-    node's resident memory grew ~170 MB past what its live allocations held (reviews/soak-heap-0fa48fb.md)."""
+    node's resident memory grew ~170 MB past what its live allocations held (reviews/soak-heap-0fa48fb.md), and
+    120–245 MB past what jemalloc holds (reviews/soak-heap-3a9250e.md). So the rest also says what kind of pages it
+    holds: `huge` (joined into huge pages by the kernel), `lazy` (freed lazily, MADV_FREE, not yet taken back),
+    how many mappings it is (`maps`) and its five largest by resident size (`top`, [size, resident] in MB)."""
     try:
         with open(f"/proc/{n.p.pid}/smaps") as f:
             lines = f.read().splitlines()
     except (OSError, AttributeError):
         return None
-    maps = []  # [start, end, permissions, name, resident kB]
+    maps = []  # [start, end, permissions, name, resident kB, huge-page kB, lazily freed kB]
+    fields = {"Rss:": 4, "AnonHugePages:": 5, "LazyFree:": 6}
     for line in lines:
         m = re.match(r"^([0-9a-f]+)-([0-9a-f]+) (\S+) \S+ \S+ \S+\s*(.*)$", line)
         if m:
-            maps.append([int(m[1], 16), int(m[2], 16), m[3], m[4].strip(), 0])
-        elif line.startswith("Rss:") and maps:
-            maps[-1][4] = int(line.split()[1])
-    kb = {"glibc": 0, "stacks": 0, "rest": 0}
+            maps.append([int(m[1], 16), int(m[2], 16), m[3], m[4].strip(), 0, 0, 0])
+        elif maps and line.split(" ", 1)[0] in fields:
+            maps[-1][fields[line.split(" ", 1)[0]]] = int(line.split()[1])
+    kb = {"glibc": 0, "stacks": 0, "rest": 0, "huge": 0, "lazy": 0}
+    rest = []  # [size kB, resident kB] of each mapping of the rest
     arena = 64 << 20
-    for i, (lo, hi, _, name, rss) in enumerate(maps):
+    for i, (lo, hi, _, name, rss, huge, lazy) in enumerate(maps):
         if name not in ("", "[heap]", "[stack]"):
             continue  # (a file's pages, or the kernel's: not the node's own)
         after = maps[i + 1] if i + 1 < len(maps) else None
@@ -87,7 +98,12 @@ def maps_mb(n):
         reserved = lo % arena == 0 and (hi - lo == arena or (after and after[0] == hi and after[2].startswith("---") and after[1] - lo == arena))
         kind = "glibc" if name == "[heap]" or reserved else "stacks" if name == "[stack]" or 8188 << 10 <= hi - lo <= 8200 << 10 else "rest"
         kb[kind] += rss
-    return {k: v // 1024 for k, v in kb.items()}
+        if kind == "rest":
+            kb["huge"] += huge
+            kb["lazy"] += lazy
+            rest.append([(hi - lo) >> 10, rss])
+    top = [[size // 1024, rss // 1024] for size, rss in sorted(rest, key=lambda m: -m[1])[:5]]
+    return {**{k: v // 1024 for k, v in kb.items()}, "maps": len(rest), "top": top}
 
 
 def gauges(x):
@@ -103,7 +119,7 @@ def allocator_mb(g):
     """jemalloc's own count from a node's `gauges` (allocated, active, resident), in MB: only a build with jemalloc's
     statistics reports it (`binary: heap`). Beside `anon_mb` it says whether the heap grew or pages were held."""
     key = lambda k: f'pondra_allocator_bytes{{kind="{k}"}}'
-    return {k: round(g[key(k)] / 2**20) for k in ("allocated", "active", "resident") if key(k) in g} or None
+    return {k: round(g[key(k)] / 2**20) for k in ("allocated", "active", "resident", "metadata", "retained") if key(k) in g} or None
 
 
 def requests_of(g):
@@ -221,7 +237,7 @@ def main():
         made = deltas["write"]
         if not A.s3 or time.time() - last_list > 1800:
             listed, last_list = objects(lake), time.time()
-        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "jemalloc_mb": {p: allocator_mb(g) for p, g in got.items()}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
+        line = {"t": round(was["elapsed"] + time.time() - start), "at": time.time(), "object_writes_per_s": round(made / max(span, 1), 1), "requests_per_s": rates, "rss_mb": {x.port: rss_mb(x) for x in live}, "anon_mb": {x.port: rss_mb(x, "RssAnon") for x in live}, "maps_mb": {x.port: maps_mb(x) for x in live}, "threads": {x.port: status_of(x, "Threads") for x in live}, "jemalloc_mb": {p: allocator_mb(g) for p, g in got.items()}, "hot_mb": {p: round(g.get("pondra_hot_bytes", 0) / 2**20) for p, g in got.items()}, "cache_mb": {p: round(sum(v for k, v in g.items() if k.startswith("pondra_cache_bytes")) / 2**20) for p, g in got.items()}, "queries": {p: [int(g.get(f"pondra_queries_{k}", 0)) for k in ("running", "waiting", "total")] + [int(g.get("pondra_query_errors_total", 0))] for p, g in got.items()}, "query_mb": {p: round(g.get("pondra_memory_reserved_bytes", 0) / 2**20) for p, g in got.items()}, "reads": load.reads[0], "hwm": {x.port: hwm_of(x) for x in live}, "pids": {x.port: x.p.pid for x in live}, "images": {x.port: images(x) for x in live},
                 "untiered_rows": stats.get("untiered_rows"), "commit_ms_p95": stats.get("commit_ms_p95"),
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
