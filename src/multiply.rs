@@ -2,6 +2,9 @@
 //! checked i128s, a call to compiler-rt's `__muloti4` on wasm32 (the browser page), for every row; when
 //! both values fit an i32 their product fits an i64 and needs no check. `Products` puts `pondra_multiply(a, b)`
 //! for each `a * b` of two DECIMALs (the same type and nullability, the same answers and overflow errors).
+//! Measured on TPC-H SF1 (10-23, 10-24): a page went from 4,542 to 4,365 ms in all, q6 from 124 to 88 ms; a node was level
+//! (1.364 s without it, 1.362 and 1.326 s with it, `tools/bench/ab_compare.py`, each loaded first once). So it runs in
+//! every form, and a statement has one plan everywhere.
 use crate::optimize::rewrite_typed;
 use datafusion::arrow::array::{new_null_array, ArrowNativeTypeOp, AsArray, PrimitiveArray};
 use datafusion::arrow::compute::{try_binary, try_unary};

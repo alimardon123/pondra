@@ -16,10 +16,10 @@ next to each other keeps that to what runs.
 
 The list keeps working through dependency and toolchain bumps: crate hashes and LLVM's `.llvm.N` suffixes are
 patterns. But it goes stale by a few MB a merge as functions are renamed and added, so CI traces it again
-(.github/workflows/startup.yml, each night the code changed since the commit the list names): on a dist build left
-unstripped, then marked from that build's objects (`-C save-temps`), and the new list rides the merge train. The
-builds read it with `PONDRA_STARTUP_LAYOUT` set (tools/startup_layout.rs), and `check` on main's builds says when
-it has gone stale anyway.
+(.github/workflows/startup.yml, each night the code or the toolchain changed since the commit and the rustc the
+list names): on a dist build left unstripped, then marked from that build's objects (`-C save-temps`), checked on
+the program linked with it, and the new list rides the merge train. The builds read it with `PONDRA_STARTUP_LAYOUT`
+set (tools/startup_layout.rs), and `check` on main's builds says when it has gone stale anyway.
 """
 import argparse, json, os, re, signal, socket, subprocess, sys, tempfile, time, urllib.request
 
@@ -125,6 +125,8 @@ def trace(a):
         f.write("# The functions a node runs to its first answer and 5 s idle (tools/startup_order.py trace, then mark).\n")
         if at := commit():
             f.write(f"# Traced on {at}.\n") # (startup.yml traces it again once the code has changed since)
+        if by := built_by(a.bin):
+            f.write(f"# Built by {by}.\n") # (and once the toolchain has: a new rustc names and inlines otherwise)
         f.writelines(p + "\n" for p in patterns)
     print(f"{len(patterns)} patterns in {a.list}", file=sys.stderr)
 
@@ -134,6 +136,13 @@ def commit():
     here = os.path.dirname(os.path.abspath(__file__))
     r = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def built_by(binary):
+    """The rustc that built the binary, as `rustc --version` says it (its `.comment` section), or None."""
+    out = subprocess.run(["readelf", "-p", ".comment", binary], capture_output=True, text=True).stdout
+    m = re.search(r"rustc version (\S+ \(\S+ \S+\))", out)
+    return f"rustc {m.group(1)}" if m else None
 
 
 def lines(path):

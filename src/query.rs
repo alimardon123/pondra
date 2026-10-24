@@ -460,17 +460,8 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
-    let shown = |c: &String| !meta.dropped.contains(c) && !(hide && c == "_deleted");
-    // A column that keeps its name is passed as it is, never aliased to its own name, as SQL's
-    // planner does for `t.id AS id`: DataFusion 55's push_down_leaf_projections, which takes a JSON
-    // or struct field down to the scan, adds `?table?.id` beside such an alias's `id`, and refused
-    // the plan as ambiguous (`doc->'a'` on every keyed table, and on any table with a renamed column).
-    let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| {
-        let name = meta.name_of(f.name());
-        let column = datafusion::prelude::ident(f.name());
-        if name == *f.name() { column } else { column.alias(name) }
-    }).collect();
-    Ok(Arc::new(Table(df.select(keep)?.into_view())))
+    let shown = |c: &str| !meta.dropped.iter().any(|d| d == c) && !(hide && c == "_deleted");
+    Ok(Arc::new(Table(crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?.into_view())))
 }
 
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
