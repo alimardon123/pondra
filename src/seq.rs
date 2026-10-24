@@ -523,7 +523,7 @@ pub fn calls(sql: &str) -> bool {
 pub async fn check_every(lake: &Lake, table: &str, width: Option<usize>) -> Result<()> {
     // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
     let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };
-    let Some(meta) = other.as_deref().unwrap_or(lake).cat.get::<TableMeta>(&crate::store::table_key(&name)).await? else { return Ok(()) };
+    let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&crate::store::table_key(&name)).await? else { return Ok(()) }; // (as parsed once a version: every positional INSERT asks)
     let columns: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).filter(|c| c != "_deleted").collect();
     let given = crate::write::implicit(&columns, width);
     let first = always(&meta).find(|n| given.iter().any(|c| c == n)).map(str::to_string);
