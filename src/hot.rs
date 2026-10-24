@@ -28,18 +28,17 @@ use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef}
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::datasource::file_format::options::ReadOptions;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
 use datafusion::common::tree_node::TreeNodeRecursion;
-use datafusion::common::{stats::Precision, ScalarValue, Statistics};
+use datafusion::common::{project_schema, stats::Precision, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::physical_expr::{DynamicFilterTracking, PhysicalExpr};
 use datafusion::physical_optimizer::pruning::{PruningPredicateBuilder, PruningStatistics};
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_children_if_necessary, union::UnionExec, ExecutionPlan};
-use futures::StreamExt;
+use datafusion::physical_plan::projection::{all_alias_free_columns, new_projections_for_columns};
 use datafusion::prelude::ParquetReadOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -57,7 +56,7 @@ pub struct Hot {
 #[derive(Default)]
 struct State {
     cols: HashMap<(String, String), Col>, // (file, column) -> its arrays, a batch each
-    rows: BTreeMap<String, Vec<usize>>,   // file -> rows per batch (the same for all its columns)
+    rows: BTreeMap<String, Arc<Vec<usize>>>, // file -> rows per batch (the same for all its columns)
     used: usize,
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
@@ -73,6 +72,33 @@ struct Col {
 /// A column's least and greatest value in each batch of a file (null: none known), and each
 /// batch's nulls and rows, as Parquet's statistics give them for a row group.
 type Ranges = Arc<[ArrayRef; 4]>;
+
+/// A file's hot columns as one scan takes them: each column's arrays (a batch each), each batch's rows, and the
+/// ranges of the columns that have them. A batch is put together only when the scan reads it (`HotSource::open`),
+/// so planning costs a few steps a file, not a step a batch.
+#[derive(Clone)]
+struct Held {
+    columns: Vec<Arc<Vec<ArrayRef>>>,
+    rows: Arc<Vec<usize>>,
+    ranges: Arc<HashMap<String, Ranges>>,
+}
+
+impl Held {
+    /// A file with no columns held: its rows in batches of `BATCH`, the last one shorter. A scan of no columns reads
+    /// these, and no data.
+    fn rows_only(rows: u64) -> Held {
+        let rows = rows as usize;
+        let batches: Vec<usize> = (0..rows).step_by(BATCH).map(|at| BATCH.min(rows - at)).collect();
+        Held { columns: vec![], rows: Arc::new(batches), ranges: Default::default() }
+    }
+
+    /// The i-th batch of the columns `projection` names (indexes into `columns`), under `projected`, the source's
+    /// projected schema, so every batch shares one schema `Arc`. Built with the batch's row count, so a batch of no columns keeps its rows.
+    fn batch(&self, projected: &SchemaRef, projection: &[usize], i: usize) -> datafusion::error::Result<RecordBatch> {
+        let columns = projection.iter().map(|&c| self.columns[c][i].clone()).collect();
+        Ok(RecordBatch::try_new_with_options(projected.clone(), columns, &RecordBatchOptions::new().with_row_count(Some(self.rows[i])))?)
+    }
+}
 
 impl Hot {
     pub fn new() -> Hot {
@@ -120,7 +146,7 @@ impl Hot {
         }
         let mut s = self.state.lock().unwrap();
         // (held as its path, or as `path#…` without its deleted rows: `key`)
-        let held = |rows: &BTreeMap<String, Vec<usize>>, p: &str| rows.range(p.to_string()..).next().is_some_and(|(k, _)| base(k) == p);
+        let held = |rows: &BTreeMap<String, Arc<Vec<usize>>>, p: &str| rows.range(p.to_string()..).next().is_some_and(|(k, _)| base(k) == p);
         let gone: HashSet<&str> = replaced.iter().map(|(p, _)| p.as_str()).filter(|p| held(&s.rows, p)).collect();
         if gone.is_empty() {
             return; // (most commits: what they replaced went at an earlier one)
@@ -135,22 +161,26 @@ impl Hot {
         s.used = s.used.saturating_sub(freed);
     }
 
-    /// `file`'s batches with `schema`'s columns, if all of them are here, and their columns' ranges.
-    fn get(&self, file: &str, schema: &SchemaRef) -> Option<(Vec<RecordBatch>, Arc<HashMap<String, Ranges>>)> {
+    /// `file`'s columns of `schema`, if all of them are here, as a `Held`. None when a column's arrays aren't of the
+    /// field's type, or a field that can't be null holds one: the checks a batch's build made, made once here (all of
+    /// a column's arrays share its type).
+    fn get(&self, file: &str, schema: &SchemaRef) -> Option<Held> {
         let mut s = self.state.lock().unwrap();
         let rows = s.rows.get(file)?.clone();
         let now = Instant::now();
-        let (mut cols, mut ranges) = (vec![], HashMap::new());
+        let (mut columns, mut ranges) = (vec![], HashMap::new());
         for f in schema.fields() {
             let c = s.cols.get_mut(&(file.to_string(), f.name().clone()))?;
+            if c.arrays.iter().any(|a| a.data_type() != f.data_type() || (!f.is_nullable() && a.null_count() > 0)) {
+                return None;
+            }
             c.read = now;
-            cols.push(c.arrays.clone());
+            columns.push(c.arrays.clone());
             if let Some(r) = &c.ranges {
                 ranges.insert(f.name().clone(), r.clone());
             }
         }
-        let batch = |i: usize| RecordBatch::try_new_with_options(schema.clone(), cols.iter().map(|c| c[i].clone()).collect(), &RecordBatchOptions::new().with_row_count(Some(rows[i])));
-        Some(((0..rows.len()).map(batch).collect::<Result<_, _>>().ok()?, Arc::new(ranges)))
+        Some(Held { columns, rows, ranges: Arc::new(ranges) })
     }
 
     /// Decode `file`'s columns among `fields` that aren't here yet, in the background, if they
@@ -178,14 +208,14 @@ impl Hot {
             let mut s = hot.state.lock().unwrap();
             s.busy.remove(&key);
             let Ok((rows, arrays, ranges)) = decoded else { return };
-            if s.rows.get(&key).is_some_and(|r| *r != rows) {
+            if s.rows.get(&key).is_some_and(|r| **r != rows) {
                 return; // (batches cut differently: can't be combined)
             }
             let sizes: Vec<usize> = arrays.iter().map(|a| size(a)).collect();
             if !s.room(sizes.iter().sum(), room) {
                 return;
             }
-            s.rows.insert(key.clone(), rows);
+            s.rows.insert(key.clone(), Arc::new(rows));
             for (((f, arrays), ranges), bytes) in fields.iter().zip(arrays).zip(ranges).zip(sizes) {
                 s.used += bytes;
                 s.cols.insert((key.clone(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
@@ -258,7 +288,7 @@ impl Hot {
         if s.rows.contains_key(path) || !s.room(total, room) {
             return;
         }
-        s.rows.insert(path.to_string(), rows);
+        s.rows.insert(path.to_string(), Arc::new(rows));
         for (f, (arrays, ranges, bytes)) in fields.iter().zip(held) {
             s.used += bytes;
             s.cols.insert((path.to_string(), f.name().clone()), Col { arrays: Arc::new(arrays), ranges, bytes, read: Instant::now() });
@@ -526,15 +556,20 @@ impl TableProvider for HotFiles {
             None => self.schema.as_ref().clone(),
         });
         let deletes = self.meta.key.is_empty(); // (a keyed table's positions are older versions its own reads pass over)
-        let (mut cached, mut cold) = (vec![], vec![]);
+        let (mut held, mut cold) = (vec![], vec![]);
         for f in &self.files {
+            // A scan of no columns reads no data: a plain file is its rows, from the catalog (no lookup, no load).
+            if schema.fields().is_empty() && plain_file(f, deletes) {
+                held.push(Held::rows_only(f.rows));
+                continue;
+            }
             match self.lake.hot.get(&key(f, deletes), &schema) {
-                Some((batches, ranges)) => cached.extend(batches.into_iter().enumerate().map(|(i, b)| (b, (ranges.clone(), i)))),
+                Some(h) => held.push(h),
                 None => cold.push(f),
             }
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
-        let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| f.lineage.is_none() && (f.deletes.is_empty() || !deletes));
+        let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| plain_file(f, deletes));
         if !plain.is_empty() {
             let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
@@ -552,17 +587,11 @@ impl TableProvider for HotFiles {
         for f in cold {
             self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes);
         }
-        if !cached.is_empty() {
-            let n = state.config().target_partitions().max(1);
-            let (mut parts, mut pieces) = (vec![vec![]; n], vec![vec![]; n]);
-            for (i, (b, piece)) in cached.into_iter().enumerate() {
-                parts[i % n].push(b);
-                pieces[i % n].push(piece);
+        if !held.is_empty() {
+            let source = HotSource::new(schema.clone(), held, state.config().target_partitions().max(1), self.known.clone());
+            if !source.parts.is_empty() {
+                plans.push(DataSourceExec::from_data_source(source));
             }
-            parts.retain(|p| !p.is_empty());
-            pieces.retain(|p| !p.is_empty());
-            let memory = MemorySourceConfig::try_new(&parts, schema.clone(), None)?;
-            plans.push(DataSourceExec::from_data_source(HotSource::new(memory, Arc::new(pieces), None, self.known.clone())));
         }
         match plans.len() {
             0 => Ok(Arc::new(EmptyExec::new(schema))),
@@ -571,8 +600,21 @@ impl TableProvider for HotFiles {
     }
 }
 
-/// A batch's place: its file's columns' ranges, and which of its batches it is.
-type Piece = (Arc<HashMap<String, Ranges>>, usize);
+/// A file a scan reads as Parquet: no lineage, and no deleted rows to drop (`deletes`: the table's rows are read
+/// without them, as a keyed table's are not).
+fn plain_file(f: &DataFile, deletes: bool) -> bool { f.lineage.is_none() && (f.deletes.is_empty() || !deletes) }
+
+/// Each file's batches dealt to `n` partitions in turn: the i-th batch, in the order the files hold them, goes to
+/// partition `i % n`. Each batch is a (file, batch) pair; an empty partition is left out.
+fn deal(files: &[Held], n: usize) -> Vec<Vec<(u32, u32)>> {
+    let mut parts = vec![vec![]; n];
+    let batches = files.iter().enumerate().flat_map(|(f, h)| (0..h.rows.len()).map(move |b| (f as u32, b as u32)));
+    for (i, batch) in batches.enumerate() {
+        parts[i % n].push(batch);
+    }
+    parts.retain(|p| !p.is_empty());
+    parts
+}
 
 /// What the planner knows of a column of the batches: the table's least and greatest value and
 /// how many values it holds, as the table gives them to the join order (`query::Pruned::count`:
@@ -629,60 +671,170 @@ fn told(plan: Arc<dyn ExecutionPlan>, known: &HashMap<String, Known>) -> datafus
     Ok(DataSourceExec::from_data_source(built))
 }
 
-/// The hot batches of a scan, as DataFusion's memory source reads them, skipping each batch the
-/// scan's filters rule out by its ranges. The filters stay above (rows are filtered there): here
-/// they only skip batches, as a Parquet scan skips row groups. A dynamic filter (a join's keys, a
-/// top-N's bound) is looked at again as it moves.
-#[derive(Debug, Clone)]
+/// The hot batches of a scan, as DataFusion's memory source reads them (the same partitions in the same order, and
+/// the same EXPLAIN text), skipping each batch the scan's filters rule out by its ranges. The filters stay above (rows
+/// are filtered there): here they only skip batches, as a Parquet scan skips row groups. A dynamic filter (a join's
+/// keys, a top-N's bound) is looked at again as it moves. A batch is put together only when it is read.
+#[derive(Clone)]
 struct HotSource {
-    memory: MemorySourceConfig,
-    pieces: Arc<Vec<Vec<Piece>>>, // (each partition's batches')
+    schema: SchemaRef,              // the scan's columns, before a projection pushed into it
+    projection: Option<Vec<usize>>, // (indexes into `schema`)
+    projected_schema: SchemaRef,    // `schema` projected: what each batch is
+    files: Arc<Vec<Held>>,
+    parts: Arc<Vec<Vec<(u32, u32)>>>, // each partition's batches, as (file, batch), in the order it reads them
+    fetch: Option<usize>,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Each partition's statistics and then all of them, as the memory source works them out, kept
     /// once worked out: it adds up every column of every batch, and planning asks again at every
     /// step (a third of planning TPC-H q8 from memory). They don't change with the fetch or the
     /// predicate, only with the batches and the columns.
-    stats: Arc<[std::sync::OnceLock<Arc<datafusion::common::Statistics>>]>,
+    stats: Arc<[std::sync::OnceLock<Arc<Statistics>>]>,
     /// What the planner knows of each column (`Known`), by name.
     known: Arc<HashMap<String, Known>>,
 }
 
 impl HotSource {
-    fn new(memory: MemorySourceConfig, pieces: Arc<Vec<Vec<Piece>>>, predicate: Option<Arc<dyn PhysicalExpr>>, known: Arc<HashMap<String, Known>>) -> HotSource {
-        let stats = (0..=memory.partitions().len()).map(|_| std::sync::OnceLock::new()).collect();
-        HotSource { memory, pieces, predicate, stats, known }
+    /// A source reading `schema`'s columns of `files`, their batches dealt to `n` partitions (`deal`).
+    fn new(schema: SchemaRef, files: Vec<Held>, n: usize, known: Arc<HashMap<String, Known>>) -> HotSource {
+        let parts = deal(&files, n);
+        HotSource {
+            projected_schema: schema.clone(),
+            schema,
+            projection: None,
+            stats: stats_for(parts.len()),
+            parts: Arc::new(parts),
+            files: Arc::new(files),
+            fetch: None,
+            predicate: None,
+            known,
+        }
+    }
+
+    /// The scan's columns the source reads: its projection, or all of them.
+    fn projection_indices(&self) -> Vec<usize> {
+        self.projection.clone().unwrap_or_else(|| (0..self.schema.fields().len()).collect())
+    }
+}
+
+impl std::fmt::Debug for HotSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "HotSource({} partitions)", self.parts.len()) }
+}
+
+/// The statistics slots of a source: one per partition, and one for all of them.
+fn stats_for(partitions: usize) -> Arc<[std::sync::OnceLock<Arc<Statistics>>]> { (0..=partitions).map(|_| std::sync::OnceLock::new()).collect() }
+
+/// The rows, bytes and each projected column's nulls of the batches `list` names, as `compute_record_batch_statistics`
+/// adds them up, worked out from the held arrays (no batch is built).
+fn statistics_of(files: &[Held], list: impl Iterator<Item = (u32, u32)>, projection: &[usize]) -> Statistics {
+    let (mut rows, mut bytes, mut nulls) = (0, 0, vec![0; projection.len()]);
+    for (file, batch) in list {
+        let (held, batch) = (&files[file as usize], batch as usize);
+        rows += held.rows[batch];
+        for (n, &c) in nulls.iter_mut().zip(projection) {
+            let array = &held.columns[c][batch];
+            bytes += array.get_array_memory_size();
+            *n += array.logical_nulls().map_or(0, |nulls| nulls.null_count());
+        }
+    }
+    Statistics {
+        num_rows: Precision::Exact(rows),
+        total_byte_size: Precision::Exact(bytes),
+        column_statistics: nulls
+            .into_iter()
+            .map(|null_count| ColumnStatistics { null_count: Precision::Exact(null_count), ..ColumnStatistics::new_unknown() })
+            .collect(),
     }
 }
 
 impl DataSource for HotSource {
-    fn open(&self, partition: usize, context: Arc<datafusion::execution::TaskContext>) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
-        let stream = self.memory.open(partition, context)?;
-        let (Some(predicate), None) = (&self.predicate, self.memory.fetch()) else { return Ok(stream) }; // (a fetch counts the rows it reads: none skipped)
-        let mut skip = Skip { predicate: predicate.clone(), tracking: DynamicFilterTracking::classify(predicate), schema: self.memory.original_schema(), pieces: self.pieces[partition].clone(), keep: None, next: 0, gap: 1, stats: Default::default() };
-        let schema = stream.schema();
-        let kept = stream.enumerate().filter_map(move |(i, b)| std::future::ready(skip.keep(i).then_some(b)));
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, kept)))
+    fn open(&self, partition: usize, _context: Arc<datafusion::execution::TaskContext>) -> datafusion::error::Result<datafusion::execution::SendableRecordBatchStream> {
+        let list = self.parts[partition].clone();
+        let projection = self.projection_indices();
+        let projected = self.projected_schema.clone();
+        let files = self.files.clone();
+        // (a fetch counts the rows it reads, so none is skipped then)
+        let mut skip = match (&self.predicate, self.fetch) {
+            (Some(predicate), None) => Some(Skip {
+                predicate: predicate.clone(),
+                tracking: DynamicFilterTracking::classify(predicate),
+                schema: self.schema.clone(),
+                files: files.clone(),
+                list: list.clone(),
+                keep: None,
+                next: 0,
+                gap: 1,
+                stats: Default::default(),
+            }),
+            _ => None,
+        };
+        let (mut left, mut at) = (self.fetch, 0); // (the rows a fetch has left, and the next batch of the list)
+        let batches = std::iter::from_fn(move || loop {
+            if left == Some(0) {
+                return None;
+            }
+            let i = at;
+            at += 1;
+            let &(file, batch) = list.get(i)?;
+            if skip.as_mut().is_some_and(|s| !s.keep(i)) {
+                continue;
+            }
+            let batch = match files[file as usize].batch(&projected, &projection, batch as usize) {
+                Ok(batch) => batch,
+                Err(e) => return Some(Err(e)),
+            };
+            let rows = batch.num_rows();
+            let batch = match left {
+                Some(n) if rows > n => batch.slice(0, n), // (the fetch's last batch, cut)
+                _ => batch,
+            };
+            left = left.map(|n| n.saturating_sub(rows));
+            return Some(Ok(batch));
+        });
+        let stream = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.projected_schema.clone(), futures::stream::iter(batches));
+        Ok(Box::pin(datafusion::physical_plan::coop::cooperative(stream)))
     }
-    fn fmt_as(&self, t: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result { self.memory.fmt_as(t, f) }
-    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning { self.memory.output_partitioning() }
-    fn eq_properties(&self) -> datafusion::physical_expr::EquivalenceProperties { self.memory.eq_properties() }
-    fn scheduling_type(&self) -> datafusion::physical_plan::execution_plan::SchedulingType { self.memory.scheduling_type() }
-    fn partition_statistics(&self, partition: Option<usize>) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
+    fn fmt_as(&self, t: datafusion::physical_plan::DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        // (the text DataFusion's memory source writes in each arm, so EXPLAIN reads as before)
+        match t {
+            datafusion::physical_plan::DisplayFormatType::Default | datafusion::physical_plan::DisplayFormatType::Verbose => {
+                let sizes: Vec<usize> = self.parts.iter().map(|p| p.len()).collect();
+                let limit = self.fetch.map_or(String::new(), |n| format!(", fetch={n}"));
+                write!(f, "partitions={}, partition_sizes={sizes:?}{limit}", sizes.len())
+            }
+            datafusion::physical_plan::DisplayFormatType::TreeRender => {
+                // (memory counts its batches as rows, and each batch's arrays of every column, the projected or not)
+                let batches: usize = self.parts.iter().map(|p| p.len()).sum();
+                let bytes: usize = self
+                    .parts
+                    .iter()
+                    .flatten()
+                    .map(|&(file, batch)| self.files[file as usize].columns.iter().map(|c| c[batch as usize].get_array_memory_size()).sum::<usize>())
+                    .sum();
+                writeln!(f, "format=memory")?;
+                writeln!(f, "rows={batches}")?;
+                writeln!(f, "bytes={bytes}")
+            }
+        }
+    }
+    fn output_partitioning(&self) -> datafusion::physical_plan::Partitioning { datafusion::physical_plan::Partitioning::UnknownPartitioning(self.parts.len()) }
+    fn eq_properties(&self) -> datafusion::physical_expr::EquivalenceProperties { datafusion::physical_expr::EquivalenceProperties::new(self.projected_schema.clone()) }
+    fn scheduling_type(&self) -> datafusion::physical_plan::execution_plan::SchedulingType { datafusion::physical_plan::execution_plan::SchedulingType::Cooperative }
+    fn partition_statistics(&self, partition: Option<usize>) -> datafusion::error::Result<Arc<Statistics>> {
         let all = self.stats.len() - 1;
         let slot = match partition {
             Some(i) if i < all => &self.stats[i],
             None => &self.stats[all],
-            Some(_) => return self.memory.partition_statistics(partition),
+            Some(_) => return Ok(Arc::new(Statistics::new_unknown(&self.projected_schema))),
         };
         if let Some(s) = slot.get() {
             return Ok(s.clone());
         }
-        let mut s = Arc::unwrap_or_clone(self.memory.partition_statistics(partition)?);
-        let schema = self.memory.original_schema();
-        let names: Vec<&str> = match self.memory.projection() {
-            Some(p) => p.iter().map(|&i| schema.field(i).name().as_str()).collect(),
-            None => schema.fields().iter().map(|f| f.name().as_str()).collect(),
+        let projection = self.projection_indices();
+        let mut s = match partition {
+            Some(i) => statistics_of(&self.files, self.parts[i].iter().copied(), &projection),
+            None => statistics_of(&self.files, self.parts.iter().flatten().copied(), &projection),
         };
+        let names: Vec<&str> = projection.iter().map(|&i| self.schema.field(i).name().as_str()).collect();
         for (c, name) in s.column_statistics.iter_mut().zip(names) {
             let Some(k) = self.known.get(name) else { continue };
             if let Some((lo, hi)) = &k.range {
@@ -694,41 +846,44 @@ impl DataSource for HotSource {
         }
         Ok(slot.get_or_init(|| Arc::new(s)).clone())
     }
-    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> { Some(Arc::new(HotSource { memory: self.memory.clone().with_limit(limit), ..self.clone() })) }
-    fn fetch(&self) -> Option<usize> { self.memory.fetch() }
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> { Some(Arc::new(HotSource { fetch: limit, ..self.clone() })) }
+    fn fetch(&self) -> Option<usize> { self.fetch }
     fn try_swapping_with_projection(&self, projection: &datafusion::physical_expr::projection::ProjectionExprs) -> datafusion::error::Result<Option<Arc<dyn DataSource>>> {
         // (a projection of plain columns: the batches and their order stay, and ranges go by name)
-        let Some(projected) = self.memory.try_swapping_with_projection(projection)? else { return Ok(None) };
-        let projected: Arc<dyn std::any::Any + Send + Sync> = projected;
-        Ok(projected.downcast::<MemorySourceConfig>().ok().map(|m| Arc::new(HotSource::new(Arc::unwrap_or_clone(m), self.pieces.clone(), self.predicate.clone(), self.known.clone())) as Arc<dyn DataSource>))
+        let exprs = projection.iter().cloned().collect::<Vec<_>>();
+        if !all_alias_free_columns(&exprs) {
+            return Ok(None);
+        }
+        let all: Vec<usize> = (0..self.schema.fields().len()).collect();
+        let columns = new_projections_for_columns(&exprs, self.projection.as_ref().unwrap_or(&all));
+        let projected_schema = project_schema(&self.schema, Some(&columns))?;
+        Ok(Some(Arc::new(HotSource { projection: Some(columns), projected_schema, stats: stats_for(self.parts.len()), ..self.clone() })))
     }
     fn try_pushdown_sort(&self, order: &[datafusion::physical_expr::PhysicalSortExpr]) -> datafusion::error::Result<datafusion::physical_plan::SortOrderPushdownResult<Arc<dyn DataSource>>> {
         // A top-N reads each partition's batches in the order its first key's ranges give, so its
         // bound is found in the first batches and the rest are skipped: the newest rows of a table
         // whose rows came oldest first, too. The sort above still sorts.
         use datafusion::physical_plan::SortOrderPushdownResult::{Inexact, Unsupported};
-        if self.memory.fetch().is_some() {
+        if self.fetch.is_some() {
             return Ok(Unsupported); // (a fetch keeps the first rows: reordered, it would keep others)
         }
         let Some((key, desc)) = order.first().and_then(|o| Some((o.expr.downcast_ref::<datafusion::physical_expr::expressions::Column>()?.name().to_string(), o.options.descending))) else { return Ok(Unsupported) };
-        let (mut parts, mut pieces) = (vec![], vec![]);
-        for (batches, own) in self.memory.partitions().iter().zip(self.pieces.iter()) {
-            let Some(ends) = own.iter().map(|(r, i)| r.get(&key).map(|r| datafusion::common::ScalarValue::try_from_array(&r[usize::from(desc)], *i).ok())).collect::<Option<Vec<_>>>() else { return Ok(Unsupported) };
-            let mut order: Vec<usize> = (0..own.len()).collect();
+        let mut parts = Vec::with_capacity(self.parts.len());
+        for list in self.parts.iter() {
+            let Some(ends) = list.iter().map(|&(file, batch)| self.files[file as usize].ranges.get(&key).map(|r| datafusion::common::ScalarValue::try_from_array(&r[usize::from(desc)], batch as usize).ok())).collect::<Option<Vec<_>>>() else { return Ok(Unsupported) };
+            let mut order: Vec<usize> = (0..list.len()).collect();
             // (by least value up, or greatest down; a batch of NULLs, or of no known range, last)
             order.sort_by(|&a, &b| match (ends[a].as_ref().filter(|v| !v.is_null()), ends[b].as_ref().filter(|v| !v.is_null())) {
                 (Some(x), Some(y)) => (if desc { y.partial_cmp(x) } else { x.partial_cmp(y) }).unwrap_or(std::cmp::Ordering::Equal),
                 (x, y) => x.is_none().cmp(&y.is_none()),
             });
-            parts.push(order.iter().map(|&i| batches[i].clone()).collect::<Vec<_>>());
-            pieces.push(order.iter().map(|&i| own[i].clone()).collect::<Vec<_>>());
+            parts.push(order.iter().map(|&i| list[i]).collect::<Vec<_>>());
         }
-        let memory = MemorySourceConfig::try_new(&parts, self.memory.original_schema(), self.memory.projection().clone())?.with_limit(self.memory.fetch());
-        Ok(Inexact { inner: Arc::new(HotSource::new(memory, Arc::new(pieces), self.predicate.clone(), self.known.clone())) })
+        Ok(Inexact { inner: Arc::new(HotSource { parts: Arc::new(parts), ..self.clone() }) })
     }
     fn try_pushdown_filters(&self, filters: Vec<Arc<dyn PhysicalExpr>>, _: &datafusion::common::config::ConfigOptions) -> datafusion::error::Result<FilterPushdownPropagation<Arc<dyn DataSource>>> {
         let below = vec![PushedDown::No; filters.len()];
-        let schema = self.memory.original_schema();
+        let schema = self.schema.clone();
         let skips = |f: &Arc<dyn PhysicalExpr>| DynamicFilterTracking::classify(f).contains_dynamic_filter() || datafusion::physical_expr::utils::collect_columns(f).iter().any(|c| schema.field_with_name(c.name()).is_ok_and(|f| ranges(&[new_null_array(f.data_type(), 0)]).is_some()));
         let useful: Vec<_> = filters.into_iter().filter(skips).collect();
         if useful.is_empty() {
@@ -737,11 +892,11 @@ impl DataSource for HotSource {
         let predicate = datafusion::physical_expr::conjunction(self.predicate.iter().cloned().chain(useful));
         Ok(FilterPushdownPropagation::with_parent_pushdown_result(below).with_updated_node(Arc::new(HotSource { predicate: Some(predicate), ..self.clone() }) as Arc<dyn DataSource>))
     }
-    fn apply_expressions(&self, f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>) -> datafusion::error::Result<TreeNodeRecursion> {
+    fn apply_expressions(&self, _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>) -> datafusion::error::Result<TreeNodeRecursion> {
         // (the predicate isn't shown: a join or an aggregate builds its dynamic filter only for a
         // plan below it that shows it, and building a join's cost TPC-H from memory a tenth, for
         // batches a key range never rules out; a top-N keeps its bound up whoever reads it)
-        self.memory.apply_expressions(f)
+        Ok(TreeNodeRecursion::Continue)
     }
 }
 
@@ -797,7 +952,8 @@ struct Skip {
     predicate: Arc<dyn PhysicalExpr>,
     tracking: DynamicFilterTracking,
     schema: SchemaRef,
-    pieces: Vec<Piece>,
+    files: Arc<Vec<Held>>,
+    list: Vec<(u32, u32)>, // the partition's batches, as (file, batch), in the order it reads them
     keep: Option<Vec<bool>>,
     next: usize, // (the batch from which a moved filter is looked at again)
     gap: usize,
@@ -834,11 +990,12 @@ impl Skip {
             .or_insert_with(|| {
                 // (a run of one file's batches in order is one slice: a partition holds hundreds)
                 let mut runs: Vec<(&Ranges, usize, usize)> = Vec::new();
-                for (r, i) in &self.pieces {
-                    let r = r.get(column)?;
+                for &(file, batch) in &self.list {
+                    let r = self.files[file as usize].ranges.get(column)?;
+                    let batch = batch as usize;
                     match runs.last_mut() {
-                        Some((last, start, len)) if Arc::ptr_eq(last, r) && *start + *len == *i => *len += 1,
-                        _ => runs.push((r, *i, 1)),
+                        Some((last, start, len)) if Arc::ptr_eq(last, r) && *start + *len == batch => *len += 1,
+                        _ => runs.push((r, batch, 1)),
                     }
                 }
                 let each: Vec<[ArrayRef; 4]> = runs.iter().map(|(r, i, n)| std::array::from_fn(|k| r[k].slice(*i, *n))).collect();
@@ -852,9 +1009,9 @@ impl Skip {
 impl PruningStatistics for Skip {
     fn min_values(&self, column: &datafusion::common::Column) -> Option<ArrayRef> { self.ranges(column.name()).map(|r| r[0].clone()) }
     fn max_values(&self, column: &datafusion::common::Column) -> Option<ArrayRef> { self.ranges(column.name()).map(|r| r[1].clone()) }
-    fn num_containers(&self) -> usize { self.pieces.len() }
+    fn num_containers(&self) -> usize { self.list.len() }
     fn null_counts(&self, column: &datafusion::common::Column) -> Option<ArrayRef> { self.ranges(column.name()).map(|r| r[2].clone()) }
-    fn row_counts(&self) -> Option<ArrayRef> { self.pieces.first().and_then(|(r, _)| r.keys().next().cloned()).and_then(|c| self.ranges(&c)).map(|r| r[3].clone()) }
+    fn row_counts(&self) -> Option<ArrayRef> { self.list.first().and_then(|&(file, _)| self.files[file as usize].ranges.keys().next().cloned()).and_then(|c| self.ranges(&c)).map(|r| r[3].clone()) }
     fn contained(&self, _: &datafusion::common::Column, _: &HashSet<datafusion::common::ScalarValue>) -> Option<BooleanArray> { None }
 }
 
@@ -879,18 +1036,56 @@ mod tests {
         hot.put("data/t/x.parquet", &fields, vec![ints, strings], 1 << 30);
 
         let schema = Arc::new(Schema::new(fields.iter().map(|f| f.as_ref().clone()).collect::<Vec<Field>>()));
-        let (batches, ranges) = hot.get("data/t/x.parquet", &schema).expect("held");
+        let held = hot.get("data/t/x.parquet", &schema).expect("held");
+        let batches: Vec<RecordBatch> = (0..held.rows.len()).map(|i| held.batch(&schema, &[0, 1], i)).collect::<datafusion::error::Result<_>>().unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).collect::<Vec<_>>(), [8192, 8192, 8192, 427]);
         let values: Vec<i64> = batches.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec()).collect();
         assert_eq!(values, (0..25_003).collect::<Vec<i64>>());
         let texts: Vec<String> = batches.iter().flat_map(|b| b.column(1).as_string_view().iter().map(|s| s.unwrap_or_default().to_string()).collect::<Vec<_>>()).collect();
         assert!(texts.iter().enumerate().all(|(i, s)| *s == format!("s{i}")));
-        assert!(ranges.get("i").is_some());
-        assert!(ranges.get("s").is_none());
+        assert!(held.ranges.get("i").is_some());
+        assert!(held.ranges.get("s").is_none());
 
         // The table's folder holds them; another table whose name starts the same doesn't.
-        let held = hot.columns("t", &schema);
-        assert_eq!(names_and_types(held), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
+        let held_fields = hot.columns("t", &schema);
+        assert_eq!(names_and_types(held_fields), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
         assert!(hot.columns("t2", &schema).is_empty());
+    }
+
+    #[test]
+    fn a_source_reads_its_batches_in_the_order_they_are_dealt() {
+        // Two files, of 3 and 2 batches (4, 4, 2 and 3, 5 rows), with an Int64 column counting up through them.
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+        let file = |from: i64, sizes: &[usize]| {
+            let mut at = from;
+            let arrays: Vec<ArrayRef> = sizes
+                .iter()
+                .map(|&n| {
+                    let array: ArrayRef = Arc::new(Int64Array::from_iter_values(at..at + n as i64));
+                    at += n as i64;
+                    array
+                })
+                .collect();
+            Held { columns: vec![Arc::new(arrays)], rows: Arc::new(sizes.to_vec()), ranges: Default::default() }
+        };
+        let files = vec![file(0, &[4, 4, 2]), file(10, &[3, 5])];
+        // Batch i goes to partition i % 2 in turn: file 0's batches 0 and 2 and file 1's batch 1, then file 0's 1 and file 1's 0.
+        assert_eq!(deal(&files, 2), vec![vec![(0, 0), (0, 2), (1, 1)], vec![(0, 1), (1, 0)]]);
+
+        let source = HotSource::new(schema, files, 2, Default::default());
+        let rows = |source: &dyn DataSource, p: usize| -> Vec<i64> {
+            let stream = source.open(p, Arc::new(datafusion::execution::TaskContext::default())).unwrap();
+            let batches = futures::executor::block_on(datafusion::physical_plan::common::collect(stream)).unwrap();
+            batches.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec()).collect()
+        };
+        assert_eq!(rows(&source, 0), [0, 1, 2, 3, 8, 9, 13, 14, 15, 16, 17]);
+        assert_eq!(rows(&source, 1), [4, 5, 6, 7, 10, 11, 12]);
+
+        // A fetch of 5 ends in the middle of the second batch read (its first row only).
+        let limited = source.with_fetch(Some(5)).unwrap();
+        assert_eq!(rows(limited.as_ref(), 0), [0, 1, 2, 3, 8]);
+
+        assert_eq!(source.partition_statistics(None).unwrap().num_rows, Precision::Exact(18));
+        assert_eq!(source.partition_statistics(Some(1)).unwrap().num_rows, Precision::Exact(7));
     }
 }
