@@ -4,6 +4,7 @@
 //! storage or the catalog, so the rules over it (`shape`) run the same in a browser as on a node.
 pub mod fit;
 pub mod keys;
+pub mod typed;
 
 use datafusion::arrow::datatypes::SchemaRef;
 
