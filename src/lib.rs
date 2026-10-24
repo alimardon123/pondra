@@ -61,6 +61,8 @@ mod scan;
 mod reach;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
 mod read_delta;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a write's rules: a node makes its table from its entry; a page's come with `shape`)
+mod rules;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
