@@ -35,6 +35,7 @@ From 1.0, releases are `major.minor.patch`.
 | The clients | Python's and JavaScript's public names (no leading `_`), their arguments, and frames' methods. | |
 | The command line | Commands, flags, documented `PONDRA_*` variables, exit codes, and what `--json` and `--format` print. | The text written for people. |
 | Running it | `pondra.toml` keys, `pondra service` options, `/metrics` names (labels may be added), `/healthz` and `/ready`, the container's paths and the Helm chart's values. | |
+| The console's API (a preview) | Nothing in 1.0. `window.pondra`'s `register.*` names are listed in `docs/surface.json` as a preview, and kept from 1.1 with their arguments (ADR-075 §5). | Every name and argument until 1.1, and the rest of `window.pondra`. |
 
 **Not kept:** what the reference marks as a preview, `PONDRA_DEBUG_*` and other undocumented
 variables, log lines, speed, and the console's look. A preview says so in its reference page and in
@@ -52,6 +53,7 @@ patch. The release notes say what changed and why.
 - the SQLSTATEs in `codes.rs`;
 - Python's and JavaScript's public names;
 - `/metrics`' names.
+- the console's `register.*` names, as a preview: a change to them is a notice, never a failure.
 
 CI (`build.yml`'s suite) compares a pull request's build with its `docs/surface.json`, and that file
 with main's:

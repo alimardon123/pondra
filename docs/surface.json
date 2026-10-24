@@ -223,6 +223,22 @@
    "LAKE"
   ]
  },
+ "console": [
+  "register.action",
+  "register.cellKind",
+  "register.command",
+  "register.doc",
+  "register.jobKind",
+  "register.key",
+  "register.nav",
+  "register.objectAction",
+  "register.objectKind",
+  "register.panel",
+  "register.renderer",
+  "register.section",
+  "register.setting",
+  "register.view"
+ ],
  "http": [
   "ANY /db/{name}",
   "ANY /db/{name}/{*rest}",
