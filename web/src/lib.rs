@@ -71,6 +71,13 @@ impl Page {
         Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?, Some(held)))
     }
 
+    /// The kept files this page couldn't read, each as `{file, why}`: the file's path and the words of why. Empty when
+    /// it read them all, and for a page that keeps nothing. The file is left as it is, so the page can say which tables
+    /// it left out.
+    pub fn unread(&self) -> JsValue {
+        self.0.unread().iter().map(|(file, why)| unread_entry(file, why)).collect::<js_sys::Array>().into()
+    }
+
     /// One request, as to a node (ADR-061's contract): `request('POST', '/sql?format=csv', {}, 'FROM t')`,
     /// `request('PUT', '/files/t.csv', {'If-Match': '"v"'}, bytes)`. `headers` is a plain object of the request's
     /// headers (or undefined or null for none); `body` is text, bytes (a Uint8Array or an ArrayBuffer) or nothing. The
@@ -94,6 +101,15 @@ impl Page {
         js_sys::Reflect::set(&out, &"body".into(), &js_sys::Uint8Array::from(&answer.body[..]).into())?;
         Ok(out.into())
     }
+}
+
+/// One unread file as `{file, why}`. A fresh object takes its keys, so setting them cannot fail.
+fn unread_entry(file: &str, why: &str) -> JsValue {
+    let object = js_sys::Object::new();
+    for (key, value) in [("file", file), ("why", why)] {
+        js_sys::Reflect::set(&object, &key.into(), &value.into()).expect("a fresh object takes its keys");
+    }
+    object.into()
 }
 
 /// A request's headers from a plain object (`{'If-Match': '"v"'}`), none for undefined or null. A value that isn't a
