@@ -8,16 +8,20 @@ use crate::front::Host;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use anyhow::Context;
 use async_trait::async_trait;
-use datafusion::arrow::datatypes::SchemaRef;
+use futures::{TryFutureExt, TryStreamExt};
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::ipc::{reader::FileReader, writer::FileWriter};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, Session, SchemaProvider, TableProvider};
-use datafusion::common::{Constraints, Statistics};
+use datafusion::common::{Constraints, DFSchema, Statistics};
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::datasource::{MemTable, TableType};
+use datafusion::datasource::{source_as_provider, MemTable, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan};
+use datafusion::logical_expr::dml::{InsertOp, WriteOp};
+use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use serde_json::json;
@@ -30,10 +34,19 @@ const JSON: &str = "application/json";
 const FILES: &str = "/files/";
 /// The folder SQL reads a relative path's file from, as a node's owner reads its working folder (`/objects` names it).
 const WORKING: &str = "mem:///files/";
+/// The folder a page's tables are kept in, beside `files/` in its store. SQL never reads it (`located`).
+const TABLES: &str = "tables";
+/// The notes an Arrow file of a kept table carries: the table's name, and a column's default as SQL text.
+const TABLE_KEY: &str = "pondra.table";
+const DEFAULT_KEY: &str = "pondra.default";
 
-/// How a page's session is made: its target partitions (a page in a browser has one), and how it reaches the web.
+/// How a page's session is made: its target partitions (a page in a browser has one), where it keeps its files and its
+/// tables, and how it reaches the web.
 pub struct Options {
     pub partitions: usize,
+    /// The store a page keeps its files and its tables in: a browser gives its origin's private file system (OPFS), so
+    /// what a page was given is there again after a reload (`kept`). None: the page's own memory, gone with the page.
+    pub store: Option<Arc<dyn ObjectStore>>,
     /// The store for a web origin (`https://host[:port]`) a statement names, made the first time one does: a
     /// browser's `fetch` (`web/`). None: the page reads only the files given to it.
     pub web: Option<Web>,
@@ -45,15 +58,16 @@ pub type Web = Arc<dyn Fn(&str) -> Arc<dyn ObjectStore> + Send + Sync>;
 
 impl Default for Options {
     fn default() -> Self {
-        Options { partitions: 1, web: None }
+        Options { partitions: 1, store: None, web: None }
     }
 }
 
-/// A page: a session of its own, whose tables are the ones its SQL made, and whose files are the ones its caller put
-/// (in its memory, nowhere else).
+/// A page: a session of its own, whose tables are the ones its SQL makes and writes, and whose files are the ones its
+/// caller put. Both are kept in the store the page was given, or in its memory when it was given none.
 pub struct Page {
     ctx: SessionContext,
-    files: Arc<InMemory>, // (the lake's own files, `files/…`, as they were put: what `FROM 'x.csv'` reads)
+    files: Arc<dyn ObjectStore>, // (the store given, or memory: the files as put, `files/…`, and the tables kept, `tables/…`)
+    keeps: bool, // (a store was given: its tables are kept there; a page in memory keeps no second copy of them)
     web: Option<Web>,
 }
 
@@ -115,7 +129,21 @@ fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 }
 
 impl Page {
-    /// A page with no tables and no files, its session a node's (`engine::session`) with the partitions asked for.
+    /// A page over `options`'s store, with the files and tables it kept: `open`, then every object the store lists under
+    /// `tables/` that ends `.arrow` is read back as a table of the page's default schema (`restore`). A kept table has its
+    /// rows, its columns and its column defaults again. Its tables stay in memory while the page runs; its files are read
+    /// from the store as they are asked for. With no store given nothing is listed, so the page is `open`'s.
+    pub async fn kept(options: &Options) -> anyhow::Result<Page> {
+        let page = Page::open(options);
+        let listed = page.files.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await?;
+        for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".arrow")) {
+            page.restore(&object.location).await?;
+        }
+        Ok(page)
+    }
+
+    /// A page with no tables, its session a node's (`engine::session`) with the partitions asked for. Its files are the
+    /// store's, as they are kept there; with no store given they are in memory.
     pub fn open(options: &Options) -> Page {
         let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1));
         // A page's Parquet strings are plain, as the files hold them: views were no faster in a page and held 230 MB
@@ -126,10 +154,13 @@ impl Page {
             .build_arc()
             .expect("a runtime");
         let ctx = crate::engine::session(config, runtime);
-        let files = Arc::new(InMemory::new());
+        let files: Arc<dyn ObjectStore> = match &options.store {
+            Some(store) => store.clone(),
+            None => Arc::new(InMemory::new()),
+        };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, web: options.web.clone() }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -159,15 +190,21 @@ impl Page {
     /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88). An
     /// EXPLAIN's rows are made readable as a node's are (`explain::answered`).
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
-        let batches = crate::engine::collect(self.plan(text).await?).await?;
+        let (frame, changed) = self.plan(text).await?;
+        let batches = crate::engine::collect(frame).await?;
+        if let Some(name) = changed {
+            self.written(&name).await?;
+        }
         let batches = if crate::explain::asked(text) { crate::explain::answered(batches)? } else { batches };
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
     /// A statement read as a node reads it: the front, ASOF JOIN's marker, then planned on the statement's own copy of
     /// the page's session (`statement`), with the files it names given to that copy alone (`given`). What a statement
-    /// makes (a table) is the page's; nothing else it registers reaches the page or another statement.
-    async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
+    /// makes or changes (a table) is the page's; nothing else it registers reaches the page or another statement. The
+    /// name of the page table it changes, if any (`touched`), comes back with the frame: `sql` keeps that table after
+    /// the frame runs.
+    async fn plan(&self, text: &str) -> anyhow::Result<(DataFrame, Option<String>)> {
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
         // (a page keeps no table's past, so `AT (…)` is refused by name: left alone, it would fail as an unknown table "at:…")
         if crate::past_names::mentioned(&expanded) {
@@ -177,7 +214,80 @@ impl Page {
         let (ctx, overlay) = self.statement()?;
         crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
         self.given(&overlay, &expanded).await?;
-        crate::engine::sql_checked(&ctx, &expanded, may).await
+        // (a `Mutex`, not a `Cell`: this future must stay `Send`, and the guard is never held over an `.await`)
+        let changed = std::sync::Mutex::new(None);
+        let frame = crate::engine::sql_checked(&ctx, &expanded, |plan| {
+            may(plan)?;
+            *changed.lock().unwrap_or_else(PoisonError::into_inner) = touched(plan);
+            Ok(())
+        })
+        .await?;
+        Ok((frame, changed.into_inner().unwrap_or_else(PoisonError::into_inner)))
+    }
+
+    /// The page's table a statement changed, once it has run: registered again, so the statistics `Counted` holds are
+    /// worked out afresh (a write leaves them out of date), and, when the page was given a store, kept as one Arrow file
+    /// under `tables/` (`kept_at`) that `kept` reads back. A table the statement dropped has neither, so its file goes. A
+    /// page in memory keeps nothing: a copy of each table beside it would double what it holds.
+    async fn written(&self, name: &str) -> anyhow::Result<()> {
+        let (_, page) = self.default_schema()?;
+        let Some(table) = page.table(name).await? else {
+            return if self.keeps { self.forget(name).await } else { Ok(()) };
+        };
+        page.deregister_table(name)?;
+        register_page_table(page.as_ref(), name.to_string(), inner(&table).clone())?;
+        if !self.keeps {
+            return Ok(());
+        }
+        let batches = batches_of(&table).await.ok_or_else(|| anyhow::anyhow!("{name}: a page's table holds its rows in memory"))?;
+        let file = table_file(name, table.as_ref(), &batches)?;
+        self.files.put_opts(&kept_at(name), PutPayload::from(file), PutOptions { mode: PutMode::Overwrite, ..Default::default() }).await?;
+        Ok(())
+    }
+
+    /// A table the statement dropped: its file goes. A table that was never kept has none, which is fine.
+    async fn forget(&self, name: &str) -> anyhow::Result<()> {
+        match self.files.delete(&kept_at(name)).await {
+            Ok(()) | Err(StoreError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Reads the kept table at `at` back into the page, as a table of its default schema. A file that doesn't read, or
+    /// that is not a kept table, fails with its path in the error.
+    async fn restore(&self, at: &Path) -> anyhow::Result<()> {
+        let file = self.files.get(at).await?.bytes().await?;
+        let (name, table) = self.table_from_file(file).map_err(|e| anyhow::anyhow!("{at}: {e:#}"))?;
+        let (_, page) = self.default_schema()?;
+        register_page_table(page.as_ref(), name, Arc::new(table))?;
+        Ok(())
+    }
+
+    /// The table a kept file holds, read back: its name (`pondra.table`), its rows as a memory table over the table's own
+    /// schema, and its column defaults again (`column_defaults`).
+    fn table_from_file(&self, file: bytes::Bytes) -> anyhow::Result<(String, MemTable)> {
+        let reader = FileReader::try_new(std::io::Cursor::new(file), None)?;
+        let kept = reader.schema();
+        let name = kept.metadata().get(TABLE_KEY).cloned().ok_or_else(|| anyhow::anyhow!("it has no {TABLE_KEY} note, so it is not a kept table"))?;
+        let schema = table_schema(&kept);
+        let defaults = self.column_defaults(&kept, &schema)?;
+        let mut batches = vec![];
+        for batch in reader {
+            batches.push(over_schema(&schema, &batch?)?);
+        }
+        Ok((name, MemTable::try_new(schema, vec![batches])?.with_column_defaults(defaults)))
+    }
+
+    /// The column defaults a kept file's notes give (`pondra.default`), each read as SQL over the table's schema.
+    fn column_defaults(&self, kept: &Schema, schema: &SchemaRef) -> anyhow::Result<HashMap<String, Expr>> {
+        let (state, df) = (self.ctx.state(), DFSchema::try_from(schema.clone())?);
+        let mut defaults = HashMap::new();
+        for field in kept.fields() {
+            if let Some(text) = field.metadata().get(DEFAULT_KEY) {
+                defaults.insert(field.name().clone(), state.create_logical_expr(text, &df)?);
+            }
+        }
+        Ok(defaults)
     }
 
     /// The name of the page's default schema, and its provider: the tables a statement is planned over.
@@ -368,14 +478,88 @@ impl Page {
 /// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
 /// (`http://`, `https://`) as written (`reached` finds its origin's store), a relative path (`'x.csv'`, `'./d/*.parquet'`)
 /// in the working folder (`under_files`), and any other URL refused by name: a page reads the files it was given and the web.
+/// A `mem:` name that leaves `files/` (`..`, `%2E%2E`) is refused too: the page's kept tables are not SQL's to read.
 fn located(url: &str) -> anyhow::Result<String> {
-    if url.starts_with(WORKING) || is_web(url) {
+    if is_web(url) {
         return Ok(url.to_string());
     }
-    if url.contains("://") {
-        return Err(crate::codes::coded("0A000", format!("{url}: a page reads the files given to it (PUT /files/{{path}}) and the web (http, https)")));
+    let made = if url.starts_with(WORKING) {
+        url.to_string()
+    } else if url.contains("://") {
+        return Err(files_or_web(url));
+    } else {
+        format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url)))
+    };
+    // (`Url::parse` takes `..` out of a path, so the name is judged once parsed: `mem:///files/../tables/t` is `/tables/t`)
+    if !url::Url::parse(&made)?.path().starts_with(FILES) {
+        return Err(files_or_web(url));
     }
-    Ok(format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))))
+    Ok(made)
+}
+
+/// The refusal of a URL a page doesn't read: the same words for each such URL, whichever way it is found to be one.
+fn files_or_web(url: &str) -> anyhow::Error {
+    crate::codes::coded("0A000", format!("{url}: a page reads the files given to it (PUT /files/{{path}}) and the web (http, https)"))
+}
+
+/// The file a page's table is kept in: `tables/{name}.arrow`. The name is one part of the path, so object_store encodes
+/// what a path can't hold (a `/` or a `?`): any name a table can have is one file.
+fn kept_at(name: &str) -> Path {
+    Path::from_iter([TABLES, format!("{name}.arrow").as_str()])
+}
+
+/// A table's batches, every partition's, as its memory table holds them (`inner`); None for another provider's table.
+async fn batches_of(table: &Arc<dyn TableProvider>) -> Option<Vec<RecordBatch>> {
+    let memory = inner(table).downcast_ref::<MemTable>()?;
+    let mut batches = vec![];
+    for partition in &memory.batches {
+        batches.extend(partition.read().await.iter().cloned());
+    }
+    Some(batches)
+}
+
+/// A page table as one Arrow IPC file: its batches over the file's schema (`kept_schema`), so `kept` reads the table
+/// back as it was.
+fn table_file(name: &str, table: &dyn TableProvider, batches: &[RecordBatch]) -> anyhow::Result<bytes::Bytes> {
+    let schema = kept_schema(name, table)?;
+    let mut writer = FileWriter::try_new(Vec::new(), &schema)?;
+    for batch in batches {
+        writer.write(&over_schema(&schema, batch)?)?;
+    }
+    Ok(writer.into_inner()?.into())
+}
+
+/// The schema a table is kept under: its own, with `pondra.table` (its name) in the schema's notes, and `pondra.default`
+/// (the column's default, as SQL text) in the notes of each column that has one.
+fn kept_schema(name: &str, table: &dyn TableProvider) -> anyhow::Result<SchemaRef> {
+    let mut fields = vec![];
+    for field in table.schema().fields() {
+        let mut notes = field.metadata().clone();
+        if let Some(default) = table.get_column_default(field.name()) {
+            notes.insert(DEFAULT_KEY.to_string(), datafusion::sql::unparser::expr_to_sql(default)?.to_string());
+        }
+        fields.push(field.as_ref().clone().with_metadata(notes));
+    }
+    let mut notes = table.schema().metadata().clone();
+    notes.insert(TABLE_KEY.to_string(), name.to_string());
+    Ok(Arc::new(Schema::new_with_metadata(fields, notes)))
+}
+
+/// The schema of a kept file without the two notes `kept_schema` added: the schema the table itself has.
+fn table_schema(kept: &Schema) -> SchemaRef {
+    let fields: Vec<Field> = kept.fields().iter().map(|f| f.as_ref().clone().with_metadata(without_notes(f.metadata()))).collect();
+    Arc::new(Schema::new_with_metadata(fields, without_notes(kept.metadata())))
+}
+
+/// The notes without the two `kept_schema` adds, which a table's own schema does not have.
+fn without_notes(notes: &HashMap<String, String>) -> HashMap<String, String> {
+    notes.iter().filter(|(k, _)| ![TABLE_KEY, DEFAULT_KEY].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// `batch` over `schema`: the same columns, under the schema's notes. A table's batches carry the table's schema exactly,
+/// as `MemTable::try_new` refuses batches whose notes the table's lack.
+fn over_schema(schema: &SchemaRef, batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
+    Ok(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?)
 }
 
 /// Whether a URL is a web address, which a page reads through the store its program gives it (`Page::reached`).
@@ -419,21 +603,14 @@ async fn delta_table(ctx: &SessionContext, found: crate::read_delta::Found) -> a
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for
 /// another provider, whose size is not known here.
 async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
-    let table = table.downcast_ref::<Counted>().map_or(table, |c| &c.rows);
-    let memory = table.downcast_ref::<MemTable>()?;
-    let mut sizes = (0, 0);
-    for partition in &memory.batches {
-        for batch in partition.read().await.iter() {
-            sizes = (sizes.0 + batch.num_rows(), sizes.1 + batch.get_array_memory_size());
-        }
-    }
-    Some(sizes)
+    let batches = batches_of(table).await?;
+    Some(batches.iter().fold((0, 0), |(rows, bytes), b| (rows + b.num_rows(), bytes + b.get_array_memory_size())))
 }
 
 /// A page's table: its rows a `MemTable`, and what the join order needs to know of them, worked out the first time it
 /// asks (as `query::Pruned::stats` is). The rule asks only when three or more inputs are joined, so a table never joined
-/// so costs its load nothing. Nothing else is passed on: a page refuses DML (`may`), and a table changed under them would
-/// make the statistics stale.
+/// so costs its load nothing. A write (INSERT, UPDATE, DELETE) goes to the rows; the statistics it leaves stale are
+/// worked out again, because the table is registered again after the write (`written`).
 #[derive(Debug)]
 struct Counted {
     rows: Arc<dyn TableProvider>,
@@ -472,8 +649,20 @@ impl TableProvider for Counted {
         self.rows.scan(state, projection, filters, limit).await
     }
 
-    /// The statistics once worked out; else worked out now from the rows, if no write holds them (a page's tables are
-    /// only ever read, so the lock is free). Anything that fails answers None and keeps nothing.
+    async fn insert_into(&self, state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(&self, state: &dyn Session, filters: Vec<Expr>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.delete_from(state, filters).await
+    }
+
+    async fn update(&self, state: &dyn Session, assignments: Vec<(String, Expr)>, filters: Vec<Expr>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.update(state, assignments, filters).await
+    }
+
+    /// The statistics once worked out; else worked out now from the rows, if no write holds them. A write may hold the
+    /// rows while it runs; then the answer is None, as it is for anything that fails, and nothing is kept.
     fn statistics(&self) -> Option<Statistics> {
         if let Some(known) = self.stats.get() {
             return Some(known.clone());
@@ -488,18 +677,60 @@ impl TableProvider for Counted {
 }
 
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
-/// NOT EXISTS`) and `DROP TABLE` are what it takes. `CREATE EXTERNAL TABLE` is refused by name: a native page has
-/// `file://` registered, so it would read its machine's disk. Every other DDL, and DML (INSERT, UPDATE, DELETE, COPY)
-/// and statements, is refused as a node's read-only SQL refuses it.
+/// NOT EXISTS`), `DROP TABLE`, and INSERT, UPDATE and DELETE into a page's own table are what it takes. `CREATE EXTERNAL
+/// TABLE` is refused by name: a native page has `file://` registered, so it would read its machine's disk. A write into
+/// anything else (a file, a view), COPY, and every other DDL and statement, is refused as a node's read-only SQL refuses
+/// it.
 fn may(plan: &LogicalPlan) -> anyhow::Result<()> {
     match plan {
         LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(_) | DdlStatement::DropTable(_)) => Ok(()),
         LogicalPlan::Ddl(ddl) => Err(crate::codes::coded("0A000", format!("a page doesn't take {} yet", ddl.name()))),
+        LogicalPlan::Dml(d) if writes_rows(&d.op) => own_table(&d.target),
+        // (EXPLAIN ANALYZE runs what it explains, so the statement it explains is judged, as if it were run)
+        LogicalPlan::Analyze(a) => may(&a.input),
         _ => {
             crate::engine::read_only().verify_plan(plan)?; // (no DDL is left here: a node's read-only SQL)
             Ok(())
         }
     }
+}
+
+/// Whether a DML statement writes rows: INSERT, UPDATE or DELETE, the three a page's own tables take.
+fn writes_rows(op: &WriteOp) -> bool {
+    matches!(op, WriteOp::Insert(_) | WriteOp::Update | WriteOp::Delete)
+}
+
+/// A write's target, when it is one of a page's own tables. Only a page's memory tables are `Counted`, so a file or a
+/// view, which is some other provider, is refused by name (its name is left out: a file's is SQL's internal one).
+fn own_table(target: &Arc<dyn TableSource>) -> anyhow::Result<()> {
+    match source_as_provider(target) {
+        Ok(table) if table.is::<Counted>() => Ok(()),
+        _ => Err(crate::codes::coded("0A000", "a page writes only its own tables")),
+    }
+}
+
+/// The name of the page table a plan makes, changes or drops, if it does: what `sql` keeps (`written`) once the plan has
+/// run. An EXPLAIN ANALYZE changes what it runs, so it is its input's.
+fn touched(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(c)) => Some(c.name.table().to_string()),
+        LogicalPlan::Ddl(DdlStatement::DropTable(d)) => Some(d.name.table().to_string()),
+        LogicalPlan::Dml(d) if writes_rows(&d.op) => Some(d.table_name.table().to_string()),
+        LogicalPlan::Analyze(a) => touched(&a.input),
+        _ => None,
+    }
+}
+
+/// `table` registered as one of a page's own tables: as `Counted`, so its statistics are worked out once and held.
+/// Both a table a statement makes and one `written` registers again go through here.
+fn register_page_table(page: &dyn SchemaProvider, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+    page.register_table(name, Counted::over(table))
+}
+
+/// The table a page's table holds its rows in: a `Counted`'s memory table, or the table itself when it is another
+/// provider's. Every reader of a page table's rows goes through here, so the downcast is written once.
+fn inner(table: &Arc<dyn TableProvider>) -> &Arc<dyn TableProvider> {
+    table.downcast_ref::<Counted>().map_or(table, |c| &c.rows)
 }
 
 /// A statement's view of its page's default schema: the files the statement names (`own`), then the page's own tables.
@@ -535,7 +766,7 @@ impl SchemaProvider for Overlay {
     }
 
     fn register_table(&self, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        self.page.register_table(name, Counted::over(table))
+        register_page_table(self.page.as_ref(), name, table)
     }
 
     fn deregister_table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
@@ -572,7 +803,8 @@ impl Host for PageHost<'_> {
     // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
     // compiler's check of that loop stops)
     fn ask(&self, sql: &str) -> impl Future<Output = anyhow::Result<DataFrame>> + Send {
-        self.0.plan(sql)
+        // (it only reads: the page table a statement would change is none of its business)
+        self.0.plan(sql).map_ok(|(frame, _)| frame)
     }
 }
 
@@ -750,13 +982,29 @@ mod tests {
         assert_eq!(got.body, want.body);
     }
 
+    /// A table made by SQL takes INSERT, UPDATE and DELETE, each answered with its count as a node answers it (`count`,
+    /// as `engine::collect` gives it). The rows they leave are the ones SELECT reads, and the statistics the table holds
+    /// say so: the write left them out of date, and the table was registered again (`written`).
     #[tokio::test]
-    async fn a_table_made_by_sql_takes_no_insert() {
+    async fn a_table_made_by_sql_takes_insert_update_and_delete() {
+        use datafusion::common::stats::Precision;
         let page = Page::open(&Options::default());
-        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (a INT)".into()).await.status, 200);
-        let insert = page.request("POST", "/sql", &[], "INSERT INTO t VALUES (1)".into()).await;
-        assert_eq!((insert.status, insert.header("x-pondra-sqlstate")), (501, Some("0A000")));
-        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n0\n");
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (id INT, name TEXT)".into()).await.status, 200);
+        let writes = [("INSERT INTO t VALUES (1, 'a'), (2, 'b')", 2), ("UPDATE t SET name = 'c' WHERE id = 2", 1), ("DELETE FROM t WHERE id = 1", 1)];
+        for (sql, count) in writes {
+            let got = page.request("POST", "/sql?format=csv", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{sql}");
+            assert_eq!(got.body, format!("count\n{count}\n"), "{sql}");
+        }
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT id, name FROM t".into()).await.body, "id,name\n2,c\n");
+        let (_, schema) = page.default_schema().unwrap();
+        let table = schema.table("t").await.unwrap().unwrap();
+        assert_eq!(table.statistics().unwrap().num_rows, Precision::Inexact(1));
+        // A file read by name is no table of the page's, so no table is written: the name finds none (42P01).
+        assert_eq!(put(&page, "x.csv", "a\n1\n").await.status, 200);
+        let into_file = page.request("POST", "/sql", &[], "INSERT INTO 'x.csv' VALUES (2)".into()).await;
+        assert_eq!(into_file.header("x-pondra-sqlstate"), Some("42P01"), "{:?}", into_file.body);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n1\n");
     }
 
     #[tokio::test]
@@ -1321,5 +1569,92 @@ mod tests {
         let got = page.request("POST", "/sql", &[], format!("FROM read_delta('{DELTA_ROOT}')").into()).await;
         assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
         assert!(std::str::from_utf8(&got.body).unwrap().contains("reads no web addresses"), "{:?}", got.body);
+    }
+
+    /// Each object `GET /objects` lists, as its name and rows. Its bytes are left out: an array read back from a file is a
+    /// slice of one buffer, so its size differs from the table's.
+    fn names_and_rows(answer: &Answer) -> Vec<(String, Option<u64>)> {
+        let v: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        v["objects"].as_array().unwrap().iter().map(|o| (o["name"].as_str().unwrap().to_string(), o["rows"].as_u64())).collect()
+    }
+
+    /// A page's files and tables are kept in its store: a page kept over the same store has what the first was given and
+    /// made, with its rows, its column defaults, and none of the tables it dropped.
+    #[tokio::test]
+    async fn a_kept_page_has_its_files_and_tables_again() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        assert_eq!(put(&a, "t.csv", "id,name\n1,a\n2,b\n").await.status, 200);
+        for sql in [
+            "CREATE TABLE t AS FROM 't.csv'",
+            "INSERT INTO t VALUES (3, 'c')",
+            "CREATE TABLE gone AS SELECT 1 AS x",
+            "DROP TABLE gone",
+            "CREATE TABLE e (a INT, b INT DEFAULT 7)",
+        ] {
+            assert_eq!(a.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
+        }
+        let b = Page::kept(&options).await.unwrap();
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "SELECT * FROM t ORDER BY id".into()).await.body, "id,name\n1,a\n2,b\n3,c\n");
+        let listed_a = a.request("GET", "/objects", &[], bytes::Bytes::new()).await;
+        let listed_b = b.request("GET", "/objects", &[], bytes::Bytes::new()).await;
+        assert_eq!(names_and_rows(&listed_b), names_and_rows(&listed_a));
+        assert_eq!(names_and_rows(&listed_b), [("e".to_string(), Some(0)), ("t".to_string(), Some(3))]);
+        assert_eq!(b.request("POST", "/sql", &[], "FROM gone".into()).await.header("x-pondra-sqlstate"), Some("42P01"));
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "FROM e".into()).await.body, "a,b\n");
+        assert_eq!(b.request("POST", "/sql", &[], "INSERT INTO e (a) VALUES (1)".into()).await.status, 200);
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "SELECT b FROM e".into()).await.body, "b\n7\n");
+        let file_a = a.request("GET", "/files/t.csv", &[], bytes::Bytes::new()).await;
+        let file_b = b.request("GET", "/files/t.csv", &[], bytes::Bytes::new()).await;
+        assert_eq!((file_a.status, file_b.status), (200, 200));
+        assert_eq!((&file_b.body, file_b.header("etag")), (&file_a.body, file_a.header("etag")));
+    }
+
+    /// A table whose name needs quoting is kept under a name the store takes: a space is kept as it is, and a `/` or a `?`
+    /// is encoded, so each table is one object, and a page kept over the same store answers each as the first did.
+    #[tokio::test]
+    async fn a_table_whose_name_needs_quoting_is_kept() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE \"My Table\" AS SELECT 1 AS x, 'a' AS y".into()).await.status, 200);
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE \"a/b?\" AS SELECT 2 AS x".into()).await.status, 200);
+        let b = Page::kept(&options).await.unwrap();
+        for sql in ["SELECT * FROM \"My Table\"", "SELECT * FROM \"a/b?\""] {
+            let (from_a, from_b) = (a.request("POST", "/sql?format=csv", &[], sql.into()).await, b.request("POST", "/sql?format=csv", &[], sql.into()).await);
+            assert_eq!((from_a.status, from_b.status), (200, 200), "{sql}");
+            assert_eq!(from_b.body, from_a.body, "{sql}");
+        }
+        let mut kept: Vec<String> = store.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await.unwrap().iter().map(|o| o.location.to_string()).collect();
+        kept.sort();
+        assert_eq!(kept, ["tables/My Table.arrow", "tables/a%2Fb%3F.arrow"]);
+    }
+
+    /// A page with no store keeps nothing: a page kept over no store is an empty page, as `open` makes one, and a table
+    /// made in it is not there for the next page.
+    #[tokio::test]
+    async fn a_page_without_a_store_keeps_nothing() {
+        let a = Page::kept(&Options::default()).await.unwrap();
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS x".into()).await.status, 200);
+        assert_eq!(names_listed(&a.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["t"]);
+        let b = Page::kept(&Options::default()).await.unwrap();
+        assert_eq!(names_listed(&b.request("GET", "/objects", &[], bytes::Bytes::new()).await), Vec::<String>::new());
+        // (and its memory holds no copy of the table beside it)
+        assert_eq!(a.files.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await.unwrap().len(), 0);
+    }
+
+    /// SQL reads a page's files and never its kept tables: a name that reaches `tables/` is refused by name, however it
+    /// is written.
+    #[tokio::test]
+    async fn sql_never_reads_the_kept_tables() {
+        let store = Arc::new(InMemory::new());
+        let page = Page::kept(&Options { store: Some(store.clone()), ..Default::default() }).await.unwrap();
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS x".into()).await.status, 200);
+        assert_eq!(store.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await.unwrap().len(), 1);
+        for sql in ["FROM 'mem:///tables/t.arrow'", "FROM 'mem:///files/../tables/t.arrow'", "FROM 'mem:///files/%2E%2E/tables/t.arrow'", "FROM '../tables/t.arrow'"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
+        }
     }
 }

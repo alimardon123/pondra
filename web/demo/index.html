@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pondra in your browser</title>
+<link rel="icon" href="data:,">
+<style>
+/* The look: system fonts and system colours (so light and dark follow the browser), one accent. The accent is
+   brand/colors.css's, copied here because this page is one file and fetches nothing but its module; the check in
+   tools/web_check.mjs fails when a copy drifts from the brand. Brand has no red, so an error is bold with a rule. */
+:root {
+  color-scheme: light dark;
+  --accent: #0B7F6A;
+  --accent-soft: #DDF3EE;
+  --on-accent: #fff;
+  --muted: color-mix(in srgb, CanvasText 62%, Canvas);
+  --line: color-mix(in srgb, CanvasText 18%, Canvas);
+  --line-strong: color-mix(in srgb, CanvasText 38%, Canvas);
+  --head: color-mix(in srgb, CanvasText 7%, Canvas);
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #2FBF9F;
+    --accent-soft: #0E2E29;
+    --on-accent: var(--accent-soft);
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; background: Canvas; color: CanvasText; font: 16px/1.5 var(--sans); }
+main { max-width: 960px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: clamp(1.5rem, 4vw, 2rem); line-height: 1.2; margin: 0 0 4px; }
+h2 { font-size: 1.125rem; margin: 32px 0 8px; }
+.lede, .note, .hint, .empty { color: var(--muted); }
+.lede { margin: 0; }
+.note { margin: 8px 0 0; font-size: .9375rem; }
+.sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.drop { position: relative; margin-top: 24px; padding: 32px 16px; border: 2px dashed var(--line-strong); border-radius: 12px; text-align: center; }
+.drop p { margin: 0; }
+.drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.drop label { color: var(--accent); font-weight: 600; text-decoration: underline; cursor: pointer; }
+#files:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px; }
+
+button { font: inherit; color: inherit; background: Canvas; border: 1px solid var(--line-strong); border-radius: 8px; padding: 6px 14px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+button.name { border: 0; padding: 0; background: none; color: var(--accent); font-family: var(--mono); text-align: left; overflow-wrap: anywhere; text-decoration: underline; }
+button.remove { border: 0; background: none; color: var(--muted); font-size: 1.25rem; line-height: 1; padding: 2px 8px; }
+button.remove:hover { color: CanvasText; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+th { font-size: .875rem; font-weight: 600; color: var(--muted); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+#tables th:last-child, #tables td:last-child { width: 1%; }
+.null { color: var(--muted); font-style: italic; }
+
+.editor { margin-top: 32px; }
+textarea { display: block; width: 100%; min-height: 9rem; resize: vertical; padding: 10px 12px; font: 16px/1.5 var(--mono); color: FieldText; background: Field; border: 1px solid var(--line-strong); border-radius: 8px; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-top: 8px; }
+.hint { font-size: .875rem; }
+
+#status { min-height: 1.5em; margin: 20px 0 8px; }
+#status .message { display: block; }
+#status .state { margin-left: .5em; color: var(--muted); font-family: var(--mono); font-size: .875em; }
+#status.error { font-weight: 600; padding-left: 10px; border-left: 3px solid CanvasText; }
+
+.scroll { max-height: 60vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+#result { width: max-content; min-width: 100%; font-family: var(--mono); font-size: 14px; }
+#result th { position: sticky; top: 0; background: var(--head); color: CanvasText; }
+#result td { white-space: nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Pondra in your browser</h1>
+    <p class="lede">Drop CSV, Parquet or JSON files here. Each becomes a table you can ask with SQL, and stays after a reload.</p>
+    <p class="note" id="note" hidden>This browser keeps nothing, so tables go when the page closes.</p>
+  </header>
+
+  <div class="drop" id="drop">
+    <p>Drop files here, or <input type="file" id="files" multiple class="sr"><label for="files">choose files</label></p>
+  </div>
+
+  <h2>Tables</h2>
+  <table id="tables">
+    <thead>
+      <tr><th scope="col">Name</th><th scope="col" class="num">Rows</th><th scope="col"><span class="sr">Remove</span></th></tr>
+    </thead>
+    <tbody><tr><td colspan="3" class="empty">Starting…</td></tr></tbody>
+  </table>
+
+  <section class="editor">
+    <textarea id="sql" aria-label="SQL" spellcheck="false" autocapitalize="off" placeholder="SELECT * FROM a_table LIMIT 100"></textarea>
+    <div class="actions">
+      <button type="button" class="primary" id="run">Run</button>
+      <span class="hint">Ctrl+Enter or Cmd+Enter runs it too</span>
+    </div>
+  </section>
+
+  <p id="status" aria-live="polite"></p>
+  <div class="scroll"><table id="result"><thead></thead><tbody></tbody></table></div>
+</main>
+
+<script type="module">
+import init, { Page } from '../pkg/pondra_web.js';
+
+const els = {
+  drop: document.getElementById('drop'),
+  files: document.getElementById('files'),
+  tables: document.querySelector('#tables tbody'),
+  editor: document.getElementById('sql'),
+  run: document.getElementById('run'),
+  status: document.getElementById('status'),
+  result: document.getElementById('result'),
+  note: document.getElementById('note'),
+};
+const decoder = new TextDecoder();
+
+// The page, once started. Nothing is asked of it before then: a request says the page is still starting.
+let page = null;
+// Actions run one after another, since a drop, a run and a removal all change the same tables.
+let queue = Promise.resolve();
+
+// A request the page answered with an error: its words, and the SQLSTATE of a SQL error.
+class Refused extends Error {
+  constructor(answer) {
+    super(answer.text.trim());
+    this.sqlstate = answer.headers['x-pondra-sqlstate'] ?? null;
+  }
+}
+
+// The words of anything thrown: an Error's message, or the string the page throws.
+const words = (e) => String(e?.message ?? e);
+// A status message: its words, and for a failure its SQLSTATE beside them.
+const ok = (text) => ({ text });
+const failure = (e) => ({ text: words(e), sqlstate: e?.sqlstate ?? null, error: true });
+const rowsWord = (n) => `${n} ${n === 1 ? 'row' : 'rows'}`;
+
+// A name as SQL reads it in double quotes, with each double quote doubled; a text likewise in single quotes.
+const quoteName = (name) => `"${name.replaceAll('"', '""')}"`;
+const quoteText = (text) => `'${text.replaceAll("'", "''")}'`;
+// A file's name in the page: every character outside A-Z a-z 0-9 . _ - made _, so SQL reads it without quotes.
+const pathOf = (name) => name.replace(/[^A-Za-z0-9._-]/gu, '_');
+// A file's table: its name before the last dot, as it is.
+const tableOf = (name) => {
+  const dot = name.lastIndexOf('.');
+  return dot > 0 ? name.slice(0, dot) : name;
+};
+// Arrow's names for the integer, decimal and float types: Int64, UInt8, Float64, Decimal128(10, 2).
+const isNumeric = (type) => /^(U?Int\d+|Float\d+|Decimal\d+\(.*\))$/.test(type);
+
+// An element with its properties set and its children added: el('td', { className: 'num' }, 'text').
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children);
+  return node;
+}
+
+// One request to the page: its status, its headers, and its body as text.
+async function ask(method, path, body) {
+  if (!page) throw new Error('The page is still starting.');
+  const answer = await page.request(method, path, undefined, body);
+  return { status: answer.status, headers: answer.headers, text: decoder.decode(answer.body) };
+}
+
+// The body of an answer that succeeded, or a throw of its error.
+function bodyOf(answer) {
+  if (answer.status >= 400) throw new Refused(answer);
+  return answer.text;
+}
+
+// SQL answered in the typed form: its columns and rows, or a throw of the error.
+async function sql(statement) {
+  return JSON.parse(bodyOf(await ask('POST', '/sql?format=typed', statement)));
+}
+
+// Runs one action after the ones queued before it. Its failure is shown in the status line, not thrown.
+function turn(action) {
+  queue = queue.then(action).catch((e) => showStatus([failure(e)]));
+  return queue;
+}
+
+// The status line: each message on its own line, in the error's style when one failed.
+function showStatus(messages) {
+  els.status.className = messages.some((m) => m.error) ? 'error' : '';
+  els.status.replaceChildren(...messages.map(messageNode));
+}
+
+function messageNode({ text, sqlstate }) {
+  const line = el('span', { className: 'message', textContent: text });
+  if (sqlstate) line.append(el('span', { className: 'state', textContent: sqlstate }));
+  return line;
+}
+
+// The tables the page lists, one row each; returns them as the page listed them.
+async function listTables() {
+  const { objects } = JSON.parse(bodyOf(await ask('GET', '/objects')));
+  els.tables.replaceChildren(...(objects.length ? objects.map(tableRow) : [emptyRow('No tables yet.')]));
+  return objects;
+}
+
+// A table's row: its name (a button that asks its first 100 rows), its row count, and a button that removes it.
+function tableRow({ name, rows }) {
+  const remove = el('button', { className: 'remove', type: 'button', textContent: '×', onclick: () => removeTable(name) });
+  remove.setAttribute('aria-label', `Remove table ${name}`);
+  const named = el('button', { className: 'name', type: 'button', textContent: name, onclick: () => showTable(name) });
+  return el('tr', {}, el('td', {}, named), el('td', { className: 'num', textContent: String(rows) }), el('td', {}, remove));
+}
+
+function emptyRow(text) {
+  return el('tr', {}, el('td', { colSpan: 3, className: 'empty', textContent: text }));
+}
+
+// A table's name asks its first 100 rows: the editor gets that query, and it runs.
+function showTable(name) {
+  els.editor.value = `SELECT * FROM ${quoteName(name)} LIMIT 100`;
+  return run();
+}
+
+function removeTable(name) {
+  return turn(async () => {
+    await sql(`DROP TABLE ${quoteName(name)}`);
+    await listTables();
+    showStatus([ok(`Removed table ${name}.`)]);
+  });
+}
+
+// The SQL in the editor: its rows under the status line, or its error. The rows are drawn once the answer is in.
+function run() {
+  return turn(async () => {
+    els.result.replaceChildren();
+    const started = performance.now();
+    const answer = await sql(els.editor.value);
+    const ms = Math.round(performance.now() - started);
+    drawResult(answer);
+    // (an answer holds at most its first 10,000 rows: the status says so when there are more)
+    const shown = answer.rows.length < answer.total ? `, the first ${answer.rows.length.toLocaleString()} shown` : '';
+    showStatus([ok(`${rowsWord(answer.total)} in ${ms} ms${shown}`)]);
+  });
+}
+
+// The answer's rows as a table: its column names as headers, numbers on the right, a null as a muted null.
+function drawResult({ columns, rows }) {
+  const numeric = columns.map((c) => isNumeric(c.type));
+  const head = el('tr', {}, ...columns.map((c, i) => el('th', { scope: 'col', className: numeric[i] ? 'num' : '', textContent: c.name })));
+  const body = rows.map((row) => el('tr', {}, ...row.map((value, i) => cell(value, numeric[i]))));
+  els.result.replaceChildren(el('thead', {}, head), el('tbody', {}, ...body));
+}
+
+function cell(value, numeric) {
+  const td = el('td', { className: numeric ? 'num' : '' });
+  if (value === null) td.append(el('span', { className: 'null', textContent: 'null' }));
+  else td.textContent = typeof value === 'string' ? value : JSON.stringify(value);
+  return td;
+}
+
+// The files chosen or dropped, in turn: each is put, made a table by SQL, and removed (its table keeps its rows). A file
+// that fails says why, and the others go on.
+function addFiles(list) {
+  if (list.length === 0) return undefined;
+  return turn(async () => {
+    const messages = [];
+    for (const file of list) messages.push(await addFile(file));
+    showStatus(messages);
+  });
+}
+
+async function addFile(file) {
+  try {
+    const table = await putFile(file);
+    const { rows } = (await listTables()).find((o) => o.name === table);
+    return ok(`Made table ${table} (${rowsWord(rows)}).`);
+  } catch (e) {
+    return failure(e);
+  }
+}
+
+async function putFile(file) {
+  const path = pathOf(file.name);
+  const table = tableOf(file.name);
+  await ask('DELETE', `/files/${path}`); // (a 404 is fine: no file of that name is there yet)
+  try {
+    bodyOf(await ask('PUT', `/files/${path}`, new Uint8Array(await file.arrayBuffer())));
+    await sql(`CREATE OR REPLACE TABLE ${quoteName(table)} AS FROM ${quoteText(path)}`);
+  } finally {
+    await ask('DELETE', `/files/${path}`); // (the table holds the rows now, so the file is not kept twice)
+  }
+  return table;
+}
+
+// Dragging files over the window lights the drop area, and dropping them anywhere adds them. A drag of anything else
+// (text into the editor, say) is left alone, so the browser does with it what it always does.
+const carriesFiles = (e) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
+// A drag leaving the window reports a position at its edge; a drag moving between the page's parts does not.
+const leftWindow = (e) => e.clientX <= 0 || e.clientY <= 0 || e.clientX >= innerWidth || e.clientY >= innerHeight;
+const highlight = (on) => els.drop.classList.toggle('over', on);
+
+document.addEventListener('dragover', (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  highlight(true);
+});
+document.addEventListener('dragleave', (e) => {
+  if (leftWindow(e)) highlight(false);
+});
+document.addEventListener('drop', (e) => {
+  if (!carriesFiles(e)) return;
+  e.preventDefault();
+  highlight(false);
+  addFiles(Array.from(e.dataTransfer.files));
+});
+
+els.files.addEventListener('change', () => {
+  addFiles(Array.from(els.files.files));
+  els.files.value = ''; // (so choosing the same file again is a change too)
+});
+els.run.addEventListener('click', () => run());
+els.editor.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault();
+    run();
+  }
+});
+
+// The page kept in the origin's private file system, under "pondra". A browser without that keeps nothing, and says so.
+async function openPage() {
+  try {
+    return await Page.kept('pondra');
+  } catch {
+    els.note.hidden = false;
+    return new Page();
+  }
+}
+
+// Starts the module and the page, then lists its tables. `window.ready` says it is ready; a failure says why in
+// `window.startError`, which the check waits on, and in the status line.
+async function start() {
+  try {
+    await init();
+    page = await openPage();
+    await listTables();
+    window.ready = true;
+  } catch (e) {
+    window.startError = words(e) || 'no message';
+    els.tables.replaceChildren(emptyRow('The tables are not listed.'));
+    showStatus([{ text: `The page did not start: ${window.startError}`, error: true }]);
+  }
+}
+
+start();
+</script>
+</body>
+</html>

@@ -7,10 +7,10 @@
 //! whose content-range the page can't see is read from the range asked (`unranged`). An `ETag` the server hides is
 //! only left out of the object's meta.
 
+use crate::js::{call_method, function, get, js_words, read_of, sent, set};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::channel::oneshot;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -18,11 +18,10 @@ use object_store::{
     ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
 };
 use std::fmt;
-use std::future::Future;
 use std::ops::Range;
 use url::Url;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_bindgen_futures::JsFuture;
 
 /// A web origin's objects. The origin is kept as parsed, or as the error that says why it isn't a URL: the core makes
 /// the store from a name in SQL, and a bad name must answer each read with its error, never trap the page.
@@ -72,21 +71,15 @@ impl ObjectStore for Fetch {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
         let url = self.url_of(location)?;
-        // An empty range has no bytes to ask for, so it is answered as a HEAD is: the object's meta, and no body.
-        let empty = match &options.range {
-            Some(GetRange::Bounded(r)) if r.start == r.end => Some(r.start),
-            _ => None,
-        };
-        let head = options.head || empty.is_some();
-        // A HEAD asks for no range: its meta is the whole object's.
-        let wanted = if head { None } else { options.range };
-        let method = if head { "HEAD" } else { "GET" };
-        let answer = sent(fetched(url.to_string(), method, wanted.as_ref().map(range_header)))
+        // (what is read, and whether a body is wanted, is `js::read_of`'s: a HEAD and an empty range want no body)
+        let read = read_of(options);
+        let method = if read.body { "GET" } else { "HEAD" };
+        let answer = sent(fetched(url.to_string(), method, read.range.as_ref().map(range_header)))
             .await
             .map_err(|_| dropped(&url))?
             .map_err(|e| transport(&url, &e))?;
-        let mut object = object_from(location, &url, answer, wanted.as_ref(), head)?;
-        if let Some(start) = empty {
+        let mut object = object_from(location, &url, answer, read.range.as_ref(), !read.body)?;
+        if let Some(start) = read.empty_at {
             object.range = start..start;
         }
         let Object { meta, range, body } = object;
@@ -137,18 +130,6 @@ fn transport(url: &Url, e: &str) -> Error {
 
 fn dropped(url: &Url) -> Error {
     generic(format!("error sending request for url ({url}): the fetch was dropped"))
-}
-
-/// Runs `work` as a task on the page's thread and gives its result back as a `Send` future: `fetch`'s futures are not
-/// `Send`, and an `ObjectStore`'s must be.
-fn sent<T: Send + 'static>(
-    work: impl Future<Output = T> + 'static,
-) -> impl Future<Output = Result<T, oneshot::Canceled>> + Send {
-    let (tx, rx) = oneshot::channel();
-    spawn_local(async move {
-        let _ = tx.send(work.await);
-    });
-    rx
 }
 
 /// A range as the `Range` header asks for it (a bounded range's last byte is `end - 1`).
@@ -220,31 +201,6 @@ async fn body(response: &JsValue) -> Result<Vec<u8>, String> {
     let promise = call_method(response, "arrayBuffer")?.dyn_into::<js_sys::Promise>().map_err(js_words)?;
     let buffer = JsFuture::from(promise).await.map_err(js_words)?;
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
-}
-
-fn get(object: &JsValue, name: &str) -> Result<JsValue, String> {
-    js_sys::Reflect::get(object, &name.into()).map_err(js_words)
-}
-
-fn set(object: &JsValue, name: &str, value: impl Into<JsValue>) -> Result<(), String> {
-    js_sys::Reflect::set(object, &name.into(), &value.into()).map(|_| ()).map_err(js_words)
-}
-
-fn function(object: &JsValue, name: &str) -> Result<js_sys::Function, String> {
-    get(object, name)?.dyn_into::<js_sys::Function>().map_err(js_words)
-}
-
-fn call_method(object: &JsValue, name: &str) -> Result<JsValue, String> {
-    function(object, name)?.call0(object).map_err(js_words)
-}
-
-/// A JavaScript failure's words: an Error's message, a thrown string, or none of those. (`JsString::from` on an object
-/// throws, so an object is never turned into a string that way.)
-fn js_words(e: JsValue) -> String {
-    e.dyn_ref::<js_sys::Error>()
-        .map(|e| String::from(e.to_string()))
-        .or_else(|| e.as_string())
-        .unwrap_or_else(|| "fetch failed".into())
 }
 
 /// What an answer says of its object. A 404 or a 403 is a missing object: a public bucket that lets no one list
