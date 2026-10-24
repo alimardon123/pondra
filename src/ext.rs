@@ -269,10 +269,12 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
     spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
 }
 
-/// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`.
+/// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`. `leaves` also takes
+/// `%2E%2E`: the url crate and DataFusion collapse an escaped `..` as they do a plain one, so without it a name read
+/// through `files/%2E%2E/` would reach past the grants on the lake's tables.
 fn own_file(lake: &Lake, u: &str) -> bool {
     let area = format!("{}/files/", lake.url.trim_end_matches('/'));
-    u.starts_with(&area) && !u[area.len()..].split('/').any(|p| p == ".." || p == ".")
+    u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
 }
 
 /// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
@@ -286,9 +288,9 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
-        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"),
+        None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
-            None => bail!("{}", uncovered(u)),
+            None => return Err(crate::codes::coded("42501", uncovered(u))),
             Some((_, s)) if s.temporary && !s.trusted => crate::public::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
             Some(_) => {}
         },
@@ -330,6 +332,12 @@ pub(crate) fn uncovered(u: &str) -> String {
     format!("no secret covers {u}: an admin makes one (CREATE SECRET name (TYPE {kind}, {keys}, SCOPE '{}'))", root(u).unwrap_or_default())
 }
 
+/// A URL as a refusal names it: a lake's own file as `files/orders.csv`, never the lake's URL in front of it (a page
+/// names its files the same way).
+fn shown<'a>(lake: &Lake, u: &'a str) -> &'a str {
+    u.strip_prefix(&format!("{}/", lake.url.trim_end_matches('/'))).unwrap_or(u)
+}
+
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     let version = |k: &str| spec.options.get(k).map(|v| v.parse::<i64>().with_context(|| format!("{k} is a number, not {v}"))).transpose();
@@ -366,7 +374,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     for u in &spec.urls {
         register(lake, u).await?;
     }
-    let found = listed(&state, spec, |u| declared.is_none().then(|| anyhow!("no files at {u}"))).await?; // (declared: none yet is an empty table)
+    let found = listed(&state, spec, |u| declared.is_none().then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
     let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() };
     if found.is_empty() {
         let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
@@ -1535,5 +1543,27 @@ mod tests {
         assert!(!within("http://127.0.0.1:9790/x.csv", "http://127.0.0.1:979"), "another port");
         assert!(!within("s3://data-other/x", "s3://data") && !within("https://prod.example.com.evil.net/", "https://prod.example.com"), "another bucket, another host");
         assert!(!within("s3://data/ab/x", "s3://data/a"), "another folder");
+    }
+
+    #[test]
+    fn a_name_that_leaves_its_folder_is_any_form_of_dot_dot() {
+        for name in ["../t", "d/../t", ".%2e/t", "%2E%2E/t", "d\\..\\t", "d/./t"] {
+            assert!(crate::lake_files::leaves(name), "{name}");
+        }
+        for name in ["a/b.csv", "d/**/*.parquet", "x..y.csv"] {
+            assert!(!crate::lake_files::leaves(name), "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn own_file_takes_no_escaped_dot_dot() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-own-file-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let files = format!("{}/files", lake.url.trim_end_matches('/'));
+        assert!(own_file(&lake, &format!("{files}/orders.csv")));
+        assert!(!own_file(&lake, &format!("{files}/%2E%2E/catalog")), "an escaped .. reaches past files/");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

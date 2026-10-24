@@ -13,6 +13,13 @@ pub fn under_files(path: &str) -> anyhow::Result<String> {
     Ok(if rel.starts_with("files/") { rel.to_string() } else { format!("files/{rel}") })
 }
 
+/// Does a name leave the folder it is read from? A `.` or `..` segment does, and so does its escaped form (`%2e`, in
+/// either case): the url crate and DataFusion collapse both, so a name with either reaches outside `files/`. A backslash
+/// separates segments too, as a Windows path writes them.
+pub fn leaves(path: &str) -> bool {
+    path.replace("%2e", ".").replace("%2E", ".").split(['/', '\\']).any(|p| p == "." || p == "..")
+}
+
 /// What a file replaced since it was read says: `store::Changed`'s `Display` writes it.
 pub const CHANGED: &str = "the file changed since it was opened: open it again, or save under another name";
 

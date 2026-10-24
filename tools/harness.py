@@ -357,7 +357,7 @@ def external():
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
             "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
-        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
+        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no file matches" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
     # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
     # a DELETE of an attached Delta table read "no table" with its path.

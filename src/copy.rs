@@ -50,9 +50,9 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let remote = scheme(to).is_some_and(|s| s != "file");
     match remote {
-        false => ensure!(owner(), "COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"),
+        false => ensure!(owner(), crate::codes::coded("42501", format!("COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"))),
         true => {
-            ensure!(owner() || covering(&list(lake).await?, to).is_some(), "{}", uncovered(to));
+            ensure!(owner() || covering(&list(lake).await?, to).is_some(), crate::codes::coded("42501", uncovered(to)));
             register(lake, to).await?;
         }
     }
@@ -360,7 +360,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
     };
     let positional = query_of.as_ref().is_some_and(|(f, r)| f == "csv" && r.get("header").is_some_and(|h| h == "false"));
     let listed = crate::ext::objects(lake, &spec).await?;
-    ensure!(!listed.is_empty(), "no files at {shown}");
+    ensure!(!listed.is_empty(), crate::codes::coded("42P01", format!("no file matches {shown}")));
     let mut pieces = vec![];
     for (url, o) in listed {
         let query = match (&query_of, from) {
