@@ -77,6 +77,18 @@ pub fn head(sql: &str) -> String {
     first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
 }
 
+/// The word of the write a query makes (`WITH … INSERT`, `… UPDATE`, `… DELETE`, `… MERGE`), or None for one that only
+/// reads. sqlparser reads each of those as a query whose body is the write, so the body is what says it.
+pub fn write_of(q: &Query) -> Option<&'static str> {
+    match *q.body {
+        SetExpr::Insert(_) => Some("INSERT"),
+        SetExpr::Update(_) => Some("UPDATE"),
+        SetExpr::Delete(_) => Some("DELETE"),
+        SetExpr::Merge(_) => Some("MERGE"),
+        _ => None,
+    }
+}
+
 /// `local` by the lake's name (the front has no `Lake`).
 pub fn local_in(lake: &str, name: &str) -> Option<String> {
     match name.split('.').collect::<Vec<_>>()[..] {

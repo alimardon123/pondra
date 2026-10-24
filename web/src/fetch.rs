@@ -7,7 +7,7 @@
 //! whose content-range the page can't see is read from the range asked (`unranged`). An `ETag` the server hides is
 //! only left out of the object's meta.
 
-use crate::js::{call_method, function, get, js_words, read_of, sent, set};
+use crate::js::{body, get, header, js_words, read_of, send, sent, status};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -20,7 +20,6 @@ use object_store::{
 use std::fmt;
 use std::ops::Range;
 use url::Url;
-use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 /// A web origin's objects. The origin is kept as parsed, or as the error that says why it isn't a URL: the core makes
@@ -160,7 +159,8 @@ struct Object {
 
 /// One request: `fetch(url, {method, headers: {Range}})`, its answer read to the end. Not `Send`: `sent` runs it.
 async fn fetched(url: String, method: &'static str, range: Option<String>) -> Result<Fetched, String> {
-    let response = JsFuture::from(send(&url, method, range)?).await.map_err(js_words)?;
+    let asked: Vec<(&str, String)> = range.into_iter().map(|range| ("Range", range)).collect();
+    let response = JsFuture::from(send(&url, method, &asked, None)?).await.map_err(js_words)?;
     let headers = get(&response, "headers")?;
     Ok(Fetched {
         status: status(&response)?,
@@ -170,37 +170,6 @@ async fn fetched(url: String, method: &'static str, range: Option<String>) -> Re
         last_modified: header(&headers, "last-modified")?,
         body: if method == "GET" { body(&response).await? } else { Vec::new() },
     })
-}
-
-/// The request's promise, from the page's global `fetch` (called with the global as `this`, as a browser needs).
-fn send(url: &str, method: &str, range: Option<String>) -> Result<js_sys::Promise, String> {
-    let init = JsValue::from(js_sys::Object::new());
-    set(&init, "method", method)?;
-    if let Some(range) = range {
-        let headers = JsValue::from(js_sys::Object::new());
-        set(&headers, "Range", range)?;
-        set(&init, "headers", headers)?;
-    }
-    let global = JsValue::from(js_sys::global());
-    let promise = function(&global, "fetch")?.call2(&global, &url.into(), &init).map_err(js_words)?;
-    promise.dyn_into::<js_sys::Promise>().map_err(js_words)
-}
-
-fn status(response: &JsValue) -> Result<u16, String> {
-    let code = get(response, "status")?.as_f64().ok_or("the response has no status")?;
-    Ok(code as u16)
-}
-
-/// One response header, or None when the response has none (`Headers.get` answers null then).
-fn header(headers: &JsValue, name: &str) -> Result<Option<String>, String> {
-    let value = function(headers, "get")?.call1(headers, &name.into()).map_err(js_words)?;
-    Ok(value.as_string())
-}
-
-async fn body(response: &JsValue) -> Result<Vec<u8>, String> {
-    let promise = call_method(response, "arrayBuffer")?.dyn_into::<js_sys::Promise>().map_err(js_words)?;
-    let buffer = JsFuture::from(promise).await.map_err(js_words)?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
 /// What an answer says of its object. A 404 or a 403 is a missing object: a public bucket that lets no one list

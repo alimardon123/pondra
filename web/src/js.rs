@@ -1,7 +1,7 @@
-//! What the page's two stores share (`fetch.rs` over `fetch`, `opfs.rs` over the origin's private file system): JavaScript
-//! calls and properties, promises awaited, a failure's words, the task a store's work runs as, what a read of an object
-//! asks for, and the Web Lock a kept folder is held by (`lock`). Both stores read an object the same way (an empty range,
-//! and a HEAD, want the meta and no body).
+//! What the page's stores and its node share (`fetch.rs` and `node.rs` over `fetch`, `opfs.rs` over the origin's private
+//! file system): JavaScript calls and properties, the one way to call `fetch`, promises awaited, a failure's words, the
+//! task a store's work runs as, what a read of an object asks for, and the Web Lock a kept folder is held by (`lock`).
+//! Both stores read an object the same way (an empty range, and a HEAD, want the meta and no body).
 
 use futures::channel::oneshot;
 use object_store::{GetOptions, GetRange};
@@ -48,6 +48,45 @@ pub(crate) async fn awaited(object: &JsValue, name: &str, args: &[JsValue]) -> R
     let args: js_sys::Array = args.iter().collect();
     let answer = method.apply(object, &args)?;
     JsFuture::from(js_sys::Promise::resolve(&answer)).await
+}
+
+/// The page's global `fetch` asked for `url` with `method`, the `headers` given and an optional `body` (a `Uint8Array`),
+/// its promise of the answer. The global is called as `this`, as a browser needs.
+pub(crate) fn send(url: &str, method: &str, headers: &[(&str, String)], body: Option<&[u8]>) -> Result<js_sys::Promise, String> {
+    let init = JsValue::from(js_sys::Object::new());
+    set(&init, "method", method)?;
+    if !headers.is_empty() {
+        let pairs = JsValue::from(js_sys::Object::new());
+        for (name, value) in headers {
+            set(&pairs, name, value.as_str())?;
+        }
+        set(&init, "headers", pairs)?;
+    }
+    if let Some(body) = body {
+        set(&init, "body", js_sys::Uint8Array::from(body))?;
+    }
+    let global = JsValue::from(js_sys::global());
+    let promise = function(&global, "fetch")?.call2(&global, &url.into(), &init).map_err(js_words)?;
+    promise.dyn_into::<js_sys::Promise>().map_err(js_words)
+}
+
+/// A response's status.
+pub(crate) fn status(response: &JsValue) -> Result<u16, String> {
+    let code = get(response, "status")?.as_f64().ok_or("the response has no status")?;
+    Ok(code as u16)
+}
+
+/// One response header, or None when the response has none (`Headers.get` answers null then).
+pub(crate) fn header(headers: &JsValue, name: &str) -> Result<Option<String>, String> {
+    let value = function(headers, "get")?.call1(headers, &name.into()).map_err(js_words)?;
+    Ok(value.as_string())
+}
+
+/// A response's body, read to the end.
+pub(crate) async fn body(response: &JsValue) -> Result<Vec<u8>, String> {
+    let promise = call_method(response, "arrayBuffer")?.dyn_into::<js_sys::Promise>().map_err(js_words)?;
+    let buffer = JsFuture::from(promise).await.map_err(js_words)?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
 /// A JavaScript failure's words: an Error's message, a thrown string, or none of those. (`JsString::from` on an object
