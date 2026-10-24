@@ -1077,6 +1077,12 @@ pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionCo
     ctx
 }
 
+/// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
+pub const READER_POLL: Duration = Duration::from_millis(250);
+
+/// A guest that reads reads one snapshot, for one statement, and never polls: its life is far shorter than this.
+pub const READER_ONE_SNAPSHOT: Duration = Duration::from_secs(3600);
+
 impl Lake {
     /// `writer`: the leader. `streamed`: a follower, which also gets every commit streamed from
     /// the leader, so its own catalog view only needs the leader's checkpoints (no log replay).
@@ -1084,6 +1090,11 @@ impl Lake {
     pub const NO_LAKE: &'static str = "holds no lake yet";
 
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
+        Self::open_polled(url, writer, streamed, READER_POLL).await
+    }
+
+    /// `open`, a reader polling the bucket every `poll` (`READER_POLL`, or `READER_ONE_SNAPSHOT` for a guest's one statement).
+    pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
@@ -1114,7 +1125,7 @@ impl Lake {
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => Catalog::writer(store.clone(), cache, local).await?,
-                false => match Catalog::opened(store.clone(), streamed, cache).await {
+                false => match Catalog::opened(store.clone(), streamed, cache, poll).await {
                     Ok(cat) => cat,
                     // (no catalog at all: say so, rather than the database's own words for it)
                     Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -2083,8 +2094,8 @@ impl Catalog {
         Ok(cat)
     }
 
-    async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
-        let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
+    async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
+        let opts = DbReaderOptions { manifest_poll_interval: poll, skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
         let (cache, held) = blocks();
         let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache);
@@ -2099,8 +2110,8 @@ impl Catalog {
     /// so a bucket that isn't there, or that refuses the credentials, left `pondra sql` waiting
     /// for ever. When opening takes a while, a listing (after the store's own retries) says
     /// whether there is a catalog to wait for.
-    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions) -> Result<Self> {
-        let open = Self::reader(store.clone(), streamed, cache);
+    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
+        let open = Self::reader(store.clone(), streamed, cache, poll);
         tokio::pin!(open);
         if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
             return cat;

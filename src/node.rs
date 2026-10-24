@@ -167,6 +167,42 @@ pub struct Node {
     guest: Option<server::App>,
 }
 
+/// A guest that reads opens its lake beside its term look (`Node::start`): this is that open, made at the same time as the
+/// look and kept if the look finds no leader to stream from. One that finds a leader drops it (aborted: the requests it sent
+/// are all it cost), and opens its lake streamed after the look.
+struct Beside(Option<tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>>);
+
+impl Beside {
+    fn start(dir: &str, guest: Option<Guest>) -> Beside {
+        Beside(matches!(guest, Some(Guest::Reads)).then(|| {
+            let dir = dir.to_string();
+            crate::panics::task(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
+        }))
+    }
+
+    /// The open, if the start keeps it: `streamed` false is a lake read beside its leader or with nobody leading, the
+    /// open's own case. None when the start opens the lake itself (streamed, or nothing was begun).
+    async fn keep(&mut self, streamed: bool) -> Option<anyhow::Result<Arc<store::Lake>>> {
+        let open = self.0.take()?;
+        if streamed {
+            open.abort();
+            return None;
+        }
+        Some(match open.await {
+            Ok(lake) => lake,
+            Err(e) => Err(anyhow::Error::new(e)),
+        })
+    }
+}
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        if let Some(open) = self.0.take() {
+            open.abort(); // (a start that ends before its look does, with an error, drops the open)
+        }
+    }
+}
+
 impl Node {
     /// Everything `pondra serve` did before it served, then the HTTP door served on a task of its own.
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
@@ -204,6 +240,9 @@ impl Node {
         if guest == Some(Guest::Writes) && store::reach_of(&dir).is_some_and(|r| r.read_only) {
             return Err(crate::write::read_only_refused(&dir));
         }
+        // (a guest that reads begins its lake's open here, beside the term look: the look and the open are each requests to
+        // the bucket, and the start waits for the later of them, not for both in turn)
+        let mut beside = Beside::start(&dir, guest);
         let cluster = match guest {
             None => cluster::Cluster::join(&store, &addr, reader, !store::served(&dir), serve_store).await?,
             Some(g) => match cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))? {
@@ -235,7 +274,16 @@ impl Node {
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         // (a guest's mode said whether its leader answers: a guest that follows one streams, and asks no more)
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || (lives && cluster.leader_alive().await));
-        let lake = match store::Lake::open(&dir, leader, streamed).await {
+        // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`)
+        let poll = match guest {
+            Some(Guest::Reads) if !streamed => store::READER_ONE_SNAPSHOT,
+            _ => store::READER_POLL,
+        };
+        let opened = match beside.keep(streamed).await {
+            Some(lake) => lake,
+            None => store::Lake::open_polled(&dir, leader, streamed, poll).await,
+        };
+        let lake = match opened {
             // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
             // nor hold the term; and a restart would find the same place again)
             Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory::torn(&e) => {
