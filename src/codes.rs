@@ -126,7 +126,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("is not a variable which can be viewed with 'show'") => "42704",                // undefined_object (Postgres: unrecognized configuration parameter)
         _ if has("is a session's:") => "55000",                                                 // (a SET, BEGIN or TEMP table sent with no session: send x-pondra-session)
         _ if has("violates check constraint") => "23514",                                       // check_violation
-        _ if has("is not null, and a row gives it no value") || has("violates not-null") => "23502", // not_null_violation
+        _ if has("is not null, and a row gives it no value") || has("violates not-null") || has("has null but schema specifies non-nullable") || has("declared as non-nullable but contains null") => "23502", // not_null_violation (a page's INSERT and UPDATE: DataFusion's and Arrow's words)
         _ if has("duplicate key") => "23505",                                                   // unique_violation
         _ if has("permission denied") || has("may not ") && (has("this user") || has("this token")) => "42501", // insufficient_privilege
         _ if has("wrong token") || has("password authentication failed") => "28P01",            // invalid_password
@@ -210,6 +210,8 @@ mod tests {
         assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
         assert_eq!(of("orders.id is NOT NULL, and a row gives it no value"), "23502");
+        assert_eq!(of("Invalid batch column at '0' has null but schema specifies non-nullable"), "23502"); // (a page's INSERT of a NULL: DataFusion's words)
+        assert_eq!(of("Column 'id' is declared as non-nullable but contains null values"), "23502"); // (a page's UPDATE of one: Arrow's words)
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");

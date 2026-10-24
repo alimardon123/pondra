@@ -213,6 +213,7 @@ impl Page {
             return Err(crate::codes::coded("0A000", format!("{}: a page keeps no table's past (a node reads a table as it was)", crate::past_names::spelled(&expanded))));
         }
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
+        rules(&expanded)?; // (a table rule a page can't keep is refused before anything is planned or read)
         let (ctx, overlay) = self.statement()?;
         crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
         self.given(&overlay, &expanded).await?;
@@ -681,6 +682,60 @@ impl TableProvider for Counted {
     }
 }
 
+/// The table rules a page can't keep, refused by name before planning (ADR-072: a form that can't do something says
+/// so). A page's tables are `MemTable`s, which keep only NOT NULL and DEFAULT: DataFusion would note a PRIMARY KEY and
+/// take any rows, and drop an identity or a generated column without a word.
+fn rules(sql: &str) -> anyhow::Result<()> {
+    use datafusion::sql::parser::DFParser;
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
+    // (the same cheap gate `asof.rs` uses: a statement with no CREATE in it makes no table to judge)
+    if !sql.to_ascii_lowercase().contains("create") {
+        return Ok(());
+    }
+    // (a parse error is the planner's to answer, as it always has)
+    let Ok(statements) = DFParser::parse_sql_with_dialect(sql, &GenericDialect {}) else { return Ok(()) };
+    statements.iter().try_for_each(statement_rules)
+}
+
+/// One statement's table rules: a CREATE TABLE's, and an EXPLAIN's (an EXPLAIN of a CREATE TABLE is refused as the
+/// CREATE TABLE is).
+fn statement_rules(statement: &datafusion::sql::parser::Statement) -> anyhow::Result<()> {
+    use datafusion::sql::parser::Statement as DfStatement;
+    use datafusion::sql::sqlparser::ast::Statement;
+    match statement {
+        DfStatement::Statement(s) => match s.as_ref() {
+            Statement::CreateTable(c) => table_rules(c),
+            _ => Ok(()),
+        },
+        DfStatement::Explain(e) => statement_rules(&e.statement),
+        _ => Ok(()),
+    }
+}
+
+/// A CREATE TABLE's rules: its first table constraint, else its first column option a page doesn't keep, each named as
+/// written. Nothing is planned for it, so the table is not made.
+fn table_rules(c: &datafusion::sql::sqlparser::ast::CreateTable) -> anyhow::Result<()> {
+    if let Some(constraint) = c.constraints.first() {
+        return Err(not_kept(&constraint.to_string()));
+    }
+    match c.columns.iter().flat_map(|column| &column.options).find(|o| !kept_option(&o.option)) {
+        Some(o) => Err(not_kept(&o.option.to_string())),
+        None => Ok(()),
+    }
+}
+
+/// The column options a page keeps: NULL and NOT NULL (enforced), DEFAULT (filled in), and COMMENT (which changes no row,
+/// so it is let by).
+fn kept_option(option: &datafusion::sql::sqlparser::ast::ColumnOption) -> bool {
+    use datafusion::sql::sqlparser::ast::ColumnOption;
+    matches!(option, ColumnOption::Null | ColumnOption::NotNull | ColumnOption::Default(_) | ColumnOption::Comment(_))
+}
+
+/// The refusal for a table rule a page can't keep: 0A000, with the words that name it and say what to do.
+fn not_kept(what: &str) -> anyhow::Error {
+    crate::codes::coded("0A000", format!("a page doesn't keep {what} yet: its tables keep only NOT NULL and DEFAULT, so they would take any rows; make the table without it, or keep it on a node"))
+}
+
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
 /// NOT EXISTS`), `DROP TABLE`, and INSERT, UPDATE and DELETE into a page's own table are what it takes. `CREATE EXTERNAL
 /// TABLE` is refused by name: a native page has `file://` registered, so it would read its machine's disk. A write into
@@ -1096,6 +1151,64 @@ mod tests {
         assert_eq!(external.header("x-pondra-sqlstate"), Some("0A000"));
         let route = page.request("GET", "/nowhere", &[], bytes::Bytes::new()).await;
         assert_eq!((route.status, route.header("x-pondra-sqlstate")), (404, Some("0A000")));
+    }
+
+    /// A page refuses by name the table rules it can't keep, before it plans anything (`rules`): each answers 0A000 with
+    /// the words that name its clause, and makes no table, so SELECT finds none.
+    #[tokio::test]
+    async fn a_page_refuses_the_rules_it_cannot_keep() {
+        let cases = [
+            ("CREATE TABLE t (id INT PRIMARY KEY)", "PRIMARY KEY"),
+            ("CREATE TABLE t (id INT, PRIMARY KEY (id))", "PRIMARY KEY"),
+            ("CREATE TABLE t (id INT UNIQUE)", "UNIQUE"),
+            ("CREATE TABLE t (id INT PRIMARY KEY) AS SELECT 1 AS id", "PRIMARY KEY"),
+            ("CREATE TABLE t (id INT CHECK (id > 0))", "CHECK"),
+            ("CREATE TABLE t (id INT REFERENCES u(id))", "REFERENCES"),
+            ("CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY)", "GENERATED"),
+            ("CREATE TABLE t (id INT, d INT GENERATED ALWAYS AS (id * 2) STORED)", "GENERATED"),
+            ("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)", "PRIMARY KEY"),
+        ];
+        let page = Page::open(&Options::default());
+        for (sql, words) in cases {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            let body = std::str::from_utf8(&got.body).unwrap();
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}: {body}");
+            assert!(body.contains(words), "{sql}: {body}");
+            let read = page.request("POST", "/sql", &[], "SELECT * FROM t".into()).await;
+            assert_eq!((read.status, read.header("x-pondra-sqlstate")), (404, Some("42P01")), "{sql}");
+        }
+    }
+
+    /// A page keeps NOT NULL and DEFAULT: a NULL into a NOT NULL column, or an UPDATE that sets one, answers 23502 with the
+    /// status a node gives it, and leaves the table as it was.
+    #[tokio::test]
+    async fn a_page_keeps_not_null_and_defaults() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (id INT NOT NULL, v INT DEFAULT 7)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t (id) VALUES (1)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT * FROM t".into()).await.body, "id,v\n1,7\n");
+        for sql in ["INSERT INTO t VALUES (NULL, 1)", "UPDATE t SET id = NULL"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (400, Some("23502")), "{sql}: {:?}", got.body);
+            assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT * FROM t".into()).await.body, "id,v\n1,7\n", "{sql}");
+        }
+        assert_eq!(crate::codes::http("23502"), 400);
+    }
+
+    /// What a page refused before it kept rules stays refused, with the code it always gave.
+    #[tokio::test]
+    async fn what_a_page_refused_already_stays_refused() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (id INT, v INT)".into()).await.status, 200);
+        for sql in [
+            "INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING",
+            "CREATE TEMP TABLE x (id INT)",
+            "CREATE TABLE s (id SERIAL)",
+            "ALTER TABLE t ADD COLUMN w INT",
+        ] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
+        }
     }
 
     /// A page keeps no table's past: `AT (…)` is refused by name, as a node would name the table it was asked of.
