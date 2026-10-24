@@ -10,6 +10,8 @@ name: startup
 # kept (`-C save-temps`, on the last two crates only, so no dependency is built again). It traces both under callgrind
 # (tools/startup_order.py trace), marks the functions LLVM made cold (mark), and when the list changed puts it on the
 # branch `startup-list` with a pull request labeled `train`: the train merges it once its run is green, like a lane's.
+# A pull request a token makes starts no workflow, so it rides at the train's next step (another lane's label, a run
+# ending, or its schedule).
 on:
   schedule:
     - cron: "41 4 * * *"
@@ -23,11 +25,12 @@ concurrency:
 
 jobs:
   trace:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # (build.yml's linux-x64: main's cached dependencies were built there)
     timeout-minutes: 150
     permissions:
       contents: write # (the branch `startup-list`)
-      pull-requests: write # (its pull request, labeled `train`)
+      pull-requests: write # (its pull request)
+      issues: write # (its label `train`, as train.yml labels)
     env:
       ZIG_TARGET: x86_64-unknown-linux-gnu.2.17 # (main's linux-x64, build.yml's matrix)
       OUT: target/x86_64-unknown-linux-gnu/dist
@@ -95,16 +98,14 @@ jobs:
           git add tools/startup.txt
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
             commit -q -m "The startup list traced again on ${at:0:7}: $new functions it was missing, $gone gone"
-          git push -f origin startup-list
+          # (a token's push is refused when its diff touches .github/workflows, as a force-push from last night's base onto
+          # a newer main's would: the branch goes and comes back new, as train.py pushes, and last night's PR closes with it)
+          git push origin --delete startup-list 2>/dev/null || true
+          git push origin startup-list
           total=$(names tools/startup.txt | wc -l)
           cold=$(grep -c '^unlikely\.' tools/startup.txt || true)
           printf '%s\n\n%s\n' \
             "Before: tools/startup.txt was traced on an older main, and $new of the functions a node now runs to its first answer and 5 s idle weren't in it, so the Linux builds that ship kept them spread through the program's code." \
             "After: it lists the $total functions the program and the library run, traced on $at ($gone gone; $cold marked cold). Made by .github/workflows/startup.yml; main's build reports the resident code it gives (\`The startup layout held\`)." > "$RUNNER_TEMP/body.md"
           title="The startup list traced again on ${at:0:7}"
-          open=$(gh pr list --head startup-list --state open --json number --jq '.[].number')
-          if [ -n "$open" ]; then
-            gh pr edit "$open" --title "$title" --body-file "$RUNNER_TEMP/body.md" # (its branch is this night's list now)
-          else
-            gh pr create --head startup-list --base main --label train --title "$title" --body-file "$RUNNER_TEMP/body.md"
-          fi
+          gh pr create --head startup-list --base main --label train --title "$title" --body-file "$RUNNER_TEMP/body.md"
