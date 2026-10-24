@@ -210,7 +210,7 @@ export class Pondra {
 
   async _statement(query, params) {
     const changes = isChange(query);
-    const path = changes ? `/sql?job=${this.producer}-${++this.jobs}` : "/sql"; // (sent again after a node went, a change is applied once)
+    const path = changes ? `/sql?job=auto-${this.producer}-${++this.jobs}` : "/sql"; // (sent again after a node went, a change is applied once; `auto-`: kept for the retry window only)
     return (await this._post(path, query, params, changes)).json();
   }
 

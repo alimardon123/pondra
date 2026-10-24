@@ -141,6 +141,11 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
         ms.sort_by(f64::total_cmp);
         let q = |p: f64| ms.get(((ms.len() as f64 * p) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0.0);
         metric("commit_ms", "gauge", "recent catalog commit latency", &[("{quantile=\"0.5\"}".into(), q(0.5)), ("{quantile=\"0.99\"}".into(), q(0.99))]);
+        // Producers' marks and the expiry keys that will remove them (`log::Producers`): flat under steady writes.
+        if let (Some(marks), Some(expiries)) = (app.lake.cat.count("p/", "p0"), app.lake.cat.count(crate::log::EXPIRY, "g/~")) {
+            metric("producer_marks", "gauge", "producers' marks in the catalog (p/): one per producer with a commit kept, a job's or a transaction's or a COPY's", &one(marks as f64));
+            metric("mark_expiries", "gauge", "expiry keys (g/) waiting: each goes with its mark once its window is up", &one(expiries as f64));
+        }
     }
     let tables = app.lake.cat.scan::<TableMeta>("t/", "t0").await?;
     let (mut files, mut rows, mut bytes, mut entry) = (vec![], vec![], vec![], vec![]);

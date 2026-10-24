@@ -609,7 +609,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
             }
             "v" | "q" | "w" | "k" | "ix" | "ty" if !wanted(name) => {} // (an index and an enum type are their schema's too)
             "ns" if !m.schemas.is_empty() && !m.schemas.iter().any(|s| s == name) => {}
-            "p" | "w" if !m.data => {}
+            "p" | "g" | "w" if !m.data => {} // (`g/`: the expiries of `p/`'s marks, and the old marks' cursor)
             "j" => {
                 // (nothing in a branch reaches the outside on its own: ALTER TASK … RESUME)
                 let mut task: crate::runs::Task = serde_json::from_slice(v).with_context(|| k.clone())?;

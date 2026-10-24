@@ -237,7 +237,7 @@ const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "
 /// without FORCE: a file last changed before this window is skipped, as its record may be gone
 /// (Snowflake's 64 days of load metadata). `PONDRA_LOAD_RETENTION_SECS` shortens it, for tests; it is
 /// read once.
-fn retention_ms() -> u64 {
+pub(crate) fn retention_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| crate::env::parse::<u64>("PONDRA_LOAD_RETENTION_SECS").map_or(64 * 24 * 3600 * 1000, |s| s * 1000))
 }

@@ -102,7 +102,7 @@ query) and `tables` are for clients that send frames and data along; the clients
 | `after` | wait until this node has seen this log segment (from an append's `seg`), for reading your own writes |
 | `spread` | `1` runs the query across the cluster even for small tables, `0` only here. Left out, the cluster decides ([clusters](/pondra/guides/clusters/)) |
 | `stale_ms` | accept a remembered answer up to this many milliseconds old |
-| `job` | for a write: a retry with the same job id is applied once |
+| `job` | for a write: a retry with the same job id is applied once (a name is remembered for 64 days, `PONDRA_LOAD_RETENTION_SECS`; an id starting `auto-` for about two minutes) |
 | `rows` | `typed` only: how many rows the first page holds (1 to 100,000; 10,000 if left out) |
 
 A query answers a JSON array of rows, one object each. A column that is null in a row is left out
