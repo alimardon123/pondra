@@ -6,13 +6,15 @@ use crate::pg_bytea;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, StringBuilder};
 use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
 /// The fields of `chunk`, in COPY's text format, as one text array per column (`names`, which says how many),
-/// read as Postgres reads them: a line a row (a `\r` before its `\n` dropped), a line that is `\.` the data's end;
-/// fields split at `delimiter` except where a backslash escapes it; a field that is `null` as written is NULL;
+/// read as Postgres reads them: a line a row (a `\r` before its `\n` dropped); fields split at `delimiter` except
+/// where a backslash escapes it; a field that is `null` as written is NULL;
 /// then `\b \f \n \r \t \v`, a backslash and one to three octal digits, `\x` and one or two hex digits (a byte
 /// each), and a backslash before anything else, a newline too, is that thing. `header` skips the first line.
 pub(crate) fn text_columns(chunk: &str, names: &[String], delimiter: u8, null: &str, header: bool) -> anyhow::Result<Vec<ArrayRef>> {
@@ -22,11 +24,6 @@ pub(crate) fn text_columns(chunk: &str, names: &[String], delimiter: u8, null: &
     let (mut at, mut first) = (0, true);
     while at < bytes.len() {
         at = split_line(bytes, at, delimiter, &mut fields);
-        if let [(range, _)] = fields.as_slice() {
-            if &bytes[range.clone()] == br"\." {
-                break; // (the end marker: nothing after it is read)
-            }
-        }
         if std::mem::replace(&mut first, false) && header {
             continue;
         }
@@ -134,18 +131,107 @@ fn unescape(raw: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Where the last whole row of text-format `data` ends: just after its last newline that no backslash escapes
-/// (one with an odd number of backslashes right before it is a row's data), or 0 when there is none.
-pub(crate) fn rows_end(data: &[u8]) -> usize {
+/// Whether the byte at `at` is not escaped: an even run of backslashes right before it.
+fn unescaped(data: &[u8], at: usize) -> bool { data[..at].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0 }
+
+/// Where the last whole row of `data` ends, just after its last newline that doesn't end a row's data: in text
+/// format one that no backslash escapes, in CSV one outside quotes (an even number of `"` before it); 0 when there is none.
+pub(crate) fn rows_end(data: &[u8], csv: bool) -> usize {
+    if csv {
+        // (the quotes before each newline, counted back from the end a stretch at a time: each byte is counted once)
+        let mut quotes = data.iter().filter(|&&b| b == b'"').count();
+        let mut stretch = data.len();
+        while let Some(i) = data[..stretch].iter().rposition(|&b| b == b'\n') {
+            quotes -= data[i..stretch].iter().filter(|&&b| b == b'"').count();
+            stretch = i;
+            if quotes % 2 == 0 {
+                return i + 1;
+            }
+        }
+        return 0;
+    }
     let mut at = data.len();
     while let Some(i) = data[..at].iter().rposition(|&b| b == b'\n') {
-        let backslashes = data[..i].iter().rev().take_while(|&&b| b == b'\\').count();
-        if backslashes % 2 == 0 {
+        if unescaped(data, i) {
             return i + 1;
         }
         at = i; // (the newline is a row's data: look for the row's end before it)
     }
     0
+}
+
+/// The first `\.` in `data` at or after `from`, at its backslash.
+fn next_dot(data: &[u8], mut from: usize) -> Option<usize> {
+    while let Some(p) = data.get(from..)?.iter().position(|&b| b == b'\\') {
+        let at = from + p;
+        if data.get(at + 1) == Some(&b'.') {
+            return Some(at);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// Where COPY's end marker `\.` starts in `data`, or None: in text format an unescaped one followed by a newline or the
+/// data's end (other text after it is 22P04), in CSV one that is a line of its own outside quotes; any other `\.` is data.
+pub(crate) fn data_end(data: &[u8], csv: bool) -> anyhow::Result<Option<usize>> {
+    if !data.contains(&b'\\') {
+        return Ok(None); // (no backslash, no marker: a fast check first, since most COPY data has no escapes)
+    }
+    let (mut at, mut quoted_to, mut quotes) = (0, 0, 0);
+    while let Some(i) = next_dot(data, at) {
+        let after = &data[i + 2..];
+        let ends = after.is_empty() || after.starts_with(b"\n") || after.starts_with(b"\r\n");
+        if csv {
+            quotes += data[quoted_to..i].iter().filter(|&&b| b == b'"').count();
+            quoted_to = i;
+            if (i == 0 || (data[i - 1] == b'\n' && quotes % 2 == 0)) && ends {
+                return Ok(Some(i));
+            }
+        } else if unescaped(data, i) {
+            if ends {
+                return Ok(Some(i));
+            }
+            return Err(coded("22P04", "end-of-copy marker corrupt"));
+        }
+        at = i + 1;
+    }
+    Ok(None)
+}
+
+/// `text` (CSV, starting at a line's start outside quotes) with `""` written at each blank line outside quotes.
+/// Postgres reads a blank line as one empty unquoted field, which is NULL under the default NULL; Arrow's reader
+/// skips a blank line, but reads `""` as empty text, which its NULL test makes NULL the same way.
+pub(crate) fn csv_blank_lines(text: &str) -> Cow<'_, str> {
+    // (a blank line is a newline that starts a line, so it follows a newline or opens the text: look for those first)
+    if !(text.starts_with('\n') || text.starts_with("\r\n") || text.contains("\n\n") || text.contains("\n\r\n")) {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let (mut quoted, mut line, mut copied) = (false, 0, 0); // (`line`: where the current line starts, outside quotes)
+    let (mut out, mut written) = (String::new(), false);
+    let mut at = 0;
+    while let Some(p) = bytes[at..].iter().position(|&b| b == b'\n' || b == b'"') {
+        let i = at + p;
+        at = i + 1;
+        if bytes[i] == b'"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted {
+            if line == i || (line + 1 == i && bytes[line] == b'\r') {
+                out.push_str(&text[copied..line]);
+                out.push_str("\"\"");
+                (copied, written) = (line, true);
+            }
+            line = i + 1;
+        }
+    }
+    if !written {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
 }
 
 /// Postgres's refusal for a COPY line with `got` fields where `names` has its columns (22P04): a line short of
@@ -183,7 +269,52 @@ fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
         return Ok(cast(&bytes, target)?);
     }
     let options = CastOptions { safe: false, ..Default::default() };
-    cast_with_options(column.as_ref(), target, &options).map_err(|e| coded("22P02", format!("{e} (column {})", field.name())))
+    cast_with_options(column.as_ref(), target, &options).map_err(|e| refused(column, field, e))
+}
+
+/// The refusal of the first text in `column` that `field`'s type can't take: 22003 for a number out of an integer
+/// type's range or with more digits before the point than a decimal has, else 22P02 as Arrow words it.
+fn refused(column: &ArrayRef, field: &Field, e: ArrowError) -> anyhow::Error {
+    let plain = coded("22P02", format!("{e} (column {})", field.name()));
+    let safe = CastOptions { safe: true, ..Default::default() };
+    let (Some(texts), Ok(cast)) = (column.as_string_opt::<i32>(), cast_with_options(column.as_ref(), field.data_type(), &safe)) else {
+        return plain;
+    };
+    let Some(i) = (0..texts.len()).find(|&i| texts.is_valid(i) && cast.is_null(i)) else { return plain };
+    let text = texts.value(i);
+    let out_of_range = match field.data_type() {
+        DataType::Int16 if overflows::<i16>(text) => Some("smallint"),
+        DataType::Int32 if overflows::<i32>(text) => Some("integer"),
+        DataType::Int64 if overflows::<i64>(text) => Some("bigint"),
+        _ => None,
+    };
+    if let Some(name) = out_of_range {
+        return coded("22003", format!("value \"{text}\" is out of range for type {name}"));
+    }
+    let too_wide = match field.data_type() {
+        DataType::Decimal128(p, s) => whole_digits(text).is_some_and(|d| d as i32 > *p as i32 - *s as i32),
+        DataType::Decimal256(p, s) => whole_digits(text).is_some_and(|d| d as i32 > *p as i32 - *s as i32),
+        _ => false,
+    };
+    if too_wide {
+        return coded("22003", "numeric field overflow");
+    }
+    plain
+}
+
+/// Whether `text` is an integer that parses as `T` only by overflowing it (a space around it is not a digit).
+fn overflows<T: std::str::FromStr<Err = std::num::ParseIntError>>(text: &str) -> bool {
+    use std::num::IntErrorKind::{NegOverflow, PosOverflow};
+    matches!(text.trim().parse::<T>(), Err(e) if matches!(e.kind(), PosOverflow | NegOverflow))
+}
+
+/// The digits before the point of `text`, a plain decimal number's (leading zeros not counted), or None when it isn't one.
+fn whole_digits(text: &str) -> Option<usize> {
+    let t = text.trim();
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    (whole.len() + frac.len() > 0 && digits(whole) && digits(frac)).then(|| whole.trim_start_matches('0').len())
 }
 
 /// Postgres's refusal of a COPY option that must be one byte (DELIMITER, QUOTE, ESCAPE) and isn't, `'é'` or `''`:
@@ -264,27 +395,100 @@ b
 
     #[test]
     fn rows_end_is_after_the_last_row_a_newline_ends() {
-        assert_eq!(rows_end(b"1\tx\n2\ty"), 4);
+        assert_eq!(rows_end(b"1\tx\n2\ty", false), 4);
         assert_eq!(rows_end(br"1	x\
-"), 0);
+", false), 0);
         let data = br"1	x\\
 ";
-        assert_eq!(rows_end(data), data.len());
-        assert_eq!(rows_end(b"1\tx"), 0);
+        assert_eq!(rows_end(data, false), data.len());
+        assert_eq!(rows_end(b"1\tx", false), 0);
     }
 
     #[test]
-    fn crlf_line_ends_header_and_the_end_marker() {
+    fn csv_rows_end_is_after_the_last_newline_outside_quotes() {
+        assert_eq!(rows_end(b"\"a\nb\"\nc", true), 6);
+        assert_eq!(rows_end(b"\"a\nb\nc", true), 0);
+        assert_eq!(rows_end(b"1,x\n2,\"y\n", true), 4);
+    }
+
+    #[test]
+    fn data_end_in_text_format() {
+        assert_eq!(data_end(b"\\.\n1\n", false).unwrap(), Some(0));
+        assert_eq!(data_end(b"1\n\\.\n", false).unwrap(), Some(2));
+        assert_eq!(data_end(b"1\n\\.", false).unwrap(), Some(2));
+        assert_eq!(data_end(b"1\\.\n2\n", false).unwrap(), Some(1));
+        assert_eq!(data_end(b"a\\\n\\.\nb\n", false).unwrap(), Some(3));
+        assert_eq!(data_end(b"1\n\\\\.\n2\n", false).unwrap(), None);
+        assert_eq!(data_end(b"1\n\\.\r\n2\n", false).unwrap(), Some(2));
+        assert_eq!(data_end(b"1\n2\n", false).unwrap(), None);
+        assert_eq!(crate::codes::of(&data_end(b"1\n\\.\\.\n", false).expect_err("\\.\\.")), "22P04");
+        let e = data_end(b"1\\.x\n2\n", false).expect_err("\\.x");
+        assert_eq!((crate::codes::of(&e), e.to_string()), ("22P04", "end-of-copy marker corrupt".to_string()));
+    }
+
+    #[test]
+    fn data_end_in_csv_format() {
+        assert_eq!(data_end(b"a\n\\.\n", true).unwrap(), Some(2));
+        assert_eq!(data_end(b"a\n\\.\nb\n", true).unwrap(), Some(2));
+        assert_eq!(data_end(b"a\r\n\\.\r\nb\n", true).unwrap(), Some(3));
+        assert_eq!(data_end(b"a\n\\.x\nb\n", true).unwrap(), None);
+        assert_eq!(data_end(b" \\.\nb\n", true).unwrap(), None);
+        assert_eq!(data_end(b"\"a\n\\.\nb\"\nc\n", true).unwrap(), None);
+        assert_eq!(data_end(b"\"a\n\"\n\\.\n", true).unwrap(), Some(5));
+        assert_eq!(data_end(b"1,x\n2,y\n", true).unwrap(), None);
+    }
+
+    #[test]
+    fn csv_blank_lines_get_an_empty_quoted_field() {
+        assert_eq!(&*csv_blank_lines("a\n\nb\n"), "a\n\"\"\nb\n");
+        assert_eq!(&*csv_blank_lines("\n\n"), "\"\"\n\"\"\n");
+        assert_eq!(&*csv_blank_lines("a\n\r\nb\n"), "a\n\"\"\r\nb\n");
+        assert_eq!(&*csv_blank_lines("\r\nx\n"), "\"\"\r\nx\n");
+        assert_eq!(&*csv_blank_lines(" \na\n"), " \na\n");
+        assert!(matches!(csv_blank_lines("\"a\n\nb\"\nc\n"), Cow::Borrowed(_)));
+        assert_eq!(&*csv_blank_lines("\"a\n\"\n\n"), "\"a\n\"\n\"\"\n");
+        assert_eq!(&*csv_blank_lines("é\n\nü\n"), "é\n\"\"\nü\n");
+    }
+
+    #[test]
+    fn csv_rows_end_counts_quotes_from_the_end() {
+        assert_eq!(rows_end(b"\"a\nb\"\nc\n\"x\n", true), 8);
+        assert_eq!(rows_end(b"a\n\"b\nc\n", true), 2);
+        assert_eq!(rows_end(b"a\n\"b\nc\"\n", true), 8);
+    }
+
+    #[test]
+    fn crlf_line_ends_and_the_header() {
         let got = columns("1\tx\r\n2\ty\r\n", b'\t');
         assert_eq!(got[0], sv(&[Some("1"), Some("2")]));
         assert_eq!(got[1], sv(&[Some("x"), Some("y")]));
         let with_header = text_columns("id\ts\n1\ta\n", &names(), b'\t', r"\N", true).expect("header");
         assert_eq!(with_header[0].as_string::<i32>().iter().collect::<Vec<_>>(), vec![Some("1")]);
-        let ended = columns(r"1	a
-\.
-2	b
-", b'\t');
-        assert_eq!(ended[0], sv(&[Some("1")]));
+        let data = b"1\ta\n\\.\n2\tb\n";
+        let end = data_end(data, false).expect("marker").expect("found");
+        assert_eq!(columns(std::str::from_utf8(&data[..end]).unwrap(), b'\t')[0], sv(&[Some("1")]));
+    }
+
+    #[test]
+    fn an_out_of_range_number_is_22003_and_other_text_is_22p02() {
+        let text = |xs: &[Option<&str>]| -> ArrayRef { Arc::new(StringArray::from(xs.to_vec())) };
+        let refusal = |xs: &[Option<&str>], t: DataType| {
+            let e = typed(vec![text(xs)], &one("n", t)).expect_err("refused");
+            (crate::codes::of(&e), e.to_string())
+        };
+        assert_eq!(refusal(&[Some("1"), Some("99999999999")], DataType::Int32), ("22003", "value \"99999999999\" is out of range for type integer".to_string()));
+        assert_eq!(refusal(&[Some("40000")], DataType::Int16).0, "22003");
+        assert_eq!(refusal(&[Some("-40000")], DataType::Int16), ("22003", "value \"-40000\" is out of range for type smallint".to_string()));
+        assert_eq!(refusal(&[Some("99999999999999999999")], DataType::Int64), ("22003", "value \"99999999999999999999\" is out of range for type bigint".to_string()));
+        assert_eq!(refusal(&[Some("12345")], DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
+        assert_eq!(refusal(&[Some("abc")], DataType::Int32).0, "22P02");
+        assert_eq!(refusal(&[Some("99999999999"), Some("abc")], DataType::Int32).0, "22003", "the first refused text decides");
+        assert_eq!(refusal(&[Some("abc"), Some("99999999999")], DataType::Int32).0, "22P02");
+        assert!(typed(vec![text(&[Some("1.2")])], &one("n", DataType::Decimal128(3, 1))).is_ok());
+        match typed(vec![text(&[Some(" 12 ")])], &one("n", DataType::Int32)) {
+            Ok(b) => assert_eq!(b.column(0).as_primitive::<datafusion::arrow::datatypes::Int32Type>().value(0), 12),
+            Err(e) => assert_eq!(crate::codes::of(&e), "22P02"),
+        }
     }
 
     #[test]

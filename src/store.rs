@@ -1960,6 +1960,16 @@ impl Catalog {
         (self.recent.lock().unwrap().0.iter().map(|(_, f)| f.clone()).collect(), rx)
     }
 
+    /// Inline data (`d/`) that one of the last 64 commits wrote: it never changes, so the frame's copy is always good.
+    fn recent_inline(&self, key: &str) -> Option<Bytes> {
+        let r = self.recent.lock().unwrap();
+        let found = r.0.iter().rev().filter_map(|(_, f)| match f {
+            Frame::Change(d) => Some(d),
+            _ => None,
+        }).take(64).find_map(|d| d.puts.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()));
+        found
+    }
+
     /// Leader: stream a frame (and keep it for followers that connect later).
     fn send(&self, f: Frame) {
         let mut r = self.recent.lock().unwrap();
@@ -2205,7 +2215,10 @@ impl Catalog {
         Ok(match &self.db {
             // The leader answers from its in-memory catalog: committed writes only, never ones
             // in flight. Inline segment data is only asked for once its segment is committed.
-            Db_::Writer(db) if key.starts_with("d/") => db.get(key).await.map_err(|e| self.fenced(e))?,
+            Db_::Writer(db) if key.starts_with("d/") => match self.recent_inline(key) {
+                Some(bytes) => Some(bytes),
+                None => db.get(key).await.map_err(|e| self.fenced(e))?,
+            },
             Db_::Writer(db) => match self.mirror.load(Relaxed) {
                 true => self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()),
                 false => db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(|e| self.fenced(e))?,
@@ -2536,6 +2549,29 @@ mod tests {
             cat.parsed(&format!("t/small{n}"), &entry(&n.to_string())?)?;
         }
         assert!(cat.metas.lock().unwrap().by_key.len() <= PARSED_COUNT, "the count bound holds");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// `recent_inline` answers a `d/` key that one of the last 64 commits wrote, and no other key: the
+    /// frames are sent by hand, as the commit loop would send them, so no commit has to wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recent_inline_answers_the_last_64_commits() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
+        cat.send(change(1, data_key(1), b"rows"));
+        assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));
+        assert_eq!(cat.recent_inline(&data_key(2)), None);
+        assert_eq!(cat.get_raw(&data_key(1)).await?.as_deref(), Some(&b"rows"[..]));
+        for i in 0..64u64 {
+            cat.send(change(2 + i, data_key(100 + i), b"other"));
+        }
+        assert_eq!(cat.recent_inline(&data_key(1)), None, "the window is the last 64 commits");
+        assert_eq!(cat.recent_inline(&data_key(163)).as_deref(), Some(&b"other"[..]));
+        cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }

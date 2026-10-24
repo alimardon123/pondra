@@ -593,26 +593,29 @@ impl Backend {
         // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
         crate::auth::check_changes(&table, !meta.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
         let n = if c.columns.is_empty() { meta.columns.iter().filter(|(c, _)| c != "_deleted").count() } else { c.columns.len() };
-        COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string() });
+        COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
     }
 
-    /// Rows a COPY FROM sent, up to the last whole line (`all`: everything), into the table's log.
+    /// Rows a COPY FROM sent, up to the last whole line (`all`: everything), into the table's log. Nothing is read
+    /// past the data's end marker.
     async fn load(&self, p: &mut Pending, all: bool) -> PgWireResult<()> {
-        let cut = match all {
-            true => p.data.len(),
-            false => match p.copy.format.as_str() {
-                // (a line ends a row unless it's inside quotes: an even number of them before it)
-                "csv" => (0..p.data.len()).rev().filter(|&i| p.data[i] == b'\n').find(|&i| p.data[..i].iter().filter(|&&b| b == b'"').count() % 2 == 0).map_or(0, |i| i + 1),
-                _ => crate::pg_copy::rows_end(&p.data), // (text format: a newline that no backslash escapes)
-            },
-        };
-        let chunk: Vec<u8> = p.data.drain(..cut).collect();
-        let (header, csv) = (p.copy.header && p.seq == 0, p.copy.format == "csv");
-        if chunk.iter().all(|b| b.is_ascii_whitespace() || *b == b'\\' || *b == b'.') {
-            return Ok(()); // (nothing, or text format's end marker `\.`)
+        if p.ended {
+            return Ok(());
         }
         let err = |e: anyhow::Error| user_error(e);
+        let csv = p.copy.format == "csv";
+        let cut = if all { p.data.len() } else { crate::pg_copy::rows_end(&p.data, csv) };
+        let mut chunk: Vec<u8> = p.data.drain(..cut).collect();
+        if let Some(end) = crate::pg_copy::data_end(&chunk, csv).map_err(err)? {
+            chunk.truncate(end);
+            p.ended = true;
+            p.data.clear(); // (what comes after the marker is not read)
+        }
+        if chunk.is_empty() {
+            return Ok(()); // (no whole line yet, or the marker comes first)
+        }
+        let header = p.copy.header && p.seq == 0;
         // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
         let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
@@ -628,7 +631,8 @@ impl Backend {
                 let null = regex::Regex::new(&format!("^{}$", regex::escape(&null))).map_err(|e| err(e.into()))?;
                 let as_text = Arc::new(Schema::new(schema.fields().iter().map(|f| Field::new(f.name(), DataType::Utf8, true)).collect::<Vec<_>>()));
                 let reader = datafusion::arrow::csv::ReaderBuilder::new(as_text).with_header(header).with_delimiter(delimiter).with_null_regex(null);
-                let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
+                let lines = crate::pg_copy::csv_blank_lines(text);
+                let batches = reader.build(std::io::Cursor::new(lines.as_bytes())).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
                 batches.iter().map(|b| b.columns().to_vec()).collect()
             }
             false => vec![crate::pg_copy::text_columns(text, &given, delimiter, &null, header).map_err(err)?],
@@ -1165,13 +1169,15 @@ impl Copy {
     }
 }
 
-/// A COPY FROM STDIN under way, per connection: what it loads, and what came that isn't loaded yet.
+/// A COPY FROM STDIN under way, per connection: what it loads, and what came that isn't loaded yet. `ended`: its
+/// data's end marker has come, so what follows it is not read.
 struct Pending {
     copy: Copy,
     data: Vec<u8>,
     rows: u64,
     seq: u64,
     job: String,
+    ended: bool,
 }
 
 crate::per_node!(static COPIES: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>> = Default::default());
@@ -1188,7 +1194,9 @@ impl CopyHandler for Backend {
         let mut p = {
             let mut copies = COPIES.lock().unwrap();
             let Some(p) = copies.get_mut(&client.socket_addr()) else { return Err(user_error(anyhow::anyhow!("COPY data without a COPY"))) };
-            p.data.extend_from_slice(&data.data);
+            if !p.ended {
+                p.data.extend_from_slice(&data.data); // (what follows the end marker is not gathered)
+            }
             if p.data.len() < 32 << 20 {
                 return Ok(());
             }
@@ -1386,7 +1394,8 @@ impl ExtendedQueryHandler for Backend {
     }
 
     // (psycopg describes the portal named after a DECLARE'd cursor right after the DECLARE: `cursor_portal`
-    // makes it when asked, as Postgres has it.)
+    // makes it when asked, as Postgres has it. The unnamed portal is pgwire's `DEFAULT_NAME`, found by
+    // `_on_describe`; only a named one can be a cursor.)
     async fn on_describe<C>(&self, client: &mut C, message: Describe) -> PgWireResult<()>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1394,9 +1403,10 @@ impl ExtendedQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let name = message.name.clone().unwrap_or_default();
-        if message.target_type == TARGET_TYPE_BYTE_PORTAL && client.portal_store().get_portal(&name).is_none() {
-            crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+        if let Some(name) = message.name.clone().filter(|_| message.target_type == TARGET_TYPE_BYTE_PORTAL) {
+            if client.portal_store().get_portal(&name).is_none() {
+                crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
+            }
         }
         self._on_describe(client, message).await
     }
