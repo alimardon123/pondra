@@ -12529,9 +12529,29 @@ def begin():
     many = [http(A.port, "SELECT sum(v) AS s, count(*) AS n FROM many", s)[2], http(A.port, "COMMIT", s)[0], q("SELECT sum(v) AS s FROM many")]
     checks["a transaction that changed 12,000 keys reads them (12,000 of 12,000) and commits; the node stays up"] = \
         many == [[{"s": 12000, "n": 12000}], 200, [{"s": 12000}]]
+    # A keyed table's own rows, read by key in one transaction over psycopg (ADR-036 §6): a key updated twice, a key deleted and
+    # then updated (no row changed), a key inserted and updated, a SAVEPOINT's update rolled back, and a key written as 01 (= 1)
+    kv, keyed = f"kv_{tag}", {}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"CREATE TABLE {kv} (id INT PRIMARY KEY, v INT)")
+        c.execute(f"INSERT INTO {kv} VALUES (1, 10), (2, 20)")
+        one = lambda sql: [r[0] for r in c.execute(sql).fetchall()]
+        c.execute("BEGIN")
+        c.execute(f"UPDATE {kv} SET v = v + 1 WHERE id = 1"); c.execute(f"UPDATE {kv} SET v = v + 1 WHERE id = 1")
+        keyed["updated twice"] = (one(f"SELECT v FROM {kv} WHERE id = 1"), one(f"SELECT v FROM {kv} WHERE id = 01"))
+        c.execute(f"DELETE FROM {kv} WHERE id = 2")
+        keyed["deleted, then updated"] = (c.execute(f"UPDATE {kv} SET v = 0 WHERE id = 2").rowcount, one(f"SELECT v FROM {kv} WHERE id = 2"))
+        c.execute(f"INSERT INTO {kv} VALUES (3, 30)"); c.execute(f"UPDATE {kv} SET v = v + 1 WHERE id = 3")
+        keyed["inserted, then updated"] = one(f"SELECT v FROM {kv} WHERE id = 3")
+        c.execute("SAVEPOINT s"); c.execute(f"UPDATE {kv} SET v = 100 WHERE id = 1"); c.execute("ROLLBACK TO s")
+        keyed["savepoint rolled back"] = one(f"SELECT v FROM {kv} WHERE id = 1")
+        c.execute("COMMIT")
+        keyed["after COMMIT"] = [tuple(r) for r in c.execute(f"SELECT id, v FROM {kv} ORDER BY id").fetchall()]
+    checks["a keyed table's own rows in one transaction, read by key: a key updated twice answers 12 (also as id = 01); one deleted then updated changes 0 rows and answers no row; one inserted then updated answers 31; a SAVEPOINT's update rolled back answers 12; after COMMIT the table is (1, 12), (3, 31)"] = \
+        keyed == {"updated twice": ([12], [12]), "deleted, then updated": (0, []), "inserted, then updated": [31], "savepoint rolled back": [12], "after COMMIT": [(1, 12), (3, 31)]}
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status, "refused": refused, "errs": errs, "many": many}}, indent=1, default=str))
+    print(json.dumps({"begin": checks, "ok": ok, "info": {"transfers": done[0], "retried": retried[0], "errors": errors[:3], "codes": codes, "status": status, "refused": refused, "errs": errs, "many": many, "keyed": keyed}}, indent=1, default=str))
     if not ok:
         sys.exit(1)
 

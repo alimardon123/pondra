@@ -45,15 +45,27 @@ struct Changes {
 }
 
 /// A keyed table's kept rows by key, as text (`key_texts`): how many of the transaction's own rows hold each key (`live`, over
-/// `Changes::new`), and the keys of the table's rows it replaced or deleted (`gone`, over `Changes::old`). `keep` keeps it as it
-/// keeps the rows, and ROLLBACK TO makes it again from the rows it puts back (a savepoint holds rows only, so taking one costs
-/// what it did). A plain INSERT's check and a read's overlay ask it rather than go over every row kept: when the check did, a
+/// `Changes::new`), and the keys of the table's rows it replaced or deleted (`gone`, over `Changes::old`). `rows` holds, for each
+/// key in `live`, the newest of its own rows as the batch it came in (one `Arc` per batch, shared by its keys) and its index. It is
+/// None until the transaction first reads or updates one of its own keys, when it is made from the rows it keeps; `keep` forgets it
+/// when it filters rows out of a kept batch, so a replaced batch isn't held, and it is made again on the next ask. `keep` keeps the
+/// rest as it keeps the rows, and ROLLBACK TO makes it again from the rows it puts back (a savepoint holds rows only, so taking one
+/// costs what it did). A plain INSERT's check and a read's overlay ask it rather than go over every row kept: when the check did, a
 /// transaction of 2,000 one-row INSERTs took 4.9 ms an INSERT by its end, against 0.9 ms at its start.
 #[derive(Default)]
 struct ByKey {
     key: Vec<String>, // (SQL's names)
     live: HashMap<String, u32>,
+    rows: Option<HashMap<String, (Arc<RecordBatch>, usize)>>,
     gone: HashSet<String>,
+}
+
+/// Puts the rows of `b` into `rows` under their keys' texts (`texts`, from `key_texts`): a later row of a key wins.
+fn index(rows: &mut HashMap<String, (Arc<RecordBatch>, usize)>, texts: &[String], b: &RecordBatch) {
+    let batch = Arc::new(b.clone());
+    for (i, k) in texts.iter().enumerate() {
+        rows.insert(k.clone(), (batch.clone(), i));
+    }
 }
 
 impl ByKey {
@@ -69,7 +81,11 @@ impl ByKey {
 
     /// The transaction's own rows `b` are kept.
     fn added(&mut self, b: &RecordBatch) -> Result<()> {
-        key_texts(b, &self.key)?.into_iter().for_each(|k| *self.live.entry(k).or_default() += 1);
+        let texts = key_texts(b, &self.key)?;
+        if let Some(rows) = self.rows.as_mut() {
+            index(rows, &texts, b);
+        }
+        texts.into_iter().for_each(|k| *self.live.entry(k).or_default() += 1);
         Ok(())
     }
 
@@ -80,6 +96,9 @@ impl ByKey {
                 *n -= 1;
                 if *n == 0 {
                     self.live.remove(&k);
+                    if let Some(rows) = self.rows.as_mut() {
+                        rows.remove(&k);
+                    }
                 }
             }
         }
@@ -96,6 +115,23 @@ impl ByKey {
     /// away, None neither (`constraints::key_check_over`).
     fn kept(&self, keys: &[String]) -> Vec<Option<bool>> {
         keys.iter().map(|k| if self.live.contains_key(k) { Some(true) } else { self.gone.contains(k).then_some(false) }).collect()
+    }
+
+    /// The transaction's own row of a key (`key_texts`): its newest, Some(None) when it took the table's row away and keeps none,
+    /// None neither. `kept` is the table's rows the transaction keeps, oldest first, which make `rows` when it is None.
+    fn own(&mut self, key: &str, kept: &[RecordBatch]) -> Result<Option<Option<RecordBatch>>> {
+        if self.rows.is_none() {
+            let mut rows = HashMap::new();
+            for b in kept.iter().filter(|b| b.num_rows() > 0) {
+                index(&mut rows, &key_texts(b, &self.key)?, b);
+            }
+            self.rows = Some(rows);
+        }
+        let found = self.rows.as_ref().and_then(|rows| rows.get(key)).map(|(b, i)| b.slice(*i, 1));
+        Ok(match found {
+            Some(row) => Some(Some(row)),
+            None => self.gone.contains(key).then_some(None),
+        })
     }
 }
 
@@ -1152,10 +1188,19 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
         c.old.push(taken);
     }
     if !mine.is_empty() {
+        let mut lost = false;
         for b in c.new.iter_mut() {
+            if b.num_rows() == 0 {
+                continue;
+            }
             let ids = b.column_by_name(crate::text::ROW_ID).context("new rows' ids")?.as_primitive::<Int64Type>().clone();
             let keep = BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| mine.contains(&i)))).collect::<Vec<_>>());
-            *b = datafusion::arrow::compute::filter_record_batch(b, &keep)?;
+            let filtered = datafusion::arrow::compute::filter_record_batch(b, &keep)?;
+            lost |= filtered.num_rows() < b.num_rows();
+            *b = filtered;
+        }
+        if let Some(by) = by.as_mut().filter(|_| lost) {
+            by.rows = None; // (a batch it held lost rows: its rows are made again on the next ask)
         }
     }
     for b in new.into_iter().filter(|b| b.num_rows() > 0) {
@@ -1751,7 +1796,8 @@ enum Current {
     Changed,
 }
 
-/// A row has the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version` (null: the transaction's own).
+/// A row has the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version` (null: the transaction's own). `key` is
+/// the key's text as `key_text` gives it.
 async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>) -> Result<Current> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
     let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns)?.fields().to_vec();
@@ -1760,16 +1806,14 @@ async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], sna
     fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
     let target = Arc::new(Schema::new(fields));
     if snapshot.is_some() {
-        if let Some(c) = with_txn(|t| t.tables.get(table).cloned()).flatten() {
-            let want = key.to_vec();
-            for b in c.new.iter().rev() {
-                if let Some(i) = keys_of(b, &meta.key)?.iter().rposition(|k| *k == want) {
-                    return Ok(Current::Row(crate::query::conform(&b.slice(i, 1), &target)?));
-                }
-            }
-            if c.old.iter().any(|b| keys_of(b, &meta.key).is_ok_and(|ks| ks.contains(&want))) {
-                return Ok(Current::Gone); // (it deleted it)
-            }
+        let own = with_txn(|t| match (t.by_key.get_mut(table), t.tables.get(table)) {
+            (Some(by), Some(c)) => by.own(&key.join(KEY_SEP), &c.new),
+            _ => Ok(None),
+        });
+        match own.transpose()?.flatten() {
+            Some(Some(row)) => return Ok(Current::Row(crate::query::conform(&row, &target)?)),
+            Some(None) => return Ok(Current::Gone), // (it deleted it)
+            None => {}
         }
     }
     let Some((r, version, created)) = crate::serve::lookup_versioned(lake, table, meta, key).await? else { return Ok(Current::Gone) };
@@ -1849,6 +1893,7 @@ pub async fn point_read(lake: &Lake, sql: &str) -> Result<Option<Vec<RecordBatch
     }
     let Some(p) = crate::serve::point(lake, sql.trim().trim_end_matches(';')).await? else { return Ok(None) };
     let Some(key) = p.key.iter().cloned().collect::<Option<Vec<String>>>() else { return Ok(None) };
+    let Ok(key) = key_text(&p.meta, &key) else { return Ok(None) }; // (a key the text can't say: SQL answers it)
     let schema = p.schema()?;
     Ok(match current(lake, &p.table, &p.meta, &key, Some(snapshot)).await? {
         Current::Row(r) => Some(vec![crate::query::conform(&r, &schema)?]),
@@ -1864,18 +1909,46 @@ mod tests {
     #[test]
     fn a_transactions_keys_are_kept_as_its_rows_are() {
         use datafusion::arrow::array::StringArray;
-        let rows = |ids: &[i64], names: &[&str]| RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef), ("name", Arc::new(StringArray::from(names.to_vec())) as ArrayRef)]).expect("a batch");
+        let rows = |ids: &[i64], names: &[&str], vs: &[i64]| RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef), ("name", Arc::new(StringArray::from(names.to_vec())) as ArrayRef), ("v", Arc::new(Int64Array::from(vs.to_vec())) as ArrayRef)]).expect("a batch");
         let key = vec!["id".to_string(), "name".to_string()];
+        let text = |id: i64, name: &str| key_texts(&rows(&[id], &[name], &[0]), &key).expect("texts").remove(0);
+        let v_of = |own: Result<Option<Option<RecordBatch>>>| own.expect("own").map(|row| row.map(|b| b.column_by_name("v").expect("v").as_primitive::<Int64Type>().value(0)));
+        let sorted = |rows: &HashMap<String, (Arc<RecordBatch>, usize)>| {
+            let mut keys: Vec<String> = rows.keys().cloned().collect();
+            keys.sort();
+            keys
+        };
         let mut by = ByKey { key: key.clone(), ..Default::default() };
-        by.added(&rows(&[1, 2], &["a", "b"])).expect("added");
-        by.taken(&rows(&[3], &["c"])).expect("taken");
-        let texts = key_texts(&rows(&[1, 3, 4], &["a", "c", "a"]), &key).expect("texts");
+        by.added(&rows(&[1, 2], &["a", "b"], &[10, 20])).expect("added");
+        by.taken(&rows(&[3], &["c"], &[30])).expect("taken");
+        assert!(by.rows.is_none(), "its rows are made when a key of its own is first asked for");
+        let texts = key_texts(&rows(&[1, 3, 4], &["a", "c", "a"], &[0, 0, 0]), &key).expect("texts");
         assert_eq!(by.kept(&texts), vec![Some(true), Some(false), None], "its own row's key, one it took away, neither");
-        by.dropped(&rows(&[1], &["a"])).expect("dropped");
+        by.dropped(&rows(&[1], &["a"], &[10])).expect("dropped");
         assert_eq!(by.kept(&texts), vec![None, Some(false), None], "a row of its own replaced or deleted frees its key");
-        // (made again from the rows, as ROLLBACK TO does, it is the same)
-        let c = Changes { new: vec![rows(&[2], &["b"])], old: vec![rows(&[3], &["c"])] };
-        let again = ByKey::of(&key, Some(&c)).expect("made again");
+        by.added(&rows(&[1], &["a"], &[11])).expect("added");
+        // (the rows it keeps, oldest first, as `keep` leaves them: (2, b), then (1, a) at 11)
+        let kept = vec![rows(&[2], &["b"], &[20]), rows(&[1], &["a"], &[11])];
+        assert_eq!(v_of(by.own(&text(1, "a"), &kept)), Some(Some(11)), "the newest version of its key, the second one added");
+        assert!(by.rows.is_some(), "asked, its rows are made from the rows it keeps");
+        assert_eq!(v_of(by.own(&text(3, "c"), &kept)), Some(None), "the key it took away, and none of its own");
+        assert_eq!(v_of(by.own(&text(4, "a"), &kept)), None, "a key neither holds");
+        // (keep forgets the rows when it filters a kept batch: made again on the next ask, the answers are the same)
+        by.rows = None;
+        assert_eq!(v_of(by.own(&text(1, "a"), &kept)), Some(Some(11)));
+        assert_eq!(v_of(by.own(&text(3, "c"), &kept)), Some(None));
+        assert_eq!(v_of(by.own(&text(4, "a"), &kept)), None);
+        by.dropped(&rows(&[2], &["b"], &[20])).expect("dropped");
+        assert!(!by.rows.as_ref().expect("made").contains_key(&text(2, "b")), "a live key whose row is dropped loses its row");
+        assert_eq!(v_of(by.own(&text(2, "b"), &kept[1..])), None, "and it is neither kept nor taken");
+        // (made again from the rows it keeps, as ROLLBACK TO does: none until asked, then the same keys)
+        let c = Changes { new: vec![rows(&[1], &["a"], &[11])], old: vec![rows(&[3], &["c"], &[30])] };
+        let mut again = ByKey::of(&key, Some(&c)).expect("made again");
+        assert!(again.rows.is_none(), "made again, its rows wait for the next ask");
+        assert_eq!(v_of(again.own(&text(1, "a"), &c.new)), Some(Some(11)));
+        by.rows = None;
+        assert_eq!(v_of(by.own(&text(1, "a"), &c.new)), Some(Some(11)));
+        assert_eq!(sorted(again.rows.as_ref().expect("made")), sorted(by.rows.as_ref().expect("made")), "the same keys have rows");
         assert_eq!((again.live, again.gone), (by.live, by.gone));
     }
 
