@@ -455,7 +455,7 @@ pub fn identity_of(c: &ast::ColumnDef) -> Result<Option<Identity>> {
     let mut out = None;
     for o in &c.options {
         out = match &o.option {
-            ast::ColumnOption::Generated { generation_expr: Some(e), .. } => bail!("{} … GENERATED ALWAYS AS ({e}): computed columns aren't taken yet (a view can compute it)", c.name),
+            ast::ColumnOption::Generated { generation_expr: Some(e), .. } => return Err(crate::codes::coded("0A000", format!("{} … GENERATED ALWAYS AS ({e}): computed columns aren't taken yet (a view can compute it)", c.name))),
             ast::ColumnOption::Generated { generated_as, sequence_options, .. } => {
                 let always = matches!(generated_as, ast::GeneratedAs::Always);
                 Some(Identity { always, declared: options(sequence_options.as_deref().unwrap_or_default())?, ..Default::default() })
