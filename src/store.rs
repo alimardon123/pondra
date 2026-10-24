@@ -176,6 +176,18 @@ pub struct TableMeta {
     /// lists too. Files there go only by the orphan sweep, which counts every table listing them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shares: Vec<String>,
+    /// The rules made from this parse, once (`rules`): never in the catalog, and a clone starts without them.
+    #[serde(skip)]
+    pub rules: RulesMemo,
+}
+
+/// The rules made from one parse of a table's entry (`TableMeta::rules`), kept once. A clone gets an empty one:
+/// it may be changed, so it makes its own.
+#[derive(Default)]
+pub struct RulesMemo(std::sync::OnceLock<Arc<crate::rules::Table>>);
+
+impl Clone for RulesMemo {
+    fn clone(&self) -> Self { RulesMemo::default() }
 }
 
 impl TableMeta {
@@ -226,12 +238,12 @@ impl TableMeta {
             ttl: self.ttl.as_ref().map(|(c, s)| (n(c), *s)),
             order: self.order.as_ref().map(n),
             partition,
-            not_null: self.not_null.iter().filter(|c| !self.dropped.contains(c)).map(n).collect(),
-            defaults: self.defaults.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
-            identity: self.identity.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, i)| (n(c), i.clone())).collect(),
+            not_null: self.in_sql_list(&self.not_null),
+            defaults: self.in_sql(&self.defaults),
+            identity: self.in_sql(&self.identity),
             constraints: self.constraints.iter().map(|c| c.named(&n)).collect(),
-            enums: self.enums.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, e)| (n(c), e.clone())).collect(),
-            sql_types: self.sql_types.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, t)| (n(c), t.clone())).collect(),
+            enums: self.in_sql(&self.enums),
+            sql_types: self.in_sql(&self.sql_types),
             names: BTreeMap::new(),
             dropped: vec![],
             ..self.clone()
@@ -244,6 +256,59 @@ impl TableMeta {
             return self.columns.clone();
         }
         self.live().map(|(_, n, t)| (n.to_string(), t.to_string())).collect()
+    }
+
+    /// A per-column map, keyed by stored name, under the names SQL knows the columns by: the entries of dropped columns
+    /// left out. `logical()` and `to_rules()` both map their fields through this, so a rename or a drop is mapped here.
+    fn in_sql<V: Clone>(&self, m: &BTreeMap<String, V>) -> BTreeMap<String, V> {
+        m.iter().filter(|(c, _)| !self.dropped.contains(c)).map(|(c, v)| (self.name_of(c).to_string(), v.clone())).collect()
+    }
+
+    /// A per-column list, by stored name, under SQL's names: the dropped columns left out (`in_sql` for a list).
+    fn in_sql_list(&self, l: &[String]) -> Vec<String> {
+        l.iter().filter(|c| !self.dropped.contains(c)).map(|c| self.name_of(c).to_string()).collect()
+    }
+
+    /// The table a write's rules see (`rules::Table`), made from the rule fields alone: never `files` or the
+    /// statistics. Each column SQL sees (`live`, the one mapping of stored names to SQL's) takes its rules by its
+    /// stored name, as the entry keeps them.
+    pub fn to_rules(&self) -> Result<crate::rules::Table> {
+        let columns = self
+            .live()
+            .map(|(stored, name, _)| crate::rules::Column {
+                name: name.to_string(),
+                stored: stored.to_string(),
+                not_null: self.not_null.iter().any(|c| c == stored),
+                default: self.defaults.get(stored).cloned(),
+                always: self.identity.get(stored).is_some_and(|i| i.always),
+                held: self.sql_types.get(stored).cloned(),
+                labels: self.enums.get(stored).map(|e| (e.of.clone(), e.labels.clone())),
+            })
+            .collect();
+        Ok(crate::rules::Table {
+            schema: crate::answer::schema(&self.logical_columns())?,
+            columns,
+            key: self.key.iter().map(|c| self.name_of(c).to_string()).collect(),
+            key_checked: crate::constraints::key_checked(self),
+            unique: self
+                .constraints
+                .iter()
+                .filter(|c| c.enforced && c.kind == crate::constraints::Kind::Unique)
+                .map(|c| (c.name.clone(), c.columns.iter().map(|s| self.name_of(s).to_string()).collect()))
+                .collect(),
+            checks: self.checks.clone(),
+            mapped: self.mapped(),
+        })
+    }
+
+    /// The rules of this entry, made once per parse and kept beside it: `Catalog::parsed` hands out one `Arc` per
+    /// entry's bytes, so a write takes them with no lookup. An owned or changed entry calls `to_rules` instead.
+    pub fn rules(self: &Arc<Self>) -> Result<Arc<crate::rules::Table>> {
+        if let Some(t) = self.rules.0.get() {
+            return Ok(t.clone());
+        }
+        let t = Arc::new(self.to_rules()?);
+        Ok(self.rules.0.get_or_init(|| t).clone())
     }
 
     /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, but
@@ -2888,5 +2953,101 @@ mod tests {
         let err = spill_fits(u64::MAX / 2).expect_err("no disk holds that");
         assert_eq!(crate::codes::of(&err), "53100");
         assert_eq!(err.to_string().contains("PONDRA_SPILL_GB"), spill_gb().is_some(), "{err}");
+    }
+
+    /// A keyed table with every rule kind: a renamed and a dropped column, both identity kinds with their
+    /// defaults, an enum, a uuid, a varchar(3), NOT NULL, DEFAULT, CHECK, an enforced and a NOT ENFORCED UNIQUE.
+    fn with_rules() -> TableMeta {
+        let col = |c: &str, t: &str| (c.to_string(), t.to_string());
+        let set = |v: &[(&str, &str)]| v.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
+        let id = |always: bool, seq: &str| crate::seq::Identity { always, declared: vec![], sequence: seq.into() };
+        let unique = |name: &str, c: &str, enforced: bool| crate::constraints::Constraint { name: name.into(), kind: crate::constraints::Kind::Unique, columns: vec![c.into()], references: None, enforced };
+        TableMeta {
+            columns: vec![col("id", "Int64"), col("seq_no", "Int64"), col("c_code", "Utf8"), col("c_status", "Utf8"), col("owner", "Utf8"), col("total", "Int64"), col("doc", "Utf8"), col("gone", "Utf8"), col("_deleted", "Boolean")],
+            key: vec!["id".into()],
+            names: set(&[("c_code", "code"), ("c_status", "status")]),
+            dropped: vec!["gone".into()],
+            not_null: vec!["id".into(), "c_code".into(), "gone".into()],
+            defaults: set(&[("id", "nextval('orders_id_seq')"), ("seq_no", "nextval('orders_seq_no_seq')"), ("total", "0"), ("gone", "'x'")]),
+            checks: vec![("orders_total_check".into(), "total >= 0".into())],
+            identity: [("id".to_string(), id(false, "orders_id_seq")), ("seq_no".to_string(), id(true, "orders_seq_no_seq"))].into(),
+            constraints: vec![unique("orders_code_key", "c_code", true), unique("orders_owner_key", "owner", false)],
+            enums: [("c_status".to_string(), crate::types::Enum { of: Some("order_status".into()), labels: vec!["open".into(), "shipped".into()] })].into(),
+            sql_types: set(&[("owner", "uuid"), ("c_code", "varchar(3)"), ("doc", "json"), ("gone", "json")]),
+            ..Default::default()
+        }
+    }
+
+    /// `logical()` of `with_rules`, as JSON: the golden is the unchanged code's.
+    #[test]
+    fn logical_is_as_before_rules() {
+        let json = serde_json::to_string(&with_rules().logical()).unwrap();
+        assert_eq!(json, r#"{"columns":[["id","Int64"],["seq_no","Int64"],["code","Utf8"],["status","Utf8"],["owner","Utf8"],["total","Int64"],["doc","Utf8"],["_deleted","Boolean"]],"key":["id"],"merge":{},"files":[],"sealed":null,"tiered":0,"garbage":[],"rows_at":0,"shadows":false,"publish":[],"cluster":[],"ttl":null,"partition":null,"ids":false,"changed":false,"not_null":["id","code"],"defaults":{"id":"nextval('orders_id_seq')","seq_no":"nextval('orders_seq_no_seq')","total":"0"},"checks":[["orders_total_check","total >= 0"]],"identity":{"id":{"always":false,"sequence":"orders_id_seq"},"seq_no":{"always":true,"sequence":"orders_seq_no_seq"}},"constraints":[{"name":"orders_code_key","kind":"unique","columns":["code"],"enforced":true},{"name":"orders_owner_key","kind":"unique","columns":["owner"]}],"enums":{"status":{"of":"order_status","labels":["open","shipped"]}},"sql_types":{"code":"varchar(3)","doc":"json","owner":"uuid"}}"#);
+    }
+
+    /// `to_rules` names everything SQL's way: the dropped column is absent, the renamed one keeps its stored name, and
+    /// each rule field is what `logical()` gives under the same names.
+    #[test]
+    fn to_rules_maps_the_rule_fields_as_logical_does() -> Result<()> {
+        let m = with_rules();
+        let (t, l) = (m.to_rules()?, m.logical());
+        let plain = |name: &str, stored: &str| crate::rules::Column { name: name.into(), stored: stored.into(), not_null: false, default: None, always: false, held: None, labels: None };
+        let want = vec![
+            crate::rules::Column { not_null: true, default: Some("nextval('orders_id_seq')".into()), ..plain("id", "id") },
+            crate::rules::Column { default: Some("nextval('orders_seq_no_seq')".into()), always: true, ..plain("seq_no", "seq_no") },
+            crate::rules::Column { not_null: true, held: Some("varchar(3)".into()), ..plain("code", "c_code") },
+            crate::rules::Column { labels: Some((Some("order_status".into()), vec!["open".into(), "shipped".into()])), ..plain("status", "c_status") },
+            crate::rules::Column { held: Some("uuid".into()), ..plain("owner", "owner") },
+            crate::rules::Column { default: Some("0".into()), ..plain("total", "total") },
+            crate::rules::Column { held: Some("json".into()), ..plain("doc", "doc") },
+            plain("_deleted", "_deleted"),
+        ];
+        assert_eq!(t.columns, want);
+        let names: Vec<&str> = t.schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "seq_no", "code", "status", "owner", "total", "doc", "_deleted"], "SQL's names, _deleted among them");
+        assert_eq!(t.key, ["id"]);
+        assert!(t.key_checked && t.mapped && t.checked() && t.width() == 7);
+        assert_eq!(t.unique, [("orders_code_key".to_string(), vec!["code".to_string()])]);
+        assert_eq!(t.checks, [("orders_total_check".to_string(), "total >= 0".to_string())]);
+        assert!(t.column("gone").is_none() && t.marker("_deleted") && !t.marker("total"));
+        for c in &t.columns {
+            assert_eq!(l.not_null.contains(&c.name), c.not_null, "{}", c.name);
+            assert_eq!(l.defaults.get(&c.name).cloned(), c.default, "{}", c.name);
+            assert_eq!(l.identity.get(&c.name).is_some_and(|i| i.always), c.always, "{}", c.name);
+            assert_eq!(l.sql_types.get(&c.name).cloned(), c.held, "{}", c.name);
+            assert_eq!(l.enums.get(&c.name).map(|e| (e.of.clone(), e.labels.clone())), c.labels, "{}", c.name);
+        }
+        assert_eq!(l.key, t.key);
+        assert_eq!(l.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), names);
+        assert!(!l.defaults.contains_key("gone") && !l.sql_types.contains_key("gone") && !l.not_null.iter().any(|c| c == "gone"));
+        Ok(())
+    }
+
+    /// A merge table (a GROUP BY view's) has a key, but its plain INSERTs' keys are not checked.
+    #[test]
+    fn a_merge_table_is_not_key_checked() -> Result<()> {
+        let m = TableMeta { columns: vec![("day".into(), "Int64".into()), ("n".into(), "Int64".into())], key: vec!["day".into()], merge: [("n".to_string(), "sum".to_string())].into(), ..Default::default() };
+        let t = m.to_rules()?;
+        assert!(!t.key_checked && !t.checked() && !t.mapped);
+        assert_eq!(t.key, ["day"]);
+        assert_eq!(t.key, m.logical().key);
+        Ok(())
+    }
+
+    /// `rules()` makes a parse's table once: the same `Arc` gives the same tables, a new parse makes its own, and a
+    /// clone starts with none.
+    #[test]
+    fn the_rules_are_made_once_per_parse() -> Result<()> {
+        let a = Arc::new(with_rules());
+        let (x, y) = (a.rules()?, a.rules()?);
+        assert!(Arc::ptr_eq(&x, &y), "the same parse gives the same tables");
+        assert_eq!(*x, a.to_rules()?, "and they are the rules of its entry");
+        let b = Arc::new((*a).clone());
+        assert!(!Arc::ptr_eq(&b.rules()?, &x), "a new parse makes its own");
+        let c = (*a).clone();
+        assert!(c.rules.0.get().is_none(), "a clone's memo is empty");
+        let made = Arc::new(c).rules()?;
+        assert_eq!(*made, *x, "and the clone's rules are the same");
+        Ok(())
     }
 }
