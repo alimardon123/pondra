@@ -9,6 +9,13 @@ one and then the other, the order flipped each round: what the machine does land
 loaded second runs a few percent slower whichever build it is (2-7% in round 35's runs), so the whole
 run is done twice with the builds' places swapped, and the two ratios are averaged (geometric mean).
 
+Both nodes keep all of the data's columns hot (`--hot-gb`, by default four times the Parquet's uncompressed
+bytes, rounded up: 3 GB for SF1). Under the hot tier's own limit (an eighth of RAM, 1.2 GB on a 15 GB machine
+against SF1's 1.29 GB) each node keeps a different part hot, whichever loaded or was evicted first, and an A/B
+measures that luck: q3's A/A ratio was 1.25 (reviews/q3-and-the-hot-limit.md). After the warm runs, once their
+loads end, each node's hot tier is checked: one that came within 10% of its limit is named, and that run's ratios
+aren't to be trusted.
+
 Per query: the median wall time and the median of the node's own CPU time (utime + stime, from /proc),
 and whether both builds gave the same answer. Prints B/A for wall and CPU; writes everything to --out.
 Exit 1 if any answer differs. Linux only (/proc).
@@ -18,7 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 import harness
-from harness import Node, call
+from harness import Node, call, metrics_of
 from tpch import TABLES, columns, queries
 
 
@@ -44,6 +51,24 @@ def load(port, data):
     call(port, "POST", "/tier", timeout=3600)
 
 
+def hot_gb(data):
+    """What the hot tier needs for every column of the data: four times the Parquet's uncompressed bytes (decoded
+    strings take about twice those), in whole GB."""
+    import pyarrow.parquet as pq
+    def raw(t):
+        m = pq.ParquetFile(os.path.join(data, f"{t}.parquet")).metadata
+        return sum(m.row_group(i).total_byte_size for i in range(m.num_row_groups))
+    return max(1, math.ceil(4 * sum(raw(t) for t in TABLES) / 2**30))
+
+
+def hot_full(port):
+    """Whether the node's hot columns came within 10% of their limit: some then read from Parquet instead. Asked
+    once the warm runs' files are loaded (in the background, after a file's second read), so no round runs half hot."""
+    harness.hot_settled(port)
+    m = metrics_of(port)
+    return m["pondra_hot_bytes"] > 0.9 * m["pondra_hot_limit_bytes"], round(m["pondra_hot_bytes"] / 2**30, 3)
+
+
 def rounded(rows):
     """An answer to compare: floats to 6 significant digits (sums may differ in the last bits)."""
     def r(v):
@@ -60,13 +85,20 @@ def one_run(first, second, A, qs, ports):
             lake = tempfile.mkdtemp(prefix="pondra-ab-")
             lakes.append(lake)
             harness.BIN = binary  # (read when a Node is made)
-            node = Node(lake, port).start()
+            node = Node(lake, port, env={"PONDRA_HOT_GB": str(A.hot_gb)}).start()
             load(port, A.data)
             nodes[name] = (node, port)
         answers = {"a": {}, "b": {}}
-        for i, q in qs.items():  # one warm run each, not counted; its answer is the one compared
-            for name in "ab":
-                answers[name][i] = rounded(call(nodes[name][1], "POST", "/sql", f"{q} -- warm".encode(), timeout=3600))
+        for w in range(2):  # two warm runs each, not counted (the hot tier takes a file on its second read); the first's answer is the one compared
+            for i, q in qs.items():
+                for name in "ab":
+                    got = call(nodes[name][1], "POST", "/sql", f"{q} -- warm {w}".encode(), timeout=3600)
+                    answers[name].setdefault(i, rounded(got))
+        hot = {name: hot_full(port) for name, (_, port) in nodes.items()}
+        for name, (full, gb) in hot.items():
+            if full:
+                print(f"{name}'s hot columns ({gb} GB) are near their limit ({A.hot_gb} GB): some queries read Parquet, "
+                      "and which ones is luck. Give --hot-gb more.", flush=True)
         wall = {n: {i: [] for i in qs} for n in "ab"}
         used = {n: {i: [] for i in qs} for n in "ab"}
         for r in range(A.rounds):
@@ -78,7 +110,7 @@ def one_run(first, second, A, qs, ports):
                     wall[name][i].append(time.time() - t)
                     used[name][i].append(cpu(node.p.pid) - c)
         med = lambda d: {n: {i: statistics.median(v) for i, v in d[n].items()} for n in "ab"}
-        return med(wall), med(used), answers
+        return med(wall), med(used), answers, hot
     finally:
         for node, _ in nodes.values():
             node.kill()
@@ -93,30 +125,32 @@ def main():
     ap.add_argument("--data", required=True, help="TPC-H Parquet: one <table>.parquet each")
     ap.add_argument("--queries", default=os.path.join(HERE, "tpch-queries"))
     ap.add_argument("--rounds", type=int, default=8)
+    ap.add_argument("--hot-gb", type=float, help="each node's PONDRA_HOT_GB (default: enough for all the data's columns)")
     ap.add_argument("--no-swap", action="store_true", help="one run only, A loaded first")
     ap.add_argument("--port", type=int, default=18461, help="A's port; B's is the next")
     ap.add_argument("--out", default="ab-compare.json")
     A = harness.A = ap.parse_args()
     A.keep = False
+    A.hot_gb = A.hot_gb or hot_gb(A.data)
     qs = queries(A.queries)
     runs, same = [], True
     orders = [(A.a, A.b)] + ([] if A.no_swap else [(A.b, A.a)])
     for k, (first, second) in enumerate(orders):
-        wall, used, answers = one_run(first, second, A, qs, (A.port, A.port + 1))
+        wall, used, answers, hot = one_run(first, second, A, qs, (A.port, A.port + 1))
         if k == 1:  # (B was loaded first: put it back under its own name)
-            wall, used, answers = ({"a": d["b"], "b": d["a"]} for d in (wall, used, answers))
+            wall, used, answers, hot = ({"a": d["b"], "b": d["a"]} for d in (wall, used, answers, hot))
         differ = [i for i in qs if answers["a"][i] != answers["b"][i]]
         same &= not differ
-        run = {"b_loaded_first": k == 1, "answers_differ": differ}
+        run = {"b_loaded_first": k == 1, "answers_differ": differ, "hot_gb": {n: hot[n][1] for n in "ab"}, "hot_full": [n for n in "ab" if hot[n][0]]}
         for what, d in (("wall", wall), ("cpu", used)):
             a, b = sum(d["a"].values()), sum(d["b"].values())
             run[what] = {"a_s": round(a, 3), "b_s": round(b, 3), "b_over_a": round(b / a, 4),
                          "per_query": {i: [round(d["a"][i], 4), round(d["b"][i], 4)] for i in qs}}
         runs.append(run)
         print(f"run {k + 1} ({'B' if k else 'A'} loaded first): wall B/A {run['wall']['b_over_a']:.3f}, cpu B/A {run['cpu']['b_over_a']:.3f}"
-              + (f"; answers differ: {differ}" if differ else ""), flush=True)
+              + (f"; answers differ: {differ}" if differ else "") + (f"; hot tier full on {run['hot_full']}: don't trust it" if run["hot_full"] else ""), flush=True)
     summary = {what: round(math.exp(statistics.mean(math.log(r[what]["b_over_a"]) for r in runs)), 4) for what in ("wall", "cpu")}
-    json.dump({"a": A.a, "b": A.b, "rounds": A.rounds, "runs": runs, "b_over_a": summary, "same_answers": same}, open(A.out, "w"), indent=1)
+    json.dump({"a": A.a, "b": A.b, "rounds": A.rounds, "hot_gb": A.hot_gb, "runs": runs, "b_over_a": summary, "same_answers": same}, open(A.out, "w"), indent=1)
     print(json.dumps({"b_over_a": summary, "same_answers": same}))
     sys.exit(0 if same else 1)
 
