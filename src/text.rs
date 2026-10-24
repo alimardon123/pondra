@@ -177,7 +177,8 @@ pub fn makes_json(sql: &str) -> bool {
 /// Could `sql` name a type of one's own, in a cast or one of the enum functions? (Only then is
 /// it parsed for one: the built-in types' names are left alone.) A cast to uuid, json or jsonb,
 /// an array type, a set function (which may read a column: `lateral::functions`), a JSON maker's
-/// call and a `||` that may meet a jsonb document are parsed too.
+/// call, a `||` that may meet a jsonb document, and a string compared with a column that reads it as jsonb (a document, or JSON
+/// written otherwise than jsonb writes it) are parsed too.
 pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("[]") {
         return true; // (an array type: a string cast to one reads as a Postgres array literal, `pg_values::array_literals`)
@@ -196,11 +197,24 @@ pub fn names_a_type(sql: &str) -> bool {
     if sql.contains("||") && TABLE_OR_JSON.is_match(sql) {
         return true;
     }
-    // (a document compared with a column, `doc = '{…}'`, `doc IN ('[…]')`, `'{…}' <> doc`: a jsonb column reads it as jsonb,
-    // `pg_types::rewrite`; a document written into a column isn't, so `VALUES (1, '{…}')` stays unparsed)
-    static DOCUMENT_COMPARED: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"(?i)(?:=|<>|!=|\bin\s*\(|\bdistinct\s+from)\s*'\s*[\[{]|'\s*[\[{](?:[^']|'')*'\s*(?:=|<>|!=)").expect("a regex"));
-    if DOCUMENT_COMPARED.is_match(sql) {
+    // (a string compared with a column, `doc = '…'`, `'…' <> doc`, `doc IN ('…', …)`, `CASE doc WHEN '…'`, `doc IS DISTINCT FROM '…'`:
+    // a jsonb column reads it as jsonb's text (`pg_types::rewrite`) when it is a document, or JSON jsonb writes otherwise than
+    // as written: `doc = '1e2'` finds 100, `doc = ' 100 '` too. A canonical scalar (`'100'`, `'"x"'`, `'true'`) compares as it is
+    // written, and a string that isn't JSON (`'x'`, `'alice'`) is not read at all, so a statement with only those is not parsed
+    // for it. A document written into a column isn't read: `VALUES (1, '{…}')` stays unparsed)
+    static COMPARED: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)(?:=|<>|!=|\bdistinct\s+from|\bwhen)\s*'((?:[^']|'')*)'|'((?:[^']|'')*)'\s*(?:=|<>|!=)|\bin\s*\(((?:\s*'(?:[^']|'')*'\s*,?)*)\s*\)").expect("a regex")
+    });
+    static STRING: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"'((?:[^']|'')*)'").expect("a regex"));
+    let read_as_jsonb = |written: &str| {
+        let v = if written.contains("''") { std::borrow::Cow::Owned(written.replace("''", "'")) } else { std::borrow::Cow::Borrowed(written) };
+        v.trim_start().starts_with(['{', '[']) || crate::pg_json_make::jsonb_text(&v).is_ok_and(|text| text != v.as_ref())
+    };
+    let compared = COMPARED.captures_iter(sql).any(|c| match c.get(3) {
+        Some(list) => STRING.captures_iter(list.as_str()).any(|s| read_as_jsonb(&s[1])),
+        None => c.get(1).or(c.get(2)).is_some_and(|s| read_as_jsonb(s.as_str())),
+    });
+    if compared {
         return true;
     }
     static NAMED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?i)(?:::|\bas)\s*"?([a-z_][a-z0-9_]*)"?\s*(?:[.]\s*"?([a-z_][a-z0-9_]*))?|\b(?:enum_(?:range|first|last)|pg_typeof)\s*\(|'(\{?[0-9a-fA-F]{8}-?(?:[0-9a-fA-F]{4}-?){3}[0-9a-fA-F]{12}\}?)'"#).expect("a regex"));
@@ -314,6 +328,19 @@ mod tests {
             assert!(names_a_type(sql), "{sql}");
         }
         for sql in [r#"INSERT INTO t VALUES (1, '{"a": 1}')"#, r#"INSERT INTO t (id, doc) VALUES (1, '[1, 2]'), (2, '{}')"#, "SELECT 1 FROM t WHERE name = 'x'"] {
+            assert!(!names_a_type(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_string_compared_with_a_column_is_parsed_when_jsonb_reads_it_otherwise_than_as_written() {
+        for sql in ["SELECT 1 FROM t WHERE doc = '1e2'", "SELECT 1 FROM t WHERE '1e2' = doc", "SELECT 1 FROM t WHERE doc IN ('x', ' 100 ')",
+            "SELECT CASE doc WHEN '1e2' THEN 1 END FROM t", "SELECT 1 FROM t WHERE doc IS DISTINCT FROM ' 1'"] {
+            assert!(names_a_type(sql), "{sql}");
+        }
+        // (a canonical scalar compares as written, and a string that isn't JSON is not read)
+        for sql in ["SELECT 1 FROM t WHERE doc = 'x'", "SELECT 1 FROM t WHERE doc = '100'", r#"SELECT 1 FROM t WHERE doc = '"x"'"#,
+            "SELECT 1 FROM t WHERE name = 'it''s'", "INSERT INTO t VALUES (1, '1e2')"] {
             assert!(!names_a_type(sql), "{sql}");
         }
     }

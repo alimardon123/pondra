@@ -16052,6 +16052,16 @@ def _same(got, want, info, sql):
     return False
 
 
+def _http_post(port, s):
+    """(status, SQLSTATE header, body) of a statement sent to POST /sql, whether it is taken or refused."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=60)
+    c.request("POST", "/sql", s.encode(), {})
+    r = c.getresponse()
+    data = r.read().decode()
+    c.close()
+    return r.status, r.getheader("x-pondra-sqlstate"), data
+
+
 def _says(body, message):
     """The message as the body carries it (JSON-escaped quotes included)."""
     return message in body or json.dumps(message)[1:-1] in body
@@ -17783,6 +17793,86 @@ def jsons():
             http, port, http_left, port_left, writes, param]
         return http == port == [1, 1, 0] and http_left == port_left == 0 and writes == [None, None, None] and param == 1
 
+    def jsonb_gate():
+        """A string compared with a jsonb column is read as jsonb's text wherever the comparison is: a WHERE, a join's ON, a CASE,
+        an item, a simple CASE, through a view, a view over a view, a column added after the statement was made, and a temporary
+        table or view. A JSON string that jsonb writes otherwise than as written ('1e2', ' 100 ') is read where it is compared, and
+        a canonical scalar ('100') compares as written. A string that isn't JSON is refused where the statement is read: a statement
+        that is read for a document in it, or for a JSON string written otherwise, refuses it (the others answer as Pondra always did).
+        The statements have no alias, pg_typeof or || (the front would parse them for those): what Postgres 16 answers, over HTTP
+        and the port."""
+        INV = "invalid input syntax for type json"
+        q("CREATE TABLE m4j (id INT, doc JSONB)")
+        q("INSERT INTO m4j (id, doc) VALUES (1, '{\"a\": 2, \"b\": 1}'), (2, '100'), (3, '\"x\"'), (4, '{\"a\": 1}')")
+
+        def port_refusal(conn, s):  # (SQLSTATE and message of the port's refusal, None when it runs)
+            try:
+                conn.execute(s)
+                return None
+            except psycopg.Error as e:
+                return e.sqlstate, e.diag.message_primary or ""
+
+        def refused_http(s):
+            status, code, body = err(s)
+            return status != 200 and code == "22P02" and _says(body, INV)
+
+        def refused_port(s):
+            with psycopg.connect(url, autocommit=True) as conn:
+                got = port_refusal(conn, s)
+            return got is not None and got[0] == "22P02" and INV in got[1]
+
+        def both(s, width):  # (HTTP's rows and the port's for a statement that runs on both: HTTP leaves a NULL column out of its row)
+            http_rows = [list(r.values()) + [None] * (width - len(r)) for r in q(s)]
+            with psycopg.connect(url, autocommit=True) as conn:
+                return [http_rows, [list(r) for r in conn.execute(s).fetchall()]]
+
+        ANSWERS = [  # (statement, Postgres 16's rows: HTTP's and the port's)
+            ("SELECT id FROM m4j WHERE doc = '1e2'", [[2]]),
+            ("SELECT id FROM m4j WHERE doc = ' 100 '", [[2]]),
+            ("SELECT id FROM m4j WHERE doc IN ('{\"b\":1,\"a\":2}', '1e2') ORDER BY id", [[1], [2]]),
+            ("SELECT s.id FROM m4j s JOIN m4j t ON s.doc = '{\"b\":1,\"a\":2}' AND t.id = 1", [[1]]),
+            ("SELECT id, CASE WHEN doc = '{\"b\":1,\"a\":2}' THEN 'y' ELSE 'n' END FROM m4j ORDER BY id", [[1, "y"], [2, "n"], [3, "n"], [4, "n"]]),
+            ("SELECT id, doc = '\"x\"' FROM m4j ORDER BY id", [[1, False], [2, False], [3, True], [4, False]]),
+            ("SELECT id, CASE doc WHEN '100' THEN 'h' WHEN '{\"b\":1,\"a\":2}' THEN 'o' END FROM m4j ORDER BY id", [[1, "o"], [2, "h"], [3, None], [4, None]]),
+        ]
+        answers = {}
+        for s, want in ANSWERS:
+            answers[s] = both(s, len(want[0]))
+        REFUSED = [  # (traced: a document is compared in the statement, or a JSON string jsonb writes otherwise; Postgres refuses 'x' in each)
+            "SELECT id FROM m4j WHERE doc IN ('x', '{\"b\":1,\"a\":2}')",
+            "SELECT id FROM m4j WHERE doc = 'x' OR doc = '1e2'",
+        ]
+        refusals = {s: [refused_http(s), refused_port(s)] for s in REFUSED}
+        q("ALTER TABLE m4j ADD COLUMN e4 JSONB")
+        q("UPDATE m4j SET e4 = '100' WHERE id = 2")
+        q("CREATE VIEW m4v AS SELECT id, doc AS d4 FROM m4j")
+        q("CREATE VIEW m4w AS SELECT id, d4 FROM m4v")
+        LATER = [  # (a JSON string written otherwise, found in each place: a column added after the statement, a view, a view over a view)
+            ("SELECT id FROM m4j WHERE e4 = '1e2'", [[2]]),
+            ("SELECT id FROM m4v WHERE d4 = '1e2'", [[2]]),
+            ("SELECT id FROM m4w WHERE d4 = ' 100 '", [[2]]),
+        ]
+        later = {s: both(s, len(want[0])) for s, want in LATER}
+        with psycopg.connect(url, autocommit=True) as conn:  # (temporary objects are the port's: this session's)
+            conn.execute("CREATE TEMP TABLE m4t (t4 JSONB)")
+            conn.execute("INSERT INTO m4t VALUES ('100')")
+            t_table = "SELECT count(*) FROM m4t WHERE t4 = ' 100 '"
+            t_table_rows = [list(r) for r in conn.execute(t_table).fetchall()]
+            conn.execute("CREATE TEMP VIEW m4tv AS SELECT doc AS d5 FROM m4j")
+            t_view = "SELECT count(*) FROM m4tv WHERE d5 = '1e2'"
+            t_view_rows = [list(r) for r in conn.execute(t_view).fetchall()]
+        temps = {t_table: t_table_rows, t_view: t_view_rows}  # (each: the port's rows, one row found)
+        info["jsonb gate: the answers (HTTP's, the port's) per statement; refusals (HTTP, port) per traced statement; the answers after "
+             "ALTER, through a view and a view over a view; the temporary table and view's rows (the port's)"] = [answers, refusals, later, temps]
+        for v in ["m4w", "m4v"]:
+            q(f"DROP VIEW {v}")
+        q("DROP TABLE m4j")
+        answers_ok = all(answers[s] == [want, want] for s, want in ANSWERS)
+        later_ok = all(later[s] == [want, want] for s, want in LATER)
+        refusals_ok = all(v == [True, True] for v in refusals.values())
+        temps_ok = all(v == [[1]] for v in temps.values())
+        return answers_ok and later_ok and refusals_ok and temps_ok
+
     try:
         node = Node(lake, port, pg=f"127.0.0.1:{pg}").start()
         check("CREATE TABLE j (doc JSON, docb JSONB): pg_attribute 114 and 3802, format_type json and jsonb, "
@@ -17833,6 +17923,9 @@ def jsons():
               in_where)
         check("a string compared with a jsonb column is read as jsonb: = and IN find the row written in another key order, <> finds none, "
               "and a DELETE of that document leaves no row, over HTTP and the port, a parameter's string too", jsonb_compared)
+        check("a string compared with a jsonb column is read as jsonb wherever the comparison is: a WHERE, a join's ON, a CASE, an item, "
+              "through a view, a view over a view, a column added after the statement, and a temporary table or view; a string that isn't "
+              "JSON is refused 22P02 where the statement is read; over HTTP and the port (Postgres 16's answers)", jsonb_gate)
         check("jsonb_contains, jsonb_contained, jsonb_exists, jsonb_exists_any, jsonb_exists_all, json_object_field, jsonb_object_field, "
               "json_array_element and jsonb_array_element answer as their operators do, over HTTP and the port", functions_by_name)
         check("a materialized view of doc -> 'a' and doc #>> '{b,0}' is filled, and follows an INSERT into its table", materialized)
@@ -22257,11 +22350,19 @@ def attached():
     finally:
         stop.set()
         [r.join() for r in readers]
+    # (a jsonb column of the attached lake, compared with a string through the attaching node: refused as this lake's own are)
+    sql(a.port, "CREATE TABLE jt (id BIGINT, j JSONB)")
+    sql(a.port, "INSERT INTO jt VALUES (1, '{\"a\": 1}')")
+    until(lambda: _try(lambda: sql(b.port, "SELECT count(*) AS n FROM other.jt")), [{"n": 1}], 15)
+    attached_found = sql(b.port, "SELECT count(*) AS n FROM other.jt WHERE j = ' {\"a\": 1}'")  # (a document with a space before it: read as jsonb)
+    status, code, body = _http_post(b.port, "SELECT 1 FROM other.jt WHERE j = 'x' OR j = '1e2'")  # (traced by '1e2': refused at 'x')
     [n.kill() for n in (a, b)]
     checks = {
         f"every read of a table of an attached lake while its leader updates, tiers and purges it holds each row once ({reads.get('t', 0)} reads)": reads.get("t", 0) > 50 and not any(t == "t" for t, _ in wrong),
         "…and of tables read while their first UPDATE lands": all(reads.get(t, 0) > 3 for t in firsts) and not any(t in firsts for t, _ in wrong),
         f"a table of an attached lake read twice in one query while its leader changes it holds one commit ({reads.get('twice', 0)} reads)": reads.get("twice", 0) > 50 and not any(t == "twice" for t, _ in wrong),
+        "a JSON string written otherwise than jsonb writes it, compared with a jsonb column of an attached lake through the node that attaches it, finds its row": attached_found == [{"n": 1}],
+        "a statement with a JSON string written otherwise, and a string that isn't JSON, is refused 22P02 in Postgres's words through the node that attaches the lake": status != 200 and code == "22P02" and _says(body, "invalid input syntax for type json"),
     }
     for name, good in checks.items():
         print(f"attached: {name}: {'OK' if good else 'FAIL'}")
