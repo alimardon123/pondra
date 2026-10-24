@@ -1518,7 +1518,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let (mut kinds, mut histories) = (vec![], std::collections::HashSet::new());
     for (name, v) in &views {
-        let meta = lake.cat.get::<TableMeta>(&table_key(name)).await?;
+        let meta = lake.cat.meta(&table_key(name)).await?;
         let merged = meta.as_ref().is_some_and(|m| !m.merge.is_empty());
         if meta.as_ref().is_some_and(|m| m.history.is_some()) {
             histories.insert(name.clone());

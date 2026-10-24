@@ -513,7 +513,7 @@ impl Json {
 /// A table's log as Flight data, from segment `after`: each commit's rows (just `columns`), then
 /// a message with `{"after": N}`.
 async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option<Vec<String>>, follow: bool) -> Result<Out<FlightData>, Status> {
-    let meta: TableMeta = app.lake.cat.get(&table_key(&table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
+    let meta = app.lake.cat.meta(&table_key(&table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
     let pick: Vec<usize> = match &columns {
         Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| Status::invalid_argument(format!("no column {c}")))).collect::<Result<_, _>>()?,
@@ -871,7 +871,7 @@ impl FlightService for Door {
                 (None, Some(table)) => {
                     // Its schema names every column: a user needs SELECT on all of them, as its log stream does (checked before the table is looked up, so an unreadable one isn't told apart).
                     crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(|e| Status::permission_denied(crate::ext::said(&e)))?;
-                    let meta: TableMeta = app.lake.cat.get(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
+                    let meta = app.lake.cat.meta(&table_key(table)).await.map_err(status)?.ok_or_else(|| Status::not_found(format!("no table {table}")))?;
                     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
                     let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
                     if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }

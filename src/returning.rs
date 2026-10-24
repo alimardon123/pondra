@@ -13,7 +13,6 @@
 
 use crate::auth::Role;
 use crate::server::App;
-use crate::store::TableMeta;
 use crate::write::Stmt;
 use anyhow::{bail, Result};
 use datafusion::arrow::compute::concat_batches;
@@ -212,7 +211,7 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
     if other.is_some() {
         return Err(refused("another database's table"));
     }
-    let Some(meta) = app.lake.cat.get::<TableMeta>(&crate::store::table_key(&name)).await? else {
+    let Some(meta) = app.lake.cat.meta(&crate::store::table_key(&name)).await? else {
         return Err(crate::codes::coded("42P01", format!("no table {table} (RETURNING answers for this database's own tables)")));
     };
     let columns: Vec<(String, String)> = meta.logical_columns().into_iter().filter(|(c, _)| c != "_deleted").collect();
