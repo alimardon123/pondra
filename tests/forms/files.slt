@@ -1,5 +1,6 @@
-# A file put by name is read by that name on every form: CSV and JSON, read_csv, and a missing one
-# refused alike (form-parity P5, designs/l2-p5-files.md: a relative name is read where the caller is).
+# A file put by name is read by that name on every form: CSV and JSON, read_csv with declared columns, a Hive folder
+# through a glob (its parts read in the page's own task: src/in_task.rs), and a missing one refused alike
+# (form-parity P5, designs/l2-p5-files.md: a relative name is read where the caller is).
 put orders.csv
 id,qty
 1,2
@@ -30,6 +31,31 @@ SELECT k, n FROM 'events.json' ORDER BY k
 ----
 a 1
 b 2
+
+query TI
+SELECT arrow_typeof(qty), sum(qty) FROM read_csv('orders.csv', columns => {'id': 'BIGINT', 'qty': 'INT'}, header => true) GROUP BY 1
+----
+Int32 7
+
+put sales/year=2024/a.csv
+item,amount
+pie,4
+
+put sales/year=2025/b.csv
+item,amount
+pie,6
+tea,3
+
+query II
+SELECT year, sum(amount) FROM 'sales/**/*.csv' GROUP BY year ORDER BY year
+----
+2024 4
+2025 9
+
+query T
+SELECT arrow_typeof(year) FROM read_csv('sales/**/*.csv', hive_types => {'year': 'INT'}) LIMIT 1
+----
+Int32
 
 statement error 42P01
 SELECT * FROM 'nope.csv'

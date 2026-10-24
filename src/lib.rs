@@ -14,6 +14,7 @@ pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
+pub mod in_task;
 pub mod page;
 pub mod request_body;
 pub mod text;

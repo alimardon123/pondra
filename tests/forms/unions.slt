@@ -1,0 +1,38 @@
+# A union of two parts answers on every form: under an aggregate, sorted, at the root, under a LIMIT and in a join. (A
+# page has no runtime to start a task per part on, so it runs them in its own task: src/in_task.rs.)
+statement ok
+CREATE TABLE u (x INT)
+
+statement ok
+INSERT INTO u VALUES (1), (2)
+
+query I
+SELECT sum(x) AS s FROM (SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0)
+----
+6
+
+query I
+SELECT x FROM u UNION ALL SELECT x + 10 FROM u ORDER BY x
+----
+1
+2
+11
+12
+
+query I rowsort
+SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0
+----
+1
+1
+2
+2
+
+query I
+SELECT count(*) AS n FROM (SELECT x FROM (SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0) LIMIT 3)
+----
+3
+
+query I
+SELECT count(*) AS n FROM u JOIN (SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0) v ON u.x = v.x
+----
+4

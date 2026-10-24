@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 use crate::ext_names::{quoted, scheme};
-use crate::ext_names::{data_files, file_format, listed, schema_of};
+use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -374,7 +374,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     }
     let ctx = lake.session();
     let state = ctx.state();
-    let format = file_format(spec, &state)?;
+    file_format(spec, &state)?; // (a format or an option no file is read by is refused before anything is registered)
     // Columns declared (`columns => {'id': 'BIGINT', …}`, CREATE EXTERNAL TABLE's): the table's.
     let declared = match spec.options.get("columns") {
         Some(c) => Some(crate::write::declared(c).await?),
@@ -389,30 +389,8 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     for u in &spec.urls {
         register(lake, u).await?;
     }
-    let found = listed(&state, spec, |u| declared.is_none().then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
-    let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() };
-    if found.is_empty() {
-        let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
-        return Ok(TableMeta { columns, ext: Some(spec.clone()), ..Default::default() });
-    }
-    // CSV's declared columns are its columns by position, JSON's by name: the readers take them as
-    // they are. Parquet's files say their own (for their statistics), read by name as declared.
-    let schema = match (&declared, spec.format.as_str()) {
-        (Some(d), "csv" | "json") => Arc::new(datafusion::arrow::datatypes::Schema::new(d.clone())),
-        _ => schema_of(&state, spec, &found).await?,
-    };
-    let mut columns: Vec<(String, String)> = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
-    // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
-    let as_stored: Vec<String> = match &declared {
-        Some(d) => d.iter().filter(|f| schema.field_with_name(f.name()).is_ok_and(|g| g.data_type() == f.data_type())).map(|f| f.name().clone()).collect(),
-        None => schema.fields().iter().map(|f| f.name().clone()).collect(),
-    };
-    let missing = declared.is_some() && spec.format == "parquet" && columns.iter().any(|(c, _)| schema.field_with_name(c).is_err());
-    // Hive-style folders (`day=2026-09-28/`): each a column, the keys and types worked out by `keys`.
-    let keys = crate::ext_names::keys(&found, spec, &hive_types, &columns)?;
-    columns.extend(keys.iter().cloned());
-    let hived = !keys.is_empty();
-    let files = data_files(&state, &format, &schema, found, hived, &as_stored, missing).await?; // (the listing's files, as a page reads them too)
+    let undeclared = declared.is_none();
+    let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
     Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
 }
 

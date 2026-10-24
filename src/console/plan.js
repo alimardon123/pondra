@@ -10,7 +10,7 @@ await moreStyle();
 
 // (a statement that sets something rather than reading rows: EXPLAIN can't take it)
 const UNPLANNED = /^(?:\s|--[^\n]*|\/\*[\s\S]*?\*\/)*(declare|set|reset|begin|start|commit|rollback|use|attach|detach|\$[a-z_]\w*\s*:?=)/i;
-const MOVES = /^(RepartitionExec|CoalescePartitionsExec|SortPreservingMergeExec|CoalesceBatchesExec)$/;
+const MOVES = /^(RepartitionExec|CoalescePartitionsExec|InTaskExec|SortPreservingMergeExec|CoalesceBatchesExec)$/;
 
 /** The Plan tab's view of `sql` (its `$name`s bound to `params`); `o.profile`: its query profile at once. */
 export function planView(sql, params, o = {}) {

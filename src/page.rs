@@ -240,7 +240,8 @@ impl Page {
             .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
             .build_arc()
             .expect("a runtime");
-        let ctx = crate::engine::session(config, runtime);
+        // (added last: a plan's partitions run in the page's own task, as there is no runtime to spawn them on)
+        let ctx = crate::in_task::planned(crate::engine::session(config, runtime));
         let files: Arc<dyn ObjectStore> = match &options.store {
             Some(store) => store.clone(),
             None => Arc::new(InMemory::new()),
@@ -655,7 +656,9 @@ impl Page {
         if !["parquet", "csv", "json", "arrow", "delta"].contains(&spec.format.as_str()) {
             return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files and Delta tables, not {} tables", spec.format)));
         }
-        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version");
+        // (the declared types of the formats whose files they type: a node's `columns` and `hive_types`, as a node reads them)
+        let declares = ["csv", "json", "parquet"].contains(&spec.format.as_str());
+        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version") || (declares && (k == "columns" || k == "hive_types"));
         if let Some(k) = spec.options.keys().find(|k| !takes(k)) {
             return Err(crate::codes::coded("0A000", format!("a page doesn't take {k} yet")));
         }
@@ -668,18 +671,30 @@ impl Page {
         if spec.format == "delta" {
             return self.delta(overlay, name, &given).await;
         }
-        let found = crate::ext_names::listed(&state, &given, |u| Some(crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))).await?;
-        let files = crate::ext_names::schema_of(&state, &given, &found).await?;
-        let columns: Vec<(String, String)> = files.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
-        let keys = crate::ext_names::keys(&found, &given, &[], &columns)?;
-        let schema = crate::answer::schema(&[columns, keys.clone()].concat())?;
-        // (the files as a node lists and reads them: a Parquet footer's rows and ranges for the planner, every column kept)
-        let stored: Vec<String> = files.fields().iter().map(|f| f.name().clone()).collect();
-        let format = crate::ext_names::file_format(&given, &state)?;
-        let data = crate::ext_names::data_files(&state, &format, &files, found, !keys.is_empty(), &stored, false).await?;
+        // The declared types are read in a copy of the page's session, so their dialect is the page's, as a node's is its
+        // own. (Its scratch table needs the default catalog, which the page's own session registers itself.)
+        let session = || SessionContext::new_with_config(self.ctx.copied_config().with_create_default_catalog_and_schema(true));
+        let declared = match given.options.get("columns") {
+            Some(c) => Some(crate::ext_names::declared(session(), c).await?),
+            None => None,
+        };
+        let hive_types = match given.options.get("hive_types") {
+            Some(c) => crate::ext_names::declared(session(), c).await?,
+            None => vec![],
+        };
+        let undeclared = declared.is_none();
+        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, |u| {
+            undeclared.then(|| crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))
+        })
+        .await?;
+        let schema = crate::answer::schema(&columns)?;
         let refs: Vec<_> = data.iter().collect();
-        let df = crate::ext_names::read(&self.ctx, &refs, &schema, &given).await?;
-        overlay.own(name.to_string(), df.into_view()); // (a name is one table: the statement's own map)
+        let table: Arc<dyn TableProvider> = if refs.is_empty() {
+            Arc::new(MemTable::try_new(schema, vec![vec![]])?) // (columns declared and no file put yet: an empty table with them, as a node answers)
+        } else {
+            crate::ext_names::read(&self.ctx, &refs, &schema, &given).await?.into_view()
+        };
+        overlay.own(name.to_string(), table); // (a name is one table: the statement's own map)
         Ok(())
     }
 
@@ -2005,7 +2020,6 @@ mod tests {
         let refused = [
             ("SELECT * FROM 'nope.csv'", "42P01"),
             ("SELECT * FROM 'https://example.com/x.csv'", "0A000"),
-            ("SELECT * FROM read_csv('orders.csv', columns => {'id': 'INT'})", "0A000"),
             ("SELECT * FROM 'nope.csv' JOIN 'orders.csv' ON true", "42P01"),
         ];
         for (sql, code) in refused {
@@ -2015,6 +2029,40 @@ mod tests {
         }
         let got = page.request("POST", "/sql?format=csv", &[], "FROM 'orders.csv'".into()).await;
         assert_eq!(got.body, rendered(&page, "SELECT * FROM orders", Some("csv")).await);
+    }
+
+    /// `columns =>` is read as a node reads it: the CSV's columns by position, each typed as declared (`qty` an `INT`,
+    /// so an `Int32`), and the rows are the file's.
+    #[tokio::test]
+    async fn read_csv_takes_declared_columns() {
+        let page = page_with_tables().await;
+        let read = "read_csv('orders.csv', columns => {'id': 'BIGINT', 'name': 'VARCHAR', 'qty': 'INT'}, header => true)";
+        let typed = page.request("POST", "/sql?format=csv", &[], format!("SELECT arrow_typeof(qty) AS t FROM {read} LIMIT 1").into()).await;
+        assert_eq!(typed.status, 200, "{}", String::from_utf8_lossy(&typed.body));
+        assert_eq!(typed.body, "t\nInt32\n");
+        let rows = page.request("POST", "/sql?format=csv", &[], format!("SELECT * FROM {read}").into()).await;
+        assert_eq!(rows.body, "id,name,qty\n1,a,5\n2,b,7\n3,c,9\n");
+    }
+
+    /// `hive_types =>` types a folder's key as declared: `sales/day=…/a.csv` has `day` a `Date32`, and a row of that day.
+    #[tokio::test]
+    async fn a_folder_key_takes_its_declared_type() {
+        let page = Page::open(&Options::default());
+        assert_eq!(put(&page, "sales/day=2026-09-28/a.csv", "id,qty\n1,5\n").await.status, 200);
+        let read = "read_csv('sales/**/*.csv', hive_types => {'day': 'DATE'})";
+        let typed = page.request("POST", "/sql?format=csv", &[], format!("SELECT arrow_typeof(day) AS t FROM {read} LIMIT 1").into()).await;
+        assert_eq!(typed.body, "t\nDate32\n");
+        let on_day = page.request("POST", "/sql?format=csv", &[], format!("SELECT count(*) AS n FROM {read} WHERE day = DATE '2026-09-28'").into()).await;
+        assert_eq!(on_day.body, "n\n1\n");
+    }
+
+    /// Declared columns with no file put are an empty table with those columns, as a node answers, not a 42P01.
+    #[tokio::test]
+    async fn declared_columns_with_no_file_are_an_empty_table() {
+        let page = Page::open(&Options::default());
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT * FROM read_csv('none/*.csv', columns => {'id': 'INT'})".into()).await;
+        assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+        assert_eq!(got.body, "id\n");
     }
 
     /// Requests on threads at once, each naming one file: none takes another's table of its name, so every one answers
@@ -2035,6 +2083,54 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A page with `u` (rows 1 and 2) and the files `a.parquet` and `b.parquet`, each holding the rows of `u`.
+    async fn union_page() -> Page {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE u (x INT)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO u VALUES (1), (2)".into()).await.status, 200);
+        let parquet = page.request("POST", "/sql?format=parquet", &[], "SELECT x FROM u".into()).await.body;
+        for name in ["a.parquet", "b.parquet"] {
+            assert_eq!(put(&page, name, parquet.clone()).await.status, 200);
+        }
+        page
+    }
+
+    /// The CSV `sql` answers on `page`, which must answer it.
+    async fn csv_of(page: &Page, sql: &str) -> String {
+        let got = page.request("POST", "/sql?format=csv", &[], sql.to_string().into()).await;
+        assert_eq!(got.status, 200, "{sql}: {}", String::from_utf8_lossy(&got.body));
+        String::from_utf8(got.body.to_vec()).unwrap()
+    }
+
+    /// A plan's partitions run in the page's own task (`in_task`). A union under an aggregate, a root of two partitions,
+    /// a scalar subquery of two and a table made from two would each start a task per partition, and a page has no
+    /// runtime to start one on: it panics, and takes every table of the page with it. Each of them answers here.
+    #[test]
+    fn a_union_runs_in_the_page_task() {
+        futures::executor::block_on(async {
+            let page = union_page().await;
+            let two = "(SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0)"; // (the filters keep a count from the tables' row counts)
+            assert_eq!(csv_of(&page, &format!("SELECT sum(x) AS s FROM {two}")).await, "s\n6\n");
+            assert_eq!(csv_of(&page, "SELECT x FROM u UNION ALL SELECT x + 10 FROM u ORDER BY x").await, "x\n1\n2\n11\n12\n");
+            let root = csv_of(&page, "SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0").await;
+            let mut lines: Vec<&str> = root.lines().collect();
+            lines.sort_unstable(); // (the rows come in any order: the header and four rows)
+            assert_eq!(lines, ["1", "1", "2", "2", "x"], "{root}");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM (SELECT x FROM {two} LIMIT 3)")).await, "n\n3\n");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM u JOIN {two} v ON u.x = v.x")).await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u JOIN (SELECT x FROM 'a.parquet' UNION ALL SELECT x FROM 'b.parquet') v ON u.x = v.x").await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT (SELECT x FROM u WHERE x = 1 UNION ALL SELECT x FROM u WHERE x > 5) AS v").await, "v\n1\n");
+            let made = "CREATE TABLE w AS SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0";
+            assert_eq!(page.request("POST", "/sql", &[], made.into()).await.status, 200);
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM w").await, "n\n4\n");
+            for (name, body) in [("s/year=2024/a.csv", "item,amount\npie,4\n"), ("s/year=2025/b.csv", "item,amount\npie,6\ntea,3\n")] {
+                assert_eq!(put(&page, name, body).await.status, 200);
+            }
+            assert_eq!(csv_of(&page, "SELECT year, sum(amount) AS a FROM 's/**/*.csv' GROUP BY year ORDER BY year").await, "year,a\n2024,4\n2025,9\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u").await, "n\n2\n");
+        });
     }
 
     #[tokio::test]
