@@ -331,13 +331,24 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> anyhow::Result<datafusion::
 /// A user's statement planned as `sql` plans it, refused unless `may` allows its plan. `may` runs before
 /// anything does: a `CREATE TABLE … AS` runs as it is planned.
 pub async fn sql_checked(ctx: &SessionContext, sql: &str, may: impl Fn(&LogicalPlan) -> anyhow::Result<()>) -> anyhow::Result<datafusion::dataframe::DataFrame> {
+    let plan = planned(ctx, sql).await?;
+    may(&plan)?;
+    run(ctx, plan).await
+}
+
+/// A user's statement planned, and nothing run: `run` runs the plan. A caller that must judge the plan first, or hold a
+/// lock across the run, takes the two apart. Planning makes no change; a DDL statement takes effect when it runs.
+pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalPlan> {
     use datafusion::config::Dialect;
     let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
-    let plan = match crate::friendly::lambdas(sql).filter(|_| generic) {
+    Ok(match crate::friendly::lambdas(sql).filter(|_| generic) {
         Some(stmt) => ctx.state().statement_to_plan(stmt).await?,
         None => ctx.state().create_logical_plan(sql).await?,
-    };
-    may(&plan)?;
+    })
+}
+
+/// A planned statement run, as `sql_checked` runs it: the frame of its rows. A DDL statement takes effect here.
+pub async fn run(ctx: &SessionContext, plan: LogicalPlan) -> anyhow::Result<datafusion::dataframe::DataFrame> {
     Ok(text_unions(ctx.execute_logical_plan(plan).await?)?)
 }
 
