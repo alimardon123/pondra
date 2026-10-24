@@ -6,14 +6,13 @@
 //! those rows (a frame's rows behind those given out, `WindowAggExec`'s concatenation, the view columns a partition key
 //! or a function reads, which stay views).
 //! `LeanExec` is the other operator here: a sort's output of strings holds only its own rows' strings (`LeanSorts`).
-use crate::store::memory_limit;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result, Statistics};
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryReservation};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::expressions::{cast, Column};
 use datafusion::physical_expr::utils::collect_columns;
@@ -324,6 +323,11 @@ impl ExecutionPlan for HeldInExec {
 
     fn execute(&self, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let held = self.slots.0.lock().unwrap().get(&p).cloned();
+        // (the limit of the pool this query runs on, read once: its figure goes in the refusal's words, if it has one)
+        let limit = match ctx.memory_pool().memory_limit() {
+            MemoryLimit::Finite(bytes) => Some(bytes),
+            _ => None,
+        };
         let s = self.input.execute(p, ctx)?;
         let Some(held) = held else { return Ok(s) }; // (run without its HeldOutExec: the input as it is)
         let schema = s.schema();
@@ -336,7 +340,8 @@ impl ExecutionPlan for HeldInExec {
             let b = bytes(&batch, extra);
             let mut h = held.lock().unwrap();
             h.reservation.try_grow(b).map_err(|_| {
-                let message = format!("out of memory: a window holds more rows than this node's memory for queries ({} MB): partition it by more columns, or give the node more memory (--memory-gb)", memory_limit() >> 20);
+                let figure = limit.map_or(String::new(), |bytes| format!(" ({} MB)", bytes >> 20));
+                let message = format!("out of memory: a window holds more rows than this node's memory for queries{figure}: partition it by more columns, or give the node more memory (--memory-gb)");
                 // ("Resources exhausted" is what starts the frugal retry (`query::exhausted`): a window over whole partitions is
                 // answered there as a GROUP BY. A streaming window's retry would run out the same way, so its refusal is a plain
                 // error. Both give 53200 on every door, by the message's words.)
@@ -506,6 +511,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "server")] // (`query::exhausted` is a node's)
     #[tokio::test]
     async fn a_streaming_window_refused_past_the_pool_is_not_retried_frugally() -> AnyResult<()> {
         let ctx = small_session()?;
