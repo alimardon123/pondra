@@ -487,6 +487,27 @@ async function keptChecks(page, lake) {
       console.error(`Page.kept('${folder}'): ${refused ?? 'it was not refused'}`);
     }
   }
+
+  // (g) A folder is one page's at a time: while a kept page holds it, a second page given it is refused by name, and once
+  // that page is freed the folder opens again. The folder is one of its own (`pondra-lock`, removed first), and no page a
+  // later check uses is freed here.
+  const held = await page.evaluate(async () => {
+    try {
+      await (await navigator.storage.getDirectory()).removeEntry('pondra-lock', { recursive: true });
+    } catch (e) {
+      if (e.name !== 'NotFoundError') throw e;
+    }
+    const first = await window.Page.kept('pondra-lock');
+    const refused = await window.Page.kept('pondra-lock').then(() => null, (e) => String(e));
+    first.free();
+    const reopened = await window.Page.kept('pondra-lock').then((again) => { again.free(); return true; }, (e) => String(e));
+    return { refused, reopened };
+  });
+  if (held.refused?.includes('pondra-lock') && held.reopened === true) passed++;
+  else {
+    failed.push("Page.kept('pondra-lock') while another page holds it");
+    console.error(`Page.kept('pondra-lock'): refused ${held.refused ?? 'not refused'}, reopened ${held.reopened}`);
+  }
 }
 
 // The demo page's files, and what its steps expect: the tables, the join's answer, and the three totals it gives.

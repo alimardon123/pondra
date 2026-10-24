@@ -16,9 +16,11 @@ extern "C" {
     fn error(text: &str);
 }
 
-/// A page: tables given to it, SQL read as a node reads it, answers in a node's bytes.
+/// A page: tables given to it, SQL read as a node reads it, answers in a node's bytes. A kept page holds its folder's
+/// Web Lock (`kept`) until it is freed, so no other page writes the folder meanwhile.
 #[wasm_bindgen]
-pub struct Page(pondra::page::Page);
+// (the lock is never read: it is held for its `Drop`, which lets the folder go when the page is freed)
+pub struct Page(pondra::page::Page, #[allow(dead_code)] Option<js::Held>);
 
 #[wasm_bindgen]
 impl Page {
@@ -28,13 +30,14 @@ impl Page {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Page {
         set_panic_hook();
-        Page(pondra::page::Page::open(&options(None)))
+        Page(pondra::page::Page::open(&options(None)), None)
     }
 
     /// A page kept in the origin's private file system (OPFS): its files and its tables are kept in the folder `folder`
-    /// (`"pondra"` when none is given), so what it had is there again after a reload. Two pages on one origin given one
-    /// folder share it, one writer at a time. `new Page()` keeps nothing. Without OPFS (Node, or a browser without it)
-    /// this rejects, before anything is read.
+    /// (`"pondra"` when none is given), so what it had is there again after a reload. A folder is one page's at a time:
+    /// while a kept page has it, another page given the same folder (in another tab, or this one) is refused, and the
+    /// folder is let go by `free()` on that page, or by closing or reloading its tab. `new Page()` keeps nothing. Without
+    /// OPFS (Node, or a browser without it) this rejects, before anything is read.
     #[wasm_bindgen(js_name = kept)]
     pub async fn kept(folder: Option<String>) -> Result<Page, JsValue> {
         set_panic_hook();
@@ -45,9 +48,15 @@ impl Page {
                 "this page has no private file system (OPFS): Page.kept needs navigator.storage.getDirectory",
             ));
         }
+        let Some(held) = js::lock(&format!("pondra:{folder}")).await.map_err(|e| JsValue::from_str(&e))? else {
+            return Err(JsValue::from_str(&format!(
+                "another page (another tab, or one in this tab) has the folder '{folder}' open: close it, or keep this page in another folder"
+            )));
+        };
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(opfs::Opfs::new(folder));
+        // (if the page can't be kept, `held` drops with this return, and the folder is let go)
         let page = pondra::page::Page::kept(&options(Some(store))).await;
-        Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?))
+        Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?, Some(held)))
     }
 
     /// One request, as to a node (ADR-061's contract): `request('POST', '/sql?format=csv', {}, 'FROM t')`,
