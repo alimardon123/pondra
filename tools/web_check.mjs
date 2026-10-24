@@ -8,7 +8,8 @@
 // `NODE_PATH=/opt/node-tools/node_modules node tools/web_check.mjs --pkg web/pkg --browser`. The lake's checks run when
 // its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
-// its files and tables in the origin's private file system) is checked last, with reloads; in Node it is refused by name.
+// its files and tables in the origin's private file system) is checked with reloads, then the demo page
+// (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name.
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -36,6 +37,9 @@ const ORDERS = 'id,name,qty\n1,a,5\n2,b,7\n3,c,9\n';
 const NAMES = 'id,label\n1,x\n3,z\n';
 const TEXT = 'text/plain; charset=utf-8';
 const JSON_TYPE = 'application/json';
+// The demo page the browser checks (web/demo/index.html, served at /demo/), and the brand's colours it copies.
+const DEMO = new URL('../web/demo/index.html', import.meta.url);
+const BRAND_COLORS = new URL('../brand/colors.css', import.meta.url);
 
 const failed = [];
 let passed = 0;
@@ -103,6 +107,17 @@ async function openInNode() {
   };
 }
 
+// A page's console errors are printed, and its uncaught errors are failures of the run.
+function watch(page) {
+  page.on('console', (m) => {
+    if (m.type() === 'error') console.error(`browser console error: ${m.text()}`);
+  });
+  page.on('pageerror', (e) => {
+    failed.push(`page error: ${e.message}`);
+    console.error(`browser page error: ${e.message}`);
+  });
+}
+
 // The module in headless Chromium, on a page of its own: a 127.0.0.1 origin, which the lake's servers are not. Each
 // request is a call of `window.pondra.request` in that page, and the browser is closed by `close` however the run ends.
 async function openInBrowser() {
@@ -112,13 +127,7 @@ async function openInBrowser() {
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
-    page.on('console', (m) => {
-      if (m.type() === 'error') console.error(`browser console error: ${m.text()}`);
-    });
-    page.on('pageerror', (e) => {
-      failed.push(`page error: ${e.message}`);
-      console.error(`browser page error: ${e.message}`);
-    });
+    watch(page);
     await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
     await untilStarted(page);
     return {
@@ -216,6 +225,9 @@ async function serveSite() {
 async function servePage(req, res) {
   const { pathname } = new URL(req.url, 'http://127.0.0.1');
   if (pathname === '/') return send(res, 200, 'text/html; charset=utf-8', PAGE);
+  if (pathname === '/demo/' || pathname === '/demo/index.html') {
+    return send(res, 200, 'text/html; charset=utf-8', await readFile(DEMO, 'utf8'));
+  }
   const name = /^\/pkg\/([\w.-]+)$/.exec(pathname)?.[1];
   const type = name && MODULE_TYPES[extname(name)];
   const body = type ? await readFile(join(pkg, name)).catch(() => null) : null;
@@ -475,6 +487,153 @@ async function keptChecks(page, lake) {
       console.error(`Page.kept('${folder}'): ${refused ?? 'it was not refused'}`);
     }
   }
+}
+
+// The demo page's files, and what its steps expect: the tables, the join's answer, and the three totals it gives.
+const DEMO_PEOPLE = { name: 'people.csv', mimeType: 'text/csv', buffer: Buffer.from('id,name\n1,Ana\n2,Ben\n3,Cy\n') };
+const DEMO_ORDERS = { name: 'orders.csv', mimeType: 'text/csv', buffer: Buffer.from('id,person,amount\n1,1,10\n2,2,20\n3,1,5\n4,3,7\n5,2,30\n') };
+const DEMO_CITIES = '{"id":1,"city":"Oslo"}\n{"id":2,"city":"Bergen"}\n{"id":3,"city":"Tromso"}\n';
+const TABLES_AB = [['orders', 5], ['people', 3]];
+const TABLES_ABC = [['cities', 3], ['orders', 5], ['people', 3]];
+const JOIN = 'SELECT p.name, sum(o.amount) AS total FROM people p JOIN orders o ON o.person = p.id GROUP BY p.name ORDER BY p.name';
+const JOIN_ROWS = [['Ana', '15'], ['Ben', '50'], ['Cy', '7']];
+const THREE_ROWS = /^3 rows in \d+ ms$/;
+
+// The demo page (web/demo/index.html) in Chromium, in a browser of its own: a new context, so its private file system
+// starts empty. Files are chosen and dropped, a join is answered, a reload keeps them, a table is removed, and an error
+// is shown with its SQLSTATE. Each step is one check. A step that throws (a wait that times out) is a failure of that
+// step, and the steps after it are left out, since they need what it made.
+async function demoChecks(page) {
+  const before = failed.length;
+  const url = `${new URL(page.url()).origin}/demo/`;
+  const demo = await page.context().browser().newPage();
+  try {
+    watch(demo);
+    for (const [name, check] of demoSteps(demo, url)) {
+      if (!(await demoCheck(name, check))) break;
+    }
+  } finally {
+    await demo.close();
+  }
+  if (failed.length === before) report.demo = '3 files, a join answered, kept across a reload';
+}
+
+// One step's check: its function gives [what came back, what is wanted], judged as `same` judges them. A throw is a
+// failure of the step; the result says whether the steps after it may run.
+async function demoCheck(name, check) {
+  let pair;
+  try {
+    pair = await check();
+  } catch (e) {
+    failed.push(name);
+    console.error(`${name}: threw ${String(e).split('\n')[0]}`);
+    return false;
+  }
+  same(name, JSON.stringify(pair[0]), JSON.stringify(pair[1]));
+  return true;
+}
+
+// The steps in order, each a name and a function that drives the demo and returns [what came back, what is wanted].
+function demoSteps(demo, url) {
+  return [
+    ['demo: accent colours are brand/colors.css values, light and dark', accentPair],
+    ['demo: starts', async () => {
+      await demo.goto(url, { waitUntil: 'commit' });
+      await untilStarted(demo);
+      return [await demo.evaluate(() => window.ready === true), true];
+    }],
+    ['demo: a. two files chosen, two tables made', async () => {
+      await demo.setInputFiles('#files', [DEMO_PEOPLE, DEMO_ORDERS]);
+      return [await untilListed(demo, TABLES_AB), TABLES_AB];
+    }],
+    ['demo: b. one file dropped, a third table made', async () => {
+      const dataTransfer = await demo.evaluateHandle((text) => {
+        const transfer = new DataTransfer();
+        transfer.items.add(new File([text], 'cities.json', { type: 'application/json' }));
+        return transfer;
+      }, DEMO_CITIES);
+      await demo.dispatchEvent('body', 'drop', { dataTransfer });
+      return [await untilListed(demo, TABLES_ABC), TABLES_ABC];
+    }],
+    ['demo: c. a join typed and run, answered', async () => {
+      await demo.fill('#sql', JOIN);
+      await demo.click('#run');
+      await untilAnswered(demo);
+      const shown = await shownAnswer(demo);
+      return [[shown.head, shown.rows, THREE_ROWS.test(shown.status)], [['name', 'total'], JOIN_ROWS, true]];
+    }],
+    ['demo: d. kept across a reload: tables listed, join answered with Ctrl+Enter', async () => {
+      await demo.reload({ waitUntil: 'commit' });
+      await untilStarted(demo);
+      const tables = await untilListed(demo, TABLES_ABC);
+      await demo.fill('#sql', JOIN);
+      await demo.focus('#sql');
+      await demo.keyboard.press('Control+Enter');
+      await untilAnswered(demo);
+      const shown = await shownAnswer(demo);
+      return [
+        [tables, shown.head, shown.rows, THREE_ROWS.test(shown.status)],
+        [TABLES_ABC, ['name', 'total'], JOIN_ROWS, true],
+      ];
+    }],
+    ['demo: e. the remove button drops a table', async () => {
+      await demo.click('button[aria-label="Remove table cities"]');
+      return [await untilListed(demo, TABLES_AB), TABLES_AB];
+    }],
+    ['demo: f. an error shown with its SQLSTATE', async () => {
+      await demo.fill('#sql', 'SELECT * FROM nothere');
+      await demo.click('#run');
+      await demo.waitForFunction(() => document.querySelector('#status').classList.contains('error'));
+      const shown = await shownAnswer(demo);
+      return [[shown.error, shown.status.includes('42P01')], [true, true]];
+    }],
+  ];
+}
+
+// The demo's accent is brand/colors.css's, copied into the page (one file, nothing fetched but its module), so this
+// fails when a copy drifts: the page's light and dark accent and soft accent, against the brand's.
+async function accentPair() {
+  const html = await readFile(DEMO, 'utf8');
+  const css = await readFile(BRAND_COLORS, 'utf8');
+  const valuesOf = (text, name) => [...text.matchAll(new RegExp(`--${name}:\\s*(#[0-9a-fA-F]{6})`, 'g'))].map((m) => m[1].toUpperCase());
+  const brandPair = (name) => [...valuesOf(css, name), ...valuesOf(css, `${name}-dark`)];
+  return [
+    { accent: valuesOf(html, 'accent'), soft: valuesOf(html, 'accent-soft') },
+    { accent: brandPair('pondra-accent'), soft: brandPair('pondra-accent-soft') },
+  ];
+}
+
+// Waits until the page's status shows an answer's rows and time (a run, after a reload or not).
+function untilAnswered(demo) {
+  return demo.waitForFunction(() => /rows in \d+ ms/.test(document.querySelector('#status').textContent));
+}
+
+// What the page's answer shows: its header's cells, its rows' cells, its status, and whether that status is an error.
+function shownAnswer(demo) {
+  return demo.evaluate(() => ({
+    head: [...document.querySelectorAll('#result thead th')].map((th) => th.textContent),
+    rows: [...document.querySelectorAll('#result tbody tr')].map((tr) => [...tr.cells].map((td) => td.textContent)),
+    status: document.querySelector('#status').textContent,
+    error: document.querySelector('#status').classList.contains('error'),
+  }));
+}
+
+// The tables `#tables` lists, as [name, rows] pairs in the order it lists them.
+function listedTables(demo) {
+  return demo.$$eval('#tables tbody tr', (trs) => trs
+    .filter((tr) => tr.querySelector('.name'))
+    .map((tr) => [tr.querySelector('.name').textContent, Number(tr.cells[1].textContent)]));
+}
+
+// Waits (up to 30 s) until `#tables` lists `want`, and returns what it lists then, so a mismatch shows what came back.
+async function untilListed(demo, want) {
+  const until = Date.now() + 30_000;
+  let listed = await listedTables(demo);
+  while (JSON.stringify(listed) !== JSON.stringify(want) && Date.now() < until) {
+    await new Promise((wake) => setTimeout(wake, 100));
+    listed = await listedTables(demo);
+  }
+  return listed;
 }
 
 const target = IN_BROWSER ? await openInBrowser() : await openInNode();
@@ -764,8 +923,10 @@ async function lakeChecks(dir) {
 
 try {
   await lakeChecks(lake);
-  if (IN_BROWSER) await keptChecks(target.page, lake);
-  else await keptRefused(target.Page);
+  if (IN_BROWSER) {
+    await keptChecks(target.page, lake);
+    await demoChecks(target.page);
+  } else await keptRefused(target.Page);
 } finally {
   await target.close();
 }
