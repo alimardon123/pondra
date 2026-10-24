@@ -1,1 +1,1 @@
-{"add":{"path":"aeeb1680-4b5f-4ab9-9d01-eb5010a3ad8b.parquet","partitionValues":{},"size":1622,"modificationTime":1792794459711,"dataChange":true,"stats":"{\"numRecords\":3}"}}
+{"add":{"path":"bee10bd9-b027-4173-8075-909f1f69d4e0.parquet","partitionValues":{},"size":1622,"modificationTime":1792803224865,"dataChange":true,"stats":"{\"numRecords\":3,\"minValues\":{\"id\":42,\"name\":\"item-42\",\"qty\":420},\"maxValues\":{\"id\":44,\"name\":\"item-44\",\"qty\":440},\"nullCount\":{\"id\":0,\"name\":0,\"qty\":0},\"tightBounds\":true}"}}
