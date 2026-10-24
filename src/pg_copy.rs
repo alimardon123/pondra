@@ -4,9 +4,8 @@
 use crate::codes::coded;
 use crate::pg_bytea;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, StringBuilder};
-use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
+use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
-use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -243,14 +242,16 @@ pub(crate) fn width(names: &[String], got: usize) -> anyhow::Error {
     }
 }
 
-/// `columns`, text as a COPY's reader gave them, as `schema`'s columns: a column already of its type as it is,
-/// a bytea's text read as Postgres reads one (`pg_bytea::parse`), and anything else cast from its text (Arrow's
-/// cast, which refuses what it can't read: 22P02).
+/// `columns`, text as a COPY's reader gave them, as `schema`'s columns: a column already of its type as it is, a
+/// bytea's text read as Postgres reads one (`pg_bytea::parse`), and anything else cast as INSERT casts a value
+/// (`as_type`).
 pub(crate) fn typed(columns: Vec<ArrayRef>, schema: &SchemaRef) -> anyhow::Result<RecordBatch> {
     let cols = columns.iter().zip(schema.fields()).map(|(column, field)| as_type(column, field.as_ref())).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema.clone(), cols)?)
 }
 
+/// `column` as `field`'s type, by `query::strict` (the write cast, which refuses a value as Postgres does: its
+/// SQLSTATE kept), with the column named as Postgres names it in a COPY's CONTEXT.
 fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
     let target = field.data_type();
     if column.data_type() == target {
@@ -268,53 +269,10 @@ fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
         let bytes = BinaryArray::from_iter(values.iter().map(|v| v.as_deref()));
         return Ok(cast(&bytes, target)?);
     }
-    let options = CastOptions { safe: false, ..Default::default() };
-    cast_with_options(column.as_ref(), target, &options).map_err(|e| refused(column, field, e))
-}
-
-/// The refusal of the first text in `column` that `field`'s type can't take: 22003 for a number out of an integer
-/// type's range or with more digits before the point than a decimal has, else 22P02 as Arrow words it.
-fn refused(column: &ArrayRef, field: &Field, e: ArrowError) -> anyhow::Error {
-    let plain = coded("22P02", format!("{e} (column {})", field.name()));
-    let safe = CastOptions { safe: true, ..Default::default() };
-    let (Some(texts), Ok(cast)) = (column.as_string_opt::<i32>(), cast_with_options(column.as_ref(), field.data_type(), &safe)) else {
-        return plain;
-    };
-    let Some(i) = (0..texts.len()).find(|&i| texts.is_valid(i) && cast.is_null(i)) else { return plain };
-    let text = texts.value(i);
-    let out_of_range = match field.data_type() {
-        DataType::Int16 if overflows::<i16>(text) => Some("smallint"),
-        DataType::Int32 if overflows::<i32>(text) => Some("integer"),
-        DataType::Int64 if overflows::<i64>(text) => Some("bigint"),
-        _ => None,
-    };
-    if let Some(name) = out_of_range {
-        return coded("22003", format!("value \"{text}\" is out of range for type {name}"));
-    }
-    let too_wide = match field.data_type() {
-        DataType::Decimal128(p, s) => whole_digits(text).is_some_and(|d| d as i32 > *p as i32 - *s as i32),
-        DataType::Decimal256(p, s) => whole_digits(text).is_some_and(|d| d as i32 > *p as i32 - *s as i32),
-        _ => false,
-    };
-    if too_wide {
-        return coded("22003", "numeric field overflow");
-    }
-    plain
-}
-
-/// Whether `text` is an integer that parses as `T` only by overflowing it (a space around it is not a digit).
-fn overflows<T: std::str::FromStr<Err = std::num::ParseIntError>>(text: &str) -> bool {
-    use std::num::IntErrorKind::{NegOverflow, PosOverflow};
-    matches!(text.trim().parse::<T>(), Err(e) if matches!(e.kind(), PosOverflow | NegOverflow))
-}
-
-/// The digits before the point of `text`, a plain decimal number's (leading zeros not counted), or None when it isn't one.
-fn whole_digits(text: &str) -> Option<usize> {
-    let t = text.trim();
-    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    (whole.len() + frac.len() > 0 && digits(whole) && digits(frac)).then(|| whole.trim_start_matches('0').len())
+    crate::query::strict(column, target).map_err(|e| {
+        let e = anyhow::Error::from(e);
+        coded(crate::codes::of(&e), format!("{} (column {})", crate::codes::words(&e), field.name()))
+    })
 }
 
 /// Postgres's refusal of a COPY option that must be one byte (DELIMITER, QUOTE, ESCAPE) and isn't, `'é'` or `''`:
@@ -476,12 +434,12 @@ b
             let e = typed(vec![text(xs)], &one("n", t)).expect_err("refused");
             (crate::codes::of(&e), e.to_string())
         };
-        assert_eq!(refusal(&[Some("1"), Some("99999999999")], DataType::Int32), ("22003", "value \"99999999999\" is out of range for type integer".to_string()));
+        assert_eq!(refusal(&[Some("1"), Some("99999999999")], DataType::Int32), ("22003", "value \"99999999999\" is out of range for type integer (column n)".to_string()));
         assert_eq!(refusal(&[Some("40000")], DataType::Int16).0, "22003");
-        assert_eq!(refusal(&[Some("-40000")], DataType::Int16), ("22003", "value \"-40000\" is out of range for type smallint".to_string()));
-        assert_eq!(refusal(&[Some("99999999999999999999")], DataType::Int64), ("22003", "value \"99999999999999999999\" is out of range for type bigint".to_string()));
-        assert_eq!(refusal(&[Some("12345")], DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
-        assert_eq!(refusal(&[Some("abc")], DataType::Int32).0, "22P02");
+        assert_eq!(refusal(&[Some("-40000")], DataType::Int16), ("22003", "value \"-40000\" is out of range for type smallint (column n)".to_string()));
+        assert_eq!(refusal(&[Some("99999999999999999999")], DataType::Int64), ("22003", "value \"99999999999999999999\" is out of range for type bigint (column n)".to_string()));
+        assert_eq!(refusal(&[Some("12345")], DataType::Decimal128(3, 1)), ("22003", "numeric field overflow (column n)".to_string()));
+        assert_eq!(refusal(&[Some("abc")], DataType::Int32), ("22P02", "invalid input syntax for type integer: \"abc\" (column n)".to_string()));
         assert_eq!(refusal(&[Some("99999999999"), Some("abc")], DataType::Int32).0, "22003", "the first refused text decides");
         assert_eq!(refusal(&[Some("abc"), Some("99999999999")], DataType::Int32).0, "22P02");
         assert!(typed(vec![text(&[Some("1.2")])], &one("n", DataType::Decimal128(3, 1))).is_ok());

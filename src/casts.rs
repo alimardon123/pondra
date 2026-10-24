@@ -11,13 +11,15 @@
 use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, PrimitiveArray};
 use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type, DecimalType, Float32Type, Float64Type};
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::config::{ConfigOptions, Dialect};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
-use datafusion::common::{DFSchema, Result, ScalarValue};
+use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::expr::{Cast, TryCast};
 use datafusion::logical_expr::{ColumnarValue, Expr, ExprSchemable, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::prelude::SessionContext;
+use crate::codes::Violation;
 use std::sync::{Arc, LazyLock};
 
 /// Can a value of this type hold a fraction that a cast to an integer would drop: a float, or a
@@ -61,16 +63,114 @@ pub fn truncated(c: &ArrayRef) -> Result<ArrayRef> {
     })
 }
 
-/// A column as type `t`, or an error naming the value that won't go (never a quiet NULL). A value with a fraction
-/// going into an integer type is rounded first, as every other cast into an integer rounds it (`whole`, invariant
-/// 293); the rest is Arrow's cast with `safe` off. Rows written into tables, setval's value and a constant folded
-/// at planning all come this way.
+/// A column as type `t`, or the refusal of the first value that won't go (never a quiet NULL), with Postgres's words
+/// and SQLSTATE (`refused`). A value with a fraction going into an integer type is rounded first, as every other cast
+/// into an integer rounds it (`whole`, invariant 293); the rest is Arrow's cast with `safe` off. Rows written into
+/// tables, setval's value, COPY's text and a constant folded at planning all come this way.
 pub fn into(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     if c.data_type() == t {
         return Ok(c.clone());
     }
     let c = if t.is_integer() && fractional(c.data_type()) { whole(c)? } else { c.clone() };
-    Ok(cast_with_options(&c, t, &CastOptions { safe: false, ..Default::default() })?)
+    cast_with_options(&c, t, &CastOptions { safe: false, ..Default::default() }).map_err(|e| refused(&c, t, e))
+}
+
+/// A refusal with Postgres's words and SQLSTATE, as a DataFusion error (`codes::of` finds the code through the chain).
+fn external(words: impl Into<String>, code: &'static str) -> DataFusionError {
+    DataFusionError::External(Box::new(Violation(words.into(), code)))
+}
+
+/// The refusal of a cast of `c` to `t` that Arrow failed with `e`: text by its first value the safe cast turns to
+/// NULL (`text_refusal`), a number by its type's range (`number_refusal`). What Postgres has no words for keeps Arrow's error.
+fn refused(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
+    let source = match c.data_type() {
+        DataType::Dictionary(_, values) => values.as_ref(), // (a Hive partition's column: its values are text)
+        v => v,
+    };
+    if matches!(source, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) {
+        text_refusal(c, t, e)
+    } else if source.is_numeric() {
+        number_refusal(t, e)
+    } else {
+        e.into()
+    }
+}
+
+/// The refusal of text `c` that won't cast to `t`, by its first value the safe cast turns to NULL, as Postgres reads it:
+/// a text that overflows an integer type is 22003 with its value; a plain number that a decimal can't hold is 22003 (its
+/// size refused it: 99.95 rounds to 100.0 in a numeric(3, 1)); other text is 22P02 with the type's name, and Arrow's
+/// words when the type has no name here.
+fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
+    let plain = || external(e.to_string(), "22P02");
+    let Ok(texts) = cast(c, &DataType::Utf8) else { return plain() };
+    let safe = CastOptions { safe: true, ..Default::default() };
+    let Ok(safe_cast) = cast_with_options(&texts, t, &safe) else { return plain() };
+    let values = texts.as_string::<i32>();
+    let Some(i) = (0..values.len()).find(|&i| values.is_valid(i) && safe_cast.is_null(i)) else { return plain() };
+    let text = values.value(i);
+    let range = match t {
+        DataType::Int16 if overflows::<i16>(text) => Some("smallint"),
+        DataType::Int32 if overflows::<i32>(text) => Some("integer"),
+        DataType::Int64 if overflows::<i64>(text) => Some("bigint"),
+        _ => None,
+    };
+    if let Some(name) = range {
+        return external(format!("value \"{text}\" is out of range for type {name}"), "22003");
+    }
+    if t.is_decimal() && whole_digits(text).is_some() {
+        return external("numeric field overflow", "22003");
+    }
+    match pg_name(t) {
+        Some(name) => external(format!("invalid input syntax for type {name}: \"{text}\""), "22P02"),
+        None => plain(),
+    }
+}
+
+/// The refusal of a number that won't go into `t`: Postgres's range words for the integer types it has (smallint, integer,
+/// bigint, NaN and the infinities too), 22003 for a decimal, and Arrow's words, as 22003, for an integer Postgres has no
+/// type for (Int8, the unsigned ones). Any other target keeps Arrow's error.
+fn number_refusal(t: &DataType, e: ArrowError) -> DataFusionError {
+    match t {
+        DataType::Int16 => external("smallint out of range", "22003"),
+        DataType::Int32 => external("integer out of range", "22003"),
+        DataType::Int64 => external("bigint out of range", "22003"),
+        t if t.is_decimal() => external("numeric field overflow", "22003"),
+        t if t.is_integer() => external(e.to_string(), "22003"),
+        _ => e.into(),
+    }
+}
+
+/// Postgres's name for a type that a text is cast to, as its `invalid input syntax for type …` names it.
+fn pg_name(t: &DataType) -> Option<&'static str> {
+    Some(match t {
+        DataType::Int16 => "smallint",
+        DataType::Int32 => "integer",
+        DataType::Int64 => "bigint",
+        DataType::Float32 => "real",
+        DataType::Float64 => "double precision",
+        DataType::Boolean => "boolean",
+        DataType::Date32 | DataType::Date64 => "date",
+        DataType::Timestamp(_, None) => "timestamp",
+        DataType::Timestamp(_, Some(_)) => "timestamp with time zone",
+        DataType::Time32(_) | DataType::Time64(_) => "time",
+        t if t.is_decimal() => "numeric",
+        _ => return None,
+    })
+}
+
+/// Whether `text` is an integer that parses as `T` only by overflowing it (a space around it is not a digit).
+fn overflows<T: std::str::FromStr<Err = std::num::ParseIntError>>(text: &str) -> bool {
+    use std::num::IntErrorKind::{NegOverflow, PosOverflow};
+    matches!(text.trim().parse::<T>(), Err(e) if matches!(e.kind(), PosOverflow | NegOverflow))
+}
+
+/// The digits before the point of `text`, a plain decimal number's (leading zeros not counted), or None when it isn't one.
+fn whole_digits(text: &str) -> Option<usize> {
+    let t = text.trim();
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
+    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    (whole.len() + frac.len() > 0 && digits(whole) && digits(frac)).then(|| whole.trim_start_matches('0').len())
 }
 
 /// `whole`'s type for values of type `t`.
@@ -247,7 +347,7 @@ fn rounded(e: Expr, schema: &DFSchema, truncate: bool) -> Result<Transformed<Exp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Decimal128Array, Float32Array, Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::array::{Decimal128Array, DictionaryArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray, StringViewArray};
     use datafusion::arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::arrow::util::display::array_value_to_string;
     use datafusion::execution::runtime_env::RuntimeEnv;
@@ -315,13 +415,69 @@ mod tests {
         let i = into(&f, &DataType::Int32).unwrap();
         assert_eq!(i.as_primitive::<Int32Type>().iter().collect::<Vec<_>>(), vec![Some(2), Some(-2), Some(4), Some(2), None]);
         let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
-        assert!(into(&nan, &DataType::Int32).unwrap_err().to_string().contains("NaN"));
+        assert_eq!(refusal(&nan, &DataType::Int32), ("22003", "integer out of range".to_string()));
         let d: ArrayRef = Arc::new(Decimal128Array::from(vec![Some(700250), Some(-250)]).with_precision_and_scale(10, 2).unwrap());
         assert_eq!(into(&d, &DataType::Int64).unwrap().as_primitive::<Int64Type>().values().to_vec(), vec![7003, -3]);
         let s: ArrayRef = Arc::new(StringArray::from(vec!["7"]));
         assert_eq!(into(&s, &DataType::Int64).unwrap().as_primitive::<Int64Type>().values().to_vec(), vec![7]);
         let big: ArrayRef = Arc::new(Int64Array::from(vec![300]));
-        assert!(into(&big, &DataType::Int8).unwrap_err().to_string().contains("300"));
+        assert!(refusal(&big, &DataType::Int8).1.contains("Can't cast value 300 to type Int8"));
+    }
+
+    /// The SQLSTATE and words of a refused cast, as a door gets them.
+    fn refusal(c: &ArrayRef, t: &DataType) -> (&'static str, String) {
+        let e = anyhow::Error::from(into(c, t).expect_err("refused"));
+        (crate::codes::of(&e), crate::codes::words(&e))
+    }
+
+    /// A text that won't go into an integer, decimal, date or timestamp is refused by its first such value, as Postgres
+    /// refuses it, from a StringArray, a Utf8View and a dictionary of text alike (a Hive partition column).
+    #[test]
+    fn text_that_wont_go_is_refused_as_postgres_refuses_it() {
+        let texts: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some("1"), Some("99999999999")])),
+            Arc::new(StringViewArray::from(vec![Some("1"), Some("99999999999")])),
+            Arc::new(DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 1]), Arc::new(StringArray::from(vec!["1", "99999999999"]))).unwrap()),
+        ];
+        for t in &texts {
+            assert_eq!(refusal(t, &DataType::Int32), ("22003", "value \"99999999999\" is out of range for type integer".to_string()));
+        }
+        let small: ArrayRef = Arc::new(StringArray::from(vec![Some("40000")]));
+        assert_eq!(refusal(&small, &DataType::Int16), ("22003", "value \"40000\" is out of range for type smallint".to_string()));
+        let wide: ArrayRef = Arc::new(StringArray::from(vec![Some("99999999999999999999")]));
+        assert_eq!(refusal(&wide, &DataType::Int64), ("22003", "value \"99999999999999999999\" is out of range for type bigint".to_string()));
+        let abc: ArrayRef = Arc::new(StringArray::from(vec![Some("12"), Some("abc"), Some("99999999999")]));
+        assert_eq!(refusal(&abc, &DataType::Int32), ("22P02", "invalid input syntax for type integer: \"abc\"".to_string()), "the first refused text decides");
+        assert_eq!(into(&abc.slice(0, 1), &DataType::Int32).unwrap().as_primitive::<Int32Type>().value(0), 12, "text that goes is unchanged");
+        let dec: ArrayRef = Arc::new(StringArray::from(vec![Some("12345")]));
+        assert_eq!(refusal(&dec, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
+        let rounded: ArrayRef = Arc::new(StringArray::from(vec![Some("99.95")]));
+        assert_eq!(refusal(&rounded, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()), "99.95 rounds to 100.0");
+        let word: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
+        assert_eq!(refusal(&word, &DataType::Decimal128(3, 1)), ("22P02", "invalid input syntax for type numeric: \"abc\"".to_string()));
+        assert_eq!(refusal(&word, &DataType::Date32), ("22P02", "invalid input syntax for type date: \"abc\"".to_string()));
+        let at = DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None);
+        assert_eq!(refusal(&word, &at), ("22P02", "invalid input syntax for type timestamp: \"abc\"".to_string()));
+        assert_eq!(refusal(&word, &DataType::Int8).0, "22P02", "a type with no name here keeps Arrow's words");
+    }
+
+    /// A number that won't go into an integer type is 22003 with Postgres's range words (NaN and the infinities too);
+    /// into a decimal it is `numeric field overflow`; into Int8 or an unsigned type Arrow's words, as 22003.
+    #[test]
+    fn numbers_that_wont_go_are_22003_with_postgres_words() {
+        let int: ArrayRef = Arc::new(Int64Array::from(vec![99999999999]));
+        assert_eq!(refusal(&int, &DataType::Int32), ("22003", "integer out of range".to_string()));
+        let float: ArrayRef = Arc::new(Float64Array::from(vec![1e20]));
+        assert_eq!(refusal(&float, &DataType::Int64), ("22003", "bigint out of range".to_string()));
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        assert_eq!(refusal(&nan, &DataType::Int64), ("22003", "bigint out of range".to_string()));
+        let inf: ArrayRef = Arc::new(Float64Array::from(vec![f64::INFINITY]));
+        assert_eq!(refusal(&inf, &DataType::Int64), ("22003", "bigint out of range".to_string()));
+        let small: ArrayRef = Arc::new(Int64Array::from(vec![40000]));
+        assert_eq!(refusal(&small, &DataType::Int16), ("22003", "smallint out of range".to_string()));
+        assert_eq!(refusal(&int, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
+        assert_eq!(refusal(&int, &DataType::UInt8).0, "22003");
+        assert!(refusal(&int, &DataType::UInt8).1.contains("Can't cast value 99999999999 to type UInt8"));
     }
 
     /// Spark's dialect cuts a cast's fraction, Pondra's SQL rounds it, in the same session type: `SET` names the
