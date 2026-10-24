@@ -113,33 +113,6 @@ jobs:
           if [ "$GITHUB_REF" = refs/heads/train ] || [ "$MODE" = train ]; then event=pull_request; elif [ "$MODE" = main ]; then event=push; fi
           if [ "$event" != pull_request ]; then FULL=true; fi
           echo "event=$event" >> "$GITHUB_OUTPUT"
-          release=false
-          if [ "$event" = workflow_dispatch ] || { [ "$event" = push ] && git diff HEAD^1 HEAD -- Cargo.toml | grep -q '^+version = '; }; then release=true; fi
-          # (linux-x64 apart: the suite and the tests after the build start once it is built, and
-          # never wait for the slowest platform)
-          echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
-          others=$(jq -c --argjson release "$release" '{include: [.[] | select(.platform != "linux-x64" and ($release or .platform != "macos-x64"))]}' <<< "$platforms")
-          echo "others=$others" >> "$GITHUB_OUTPUT"
-          if [ "$event" = push ]; then
-            # (a run with every package this one would make, `pondra` itself among them)
-            run=$(bash tools/ci_build.sh "$GITHUB_SHA" "$(jq -r '[.include[].platform | "pondra-\(.)"] + ["pondra-linux-x64", "pondra-npm"] | join(" ")' <<< "$others")")
-            echo "run=$run" >> "$GITHUB_OUTPUT"
-            if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
-          fi
-          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
-          # A pull request's linux-x64 alone (\`ci\`) is built in the release profile, for this runner's
-          # glibc: the dist profile's one codegen unit and thin LTO took 23 of a run's 43 minutes (median of
-          # 26 runs, 10-14 to 10-17), and the release profile's dependencies are the ones the unit tests
-          # cache. What ships is still built as it ships, and its suite run, on main and with \`full-ci\`.
-          profile=dist
-          # Its packages are named \`pr-linux-x64\`, never \`pondra-linux-x64\`, so nothing takes them for what
-          # ships (a release, a bench, the soak, the nightly checks: tools/ci_build.sh and ci_artifact.sh
-          # take \`pondra-*\`).
-          packages=pondra
-          if [ "$event" = pull_request ] && [ "$FULL" != true ]; then profile=release; packages=pr; fi
-          echo "profile=$profile" >> "$GITHUB_OUTPUT"
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           # What a change touches decides what runs: nothing for one no check reads (docs/ but its
           # surface and glossary, AGENTS.md, the benches', the soak's and other workflows' own files);
           # the unit tests when the crate or its tests change; the harness when the program, its
@@ -168,6 +141,45 @@ jobs:
           bin='^(src/|capi/|launcher/|brand/|build\.rs$|tools/startup_layout\.rs$|Cargo\.(toml|lock)$)' # (the program and the library, and their build scripts)
           pkg='^(python/|js/|install\.(sh|ps1)$|tools/(package|smoke|package_check)\.py$|tools/(package_check\.mjs|try_packages\.sh|npm_publish\.sh|try_install\.ps1)$)' # (the packages, and what tries them)
           self='^\.github/workflows/build\.yml$'
+          release=false
+          # (what the version is compared with: main's last passed run for a push (`base`: a landed train holds several
+          # merges, and the version commit needn't be the last), the main a train was cut on, a pull request's main)
+          since=HEAD^1
+          if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$files" != ALL ] && [ -n "$base" ]; then since=$base; fi
+          if [ "$event" = workflow_dispatch ] || { [ "$event" = push ] && git diff "$since" HEAD -- Cargo.toml | grep -q '^+version = '; }; then release=true; fi
+          # (linux-x64 apart: the suite and the tests after the build start once it is built, and
+          # never wait for the slowest platform)
+          echo "linux=$(jq -c '{include: [.[] | select(.platform == "linux-x64")]}' <<< "$platforms")" >> "$GITHUB_OUTPUT"
+          others=$(jq -c --argjson release "$release" '{include: [.[] | select(.platform != "linux-x64" and ($release or .platform != "macos-x64"))]}' <<< "$platforms")
+          echo "others=$others" >> "$GITHUB_OUTPUT"
+          if [ "$event" = push ]; then
+            # (a run with every package this one would make, `pondra` itself among them)
+            run=$(bash tools/ci_build.sh "$GITHUB_SHA" "$(jq -r '[.include[].platform | "pondra-\(.)"] + ["pondra-linux-x64", "pondra-npm"] | join(" ")' <<< "$others")")
+            echo "run=$run" >> "$GITHUB_OUTPUT"
+            if [ -n "$run" ]; then echo "Built and tested already: https://github.com/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"; fi
+          fi
+          if [ "$FULL" != true ]; then echo "linux-x64 alone (the label \`ci\`): the pull request merges once it passes, and main builds the other platforms (the label \`full-ci\` builds them here first, but macOS Intel)." >> "$GITHUB_STEP_SUMMARY"; fi
+          # A pull request's linux-x64 alone (\`ci\`) is built in the release profile, for this runner's
+          # glibc: the dist profile's one codegen unit and thin LTO took 23 of a run's 43 minutes (median of
+          # 26 runs, 10-14 to 10-17), and the release profile's dependencies are the ones the unit tests
+          # cache. What ships is still built as it ships, and its suite run, on main and with \`full-ci\`.
+          profile=dist
+          # Its packages are named \`pr-linux-x64\`, never \`pondra-linux-x64\`, so nothing takes them for what
+          # ships (a release, a bench, the soak, the nightly checks: tools/ci_build.sh and ci_artifact.sh
+          # take \`pondra-*\`).
+          packages=pondra
+          if [ "$event" = pull_request ] && [ "$FULL" != true ]; then profile=release; packages=pr; fi
+          # (but in the dist profile, with zig for glibc 2.17, when the change is to what only that build tries: the lock
+          # file, a build script or the dist profile. A new dependency that links a newer glibc symbol (invariant 48), or a
+          # link the dist profile can't make, is then found before main, not on it)
+          dist_profile() { git show "$1:Cargo.toml" 2>/dev/null | awk '/^\[/ { on = index($0, "[profile.dist") == 1 } on'; }
+          if [ "$profile" = release ] && { has '(^|/)build\.rs$|^Cargo\.lock$' || [ "$(dist_profile "$since")" != "$(dist_profile HEAD)" ]; }; then
+            profile=dist
+            echo "linux-x64 in the dist profile, against glibc 2.17: this changes the lock file, a build script or the dist profile, which only that build tries." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "profile=$profile" >> "$GITHUB_OUTPUT"
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          if [ "$FULL" = true ] && [ "$release" = false ]; then echo "macOS Intel is built on a version commit (the one a release tags) or a run started by hand." >> "$GITHUB_STEP_SUMMARY"; fi
           code=false; unit=false; harness=false; docs=false; site=false; deploy=false; full=false
           if has "$bin|$pkg|$self"; then code=true; fi
           if has "$bin|^tests/|^tools/per_node_check\.py\$|$self"; then unit=true; fi
@@ -181,6 +193,9 @@ jobs:
           # pull request, `red`, without a pull request's `ci` waiting for a wasm build)
           web=false
           if [ "$FULL" = true ] && has "^(src/|web/|tools/web_|Cargo\.(toml|lock)\$)|$self"; then web=true; fi
+          # (and a pull request's, or a train's, when the module itself, the core's list of modules or its
+          # dependencies change: the unit tests compile the core without the server feature, but not for wasm32)
+          if [ "$event" = pull_request ] && has '^(web/|tools/web_|src/lib\.rs$|Cargo\.toml$)'; then web=true; fi
           if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
           if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
           upgrade=false; resilience=false; sharing=false; sso=false
@@ -191,7 +206,7 @@ jobs:
             if has "$bin|^python/|^tools/(upgrade_check|history_check|environments_check|backup_check|git_check|project_check|fake_github|sim_r2)\.py\$|^tools/(ci_artifact\.sh|requirements\.txt)\$|^\.github/workflows/(upgrade|build)\.yml\$"; then upgrade=true; fi
             if has '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)'; then resilience=true; fi
             if has '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
-            if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
+            if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings|sso)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
           if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi

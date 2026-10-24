@@ -24,7 +24,8 @@ and then, and what drifts over time measured.
   minutes); memory flat (each node process that lived ten samples: its own memory, less its
   caches (the hot columns, and what `pondra_cache_bytes` counts), the lower quartile of the last
   tenth of its life within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the
-  lake's objects (data files, log segments, the catalog's) and every stop's longest wait.
+  lake's objects (data files, log segments, the catalog's) and every stop's longest wait, with when
+  the node exited and, for a leader, when another led.
   Prints the checks as JSON (and writes them to --out) and exits 1 if one fails. It prices what the
   bucket was asked and holds at S3's and R2's list prices (tools/prices.py): dollars a month at this load.
 
@@ -238,11 +239,16 @@ def main():
                 t0 = time.time()
                 live.remove(x)
                 x.stop(how)
+                # (a leader's stop splits its followers' wait in two: its own steps until it exits, then a follower
+                # taking the term and opening the lake as its leader)
+                times = {"exited_s": round(time.time() - t0, 2)}
+                if who == "leader" and until(lambda: any(y.get("/stats", timeout=2)["role"] == "leader" for y in live), 60, 0.1):
+                    times["led_s"] = round(time.time() - t0, 2)
                 time.sleep(2)
                 y = Node(binary, lake, x.port, work, tier_secs=10).start()
                 until(lambda: y.plain("GET", "/ready")[0] == 200, 60)
                 live.append(y)
-                moves.append({"at_s": round(was["elapsed"] + t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", "window": (t0 - 0.5, time.time())})
+                moves.append({"at_s": round(was["elapsed"] + t0 - start), "node": f"{who} {x.port}", "how": "stopped" if how == "term" else "killed", **times, "window": (t0 - 0.5, time.time())})
             next_move += every
     ups.stop_.set()
     for m in moves:

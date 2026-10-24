@@ -2,13 +2,14 @@
 //! cast drops the fraction: `CAST(2.5 AS INT)` is 3 (a decimal rounds half away from zero) and
 //! `CAST(2.5::DOUBLE AS INT)` is 2 (a float rounds half to even, as C's `rint`: 3.5 is 4). A query's
 //! casts take `pondra_whole` of their value (`Rounds`, an analyzer rule after type coercion), and a
-//! value written into an integer column is rounded the same way (`query::strict`).
+//! value written into an integer column, or a constant or a setval's value cast into one, is rounded the
+//! same way (`into`).
 //!
 //! In Spark's dialect (`datafusion.sql_parser.dialect = 'spark'`, and `spark_sql('…')`, whose casts Pondra's
 //! SQL turns into `pondra_truncate`) the fraction is cut toward zero instead, as Spark and Polars cast:
 //! `CAST(2.7 AS INT)` is 2 and `CAST(-2.7 AS INT)` is -2 (`Rounds` picks it by the dialect).
 use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, PrimitiveArray};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type, DecimalType, Float32Type, Float64Type};
 use datafusion::common::config::{ConfigOptions, Dialect};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
@@ -58,6 +59,18 @@ pub fn truncated(c: &ArrayRef) -> Result<ArrayRef> {
         DataType::Decimal256(..) => Arc::new(decimal::<Decimal256Type>(c.as_primitive(), false)?),
         _ => c.clone(),
     })
+}
+
+/// A column as type `t`, or an error naming the value that won't go (never a quiet NULL). A value with a fraction
+/// going into an integer type is rounded first, as every other cast into an integer rounds it (`whole`, invariant
+/// 293); the rest is Arrow's cast with `safe` off. Rows written into tables, setval's value and a constant folded
+/// at planning all come this way.
+pub fn into(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
+    if c.data_type() == t {
+        return Ok(c.clone());
+    }
+    let c = if t.is_integer() && fractional(c.data_type()) { whole(c)? } else { c.clone() };
+    Ok(cast_with_options(&c, t, &CastOptions { safe: false, ..Default::default() })?)
 }
 
 /// `whole`'s type for values of type `t`.
@@ -234,8 +247,8 @@ fn rounded(e: Expr, schema: &DFSchema, truncate: bool) -> Result<Transformed<Exp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Decimal128Array, Float32Array, Float64Array, Int64Array};
-    use datafusion::arrow::datatypes::Int64Type;
+    use datafusion::arrow::array::{Decimal128Array, Float32Array, Float64Array, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{Int32Type, Int64Type};
     use datafusion::arrow::util::display::array_value_to_string;
     use datafusion::execution::runtime_env::RuntimeEnv;
     use datafusion::prelude::SessionConfig;
@@ -292,6 +305,23 @@ mod tests {
         assert_eq!(t, vec![Some(200), Some(-200), Some(0), None]);
         let i: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, -7]));
         assert_eq!(truncated(&i).unwrap().as_primitive::<Int64Type>().values().to_vec(), vec![i64::MAX, -7]);
+    }
+
+    /// `into` rounds a fraction going into an integer as a cast does, text casts, and a value that won't go is an
+    /// error naming it (one bad value fails the column, so NaN is tested apart).
+    #[test]
+    fn into_rounds_a_fraction_and_refuses_a_value_that_wont_go() {
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![Some(2.5), Some(-2.5), Some(3.5), Some(2.4), None]));
+        let i = into(&f, &DataType::Int32).unwrap();
+        assert_eq!(i.as_primitive::<Int32Type>().iter().collect::<Vec<_>>(), vec![Some(2), Some(-2), Some(4), Some(2), None]);
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
+        assert!(into(&nan, &DataType::Int32).unwrap_err().to_string().contains("NaN"));
+        let d: ArrayRef = Arc::new(Decimal128Array::from(vec![Some(700250), Some(-250)]).with_precision_and_scale(10, 2).unwrap());
+        assert_eq!(into(&d, &DataType::Int64).unwrap().as_primitive::<Int64Type>().values().to_vec(), vec![7003, -3]);
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["7"]));
+        assert_eq!(into(&s, &DataType::Int64).unwrap().as_primitive::<Int64Type>().values().to_vec(), vec![7]);
+        let big: ArrayRef = Arc::new(Int64Array::from(vec![300]));
+        assert!(into(&big, &DataType::Int8).unwrap_err().to_string().contains("300"));
     }
 
     /// Spark's dialect cuts a cast's fraction, Pondra's SQL rounds it, in the same session type: `SET` names the

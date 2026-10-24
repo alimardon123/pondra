@@ -59,7 +59,7 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     let query = crate::routines::expand(lake, query).await?; // (the files, macros and FROM-first queries it reads)
     if to.starts_with("kafka://") {
         let df = crate::engine::sql(&crate::query::session(lake, &query, "").await?, &query).await?;
-        return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's)
+        return crate::kafka_client::copy_to(lake, df, to, options).await; // (rows as records: a topic's; not retried, as records sent are sent)
     }
     ensure!(!options.contains_key("key"), "KEY is a Kafka topic's (COPY … TO 'kafka://brokers/topic')");
     let format = match options.get("format") {
@@ -69,8 +69,15 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     if format == "delta" || format == "iceberg" {
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
         let ctx = crate::query::session(lake, &query, "").await?;
-        let df = crate::engine::sql(&ctx, &query).await?;
-        return crate::write_outside::copy_table(lake, &ctx, df, to, &format, on("append"), on("overwrite")).await; // (a table, not files: ADR-028)
+        let (append, overwrite) = (on("append"), on("overwrite"));
+        return crate::query::frugally(&ctx, |ctx| {
+            let (query, format) = (&query, &format);
+            async move {
+                let df = crate::engine::sql(&ctx, query).await?;
+                // (a new table's first version is put before its rows, so a try that ran out of memory left an empty table: its retry adds to it)
+                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite).await
+            }
+        }).await; // (a table, not files: ADR-028)
     }
     ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
     ensure!(format == "parquet" || !options.contains_key("compression") && !options.contains_key("row_group_size"), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (files are read as they are: not compressed)");
@@ -97,28 +104,30 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
                 Err(e) => {
                     // What the nodes wrote goes, and this node writes it all.
                     eprintln!("COPY … TO {to} across the nodes failed, writing it from here: {e:#}");
-                    let written = listed(lake, to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
-                    delete(lake, to, written).await?;
+                    undo(lake, to, &kept).await?;
                 }
             }
         }
     }
-    let rows = crate::query::frugally(|frugal| {
+    let ctx = crate::query::session(lake, &query, "").await?; // (made once: a try that runs out of memory retries on a copy of it)
+    let rows = crate::query::frugally(&ctx, |ctx| {
         let (query, target, kept) = (&query, &target, &kept);
         async move {
-            if frugal && target.folder() {
+            if crate::query::retrying(&ctx) && target.folder() {
                 // (what the first try wrote goes, as after a spread COPY that failed)
-                let written = listed(lake, &target.to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
-                delete(lake, &target.to, written).await?;
-            }
-            let ctx = crate::query::session(lake, query, "").await?;
-            if frugal {
-                crate::query::frugal(&ctx);
+                undo(lake, &target.to, kept).await?;
             }
             write(crate::engine::sql(&ctx, query).await?, target).await
         }
     }).await?;
     Ok(serde_json::json!({"copied": rows, "to": to}))
+}
+
+/// Deletes what is listed under `to` now except `kept` (what the folder held before the statement, and keeps): what
+/// an attempt that failed wrote.
+async fn undo(lake: &Lake, to: &str, kept: &HashSet<object_store_df::path::Path>) -> Result<()> {
+    let written = listed(lake, to).await?.into_iter().filter(|p| !kept.contains(p)).collect();
+    delete(lake, to, written).await
 }
 
 /// The files under a folder (none if it isn't there).
