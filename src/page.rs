@@ -133,6 +133,7 @@ pub struct Page {
     keeping: futures::lock::Mutex<()>,
     node: Option<Node>,
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
+    unread: Vec<(String, String)>, // (the kept files `kept` couldn't read, each as its path and the words of why)
 }
 
 /// What a write to a page table found there, for `undo` to put back: the table and its rows, partition by partition.
@@ -208,14 +209,23 @@ impl Page {
     /// A page over `options`'s store, with the files and tables it kept: `open`, then every object the store lists under
     /// `tables/` that ends `.arrow` is read back as a table of the page's default schema (`restore`). A kept table has its
     /// rows, its columns and its column defaults again. Its tables stay in memory while the page runs; its files are read
-    /// from the store as they are asked for. With no store given nothing is listed, so the page is `open`'s.
+    /// from the store as they are asked for. With no store given nothing is listed, so the page is `open`'s. A kept file
+    /// that doesn't read is left out and listed by `unread`, so the page still opens with the tables it can read.
     pub async fn kept(options: &Options) -> anyhow::Result<Page> {
-        let page = Page::open(options);
+        let mut page = Page::open(options);
         let listed = page.files.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await?;
         for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".arrow")) {
-            page.restore(&object.location).await?;
+            if let Err(e) = page.restore(&object.location).await {
+                page.unread.push((object.location.to_string(), crate::codes::words(&e)));
+            }
         }
         Ok(page)
+    }
+
+    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is; a table
+    /// written later under that name replaces it.
+    pub fn unread(&self) -> &[(String, String)] {
+        &self.unread
     }
 
     /// A page with no tables, its session a node's (`engine::session`) with the partitions asked for. Its files are the
@@ -248,7 +258,7 @@ impl Page {
         };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![] }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -581,10 +591,10 @@ impl Page {
     }
 
     /// Reads the kept table at `at` back into the page, as a table of its default schema. A file that doesn't read, or
-    /// that is not a kept table, fails with its path in the error.
+    /// that is not a kept table, fails with the words of why and no path: `kept` lists the file by its path beside them.
     async fn restore(&self, at: &Path) -> anyhow::Result<()> {
         let file = self.files.get(at).await?.bytes().await?;
-        let (name, table) = self.table_from_file(file).map_err(|e| anyhow::anyhow!("{at}: {e:#}"))?;
+        let (name, table) = self.table_from_file(file)?;
         let (_, page) = self.default_schema()?;
         register_page_table(page.as_ref(), name, Arc::new(table))?;
         Ok(())
@@ -2626,6 +2636,23 @@ mod tests {
         let mut kept: Vec<String> = store.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await.unwrap().iter().map(|o| o.location.to_string()).collect();
         kept.sort();
         assert_eq!(kept, ["tables/My Table.arrow", "tables/a%2Fb%3F.arrow"]);
+    }
+
+    /// A kept file that doesn't read is left out, not fatal: a page kept over a store with one good table and one bad file
+    /// still opens, the good table answers its rows, and `unread` names the bad file.
+    #[tokio::test]
+    async fn a_kept_page_opens_past_a_file_it_cannot_read() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
+        assert_eq!(a.request("POST", "/sql", &[], "INSERT INTO t VALUES (2)".into()).await.status, 200);
+        store.put(&Path::from("tables/bad.arrow"), bytes::Bytes::from_static(b"not arrow").into()).await.unwrap();
+        let b = Page::kept(&options).await.unwrap();
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "SELECT id FROM t ORDER BY id".into()).await.body, "id\n1\n2\n");
+        let unread = b.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].0.ends_with("tables/bad.arrow"), "{unread:?}");
     }
 
     /// A page with no store keeps nothing: a page kept over no store is an empty page, as `open` makes one, and a table
