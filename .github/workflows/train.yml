@@ -9,9 +9,12 @@ name: train
 # alone, so one pull request can't hold the others for long. A pull request whose workflows aren't main's can't ride
 # (the workflow's token may not push a workflow): it takes `ci` as before.
 #
-# Each run does the one next thing and ends: on a `train` label, at the end of every build run, every 15 minutes (a
-# run's end may not reach here: GitHub stops chains of workflow_run), and by hand. One at a time. Main's copy runs,
-# on a checkout of main: a pull request's code is merged, never run. The repository variable TRAIN = off stops it.
+# A run steps on a `train` label, at the end of every build run, every 15 minutes, and by hand. The train's own build
+# run ends without starting one (GitHub starts no workflow_run for a run the workflow's token began) and the schedule
+# can lag by hours, so while the train waits on its own run a step looks again each minute (--wait), landing a green
+# run within a minute of its end; after 50 minutes it starts this workflow once more to go on. One at a time. Main's
+# copy runs, on a checkout of main: a pull request's code is merged, never run. The repository variable TRAIN = off
+# stops it.
 # A pull request that changes the conductor runs its tests (tools/train_test.py) instead.
 on:
   pull_request_target:
@@ -38,9 +41,9 @@ jobs:
       group: train
       cancel-in-progress: false
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 60 # (a wait of 50, and a step after it)
     permissions:
-      actions: write # (starting build.yml on the train and on main, re-running a red train's failed jobs)
+      actions: write # (starting build.yml on the train and on main, re-running a red train's failed jobs, this again)
       contents: write # (the branch `train`, and main moved to its tip)
       issues: write # (labels and comments)
       pull-requests: write
@@ -56,7 +59,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          python3 tools/train.py step
+          python3 tools/train.py step --wait 50
 
   test:
     if: github.event_name == 'pull_request'
