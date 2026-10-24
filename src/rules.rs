@@ -3,6 +3,7 @@
 //! only `Column::stored` keeps the name a file or the log holds a column under. Nothing here reads files,
 //! storage or the catalog, so the rules over it (`shape`) run the same in a browser as on a node.
 pub mod fit;
+pub mod keys;
 
 use datafusion::arrow::datatypes::SchemaRef;
 

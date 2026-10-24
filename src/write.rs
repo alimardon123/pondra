@@ -1107,7 +1107,7 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
     let columns = row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let names = if names.is_empty() { implicit(&columns, rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
-    crate::seq::check_given(&meta.logical(), table, &given)?;
+    crate::seq::check_given(&meta, table, &given)?;
     let default = |c: &str| crate::defaults::sql_of(&meta, c);
     if plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
@@ -1969,7 +1969,7 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
     let lake = other.as_deref().unwrap_or(lake);
     let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
-        crate::seq::check_set(&m.logical(), &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+        crate::seq::check_set(m, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
