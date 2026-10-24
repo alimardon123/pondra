@@ -1173,7 +1173,8 @@ impl Lake {
                 lake.cat.send(Frame::Durable(id));
             }
         });
-        while let Some((handle, d, done)) = writes.recv().await {
+        while let Some((handle, d, done, sent)) = writes.recv().await {
+            let t = commit_stage("queued", sent);
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
             let need = cat.replicas.saturating_sub(1);
@@ -1199,6 +1200,7 @@ impl Lake {
                     _ = acked.changed() => {}
                 }
             }
+            let t = commit_stage("durable", t);
             if need == 0 {
                 cat.send(Frame::Change(d.clone()));
             }
@@ -1207,6 +1209,7 @@ impl Lake {
             cat.send(Frame::Committed(d.id));
             let _ = to_bucket.send((handle, d.id));
             let _ = done.send(());
+            commit_stage("applied", t);
         }
     }
 
@@ -1757,7 +1760,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>);
+type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
 
 enum Db_ {
     Writer(Db),
@@ -2562,6 +2565,7 @@ impl Catalog {
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
+        let t0 = Instant::now();
         let puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut batch = WriteBatch::new();
         for (k, v) in &puts {
@@ -2571,9 +2575,11 @@ impl Catalog {
             batch.delete(k);
         }
         let mut id = self.order.lock().await;
+        let t1 = commit_stage("order", t0);
         let c = ("c".to_string(), Bytes::from(json(&*id)));
         batch.put(&c.0, &c.1);
         let handle = db.write(batch).await.map_err(|e| self.fenced(e))?;
+        let t2 = commit_stage("slatedb write", t1);
         if self.flush_now {
             // (its WAL written now, not at the next tick of `flush_interval`: a commit waited about a
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
@@ -2586,12 +2592,54 @@ impl Catalog {
         }
         let (done, rx) = oneshot::channel();
         let puts = puts.into_iter().chain([c]).collect();
-        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done));
+        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done, t2));
         *id += 1;
         Ok(rx)
     }
 }
 
+
+/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
+/// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
+/// sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy). Returns now, the
+/// next stage's start.
+pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
+    type Stages = Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>;
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::env::is_set("PONDRA_TRACE_COMMIT");
+        if on {
+            crate::panics::spawn(async {
+                loop {
+                    let t = Instant::now();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    commit_stage("lag", t + Duration::from_millis(10));
+                }
+            });
+        }
+        on
+    });
+    static STAGES: std::sync::LazyLock<Stages> = std::sync::LazyLock::new(|| Mutex::new((Instant::now(), vec![])));
+    let now = Instant::now();
+    if !*ON {
+        return now;
+    }
+    let mut s = STAGES.lock().unwrap();
+    let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+    match s.1.iter_mut().find(|(n, _)| *n == stage) {
+        Some((_, v)) => v.push(ms),
+        None => s.1.push((stage, vec![ms])),
+    }
+    if now - s.0 >= Duration::from_secs(60) {
+        let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
+            v.sort_by(f64::total_cmp);
+            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+            format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
+        }).collect();
+        eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
+        *s = (now, vec![]);
+    }
+    now
+}
 
 impl Catalog {
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
