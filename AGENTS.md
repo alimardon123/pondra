@@ -2930,6 +2930,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    reader then reads again (20 ms, doubling to 500 ms, 10 s in all), its marks moved on between tries; a writer's miss,
    or one past the wait, is still an error. A failover's reader once got "500: missing inline segment 19178".
    `cargo test --lib store::tests::a_listed_segment_waits_for_its_inline_rows` (fails at its first read without it).
+427. **The names 1.1 needs are refused now** (`ddl::database_name`, `lake_files::under_files`): a database's name never
+   starts with `_` (42602: `_pondra` is the server's own folder, and `ddl::lakes_in` skips `_` folders), and a lake
+   file's path never has `~` or `Shared` as its first folder, with or without a leading `/` (0A000: they are the
+   workspace of 1.1, ADR-054), at every caller (`PUT /files`, `CALL run`, `files()`, a page, git folders). A database
+   server's errors carry `x-pondra-sqlstate` as a node's do (`server::error_response`). `harness.py server`, `files`,
+   `workspace`; `cargo test --lib lake_files:: ddl::`.
+428. **DuckDB's `INSTALL` and `LOAD` answer a notice for the extensions Pondra has built in, and are refused by name
+   (0A000) for any other, never answered as done** (`extension::statement`, ADR-075): `[FORCE] INSTALL x [FROM r]
+   [VERSION v]` and `LOAD x`, read from tokens, so `LOAD DATA …` stays another statement; a node's doors answer them
+   through `settings::is` (the command tag and the notice), a page and `pondra sql` through `extension::row` (one row).
+   A name goes in `BUILT_IN` only when a DuckDB script that loads it and uses it runs here. `harness.py friendly`
+   (HTTP, scripts, the Postgres port); `cargo test --lib extension:: page::`.
+429. **A table's entry is parsed once a version, wherever a request reads it** (`Catalog::parsed`, `Catalog::meta`): an
+   LRU of parsed entries by key (256, 16 MB of raw bytes), a hit when the bytes are the ones it was parsed from. A
+   per-request read of one table's entry goes through `cat.meta`, not `cat.get::<TableMeta>`; whole scans of every
+   entry, writes and restarts parse as before. `cargo test --lib store::`.
 ## Tests: run these before and after any change
 
 ```bash
