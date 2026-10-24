@@ -5,7 +5,7 @@
 
 use crate::text::{join, PUBLIC};
 use crate::objects::{expect_sql, ident, kind, lakes, list, list_sql, name_sql, sql_type, Object, KINDS, PARTS, PATTERNS};
-use crate::store::{table_key, Lake, TableMeta};
+use crate::store::{table_key, Lake};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use futures::future::BoxFuture;
@@ -103,7 +103,7 @@ fn partial_columns(a: &crate::users::Access, o: &Object, here: &str) -> Option<H
 /// limited caller may see (`partial_columns`), and then nothing else.
 async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -> Result<Vec<PartRow>> {
     let local = o.local();
-    let Some(meta) = l.cat.get::<TableMeta>(&table_key(&local)).await? else { return Ok(vec![]) };
+    let Some(meta) = l.cat.meta(&table_key(&local)).await? else { return Ok(vec![]) };
     let d = meta.described();
     let comments = column_comments(l, &local).await?;
     let mut out = vec![];

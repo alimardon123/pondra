@@ -484,7 +484,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
     let mut indexes = vec![];
     for (k, i) in lake.cat.scan::<crate::index::Index>("ix/", "ix0").await? {
         let Some(r) = rels.iter().find(|r| r.oid == oid("r", &i.table)) else { continue };
-        let meta = lake.cat.get::<TableMeta>(&crate::store::table_key(&i.table)).await?;
+        let meta = lake.cat.meta(&crate::store::table_key(&i.table)).await?;
         let name = crate::text::split(&k[3..]).1.to_string();
         let at = i.keys.iter().map(|key| {
             let column = key.expr.strip_prefix('"').and_then(|e| e.strip_suffix('"')).filter(|c| !c.contains('"'));
@@ -492,7 +492,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
             named.and_then(|c| r.columns.iter().position(|(n, ..)| n == c)).map_or(0, |p| p as i16 + 1)
         }).collect();
         let table = format!("{}.{}", crate::objects::ident(&r.schema), crate::objects::ident(&r.name));
-        let def = crate::index::create_sql(&crate::objects::ident(&name), &table, &i, meta.as_ref());
+        let def = crate::index::create_sql(&crate::objects::ident(&name), &table, &i, meta.as_deref());
         indexes.push(PgIndex { oid: oid("ix", &k[3..]), schema: r.schema.clone(), name, table: r.oid, table_name: r.name.clone(), at, def, unique: false });
     }
     // An enforced UNIQUE is an index too, as Postgres makes one for it (`\d` lists it).

@@ -57,7 +57,7 @@ pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Re
 /// (`$1`: a prepared statement's, whose columns and parameter types are known without planning).
 pub struct Point {
     pub table: String,
-    pub meta: TableMeta,
+    pub meta: Arc<TableMeta>,
     pub names: Vec<String>,      // the columns it returns
     pub key: Vec<Option<String>>, // each key column's value, in key order (None: a parameter)
     params: HashMap<String, usize>, // a key column a parameter stands for -> its number ($n)
@@ -161,7 +161,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
         }
     }
     let table = name.to_string().trim_matches('"').to_string();
-    let Some(meta) = lake.cat.get::<TableMeta>(&table_key(&table)).await? else { return Ok(None) };
+    let Some(meta) = lake.cat.meta(&table_key(&table)).await? else { return Ok(None) };
     let mut cols: Vec<&String> = eqs.iter().map(|(c, _)| c).collect();
     cols.sort();
     let mut key: Vec<&String> = meta.key.iter().collect();

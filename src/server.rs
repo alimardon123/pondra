@@ -877,15 +877,20 @@ impl App {
             }
             let here = std::time::Instant::now();
             let ctx = session(&self.lake, query, "").await?;
+            crate::query::mark("session with its tables");
             let ctx = if files { ctx.enable_url_table() } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
             let out = crate::query::frugally(&ctx, |ctx| async move {
                 let df = crate::engine::sql(&ctx, query).await?;
+                crate::query::mark("parsed to logical plan");
                 let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
+                crate::query::mark("optimized plan");
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
+                crate::query::mark("physical plan");
                 let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
+                crate::query::mark("run to the end");
                 crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
                 anyhow::Ok(crate::engine::kept(out, &plan))
@@ -1256,7 +1261,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
     crate::auth::check_all(&name)?; // (a user's: the whole row)
     let lake = &app.lake;
-    let meta: TableMeta = lake.cat.get(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let meta = lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
@@ -1339,7 +1344,7 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
     let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();
     let applied = async move { if applying { crate::protect::APPLYING.scope((), go).await } else { go.await } };
-    let mut go = Box::pin(crate::auth::carried(crate::routines::with_notices(crate::python::holder(vars.is_some(), applied)))); // (a lent token's code holds a slot: what it calls takes none; boxed: a statement's future is big)
+    let mut go = Box::pin(crate::query::traced(crate::auth::carried(crate::routines::with_notices(crate::python::holder(vars.is_some(), applied))))); // (a lent token's code holds a slot: what it calls takes none; boxed: a statement's future is big; traced with PONDRA_TRACE_QUERY)
     let (out, heard) = tokio::select! {
         biased;
         done = &mut go => done,
@@ -1435,6 +1440,7 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let sent = one;
         let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
         if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && !crate::routines::several(&one) && crate::txn::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
+            crate::query::mark("request read and checked");
             return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
@@ -1468,7 +1474,10 @@ async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Re
     // The program that started the node (`files`) has its answers remembered apart, run with its
     // rights: a file here it reads is named in the statement as expanded, or in a view it reads, and
     // so never remembered.
-    let Some(version) = app.remembers(query).await else { return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref())) };
+    let Some(version) = app.remembers(query).await else {
+        crate::query::mark("answer kept?");
+        return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref()));
+    };
     let key = format!("{format}{}|{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""), if files { "owner" } else { "" });
     let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
     let run = || async {
@@ -1544,6 +1553,7 @@ impl App {
         }
         (slot.0, slot.1) = (flight.0.load(std::sync::atomic::Ordering::Relaxed), None);
         let version = self.lake.version_for(query).await; // (read after `covers`: this run reads at least this)
+        crate::query::mark("answer kept?");
         let run = run();
         tokio::pin!(run);
         let (keep, own) = tokio::select! {
@@ -1577,7 +1587,9 @@ async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::
     if crate::query::handed().is_some() {
         return Ok(Rendered::Sent); // (its answer went to the door in pieces as its plan made them)
     }
-    answer(&batches, p)
+    let rendered = answer(&batches, p);
+    crate::query::mark("answer rendered");
+    rendered
 }
 
 /// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at

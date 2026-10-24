@@ -27,7 +27,7 @@ impl Host for Lake {
     async fn columns(&self, tables: BTreeSet<String>) -> Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for n in tables {
-            if let Some(m) = self.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&n)).await? {
+            if let Some(m) = self.cat.meta(&crate::store::table_key(&n)).await? {
                 out.insert(n, m.logical_columns().into_iter().map(|(c, _)| c).chain(crate::text::NAMES.map(String::from)).collect());
             }
         }
