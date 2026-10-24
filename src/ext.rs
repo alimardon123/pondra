@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
 use crate::ext_names::{quoted, scheme};
-use crate::ext_names::{data_files, file_format, listed, schema_of};
+use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
     /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
@@ -217,7 +217,7 @@ pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
     if !is(table) {
         return lake.cat.meta(&crate::store::table_key(table)).await.map(|m| m.map(Arc::unwrap_or_clone));
     }
-    let spec = spec(table).context("not a table of files")?;
+    let spec = for_caller(lake, spec(table).context("not a table of files")?)?;
     check(lake, &spec).await?;
     if let Ok(Some(m)) = LISTED.try_with(|l| l.borrow().get(table).cloned()) {
         return Ok(Some(m));
@@ -253,6 +253,19 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
     Ok(())
 }
 
+/// The spec's names as this caller reads them. The program that started the node reads its own folder, relative names
+/// too, as DuckDB does, so its names stay as they are. A client over the network has no folder on the server, so its
+/// relative names are read where a page reads them: in the lake's files (`lake_files::relative`, `PUT /files/…`'s
+/// place). A URL with a scheme, or an absolute path, stays as it is, and `check` decides it.
+fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
+    if owner() {
+        return Ok(spec);
+    }
+    let root = format!("{}/", lake.url.trim_end_matches('/'));
+    let urls = spec.urls.iter().map(|u| crate::lake_files::relative(&root, u).unwrap_or_else(|| Ok(u.clone()))).collect::<Result<Vec<_>>>()?;
+    Ok(Spec { urls, ..spec })
+}
+
 /// May this caller read these files? A path on this machine: only the program that started the
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
@@ -269,10 +282,12 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
     spec.urls.iter().try_for_each(|u| allowed(&secrets, u))
 }
 
-/// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`.
+/// Is `u` in the lake's own files (`PUT /files/…`, `files()`)? Written out whole, with no `..`. `leaves` also takes
+/// `%2E%2E`: the url crate and DataFusion collapse an escaped `..` as they do a plain one, so without it a name read
+/// through `files/%2E%2E/` would reach past the grants on the lake's tables.
 fn own_file(lake: &Lake, u: &str) -> bool {
     let area = format!("{}/files/", lake.url.trim_end_matches('/'));
-    u.starts_with(&area) && !u[area.len()..].split('/').any(|p| p == ".." || p == ".")
+    u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
 }
 
 /// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
@@ -286,9 +301,9 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
     match scheme(u).filter(|s| *s != "file") {
-        None => bail!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"),
+        None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
-            None => bail!("{}", uncovered(u)),
+            None => return Err(crate::codes::coded("42501", uncovered(u))),
             Some((_, s)) if s.temporary && !s.trusted => crate::public::check(&url::Url::parse(u)?)?, // (`register` holds its store to the public internet)
             Some(_) => {}
         },
@@ -315,7 +330,9 @@ async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Resul
     .collect();
     folders.sort_unstable();
     folders.dedup();
-    folders.into_iter().try_for_each(|d| allowed(&secrets, &format!("{d}/")))
+    // (a data folder the client put in the lake's files is the lake's, as its files are: `own_file` says so, and only
+    // a name that stays in `files/` passes it, so a table there reads as a page reads it)
+    folders.into_iter().filter(|d| !own_file(lake, &format!("{d}/"))).try_for_each(|d| allowed(&secrets, &format!("{d}/")))
 }
 
 /// What to do about a URL no secret covers: the statement that would, for its store.
@@ -330,15 +347,20 @@ pub(crate) fn uncovered(u: &str) -> String {
     format!("no secret covers {u}: an admin makes one (CREATE SECRET name (TYPE {kind}, {keys}, SCOPE '{}'))", root(u).unwrap_or_default())
 }
 
+/// A URL as a refusal names it: a lake's own file as `files/orders.csv`, never the lake's URL in front of it (a page
+/// names its files the same way).
+fn shown<'a>(lake: &Lake, u: &'a str) -> &'a str {
+    u.strip_prefix(&format!("{}/", lake.url.trim_end_matches('/'))).unwrap_or(u)
+}
+
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
-    let version = |k: &str| spec.options.get(k).map(|v| v.parse::<i64>().with_context(|| format!("{k} is a number, not {v}"))).transpose();
     match spec.format.as_str() {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
         "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
-                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, version("version")?).await?), None), // (a folder named relatively: from where the node runs)
+                "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
                 _ => crate::read_iceberg::resolve(lake, &spec.urls[0], &spec.options).await?,
             };
             check_files(lake, &m, d.as_ref().map(|d| d.prefix.as_str())).await?;
@@ -351,7 +373,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     }
     let ctx = lake.session();
     let state = ctx.state();
-    let format = file_format(spec, &state)?;
+    file_format(spec, &state)?; // (a format or an option no file is read by is refused before anything is registered)
     // Columns declared (`columns => {'id': 'BIGINT', …}`, CREATE EXTERNAL TABLE's): the table's.
     let declared = match spec.options.get("columns") {
         Some(c) => Some(crate::write::declared(c).await?),
@@ -366,30 +388,8 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     for u in &spec.urls {
         register(lake, u).await?;
     }
-    let found = listed(&state, spec, |u| declared.is_none().then(|| anyhow!("no files at {u}"))).await?; // (declared: none yet is an empty table)
-    let named = |fields: &[datafusion::arrow::datatypes::FieldRef]| -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() };
-    if found.is_empty() {
-        let columns = [named(declared.as_deref().unwrap_or_default()), named(&hive_types)].concat();
-        return Ok(TableMeta { columns, ext: Some(spec.clone()), ..Default::default() });
-    }
-    // CSV's declared columns are its columns by position, JSON's by name: the readers take them as
-    // they are. Parquet's files say their own (for their statistics), read by name as declared.
-    let schema = match (&declared, spec.format.as_str()) {
-        (Some(d), "csv" | "json") => Arc::new(datafusion::arrow::datatypes::Schema::new(d.clone())),
-        _ => schema_of(&state, spec, &found).await?,
-    };
-    let mut columns: Vec<(String, String)> = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
-    // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
-    let as_stored: Vec<String> = match &declared {
-        Some(d) => d.iter().filter(|f| schema.field_with_name(f.name()).is_ok_and(|g| g.data_type() == f.data_type())).map(|f| f.name().clone()).collect(),
-        None => schema.fields().iter().map(|f| f.name().clone()).collect(),
-    };
-    let missing = declared.is_some() && spec.format == "parquet" && columns.iter().any(|(c, _)| schema.field_with_name(c).is_err());
-    // Hive-style folders (`day=2026-09-28/`): each a column, the keys and types worked out by `keys`.
-    let keys = crate::ext_names::keys(&found, spec, &hive_types, &columns)?;
-    columns.extend(keys.iter().cloned());
-    let hived = !keys.is_empty();
-    let files = data_files(&state, &format, &schema, found, hived, &as_stored, missing).await?; // (the listing's files, as a page reads them too)
+    let undeclared = declared.is_none();
+    let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
     Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
 }
 
@@ -397,7 +397,8 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
 /// format): each one's full URL and its listing (its e-tag, size and time), sorted by name. Checked
 /// as a table's files are: a path of this machine only for the program that started the node.
 pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
-    check(lake, spec).await?;
+    let spec = for_caller(lake, spec.clone())?;
+    check(lake, &spec).await?;
     let u = &spec.urls[0];
     register(lake, u).await?;
     let state = lake.session().state();
@@ -1535,5 +1536,77 @@ mod tests {
         assert!(!within("http://127.0.0.1:9790/x.csv", "http://127.0.0.1:979"), "another port");
         assert!(!within("s3://data-other/x", "s3://data") && !within("https://prod.example.com.evil.net/", "https://prod.example.com"), "another bucket, another host");
         assert!(!within("s3://data/ab/x", "s3://data/a"), "another folder");
+    }
+
+    #[test]
+    fn a_name_that_leaves_its_folder_is_any_form_of_dot_dot() {
+        for name in ["../t", "d/../t", ".%2e/t", "%2E%2E/t", "d\\..\\t", "d/./t"] {
+            assert!(crate::lake_files::leaves(name), "{name}");
+        }
+        for name in ["a/b.csv", "d/**/*.parquet", "x..y.csv"] {
+            assert!(!crate::lake_files::leaves(name), "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn own_file_takes_no_escaped_dot_dot() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-own-file-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let files = format!("{}/files", lake.url.trim_end_matches('/'));
+        assert!(own_file(&lake, &format!("{files}/orders.csv")));
+        assert!(!own_file(&lake, &format!("{files}/%2E%2E/catalog")), "an escaped .. reaches past files/");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// One statement as `pondra sql` runs it (`cli.rs`), for a caller that is the program that started the node or not:
+    /// its rows, or its error.
+    async fn run(lake: &Lake, owner: bool, sql: &str) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+        let expanded = crate::routines::expand(lake, sql).await?;
+        let planned = crate::sys::planned(&expanded)?;
+        scope(owner, async {
+            anyhow::Ok(crate::query::session(lake, &expanded, "").await?.enable_url_table().sql(&planned).await?.collect().await?)
+        })
+        .await
+    }
+
+    /// The one integer a query answers (`SELECT sum(…) AS …`).
+    fn one_int(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
+        let column = batches[0].column(0);
+        column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("an integer").value(0)
+    }
+
+    /// A client over the network reads a relative name as a page reads it: a file of the lake's own, as `PUT /files/…`
+    /// wrote it. The program that started the node reads its own folder, so the same name is not the lake's file for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relative_name_is_the_lakes_file_for_a_client_and_the_owners_folder_for_its_program() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-relative-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        lake.put("files/orders.csv", b"id,qty\n1,2\n2,5\n".to_vec()).await?;
+        for sql in ["SELECT sum(qty) AS q FROM 'orders.csv'", "SELECT sum(qty) AS q FROM './orders.csv'"] {
+            assert_eq!(one_int(&run(&lake, false, sql).await?), 7, "{sql}");
+        }
+        let mine = format!("{}.csv", uuid::Uuid::new_v4());
+        lake.put(&format!("files/{mine}"), b"id,qty\n9,9\n".to_vec()).await?;
+        let err = run(&lake, true, &format!("SELECT * FROM '{mine}'")).await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42P01", "the owner reads its own folder, not the lake's files");
+
+        let err = run(&lake, false, "SELECT * FROM read_csv('/etc/hostname')").await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42501", "a path on the server's disk");
+        let err = run(&lake, false, "SELECT * FROM '../x.csv'").await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "0A000", "a name that leaves files/");
+        let escaped = format!("{}/files/%2E%2E/x.csv", lake.url);
+        let err = run(&lake, false, &format!("SELECT * FROM '{escaped}'")).await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42501", "an escaped .. in a whole path");
+
+        let err = run(&lake, false, "SELECT * FROM 'missing.csv'").await.unwrap_err();
+        let said = crate::codes::words(&err);
+        assert_eq!(crate::codes::of(&err), "42P01");
+        assert!(said.contains("files/missing.csv") && !said.contains(&lake.url), "{said}");
+
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

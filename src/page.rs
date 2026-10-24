@@ -133,6 +133,7 @@ pub struct Page {
     keeping: futures::lock::Mutex<()>,
     node: Option<Node>,
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
+    unread: Vec<(String, String)>, // (the kept files `kept` couldn't read, each as its path and the words of why)
 }
 
 /// What a write to a page table found there, for `undo` to put back: the table and its rows, partition by partition.
@@ -208,14 +209,23 @@ impl Page {
     /// A page over `options`'s store, with the files and tables it kept: `open`, then every object the store lists under
     /// `tables/` that ends `.arrow` is read back as a table of the page's default schema (`restore`). A kept table has its
     /// rows, its columns and its column defaults again. Its tables stay in memory while the page runs; its files are read
-    /// from the store as they are asked for. With no store given nothing is listed, so the page is `open`'s.
+    /// from the store as they are asked for. With no store given nothing is listed, so the page is `open`'s. A kept file
+    /// that doesn't read is left out and listed by `unread`, so the page still opens with the tables it can read.
     pub async fn kept(options: &Options) -> anyhow::Result<Page> {
-        let page = Page::open(options);
+        let mut page = Page::open(options);
         let listed = page.files.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await?;
         for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".arrow")) {
-            page.restore(&object.location).await?;
+            if let Err(e) = page.restore(&object.location).await {
+                page.unread.push((object.location.to_string(), crate::codes::words(&e)));
+            }
         }
         Ok(page)
+    }
+
+    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is; a table
+    /// written later under that name replaces it.
+    pub fn unread(&self) -> &[(String, String)] {
+        &self.unread
     }
 
     /// A page with no tables, its session a node's (`engine::session`) with the partitions asked for. Its files are the
@@ -240,14 +250,15 @@ impl Page {
             .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
             .build_arc()
             .expect("a runtime");
-        let ctx = crate::engine::session(config, runtime);
+        // (added last: a plan's partitions run in the page's own task, as there is no runtime to spawn them on)
+        let ctx = crate::in_task::planned(crate::engine::session(config, runtime));
         let files: Arc<dyn ObjectStore> = match &options.store {
             Some(store) => store.clone(),
             None => Arc::new(InMemory::new()),
         };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![] }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -580,10 +591,10 @@ impl Page {
     }
 
     /// Reads the kept table at `at` back into the page, as a table of its default schema. A file that doesn't read, or
-    /// that is not a kept table, fails with its path in the error.
+    /// that is not a kept table, fails with the words of why and no path: `kept` lists the file by its path beside them.
     async fn restore(&self, at: &Path) -> anyhow::Result<()> {
         let file = self.files.get(at).await?.bytes().await?;
-        let (name, table) = self.table_from_file(file).map_err(|e| anyhow::anyhow!("{at}: {e:#}"))?;
+        let (name, table) = self.table_from_file(file)?;
         let (_, page) = self.default_schema()?;
         register_page_table(page.as_ref(), name, Arc::new(table))?;
         Ok(())
@@ -655,7 +666,9 @@ impl Page {
         if !["parquet", "csv", "json", "arrow", "delta"].contains(&spec.format.as_str()) {
             return Err(crate::codes::coded("0A000", format!("a page reads Parquet, CSV, JSON and Arrow files and Delta tables, not {} tables", spec.format)));
         }
-        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version");
+        // (the declared types of the formats whose files they type: a node's `columns` and `hive_types`, as a node reads them)
+        let declares = ["csv", "json", "parquet"].contains(&spec.format.as_str());
+        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version") || (declares && (k == "columns" || k == "hive_types"));
         if let Some(k) = spec.options.keys().find(|k| !takes(k)) {
             return Err(crate::codes::coded("0A000", format!("a page doesn't take {k} yet")));
         }
@@ -668,18 +681,30 @@ impl Page {
         if spec.format == "delta" {
             return self.delta(overlay, name, &given).await;
         }
-        let found = crate::ext_names::listed(&state, &given, |u| Some(crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))).await?;
-        let files = crate::ext_names::schema_of(&state, &given, &found).await?;
-        let columns: Vec<(String, String)> = files.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
-        let keys = crate::ext_names::keys(&found, &given, &[], &columns)?;
-        let schema = crate::answer::schema(&[columns, keys.clone()].concat())?;
-        // (the files as a node lists and reads them: a Parquet footer's rows and ranges for the planner, every column kept)
-        let stored: Vec<String> = files.fields().iter().map(|f| f.name().clone()).collect();
-        let format = crate::ext_names::file_format(&given, &state)?;
-        let data = crate::ext_names::data_files(&state, &format, &files, found, !keys.is_empty(), &stored, false).await?;
+        // The declared types are read in a copy of the page's session, so their dialect is the page's, as a node's is its
+        // own. (Its scratch table needs the default catalog, which the page's own session registers itself.)
+        let session = || SessionContext::new_with_config(self.ctx.copied_config().with_create_default_catalog_and_schema(true));
+        let declared = match given.options.get("columns") {
+            Some(c) => Some(crate::ext_names::declared(session(), c).await?),
+            None => None,
+        };
+        let hive_types = match given.options.get("hive_types") {
+            Some(c) => crate::ext_names::declared(session(), c).await?,
+            None => vec![],
+        };
+        let undeclared = declared.is_none();
+        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, |u| {
+            undeclared.then(|| crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))
+        })
+        .await?;
+        let schema = crate::answer::schema(&columns)?;
         let refs: Vec<_> = data.iter().collect();
-        let df = crate::ext_names::read(&self.ctx, &refs, &schema, &given).await?;
-        overlay.own(name.to_string(), df.into_view()); // (a name is one table: the statement's own map)
+        let table: Arc<dyn TableProvider> = if refs.is_empty() {
+            Arc::new(MemTable::try_new(schema, vec![vec![]])?) // (columns declared and no file put yet: an empty table with them, as a node answers)
+        } else {
+            crate::ext_names::read(&self.ctx, &refs, &schema, &given).await?.into_view()
+        };
+        overlay.own(name.to_string(), table); // (a name is one table: the statement's own map)
         Ok(())
     }
 
@@ -727,7 +752,7 @@ impl Page {
     /// A Delta table (`read_delta`) at the version asked, or its latest: read from its log as a node reads it
     /// (`read_delta::resolve`, over this page's own `Reach`), its columns as SQL names them (`delta_table`).
     async fn delta(&self, overlay: &Overlay, name: &str, given: &crate::ext_names::Spec) -> anyhow::Result<()> {
-        let version = given.options.get("version").map(|v| v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))).transpose()?;
+        let version = crate::ext_names::version(given)?;
         let found = crate::read_delta::resolve(&PageReach(self), given.urls[0].trim_end_matches('/'), version).await?;
         overlay.own(name.to_string(), delta_table(&self.ctx, found).await?);
         Ok(())
@@ -806,18 +831,20 @@ impl Page {
 
 /// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
 /// (`http://`, `https://`) as written (`reached` finds its origin's store), a relative path (`'x.csv'`, `'./d/*.parquet'`)
-/// in the working folder (`under_files`), and any other URL refused by name: a page reads the files it was given and the web.
-/// A `mem:` name that leaves `files/` (`..`, `%2E%2E`) is refused too: the page's kept tables are not SQL's to read.
+/// in the working folder (`lake_files::relative`, as a node reads a client's), and any other URL refused by name: a page
+/// reads the files it was given and the web. A `mem:` name that leaves `files/` (`..`, `%2E%2E`) is refused too: the
+/// page's kept tables are not SQL's to read.
 fn located(url: &str) -> anyhow::Result<String> {
     if is_web(url) {
         return Ok(url.to_string());
     }
     let made = if url.starts_with(WORKING) {
         url.to_string()
-    } else if url.contains("://") {
-        return Err(files_or_web(url));
     } else {
-        format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))?)
+        match crate::lake_files::relative("mem:///", url) {
+            Some(r) => r?,
+            None => return Err(files_or_web(url)), // (a URL with a scheme, or an absolute path: a page has no disk)
+        }
     };
     // (`Url::parse` takes `..` out of a path, so the name is judged once parsed: `mem:///files/../tables/t` is `/tables/t`)
     if !url::Url::parse(&made)?.path().starts_with(FILES) {
@@ -1004,19 +1031,13 @@ impl crate::reach::Reach for PageReach<'_> {
 /// read under its physical name and renamed to its SQL name. A table with no files is empty, with its columns, as a
 /// node reads one.
 async fn delta_table(ctx: &SessionContext, found: crate::read_delta::Found) -> anyhow::Result<Arc<dyn TableProvider>> {
-    use datafusion::prelude::ident;
     if found.files.is_empty() {
         let columns: Vec<(String, String)> = found.columns.iter().map(|(c, t)| (found.names.get(c).unwrap_or(c).clone(), t.clone())).collect();
         return Ok(Arc::new(MemTable::try_new(crate::answer::schema(&columns)?, vec![vec![]])?));
     }
     let files: Vec<&crate::data_file::DataFile> = found.files.iter().collect();
     let df = crate::scan::read(ctx, &files, &crate::answer::schema(&found.columns)?, None).await?;
-    let select = found.columns.iter().map(|(c, _)| {
-        let name = found.names.get(c).map_or(c.as_str(), String::as_str);
-        // (a column named as it is is not aliased to itself: `query.rs` says why)
-        if name == c { ident(c) } else { ident(c).alias(name) }
-    }).collect::<Vec<_>>();
-    Ok(df.select(select)?.into_view())
+    Ok(crate::answer::renamed(df, |c| found.names.get(c).map_or(c, String::as_str).to_string(), |_| true)?.into_view())
 }
 
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for
@@ -2003,7 +2024,6 @@ mod tests {
         let refused = [
             ("SELECT * FROM 'nope.csv'", "42P01"),
             ("SELECT * FROM 'https://example.com/x.csv'", "0A000"),
-            ("SELECT * FROM read_csv('orders.csv', columns => {'id': 'INT'})", "0A000"),
             ("SELECT * FROM 'nope.csv' JOIN 'orders.csv' ON true", "42P01"),
         ];
         for (sql, code) in refused {
@@ -2013,6 +2033,40 @@ mod tests {
         }
         let got = page.request("POST", "/sql?format=csv", &[], "FROM 'orders.csv'".into()).await;
         assert_eq!(got.body, rendered(&page, "SELECT * FROM orders", Some("csv")).await);
+    }
+
+    /// `columns =>` is read as a node reads it: the CSV's columns by position, each typed as declared (`qty` an `INT`,
+    /// so an `Int32`), and the rows are the file's.
+    #[tokio::test]
+    async fn read_csv_takes_declared_columns() {
+        let page = page_with_tables().await;
+        let read = "read_csv('orders.csv', columns => {'id': 'BIGINT', 'name': 'VARCHAR', 'qty': 'INT'}, header => true)";
+        let typed = page.request("POST", "/sql?format=csv", &[], format!("SELECT arrow_typeof(qty) AS t FROM {read} LIMIT 1").into()).await;
+        assert_eq!(typed.status, 200, "{}", String::from_utf8_lossy(&typed.body));
+        assert_eq!(typed.body, "t\nInt32\n");
+        let rows = page.request("POST", "/sql?format=csv", &[], format!("SELECT * FROM {read}").into()).await;
+        assert_eq!(rows.body, "id,name,qty\n1,a,5\n2,b,7\n3,c,9\n");
+    }
+
+    /// `hive_types =>` types a folder's key as declared: `sales/day=…/a.csv` has `day` a `Date32`, and a row of that day.
+    #[tokio::test]
+    async fn a_folder_key_takes_its_declared_type() {
+        let page = Page::open(&Options::default());
+        assert_eq!(put(&page, "sales/day=2026-09-28/a.csv", "id,qty\n1,5\n").await.status, 200);
+        let read = "read_csv('sales/**/*.csv', hive_types => {'day': 'DATE'})";
+        let typed = page.request("POST", "/sql?format=csv", &[], format!("SELECT arrow_typeof(day) AS t FROM {read} LIMIT 1").into()).await;
+        assert_eq!(typed.body, "t\nDate32\n");
+        let on_day = page.request("POST", "/sql?format=csv", &[], format!("SELECT count(*) AS n FROM {read} WHERE day = DATE '2026-09-28'").into()).await;
+        assert_eq!(on_day.body, "n\n1\n");
+    }
+
+    /// Declared columns with no file put are an empty table with those columns, as a node answers, not a 42P01.
+    #[tokio::test]
+    async fn declared_columns_with_no_file_are_an_empty_table() {
+        let page = Page::open(&Options::default());
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT * FROM read_csv('none/*.csv', columns => {'id': 'INT'})".into()).await;
+        assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+        assert_eq!(got.body, "id\n");
     }
 
     /// Requests on threads at once, each naming one file: none takes another's table of its name, so every one answers
@@ -2033,6 +2087,54 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A page with `u` (rows 1 and 2) and the files `a.parquet` and `b.parquet`, each holding the rows of `u`.
+    async fn union_page() -> Page {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE u (x INT)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO u VALUES (1), (2)".into()).await.status, 200);
+        let parquet = page.request("POST", "/sql?format=parquet", &[], "SELECT x FROM u".into()).await.body;
+        for name in ["a.parquet", "b.parquet"] {
+            assert_eq!(put(&page, name, parquet.clone()).await.status, 200);
+        }
+        page
+    }
+
+    /// The CSV `sql` answers on `page`, which must answer it.
+    async fn csv_of(page: &Page, sql: &str) -> String {
+        let got = page.request("POST", "/sql?format=csv", &[], sql.to_string().into()).await;
+        assert_eq!(got.status, 200, "{sql}: {}", String::from_utf8_lossy(&got.body));
+        String::from_utf8(got.body.to_vec()).unwrap()
+    }
+
+    /// A plan's partitions run in the page's own task (`in_task`). A union under an aggregate, a root of two partitions,
+    /// a scalar subquery of two and a table made from two would each start a task per partition, and a page has no
+    /// runtime to start one on: it panics, and takes every table of the page with it. Each of them answers here.
+    #[test]
+    fn a_union_runs_in_the_page_task() {
+        futures::executor::block_on(async {
+            let page = union_page().await;
+            let two = "(SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0)"; // (the filters keep a count from the tables' row counts)
+            assert_eq!(csv_of(&page, &format!("SELECT sum(x) AS s FROM {two}")).await, "s\n6\n");
+            assert_eq!(csv_of(&page, "SELECT x FROM u UNION ALL SELECT x + 10 FROM u ORDER BY x").await, "x\n1\n2\n11\n12\n");
+            let root = csv_of(&page, "SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0").await;
+            let mut lines: Vec<&str> = root.lines().collect();
+            lines.sort_unstable(); // (the rows come in any order: the header and four rows)
+            assert_eq!(lines, ["1", "1", "2", "2", "x"], "{root}");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM (SELECT x FROM {two} LIMIT 3)")).await, "n\n3\n");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM u JOIN {two} v ON u.x = v.x")).await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u JOIN (SELECT x FROM 'a.parquet' UNION ALL SELECT x FROM 'b.parquet') v ON u.x = v.x").await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT (SELECT x FROM u WHERE x = 1 UNION ALL SELECT x FROM u WHERE x > 5) AS v").await, "v\n1\n");
+            let made = "CREATE TABLE w AS SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0";
+            assert_eq!(page.request("POST", "/sql", &[], made.into()).await.status, 200);
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM w").await, "n\n4\n");
+            for (name, body) in [("s/year=2024/a.csv", "item,amount\npie,4\n"), ("s/year=2025/b.csv", "item,amount\npie,6\ntea,3\n")] {
+                assert_eq!(put(&page, name, body).await.status, 200);
+            }
+            assert_eq!(csv_of(&page, "SELECT year, sum(amount) AS a FROM 's/**/*.csv' GROUP BY year ORDER BY year").await, "year,a\n2024,4\n2025,9\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u").await, "n\n2\n");
+        });
     }
 
     #[tokio::test]
@@ -2106,6 +2208,17 @@ mod tests {
         let body = std::str::from_utf8(&got.body).unwrap();
         assert_eq!(got.header("x-pondra-sqlstate"), Some("42P01"));
         assert!(body.contains("no file nope.csv was given to this page") && !body.contains("mem:///"), "{body}");
+    }
+
+    /// A page has no disk, so a name that starts at the disk's root is refused by name (0A000), as a URL with a scheme is:
+    /// it is not read as the page's own file of that name.
+    #[tokio::test]
+    async fn a_page_refuses_an_absolute_name() {
+        let page = Page::open(&Options::default());
+        for sql in ["SELECT * FROM '/x.csv'", "SELECT * FROM 'C:/x.csv'"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
+        }
     }
 
     #[tokio::test]
@@ -2517,6 +2630,23 @@ mod tests {
         let mut kept: Vec<String> = store.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await.unwrap().iter().map(|o| o.location.to_string()).collect();
         kept.sort();
         assert_eq!(kept, ["tables/My Table.arrow", "tables/a%2Fb%3F.arrow"]);
+    }
+
+    /// A kept file that doesn't read is left out, not fatal: a page kept over a store with one good table and one bad file
+    /// still opens, the good table answers its rows, and `unread` names the bad file.
+    #[tokio::test]
+    async fn a_kept_page_opens_past_a_file_it_cannot_read() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
+        assert_eq!(a.request("POST", "/sql", &[], "INSERT INTO t VALUES (2)".into()).await.status, 200);
+        store.put(&Path::from("tables/bad.arrow"), bytes::Bytes::from_static(b"not arrow").into()).await.unwrap();
+        let b = Page::kept(&options).await.unwrap();
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "SELECT id FROM t ORDER BY id".into()).await.body, "id\n1\n2\n");
+        let unread = b.unread();
+        assert_eq!(unread.len(), 1, "{unread:?}");
+        assert!(unread[0].0.ends_with("tables/bad.arrow"), "{unread:?}");
     }
 
     /// A page with no store keeps nothing: a page kept over no store is an empty page, as `open` makes one, and a table

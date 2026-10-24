@@ -17,7 +17,7 @@ use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{create_udf, SessionConfig, SessionContext};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -375,8 +375,9 @@ pub async fn collect(df: datafusion::dataframe::DataFrame) -> anyhow::Result<Vec
 
 /// `EXPLAIN ANALYZE` run in this task. DataFusion's `AnalyzeExec` runs each input partition on a tokio task, and a
 /// page has no tokio runtime to spawn one on: it panics there and takes every table of the page with it. So the
-/// input runs here, one partition after another, and the answer is built as DataFusion builds it. Its names and
-/// estimates are made readable by `explain::answered`, on a node and a page alike.
+/// input's partitions run here, all at once (`in_task::stream`: a hash join's probe partitions wait for each other),
+/// and the answer is built as DataFusion builds it. Its names and estimates are made readable by `explain::answered`,
+/// on a node and a page alike.
 async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType>) -> anyhow::Result<Vec<RecordBatch>> {
     let task = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
@@ -386,11 +387,9 @@ async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType
     let input = exec.input().clone();
     let start = Instant::now();
     let mut rows = 0;
-    for partition in 0..input.output_partitioning().partition_count() {
-        let mut stream = input.execute(partition, task.clone())?;
-        while let Some(batch) = stream.next().await.transpose()? {
-            rows += batch.num_rows();
-        }
+    let mut stream = crate::in_task::stream(input, task.clone())?;
+    while let Some(batch) = stream.next().await.transpose()? {
+        rows += batch.num_rows();
     }
     let duration = Instant::now() - start;
     // (The planner works the metric types out from the statement's level or the session's; `AnalyzeExec` keeps

@@ -340,12 +340,21 @@ async function openPage() {
   }
 }
 
+// A kept table the page couldn't read is left as it is, and the note says which, so it is not gone without a word.
+function noteUnread() {
+  const unread = page.unread();
+  if (unread.length === 0) return;
+  els.note.textContent = `Kept tables that couldn't be read were left as they are: ${unread.map((u) => `${u.file} (${u.why})`).join('; ')}.`;
+  els.note.hidden = false;
+}
+
 // Starts the module and the page, then lists its tables. `window.ready` says it is ready; a failure says why in
 // `window.startError`, which the check waits on, and in the status line.
 async function start() {
   try {
     await init();
     page = await openPage();
+    noteUnread();
     await listTables();
     window.ready = true;
   } catch (e) {

@@ -32,6 +32,12 @@ fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to
 
 pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
 
+/// The `version` option as a number: the Delta version a read asks for, or None for its latest. Refused by name when it
+/// is not a number, so a node and a page say the same words.
+pub fn version(spec: &Spec) -> Result<Option<i64>> {
+    spec.options.get("version").map(|v| v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))).transpose()
+}
+
 /// Text (an error, a plan) with each table of files named as SQL named it: `'s3://…'`, or
 /// `read_csv('…', delim => ';')`, not its internal name.
 pub fn readable(text: &str) -> String {
@@ -554,6 +560,49 @@ pub async fn data_files(state: &SessionState, format: &Arc<dyn FileFormat>, sche
         }
     }).collect();
     futures::stream::iter(stats).buffered(32).try_collect().await
+}
+
+/// Columns as SQL declares them (`"id" BIGINT, "name" VARCHAR`): their Arrow fields, as DataFusion types them. The
+/// session is the caller's, and its dialect is the one the columns are read in: a node's (`write::declared`), or a
+/// page's own.
+pub async fn declared(ctx: SessionContext, cols: &str) -> Result<Vec<FieldRef>> {
+    ctx.sql(&format!("CREATE TABLE t ({cols})")).await.with_context(|| format!("the columns ({cols})"))?;
+    Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
+}
+
+/// A table's columns as `(name, type)`, the types as `answer::type_name` writes them.
+fn named(fields: &[FieldRef]) -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() }
+
+/// A table of files, from the spec's listing to its files' footers: its columns (the Hive folders' keys too) and its
+/// data files. A node's `resolve` and a page's `register` both call it, so the same files are read the same way on
+/// either. Declared columns are the table's: CSV and JSON read their files by them (by position, and by name), Parquet
+/// by name. With no file yet, declared columns make an empty table; without them, `none` says what no file is (and
+/// gives None when columns are declared, as the caller's words for it).
+pub async fn files_table(state: &SessionState, spec: &Spec, declared: Option<Vec<FieldRef>>, hive_types: &[FieldRef], none: impl Fn(&str) -> Option<anyhow::Error>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
+    let found = listed(state, spec, &none).await?; // (declared: none yet is an empty table)
+    if found.is_empty() {
+        return Ok(([named(declared.as_deref().unwrap_or_default()), named(hive_types)].concat(), vec![]));
+    }
+    // CSV's declared columns are its columns by position, JSON's by name: the readers take them as
+    // they are. Parquet's files say their own (for their statistics), read by name as declared.
+    let schema = match (&declared, spec.format.as_str()) {
+        (Some(d), "csv" | "json") => Arc::new(Schema::new(d.clone())),
+        _ => schema_of(state, spec, &found).await?,
+    };
+    let mut columns = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
+    // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
+    let as_stored: Vec<String> = match &declared {
+        Some(d) => d.iter().filter(|f| schema.field_with_name(f.name()).is_ok_and(|g| g.data_type() == f.data_type())).map(|f| f.name().clone()).collect(),
+        None => schema.fields().iter().map(|f| f.name().clone()).collect(),
+    };
+    let missing = declared.is_some() && spec.format == "parquet" && columns.iter().any(|(c, _)| schema.field_with_name(c).is_err());
+    // Hive-style folders (`day=2026-09-28/`): each a column, the keys and types worked out by `keys`.
+    let keys = keys(&found, spec, hive_types, &columns)?;
+    columns.extend(keys.iter().cloned());
+    let hived = !keys.is_empty();
+    let format = file_format(spec, state)?;
+    let files = data_files(state, &format, &schema, found, hived, &as_stored, missing).await?; // (the listing's files, as a page reads them too)
+    Ok((columns, files))
 }
 
 /// The rows of `files` of a spec, as `schema`: Parquet by `scan::read` (the footers' rows and ranges, the folders'
