@@ -8,16 +8,18 @@ use crate::front::Host;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
 use anyhow::Context;
 use async_trait::async_trait;
+use futures::TryFutureExt;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, Session, SchemaProvider, TableProvider};
 use datafusion::common::{Constraints, Statistics};
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::datasource::{MemTable, TableType};
+use datafusion::datasource::{source_as_provider, MemTable, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan};
+use datafusion::logical_expr::dml::{InsertOp, WriteOp};
+use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use serde_json::json;
@@ -49,8 +51,8 @@ impl Default for Options {
     }
 }
 
-/// A page: a session of its own, whose tables are the ones its SQL made, and whose files are the ones its caller put
-/// (in its memory, nowhere else).
+/// A page: a session of its own, whose tables are the ones its SQL makes and writes, and whose files are the ones its
+/// caller put (in its memory, nowhere else).
 pub struct Page {
     ctx: SessionContext,
     files: Arc<InMemory>, // (the lake's own files, `files/…`, as they were put: what `FROM 'x.csv'` reads)
@@ -159,15 +161,21 @@ impl Page {
     /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88). An
     /// EXPLAIN's rows are made readable as a node's are (`explain::answered`).
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
-        let batches = crate::engine::collect(self.plan(text).await?).await?;
+        let (frame, changed) = self.plan(text).await?;
+        let batches = crate::engine::collect(frame).await?;
+        if let Some(name) = changed {
+            self.written(&name).await?;
+        }
         let batches = if crate::explain::asked(text) { crate::explain::answered(batches)? } else { batches };
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
     /// A statement read as a node reads it: the front, ASOF JOIN's marker, then planned on the statement's own copy of
     /// the page's session (`statement`), with the files it names given to that copy alone (`given`). What a statement
-    /// makes (a table) is the page's; nothing else it registers reaches the page or another statement.
-    async fn plan(&self, text: &str) -> anyhow::Result<DataFrame> {
+    /// makes or changes (a table) is the page's; nothing else it registers reaches the page or another statement. The
+    /// name of the page table it changes, if any (`touched`), comes back with the frame: `sql` keeps that table after
+    /// the frame runs.
+    async fn plan(&self, text: &str) -> anyhow::Result<(DataFrame, Option<String>)> {
         let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
         // (a page keeps no table's past, so `AT (…)` is refused by name: left alone, it would fail as an unknown table "at:…")
         if crate::past_names::mentioned(&expanded) {
@@ -177,7 +185,25 @@ impl Page {
         let (ctx, overlay) = self.statement()?;
         crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
         self.given(&overlay, &expanded).await?;
-        crate::engine::sql_checked(&ctx, &expanded, may).await
+        // (a `Mutex`, not a `Cell`: this future must stay `Send`, and the guard is never held over an `.await`)
+        let changed = std::sync::Mutex::new(None);
+        let frame = crate::engine::sql_checked(&ctx, &expanded, |plan| {
+            may(plan)?;
+            *changed.lock().unwrap_or_else(PoisonError::into_inner) = touched(plan);
+            Ok(())
+        })
+        .await?;
+        Ok((frame, changed.into_inner().unwrap_or_else(PoisonError::into_inner)))
+    }
+
+    /// The page's table a statement changed is registered again once it has run, so the statistics `Counted` holds are
+    /// worked out afresh: a write leaves them out of date. A table the statement dropped has none to register.
+    async fn written(&self, name: &str) -> anyhow::Result<()> {
+        let (_, page) = self.default_schema()?;
+        let Some(table) = page.table(name).await? else { return Ok(()) };
+        page.deregister_table(name)?;
+        register_page_table(page.as_ref(), name.to_string(), inner(&table).clone())?;
+        Ok(())
     }
 
     /// The name of the page's default schema, and its provider: the tables a statement is planned over.
@@ -419,8 +445,7 @@ async fn delta_table(ctx: &SessionContext, found: crate::read_delta::Found) -> a
 /// A table's rows and bytes, as its batches hold them: a memory table's, which is what a page's tables are. None for
 /// another provider, whose size is not known here.
 async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
-    let table = table.downcast_ref::<Counted>().map_or(table, |c| &c.rows);
-    let memory = table.downcast_ref::<MemTable>()?;
+    let memory = inner(table).downcast_ref::<MemTable>()?;
     let mut sizes = (0, 0);
     for partition in &memory.batches {
         for batch in partition.read().await.iter() {
@@ -432,8 +457,8 @@ async fn sizes(table: &Arc<dyn TableProvider>) -> Option<(usize, usize)> {
 
 /// A page's table: its rows a `MemTable`, and what the join order needs to know of them, worked out the first time it
 /// asks (as `query::Pruned::stats` is). The rule asks only when three or more inputs are joined, so a table never joined
-/// so costs its load nothing. Nothing else is passed on: a page refuses DML (`may`), and a table changed under them would
-/// make the statistics stale.
+/// so costs its load nothing. A write (INSERT, UPDATE, DELETE) goes to the rows; the statistics it leaves stale are
+/// worked out again, because the table is registered again after the write (`written`).
 #[derive(Debug)]
 struct Counted {
     rows: Arc<dyn TableProvider>,
@@ -472,8 +497,20 @@ impl TableProvider for Counted {
         self.rows.scan(state, projection, filters, limit).await
     }
 
-    /// The statistics once worked out; else worked out now from the rows, if no write holds them (a page's tables are
-    /// only ever read, so the lock is free). Anything that fails answers None and keeps nothing.
+    async fn insert_into(&self, state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.insert_into(state, input, insert_op).await
+    }
+
+    async fn delete_from(&self, state: &dyn Session, filters: Vec<Expr>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.delete_from(state, filters).await
+    }
+
+    async fn update(&self, state: &dyn Session, assignments: Vec<(String, Expr)>, filters: Vec<Expr>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.rows.update(state, assignments, filters).await
+    }
+
+    /// The statistics once worked out; else worked out now from the rows, if no write holds them. A write may hold the
+    /// rows while it runs; then the answer is None, as it is for anything that fails, and nothing is kept.
     fn statistics(&self) -> Option<Statistics> {
         if let Some(known) = self.stats.get() {
             return Some(known.clone());
@@ -488,18 +525,60 @@ impl TableProvider for Counted {
 }
 
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
-/// NOT EXISTS`) and `DROP TABLE` are what it takes. `CREATE EXTERNAL TABLE` is refused by name: a native page has
-/// `file://` registered, so it would read its machine's disk. Every other DDL, and DML (INSERT, UPDATE, DELETE, COPY)
-/// and statements, is refused as a node's read-only SQL refuses it.
+/// NOT EXISTS`), `DROP TABLE`, and INSERT, UPDATE and DELETE into a page's own table are what it takes. `CREATE EXTERNAL
+/// TABLE` is refused by name: a native page has `file://` registered, so it would read its machine's disk. A write into
+/// anything else (a file, a view), COPY, and every other DDL and statement, is refused as a node's read-only SQL refuses
+/// it.
 fn may(plan: &LogicalPlan) -> anyhow::Result<()> {
     match plan {
         LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(_) | DdlStatement::DropTable(_)) => Ok(()),
         LogicalPlan::Ddl(ddl) => Err(crate::codes::coded("0A000", format!("a page doesn't take {} yet", ddl.name()))),
+        LogicalPlan::Dml(d) if writes_rows(&d.op) => own_table(&d.target),
+        // (EXPLAIN ANALYZE runs what it explains, so the statement it explains is judged, as if it were run)
+        LogicalPlan::Analyze(a) => may(&a.input),
         _ => {
             crate::engine::read_only().verify_plan(plan)?; // (no DDL is left here: a node's read-only SQL)
             Ok(())
         }
     }
+}
+
+/// Whether a DML statement writes rows: INSERT, UPDATE or DELETE, the three a page's own tables take.
+fn writes_rows(op: &WriteOp) -> bool {
+    matches!(op, WriteOp::Insert(_) | WriteOp::Update | WriteOp::Delete)
+}
+
+/// A write's target, when it is one of a page's own tables. Only a page's memory tables are `Counted`, so a file or a
+/// view, which is some other provider, is refused by name (its name is left out: a file's is SQL's internal one).
+fn own_table(target: &Arc<dyn TableSource>) -> anyhow::Result<()> {
+    match source_as_provider(target) {
+        Ok(table) if table.is::<Counted>() => Ok(()),
+        _ => Err(crate::codes::coded("0A000", "a page writes only its own tables")),
+    }
+}
+
+/// The name of the page table a plan makes, changes or drops, if it does: what `sql` registers again (`written`) once
+/// the plan has run. An EXPLAIN ANALYZE changes what it runs, so it is its input's.
+fn touched(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(c)) => Some(c.name.table().to_string()),
+        LogicalPlan::Ddl(DdlStatement::DropTable(d)) => Some(d.name.table().to_string()),
+        LogicalPlan::Dml(d) if writes_rows(&d.op) => Some(d.table_name.table().to_string()),
+        LogicalPlan::Analyze(a) => touched(&a.input),
+        _ => None,
+    }
+}
+
+/// `table` registered as one of a page's own tables: as `Counted`, so its statistics are worked out once and held.
+/// Both a table a statement makes and one `written` registers again go through here.
+fn register_page_table(page: &dyn SchemaProvider, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
+    page.register_table(name, Counted::over(table))
+}
+
+/// The table a page's table holds its rows in: a `Counted`'s memory table, or the table itself when it is another
+/// provider's. Every reader of a page table's rows goes through here, so the downcast is written once.
+fn inner(table: &Arc<dyn TableProvider>) -> &Arc<dyn TableProvider> {
+    table.downcast_ref::<Counted>().map_or(table, |c| &c.rows)
 }
 
 /// A statement's view of its page's default schema: the files the statement names (`own`), then the page's own tables.
@@ -535,7 +614,7 @@ impl SchemaProvider for Overlay {
     }
 
     fn register_table(&self, name: String, table: Arc<dyn TableProvider>) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
-        self.page.register_table(name, Counted::over(table))
+        register_page_table(self.page.as_ref(), name, table)
     }
 
     fn deregister_table(&self, name: &str) -> datafusion::common::Result<Option<Arc<dyn TableProvider>>> {
@@ -572,7 +651,8 @@ impl Host for PageHost<'_> {
     // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
     // compiler's check of that loop stops)
     fn ask(&self, sql: &str) -> impl Future<Output = anyhow::Result<DataFrame>> + Send {
-        self.0.plan(sql)
+        // (it only reads: the page table a statement would change is none of its business)
+        self.0.plan(sql).map_ok(|(frame, _)| frame)
     }
 }
 
@@ -750,13 +830,29 @@ mod tests {
         assert_eq!(got.body, want.body);
     }
 
+    /// A table made by SQL takes INSERT, UPDATE and DELETE, each answered with its count as a node answers it (`count`,
+    /// as `engine::collect` gives it). The rows they leave are the ones SELECT reads, and the statistics the table holds
+    /// say so: the write left them out of date, and the table was registered again (`written`).
     #[tokio::test]
-    async fn a_table_made_by_sql_takes_no_insert() {
+    async fn a_table_made_by_sql_takes_insert_update_and_delete() {
+        use datafusion::common::stats::Precision;
         let page = Page::open(&Options::default());
-        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (a INT)".into()).await.status, 200);
-        let insert = page.request("POST", "/sql", &[], "INSERT INTO t VALUES (1)".into()).await;
-        assert_eq!((insert.status, insert.header("x-pondra-sqlstate")), (501, Some("0A000")));
-        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n0\n");
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (id INT, name TEXT)".into()).await.status, 200);
+        let writes = [("INSERT INTO t VALUES (1, 'a'), (2, 'b')", 2), ("UPDATE t SET name = 'c' WHERE id = 2", 1), ("DELETE FROM t WHERE id = 1", 1)];
+        for (sql, count) in writes {
+            let got = page.request("POST", "/sql?format=csv", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (200, None), "{sql}");
+            assert_eq!(got.body, format!("count\n{count}\n"), "{sql}");
+        }
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT id, name FROM t".into()).await.body, "id,name\n2,c\n");
+        let (_, schema) = page.default_schema().unwrap();
+        let table = schema.table("t").await.unwrap().unwrap();
+        assert_eq!(table.statistics().unwrap().num_rows, Precision::Inexact(1));
+        // A file read by name is no table of the page's, so no table is written: the name finds none (42P01).
+        assert_eq!(put(&page, "x.csv", "a\n1\n").await.status, 200);
+        let into_file = page.request("POST", "/sql", &[], "INSERT INTO 'x.csv' VALUES (2)".into()).await;
+        assert_eq!(into_file.header("x-pondra-sqlstate"), Some("42P01"), "{:?}", into_file.body);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n1\n");
     }
 
     #[tokio::test]
