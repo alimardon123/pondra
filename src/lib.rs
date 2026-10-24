@@ -59,6 +59,7 @@ mod pg_oids;
 mod pg_casts;
 pub mod pg_bytea;
 mod optimize;
+mod held;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -67,6 +68,8 @@ mod scan;
 mod reach;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
 mod read_delta;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a write's rules: a node makes its table from its entry; a page's come with `shape`)
+mod rules;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).
 // Feature `server`, on by default; every module the node is made of is one of these.
@@ -88,7 +91,6 @@ mod read_delta;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
-#[cfg(feature = "server")] mod held;
 #[cfg(feature = "server")] mod hilbert;
 #[cfg(feature = "server")] mod history;
 #[cfg(feature = "server")] mod ddl;

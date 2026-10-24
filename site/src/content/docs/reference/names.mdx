@@ -61,9 +61,10 @@ Options come by name. The same option has each tool's spelling:
 | Types of the `k=v` folders' keys | `hive_types => {'day': 'DATE'}` | | |
 | CSV comment lines | `comment => '#'` | | |
 | CSV line ends | `new_line => '\r'` | | |
+| CSV columns all as text | `all_varchar => true` | `all_varchar=True` | |
 
 `columns` matches a CSV's columns by position, and JSON's and Parquet's by name. `hive_types` implies
-`hive_partitioning`. `new_line` is only needed for `\r` line ends. These four are DuckDB's names, given in SQL.
+`hive_partitioning`. `new_line` is only needed for `\r` line ends. These five are DuckDB's names, given in SQL.
 
 Writing takes `PARTITION_BY (col, …)`, `APPEND` or `OVERWRITE`, `HEADER`, `DELIMITER`,
 `COMPRESSION` and `ROW_GROUP_SIZE` in SQL, or DataFusion's `STORED AS`, `PARTITIONED BY` and `OPTIONS`

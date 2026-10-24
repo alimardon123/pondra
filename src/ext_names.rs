@@ -61,8 +61,9 @@ pub fn mentions(sql: &str) -> bool {
     FILES.is_match(sql)
 }
 
-/// The options `file_format` reads for CSV (DuckDB's names).
-pub(crate) const CSV_OPTIONS: &[&str] = &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line"];
+/// The options `file_format` reads for CSV (DuckDB's names). `all_varchar` reads every column as text, with no type
+/// inference (`file_format`).
+pub(crate) const CSV_OPTIONS: &[&str] = &["header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "all_varchar"];
 /// The options every listing of files takes, on a node.
 const LISTING_OPTIONS: &[&str] = &["hive_partitioning", "hive_types", "union_by_name", "columns"];
 
@@ -252,6 +253,9 @@ pub(crate) fn file_format(spec: &Spec, state: &dyn datafusion::catalog::Session)
         "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
         "csv" => {
             let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false"));
+            if o("all_varchar").is_some_and(|v| v != "false") {
+                f = f.with_schema_infer_max_rec(0); // (no inference: every column is text, as DuckDB's all_varchar reads it)
+            }
             if let Some(d) = o("delim").or(o("sep")).or(o("delimiter")) {
                 f = f.with_delimiter(byte("delim", d)?);
             }

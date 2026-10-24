@@ -149,7 +149,7 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
     };
     match batches {
         Ok(b) if b.iter().map(|b| b.num_rows()).sum::<usize>() == 1 => {
-            crate::query::strict(b[0].column(0), &crate::answer::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {e}"))
+            crate::query::strict(b[0].column(0), &crate::answer::dtype(sql_type)?).map(|_| ()).map_err(|e| anyhow::anyhow!("{column} DEFAULT {expr}: {}", crate::codes::words(&anyhow::Error::from(e))))
         }
         Ok(_) => bail!("{column} DEFAULT {expr}: a default is one value, not a query's rows (DEFAULT 0, DEFAULT now(), DEFAULT nextval('s'))"),
         Err(e) => bail!("{column} DEFAULT {expr}: {e} (a default is an expression of constants and built-in functions, such as now() or uuid())"),
