@@ -143,6 +143,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("can't cast value") || has("too large to store in a decimal") || int_overflow_text(&t) => "22003", // (Arrow's words for a number that doesn't fit: a value cast to a narrower integer, a decimal's precision, digits that overflow an integer)
+        _ if has("csv error") => "22P04", // bad_copy_file_format (a file read as CSV is malformed: Arrow's words, e.g. a line with more fields than the schema has)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
@@ -247,6 +248,7 @@ mod tests {
         assert_eq!(of("Cast error: Cannot cast string 'abc' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '1.5' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '4.4.5' to value of Decimal128(38, 10) type"), "22P02");
+        assert_eq!(of("Arrow error: Csv error: incorrect number of fields for line 1, expected 0 got more than 0"), "22P04"); // (a read_csv over a file of blank lines: a malformed file, not a 500)
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)
         assert_eq!(super::named("invalid_catalog_name"), Some("3D000"));

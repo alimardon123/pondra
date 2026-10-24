@@ -276,7 +276,7 @@ pub struct Entry {
 /// column the table lacks is refused by name; a table column the file lacks is NULL or its DEFAULT,
 /// as INSERT does it. Refused: a view, a keyed table, a table of another lake.
 ///
-/// A CSV file is read as `read_csv` reads it: a line `\.` is data, as DuckDB and Postgres 18 read a file (the end
+/// A CSV file is read as text (`all_varchar`): a line `\.` is data, as DuckDB and Postgres 18 read a file (the end
 /// marker is COPY FROM STDIN's); a blank line is no row (Postgres and DuckDB read one as a NULL in a one-column file);
 /// a file with no rows loads nothing. Such a file is listed in the answer with 0 rows, and nothing is recorded for it:
 /// each later run lists it again with 0 rows, FORCE changes nothing, and `pondra.loads` doesn't show it. A value that
@@ -390,8 +390,14 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
     Ok((shown, positional, pieces))
 }
 
-/// `SELECT * FROM read_csv('file', header => true)`: one file, read as a table's reader reads it.
+/// `SELECT * FROM read_csv('file', header => true)`: one file, read as a table's reader reads it. A CSV is read as text
+/// (`all_varchar`, no inference), as Postgres's COPY reads it: the insert casts each value to its column, and refuses
+/// one that won't go with Postgres's words (`casts::into`).
 fn reader_query(format: &str, file: &str, reader: &BTreeMap<String, String>) -> String {
+    let mut reader = reader.clone();
+    if format == "csv" {
+        reader.insert("all_varchar".into(), "true".into());
+    }
     let args: String = reader.iter().map(|(k, v)| {
         let v = if v == "true" || v == "false" || v.parse::<f64>().is_ok() { v.clone() } else { format!("'{}'", v.replace('\'', "''")) };
         format!(", {k} => {v}")

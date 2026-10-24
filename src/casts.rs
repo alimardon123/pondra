@@ -97,9 +97,9 @@ fn refused(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
 }
 
 /// The refusal of text `c` that won't cast to `t`, by its first value the safe cast turns to NULL, as Postgres reads it:
-/// a text that overflows an integer type is 22003 with its value; a plain number that a decimal can't hold is 22003 (its
-/// size refused it: 99.95 rounds to 100.0 in a numeric(3, 1)); other text is 22P02 with the type's name, and Arrow's
-/// words when the type has no name here.
+/// a text that overflows an integer type is 22003 with its value; a number that a decimal can't hold is 22003 (its size
+/// refused it: 99.95 rounds to 100.0 in a numeric(3, 1); 1e5 and inf are numbers too, as Rust reads them); other text is
+/// 22P02 with the type's name, and Arrow's words when the type has no name here.
 fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     let plain = || external(e.to_string(), "22P02");
     let Ok(texts) = cast(c, &DataType::Utf8) else { return plain() };
@@ -117,7 +117,7 @@ fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     if let Some(name) = range {
         return external(format!("value \"{text}\" is out of range for type {name}"), "22003");
     }
-    if t.is_decimal() && whole_digits(text).is_some() {
+    if t.is_decimal() && text.trim().parse::<f64>().is_ok() { // (a number Rust reads that a decimal can't hold: Postgres's numeric input reads 1e5 and Infinity too)
         return external("numeric field overflow", "22003");
     }
     match pg_name(t) {
@@ -162,15 +162,6 @@ fn pg_name(t: &DataType) -> Option<&'static str> {
 fn overflows<T: std::str::FromStr<Err = std::num::ParseIntError>>(text: &str) -> bool {
     use std::num::IntErrorKind::{NegOverflow, PosOverflow};
     matches!(text.trim().parse::<T>(), Err(e) if matches!(e.kind(), PosOverflow | NegOverflow))
-}
-
-/// The digits before the point of `text`, a plain decimal number's (leading zeros not counted), or None when it isn't one.
-fn whole_digits(text: &str) -> Option<usize> {
-    let t = text.trim();
-    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
-    let digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
-    (whole.len() + frac.len() > 0 && digits(whole) && digits(frac)).then(|| whole.trim_start_matches('0').len())
 }
 
 /// `whole`'s type for values of type `t`.
@@ -453,6 +444,12 @@ mod tests {
         assert_eq!(refusal(&dec, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
         let rounded: ArrayRef = Arc::new(StringArray::from(vec![Some("99.95")]));
         assert_eq!(refusal(&rounded, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()), "99.95 rounds to 100.0");
+        for number in ["1e5", "inf", " -1E9 "] {
+            let c: ArrayRef = Arc::new(StringArray::from(vec![Some(number)]));
+            assert_eq!(refusal(&c, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()), "{number}: a number Rust reads");
+        }
+        let junk: ArrayRef = Arc::new(StringArray::from(vec![Some("12abc")]));
+        assert_eq!(refusal(&junk, &DataType::Decimal128(3, 1)).0, "22P02", "text that Rust doesn't read as a number is 22P02");
         let word: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
         assert_eq!(refusal(&word, &DataType::Decimal128(3, 1)), ("22P02", "invalid input syntax for type numeric: \"abc\"".to_string()));
         assert_eq!(refusal(&word, &DataType::Date32), ("22P02", "invalid input syntax for type date: \"abc\"".to_string()));
