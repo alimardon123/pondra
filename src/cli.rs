@@ -525,7 +525,7 @@ async fn run() -> anyhow::Result<()> {
             // starts again, so the selects below poll this one alone)
             let mut stop = Box::pin(stopped(stop_with_stdin));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
-            let mut options = node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth };
+            let mut options = node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth, guest: None };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
                 let mut node = tokio::select! {

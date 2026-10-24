@@ -292,6 +292,12 @@ impl Auth {
         auth
     }
 
+    /// The three tokens as the environment gives them (`PONDRA_READ_TOKEN`, `PONDRA_WRITE_TOKEN`, `PONDRA_ADMIN_TOKEN`): what
+    /// a library's node and a guest take.
+    pub fn from_env() -> Auth {
+        Auth::new(crate::env::get("PONDRA_READ_TOKEN"), crate::env::get("PONDRA_WRITE_TOKEN"), crate::env::get("PONDRA_ADMIN_TOKEN"))
+    }
+
     pub fn on(&self) -> bool { self.read.is_some() || self.write.is_some() || self.admin.is_some() }
 
     /// This node listens beyond this machine (`network`).
@@ -306,6 +312,9 @@ impl Auth {
     pub fn owned_by(self, owner: Option<String>) -> Auth { Auth { owner, ..self } }
 
     pub fn owned(&self) -> bool { self.owner.is_some() }
+
+    /// The key of the program that started this node (`owned_by`), if one did: what the node's own calls are signed with.
+    pub fn owner_key(&self) -> Option<&str> { self.owner.as_deref() }
 
     /// Is `key` the key of the program that started this node (`owned_by`)? Compared in constant time.
     pub fn is_owner(&self, key: &str) -> bool {

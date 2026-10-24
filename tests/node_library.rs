@@ -14,8 +14,10 @@ use pondra::node::Options;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+mod common;
+use common::{free_addr, Leader};
 
 /// Talks to nodes over HTTP. It has a runtime of its own, since `Opened::open` and `close` block the
 /// thread that calls them: each request waits here for its answer, one at a time.
@@ -146,43 +148,6 @@ fn state_name(state: &State) -> &'static str {
         State::Restarting(_) => "Restarting",
         State::Failed(_) => "Failed",
         State::Closed => "Closed",
-    }
-}
-
-/// A free `host:port` on this machine: the port is bound and let go, so a node can have it next.
-fn free_addr() -> String {
-    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    format!("127.0.0.1:{port}")
-}
-
-/// A leader in a process of its own, as `pondra serve --lake` starts one. Its standard input stays
-/// open to it (nothing reads it: the node isn't given `--stop-with-stdin`). Killed when dropped, so a
-/// check that fails leaves no node running.
-struct Leader(Child);
-
-impl Leader {
-    fn start(lake: &str, addr: &str, log: &Path) -> Leader {
-        let log = std::fs::File::create(log).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_pondra"))
-            .args(["serve", "--lake", lake, "--addr", addr])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .expect("the pondra program starts");
-        Leader(child)
-    }
-
-    /// SIGKILL, as a machine losing the process: nothing is said to the lake, and the process is reaped.
-    fn kill(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl Drop for Leader {
-    fn drop(&mut self) {
-        self.kill();
     }
 }
 

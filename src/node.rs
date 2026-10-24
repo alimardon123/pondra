@@ -1,5 +1,6 @@
 //! A node: one lake served, from its start to its stop (ADR-061). The program (`cli.rs`) starts one
 //! with its signals and standard input around it; a library will start and stop one in its own process.
+//! A guest (`Options::guest`) is a node a program starts for its own statements: it answers them and ends.
 use crate::*;
 use std::{future::Future, sync::{Arc, OnceLock}, time::Duration};
 
@@ -25,6 +26,8 @@ pub struct Options {
     pub(crate) attach_found: Option<String>,
     pub(crate) python: Option<String>,
     pub(crate) auth: Arc<auth::Auth>,
+    /// What a guest is for (`Options::guest`); None for a node that lives.
+    pub(crate) guest: Option<Guest>,
 }
 
 impl Options {
@@ -32,9 +35,48 @@ impl Options {
     /// library opens (ADR-061 §2).
     pub fn local(dir: &str, listen: &str) -> Options {
         Options { dir: dir.into(), listen: listen.into(), advertise: None, reader: false, flush_ms: 0, tier_secs: 10.0, task_ms: 1000, retain_secs: 60, backlog: 10_000_000,
-                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, python: None, auth: Arc::new(auth::Auth::new(None, None, None)) }
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach: vec![], attach_found: None, python: None, auth: Arc::new(auth::Auth::new(None, None, None)), guest: None }
+    }
+
+    /// A guest for `dir`: the node a program starts for its own statements, which answers them and ends. No
+    /// address and no doors, and none of the loops a node that lives keeps (`Node::start`). Its tokens are the
+    /// environment's, and its own calls are signed with a key it makes, as a library's node's are.
+    pub fn guest(dir: &str, attach: Vec<String>, guest: Guest) -> Options {
+        let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
+        Options { dir: dir.into(), listen: String::new(), advertise: None, reader: false, flush_ms: 0, tier_secs: 0.0, task_ms: 1000, retain_secs: 60, backlog: 10_000_000,
+                  pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, python: None, auth: Arc::new(auth), guest: Some(guest) }
     }
 }
+
+/// What a guest is for. A guest that reads claims nothing; one that writes may record, so it leads a lake nobody leads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Guest {
+    /// It only reads: it follows a leader that answers, or reads beside one that doesn't, or nobody's, and claims nothing.
+    Reads,
+    /// It may record writes, so it leads a lake nobody leads (`Cluster::guest`).
+    Writes,
+}
+
+crate::per_node!(
+    /// Is the node open in this process a guest? Set at its start, set back when it stops: `cluster::restart_with`
+    /// keeps a guest's job, and a guest's lock file counts as gone at once.
+    static GUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+
+/// Is the node open in this process a guest (`Options::guest`)?
+pub(crate) fn is_guest() -> bool { GUEST.load(std::sync::atomic::Ordering::SeqCst) }
+
+/// A guest's start found its lake's leader alive but not answering from here: its write goes through the bucket's
+/// inbox instead (the program downcasts it to know so).
+#[derive(Debug)]
+pub struct Unreached;
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the lake's leader is alive but doesn't answer from here")
+    }
+}
+
+impl std::error::Error for Unreached {}
 
 /// A lake moving to another place (`memory::set_location`): the host stops the node, settles the lake's
 /// objects there (`memory::settle`) and starts the node again on `to`. `copied` is what the first pass copied.
@@ -115,32 +157,62 @@ impl Held {
 pub struct Node {
     /// What this node holds, given back by `stop`.
     held: Arc<Held>,
-    /// The HTTP door, served on a task of its own: `serving` waits on it.
-    served: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// The HTTP door, served on a task of its own: `serving` waits on it. None for a guest, which has no door.
+    served: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     /// What the door serves: a library's host calls it straight (`library::Opened::ask`).
     router: axum::Router,
+    /// The key this node's own calls are signed with (`Auth::owner_key`): `ask` sends it as the owner.
+    owner: Option<String>,
+    /// A guest's App, for `finish`: what it drains and waits for before it stops.
+    guest: Option<server::App>,
 }
 
 impl Node {
     /// Everything `pondra serve` did before it served, then the HTTP door served on a task of its own.
     /// `held` takes what this start takes (the term, then the lake), so a stop during the start gives it back.
     pub(crate) async fn start(o: Options, held: Arc<Held>) -> anyhow::Result<Node> {
-        let Options { dir, listen, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth } = o;
-        // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
-        // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
-        std::thread::spawn(crate::memory::sweep_all);
-        let serve_store = crate::env::flag("PONDRA_SERVE_STORE"); // (read once, here: the checks, the cluster and the store's door all take this start's answer)
+        let Options { dir, listen, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth, guest } = o;
+        // (a guest answers one program's statements and ends: none of the loops and doors a node that lives keeps, so
+        // every `lives` below keeps them for a node that lives only)
+        let lives = guest.is_none();
+        GUEST.store(!lives, std::sync::atomic::Ordering::SeqCst);
+        if lives {
+            // (the spill folders of processes that ended, swept beside the start and not on it: a crashed one's may be
+            // gigabytes, and a cold start waits for nothing but what serving needs, invariant 182)
+            std::thread::spawn(crate::memory::sweep_all);
+        }
+        let serve_store = lives && crate::env::flag("PONDRA_SERVE_STORE"); // (read once, here: the checks, the cluster and the store's door all take this start's answer)
         crate::served::checked(&dir, reader, auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
+        let owner = auth.owner_key().map(str::to_string); // (what `ask` signs with: read before `auth` moves into the App)
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
         let tr = |w: &str| store::trace(w, t_start);
         let addr = advertise.unwrap_or_else(|| listen.clone()); // (how others reach it: its cluster name)
-        sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
-        if let Some(at) = dir.strip_prefix("pondra://") {
-            // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader)
-            crate::served::wait_up(at.trim_end_matches('/')).await;
+        if lives {
+            sharing::set_endpoint(&addr); // (where a recipient's profile points: `sharing.rs`)
         }
-        let cluster = cluster::Cluster::join(&store, &addr, reader, !store::served(&dir), serve_store).await?;
+        if let Some(at) = dir.strip_prefix("pondra://") {
+            // (a lake whose node is away, or not up yet: wait for it, as a follower waits for its leader; a guest waits 10 s at most)
+            let at = at.trim_end_matches('/');
+            match lives {
+                true => crate::served::wait_up(at).await,
+                false => tokio::time::timeout(Duration::from_secs(10), crate::served::wait_up(at)).await.map_err(|_| anyhow::anyhow!("{dir} doesn't answer: the node that serves it must be up"))?,
+            }
+        }
+        // (a guest that writes can't lead a lake read through another server: refused by name, as `write::deliver` refuses it)
+        if guest == Some(Guest::Writes) && store::reach_of(&dir).is_some_and(|r| r.read_only) {
+            return Err(crate::write::read_only_refused(&dir));
+        }
+        let cluster = match guest {
+            None => cluster::Cluster::join(&store, &addr, reader, !store::served(&dir), serve_store).await?,
+            Some(g) => match cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))? {
+                Some(c) => c,
+                // (its leader is alive and answers nobody here: the program sends the write through the bucket's inbox)
+                None => return Err(anyhow::Error::new(Unreached)),
+            },
+        };
+        // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
+        let reader = reader || cluster.reader;
         let leader = cluster.is_leader();
         // (the node that serves its store leads it: its followers' store is in this process, invariant 299)
         anyhow::ensure!(!serve_store || leader, "--serve-store: {dir} is led by the node at {}; the node that serves a lake's store leads it (stop that node first)", cluster.leader.addr);
@@ -150,12 +222,18 @@ impl Node {
         }
         tr("the lease");
         if leader {
-            // "Still here", in the bucket, from the start: for machines outside the cluster.
-            cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
+            // "Still here", in the bucket, from the start: for machines outside the cluster. (A guest marks its term
+            // as `write::lead` does: its task ends with the node.)
+            if lives {
+                cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
+            } else {
+                let _ = cluster::mark_every(store.clone(), cluster.leader.n);
+            }
         }
         // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
-        let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || cluster.leader_alive().await);
+        // (a guest's mode said whether its leader answers: a guest that follows one streams, and asks no more)
+        let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || (lives && cluster.leader_alive().await));
         let lake = match store::Lake::open(&dir, leader, streamed).await {
             // (a lake a newer Pondra wrote, or a place a move didn't finish: this binary must not lead or serve it,
             // nor hold the term; and a restart would find the same place again)
@@ -165,6 +243,8 @@ impl Node {
                 }
                 return Err(e);
             }
+            // (a guest answers with the error: `Node::open` gives back what it took)
+            Err(e) if !lives => return Err(e),
             Err(e) if leader => {
                 eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -182,7 +262,7 @@ impl Node {
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
         tr("the lake open");
         for spec in &attached {
-            attach(&lake, spec, &addr, true).await?;
+            attach(&lake, spec, &addr, lives).await?;
         }
         if let Some(folder) = &attach_found {
             let found = ddl::attach_found(&lake, folder, &addr).await;
@@ -193,15 +273,17 @@ impl Node {
         // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
         tr("lakes attached");
         let (l, me) = (lake.clone(), addr.clone());
-        ddl::sync(&l, &me, true).await?;
+        ddl::sync(&l, &me, lives).await?;
         tr("attachments synced");
-        every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
-        let l = lake.clone();
-        crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+        if lives {
+            every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
+            let l = lake.clone();
+            crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+        }
         // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
         // a new leader first commits what they hold from the previous one.
         tr("warming");
-        let replica = if reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) }; // (a lake in memory has no followers to hold changes for)
+        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
         if let (true, Some(own)) = (leader, &replica) {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
@@ -211,6 +293,9 @@ impl Node {
                 }
             }
             replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
+        } else if leader && !lives {
+            // (a guest that leads recovers as `write::lead` does: no followers' changes to hold, and no key to ask for)
+            replica::recover(&lake, "", cluster.leader.n, None).await?;
         }
         tr("followers' changes recovered");
         let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
@@ -246,7 +331,7 @@ impl Node {
                 }
             }
         }
-        if leader {
+        if leader && lives {
             let (l, c, tokens) = (app.lake.clone(), app.cluster.clone(), app.auth.on()); // (beside serving, not before it: C5)
             panics::spawn(async move {
                 let made = users::kept(&l).await == "none";
@@ -293,30 +378,32 @@ impl Node {
             });
         }
         tr("the app");
-        let l = app.lake.clone();
-        panics::spawn(async move {
-            // (a follower's catalog shows the leader's keys once the leader has flushed them)
-            let mut said = false;
-            for _ in 0..600 {
-                match users::node_key(&l).await {
-                    Ok(k) => {
-                        cluster::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
-                        return;
+        if lives {
+            let l = app.lake.clone();
+            panics::spawn(async move {
+                // (a follower's catalog shows the leader's keys once the leader has flushed them)
+                let mut said = false;
+                for _ in 0..600 {
+                    match users::node_key(&l).await {
+                        Ok(k) => {
+                            cluster::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                            return;
+                        }
+                        Err(e) if !said && format!("{e:#}").contains("master key") => {
+                            said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
+                            eprintln!("{e:#}");
+                        }
+                        Err(_) => {}
                     }
-                    Err(e) if !said && format!("{e:#}").contains("master key") => {
-                        said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
-                        eprintln!("{e:#}");
-                    }
-                    Err(_) => {}
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            eprintln!("the lake's key for its nodes isn't readable here: with users and no --admin-token, this node can't call the others");
-        });
-        if cluster.is_leader() && !cluster.reader {
+                eprintln!("the lake's key for its nodes isn't readable here: with users and no --admin-token, this node can't call the others");
+            });
+        }
+        if cluster.is_leader() && !cluster.reader && lives {
             runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
         }
-        if cluster.is_leader() && !cluster.reader && !backup::frozen(&lake) {
+        if cluster.is_leader() && !cluster.reader && lives && !backup::frozen(&lake) {
             // (a lake opened somewhere it didn't publish from — moved by SET LOCATION, or copied — publishes its
             // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
             // published table's manifests, and a lake that stayed where it was has nothing new for it)
@@ -352,10 +439,10 @@ impl Node {
             let a = app.clone();
             panics::spawn(async move { flight::serve(a, flight_addr).await.map_err(|e| eprintln!("flight: {e:#}")) });
         }
-        if app.log.is_some() {
+        if lives && app.log.is_some() {
             feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
         }
-        if let (Some(_), Some(log)) = (&app.seq, &app.log) {
+        if let (true, Some(_), Some(log)) = (lives, &app.seq, &app.log) {
             let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
             panics::spawn(async move {
                 loop {
@@ -367,11 +454,13 @@ impl Node {
             });
         }
         // Finished shuffles are forgotten here, and what they spilled deleted.
-        every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
-        if let Some(seq) = &app.seq {
+        if lives {
+            every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
+        }
+        if let (true, Some(seq)) = (lives, &app.seq) {
             inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
         }
-        if leader {
+        if leader && lives {
             // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
             // columns of the files they replaced).
             let l = lake.clone();
@@ -425,23 +514,33 @@ impl Node {
                 replica::members(lake.clone(), cluster.clone());
             }
             format::raise(lake.clone(), cluster.clone()); // (once every node knows this build's format: ADR-039)
-        } else {
-            format::watch(lake.clone());
+        }
+        if !leader {
+            if lives {
+                format::watch(lake.clone());
+            }
             if streamed {
+                if !lives {
+                    cluster::signed(&lake).await; // (a guest's calls to its leader are signed with the nodes' key, which it waits for, 10 s at most)
+                }
                 cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
             }
-            match reader {
-                false => cluster.clone().follow(store),
-                true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads
+            if lives {
+                match reader {
+                    false => cluster.clone().follow(store),
+                    true => cluster.clone().watch_leader(store, streamed), // a reader never votes or leads
+                }
             }
             if streamed {
                 cluster::mirror(lake.clone(), cluster.leader.addr.clone(), addr.clone(), replica);
             }
             // How far our own catalog view is: all a reader has, and a follower's fallback.
-            let l = lake.clone();
-            every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
+            if lives {
+                let l = lake.clone();
+                every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
+            }
         }
-        if !reader {
+        if !reader && lives {
             let (a, max_wait) = (app.clone(), Duration::from_millis(task_ms));
             panics::spawn(async move {
                 let mut commits = a.lake.hwm.subscribe();
@@ -454,40 +553,85 @@ impl Node {
                 }
             });
         }
-        let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
-        if !crate::library::on() {
-            eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n); // (a library's host hears only of trouble)
+        if lives {
+            let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
+            if !crate::library::on() {
+                eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n); // (a library's host hears only of trouble)
+            }
         }
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).
         tr("listening");
-        let listener = tls::Doors::bind(&listen, tls::Door::Http).await?; // (TLS too: `tls.rs`)
-        store::serving(); // (the catalog's compactor and garbage collector start now: C5)
-        crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
-        runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
-        if leader {
-            let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
-            crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+        let listener = match lives {
+            true => Some(tls::Doors::bind(&listen, tls::Door::Http).await?), // (TLS too: `tls.rs`)
+            false => None,
+        };
+        if lives {
+            store::serving(); // (the catalog's compactor and garbage collector start now: C5)
         }
+        crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
+        if lives {
+            runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
+            if leader {
+                let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
+                crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+            }
+        }
+        let guest_app = (!lives).then(|| app.clone());
         // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
         let router = server::router(app);
-        let door = router.clone();
-        let served = panics::spawn(async move {
-            // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
-            drain::door_open();
-            let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(drain::closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
-            drain::door_closed();
-            out
+        let served = listener.map(|listener| {
+            let door = router.clone();
+            panics::spawn(async move {
+                // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
+                drain::door_open();
+                let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(drain::closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
+                drain::door_closed();
+                out
+            })
         });
-        Ok(Node { held, served, router })
+        Ok(Node { held, served, router, owner, guest: guest_app })
     }
 
     /// What the HTTP door serves, for a request made in this process (`library::Opened::ask`).
     pub(crate) fn router(&self) -> axum::Router { self.router.clone() }
 
-    /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline.
+    /// Until the HTTP door stops. An error ends the program, as it did when `serve` ran the door inline. A guest has
+    /// no door: nothing ends this, and the program ends with its statement.
     pub(crate) async fn serving(&mut self) -> anyhow::Result<()> {
-        (&mut self.served).await?
+        match self.served.as_mut() {
+            Some(served) => served.await?,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// One request, made in this process to the node's own router as its owner (`request`), with no port: how a guest
+    /// asks its statement, as a library's host asks its node (`library::Opened::ask`).
+    pub async fn ask(&self, method: &str, path: &str, body: Vec<u8>) -> anyhow::Result<http::Response<axum::body::Body>> {
+        use tower::ServiceExt;
+        let req = request(method, path, &[], body, self.owner.as_deref())?;
+        Ok(self.router.clone().oneshot(req).await.unwrap_or_else(|never| match never {}))
+    }
+
+    /// Ends a guest once its statement is answered: a guest that leads drains the inbox (the writers that couldn't reach
+    /// it) and waits for what it committed to be durable, then it stops, on every path, so its term is given back. What
+    /// the drain or the wait gave is returned after the stop. A node that lives is only stopped.
+    pub async fn finish(self) -> anyhow::Result<()> {
+        let Some(app) = self.guest.clone() else {
+            self.stop().await;
+            return Ok(());
+        };
+        let drained = async {
+            if let Some(seq) = &app.seq {
+                inbox::drain(&app.lake, seq, &app.lock).await?;
+                app.lake.cat.wait_durable(app.lake.cat.committed()).await; // (no cap: the answer is printed after this, and a leader's acks are durable already)
+            }
+            anyhow::Ok(())
+        }
+        .await;
+        crate::locks::release_all(); // (the row locks go to their leaders now, as `drain::drain` ends)
+        self.stop().await; // (on every path: an early `?` would leave the term marked, and the next open in this process waiting on it)
+        drained
     }
 
     /// Once drained (`drain.rs`, run by the program first): gives back what the node holds (`Held::stop`).
@@ -513,6 +657,23 @@ impl Node {
         self.held.stop().await;
         reset::reset();
     }
+}
+
+/// One request for a node's router, as its HTTP door takes it: `method` and `path` (with its query), `headers`, and
+/// `body`, made in this process as the owner `owner` (its key, which the owner's files and rights go by), with no port
+/// (`library::Opened::ask`, `Node::ask`).
+pub(crate) fn request(method: &str, path: &str, headers: &[(String, String)], body: Vec<u8>, owner: Option<&str>) -> anyhow::Result<http::Request<axum::body::Body>> {
+    let mut req = http::Request::builder().method(method).uri(path);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(key) = owner {
+        req = req.header("x-pondra-owner", key);
+    }
+    let mut req = req.body(axum::body::Body::from(body))?;
+    let from = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    req.extensions_mut().insert(axum::extract::ConnectInfo(crate::tls::Peer { addr: from, tls: false, signed: false, local: true }));
+    Ok(req)
 }
 
 /// `--attach name=dir`: read another lake as `name.table`. A node keeps it fresh the way a

@@ -17,6 +17,7 @@
 //!   a process on the same machine knows at once that a killed claimer is gone; another machine
 //!   has no file to look at and waits for the mark. A leader killed and started again takes the
 //!   next term: only its own restart takes its term back.
+use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
 use anyhow::Result;
@@ -114,15 +115,60 @@ impl Cluster {
                 }
             }
         };
-        let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
-        // (a node that never leads gets no startup grace: a holder that changed under its name shows at
-        // its first answer, not 30 s later, so the restart check in `follow` can fire)
-        let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
-        let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-        Ok(Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back }))
+        Ok(made(addr, leader, reader, may_lead, serves_store, taken_back))
     }
 
-    pub fn is_leader(&self) -> bool { self.leader.addr == self.addr }
+    /// A guest's cluster (`node.rs`: a program's node for its own statements, which ends after them). Not `join`:
+    /// its "the latest term is mine" would take back another guest's stale empty-address term, and its loops restart by
+    /// exec without the job. It asks the lake's leader as `write::deliver` does. A live leader that answers is followed,
+    /// as a follower that never beats (so it is never listed, and gets no work). A live leader that doesn't answer from
+    /// here is the reads of a `Reads` guest, and `None` for a `Writes` one (the caller goes through the bucket's inbox;
+    /// `PONDRA_NO_DIRECT` makes a write take an answering leader for that). A term with no address that is alive is a
+    /// one-off writer recording: a read reads beside it, a write waits for it. With nobody alive, a read reads, and a
+    /// write claims the next term with no address and leads it (invariant 17). `may_lead` false is a store another
+    /// node serves (`pondra://`): it is never led, so a write whose holder doesn't answer is an error, not a wait.
+    /// A lake on a read-only reach (`write::across`) is refused by `Node::start` before this runs.
+    pub async fn guest(store: &Store, guest: Guest, may_lead: bool) -> Result<Option<Arc<Cluster>>> {
+        let writes = guest == Guest::Writes;
+        let not_led = || anyhow::anyhow!("the node that serves this store doesn't lead it or answer from here, and a write can't go another way: start it, or read");
+        loop {
+            match latest(store).await? {
+                Some(t) if !t.addr.is_empty() && alive(store, &t).await => {
+                    let follower = made("", t.clone(), false, false, false, false);
+                    if (!writes || !crate::env::is_set("PONDRA_NO_DIRECT")) && follower.leader_alive().await {
+                        return Ok(Some(follower));
+                    }
+                    return match (writes, may_lead) {
+                        (false, _) => Ok(Some(made("", t, true, may_lead, false, false))),
+                        (true, false) => Err(not_led()),
+                        (true, true) => Ok(None),
+                    };
+                }
+                // (another one-off writer is recording: a read reads beside it, a write waits for it to finish)
+                Some(t) if alive(store, &t).await => {
+                    if !writes {
+                        return Ok(Some(made("", t, true, may_lead, false, false)));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+                // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
+                t => {
+                    if !writes {
+                        return Ok(Some(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new() }), true, may_lead, false, false)));
+                    }
+                    if !may_lead {
+                        return Err(not_led());
+                    }
+                    if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
+                        return Ok(Some(made("", term, false, true, false, false)));
+                    }
+                    // (someone else claimed it just now: look again)
+                }
+            }
+        }
+    }
+
+    pub fn is_leader(&self) -> bool { !self.reader && self.leader.addr == self.addr }
 
     /// Live members, sorted: shard `s` of a task runs on `nodes[s % nodes.len()]`.
     pub fn nodes(&self) -> Vec<String> {
@@ -346,6 +392,16 @@ impl Cluster {
     }
 }
 
+/// A cluster as a node's start decided it (`Cluster::join`, `Cluster::guest`): the term it follows or leads, and what it is.
+fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool) -> Arc<Cluster> {
+    let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
+    // (a node that never leads gets no startup grace: a holder that changed under its name shows at
+    // its first answer, not 30 s later, so the restart check in `follow` can fire)
+    let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
+    let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back })
+}
+
 /// A node that just started under a leader, reading the commit stream (its view reads no WAL):
 /// what the leader has committed, then until this node holds it too (`Lake::caught_up` waits on
 /// it, and refuses meanwhile). Restarted after a failover, its catalog view lacks what the new
@@ -549,6 +605,17 @@ pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
     Ok(())
 }
 
+/// The leader of term `n` marks it alive every 10 s, until the task ends (`write::lead`, and a guest that leads: the
+/// node's stop ends it with its other tasks, before it gives its term back).
+pub fn mark_every(store: Store, n: u64) -> tokio::task::JoinHandle<()> {
+    crate::panics::task(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = mark_alive(&store, n).await;
+        }
+    })
+}
+
 /// Is the holder of term `t` alive? A claim made on this machine is alive while its process holds
 /// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s.
 pub async fn alive(store: &Store, t: &Term) -> bool {
@@ -721,11 +788,20 @@ pub fn restart(why: &str) -> ! {
 /// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
 /// tries: `env.rs`), on top of what this process was given.
 pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
+    let guest = crate::node::is_guest();
+    if guest && crate::write::tries() >= 5 {
+        eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
+        crate::memory::leave();
+        std::process::exit(1);
+    }
     eprintln!("restarting to rejoin the cluster: {why}");
     // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
-    // them for a moment, and nobody here may take that for our end: `gone_here`)
-    if let Ok(held) = HELD.lock() {
-        held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
+    // them for a moment, and nobody here may take that for our end: `gone_here`. A guest's don't: its
+    // lock is let go by the exec, and counts as gone at once, so the next writer doesn't wait on it)
+    if !guest {
+        if let Ok(held) = HELD.lock() {
+            held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
+        }
     }
     if crate::library::on() {
         crate::library::restart(why); // (in place: a library's host keeps its process)
@@ -733,7 +809,13 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
     crate::memory::leave(); // (what this process made goes first: exec and `process::exit` run no destructor)
     let mut args = std::env::args_os();
     let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
-    cmd.args(args).envs(crate::env::given()).envs(carried.iter().map(|(k, v)| (k, v)));
+    // (a guest's rerun keeps its job, so a write it recorded once isn't recorded again by the rerun: `write::job`)
+    let mut carry = carried.to_vec();
+    if guest && !carried.iter().any(|(k, _)| *k == "PONDRA_JOB") {
+        carry.push(("PONDRA_JOB", crate::write::job().to_string()));
+        carry.push(("PONDRA_TRIES", (crate::write::tries() + 1).to_string()));
+    }
+    cmd.args(args).envs(crate::env::given()).envs(carry.iter().map(|(k, v)| (k, v)));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
