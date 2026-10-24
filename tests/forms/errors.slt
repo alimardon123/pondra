@@ -1,0 +1,21 @@
+# The same refusal for the same mistake, with Postgres's SQLSTATEs (form-parity P8).
+statement error 42P01
+SELECT * FROM nowhere
+
+statement ok
+CREATE TABLE e (a INT)
+
+statement error 42703
+SELECT nothing FROM e
+
+statement error 22012
+SELECT 1 / 0
+
+statement error 42601
+SELEC 1
+
+statement error 22P02
+SELECT CAST('x' AS INT)
+
+statement error 42P07
+CREATE TABLE e (a INT)

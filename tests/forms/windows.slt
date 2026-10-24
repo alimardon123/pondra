@@ -1,0 +1,24 @@
+# Window functions and sorts answer alike whatever holds their rows (form-parity P6).
+statement ok
+CREATE TABLE s (g TEXT, x INT)
+
+statement ok
+INSERT INTO s VALUES ('a', 3), ('a', 1), ('b', 2), ('b', 4), ('b', 6)
+
+query TIII
+SELECT g, x, row_number() OVER (PARTITION BY g ORDER BY x), sum(x) OVER (PARTITION BY g) FROM s ORDER BY g, x
+----
+a 1 1 4
+a 3 2 4
+b 2 1 12
+b 4 2 12
+b 6 3 12
+
+query TII
+SELECT g, x, lag(x) OVER (ORDER BY g, x) FROM s ORDER BY g, x
+----
+a 1 NULL
+a 3 1
+b 2 3
+b 4 2
+b 6 4

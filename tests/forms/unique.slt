@@ -1,0 +1,16 @@
+# UNIQUE: a value given twice is refused (23505); NULLs never clash (form-parity P1).
+statement ok
+CREATE TABLE u (id INT, email TEXT UNIQUE)
+
+statement ok
+INSERT INTO u VALUES (1, 'a@x'), (2, NULL), (3, NULL)
+
+statement error 23505
+INSERT INTO u VALUES (4, 'a@x')
+
+query IT rowsort
+SELECT id, email FROM u
+----
+1 a@x
+2 NULL
+3 NULL
