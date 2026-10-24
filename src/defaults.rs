@@ -70,24 +70,11 @@ fn copy() -> SessionContext { SessionContext::new_with_state(BASE.state()) }
 
 /// `expr` over `rows` (their columns by name), a value for each row; None if it doesn't plan
 /// over them alone (a qualified name, a subquery: SQL works it out instead).
-pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
-    use datafusion::common::DFSchema;
-    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let Ok(e) = BASE.parse_sql_expr(expr, &schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
-    let Ok(phys) = BASE.create_physical_expr(e, &schema) else { return Ok(None) };
-    Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
-}
+pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> { crate::rules::fit::evaluate(&BASE, rows, expr) }
 
 /// Which of `rows` break `check`, a condition over their columns by name: those it is false for
 /// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
-pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
-    use datafusion::common::DFSchema;
-    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let expr = BASE.parse_sql_expr(check, &schema).and_then(crate::optimize::whole_literals)?;
-    let value = BASE.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
-    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
-    Ok(b.iter().map(|v| Some(v == Some(false))).collect())
-}
+pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> { crate::rules::fit::breaking(&BASE, rows, check) }
 
 /// A table's DEFAULTs and CHECKs, checked as its CREATE checks them: a default gives one value of its column's type,
 /// and a CHECK is a condition over the table's columns. A lake table's CREATE (`write::create_table`) and a temporary

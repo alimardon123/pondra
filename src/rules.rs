@@ -2,6 +2,8 @@
 //! (`TableMeta::rules`), and a page will from its own definitions. Names are SQL's, as rows reach the rules;
 //! only `Column::stored` keeps the name a file or the log holds a column under. Nothing here reads files,
 //! storage or the catalog, so the rules over it (`shape`) run the same in a browser as on a node.
+pub mod fit;
+
 use datafusion::arrow::datatypes::SchemaRef;
 
 /// A table as a write's rules see it, made once a version of it is parsed (`TableMeta::to_rules`).

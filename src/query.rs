@@ -30,18 +30,7 @@ pub fn read_schema(columns: &[(String, String)]) -> Result<SchemaRef> {
     Ok(Arc::new(Schema::new(fields.collect::<Vec<_>>())))
 }
 
-/// `b` with `s`'s columns, by name: older rows (written before an ALTER TABLE … ADD COLUMN) get
-/// nulls for the columns added since.
-pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
-    if b.schema().fields() == s.fields() {
-        return Ok(b.clone());
-    }
-    let columns = s.fields().iter().map(|f| match b.column_by_name(f.name()) {
-        Some(c) => Ok(strict(c, f.data_type())?),
-        None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows())),
-    });
-    Ok(RecordBatch::try_new(s.clone(), columns.collect::<Result<Vec<_>>>()?)?)
-}
+pub use crate::rules::fit::{conform, strict};
 
 /// A query's rows as `s`'s columns, by position, cast to its types: a view's or a task's output
 /// into its table (strings a query reads from files are views; the table holds plain ones).
@@ -55,28 +44,6 @@ pub fn cast_as(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
     }
     let options = datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
     Ok(RecordBatch::try_new_with_options(s.clone(), columns, &options)?)
-}
-
-/// A column as type `t`, or an error saying which value wouldn't go (never a quiet NULL): `casts::into`, which
-/// rounds a fraction going into an integer column as a cast does. Text meant as a timestamp gets its seconds first.
-pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
-    Ok(match (c.data_type(), t) {
-        (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Timestamp(..)) => crate::casts::into(&with_seconds(c)?, t)?, // ('… 10:00')
-        _ => crate::casts::into(c, t)?,
-    })
-}
-
-use crate::optimize::seconds;
-
-/// Text meant as timestamps, the ones without seconds given them (`seconds`).
-fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
-    use datafusion::arrow::array::{AsArray, StringArray};
-    let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
-    let text = text.as_string::<i32>();
-    if !text.iter().flatten().any(|s| seconds(s).is_some()) {
-        return Ok(c.clone());
-    }
-    Ok(Arc::new(text.iter().map(|s| s.map(|s| seconds(s).unwrap_or_else(|| s.to_string()))).collect::<StringArray>()) as ArrayRef)
 }
 
 /// Rows of `table` from committed segments in (after, upto], file commits' too (what the log's
