@@ -89,6 +89,7 @@ class FakeGitHub(GitHub):
         self.dispatches = []  # (ref, mode)
         self.reruns = []      # run ids
         self.writes = []      # (method, path) of every write made through api
+        self.later = 0        # train.yml runs started (a wait's hand-over)
 
     def git(self, *args):
         return sh("git", "--git-dir", self.bare, *args)
@@ -157,6 +158,9 @@ class FakeGitHub(GitHub):
     def dispatch(self, ref, mode):
         self.dispatches.append((ref, mode))
 
+    def step_later(self):
+        self.later += 1
+
 
 class Scenario:
     """A bare origin with main, a clone of it (where `step` runs) and a FakeGitHub over the origin. `work` is a
@@ -216,6 +220,13 @@ class Scenario:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             train.Train(self.gh, dry=dry).step()
+        return out.getvalue()
+
+    def conduct(self, minutes, dry=False):
+        """One call of `step --wait minutes`. Returns the lines it printed."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            train.conduct(self.gh, dry=dry, minutes=minutes)
         return out.getvalue()
 
     def riders(self):
@@ -580,6 +591,123 @@ def main_changed_a_workflow(path):
         time.sleep(1.1)
         sc.step()
         expect(sc.train_heads() == [4] and sc.gh.bare_rev("refs/heads/train^1") == sc.main_sha(), f"{sc.train_heads()}")
+
+
+def stray_tip_recut(sc, out, stray):
+    """A stray tip, green: main is left alone and the train is cut again from its PRs, on main."""
+    expect(sc.main_sha() != stray and sc.gh.bare_rev("refs/heads/main") == sc.gh.bare_rev("refs/heads/train^1^1"),
+           "main moved, or the train wasn't cut again on main")
+    expect(sc.tip() != stray and sc.train_heads() == [1, 2], f"tip {sc.tip()}, train merged {sc.train_heads()}")
+    expect("the train's tip isn't what a cut makes" in out and "cut #1 #2" in out, out)
+    expect(all(c == [] for c in sc.gh.comments.values()), f"comments {sc.gh.comments}")
+
+
+@case
+def stray_commit_never_lands(path):
+    """A commit pushed onto the train after its cut, its run green: it doesn't land; the train is cut again."""
+    with Scenario(path) as sc:
+        sc.riders()
+        git(sc.work, "fetch", "-q", "origin")
+        git(sc.work, "checkout", "-q", "-B", "stray", "origin/train")
+        write_commit(sc.work, {"stray.txt": "no PR brought this\n"}, "stray")
+        git(sc.work, "push", "-q", sc.bare, "HEAD:refs/heads/train")
+        stray = sc.tip()
+        sc.add_run(5, stray, conclusion="success")
+        time.sleep(1.1)
+        stray_tip_recut(sc, sc.step(), stray)
+
+
+@case
+def forged_merge_never_lands(path):
+    """A merge with a PR's parents and trailers but more in its tree, its run green: it doesn't land either."""
+    with Scenario(path) as sc:
+        sc.riders()
+        git(sc.work, "fetch", "-q", "origin")
+        git(sc.work, "checkout", "-q", "-B", "forged", "origin/train^1")
+        git(sc.work, "merge", "-q", "--no-ff", "--no-commit", "origin/train^2")
+        write_commit(sc.work, {"extra.txt": "slipped in\n"}, git(sc.work, "log", "-1", "--format=%B", "origin/train"))
+        git(sc.work, "push", "-q", "-f", sc.bare, "HEAD:refs/heads/train")
+        stray = sc.tip()
+        expect(sc.gh.bare_rev("refs/heads/train^2") == sc.gh.bare_rev("refs/pull/2/head"), "the forged merge's parents")
+        sc.add_run(5, stray, conclusion="success")
+        time.sleep(1.1)
+        stray_tip_recut(sc, sc.step(), stray)
+
+
+@contextlib.contextmanager
+def clock(on_pause=lambda n: None):
+    """Time for a wait: the clock starts at the real one and each pause moves it on, then calls on_pause with how
+    many pauses there have been. Yields the list of the pauses' seconds."""
+    real_now, real_pause = train.now, train.pause
+    t, pauses = [real_now()], []
+
+    def fake_pause(seconds):
+        t[0] += seconds
+        pauses.append(seconds)
+        on_pause(len(pauses))
+
+    train.now, train.pause = (lambda: t[0]), fake_pause
+    try:
+        yield pauses
+    finally:
+        train.now, train.pause = real_now, real_pause
+
+
+@case
+def wait_lands(path):
+    """--wait on two queued PRs: one call cuts them, waits out their run and lands them a minute after it is green."""
+    with Scenario(path) as sc:
+        sc.open_pr(1, "first", {"a.txt": "one\n"})
+        sc.open_pr(2, "second", {"b.txt": "two\n"})
+
+        tips = []
+
+        def run_moves(n):
+            if n == 1:
+                tips.append(sc.tip())
+                sc.add_run(5, sc.tip(), status="in_progress", conclusion=None)
+            elif n == 2:
+                sc.gh.runs[0].update(status="completed", conclusion="success")
+
+        with clock(run_moves) as pauses:
+            out = sc.conduct(50)
+        expect(pauses == [60, 60], f"pauses {pauses}")
+        expect("cut #1 #2" in out and "waiting: run going" in out and "landed #1 #2" in out, out)
+        expect(sc.main_sha() == tips[0], "main isn't the train's tip")
+        expect(not sc.gh.prs[1]["open"] and not sc.gh.prs[2]["open"], "PRs open after landing")
+        expect(sc.gh.later == 0, "train.yml was started again with nothing to wait on")
+
+
+@case
+def wait_hands_over(path):
+    """--wait 3 on a run that goes on: four steps a minute apart change nothing, then train.yml is started once."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(5, sc.tip(), status="in_progress", conclusion=None)
+        before, writes = sc.state(), len(sc.gh.writes)
+        with clock() as pauses:
+            out = sc.conduct(3)
+        expect(pauses == [60, 60, 60] and out.count("waiting: run going") == 4, f"pauses {pauses}: {out}")
+        expect(sc.gh.later == 1 and "waited 3 minutes" in out, f"started {sc.gh.later}: {out}")
+        expect(sc.state() == before and len(sc.gh.writes) == writes, "a wait changed state while the run went")
+
+
+@case
+def wait_stops(path):
+    """--wait doesn't wait on main's own failure, an empty queue or a dry run: one step each, no hand-over."""
+    with Scenario(path) as sc:
+        with clock() as pauses:
+            sc.conduct(50)   # nothing queued
+            sc.open_pr(1, "first", {"a.txt": "one\n"})
+            out = sc.conduct(50, dry=True)
+            expect(sc.gh.writes == [] and sc.gh.dispatches == [] and "dry run: git push origin train" in out, out)
+            sc.open_pr(2, "second", {"b.txt": "two\n"})
+            sc.step()
+            sc.add_run(9, sc.tip(), attempt=2, failed=("lint",))
+            sc.add_run(3, sc.main_sha(), event="push", branch="main", failed=("lint",))
+            out = sc.conduct(50)
+        expect("waiting: main fails the same way: lint" in out, out)
+        expect(pauses == [] and sc.gh.later == 0, f"pauses {pauses}, started {sc.gh.later}")
 
 
 def main():

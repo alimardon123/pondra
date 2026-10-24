@@ -11286,7 +11286,7 @@ for _ in range(10):
 
 def sso_pg():
     """psql 18's sign-in through a provider (ADR-074 §6's third part, invariant 413, src/pg.rs): with POSTGRES 'oauth', the
-    Postgres port asks a user with no password (or, for a USERS 'any' provider, a name no user has) for OAUTHBEARER
+    Postgres port asks a user with no password (and a name no user has, so it never says who is a user) for OAUTHBEARER
     (RFC 7628) instead of a password, with SCRAM-SHA-256 after it only so that a client before libpq 18 is told the way
     out. A client with no token is told where the provider is (the error's
     openid-configuration and scope) and refused, a token goes straight to AuthenticationOk (no SASLFinal: libpq refuses
@@ -11439,13 +11439,16 @@ def sso_pg():
             and "doesn't sign in ana@acme.com" in refused["eve's token as ana"]["error"]["M"] \
             and "isn't its issuer's" in refused["a stranger's key"]["error"]["M"] and "expired" in refused["expired"]["error"]["M"]
 
-        # 4. One way a connection: a user with a password still signs in with SCRAM; a name no user has, with no
-        # USERS 'any' provider, too; and a driver that sends the token as its password can't, once OAUTHBEARER is asked.
+        # 4. One way a connection: a user with a password still signs in with SCRAM; a name no user has is asked what a
+        # user with no password is (so the port never says whether a name is a user here: the 10-18 audit's L12), and
+        # its token is refused; and a driver that sends the token as its password can't, once OAUTHBEARER is asked.
         driver = pg_as(ana, ana_t)
+        stranger = by_hand(cy, token_for(cy))
         info["psycopg with the token as the password"] = driver
-        checks["one way a connection: bo (a password) is asked for SCRAM and signs in, a name no user has too; ana's token as psycopg's password is refused once she is asked for OAUTHBEARER"] = \
+        info["a name no user has, with its token"] = stranger
+        checks["one way a connection: bo (a password) is asked for SCRAM and signs in; a name no user has is offered what ana is, then refused 28000; ana's token as psycopg's password is refused once she is asked for OAUTHBEARER"] = \
             by_hand(bo, None) == {"asked": ["SCRAM-SHA-256"]} and pg_as(bo, "bo-password-1") == [(7,)] \
-            and by_hand(cy, None) == {"asked": ["SCRAM-SHA-256"]} and isinstance(driver, str)
+            and stranger.get("asked") == OFFERED and stranger.get("error", {}).get("C") == "28000" and isinstance(driver, str)
 
         # 4a. A service's user, with tokens of its own and no password, is still asked for a password (M24 of the 10-17
         # audit): libpq 18's OAuth can't carry a pt_ token, and its drivers were refused once OAUTHBEARER was asked.
