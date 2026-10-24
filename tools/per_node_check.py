@@ -68,6 +68,7 @@ PROCESS = {
     "live.rs:OPEN": GAUGE,
     "log.rs:N": SETTING + " (PONDRA_INLINE_KB, PONDRA_REPLICAS)",
     "main.rs:ALLOC": "the allocator: one a process, the program's (ADR-061 §1)",
+    "main.rs:MALLOC_CONF": "jemalloc's options, read once at its start: one a process, the program's (`jemalloc::CONF`)",
     "metrics.rs:RUNNING": "a gauge of the process's queries running now: a stopped node's last ones count themselves down (set back to 0, it would wrap)",
     "metrics.rs:WAITING": "a gauge of the process's queries waiting for a turn, as RUNNING",
     "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
