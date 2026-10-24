@@ -760,7 +760,7 @@ pub(crate) fn dollar_tag(s: &str) -> Option<&str> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
-    if let Some(word) = crate::txn::control(sql) {
+    if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
         let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));

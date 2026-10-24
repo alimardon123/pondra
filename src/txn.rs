@@ -246,8 +246,6 @@ static LOCKING: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?
 const NESTED_LOCK: &str = "a row lock in a subquery, a union or a write's query isn't taken here: lock one table's rows, in a SELECT of its own";
 const ONE_TABLE: &str = "FOR UPDATE over a join, GROUP BY, DISTINCT or WITH isn't taken here: lock one table's rows, in a SELECT of its own";
 const MERGE_TABLE: &str = "is a merge table: its rows add up as they're read, so UPDATE and DELETE aren't taken; insert rows that add up to the change";
-/// The words a `BEGIN` may take after its first (`control`).
-const BEGIN_WORDS: [&str; 14] = ["WORK", "TRANSACTION", "ISOLATION", "LEVEL", "READ", "WRITE", "ONLY", "REPEATABLE", "SERIALIZABLE", "COMMITTED", "UNCOMMITTED", "SNAPSHOT", "DEFERRABLE", "NOT"];
 
 // ---------------------------------------------------------------- the book
 
@@ -330,31 +328,6 @@ fn writable(word: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------- transaction words
-
-/// Is a ROLLBACK's first words `[WORK | TRANSACTION] TO`? (`words` holds at most three.)
-fn to_point(words: &[String]) -> bool {
-    let at = |i: usize| words.get(i).map(String::as_str);
-    at(1) == Some("TO") || (matches!(at(1), Some("WORK" | "TRANSACTION")) && at(2) == Some("TO"))
-}
-
-/// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
-/// (`SET TRANSACTION` is `settings.rs`'s.)
-pub fn control(sql: &str) -> Option<&'static str> {
-    // (past leading comments: dbt sends `/* {"app": "dbt"} */ commit;`)
-    let words: Vec<String> = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().take(3).map(|w| w.to_uppercase()).collect();
-    let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
-    match words.first().map(String::as_str) {
-        Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
-        Some("START") if words.get(1).map(String::as_str) == Some("TRANSACTION") => Some("BEGIN"),
-        Some("COMMIT" | "END") if rest_ok(1) => Some("COMMIT"),
-        // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name: a savepoint's, not the transaction's
-        Some("ROLLBACK") if to_point(&words) => Some("ROLLBACK TO"),
-        Some("ROLLBACK" | "ABORT") if rest_ok(1) => Some("ROLLBACK"),
-        Some("SAVEPOINT") => Some("SAVEPOINT"),
-        Some("RELEASE") => Some("RELEASE"),
-        _ => None,
-    }
-}
 
 /// `BEGIN`, `COMMIT` or `ROLLBACK` (`control`), or a savepoint word, for the current session. Its answer: the command's
 /// tag (a failed transaction's COMMIT is a ROLLBACK, as in Postgres), and a warning, if any.
@@ -1946,9 +1919,9 @@ mod tests {
 
     #[test]
     fn begin_takes_its_modes_and_refuses_what_is_not_built() {
-        assert_eq!(control("BEGIN ISOLATION LEVEL REPEATABLE READ"), Some("BEGIN"));
-        assert_eq!(control("START TRANSACTION READ ONLY"), Some("BEGIN"));
-        assert_eq!(control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"), None, "SET TRANSACTION is settings.rs's");
+        assert_eq!(crate::text::control("BEGIN ISOLATION LEVEL REPEATABLE READ"), Some("BEGIN"));
+        assert_eq!(crate::text::control("START TRANSACTION READ ONLY"), Some("BEGIN"));
+        assert_eq!(crate::text::control("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"), None, "SET TRANSACTION is settings.rs's");
         let modes = begin_modes("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").expect("parses");
         assert_eq!(plan(&modes).expect("plans"), (Some(Level::Repeatable), Some(true)));
         assert_eq!(plan(&begin_modes("BEGIN").expect("parses")).expect("plans"), (None, None));
@@ -1972,11 +1945,11 @@ mod tests {
     #[test]
     fn a_comment_before_a_control_word_is_skipped() {
         // (dbt sends `/* {"app": "dbt"} */ commit;`; a `--` comment ends at its newline)
-        assert_eq!(control("/* {\"app\": \"dbt\"} */ commit;"), Some("COMMIT"));
-        assert_eq!(control("-- c\nBEGIN"), Some("BEGIN"));
-        assert_eq!(control("/* c */ START TRANSACTION READ ONLY"), Some("BEGIN"));
-        assert_eq!(control("-- c\nROLLBACK"), Some("ROLLBACK"));
-        assert_eq!(control("/* c */ SELECT 1"), None);
+        assert_eq!(crate::text::control("/* {\"app\": \"dbt\"} */ commit;"), Some("COMMIT"));
+        assert_eq!(crate::text::control("-- c\nBEGIN"), Some("BEGIN"));
+        assert_eq!(crate::text::control("/* c */ START TRANSACTION READ ONLY"), Some("BEGIN"));
+        assert_eq!(crate::text::control("-- c\nROLLBACK"), Some("ROLLBACK"));
+        assert_eq!(crate::text::control("/* c */ SELECT 1"), None);
     }
 
     #[test]

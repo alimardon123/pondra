@@ -382,7 +382,7 @@ impl Backend {
             eprintln!("pg {user}: {sql}");
         }
         let statement = crate::text::first_word(&sql); // (dbt's leading comment is no part of the statement)
-        if let Some(word) = crate::txn::control(statement) {
+        if let Some(word) = crate::text::control(statement) {
             // BEGIN, COMMIT, ROLLBACK: this connection's transaction (ADR-036 §5)
             let answer = crate::txn::command(&self.app, word, statement).await;
             crate::cursors::sweep(); // (a COMMIT or ROLLBACK ends the cursors without HOLD: their answers go now, refused or not)
@@ -506,7 +506,7 @@ impl Backend {
         let run = async { crate::panics::door(Box::pin(self.run(user, sql, format))).await.unwrap_or_else(|m| Err(user_error(anyhow::anyhow!(m)))) };
         let out = crate::audit::statement(&self.app, sql, run).await;
         if let Err(e) = &out {
-            if crate::txn::control(sql).is_none() {
+            if crate::text::control(sql).is_none() {
                 crate::txn::failed(&e.to_string());
             }
         }

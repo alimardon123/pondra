@@ -1243,6 +1243,35 @@ fn not_kept(what: &str) -> anyhow::Error {
     crate::codes::coded("0A000", format!("a page doesn't keep {what} yet: its tables keep only NOT NULL and DEFAULT, so they would take any rows; make the table without it, or keep it on a node"))
 }
 
+/// The statements a page doesn't take yet, refused by name before anything is parsed (ADR-072: a form that can't do a thing
+/// says so, and says what to write instead). A transaction word, DECLARE, MERGE and the type statements each name what to
+/// write in its place; DataFusion's own words for them name nothing of the kind. Words are whole and read past comments, so
+/// a table named `merged` or a string `'begin'` is not one of them.
+fn not_taken(sql: &str) -> anyhow::Result<()> {
+    if let Some(word) = crate::text::control(sql) {
+        return Err(crate::codes::coded("0A000", format!("a page has no transactions yet ({word}): each statement it runs is its own, so run them one at a time, or in a transaction on a node")));
+    }
+    let words = crate::text::first_words(sql, 4);
+    if begins(&words, &["DECLARE"]) {
+        return Err(crate::codes::coded("0A000", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"));
+    }
+    if begins(&words, &["MERGE"]) {
+        return Err(crate::codes::coded("0A000", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"));
+    }
+    match TYPE_STATEMENTS.into_iter().find(|pattern| begins(&words, pattern)) {
+        Some(pattern) => Err(crate::codes::coded("0A000", format!("a page makes no types yet ({}): make the column text, or keep the type on a node", pattern.join(" ")))),
+        None => Ok(()),
+    }
+}
+
+/// The words of the statements that make or drop a type, as `not_taken` reads them.
+const TYPE_STATEMENTS: [&[&str]; 4] = [&["CREATE", "TYPE"], &["CREATE", "OR", "REPLACE", "TYPE"], &["DROP", "TYPE"], &["ALTER", "TYPE"]];
+
+/// Whether `words` begin with `pattern`'s words (`text::first_words` gives them upper-cased, as a pattern is written).
+fn begins(words: &[String], pattern: &[&str]) -> bool {
+    words.len() >= pattern.len() && words.iter().zip(pattern).all(|(word, p)| word == p)
+}
+
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
 /// NOT EXISTS`), `DROP TABLE`, and INSERT, UPDATE and DELETE into a page's own table are what it takes. `CREATE EXTERNAL
 /// TABLE` is refused by name: a native page has `file://` registered, so it would read its machine's disk. A write into
@@ -1356,7 +1385,10 @@ impl Host for PageHost<'_> {
         "page".to_string()
     }
 
+    // (the front asks the host first, before anything is parsed: a statement a page doesn't take is refused here, in the
+    // words that say what to write instead, as a node refuses what it doesn't take, and not in DataFusion's)
     async fn own(&self, sql: &str) -> anyhow::Result<Own> {
+        not_taken(sql)?;
         Ok(Own::Go(sql.to_string()))
     }
 
@@ -1710,6 +1742,42 @@ mod tests {
             assert!(body.contains(words), "{sql}: {body}");
             let read = page.request("POST", "/sql", &[], "SELECT * FROM t".into()).await;
             assert_eq!((read.status, read.header("x-pondra-sqlstate")), (404, Some("42P01")), "{sql}");
+        }
+    }
+
+    /// A page names the statements it doesn't take yet, before anything is parsed (`not_taken`): each answers 0A000 with words
+    /// that say what to write instead. The words that only look like them (a string, a table's name, a column) run.
+    #[tokio::test]
+    async fn a_page_names_the_statements_it_doesnt_take() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
+        let refused = [
+            "BEGIN", "begin transaction;", "START TRANSACTION", "COMMIT", "END", "ROLLBACK", "ROLLBACK TO SAVEPOINT a", "SAVEPOINT a",
+            "RELEASE a", "/* {\"app\": \"dbt\"} */ commit;", "DECLARE $x = 1", "declare $mode = 'full'",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "CREATE TYPE mood AS ENUM ('sad', 'ok')", "DROP TYPE mood",
+        ];
+        for sql in refused {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            let body = std::str::from_utf8(&got.body).unwrap();
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}: {body}");
+            assert!(body.starts_with("a page"), "{sql}: {body}");
+        }
+        for (sql, words) in [
+            ("BEGIN", "a page has no transactions yet (BEGIN): each statement it runs is its own, so run them one at a time, or in a transaction on a node"),
+            ("DECLARE $x = 1", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"),
+            ("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"),
+            ("CREATE TYPE mood AS ENUM ('sad', 'ok')", "a page makes no types yet (CREATE TYPE): make the column text, or keep the type on a node"),
+        ] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!(std::str::from_utf8(&got.body).unwrap(), words, "{sql}");
+        }
+        for sql in [
+            "SELECT 'begin' AS w",
+            "CREATE TABLE merged AS SELECT 1 AS declared",
+            "SELECT declared FROM merged",
+            "CREATE TABLE types AS SELECT 1 AS id",
+        ] {
+            assert_eq!(page.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
         }
     }
 
