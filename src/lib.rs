@@ -53,6 +53,7 @@ mod pg_json_sets;
 mod pg_text;
 pub mod pg_bytea;
 mod optimize;
+mod held;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -82,7 +83,6 @@ mod read_delta;
 #[cfg(feature = "server")] mod copy;
 #[cfg(feature = "server")] mod cursors;
 #[cfg(feature = "server")] mod guard;
-mod held;
 #[cfg(feature = "server")] mod hilbert;
 #[cfg(feature = "server")] mod history;
 #[cfg(feature = "server")] mod ddl;
