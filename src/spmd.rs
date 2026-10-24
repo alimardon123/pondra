@@ -845,11 +845,16 @@ impl Job {
         let id = s.shuffle.as_ref().expect("a shuffle").id.clone();
         let which = |p: &Arc<dyn ExecutionPlan>| exchanges.iter().position(|x| Arc::ptr_eq(&x.plan, p)).map(|k| (k, hashed(p) && !exchanges[k].own));
         let joins = crate::skew::joins(&region, &which, exchanges.len());
-        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), subqueries, joins, at: std::time::Instant::now(), done: Default::default() });
         let mut jobs = JOBS.lock().unwrap();
         // (a shuffle given up on while this one was being planned must not be left behind)
         ensure!(!DROPPED.lock().unwrap().contains_key(&id), "shuffle abandoned");
         jobs.retain(|_, j| !j.stale());
+        // (a retry's open, beside the first try's still planning, takes the job the first try made: one job holds
+        // the shuffle's buckets, and only its drop clears them)
+        if let Some(open) = jobs.get(&id) {
+            return Ok(Some(open.clone()));
+        }
+        let job = Arc::new(Job { id: id.clone(), ctx, plan, exchanges, cut, shape: shape(&region), buckets: Default::default(), subqueries, joins, at: std::time::Instant::now(), done: Default::default() });
         jobs.insert(id, job.clone());
         Ok(Some(job))
     }
@@ -1205,11 +1210,12 @@ fn shape(p: &Arc<dyn ExecutionPlan>) -> String {
     format!("{}[{}]", what.trim(), p.children().iter().map(|c| shape(c)).collect::<Vec<_>>().join(", "))
 }
 
-/// For tests only: a step's first try on this node fails once after it has run, as a reply lost on
-/// the way does (`PONDRA_DEBUG_FAIL_STEP` names the step); the second try goes through.
-fn fails_once(sh: &Shuffle) -> Result<()> {
-    if !sh.again && crate::env::parse::<usize>("PONDRA_DEBUG_FAIL_STEP") == Some(sh.step) {
-        bail!("step {} failed on purpose (PONDRA_DEBUG_FAIL_STEP)", sh.step);
+/// For tests only: a step's first try on this node fails once, as a reply lost on the way does, and the
+/// second try goes through. `var` names the setting that holds the step: `PONDRA_DEBUG_FAIL_STEP` fails
+/// it after it has run, `PONDRA_DEBUG_FAIL_STEP_AFTER` after its buckets are kept.
+fn fails_once(sh: &Shuffle, var: &str) -> Result<()> {
+    if !sh.again && crate::env::parse::<usize>(var) == Some(sh.step) {
+        bail!("step {} failed on purpose ({var})", sh.step);
     }
     Ok(())
 }
@@ -1221,6 +1227,12 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     let open = JOBS.lock().unwrap().get(&sh.id).cloned();
     let job = match (open, sh.step) {
         (Some(job), _) => job,
+        // (a test's race: two opens at once, as a retry beside a first try still planning makes them; the second's
+        // answer, or its error, is not used)
+        (None, 0) if crate::env::is_set("PONDRA_DEBUG_OPEN_TWICE") => {
+            let (first, _second) = futures::join!(Job::open(lake, s), Job::open(lake, s));
+            first?.context("can't shuffle this plan here")?
+        }
         (None, 0) => Job::open(lake, s).await?.context("can't shuffle this plan here")?,
         (None, _) => bail!("shuffle expired"),
     };
@@ -1243,7 +1255,7 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
     let tag = format!("{}{}", sh.step, if sh.again { "r" } else { "" });
     if last {
         let out = drain(&top, job.ctx.task_ctx(), &sh.id, &format!("out-{tag}")).await?;
-        fails_once(sh)?;
+        fails_once(sh, "PONDRA_DEBUG_FAIL_STEP")?;
         job.done.store(true, std::sync::atomic::Ordering::Relaxed); // (the sweep frees its scratch shortly)
         return Ok((job.shape.clone(), out));
     }
@@ -1263,11 +1275,12 @@ async fn step(lake: &Lake, s: &Slice, sh: &Shuffle) -> Result<(String, Vec<Spill
         }
     };
     let sent: Vec<Vec<u64>> = made.iter().map(|to| to.iter().map(|s| s.bytes()).collect()).collect();
-    fails_once(sh)?;
+    fails_once(sh, "PONDRA_DEBUG_FAIL_STEP")?;
     let mut buckets = job.buckets.lock().unwrap();
     for (to, spill) in made.into_iter().enumerate() {
         buckets.insert((sh.step, to), spill);
     }
+    fails_once(sh, "PONDRA_DEBUG_FAIL_STEP_AFTER")?;
     Ok((format!("{}\n{}", job.shape, serde_json::to_string(&sent)?), vec![]))
 }
 

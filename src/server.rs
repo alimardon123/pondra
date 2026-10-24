@@ -732,7 +732,7 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
         let _ = &streamed;
         Ok::<_, std::io::Error>(f.encode())
     });
-    Body::from_stream(frames).into_response()
+    Body::from_stream(crate::drain::endless(frames)).into_response() // (never ends by itself: it ends when the node's door closes)
 }
 
 #[derive(Deserialize, Default)]
@@ -1617,45 +1617,27 @@ fn big(batches: &[RecordBatch]) -> bool {
     batches.iter().map(|b| counted.count_batch(b)).sum::<usize>() >= crate::query::stream_bytes()
 }
 
-/// An answer in pieces of about 1 MB of Arrow, each written as `render` writes its rows (`Encoding`),
-/// so the pieces together are the answer's bytes. The first piece is written before the body starts,
-/// so a format that can't write the answer's columns (a list in CSV) is refused as `render` refuses
-/// it, with its message; a failure later cuts the body short (no end of it is sent). The batches,
-/// and the memory counted for them, go when the last piece is written, or when the client goes.
+/// An answer already collected, sent in pieces of about 1 MB of Arrow, each written as `render` writes its rows
+/// (`query::hand_out`), so the pieces together are the answer's bytes. The first piece is written before the body
+/// starts, so a format that can't write the answer's columns (a list in CSV) is refused as `render` refuses it,
+/// with its message; a failure later cuts the body short.
 fn stream(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> anyhow::Result<Body> {
-    let parts: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
-    let mut enc = crate::answer::Encoding::new(format);
-    let mut steps = parts.into_iter().map(Some).chain(std::iter::once(None)); // (then the end)
-    let first = enc.step(steps.next().flatten().as_ref())?;
-    // The rest is written on the queries' runtime, at most two pieces ahead of the client: the
-    // node's own runtime keeps to appends and commits (invariant 231).
-    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Bytes>>(2);
-    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let done = ended.clone();
-    crate::panics::aside(async move {
-        let _held = held;
-        for step in steps {
-            let bytes = enc.step(step.as_ref()).map(Bytes::from).map_err(std::io::Error::other);
-            let failed = bytes.is_err();
-            if tx.send(bytes).await.is_err() || failed {
-                return; // (its client went, or the rest can't be written: the body fails, not ends)
-            }
-        }
-        done.store(true, std::sync::atomic::Ordering::Release); // (the end is written: the body may end)
-    });
-    Ok(pieces(crate::query::Handed { first, rest: rx, ended }))
+    Ok(pieces(crate::query::hand_out(batches, format, held)?))
 }
 
 /// The body of an answer in pieces (`query::Handed`): its first piece, then the rest as they are written. A channel
 /// that closes before the last piece was written fails the body, so a client never takes a cut answer for a whole one.
 fn pieces(h: crate::query::Handed) -> Body {
     let crate::query::Handed { first, rest, ended } = h;
+    // (counted until the body's last piece is read, not until its writer ends: the pieces still in the channel are what
+    // a node stopping after the writer would cut short, so a node told to stop waits for them: `drain::Busy::carried`)
+    let busy = crate::drain::Busy::carried();
     let head = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(first)) });
-    let rest = futures::stream::unfold(Some((rest, ended)), |state| async move {
-        let (mut rest, ended) = state?;
+    let rest = futures::stream::unfold(Some((rest, ended, busy)), |state| async move {
+        let (mut rest, ended, busy) = state?;
         match rest.recv().await {
-            Some(piece) => Some((piece, Some((rest, ended)))),
-            None if ended.load(std::sync::atomic::Ordering::Acquire) => None,
+            Some(piece) => Some((piece, Some((rest, ended, busy)))),
+            None if ended.load(std::sync::atomic::Ordering::Acquire) => None, // (the count goes with the state here)
             None => Some((Err(std::io::Error::other("the answer stopped before its end")), None)),
         }
     });
@@ -1718,7 +1700,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
             hwm.changed().await.ok()?;
         }
     });
-    Body::from_stream(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty())))).into_response()
+    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))))).into_response() // (never ends by itself: `drain::endless`)
 }
 
 fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {

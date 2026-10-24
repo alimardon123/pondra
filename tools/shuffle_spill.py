@@ -16,7 +16,11 @@ this proves:
   the results of each stage cross the wire a piece at a time rather than whole;
 - the buckets came out even (`pondra_shuffle_skew`, the biggest against the average);
 - with a node killed just before the query, the shuffle runs again without it and still answers;
-- a step that fails once on a node (PONDRA_DEBUG_FAIL_STEP) is run again and answers as one node does.
+- a step that fails once on a node is run again and answers as one node does: before its buckets are kept
+  (PONDRA_DEBUG_FAIL_STEP), after they are kept (PONDRA_DEBUG_FAIL_STEP_AFTER, a middle step of a query with two
+  exchanges), and at the last step of that query (PONDRA_DEBUG_FAIL_STEP=2);
+- a shuffle opened twice at once on a node (PONDRA_DEBUG_OPEN_TWICE, a retry beside a first try still planning)
+  answers as one node does, and the coordinator drops no node for it.
 """
 import argparse, http.client, itertools, json, os, subprocess, sys, threading, time
 
@@ -44,20 +48,40 @@ def rss_mb(node):
 
 
 def fails_once(port, rows):
-    """A step that fails once on a node is run again and answers as one node does. PONDRA_DEBUG_FAIL_STEP makes
-    node 1 (a follower) fail step 0, the shuffle's first step, and node 2 fail step 1, which is this query's last
-    step (one exchange). Each run has a lake and three nodes of its own."""
+    """A step that fails once on a node is run again and answers as one node does, and a shuffle opened twice at once
+    on a node is one job (the others' buckets are not cleared under them). Five runs, each with a lake and three
+    nodes of its own, its own query and its own settings (`runs`):
+    - PONDRA_DEBUG_FAIL_STEP makes node 1 (a follower) fail step 0, the shuffle's first step, and node 2 fail step 1,
+      which is the last step of a query with one exchange;
+    - PONDRA_DEBUG_FAIL_STEP_AFTER makes node 1 fail step 1 once its buckets are kept: a middle step, which reads
+      the buckets of exchange 0 and keeps those of exchange 1 for the last step;
+    - PONDRA_DEBUG_FAIL_STEP=2 makes node 2 fail the last step of that two-exchange query;
+    - PONDRA_DEBUG_OPEN_TWICE makes node 1 open the shuffle twice at once: the coordinator must not run it again
+      without that node (the second open used to replace the first job and clear its buckets).
+    Each run's answers are compared with one node's, and the coordinator's log (`run`) says what the run should show."""
     scratch = os.path.join(harness.tempfile.gettempdir(), f"pondra-fail-{os.getpid()}")
-    q = "SELECT k, sum(v) AS s, count(*) AS n FROM ev GROUP BY k ORDER BY k LIMIT 20"
+    one_exchange = "SELECT k, sum(v) AS s, count(*) AS n FROM ev GROUP BY k ORDER BY k LIMIT 20"
+    two_exchanges = "SELECT s % 7 AS g, count(*) AS n, sum(s) AS t FROM (SELECT k, sum(v) AS s FROM ev GROUP BY k) GROUP BY 1 ORDER BY 1"
     check = "SELECT count(*) AS keys, sum(s) AS total FROM (SELECT k, sum(v) AS s FROM ev GROUP BY k)"
     once = lambda sql: (sql + f" -- {next(RUNS)}").encode()
-    checks, answers, said = {}, {}, []
-    runs = [(1, 0, "a step that fails once on a follower answers on its second try with the same rows as one node"),
-            (2, 1, "a last step that fails once answers with the same rows")]
-    for r, (failing, step, key) in enumerate(runs):
+    # (query, each node's settings beyond the spill ones, the check's key, what the coordinator's log must say, what it must not)
+    runs = [
+        (one_exchange, {1: {"PONDRA_DEBUG_FAIL_STEP": "0"}}, "a step that fails once on a follower answers on its second try with the same rows as one node",
+         ["second try answered"], []),
+        (one_exchange, {2: {"PONDRA_DEBUG_FAIL_STEP": "1"}}, "a last step that fails once answers with the same rows",
+         ["second try answered"], []),
+        (two_exchanges, {1: {"PONDRA_DEBUG_FAIL_STEP_AFTER": "1"}}, "a middle step that fails once after its buckets are kept answers on its second try, with the same rows",
+         ["on purpose (PONDRA_DEBUG_FAIL_STEP_AFTER)", "second try answered"], []),
+        (two_exchanges, {2: {"PONDRA_DEBUG_FAIL_STEP": "2"}}, "the last step of two exchanges fails once and answers with the same rows",
+         ["step 2 failed on purpose (PONDRA_DEBUG_FAIL_STEP)", "second try answered"], []),
+        (two_exchanges, {1: {"PONDRA_DEBUG_OPEN_TWICE": "1"}}, "a shuffle opened twice at once answers with the same rows, and no node is dropped",
+         [], ["running it again without that node"]),
+    ]
+    checks, answers = {}, {}
+    for r, (sql, extra, key, says, says_not) in enumerate(runs):
         base = port + 4 * r
         lake = harness.new_lake()
-        envs = [{"PONDRA_SPILL_MB": "1", "PONDRA_DEBUG_SPREAD": "1", "PONDRA_CACHE_DIR": f"{scratch}/{r}-{i}", **({"PONDRA_DEBUG_FAIL_STEP": str(step)} if i == failing else {})} for i in range(3)]
+        envs = [{"PONDRA_SPILL_MB": "1", "PONDRA_DEBUG_SPREAD": "1", "PONDRA_CACHE_DIR": f"{scratch}/{r}-{i}", **extra.get(i, {})} for i in range(3)]
         nodes = [Node(lake, base + i, env=envs[i], memory_gb=A.memory_gb, tier_secs=0).start() for i in range(3)]
         deadline = time.time() + 120  # (the nodes listed before the first statement, as spread_tpch.py waits for them)
         while len(call(base, "GET", "/stats").get("nodes", [])) < 3 and time.time() < deadline:
@@ -68,26 +92,28 @@ def fails_once(port, rows):
             call(base, "POST", "/sql", f"INSERT INTO ev SELECT value + {i}, 'key-' || (value + {i}), (value % 97) * 1.5 FROM generate_series(1, {n})".encode(), timeout=3600)
         call(base, "POST", "/tier", timeout=3600)
 
-        def answer(spread, sql):
+        def answer(spread, text):
             try:
-                return call(base, "POST", f"/sql?spread={spread}", once(sql), timeout=3600)
+                return call(base, "POST", f"/sql?spread={spread}", once(text), timeout=3600)
             except RuntimeError as e:
                 return f"error: {e}"  # (what a run that fails answers: shown, not raised)
 
         shuffled = metrics(base).get("pondra_shuffled_queries_total", 0)
         one, spread_one = answer(0, check), answer(1, check)
-        rows_one, rows_spread = answer(0, q), answer(1, q)
+        rows_one, rows_spread = answer(0, sql), answer(1, sql)
         shuffled = metrics(base).get("pondra_shuffled_queries_total", 0) - shuffled
-        said.append("second try answered" in open(nodes[0].log).read())  # (the coordinator's stderr: `run`)
-        checks[key] = one == spread_one and rows_one == rows_spread and shuffled >= 1
-        answers[key] = {"one_node": one, "spread": spread_one, "rows_one_node": rows_one, "rows_spread": rows_spread, "shuffled": shuffled}
+        log = open(nodes[0].log, errors="replace").read()  # (the coordinator's stderr: `run`, `spread_once`)
+        logged = all(s in log for s in says) and not any(s in log for s in says_not)
+        checks[key] = one == spread_one and rows_one == rows_spread and shuffled >= 1 and logged
+        plan = [l.strip() for l in log.splitlines() if l.startswith("spread: shuffled")][-1:]  # (the last query's exchanges, as the coordinator planned them)
+        answers[key] = {"one_node": one, "spread": spread_one, "rows_one_node": rows_one, "rows_spread": rows_spread, "shuffled": shuffled, "logged": logged, "plan": plan}
         for n in nodes:
             n.kill()
         if not harness.A.keep and not lake.startswith("s3://"):
             subprocess.run(["rm", "-rf", lake])
     subprocess.run(["rm", "-rf", scratch])
-    checks["the coordinator says the step ran again"] = all(said)
     return checks, answers
+
 
 def load(port, rows):
     """Table `ev`: `rows` rows, as many distinct keys, tiered. One INSERT per million rows: as many keys as rows, so

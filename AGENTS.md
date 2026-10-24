@@ -118,7 +118,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); round 35 served.rs (a lake's store over HTTP:
-          pondra://host:port, ADR-072 §8, invariant 299)
+          pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
+          in the old one's place in one commit: invariant 425)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
@@ -2911,8 +2912,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    the plan it replaces, which couldn't answer. A query that fits plans as before (TPC-H SF1: the same answers, B/A
    wall 0.98). `harness.py scale`: "a median of 12M values in 3 groups past the memory limit answers…" (3.9 s on a
    0.05 GB node; refused before, 53200); `frugal::tests::medians_…`.
-425. **`CREATE OR REPLACE TABLE` keeps the old table until the new one takes its place, in one commit** (`write::replacing`,
-   `ddl::replace`). The new table is made and filled under a staged name of its job (`sys::staged`: `t$new-…`, hidden,
+425. **`CREATE OR REPLACE TABLE` keeps the old table until the new one takes its place, in one commit** (`replace::replacing`,
+   `replace::replace`). The new table is made and filled under a staged name of its job (`sys::staged`: `t$new-…`, hidden,
    never published), so its query may read the old `t`, and a statement that fails or stops leaves `t` as it was; the
    leader then sets the old table's entries aside as a drop sets them (UNDROP brings it back) and moves the staged ones
    under `t`, every entry at the largest `tiered` mark (as a swap, invariant 281), with `t`'s appends held meanwhile

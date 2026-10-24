@@ -77,8 +77,8 @@ impl Held {
     /// racing it): what it committed is made durable, the catalog is checkpointed, and a leader gives up
     /// its term, so the next node leads at once instead of waiting out the lease (invariant 210). A node
     /// stopped before its lake is open gives up its term without the durable wait and the checkpoint.
-    /// In between, what the node started ends (ADR-061 §4): its loops, the HTTP door, then its
-    /// catalog's own work, so nothing of it writes the lake once its term is given back (a keep-alive
+    /// In between, what the node started ends (ADR-061 §4): the HTTP door closes (`drain::close_door`), then its
+    /// loops, then its catalog's own work, so nothing of it writes the lake once its term is given back (a keep-alive
     /// left running would write the leader's mark again).
     pub(crate) async fn stop(&self) {
         let (term, lake) = (self.term.get(), self.lake.get());
@@ -93,6 +93,10 @@ impl Held {
             let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.checkpoint()).await;
             tr("checkpoint");
         }
+        // (after the checkpoint, as a leader's followers may still call the door until then; before the tasks end, so
+        // the answers the door is writing go out whole first)
+        crate::drain::close_door().await;
+        tr("door");
         panics::abort_all();
         tr("tasks");
         if let Some(l) = lake {
@@ -468,7 +472,13 @@ impl Node {
         // (the HTTP door, a loop the node can't do without: a panic in it aborts, as invariant 178 says; `serving` waits on it)
         let router = server::router(app);
         let door = router.clone();
-        let served = panics::spawn(async move { axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).await.map_err(anyhow::Error::from) }); // (who asks: `console::save_settings`)
+        let served = panics::spawn(async move {
+            // (closing once `drain::close_door` runs: no new connections, each one's answer finished, then the serve ends)
+            drain::door_open();
+            let out = axum::serve(listener, door.into_make_service_with_connect_info::<tls::Peer>()).with_graceful_shutdown(drain::closing()).await.map_err(anyhow::Error::from); // (who asks: `console::save_settings`)
+            drain::door_closed();
+            out
+        });
         Ok(Node { held, served, router })
     }
 

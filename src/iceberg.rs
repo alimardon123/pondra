@@ -189,7 +189,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     let Some(fields) = fields(meta) else { return Ok(None) }; // a type Iceberg can't carry
     let Some(parts) = crate::delta::publishable(lake, meta).await? else { return Ok(None) };
     let cols = columns(meta);
-    let key = format!("i/{table}");
+    let key = crate::delta::state_key(table, "iceberg");
     let mut st: Published = lake.cat.get(&key).await?.unwrap_or_default();
     let here = lake.full(&format!("data/{}", meta.folder(table)));
     let moved = !st.location.is_empty() && st.location.trim_end_matches('/') != here.trim_end_matches('/');
@@ -208,7 +208,7 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if st.uuid.is_empty() {
         st.uuid = uuid::Uuid::new_v4().to_string();
     }
-    let (dir, now, mut v) = (format!("data/{}/metadata", meta.folder(table)), crate::log::now_ms(), st.version + 1);
+    let (dir, now, mut v) = (metadata_dir(meta.folder(table)), crate::log::now_ms(), st.version + 1);
     // (a version already there was written by an attempt that crashed before recording it: it's
     // never overwritten, so this one takes the next number)
     while lake.store.head(&Path::from(format!("{dir}/v{v}.metadata.json"))).await.is_ok() {
@@ -293,9 +293,8 @@ pub async fn publish(lake: &Lake, table: &str, meta: &TableMeta, named: Option<&
     if inline_changed {
         st.dropped.extend([st.inline.take(), st.inline_deleting.take()].into_iter().flatten().map(|a| (v, a.path)));
     }
-    for (s, list) in &gone {
-        lake.delete(&format!("{dir}/v{}.metadata.json", s["sequence-number"])).await;
-        lake.delete(list).await;
+    for object in snapshot_objects(&dir, &gone) {
+        lake.delete(&object).await;
     }
     let oldest = st.snapshots.first().map_or(v, |(s, _)| s["sequence-number"].as_u64().unwrap_or(v));
     for (_, path) in st.dropped.iter().filter(|(at, _)| *at < oldest) {
@@ -331,6 +330,25 @@ fn forget(st: &mut Published) -> Vec<(Value, String)> {
     st.deleted.clear();
     st.since.clear();
     std::mem::take(&mut st.snapshots)
+}
+
+/// The metadata folder of a table's folder under `data/` (where its versions, snapshot lists and version hint are).
+fn metadata_dir(folder: &str) -> String { format!("data/{folder}/metadata") }
+
+/// `CREATE OR REPLACE TABLE` continues a table's Iceberg state under the new table, whose files are in the same folder: the
+/// same uuid and version, with its history let go as `forget` lets it go (the old schema's snapshots must not be read with the
+/// new one). Returns the state's bytes to record, and the objects of the snapshots let go (their metadata and manifest lists),
+/// which the caller deletes once the new version is written.
+pub fn reset(state: &[u8], folder: &str) -> Result<(Vec<u8>, Vec<String>)> {
+    let mut st: Published = serde_json::from_slice(state)?;
+    let dir = metadata_dir(folder);
+    let objects = snapshot_objects(&dir, &forget(&mut st));
+    Ok((json(&st), objects))
+}
+
+/// The objects of snapshots let go: each one's metadata version and manifest list.
+fn snapshot_objects(dir: &str, snapshots: &[(Value, String)]) -> Vec<String> {
+    snapshots.iter().flat_map(|(s, list)| [format!("{dir}/v{}.metadata.json", s["sequence-number"]), list.clone()]).collect()
 }
 
 /// Whether a published table names a place other than this lake's (the lake was moved or copied: invariant
@@ -973,7 +991,7 @@ async fn load(axum::extract::State(app): axum::extract::State<crate::server::App
 
 /// A table's current version, as the catalog answers it (`metadata-location`, `metadata`).
 async fn loaded(lake: &Lake, table: &str) -> Result<Value> {
-    let st: Published = lake.cat.get(&format!("i/{table}")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
+    let st: Published = lake.cat.get(&crate::delta::state_key(table, "iceberg")).await?.filter(|p: &Published| p.version > 0).context("not published")?;
     let path = format!("data/{}/metadata/v{}.metadata.json", crate::store::folder_of(lake, table).await?, st.version);
     let metadata: Value = serde_json::from_slice(&lake.object(&path).await?)?;
     Ok(json!({"metadata-location": lake.full(&path), "metadata": metadata, "config": {}}))
@@ -1399,7 +1417,7 @@ fn requirements(meta: &Value, asked: &Value) -> Result<(), Refusal> {
 
 /// Does the table still stand as the writer read it (its uuid, and main's snapshot)?
 async fn check(lake: &Lake, c: &Commit) -> Result<()> {
-    let st: Published = lake.cat.get(&format!("i/{}", c.table)).await?.unwrap_or_default();
+    let st: Published = lake.cat.get(&crate::delta::state_key(&c.table, "iceberg")).await?.unwrap_or_default();
     anyhow::ensure!(c.uuid.as_ref().is_none_or(|u| *u == st.uuid), "{CONFLICT}: it is another table now (a new uuid)");
     let main = st.snapshots.last().and_then(|(s, _)| s["snapshot-id"].as_i64());
     let snapshot = |s: Option<i64>| s.map_or("none".to_string(), |s| s.to_string());

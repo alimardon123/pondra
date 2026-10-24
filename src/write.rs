@@ -77,7 +77,7 @@ fn already(name: &str) -> anyhow::Error {
 
 /// A table's definition, marked with the job of the CREATE TABLE that sends it: a `CREATE TABLE … AS SELECT` (or a
 /// plain one) sends its definition under its own job only, so another statement's is refused while the table is there.
-fn made_by_job(spec: String, job: &str) -> Result<String> {
+pub(crate) fn made_by_job(spec: String, job: &str) -> Result<String> {
     let mut spec: Value = serde_json::from_str(&spec)?; // (create_spec's: always an object)
     spec["made_by"] = job.into();
     Ok(spec.to_string())
@@ -161,7 +161,16 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         None => {
             crate::ddl::unclaimed(lake, owner).await?;
             // (a renamed table may still have this name's folder; a staged table's folder is its table's name, unless taken)
-            let folder = crate::ddl::free_folder(lake, owner).await?.or_else(|| (owner != name.as_str()).then(|| owner.to_string()));
+            // (a staged table replacing a live one takes that table's folder: its new files go beside the old one's (uuid
+            // names), so the published copies stay where other engines read them)
+            let live = match owner != name.as_str() {
+                true => lake.cat.get::<TableMeta>(&table_key(owner)).await?,
+                false => None,
+            };
+            let folder = match live {
+                Some(old) => Some(old.folder(owner).to_string()),
+                None => crate::ddl::free_folder(lake, owner).await?.or_else(|| (owner != name.as_str()).then(|| owner.to_string())),
+            };
             let mut identity = identity;
             for (c, i) in identity.iter_mut() {
                 let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
@@ -188,6 +197,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let republish = publish.as_ref().is_some_and(|p| *p != m.publish);
             // (Delta and Iceberg name a table's files under its folder; a clone lists others': ADR-043)
             ensure!(!republish || m.shares.is_empty() || publish.as_ref().is_some_and(|p| p.is_empty()), "{name} is a clone, whose files are partly another table's: it can't be published (CREATE TABLE … AS SELECT * FROM {name} copies it)");
+            if publish.iter().flatten().any(|f| !m.publish.contains(f)) {
+                crate::ddl::publishes_alone(lake, name, m.folder(name), &[name]).await?;
+            }
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);
             let reretain = retention.is_some() && retention != m.retention_secs;
@@ -1604,7 +1616,7 @@ where
 {
     let name = object(&c.name);
     if c.or_replace {
-        replacing(&run, lake, c, &name, job, files, armed).await
+        crate::replace::replacing(&run, lake, c, &name, job, files, armed).await
     } else {
         ctas(&run, lake, c, &name, job, files, armed).await
     }
@@ -1630,74 +1642,14 @@ where
     out
 }
 
-/// CREATE OR REPLACE TABLE: the new table is made under a staged name (`sys::staged`), its rows go in, and the leader puts it
-/// in `name`'s place in one commit (`Ddl::ReplaceTable`). Until then `name` is as it was, so a failed or stopped statement
-/// leaves it so. A retry whose replace went through answers as a duplicate; a retry whose rows went into a table that was let
-/// go is refused by name (its job's rows are recorded, so they would not be written again).
-async fn replacing<F>(run: &F, lake: &Lake, c: &ast::CreateTable, name: &str, job: &str, files: bool, armed: &mut (dyn FnMut(&str) + Send)) -> Result<Value>
-where
-    F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
-{
-    if crate::ddl::resolve(lake, name).await?.0.is_some() {
-        return Err(crate::codes::coded("0A000", format!("CREATE OR REPLACE TABLE {name}: another database's table is replaced from a node of that database")));
-    }
-    if lake.cat.get::<TableMeta>(&table_key(name)).await?.is_some_and(|m| m.made_by.as_deref() == Some(job)) {
-        return Ok(j!({"table": name, "duplicate": true})); // (a retry: the replace this job sent went through)
-    }
-    crate::ddl::replaceable(lake, name).await?; // (refused before any query runs)
-    let staged = crate::sys::staged(name, job);
-    let existed = lake.cat.get::<TableMeta>(&table_key(&staged)).await?.is_some(); // (a node left this job's staged table: its rows are in it)
-    let spec = made_by_job(create_spec(c, lake, files).await?, job)?;
-    let mut out = run(Stmt::Define(staged.clone(), spec)).await.map_err(|e| named(e, &staged, name))?;
-    armed(&staged);
-    if let Some(q) = &c.query {
-        let inserted = run(Stmt::Insert(staged.clone(), q.to_string())).await.map_err(|e| named(e, &staged, name));
-        let rows = match inserted {
-            Ok(v) if v["duplicate"] == true && !existed => {
-                Err(anyhow::anyhow!("{name}: this statement's rows were written before, into a table that was let go, so they can't be written again: run the statement again with a new job"))
-            }
-            other => other,
-        };
-        out = match rows {
-            Ok(v) => v,
-            Err(e) => {
-                undo_made(run, &staged, job).await; // (nothing replaced: `name` is as it was)
-                return Err(e);
-            }
-        };
-    }
-    let replace = crate::ddl::Ddl::ReplaceTable { name: name.to_string(), staged: staged.clone() };
-    if let Err(e) = run(Stmt::Ddl(vec![replace])).await {
-        undo_made(run, &staged, job).await;
-        return Err(named(e, &staged, name));
-    }
-    if let Some(t) = out.get_mut("table") {
-        *t = Value::from(name); // (the staged table's answer names the table it replaced)
-    }
-    Ok(out)
-}
-
 /// Drops the table a statement made under `name` after it failed or stopped: purged, as `made_drop` says (never another
 /// statement's table). The statement's own error stays its answer.
-async fn undo_made<F>(run: &F, name: &str, job: &str)
+pub(crate) async fn undo_made<F>(run: &F, name: &str, job: &str)
 where
     F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
 {
     if let Err(e) = run(made_drop(name, job)).await {
         eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS failed didn't answer: {e:#}");
-    }
-}
-
-/// An error of a replace's steps, said of the table the statement named: the staged name (`t$new-…`) becomes `t`, and its code
-/// stays. An error that doesn't name the staged table goes on as it is.
-fn named(e: anyhow::Error, staged: &str, name: &str) -> anyhow::Error {
-    if !format!("{e:#}").contains(staged) {
-        return e;
-    }
-    let text = format!("{e:#}").replace(staged, name);
-    match crate::codes::of(&e) {
-        "XX000" => anyhow::anyhow!(text),
-        code => crate::codes::coded(code, text),
     }
 }
 

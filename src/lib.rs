@@ -158,6 +158,7 @@ mod read_delta;
 #[cfg(feature = "server")] mod python;
 #[cfg(feature = "server")] mod runs;
 #[cfg(feature = "server")] mod skew;
+#[cfg(feature = "server")] mod replace;
 #[cfg(feature = "server")] mod replica;
 #[cfg(feature = "server")] mod routines;
 #[cfg(feature = "server")] mod host;

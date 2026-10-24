@@ -66,7 +66,7 @@ pub async fn publish_named(lake: &Lake, named: &[crate::iceberg::Named<'_>]) -> 
     // A table whose metadata is as last published is skipped without loading its manifests.
     crate::per_node!(static SEEN: std::sync::Mutex<std::collections::HashMap<String, u64>> = Default::default());
     let print = |meta: &TableMeta| std::hash::BuildHasher::hash_one(&std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default(), json(meta));
-    // (a staged table of a CREATE OR REPLACE TABLE is published once it has taken the old table's place: `ddl::replace`)
+    // (a staged table of a CREATE OR REPLACE TABLE is published once it has taken the old table's place: `replace::replace`)
     let tables: Vec<_> = lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().filter(|(key, _)| crate::sys::staged_for(&key[2..]).is_none()).collect();
     let changed: Vec<_> = tables.iter().filter(|(key, meta)| named.iter().any(|n| key[2..] == *n.table) || SEEN.lock().unwrap().get(key) != Some(&print(meta))).collect();
     // Each table's formats publish at once (Delta's PUTs must not add to Iceberg's freshness every
@@ -162,16 +162,64 @@ pub fn left_out(name: &str, meta: &TableMeta) -> Option<String> {
     (!formats.is_empty()).then(|| format!("{name} isn't published as {}, though --publish asks for it: {}", formats.join(" or "), whys.join("; ")))
 }
 
-/// Stop publishing a table in `format`: its metadata goes, so no engine reads a stale copy.
+/// The catalog key of a table's published state in `format`: the Delta log's (`x/`) or the Iceberg metadata's (`i/`).
+pub fn state_key(table: &str, format: &str) -> String {
+    match format {
+        "delta" => format!("x/{table}"),
+        _ => format!("i/{table}"),
+    }
+}
+
+/// A table's published copies, as a drop or a replace takes them out: their states (`keys`) go in the caller's commit and
+/// their objects (`delete`) after it, so other engines read the copies until the commit, and no state is left naming
+/// objects that are gone.
+pub struct Copies {
+    table: String,
+    folder: String,
+    formats: Vec<String>,
+}
+
+impl Copies {
+    /// Those of `formats` whose state the catalog holds for `table`: only those have objects of the table's in `folder` (a
+    /// staged table has none, and its folder is its live table's).
+    pub async fn of(lake: &Lake, table: &str, folder: &str, formats: &[String]) -> Result<Copies> {
+        let mut found = vec![];
+        for format in formats {
+            if lake.cat.get_raw(&state_key(table, format)).await?.is_some() {
+                found.push(format.clone());
+            }
+        }
+        Ok(Copies { table: table.to_string(), folder: folder.to_string(), formats: found })
+    }
+
+    /// Their catalog keys, for the caller's commit to delete.
+    pub fn keys(&self) -> impl Iterator<Item = String> + '_ { self.formats.iter().map(|f| state_key(&self.table, f)) }
+
+    /// Deletes their objects (each format's Delta log or Iceberg metadata), once the commit is in. A failure is logged: no
+    /// state names them any more, so they are garbage.
+    pub async fn delete(&self, lake: &Lake) {
+        for format in &self.formats {
+            let dir = match format.as_str() {
+                "delta" => format!("data/{}/_delta_log", self.folder),
+                _ => format!("data/{}/metadata", self.folder),
+            };
+            let listed: Result<Vec<_>, _> = futures::TryStreamExt::try_collect(lake.store.list(Some(&Path::from(dir)))).await;
+            match listed {
+                Ok(objects) => drop(futures::future::join_all(objects.iter().map(|o| lake.delete(o.location.as_ref()))).await),
+                Err(e) => eprintln!("{}: deleting its {format} copy: {e:#}", self.table),
+            }
+        }
+    }
+}
+
+/// Stop publishing a table in `format`: its state goes, then its objects, so no engine reads a stale copy.
 pub async fn unpublish(lake: &Lake, table: &str, format: &str) -> Result<()> {
-    let folder = crate::store::folder_of(lake, table).await?;
-    let (dir, state) = match format {
-        "delta" => (format!("data/{folder}/_delta_log"), format!("x/{table}")),
-        _ => (format!("data/{folder}/metadata"), format!("i/{table}")),
-    };
-    lake.cat.commit(vec![], &[state]).await?;
-    let objects: Vec<_> = futures::TryStreamExt::try_collect(lake.store.list(Some(&Path::from(dir)))).await?;
-    futures::future::join_all(objects.iter().map(|o| lake.delete(o.location.as_ref()))).await;
+    let copies = Copies::of(lake, table, &crate::store::folder_of(lake, table).await?, &[format.to_string()]).await?;
+    let keys: Vec<String> = copies.keys().collect();
+    if !keys.is_empty() {
+        lake.cat.commit(vec![], &keys).await?;
+    }
+    copies.delete(lake).await;
     Ok(())
 }
 
@@ -187,7 +235,7 @@ pub fn decimal(t: &str) -> Option<(u8, i8)> {
 /// The table's next Delta commit, if its files changed; returns the new publish state to record.
 async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(String, Vec<u8>)>> {
     let Some(parts) = publishable(lake, meta).await? else { return Ok(None) };
-    let (dir, key) = (format!("data/{}/", meta.folder(table)), format!("x/{table}"));
+    let (dir, key) = (format!("data/{}/", meta.folder(table)), state_key(table, "delta"));
     let mut state: Published = lake.cat.get(&key).await?.unwrap_or_default();
     // (once a column was renamed or dropped, Delta's column mapping stays on: it can't be turned off)
     let mapped = meta.mapped() || state.schema.contains(MAPPING_ID);

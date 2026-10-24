@@ -232,7 +232,7 @@ pub enum Ddl {
     AlterColumn { table: String, column: String, change: Change }, // ALTER TABLE … RENAME/DROP/ALTER COLUMN (ADR-022)
     RenameTable { name: String, to: String }, // ALTER TABLE | VIEW … RENAME TO (ADR-030)
     Swap { name: String, with: String }, // ALTER TABLE … SWAP WITH … (write-audit-publish)
-    ReplaceTable { name: String, staged: String }, // CREATE OR REPLACE TABLE: the staged table takes name's place in one commit (`replace`, audit M3)
+    ReplaceTable { name: String, staged: String }, // CREATE OR REPLACE TABLE: the staged table takes name's place in one commit (`replace::replace`, audit M3)
     CreateRoutine { name: String, routine: crate::expander::Routine, replace: bool }, // CREATE MACRO, CREATE PROCEDURE (ADR-023)
     DropRoutine { name: String, if_exists: bool },
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
@@ -507,7 +507,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::AlterColumn { table, column, change } => alter_column(lake, &table, &column, change).await,
         Ddl::RenameTable { name, to } => rename(lake, &name, &to).await,
         Ddl::Swap { name, with } => swap(lake, &name, &with).await,
-        Ddl::ReplaceTable { name, staged } => replace(lake, &name, &staged).await,
+        Ddl::ReplaceTable { name, staged } => crate::replace::replace(lake, &name, &staged).await,
         Ddl::CreateRoutine { name, routine, replace } => crate::routines::create(lake, &name, routine, replace).await,
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
@@ -849,7 +849,7 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
 /// (`tier::collect_orphans`). It leaves the shares that hand it out (`shares::tables_moved`).
 /// `made_by` (a failed `CREATE TABLE … AS SELECT`'s undo): only a table that job made is dropped. The leader decides it
 /// here, under the lake's lock: a follower may not see the table yet, and another statement's table under the name stays.
-async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_by: Option<&str>) -> Result<Value> {
+pub(crate) async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_by: Option<&str>) -> Result<Value> {
     if let Some(job) = made_by {
         if lake.cat.get::<TableMeta>(&table_key(name)).await?.and_then(|m| m.made_by).as_deref() != Some(job) {
             return Ok(j!({"table": name, "dropped": false, "kept": true}));
@@ -863,7 +863,7 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_
         ensure!(if_exists, "no table {name}");
         return Ok(j!({"table": name, "dropped": false}));
     };
-    table_only(lake, name).await?;
+    table_only(lake, name, "dropped").await?;
     let readers = readers(lake, name).await?;
     if !readers.is_empty() {
         // (CASCADE drops views only: with a task among the readers, it would refuse too)
@@ -879,30 +879,61 @@ async fn drop_table(lake: &Lake, name: &str, if_exists: bool, purge: bool, made_
     };
     let meta = lake.cat.get::<TableMeta>(&table_key(name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?; // (its rows in files now: the entry as it is)
     let (puts, from) = set_aside(lake, name, &meta, kept).await?;
-    lake.cat.commit(puts, &[table_key(name), table_key(&deleted)]).await?; // (and its replaced rows)
+    let copies = crate::delta::Copies::of(lake, name, meta.folder(name), &meta.publish).await?; // (their states go in this commit)
+    let gone: Vec<String> = [table_key(name), table_key(&deleted)].into_iter().chain(copies.keys()).collect(); // (and its replaced rows)
+    lake.cat.commit(puts, &gone).await?;
+    copies.delete(lake).await;
     if !kept {
         crate::seq::drop_owned(lake, &meta).await?; // (a table kept to be undropped keeps its identity's sequences)
     }
     Ok(left_shares(j!({"table": name, "dropped": true}), from))
 }
 
-/// What a table's own statements leave alone: a materialized view's table or part of one (its `_final`, its open table), and
-/// a table a topic feeds (`feeds::feed_key`: a feed has no view of its own, so a drop missed it before).
-async fn table_only(lake: &Lake, name: &str) -> Result<()> {
+/// What a statement on a table leaves alone, for `doing` (the verb its refusal names: "dropped", "renamed", "swapped",
+/// "replaced"): a materialized view's own table, its `_final` part, its open table, and a table a topic feeds
+/// (`feeds::feed_key`: a feed has no view of its own, so a drop missed it before). Drop, rename, swap and replace all call it.
+pub(crate) async fn table_only(lake: &Lake, name: &str, doing: &str) -> Result<()> {
     let owner = name.strip_suffix("_final").unwrap_or(name);
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is materialized view {owner}'s: DROP MATERIALIZED VIEW {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_none(), "{name} is a materialized view: DROP MATERIALIZED VIEW {name}");
-    ensure!(lake.cat.get::<Value>(&crate::feeds::feed_key(name)).await?.is_none(), "{name} is fed by a topic: DROP MATERIALIZED VIEW {name}");
+    let open = crate::once::open(name);
+    for (key, view) in [(name, name), (owner, owner), (open.as_str(), name)] {
+        if lake.cat.get::<Value>(&crate::views::view_key(key)).await?.is_some() {
+            bail!(kept_by(name, view, doing));
+        }
+    }
+    ensure!(lake.cat.get::<Value>(&crate::feeds::feed_key(name)).await?.is_none(), "{name} is fed by a topic, so it can't be {doing}: DROP MATERIALIZED VIEW {name}");
+    Ok(())
+}
+
+/// The refusal for a table that materialized view `view` keeps: `name` is the view's own table, or its `_final` part. A rename
+/// is said to be done by dropping the view and creating it under the new name; the other statements say `DROP MATERIALIZED VIEW`.
+fn kept_by(name: &str, view: &str, doing: &str) -> String {
+    let hint = match doing {
+        "renamed" => "DROP it, and CREATE it under the new name".to_string(),
+        _ => format!("DROP MATERIALIZED VIEW {view}"),
+    };
+    let what = match name == view {
+        true => "a materialized view".to_string(),
+        false => format!("part of materialized view {view}"),
+    };
+    format!("{name} is {what}, so it can't be {doing}: {hint}")
+}
+
+/// Refused while a table has followers: a materialized view or a task that reads it (`readers`, but not a stored view, which
+/// reads a table by name). `why` says what the followers keep, as the refusal words it.
+pub(crate) async fn no_followers(lake: &Lake, name: &str, why: &str) -> Result<()> {
+    let followers: Vec<String> = readers(lake, name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
+    ensure!(followers.is_empty(), "{name} is followed by {}: {why}, so drop them first", followers.join(", "));
     Ok(())
 }
 
 /// Is a dropped table kept to be undropped (ADR-043)? Not with PURGE, not a hidden table, and not with a retention of 0.
-fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
+pub(crate) fn keeps(name: &str, meta: &TableMeta, purge: bool) -> bool { meta.retention_secs.map_or(KEEP_MS, |s| s * 1000) > 0 && !purge && !crate::sys::hidden(name) }
 
 /// A table's entries set aside as a drop sets them (leader, under the lock): kept to be undropped when `kept`, as `dt/` with
-/// its changed rows' old versions; unpublished for other engines; taken out of every share (`shares::tables_moved`). The
-/// caller's commit deletes the table's own entries. Returns the puts, and the shares it left.
-async fn set_aside(lake: &Lake, name: &str, meta: &TableMeta, kept: bool) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
+/// its changed rows' old versions; taken out of every share (`shares::tables_moved`). The caller's commit deletes the table's own
+/// entries and its published states (`delta::Copies`), and deletes their objects after it: until then other engines still
+/// find the table's copies, so nothing is unpublished here. Returns the puts, and the shares it left.
+pub(crate) async fn set_aside(lake: &Lake, name: &str, meta: &TableMeta, kept: bool) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
     let mut puts = vec![];
     if kept {
         let at_ms = crate::log::now_ms();
@@ -910,16 +941,13 @@ async fn set_aside(lake: &Lake, name: &str, meta: &TableMeta, kept: bool) -> Res
         let deleted = lake.cat.get::<TableMeta>(&table_key(&crate::sys::deleted(name))).await?;
         puts.push((format!("dt/{name}/{at_ms:020}"), json(&Dropped { at_ms, keep_ms, meta: meta.clone(), deleted })));
     }
-    for format in &meta.publish {
-        crate::delta::unpublish(lake, name, format).await?; // (no copy left for other engines)
-    }
     let (unshared, from) = crate::shares::tables_moved(lake, &[(name, None)]).await?; // (UNDROP doesn't share it again)
     puts.extend(unshared);
     Ok((puts, from))
 }
 
 /// A drop's answer, with the shares it took the table out of.
-fn left_shares(mut out: Value, shares: Vec<String>) -> Value {
+pub(crate) fn left_shares(mut out: Value, shares: Vec<String>) -> Value {
     if !shares.is_empty() {
         out["unshared"] = j!(shares);
     }
@@ -1025,7 +1053,7 @@ async fn clone(lake: &Lake, name: &str, from: &str) -> Result<Value> {
 /// has the name then) and the rows that came meanwhile go to files too. Looking at the log again
 /// instead left a row sequenced between the last look and the statement's commit under a name no
 /// table read, and refused the statement while writers kept up.
-async fn still(lake: &Lake, tables: &[String]) -> Result<crate::log::Hold> {
+pub(crate) async fn still(lake: &Lake, tables: &[String]) -> Result<crate::log::Hold> {
     to_files(lake, tables).await?;
     let Some(crate::log::To::Local(seq)) = lake.to.get() else { bail!("a table's entry is moved by the leader") };
     let hold = seq.hold(tables).await?;
@@ -1063,13 +1091,10 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
         lake.cat.commit(vec![(query_key(&to), json(&v))], &[query_key(&name)]).await?;
         return Ok(j!({"view": name, "renamed": to}));
     }
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view: they aren't renamed yet (DROP it, and CREATE it under the new name)");
-    let owner = name.strip_suffix("_final").unwrap_or(&name);
-    ensure!(!crate::sys::hidden(&name) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{name} is part of materialized view {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(&name))).await?.is_none(), "{name} is a materialized view: they aren't renamed yet (DROP it, and CREATE it under the new name)");
+    table_only(lake, &name, "renamed").await?;
+    ensure!(!crate::sys::hidden(&name), "{name} is written by Pondra alone");
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_some(), "no table or view {name}");
-    let followers: Vec<String> = readers(lake, &name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{name} is followed by {}: they follow it by name, so drop them first", followers.join(", "));
+    no_followers(lake, &name, "they follow it by name").await?;
     // Its rows in the log go to files, so none is left under the old name; its changed rows' old
     // versions (`{name}$deleted`) too, or they would show again. Appends wait meanwhile, then go to
     // whatever has the name, or are refused if nothing does.
@@ -1083,7 +1108,7 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
 /// A table's entries under another name (`rename`, `replace`): its entry and its `$deleted` entry move, each with the folder it
 /// has (`TableMeta::folder`), and so do its published states (`x/`, `i/`). `change` sets what the new name's entries take. The
 /// names left behind are returned as deletes; a caller that puts a key over one of them keeps only the put.
-async fn move_entry(lake: &Lake, from: &str, to: &str, change: impl Fn(&mut TableMeta)) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
+pub(crate) async fn move_entry(lake: &Lake, from: &str, to: &str, change: impl Fn(&mut TableMeta)) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
     let moved = |mut m: TableMeta, n: &str| {
         m.folder = Some(m.folder(n).to_string());
         change(&mut m);
@@ -1131,14 +1156,11 @@ async fn swap(lake: &Lake, name: &str, with: &str) -> Result<Value> {
 /// that nothing keeps rows derived from, and that no other engine reads or a share hands out.
 async fn swappable(lake: &Lake, n: &str) -> Result<()> {
     ensure!(lake.cat.get::<StoredView>(&query_key(n)).await?.is_none(), "{n} is a view: a swap exchanges two tables (CREATE OR REPLACE VIEW changes a view)");
-    let owner = n.strip_suffix("_final").unwrap_or(n);
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(n)).await?.is_none(), "{n} is a materialized view: they aren't swapped");
-    ensure!(!crate::sys::hidden(n) && lake.cat.get::<Value>(&crate::views::view_key(owner)).await?.is_none(), "{n} is part of materialized view {owner}");
-    ensure!(lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(n))).await?.is_none(), "{n} is a materialized view: they aren't swapped");
+    table_only(lake, n, "swapped").await?;
+    ensure!(!crate::sys::hidden(n), "{n} is written by Pondra alone");
     let meta = lake.cat.get::<TableMeta>(&table_key(n)).await?.ok_or_else(|| anyhow::anyhow!("no table {n}"))?;
     // (a stored view reads by name, so it keeps working after a swap; what keeps rows derived from the table does not)
-    let followers: Vec<String> = readers(lake, n).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{n} is followed by {}: they keep rows derived from what it holds, so drop them first", followers.join(", "));
+    no_followers(lake, n, "they keep rows derived from what it holds").await?;
     // (a share publishes its table as Delta, so its share is named before its publishing)
     if let Some((s, _)) = crate::shares::shares(lake).await?.into_iter().find(|(_, s)| s.tables.iter().any(|x| x.table == n)) {
         bail!("{n} is in share {s}: its recipients read its files by name");
@@ -1157,6 +1179,11 @@ async fn alike(lake: &Lake, a: &str, b: &str) -> Result<()> {
     Ok(())
 }
 
+/// The largest `tiered` mark of the entries given (0 if none): the entries that move together take it (see `exchange`).
+pub(crate) fn mark<'a>(metas: impl IntoIterator<Item = Option<&'a TableMeta>>) -> u64 {
+    metas.into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0)
+}
+
 /// The swap itself, in one commit (leader), the four tables' rows all in files and their appends held
 /// (`still`). Each name takes the other's entry, and its `$deleted` entry (or none, when the other had
 /// none), keeping the folder it had. Every moved entry takes the largest of the four `tiered` marks: a
@@ -1166,7 +1193,7 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
     let (da, db) = (crate::sys::deleted(a), crate::sys::deleted(b));
     let (ea, eb) = (lake.cat.get::<TableMeta>(&table_key(a)).await?, lake.cat.get::<TableMeta>(&table_key(b)).await?);
     let (eda, edb) = (lake.cat.get::<TableMeta>(&table_key(&da)).await?, lake.cat.get::<TableMeta>(&table_key(&db)).await?);
-    let mark = [&ea, &eb, &eda, &edb].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
+    let mark = mark([ea.as_ref(), eb.as_ref(), eda.as_ref(), edb.as_ref()]);
     let (mut puts, mut gone) = (vec![], vec![]);
     for (to, from, from_name) in [(a, eb, b), (b, ea, a), (&da[..], edb, &db[..]), (&db[..], eda, &da[..])] {
         match from {
@@ -1181,98 +1208,57 @@ async fn exchange(lake: &Lake, a: &str, b: &str) -> Result<()> {
     lake.cat.commit(puts, &gone).await
 }
 
-/// What CREATE OR REPLACE TABLE refuses to replace (the leader, and a node before it runs the statement's query): a view, a
-/// table `table_only` leaves alone, a hidden table, or a table that a materialized view or a task keeps rows derived from (drop
-/// those first). Stored views read a table by name, so they keep working, as after a rename.
-pub(crate) async fn replaceable(lake: &Lake, name: &str) -> Result<()> {
-    ensure!(lake.cat.get::<StoredView>(&query_key(name)).await?.is_none(), "{name} is a view: CREATE OR REPLACE VIEW changes a view");
-    table_only(lake, name).await?;
-    ensure!(!crate::sys::hidden(name), "{name} is written by Pondra alone");
-    let followers: Vec<String> = readers(lake, name).await?.into_iter().filter(|r| !r.starts_with("view ")).collect();
-    ensure!(followers.is_empty(), "{name} is followed by {}: they keep rows derived from what it holds, so drop them first", followers.join(", "));
-    Ok(())
-}
-
-/// `CREATE OR REPLACE TABLE`'s last step (leader, under the lock): the staged table, filled, takes `name`'s place in one commit.
-/// `name`'s entries are set aside as a drop sets them, so UNDROP brings them back; the staged table's move under its name with
-/// the folder they have. All of them take the largest `tiered` mark: the log between two marks holds rows of the other table,
-/// already in files (as `exchange` does). The new table was made now, so `name AT (…)` before this is refused rather than
-/// answered with the staged rows (`past_from`). A staged table is never published, so the new table publishes after the commit.
-async fn replace(lake: &Lake, name: &str, staged: &str) -> Result<Value> {
-    if lake.cat.get::<TableMeta>(&table_key(staged)).await?.is_none() {
-        // (a repeat of a replace that committed, or the staged table was let go: the job that made `name` says which)
-        let job = lake.cat.get::<TableMeta>(&table_key(name)).await?.and_then(|m| m.made_by);
-        ensure!(job.is_some_and(|j| crate::sys::staged(name, &j) == staged), "{name}: its new table is gone (its statement failed or expired): run the statement again");
-        return Ok(j!({"table": name, "replaced": true}));
-    }
-    replaceable(lake, name).await?;
-    let (old_deleted, staged_deleted) = (crate::sys::deleted(name), crate::sys::deleted(staged));
-    let _held = still(lake, &[name.to_string(), old_deleted.clone(), staged.to_string(), staged_deleted.clone()]).await?;
-    let old = lake.cat.get::<TableMeta>(&table_key(name)).await?;
-    let old_del = lake.cat.get::<TableMeta>(&table_key(&old_deleted)).await?;
-    let new_del = lake.cat.get::<TableMeta>(&table_key(&staged_deleted)).await?;
-    let new = lake.cat.get::<TableMeta>(&table_key(staged)).await?.ok_or_else(|| anyhow::anyhow!("no table {staged}"))?;
-    let mark = [old.as_ref(), old_del.as_ref(), new_del.as_ref(), Some(&new)].into_iter().flatten().map(|m| m.tiered).max().unwrap_or(0);
-    let (at, now) = (lake.visible(), crate::log::now_ms());
-    let kept = old.as_ref().is_some_and(|m| keeps(name, m, false));
-    let (mut puts, shares) = match &old {
-        Some(m) => set_aside(lake, name, m, kept).await?,
-        None => (vec![], vec![]),
-    };
-    let stamp = |m: &mut TableMeta| {
-        m.tiered = mark;
-        m.made = Some((at, now));
-        m.past_from = Some((at, now));
-    };
-    let (moved, mut gone) = move_entry(lake, staged, name, stamp).await?;
-    puts.extend(moved);
-    gone.extend([table_key(name), table_key(&old_deleted), format!("x/{name}"), format!("i/{name}")]); // (the old's, where the moved ones don't go over them)
-    gone.retain(|k| !puts.iter().any(|(p, _)| p == k));
-    lake.cat.commit(puts, &gone).await?;
-    if let (false, Some(m)) = (kept, &old) {
-        crate::seq::drop_owned(lake, m).await?; // (after the commit: the new table's identity sequences are its own now)
-    }
-    if let Err(e) = crate::delta::publish_all(lake).await {
-        eprintln!("publishing {name}, which was replaced: {e:#}"); // (the replace has happened: the next round publishes it)
-    }
-    Ok(left_shares(j!({"table": name, "replaced": true}), shares))
-}
-
-/// Staged tables a node left behind (killed between its definition and its replace) are let go once older than
-/// `PONDRA_STAGED_SECS` (`sys::stale_staged`), purged as a failed replace's are. `tables` is the table entries the caller
-/// has just read (`tier::expire`'s scan, so no second one); the tables let go are taken out of it.
-pub async fn drop_stale_staged(lake: &Lake, tables: &mut Vec<(String, TableMeta)>) -> Result<()> {
-    let (now, secs) = (crate::log::now_ms(), crate::env::or("PONDRA_STAGED_SECS", 86_400u64));
-    let stale: Vec<String> = tables
-        .iter()
-        .filter(|(key, m)| m.made.is_some_and(|(_, made_ms)| crate::sys::stale_staged(&key[2..], made_ms, now, secs)))
-        .map(|(key, _)| key[2..].to_string())
-        .collect();
-    for name in &stale {
-        drop_table(lake, name, true, true, None).await?;
-    }
-    tables.retain(|(key, _)| !stale.iter().any(|name| name.as_str() == &key[2..]));
-    Ok(())
-}
-
 /// A folder under `data/` for a new table: its name's, unless another table has that one (a
 /// renamed table keeps its folder, a dropped one while it can be undropped): then `name__2`, `name__3`… (characters a bucket's paths
 /// take as they are).
 pub async fn free_folder(lake: &Lake, name: &str) -> Result<Option<String>> {
-    let mut used: std::collections::HashSet<String> = Default::default();
+    let users = folder_users(lake).await?;
+    Ok(match users.contains_key(name) {
+        false => None,
+        true => (2..).map(|i| format!("{name}__{i}")).find(|f| !users.contains_key(f)),
+    })
+}
+
+/// How a table uses a folder under `data/` (`folder_users`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Use {
+    /// A live table's own folder: where its files and published copies are written.
+    Own,
+    /// A live clone's source's folder (`TableMeta::shares`, even once the source is gone: ADR-043).
+    Shares,
+    /// A dropped table's, kept to be undropped (its own, its sources', its changed rows' old versions').
+    Kept,
+}
+
+/// The tables that use each folder under `data/`, and how: the live tables, and the dropped ones kept to be undropped.
+pub async fn folder_users(lake: &Lake) -> Result<std::collections::BTreeMap<String, Vec<(String, Use)>>> {
+    let mut users: std::collections::BTreeMap<String, Vec<(String, Use)>> = Default::default();
     for (k, m) in lake.cat.scan::<TableMeta>("t/", "t0").await? {
-        used.insert(m.folder(&k[2..]).to_string());
-        used.extend(m.shares); // (a clone's source's, even once the source is gone: ADR-043)
+        let name = &k[2..];
+        users.entry(m.folder(name).to_string()).or_default().push((name.to_string(), Use::Own));
+        for folder in m.shares {
+            users.entry(folder).or_default().push((name.to_string(), Use::Shares));
+        }
     }
     for (n, d) in dropped(lake).await? {
-        used.insert(d.meta.folder(&n).to_string()); // (kept to be undropped: ADR-043)
-        used.extend(d.meta.shares);
-        used.extend(d.deleted.map(|m| m.folder(&crate::sys::deleted(&n)).to_string()));
+        let deleted = d.deleted.as_ref().map(|m| m.folder(&crate::sys::deleted(&n)).to_string()); // (its changed rows' old versions)
+        for folder in std::iter::once(d.meta.folder(&n).to_string()).chain(d.meta.shares).chain(deleted) {
+            users.entry(folder).or_default().push((n.clone(), Use::Kept));
+        }
     }
-    Ok(match used.contains(name) {
-        false => None,
-        true => (2..).map(|i| format!("{name}__{i}")).find(|f| !used.contains(f)),
-    })
+    Ok(users)
+}
+
+/// Refuses publishing `name` in `folder` when another live table's files are written there too (`except`: the tables this
+/// statement is about): each table's Delta log and Iceberg metadata would be written in one place. `ALTER TABLE … RENAME`
+/// keeps a folder, so `t` renamed and `t` undropped share one.
+pub async fn publishes_alone(lake: &Lake, name: &str, folder: &str, except: &[&str]) -> Result<()> {
+    let users = folder_users(lake).await?;
+    if let Some((other, _)) = users.get(folder).into_iter().flatten().find(|(o, u)| *u == Use::Own && !except.contains(&o.as_str())) {
+        let why = format!("{name} can't be published: its folder ({folder}) is {other}'s too, and two tables can't publish in one folder (CREATE TABLE … AS SELECT * FROM {name} copies it into a folder of its own)");
+        return Err(crate::codes::coded("55000", why)); // object_not_in_prerequisite_state
+    }
+    Ok(())
 }
 
 /// What reads or writes table `name` by its columns: views, stored views, tasks.
@@ -1469,17 +1455,19 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     ensure!(followers.is_empty(), "{shown} is followed by {}: drop them first", followers.join(", "));
     let producers = crate::views::producers(name);
     let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
-    let tables = [name.to_string(), kept, crate::sys::deleted(name)];
+    let (tables, mut copies) = ([name.to_string(), kept, crate::sys::deleted(name)], vec![]);
     for table in &tables {
         if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? {
-            for format in &meta.publish {
-                crate::delta::unpublish(lake, table, format).await?;
-            }
-            gone.push(table_key(table));
+            let published = crate::delta::Copies::of(lake, table, meta.folder(table), &meta.publish).await?; // (as `drop_table`'s)
+            gone.extend(published.keys().chain([table_key(table)]));
+            copies.push(published);
         }
     }
     let (unshared, from) = crate::shares::tables_moved(lake, &[(tables[0].as_str(), None), (tables[1].as_str(), None)]).await?;
     lake.cat.commit(unshared, &gone).await?;
+    for published in &copies {
+        published.delete(lake).await;
+    }
     crate::log::forget_producers(producers); // (a view made again under this name starts over)
     crate::views::forget(lake);
     Ok(left_shares(j!({"view": shown, "dropped": true}), from))

@@ -13610,7 +13610,7 @@ def objects():
     q("CREATE OR REPLACE TABLE t AS SELECT 7 AS a")
     checks["CREATE OR REPLACE TABLE makes it anew"] = q("SELECT a FROM t") == [{"a": 7}]
     # CREATE OR REPLACE TABLE puts the new table in the old one's place in one commit, the old one kept for UNDROP
-    # (`ddl::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
+    # (`replace::replace`). A query reading t reads the old t; a replace that fails, or one a materialized view follows,
     # leaves t as it was; the same job sent again writes its rows once. Each check has tables of its own, and the
     # replaces and their follow-ups answer their status rather than raise, so every check gets its answer on a build
     # that gets one wrong.
@@ -13697,6 +13697,46 @@ def objects():
         renamed_ok and undrop[0] == 200 and undone == [{"a": 10}, {"a": 20}, {"a": 30}] and renamed == [{"a": 5}]
     checks["a CREATE OR REPLACE TABLE sent again with its job answers duplicate, its rows once"] = \
         first[0] == 200 and again[0] == 200 and isinstance(again[2], dict) and again[2].get("duplicate") is True and job_rows == [{"n": 3}]
+    # A published table replaced (`replace::replace`, `write::create_table`): the new table takes the old one's folder, so Delta and
+    # Iceberg readers find its copies where they were (no `pubr__2`), the same Delta log and Iceberg metadata go on, and the new
+    # rows are read from both. Then the old table is UNDROPped beside the new one in that folder: publishing it there is refused.
+    import open_check
+    def scan_with(kind, table, cols):
+        try:  # (what isn't written yet is an error: the waits below try again)
+            src = f"delta_scan('{lake}/data/{table}')" if kind == "delta" else f"iceberg_scan('{open_check.iceberg_metadata(lake, table)}')"
+            return open_check.duck(lake).execute(f"SELECT {cols} FROM {src} ORDER BY a").fetchall()
+        except Exception as e:
+            return str(e)[:200]
+    def delta_commits(table):
+        try:
+            return len([f for f in os.listdir(f"{lake}/data/{table}/_delta_log") if f.endswith(".json")])
+        except OSError:
+            return -1
+    q("CREATE TABLE pubr (a BIGINT, s VARCHAR) WITH (publish = 'delta,iceberg')")
+    q("INSERT INTO pubr VALUES (1, 'x'), (2, 'y')")
+    call(A.port, "POST", "/tier", timeout=600)
+    old_rows = [(1, "x"), (2, "y")]
+    first_copies = until(lambda: (scan_with("delta", "pubr", "a, s"), scan_with("iceberg", "pubr", "a, s")), (old_rows, old_rows), secs=90)
+    commits_before = delta_commits("pubr")
+    replaced_pub = http("CREATE OR REPLACE TABLE pubr WITH (publish = 'delta,iceberg') AS SELECT 7 AS a, 'z' AS s, CAST(1.5 AS DOUBLE) AS d "
+                        "UNION ALL SELECT 8, 'w', CAST(2.5 AS DOUBLE)")
+    call(A.port, "POST", "/tier", timeout=600)
+    new_rows = [(7, "z", 1.5), (8, "w", 2.5)]
+    new_copies = until(lambda: (scan_with("delta", "pubr", "a, s, d"), scan_with("iceberg", "pubr", "a, s, d")), (new_rows, new_rows), secs=90)
+    commits_after = delta_commits("pubr")
+    renamed_pub = http("ALTER TABLE pubr RENAME TO pubr_now")[0] == 200
+    undrop_pub = http("UNDROP TABLE pubr")
+    turn_on = http("ALTER TABLE pubr SET (publish = 'delta')")
+    undone_pub = read("SELECT a, s FROM pubr ORDER BY a")
+    renamed_copies = until(lambda: scan_with("delta", "pubr", "a, s, d"), new_rows, secs=60)
+    info["publish_replace"] = {"first": first_copies, "replaced": [replaced_pub[0], str(replaced_pub[2])[:200]],
+                               "new": new_copies, "commits": [commits_before, commits_after], "turn_on": [turn_on[0], str(turn_on[2])[:300]], "undone": undone_pub}
+    checks["CREATE OR REPLACE TABLE of a published table: its copies stay at its folder (no pubr__2), Delta and Iceberg read the new rows, and the Delta log goes on"] = \
+        first_copies == (old_rows, old_rows) and replaced_pub[0] == 200 and new_copies == (new_rows, new_rows) and not os.path.isdir(f"{lake}/data/pubr__2") \
+        and commits_after > commits_before
+    checks["an old copy UNDROPped beside the table that replaced it: publishing it in that folder is refused naming the other table, and the new table's copies stay"] = \
+        renamed_pub and undrop_pub[0] == 200 and undone_pub == [{"a": 1, "s": "x"}, {"a": 2, "s": "y"}] and turn_on[0] != 200 and "pubr_now" in str(turn_on[2]) \
+        and renamed_copies == new_rows
     # An INSERT into a name no table has is refused (42P01, as Postgres and DuckDB refuse it), over
     # HTTP and pondra sql, and nothing is made; the bulk door (POST /insert/{t}) still makes one.
     nope = http("INSERT INTO nope VALUES (1, 'a')")
