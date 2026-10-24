@@ -417,7 +417,7 @@ async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String],
 
 fn ld_key(folder: &str, file: &str) -> String {
     let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, file.as_bytes());
-    format!("ld/{folder}/{}", hash.as_ref().iter().map(|b| format!("{b:02x}")).collect::<String>())
+    format!("ld/{folder}/{}", crate::text::hex(hash.as_ref()))
 }
 
 fn job_of(load: &Load) -> String { format!("load:{}", serde_json::to_string(load).expect("a load")) }

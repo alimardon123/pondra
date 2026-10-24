@@ -20,7 +20,7 @@ use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use crate::codes::coded;
 use crate::pg_functions::MARK;
 use crate::pg_names;
-use crate::store::{table_key, Lake};
+use crate::store::{table_key, Lake, TableMeta};
 use crate::text::{at, ident, names_kept, object};
 
 // The JSON makers: the functions that make JSON from values (`pg_json_make.rs`). A statement that calls one has its
@@ -166,8 +166,8 @@ pub async fn columns(lake: &Lake, sql: &str) -> Shape {
 }
 
 /// Which of `sql`'s parameters are uuids, by their number less one (`$1` is 0): one cast to uuid, one
-/// a uuid column is compared with in a WHERE or HAVING, an INSERT's value for a uuid column, an
-/// UPDATE's `SET c = $1`.
+/// a uuid column is compared with in any expression (a WHERE, a join's ON, an item, a CASE), an INSERT's
+/// value for a uuid column, an UPDATE's `SET c = $1`.
 pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
     if !sql.contains('$') {
         return vec![];
@@ -186,23 +186,29 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
     t.params.into_inner()
 }
 
+/// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
+/// by. `sql_types` is keyed by the stored name.
+fn typed_columns(m: &TableMeta) -> impl Iterator<Item = (&str, Option<Ty>)> + '_ {
+    m.live().filter(|(_, n, _)| !m.marker(n)).map(|(s, n, _)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
+}
+
 /// What Postgres reads by a uuid's type, read so where SQL comes in, at every door (`types::rewrite`): a
 /// string compared with a uuid, or written into a uuid column (`VALUES`, `SET`), is a uuid (`id = 'A0EE…'`
 /// finds `a0ee…`, as the column holds it, and `SET id = 'A0EE…'` writes it so), and
 /// `pg_typeof(x)` of one is 'uuid' (the planner sees text). A string compared with a jsonb column is read as
-/// jsonb's text (`doc = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`), and one that isn't JSON is refused 22P02.
-/// Only for a statement with such a string, a `pg_typeof`, a JSON maker or a `||`: for jsonb, a document (a string that
-/// starts with `{` or `[`, after JSON's spaces) compared by equality, so a scalar string such as `'1e2'` is left as
-/// written unless the statement is traced for another reason. Whether it changed anything.
+/// jsonb's text (`doc = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`, and `doc = '1e2'` finds 100), and one that
+/// isn't JSON is refused 22P02. Only for a statement with such a string, a `pg_typeof`, a JSON maker or a `||`: a string
+/// compared by equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`, a CASE's WHEN) counts as one. A string written into a
+/// column is held as its column says (`defaults::fit`). Whether it changed anything.
 pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::types::uuid_of(s).is_ok());
-    // (a document compared by equality, `doc = '{…}'`, `'[…]' <> doc`, `doc IN ('{…}')`, as `text::names_a_type` lets in; a
-    // document written into a column is held as its column says, `defaults::fit`)
-    let document = |e: &Expr| string(e).is_some_and(|s| s.trim_start_matches(crate::pg_json::JSON_SPACE).starts_with(['{', '[']));
-    let compares_document = |e: &Expr| match e {
-        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } | Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => document(left) || document(right),
-        Expr::InList { list, .. } => list.iter().any(document),
+    // (a string compared by equality, `doc = '…'`, `'…' <> doc`, `doc IN ('…')`, `CASE doc WHEN '…'`: each is read as the
+    // column it is compared with reads it, `comparison`)
+    let compares_string = |e: &Expr| match e {
+        Expr::BinaryOp { left, op: ast::BinaryOperator::Eq | ast::BinaryOperator::NotEq, right } | Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => string(left).is_some() || string(right).is_some(),
+        Expr::InList { list, .. } => list.iter().any(|e| string(e).is_some()),
+        Expr::Case { operand: Some(_), conditions, .. } => conditions.iter().any(|w| string(&w.condition).is_some()),
         _ => false,
     };
     let maker = |e: &Expr| matches!(e, Expr::Function(f) if MAKERS.contains(&object(&f.name).as_str()));
@@ -211,7 +217,7 @@ pub async fn rewrite(lake: &Lake, stmt: &mut Statement) -> anyhow::Result<bool> 
     // text concatenation over other columns reads nothing more than the names it has)
     let (mut trigger, mut concatenates, mut json) = (false, false, false);
     let _ = ast::visit_expressions(stmt, |e| {
-        trigger |= asks(e) || spelled(e) || compares_document(e) || maker(e);
+        trigger |= asks(e) || spelled(e) || compares_string(e) || maker(e);
         concatenates |= is_concat(e);
         json |= visibly_json(e);
         ControlFlow::<()>::Continue(())
@@ -486,11 +492,24 @@ async fn of(lake: &Lake, name: &str, known: &mut Known, depth: usize) -> Option<
         // (a session's temporary table shadows a lake table of its name, so its own columns and types come first)
         return Some(cols.into_iter().map(|(c, t)| (c, t.as_deref().and_then(Ty::of))).collect());
     }
+    // (a session's temporary view: its query, traced as a stored view's is below)
+    if let Some((_, sql)) = crate::temp::views(name).into_iter().find(|(n, _)| n == name) {
+        if depth >= 4 {
+            return None;
+        }
+        let stmt = one(&sql)?;
+        look_up(lake, &stmt, known, depth + 1).await;
+        return Trace::new(known).statement(&stmt);
+    }
     let (other, local) = crate::ddl::resolve(lake, name).await.ok()?;
     let lake = other.as_deref().unwrap_or(lake);
     if let Ok(Some(m)) = lake.cat.meta(&table_key(&local)).await {
-        let l = m.described(); // (SQL's names, as `SELECT *` shows them)
-        return Some(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).and_then(|t| Ty::of(t)))).collect());
+        if m.finish.is_some() {
+            // (a view that finishes its answers shows the columns it answers, SQL's names as `SELECT *` shows them, not its partial ones)
+            let l = m.described();
+            return Some(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).and_then(|t| Ty::of(t)))).collect());
+        }
+        return Some(typed_columns(&m).map(|(c, t)| (c.to_string(), t)).collect());
     }
     let view = match depth < 4 {
         true => lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await.ok()??,
@@ -534,7 +553,8 @@ struct Trace<'a> {
     typeof_: RefCell<Vec<(usize, Ty)>>,
     /// The string literals read as uuids (compared with one, or written into one), by place.
     strings: RefCell<Vec<usize>>,
-    /// The string literals compared with a jsonb column (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`), by place: each is read as jsonb's text.
+    /// The string literals compared with a jsonb column (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`, a simple CASE's WHEN), by place:
+    /// each is read as jsonb's text.
     jsonb_strings: RefCell<Vec<usize>>,
     /// The JSON makers' JSON arguments, by place, with their type: each is wrapped as its type prints it.
     wraps: RefCell<Vec<(usize, Ty)>>,
@@ -565,7 +585,7 @@ impl<'a> Trace<'a> {
                     self.inserted(source, &i.columns, &into);
                 }
                 let rels = [into];
-                self.item_makers(i.returning.as_deref().unwrap_or_default(), &rels);
+                self.walk_items(i.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(i.returning.as_deref()?, &rels)
             }
             Statement::Update(u) => {
@@ -579,24 +599,18 @@ impl<'a> Trace<'a> {
                             self.uuid(&a.value);
                         }
                     }
-                    self.makers_in(&a.value, &rels);
+                    self.walk(&a.value, &rels);
                 }
-                u.selection.iter().for_each(|e| {
-                    self.compared(e, &rels);
-                    self.makers_in(e, &rels);
-                });
-                self.item_makers(u.returning.as_deref().unwrap_or_default(), &rels);
+                u.selection.iter().for_each(|e| self.walk(e, &rels));
+                self.walk_items(u.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(u.returning.as_deref()?, &rels)
             }
             Statement::Delete(d) => {
                 let (ast::FromTable::WithFromKeyword(t) | ast::FromTable::WithoutKeyword(t)) = &d.from;
                 let mut rels = self.from(t);
                 rels.extend(self.from(d.using.as_deref().unwrap_or_default()));
-                d.selection.iter().for_each(|e| {
-                    self.compared(e, &rels);
-                    self.makers_in(e, &rels);
-                });
-                self.item_makers(d.returning.as_deref().unwrap_or_default(), &rels);
+                d.selection.iter().for_each(|e| self.walk(e, &rels));
+                self.walk_items(d.returning.as_deref().unwrap_or_default(), &rels);
                 self.items(d.returning.as_deref()?, &rels)
             }
             // (A materialized view and `CREATE TABLE … AS` run their query when made and when refreshed, so their
@@ -607,11 +621,11 @@ impl<'a> Trace<'a> {
         }
     }
 
-    /// The JSON makers in SELECT items or a write's RETURNING items, over their relations.
-    fn item_makers(&self, items: &[SelectItem], rels: &[Rel]) {
+    /// The JSON makers and comparisons in SELECT items or a write's RETURNING items, over their relations.
+    fn walk_items(&self, items: &[SelectItem], rels: &[Rel]) {
         for item in items {
             if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
-                self.makers_in(e, rels);
+                self.walk(e, rels);
             }
         }
     }
@@ -650,26 +664,25 @@ impl<'a> Trace<'a> {
 
     fn select(&self, s: &Select) -> Option<Cols> {
         let rels = self.from(&s.from);
-        s.selection.iter().chain(&s.having).for_each(|e| self.compared(e, &rels));
-        self.select_makers(s, &rels);
+        self.walk_select(s, &rels);
         self.items(&s.projection, &rels)
     }
 
-    /// The JSON makers in a SELECT's own expressions, over its relations: its items, WHERE, GROUP BY, HAVING, QUALIFY and
-    /// its joins' conditions.
-    fn select_makers(&self, s: &Select, rels: &[Rel]) {
-        self.item_makers(&s.projection, rels);
-        s.selection.iter().chain(&s.having).chain(&s.qualify).for_each(|e| self.makers_in(e, rels));
+    /// The JSON makers and comparisons in a SELECT's own expressions, over its relations: its items, WHERE, GROUP BY, HAVING,
+    /// QUALIFY and its joins' conditions.
+    fn walk_select(&self, s: &Select, rels: &[Rel]) {
+        self.walk_items(&s.projection, rels);
+        s.selection.iter().chain(&s.having).chain(&s.qualify).for_each(|e| self.walk(e, rels));
         if let ast::GroupByExpr::Expressions(exprs, _) = &s.group_by {
-            exprs.iter().for_each(|e| self.makers_in(e, rels));
+            exprs.iter().for_each(|e| self.walk(e, rels));
         }
-        on_conditions(&s.from).into_iter().for_each(|e| self.makers_in(e, rels));
+        on_conditions(&s.from).into_iter().for_each(|e| self.walk(e, rels));
     }
 
-    /// The JSON makers in a VALUES list (no relations: a row's values are its own).
+    /// The JSON makers and comparisons in a VALUES list (no relations: a row's values are its own).
     fn values(&self, v: &ast::Values) {
         for e in v.rows.iter().flat_map(|row| row.iter()) {
-            self.makers_in(e, &[]);
+            self.walk(e, &[]);
         }
     }
 
@@ -833,26 +846,17 @@ impl<'a> Trace<'a> {
         same(rels.iter().filter(|r| q.is_none_or(|q| r.names.iter().any(|n| n == q))).filter_map(|r| r.cols.as_ref()?.iter().find(|(n, _)| n == c).map(|(_, t)| *t)))
     }
 
-    /// The parameters and strings a uuid is compared with in a condition: `c = $1`, `'…' <> c`, `c IN ($1, '…')`. The strings
-    /// a jsonb is compared with by equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`) are noted too (`jsonb_string`).
-    fn compared(&self, e: &Expr, rels: &[Rel]) {
+    /// The comparison `e` is, if it is one, read as Postgres reads it: a uuid or a jsonb compared with a parameter or a string
+    /// (`c = $1`, `'…' <> c`, `c IN ($1, '…')`, `c IS DISTINCT FROM '…'`), and a simple CASE's WHEN values as `c = '…'` would
+    /// be (`CASE c WHEN '…'`). The strings a jsonb is compared with by equality are noted too (`jsonb_string`). One expression
+    /// only: `walk` visits the rest.
+    fn comparison(&self, e: &Expr, rels: &[Rel]) {
         use ast::BinaryOperator as Op;
         match e {
-            Expr::BinaryOp { left, op: Op::And | Op::Or, right } => {
-                self.compared(left, rels);
-                self.compared(right, rels);
-            }
             Expr::BinaryOp { left, op: Op::Eq | Op::NotEq | Op::Lt | Op::LtEq | Op::Gt | Op::GtEq, right } | Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
                 let equality = !matches!(e, Expr::BinaryOp { op: Op::Lt | Op::LtEq | Op::Gt | Op::GtEq, .. });
                 for (a, b) in [(left, right), (right, left)] {
-                    if param(b).is_none() && string(b).is_none() {
-                        continue;
-                    }
-                    match self.expr(a, rels) {
-                        Some(Ty::Uuid) => self.uuid(b),
-                        Some(Ty::Jsonb) if equality => self.jsonb_string(b),
-                        _ => {}
-                    }
+                    self.compared_with(a, b, rels, equality);
                 }
             }
             Expr::InList { expr, list, .. } => match self.expr(expr, rels) {
@@ -860,7 +864,20 @@ impl<'a> Trace<'a> {
                 Some(Ty::Jsonb) => list.iter().for_each(|e| self.jsonb_string(e)),
                 _ => {}
             },
-            Expr::Nested(e) | Expr::UnaryOp { expr: e, .. } => self.compared(e, rels),
+            Expr::Case { operand: Some(operand), conditions, .. } => conditions.iter().for_each(|w| self.compared_with(operand, &w.condition, rels, true)),
+            _ => {}
+        }
+    }
+
+    /// `b`, compared with `a` (`equality`: by `=`, not an order comparison): a parameter or a string that `a`, a uuid, reads as
+    /// a uuid, or that `a`, a jsonb, reads as jsonb's text.
+    fn compared_with(&self, a: &Expr, b: &Expr, rels: &[Rel], equality: bool) {
+        if param(b).is_none() && string(b).is_none() {
+            return;
+        }
+        match self.expr(a, rels) {
+            Some(Ty::Uuid) => self.uuid(b),
+            Some(Ty::Jsonb) if equality => self.jsonb_string(b),
             _ => {}
         }
     }
@@ -908,10 +925,11 @@ impl<'a> Trace<'a> {
         }
     }
 
-    /// The JSON makers in `e`, noted where they are (`change_makers` changes them). A query nested in `e` is traced with its
-    /// own relations, which note its own makers: this walk leaves its expressions alone (`Makers`).
-    fn makers_in(&self, e: &Expr, rels: &[Rel]) {
-        let _ = e.visit(&mut Makers { trace: self, rels, depth: 0 });
+    /// Notes what the trace reads in `e`, where it is: the JSON makers (`maker`, which `change_makers` changes), the `||`s
+    /// (`concat`) and the comparisons (`comparison`). A query nested in `e` is traced with its own relations, which note their
+    /// own: this walk leaves its expressions alone (`Walk`).
+    fn walk(&self, e: &Expr, rels: &[Rel]) {
+        let _ = e.visit(&mut Walk { trace: self, rels, depth: 0 });
     }
 
     /// Notes what a JSON maker's arguments need, when `e` is a call of one: an aggregate (`aggregate`), or each argument of a
@@ -1019,15 +1037,15 @@ impl<'a> Trace<'a> {
     fn refuse(&self, e: anyhow::Error) { self.refused.borrow_mut().get_or_insert(e); }
 }
 
-/// Visits one query's expressions (`Trace::makers_in`). At depth 0 it notes each maker and traces each query nested in an
-/// expression with its own relations; deeper, it skips a nested query, which is traced that way.
-struct Makers<'t, 'k> {
+/// Visits one query's expressions (`Trace::walk`). At depth 0 it notes each maker, `||` and comparison, and traces each query
+/// nested in an expression with its own relations; deeper, it skips a nested query, which is traced that way.
+struct Walk<'t, 'k> {
     trace: &'t Trace<'k>,
     rels: &'t [Rel],
     depth: usize,
 }
 
-impl ast::Visitor for Makers<'_, '_> {
+impl ast::Visitor for Walk<'_, '_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
@@ -1047,6 +1065,7 @@ impl ast::Visitor for Makers<'_, '_> {
         if self.depth == 0 {
             self.trace.maker(e, self.rels);
             self.trace.concat(e, self.rels);
+            self.trace.comparison(e, self.rels);
         }
         ControlFlow::Continue(())
     }
@@ -1328,6 +1347,9 @@ mod tests {
         assert_eq!(params("SELECT name FROM t WHERE id = $1 UNION SELECT name FROM t WHERE parent <> $2"), [0, 1]);
         // (a json column's parameters are the client's type, not a uuid)
         assert_eq!(params("SELECT name FROM t WHERE doc = $1"), Vec::<usize>::new());
+        // (a uuid compared in a CASE, and in a join's ON, is read as one as well)
+        assert_eq!(params("SELECT CASE WHEN id = $1 THEN 1 END FROM t"), [0]);
+        assert_eq!(params("SELECT 1 FROM t JOIN s.o ON o.ref = $1"), [0]);
     }
 
     #[test]
@@ -1600,5 +1622,21 @@ mod tests {
         assert_eq!(rewrite_text("SELECT x.name || '{}' FROM t AS x"), "SELECT x.name || '{}' FROM t AS x");
         // a refusal in a WHERE is refused before anything changes
         assert_eq!(refusal("SELECT x.id FROM t AS x, s.o AS o WHERE x.doc || o.b IS NULL").0, "42883");
+    }
+
+    /// A comparison is noted in a join's ON, a CASE, an item and a simple CASE, as it is in a WHERE: a jsonb is read as its text, a
+    /// uuid spelled as the column holds it. A comparison of a text column is left as written.
+    #[test]
+    fn a_comparison_is_noted_in_a_join_a_case_and_an_item() {
+        let (doc, read) = (r#"'{ "b" : 1, "a" : 2 }'"#, r#"'{"a": 2, "b": 1}'"#);
+        assert!(rewrite_text(&format!("SELECT t.id FROM t JOIN s.o AS o ON o.b = {doc}")).contains(&format!("ON o.b = {read}")));
+        assert!(rewrite_text(&format!("SELECT CASE WHEN o.b = {doc} THEN 1 END FROM s.o AS o")).contains(&format!("WHEN o.b = {read} THEN 1")));
+        assert!(rewrite_text(&format!("SELECT CASE o.b WHEN {doc} THEN 1 END FROM s.o AS o")).contains(&format!("CASE o.b WHEN {read} THEN 1")));
+        assert!(rewrite_text(&format!("SELECT o.b = {doc} FROM s.o AS o")).contains(&format!("SELECT o.b = {read} AS")));
+        let (u, spelled) = ("A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+        assert!(rewrite_text(&format!("SELECT 1 FROM t JOIN s.o AS o ON o.ref = '{u}'")).contains(&format!("ON o.ref = '{spelled}'")));
+        assert!(rewrite_text(&format!("SELECT CASE WHEN id = '{u}' THEN 1 END FROM t")).contains(&format!("WHEN id = '{spelled}'")));
+        assert!(rewrite_text(&format!("SELECT id = '{u}' FROM t")).contains(&format!("SELECT id = '{spelled}' AS")));
+        assert_eq!(rewrite_text("SELECT CASE name WHEN 'x' THEN 1 END FROM t"), "SELECT CASE name WHEN 'x' THEN 1 END FROM t");
     }
 }

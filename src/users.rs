@@ -689,7 +689,7 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
 
 // ---------------------------------------------------------------- passwords, tokens, sessions
 
-pub fn sha256(s: &str) -> String { digest::digest(&digest::SHA256, s.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect() }
+pub fn sha256(s: &str) -> String { crate::text::hex(digest::digest(&digest::SHA256, s.as_bytes()).as_ref()) }
 
 /// A new token for `user`, as `CREATE TOKEN` makes it: `pt_<user>_<32 random bytes>` (base64url) and
 /// its SHA-256 (hex), the only part kept. The randomness can't fail on a machine that runs this.

@@ -1426,7 +1426,7 @@ fn machine_key() -> Result<String> {
     std::fs::create_dir_all(path.parent().expect("a folder"))?;
     let mut bytes = [0u8; 32];
     aws_lc_rs::rand::fill(&mut bytes).map_err(|_| anyhow!("no randomness"))?;
-    let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let key: String = crate::text::hex(&bytes);
     match link_key(&key, &path) {
         Ok(()) => Ok(key),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => checked_key(&path, &std::fs::read_to_string(&path)?), // (another node, at once: a file is linked only once whole)
@@ -1450,7 +1450,7 @@ fn checked_key(path: &std::path::Path, text: &str) -> Result<String> {
 fn link_key(key: &str, path: &std::path::Path) -> std::io::Result<()> {
     let mut salt = [0u8; 8];
     aws_lc_rs::rand::fill(&mut salt).map_err(|_| std::io::Error::other("no randomness"))?;
-    let tmp = path.with_file_name(format!("secret.key.{}.{}", std::process::id(), salt.iter().map(|b| format!("{b:02x}")).collect::<String>()));
+    let tmp = path.with_file_name(format!("secret.key.{}.{}", std::process::id(), crate::text::hex(&salt)));
     let mut f = std::fs::OpenOptions::new();
     f.write(true).create_new(true);
     #[cfg(unix)]

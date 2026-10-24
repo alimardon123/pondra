@@ -1,7 +1,7 @@
 //! The session every query starts from, in every build: DataFusion's, with Pondra's rules, planners and the
 //! functions that need no lake (Spark's, JSON's, `sum` over DOUBLE, …). A node adds its own (`Lake::made`); a page
 //! uses it as it is, so both plan a query alike (designs/l2-b4-front-and-web.md).
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, StringArray, StringBuilder, UnionArray};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StringArray, StringBuilder, UnionArray};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
@@ -18,7 +18,7 @@ use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldAr
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::{create_udf, SessionConfig, SessionContext};
+use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,19 +52,8 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
-    // `byte_length` is Pondra's own; `pg_bytea` gives Postgres's bytea functions (DataFusion's other byte
-    // functions, sha256 and md5, take BINARY as they are); substr is below.
-    let bytes = |args: &[ColumnarValue]| {
-        let arrays: Vec<ArrayRef> = args.iter().map(|a| match a {
-            ColumnarValue::Array(a) => Ok(a.clone()),
-            ColumnarValue::Scalar(s) => s.to_array(),
-        }).collect::<Result<_>>()?;
-        let binary = datafusion::arrow::compute::cast(&arrays[0], &DataType::Binary)?;
-        let binary = binary.as_binary::<i32>();
-        let lengths = (0..binary.len()).map(|i| binary.is_valid(i).then(|| binary.value(i).len() as i64));
-        Ok(ColumnarValue::Array(Arc::new(lengths.collect::<Int64Array>())))
-    };
-    ctx.register_udf(create_udf("byte_length", vec![DataType::Binary], DataType::Int64, Volatility::Immutable, Arc::new(bytes)));
+    // `pg_bytea` gives Postgres's bytea functions, `byte_length` among them (DataFusion's other byte functions, sha256
+    // and md5, take BINARY as they are); substr is below.
     ctx.register_udf(substr().as_ref().clone());
     let ctx = crate::pg_json::planned(ctx); // (Postgres's JSON: its operators ahead of the planners above, its functions)
     crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
@@ -439,6 +428,7 @@ fn analyze_output(exec: &AnalyzeExec, schema: &SchemaRef, rows: usize, duration:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::util::display::array_value_to_string;
 
     /// A session answers as a node's does: one value per query, from the functions the session has.
