@@ -1,13 +1,18 @@
 #!/usr/bin/env node
-// The page form's module (web/, designs/l2-b4-web.md) in Node: each request's status, headers and body checked against
-// what a node answers (ADR-061's contract: files are files, tables are made by SQL, the routes mean what a node's mean).
-// `node tools/web_check.mjs [--pkg web/pkg] [--sizes] [--lake web/lake]`; one JSON line, exit 1 on a failure. The lake's
-// checks run when its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a
-// web server that lists nothing, each read compared with the node's own answer for the same bytes.
+// The page form's module (web/, designs/l2-b4-web.md) checked against what a node answers (ADR-061's contract: files are
+// files, tables are made by SQL, the routes mean what a node's mean): each request's status, headers and body.
+// `node tools/web_check.mjs [--pkg web/pkg] [--sizes] [--lake web/lake] [--browser]`; one JSON line, exit 1 on a failure.
+// The module runs in Node, or with `--browser` in headless Chromium: a page on 127.0.0.1 loads it, and the lake's checks
+// read the lake from another origin, so CORS decides what the page may see. Playwright isn't a dependency of the
+// repository: `--browser` loads it from the working folder or NODE_PATH, as in
+// `NODE_PATH=/opt/node-tools/node_modules node tools/web_check.mjs --pkg web/pkg --browser`. The lake's checks run when
+// its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
+// lists nothing, each read compared with the node's own answer for the same bytes.
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { basename, dirname, extname, join, resolve, sep } from 'node:path';
+import { createRequire } from 'node:module';
+import { basename, delimiter, dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { brotliCompressSync, constants, gzipSync } from 'node:zlib';
 
@@ -19,15 +24,11 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
+// every header, so there that server's 206s carry no Content-Range, where a browser is sent one and hides it.
+const IN_BROWSER = args.includes('--browser');
 
-const { default: init, Page } = await import(pathToFileURL(join(pkg, 'pondra_web.js')).href);
 const wasm = await readFile(join(pkg, 'pondra_web_bg.wasm'));
-await init({ module_or_path: wasm });
-
-const t0 = performance.now();
-const page = new Page();
-const open_ms = Number((performance.now() - t0).toFixed(1));
-
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const ORDERS = 'id,name,qty\n1,a,5\n2,b,7\n3,c,9\n';
@@ -74,7 +75,7 @@ function judge(name, answer, want = {}) {
 // One request of a check; a throw is a failure of that check, not of the run.
 async function ask(name, method, path, headers, body) {
   try {
-    return await page.request(method, path, headers, body);
+    return await target.request(method, path, headers, body);
   } catch (e) {
     failed.push(name);
     console.error(`${name}: threw ${e}`);
@@ -82,6 +83,146 @@ async function ask(name, method, path, headers, body) {
   }
 }
 
+// The module in Node: imported from the --pkg folder, and its Page made and timed here.
+async function openInNode() {
+  const { default: init, Page } = await import(pathToFileURL(join(pkg, 'pondra_web.js')).href);
+  await init({ module_or_path: wasm });
+  const t0 = performance.now();
+  const page = new Page();
+  const open_ms = Number((performance.now() - t0).toFixed(1));
+  return {
+    open_ms,
+    request: (method, path, headers, body) => page.request(method, path, headers, body),
+    close: async () => {},
+  };
+}
+
+// The module in headless Chromium, on a page of its own: a 127.0.0.1 origin, which the lake's servers are not. Each
+// request is a call of `window.pondra.request` in that page, and the browser is closed by `close` however the run ends.
+async function openInBrowser() {
+  const chromium = await playwrightChromium();
+  const site = await serveSite();
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    page.on('console', (m) => {
+      if (m.type() === 'error') console.error(`browser console error: ${m.text()}`);
+    });
+    page.on('pageerror', (e) => {
+      failed.push(`page error: ${e.message}`);
+      console.error(`browser page error: ${e.message}`);
+    });
+    await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: wait below)
+    await page.waitForFunction(() => window.ready || window.startError, null, { timeout: 120_000 });
+    const startError = await page.evaluate(() => window.startError);
+    if (startError) throw new Error(`the module did not start in the browser: ${startError}`);
+    return {
+      browser: browser.version(),
+      open_ms: await page.evaluate(() => window.open_ms),
+      request: (method, path, headers, body) => requestInBrowser(page, method, path, headers, body),
+      close: () => closeAll(browser, site),
+    };
+  } catch (e) {
+    await closeAll(browser, site);
+    throw e;
+  }
+}
+
+// One request in the page. A Uint8Array can't cross into the page, so bytes go in as numbers and come back as numbers.
+async function requestInBrowser(page, method, path, headers, body) {
+  const sent = typeof body === 'string' || body === undefined ? body : Array.from(body);
+  const answer = await page.evaluate(
+    async ({ method, path, headers, body }) => {
+      const bytes = typeof body === 'string' || body === undefined ? body : new Uint8Array(body);
+      const out = await window.pondra.request(method, path, headers, bytes);
+      return { status: out.status, headers: out.headers, body: Array.from(out.body) };
+    },
+    { method, path, headers, body: sent },
+  );
+  return { ...answer, body: Uint8Array.from(answer.body) };
+}
+
+async function closeAll(browser, site) {
+  try {
+    await browser?.close();
+  } finally {
+    await site.close();
+  }
+}
+
+// Playwright from where it is installed: the working folder, then NODE_PATH's folders. Not found, one line says what to
+// do and the run stops.
+async function playwrightChromium() {
+  const from = [process.cwd(), ...(process.env.NODE_PATH ?? '').split(delimiter).filter(Boolean)];
+  let file;
+  try {
+    file = createRequire(import.meta.url).resolve('playwright', { paths: from });
+  } catch {
+    console.error('playwright is not installed where this can find it: install it, or set NODE_PATH to the folder holding it');
+    process.exit(1);
+  }
+  const mod = await import(pathToFileURL(file).href);
+  return mod.chromium ?? mod.default.chromium;
+}
+
+// The page the browser opens. Its module is the one under /pkg/, made and timed as Node makes and times it; a failure to
+// start is kept for the run to say, rather than left to a page error and a timeout.
+const MODULE_TYPES = { '.js': 'text/javascript; charset=utf-8', '.wasm': 'application/wasm' };
+const PAGE = `<!doctype html>
+<meta charset="utf-8">
+<title>pondra web check</title>
+<script type="module">
+  try {
+    const { default: init, Page } = await import('/pkg/pondra_web.js');
+    await init();
+    const t0 = performance.now();
+    window.pondra = new Page();
+    window.open_ms = Number((performance.now() - t0).toFixed(1));
+    window.ready = true;
+  } catch (e) {
+    window.startError = String(e) || 'no message';
+  }
+</script>
+`;
+
+// The page's server on 127.0.0.1: the page at `/`, and the --pkg folder's files under `/pkg/`. The .wasm goes as
+// `application/wasm`, which a browser needs to compile it while it streams in.
+async function serveSite() {
+  const server = createServer(async (req, res) => {
+    try {
+      await servePage(req, res);
+    } catch (e) {
+      send(res, 500, TEXT, String(e));
+    }
+  });
+  await new Promise((listening) => server.listen(0, '127.0.0.1', listening));
+  return {
+    port: server.address().port,
+    close: () => {
+      server.closeAllConnections(); // (a kept-alive socket would hold the server open)
+      return new Promise((closed) => server.close(closed));
+    },
+  };
+}
+
+async function servePage(req, res) {
+  const { pathname } = new URL(req.url, 'http://127.0.0.1');
+  if (pathname === '/') return send(res, 200, 'text/html; charset=utf-8', PAGE);
+  const name = /^\/pkg\/([\w.-]+)$/.exec(pathname)?.[1];
+  const type = name && MODULE_TYPES[extname(name)];
+  const body = type ? await readFile(join(pkg, name)).catch(() => null) : null;
+  if (!body) return send(res, 404, TEXT, 'not found');
+  res.writeHead(200, { 'Content-Type': type, 'Content-Length': body.length });
+  res.end(body);
+}
+
+function send(res, status, type, text) {
+  res.writeHead(status, { 'Content-Type': type, 'Content-Length': Buffer.byteLength(text) });
+  res.end(text);
+}
+
+const target = IN_BROWSER ? await openInBrowser() : await openInNode();
 // Files are files, and a table is made from one by SQL (the node's contract): PUT answers the node's JSON and an etag,
 // and makes no table; CREATE TABLE … AS FROM reads the file once.
 const put = await ask('PUT /files/orders.csv', 'PUT', '/files/orders.csv', undefined, ORDERS);
@@ -213,24 +354,42 @@ const series_10m_ms = Number((performance.now() - t1).toFixed(1));
 if (series) judge('generate_series of 10M rows', series, { status: 200, sqlstate: null, out: 'count(*),sum(t.x)\n10000000,50000005000000\n' });
 
 // A web server over a folder, as a bucket's public address is: files by their bytes (GET, HEAD, a Range), and nothing
-// listed (a folder, a path ending in `/`, a name not there: 404). It counts the requests it answers.
-async function serveFolder(root) {
+// listed (a folder, a path ending in `/`, a name not there: 404). It counts the requests it answers, and the CORS
+// preflights apart from them. Its answers allow any origin, and no browser keeps one (Chromium would keep one from
+// Last-Modified). `hidden` is a server whose page can't see its Content-Range: it exposes none of its headers, and
+// `sendsRange` false leaves the Content-Range out of its 206s, as a server that sends none does.
+async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
   const started = new Date().toUTCString();
-  let served = 0;
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+  if (!hidden) cors['Access-Control-Expose-Headers'] = 'Content-Range, ETag, Last-Modified';
+  let requests = 0;
+  let preflights = 0;
   const server = createServer(async (req, res) => {
-    served++;
+    if (req.method === 'OPTIONS') {
+      preflights++;
+      console.error(`preflight ${req.url}: asks for ${req.headers['access-control-request-headers'] ?? 'no headers'}`);
+      return answerPreflight(res, cors);
+    }
+    requests++;
+    for (const [name, value] of Object.entries(cors)) res.setHeader(name, value);
     try {
-      await answerFile(root, started, req, res);
+      await answerFile(root, started, req, res, sendsRange);
     } catch (e) {
       reply(req, res, { status: 500, body: enc.encode(String(e)), modified: started });
     }
   });
   await new Promise((listening) => server.listen(0, '127.0.0.1', listening));
-  return { server, port: server.address().port, served: () => served };
+  return { server, port: server.address().port, served: () => requests, preflights: () => preflights };
+}
+
+// A CORS preflight, which a browser sends before a request CORS doesn't let through alone (a suffix Range is one).
+function answerPreflight(res, cors) {
+  res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, HEAD', 'Access-Control-Allow-Headers': 'Range' });
+  res.end();
 }
 
 // One request: a file's bytes, or the Range of them; anything that is not a file is 404 (405 for a method but GET and HEAD).
-async function answerFile(root, started, req, res) {
+async function answerFile(root, started, req, res, sendsRange = true) {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     return reply(req, res, { status: 405, body: enc.encode('only GET and HEAD'), modified: started, headers: { Allow: 'GET, HEAD' } });
   }
@@ -249,7 +408,7 @@ async function answerFile(root, started, req, res) {
   if (!range) return reply(req, res, { status: 200, type, body, etag, modified });
   return reply(req, res, {
     status: 206, type, body: body.subarray(range.start, range.end + 1), etag, modified,
-    headers: { 'Content-Range': `bytes ${range.start}-${range.end}/${body.length}` },
+    headers: sendsRange ? { 'Content-Range': `bytes ${range.start}-${range.end}/${body.length}` } : {},
   });
 }
 
@@ -286,6 +445,21 @@ function rangeOf(header, size) {
   return { start, end: m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1) };
 }
 
+// A port nothing listens on: one the system gave a server that is closed again.
+async function closedPort() {
+  const server = createServer();
+  await new Promise((listening) => server.listen(0, '127.0.0.1', listening));
+  const { port } = server.address();
+  await new Promise((closed) => server.close(closed));
+  return port;
+}
+
+// Stops a lake server: its kept-alive sockets close first, or Node waits for them.
+function stop(web) {
+  web.server.closeAllConnections();
+  return new Promise((closed) => web.server.close(closed));
+}
+
 // The lake's checks: the page reads a node's published Delta table over a web server that lists nothing, and each read is
 // the node's own answer for the same bytes (expected.json). The latest version is read first: the page keeps what it
 // read, and `Object.keys` would put "0", "1", ... first.
@@ -298,6 +472,8 @@ async function lakeChecks(dir) {
     throw e;
   }
   const web = await serveFolder(dir);
+  const nobody = await closedPort(); // (not port 1: a browser refuses to ask it at all, so nothing would be tried)
+  const hidden = await serveFolder(dir, { hidden: true, sendsRange: IN_BROWSER });
   const at = `http://127.0.0.1:${web.port}/orders`;
   const { versions, file } = expected;
   const order = ['latest', ...Object.keys(versions).filter((k) => k !== 'latest')];
@@ -316,20 +492,32 @@ async function lakeChecks(dir) {
     ['lake read_delta of /none', `SELECT * FROM read_delta('http://127.0.0.1:${web.port}/none')`, { error: true, says: 'no Delta table there' }],
     ['lake read_parquet of a folder', `SELECT * FROM read_parquet('${at}/')`, { status: 501, sqlstate: '0A000' }],
     ['lake a file not there', `SELECT * FROM '${at}/nope.parquet'`, { status: 404, sqlstate: '42P01' }],
-    ['lake read_delta with nothing listening', "SELECT * FROM read_delta('http://127.0.0.1:1/x')", { status: 503, sqlstate: '58030' }],
+    ['lake read_delta with nothing listening', `SELECT * FROM read_delta('http://127.0.0.1:${nobody}/x')`, { status: 503, sqlstate: '58030' }],
   ];
   for (const [name, text, want] of refusals) {
     const answer = await ask(name, 'POST', '/sql?format=csv', undefined, text);
     if (answer) judge(name, answer, want);
   }
+  // The latest version again, from the server that hides its Content-Range: another origin, so nothing the page kept is
+  // reused, and each read takes the range it asked for (`unranged` in web/src/fetch.rs).
+  const hiddenAt = `http://127.0.0.1:${hidden.port}/orders`;
+  const hiddenRead = await ask('lake latest, its Content-Range hidden', 'POST', '/sql?format=csv', undefined,
+    `SELECT * FROM read_delta('${hiddenAt}') ORDER BY id`);
+  if (hiddenRead) judge('lake latest, its Content-Range hidden', hiddenRead, { status: 200, sqlstate: null, out: versions.latest });
   report.lake_versions = order.length - 1;
   report.lake_requests = latest_requests;
-  web.server.closeAllConnections(); // (Node waits for kept-alive sockets otherwise)
-  await new Promise((closed) => web.server.close(closed));
+  report.lake_preflights = web.preflights() + hidden.preflights();
+  await stop(web);
+  await stop(hidden);
 }
 
 await lakeChecks(lake);
-const result = { ok: failed.length === 0, checks: passed, failed, open_ms, series_10m_ms, wasm_bytes: wasm.length, ...report };
+await target.close();
+const result = {
+  ok: failed.length === 0, checks: passed, failed, open_ms: target.open_ms, series_10m_ms, wasm_bytes: wasm.length,
+  browser: target.browser, // (absent in Node: JSON leaves out an undefined value)
+  ...report,
+};
 if (sizes) {
   result.gzip_bytes = gzipSync(wasm, { level: 9 }).length;
   result.brotli_bytes = brotliCompressSync(wasm, {
