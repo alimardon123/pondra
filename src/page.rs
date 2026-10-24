@@ -240,7 +240,8 @@ impl Page {
             .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
             .build_arc()
             .expect("a runtime");
-        let ctx = crate::engine::session(config, runtime);
+        // (added last: a plan's partitions run in the page's own task, as there is no runtime to spawn them on)
+        let ctx = crate::in_task::planned(crate::engine::session(config, runtime));
         let files: Arc<dyn ObjectStore> = match &options.store {
             Some(store) => store.clone(),
             None => Arc::new(InMemory::new()),
@@ -2082,6 +2083,54 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A page with `u` (rows 1 and 2) and the files `a.parquet` and `b.parquet`, each holding the rows of `u`.
+    async fn union_page() -> Page {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE u (x INT)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO u VALUES (1), (2)".into()).await.status, 200);
+        let parquet = page.request("POST", "/sql?format=parquet", &[], "SELECT x FROM u".into()).await.body;
+        for name in ["a.parquet", "b.parquet"] {
+            assert_eq!(put(&page, name, parquet.clone()).await.status, 200);
+        }
+        page
+    }
+
+    /// The CSV `sql` answers on `page`, which must answer it.
+    async fn csv_of(page: &Page, sql: &str) -> String {
+        let got = page.request("POST", "/sql?format=csv", &[], sql.to_string().into()).await;
+        assert_eq!(got.status, 200, "{sql}: {}", String::from_utf8_lossy(&got.body));
+        String::from_utf8(got.body.to_vec()).unwrap()
+    }
+
+    /// A plan's partitions run in the page's own task (`in_task`). A union under an aggregate, a root of two partitions,
+    /// a scalar subquery of two and a table made from two would each start a task per partition, and a page has no
+    /// runtime to start one on: it panics, and takes every table of the page with it. Each of them answers here.
+    #[test]
+    fn a_union_runs_in_the_page_task() {
+        futures::executor::block_on(async {
+            let page = union_page().await;
+            let two = "(SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0)"; // (the filters keep a count from the tables' row counts)
+            assert_eq!(csv_of(&page, &format!("SELECT sum(x) AS s FROM {two}")).await, "s\n6\n");
+            assert_eq!(csv_of(&page, "SELECT x FROM u UNION ALL SELECT x + 10 FROM u ORDER BY x").await, "x\n1\n2\n11\n12\n");
+            let root = csv_of(&page, "SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0").await;
+            let mut lines: Vec<&str> = root.lines().collect();
+            lines.sort_unstable(); // (the rows come in any order: the header and four rows)
+            assert_eq!(lines, ["1", "1", "2", "2", "x"], "{root}");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM (SELECT x FROM {two} LIMIT 3)")).await, "n\n3\n");
+            assert_eq!(csv_of(&page, &format!("SELECT count(*) AS n FROM u JOIN {two} v ON u.x = v.x")).await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u JOIN (SELECT x FROM 'a.parquet' UNION ALL SELECT x FROM 'b.parquet') v ON u.x = v.x").await, "n\n4\n");
+            assert_eq!(csv_of(&page, "SELECT (SELECT x FROM u WHERE x = 1 UNION ALL SELECT x FROM u WHERE x > 5) AS v").await, "v\n1\n");
+            let made = "CREATE TABLE w AS SELECT x FROM u WHERE x > 0 UNION ALL SELECT x FROM u WHERE x > 0";
+            assert_eq!(page.request("POST", "/sql", &[], made.into()).await.status, 200);
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM w").await, "n\n4\n");
+            for (name, body) in [("s/year=2024/a.csv", "item,amount\npie,4\n"), ("s/year=2025/b.csv", "item,amount\npie,6\ntea,3\n")] {
+                assert_eq!(put(&page, name, body).await.status, 200);
+            }
+            assert_eq!(csv_of(&page, "SELECT year, sum(amount) AS a FROM 's/**/*.csv' GROUP BY year ORDER BY year").await, "year,a\n2024,4\n2025,9\n");
+            assert_eq!(csv_of(&page, "SELECT count(*) AS n FROM u").await, "n\n2\n");
+        });
     }
 
     #[tokio::test]
