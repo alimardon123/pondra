@@ -251,7 +251,7 @@ pub fn own(stmt: &Stmt) -> bool {
 }
 
 /// The columns of the current session's temporary table `name`, with the SQL type each holds as text, if there is one
-/// (`pg_types::of` reads them before a lake table of the name: a temporary table shadows it).
+/// (a node's `Host::relation`, in host.rs, reads them before a lake table of the name: a temporary table shadows it).
 pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
     peek(&current()?, |x| x.tables.get(name).map(|t| t.meta.columns.iter().map(|(c, _)| (c.clone(), t.meta.sql_types.get(c).cloned())).collect()))
 }
