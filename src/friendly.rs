@@ -40,15 +40,14 @@ pub fn wanted(sql: &str) -> bool {
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
-    // `(a, b) IN (SELECT …)`, a DELETE or UPDATE with an alias, a character type's Postgres name,
-    // DEFAULT VALUES, LIKE … ESCAPE, an array literal `[…]` or `ARRAY[…]` (a `[` straight after a word,
-    // `)`, `]` or `"` is a subscript, `arr[1]`))
+    // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
+    // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`))
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
     });
     // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
     static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql)
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -59,6 +58,14 @@ fn alias_in_where(sql: &str) -> bool {
     let Some(w) = WHERE.find(sql) else { return false };
     let named: Vec<&str> = AS.captures_iter(&sql[..w.start()]).filter_map(|c| c.get(1)).map(|m| m.as_str()).collect();
     !named.is_empty() && WORD.find_iter(&sql[w.end()..]).any(|m| named.iter().any(|n| n.eq_ignore_ascii_case(m.as_str())))
+}
+
+/// Whether a DELETE or UPDATE's table has an alias (`UPDATE t AS u`, `UPDATE t u`, `DELETE FROM t AS d`).
+fn alias_after_table(sql: &str) -> bool {
+    static TABLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)^\s*(?:delete\s+from|update)\s+[\w."]+\s+(as\s+)?(\w+)\b"#).expect("a regex"));
+    let Some(c) = TABLE.captures(sql) else { return false };
+    let word = c[2].to_lowercase();
+    c.get(1).is_some() || !["set", "where", "using", "from", "returning"].contains(&word.as_str())
 }
 
 // ---------------------------------------------------------------- the text
@@ -1791,6 +1798,23 @@ mod tests {
         let refusal = call("sha256('\\x0')").unwrap_err();
         assert_eq!((crate::codes::of(&refusal), refusal.to_string()), ("22023", "invalid hexadecimal data: odd number of digits".to_string()));
         assert!(wanted("SELECT sha256('\\x01')"));
+    }
+
+    #[test]
+    fn an_update_or_delete_has_an_alias_only_when_one_is_written() {
+        // (the word after a DELETE's or UPDATE's table is an alias unless it is one that can follow the table there)
+        for sql in [
+            "UPDATE k SET v = v + 1 WHERE id = 1",
+            r#"update "s"."k" set v = 0"#,
+            "DELETE FROM k WHERE id = 1",
+            "DELETE FROM k USING j WHERE k.id = j.id",
+            "DELETE FROM k RETURNING id",
+        ] {
+            assert!(!wanted(sql), "{sql}");
+        }
+        for sql in ["UPDATE k AS u SET v = 0", "UPDATE k u SET v = 0", "DELETE FROM k AS d WHERE d.id = 1", "DELETE FROM k d WHERE d.id = 1"] {
+            assert!(wanted(sql), "{sql}");
+        }
     }
 
     #[test]
