@@ -1425,6 +1425,20 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
+/// The text as sent, when it is one statement that is no variable's change and no script: the first half of the test
+/// `sql_as` makes of a request for a plain query. `pondra sql` makes it of its argument too (cli.rs).
+pub(crate) fn single_statement(sql: &str) -> Option<String> {
+    let [one] = &crate::routines::split(sql)[..] else { return None };
+    (crate::vars::change(sql).is_none() && !crate::script::is(sql)).then(|| one.clone())
+}
+
+/// The second half, on the statement once its `$name`s and functions are expanded: none of a checkpoint, a procedure's
+/// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
+/// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
+pub(crate) fn plain_statement(one: &str) -> bool {
+    !crate::write::checkpoint(one) && !crate::routines::runs_procedure(one) && crate::write::parse(one).is_none() && !crate::routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
+}
+
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
     use crate::routines::{Outcome, Who};
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
@@ -1437,12 +1451,11 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
-    if let ([one], true, true, true, None, false) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql), crate::script::is(&req.sql)) {
-        let sent = one;
-        let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && !crate::routines::several(&one) && crate::text::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
+    if let (Some(sent), true, true, true) = (single_statement(&req.sql), req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
+        let one = crate::routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
+        if plain_statement(&one) && !crate::txn::open() {
             crate::query::mark("request read and checked");
-            return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
+            return Ok(crate::audit::statement(&app, &sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
     let tables = Arc::new(req.tables);

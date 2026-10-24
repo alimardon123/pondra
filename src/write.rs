@@ -1822,7 +1822,6 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
 /// A statement once the session's own tables and its transaction have had their turn (`on_node_listed`): written here
 /// or by the leader.
 async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
-    ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
@@ -1830,6 +1829,12 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     if crate::backup::frozen(&app.lake) && !crate::backup::reads_only(&stmt) {
         return Err(crate::backup::refused(Some(&app.lake.url)));
     }
+    // (COPY … TO reads the lake and writes no lake: a reader may export, as Postgres's read-only transactions allow it)
+    if let Stmt::CopyTo(query, to, options) = &stmt {
+        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
+    }
+    // (above a view of a folder's write: a reader writes no file either)
+    ensure!(!app.cluster.reader, "read-only node");
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
@@ -1847,9 +1852,6 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         s => s,
     };
-    if let Stmt::CopyTo(query, to, options) = &stmt {
-        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
-    }
     if let Stmt::CopyInto(table, from, options) = &stmt {
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
@@ -2473,14 +2475,20 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
     }
     if !res.status().is_success() {
         // (the leader's refusal keeps its SQLSTATE: a follower's client tells it apart as the leader's would)
-        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(crate::codes::received);
-        let said = format!("the leader at {addr}: {}", res.text().await?);
-        return Err(match code {
-            Some(code) => crate::codes::coded(code, said),
-            None => anyhow::anyhow!("{said}"),
-        });
+        let sqlstate = res.headers().get("x-pondra-sqlstate").cloned();
+        return Err(refusal(sqlstate.as_ref(), format!("the leader at {addr}: {}", res.text().await?)));
     }
     Ok(res.json().await?)
+}
+
+/// The error a node's answer that isn't a success is, as a client takes it: the answer's words, with the SQLSTATE its
+/// `x-pondra-sqlstate` header names (none: the words alone). Shared by a follower's forwarded write (`post_as`) and a
+/// guest's answer (cli.rs), so both give the same error.
+pub(crate) fn refusal(sqlstate: Option<&axum::http::HeaderValue>, said: String) -> anyhow::Error {
+    match sqlstate.and_then(|v| v.to_str().ok()).and_then(crate::codes::received) {
+        Some(code) => crate::codes::coded(code, said),
+        None => anyhow::anyhow!("{said}"),
+    }
 }
 
 /// A failure to reach the leader at all (not an answer from it).
@@ -2504,8 +2512,8 @@ fn summary(flush: bool, v: Value) -> Result<Value> {
     Ok(if acks.iter().all(|a| a.duplicate) { j!({"duplicate": true}) } else { j!({"committed": true}) })
 }
 
-/// Was this writer fenced out of the catalog by a newer one?
-fn fenced(e: &anyhow::Error) -> bool {
+/// Was this writer fenced out of the catalog by a newer one? (`pondra sql`'s guest asks it of an answer's words too.)
+pub(crate) fn fenced(e: &anyhow::Error) -> bool {
     e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
 }
 

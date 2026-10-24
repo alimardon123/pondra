@@ -1893,6 +1893,113 @@ def insert_spread():
     return f"on three nodes every node writes its share ({got['n']:,} rows in {took} s), one commit, ids unique; {len(checks)} checks"
 
 
+def serverless_guest(port):
+    """`pondra sql` as a guest node (node.rs's Guest): what a statement reads or writes, and how the lake's leader
+    answers it. Each check is one assertion, named in the result; a lake on object storage has no term files to look at."""
+    lake = new_lake()
+    local_lake = not lake.startswith("s3://")
+    terms, left = os.path.join(lake, "cluster", "term"), os.path.join(lake, "cluster", "left")
+    folder = tempfile.mkdtemp(prefix="pondra-guest-")
+    csv, parquet = os.path.join(folder, "rows.csv"), os.path.join(folder, "out.parquet")
+    with open(csv, "w") as f:
+        f.write("a,b\n1,x\n2,y\n3,z\n")
+
+    def run(q, extra=None):
+        p = subprocess.run([BIN, "sql", "--dir", lake, q], capture_output=True, text=True, env={**os.environ, **(extra or {})}, timeout=300)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+    def ran(q):
+        rc, _, err = run(q)
+        if rc:
+            raise RuntimeError(f"{q}: {err[-800:]}")
+
+    def count():  # with nobody leading the lake, or with a node: the rows of t as `pondra sql` shows them
+        rc, out, err = run("SELECT count(*) AS n FROM t")
+        found = re.search(r"^\|\s*(\d+)\s*\|$", out, re.M)
+        return int(found.group(1)) if rc == 0 and found else None
+
+    def shown(out, n):
+        return re.search(r"^\|\s*%d\s*\|$" % n, out, re.M) is not None
+
+    def listing(d):
+        return set(os.listdir(d)) if os.path.isdir(d) else set()
+
+    def node_count(url_port):
+        return call(url_port, "POST", "/sql", b"SELECT count(*) AS n FROM t")[0]["n"]
+
+    def ready_at(url_port, cap=30):
+        deadline = time.time() + cap
+        while time.time() < deadline:
+            try:
+                call(url_port, "GET", "/ready", timeout=2)
+                return True
+            except Exception:
+                time.sleep(0.05)
+        return False
+
+    checks, times = {}, {}
+    ran("CREATE TABLE t (a INT, b VARCHAR)")  # nobody leads: the guest leads it for the moment, and lets go
+
+    # a. COPY INTO loads a CSV file's rows on a lake nobody leads
+    rc, _, err = run(f"COPY INTO t FROM '{csv}' (FORMAT csv, HEADER)")
+    checks["a COPY INTO loads a file's rows on a lake nobody leads"] = rc == 0 and count() == 3
+
+    # b. A SELECT and an export read: no term is claimed, and the export's file is written
+    before = listing(terms)
+    rc1, _, _ = run("SELECT count(*) AS n FROM t")
+    rc2, _, err2 = run(f"COPY (SELECT * FROM t) TO '{parquet}'")
+    checks["b a SELECT and a COPY … TO make no term on a lake nobody leads, and the export is written"] = \
+        (rc1 == 0 and rc2 == 0 and os.path.exists(parquet) and (not local_lake or listing(terms) == before))
+
+    # c. An INSERT on a lake nobody leads leaves its term given back, and a node started right after answers /ready in time
+    left_before = listing(left)
+    rc3, _, err3 = run("INSERT INTO t VALUES (4, 'w')")
+    left_new = listing(left) - left_before
+    t0 = time.time()
+    node = Node(lake, port).start()
+    checks["c an INSERT leaves its term in cluster/left, and a node started right after answers /ready within 5 s"] = \
+        rc3 == 0 and (not local_lake or bool(left_new)) and ready_at(port) and time.time() - t0 <= 5
+    times["ready_s"] = round(time.time() - t0, 2)
+
+    # d. With a node leading, the statement goes to it, and a text of two statements reads its own write
+    rc4, _, err4 = run("INSERT INTO t VALUES (5, 'd')")
+    n4 = node_count(port)
+    nodes = call(port, "GET", "/stats")["nodes"]
+    rc5, out5, err5 = run("INSERT INTO t VALUES (6, 'e'); SELECT count(*) AS n FROM t")
+    checks["d with a node leading, an INSERT goes to it, the node's /stats keep it alone, and one argument of two statements reads its own write"] = \
+        rc4 == 0 and n4 == 5 and len(nodes) == 1 and rc5 == 0 and shown(out5, 6)
+
+    # e. With PONDRA_NO_DIRECT, an INSERT goes through the inbox, and two statements are refused by name
+    no_direct = {"PONDRA_NO_DIRECT": "1"}
+    rc6, _, err6 = run("INSERT INTO t VALUES (7, 'f')", no_direct)
+    n6 = node_count(port)
+    rc7, _, err7 = run("INSERT INTO t VALUES (8, 'g'); INSERT INTO t VALUES (9, 'h')", no_direct)
+    checks["e with PONDRA_NO_DIRECT, an INSERT lands through the inbox, and two statements are refused with the reason"] = \
+        rc6 == 0 and n6 == 7 and rc7 == 1 and "several statements" in err7 and "doesn't answer from here" in err7
+    node.kill()
+
+    # f. On a lake nobody leads: a CALL of a procedure that writes, and two statements in one argument, both write and answer
+    ran("CREATE PROCEDURE ins() LANGUAGE sql AS $$ INSERT INTO t VALUES (10, 'p'); $$")
+    rc8, _, err8 = run("CALL ins()")
+    rc9, out9, err9 = run("INSERT INTO t VALUES (11, 'q'); SELECT count(*) AS n FROM t")
+    checks["f on a lake nobody leads, a CALL that writes and two statements in one argument both write and answer"] = \
+        rc8 == 0 and rc9 == 0 and shown(out9, 9) and count() == 9
+
+    # g. A bad statement prints Error: with the words a node's POST /sql gives it, and exits 1
+    node = Node(lake, port).start()
+    ready_at(port)
+    conn = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("POST", "/sql", b"SELECT * FROM no_such_table")
+    reply = conn.getresponse()
+    words = reply.read().decode().strip()
+    rc10, _, err10 = run("SELECT * FROM no_such_table")
+    checks["g a bad statement prints Error: with a node's words for it, and exits 1"] = \
+        reply.status != 200 and rc10 == 1 and err10 == f"Error: {words}"
+    node.kill()
+    shutil.rmtree(folder, ignore_errors=True)
+    return checks, times
+
+
 def serverless():
     """Writes from any machine with the binary, with and without a running node."""
     import pyarrow as pa, pyarrow.parquet as pq
@@ -1965,12 +2072,13 @@ def serverless():
     n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
     node2_leads = leads(node2)
     node2.kill()
+    guest_checks, guest_times = serverless_guest(A.port + 3)  # (`pondra sql` as a guest node: its own lakes, one assertion each)
     # 8000 rows, and the leader started here adds 1000 more: 9000.
     ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and other_machine_waits)
+          and after_kill_s < 10 and other_machine_waits and all(guest_checks.values()))
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
                                      "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
-                                     "rows": n, "ok": ok}}))
+                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
