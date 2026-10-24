@@ -726,16 +726,8 @@ fn write_word(sql: &str) -> Option<String> {
 /// The write a `WITH` statement makes (`WITH … INSERT`, `… UPDATE`, `… DELETE`, `… MERGE`), by its parse; None for one
 /// that only reads, or doesn't parse (the door reports that).
 fn with_write(sql: &str) -> Option<String> {
-    // (sqlparser reads `WITH … INSERT` as a query whose body is the write)
     let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? else { return None };
-    let word = match *q.body {
-        SetExpr::Insert(_) => "INSERT",
-        SetExpr::Update(_) => "UPDATE",
-        SetExpr::Delete(_) => "DELETE",
-        SetExpr::Merge(_) => "MERGE",
-        _ => return None,
-    };
-    Some(word.to_string())
+    crate::text::write_of(&q).map(str::to_string)
 }
 
 /// Statements that set or show something rather than run a query: they don't make a transaction one that has run.

@@ -187,6 +187,7 @@ pub fn http(code: &str) -> u16 {
         "42P07" | "23505" => 409,                                         // already exists, duplicate key
         "53300" => 429,                                                   // too many of a user's queries at once (a quota)
         "0A000" => 501,                                                   // feature_not_supported
+        "54000" => 413,                                                   // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
@@ -279,6 +280,7 @@ mod tests {
         assert_eq!(h("P0001"), 400); // raise_exception (a procedure's RAISE)
         assert_eq!(h("53300"), 429); // too many of a user's queries at once
         assert_eq!(h("0A000"), 501); // feature_not_supported
+        assert_eq!(h("54000"), 413); // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB)
         assert_eq!(h("57014"), 503); // query_canceled (timeout)
         assert_eq!(h("57P03"), 503); // cannot_connect_now (catching up / cut off)
         assert_eq!(h("58030"), 503); // io_error (bucket or node silent)

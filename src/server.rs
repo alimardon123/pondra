@@ -192,6 +192,7 @@ pub fn router(app: App) -> Router {
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
+        .layer(middleware::from_fn_with_state(Arc::new(crate::origins::ORIGINS.clone()), crate::origins::door)) // (outermost: a preflight is answered before guard, and guard's refusals carry the headers)
         .with_state(app)
 }
 
