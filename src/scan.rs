@@ -34,6 +34,9 @@ pub struct Outside {
     /// Its data sequence number (Iceberg's: equality deletes apply to files older than them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<i64>,
+    /// Its rows are a guess from its size (its table's log doesn't count them): an estimate for the planner, never an answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guessed: bool,
 }
 
 /// How another engine's table matches its files' columns to its own (Iceberg: by field id).
@@ -121,11 +124,12 @@ pub async fn read(ctx: &datafusion::prelude::SessionContext, files: &[&crate::da
         if equality {
             partition.push(ScalarValue::Int64(Some(f.outside.as_ref().and_then(|o| o.seq).unwrap_or(0))));
         }
-        let rows = match (&gone, f.outside.as_ref().and_then(|o| o.rows)) {
-            (Some(_), None) => footer_rows(ctx, &store, &key, f.bytes).await?,
-            (_, rows) => rows.unwrap_or(f.rows),
+        let (rows, counted) = match (&gone, f.outside.as_ref().and_then(|o| o.rows)) {
+            (Some(_), None) => (footer_rows(ctx, &store, &key, f.bytes).await?, true),
+            (_, Some(n)) => (n, true),
+            (_, None) => (f.rows, !f.outside.as_ref().is_some_and(|o| o.guessed)),
         };
-        let stats = Arc::new(statistics(f, rows, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
+        let stats = Arc::new(statistics(f, rows, counted, gone.as_ref().map_or(0, |g| g.len()), table.is_none(), &file_schema));
         out.push(File { key, size: f.bytes, rows, partition, deleted: gone, range: None, only: None, stats });
     }
     let adapter = (!ids.is_empty()).then(|| Arc::new(ById { ids: ids.clone(), mapping: table.and_then(|t| t.name_mapping.as_deref()).map(name_mapping).unwrap_or_default() }) as _);
@@ -139,12 +143,12 @@ const SEQ: &str = "__pondra_seq";
 /// What the planner knows of a file before reading it (the join order rests on it): its rows
 /// and bytes and, for plain Parquet files, its columns' ranges from their footers, as the
 /// statement listed them (bounds for pruning, never read as answers). Another engine's counts
-/// come from its log: estimates.
-pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, deleted: usize, plain: bool, schema: &Schema) -> datafusion::common::Statistics {
+/// come from its log only when the log gives them (`counted`); otherwise they are estimates.
+pub(crate) fn statistics(f: &crate::data_file::DataFile, rows: u64, counted: bool, deleted: usize, plain: bool, schema: &Schema) -> datafusion::common::Statistics {
     use datafusion::common::stats::Precision::{Exact, Inexact};
     let mut s = datafusion::common::Statistics::new_unknown(schema);
     let n = rows.saturating_sub(deleted as u64) as usize;
-    (s.num_rows, s.total_byte_size) = (if plain { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
+    (s.num_rows, s.total_byte_size) = (if plain && counted { Exact(n) } else { Inexact(n) }, Inexact(f.bytes as usize));
     for (field, c) in schema.fields().iter().zip(s.column_statistics.iter_mut()).filter(|_| plain) {
         let parse = |v: &String| ScalarValue::try_from_string(v.clone(), field.data_type()).ok();
         if let Some((Some(lo), Some(hi))) = f.stats.get(field.name()).map(|(lo, hi)| (parse(lo), parse(hi))) {

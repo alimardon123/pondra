@@ -647,9 +647,8 @@ pub struct Request {
 
 impl Request {
     /// The body as it came: SQL; JSON (`{"sql": …, "params": {…}}`); or, with tables of its own,
-    /// `application/vnd.pondra.request`: the JSON's length (4 bytes, little-endian), the JSON
-    /// (`"tables"`: their names), then each table as its length (8 bytes) and an Arrow IPC stream.
-    /// A body that can't be read is the caller's mistake (22P02), not the node's.
+    /// `application/vnd.pondra.request` (`request_body`: the JSON, whose `"tables"` name the Arrow IPC
+    /// streams after it, in order). A body that can't be read is the caller's mistake (22P02), not the node's.
     pub fn read(kind: &str, body: &[u8]) -> Result<Request> {
         Self::parse(kind, body).map_err(|e| crate::codes::coded("22P02", format!("the request's body can't be read: {e:#}")))
     }
@@ -665,20 +664,21 @@ impl Request {
             #[serde(default)]
             tables: Vec<String>,
         }
-        let short = || anyhow::anyhow!("the request ends too soon");
-        let (head, mut rest): (Head, &[u8]) = match kind.split(';').next().unwrap_or_default().trim() {
-            "application/json" => (serde_json::from_slice(body)?, &[]),
-            "application/vnd.pondra.request" => {
-                let n = u32::from_le_bytes(body.get(..4).ok_or_else(short)?.try_into()?) as usize;
-                (serde_json::from_slice(body.get(4..4 + n).ok_or_else(short)?)?, &body[4 + n..])
+        let (head, streams): (Head, Vec<&[u8]>) = match kind.split(';').next().unwrap_or_default().trim() {
+            "application/json" => (serde_json::from_slice(body)?, vec![]),
+            crate::request_body::CONTENT_TYPE => {
+                let (json, streams) = crate::request_body::read(body)?;
+                (serde_json::from_slice(json)?, streams)
             }
             _ => return Ok(Request { sql: String::from_utf8(body.to_vec())?, ..Default::default() }),
         };
+        // (each name is one stream, in order: a name with no stream is a body that was cut short)
+        if head.tables.len() > streams.len() {
+            return Err(anyhow::anyhow!("the request ends too soon"));
+        }
         let mut tables = vec![];
-        for name in head.tables {
-            let n = u64::from_le_bytes(rest.get(..8).ok_or_else(short)?.try_into()?) as usize;
-            tables.push((name, crate::query::read_ipc(rest.get(8..8 + n).ok_or_else(short)?)?));
-            rest = &rest[8 + n..];
+        for (name, stream) in head.tables.into_iter().zip(streams) {
+            tables.push((name, crate::query::read_ipc(stream)?));
         }
         Ok(Request { sql: head.sql, params: head.params, views: head.views.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect(), tables })
     }
@@ -760,7 +760,7 @@ pub(crate) fn dollar_tag(s: &str) -> Option<&str> {
 
 /// Run one statement here as the caller could have sent it (the audit log told: `audit.rs`).
 pub async fn one(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
-    if let Some(word) = crate::txn::control(sql) {
+    if let Some(word) = crate::text::control(sql) {
         // BEGIN, COMMIT, ROLLBACK: the session's transaction (ADR-036 §5)
         let (tag, warning) = crate::audit::statement(app, sql, Box::pin(crate::txn::command(app, word, sql))).await?; // (on the heap: procedures call procedures deep)
         warning.iter().for_each(|w| heard(&format!("WARNING: {w}")));

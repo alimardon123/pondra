@@ -14,7 +14,9 @@ pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
+pub mod in_task;
 pub mod page;
+pub mod request_body;
 pub mod text;
 pub mod extension;
 pub mod ext_names;
@@ -51,6 +53,10 @@ mod pg_json_edit;
 mod pg_json_sets;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_text;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
+mod pg_oids;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the visitor that rewrites a statement's casts is a node's until the front runs it)
+mod pg_casts;
 pub mod pg_bytea;
 mod optimize;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -129,7 +135,9 @@ mod read_delta;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod oom;
 #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] mod jemalloc;
+#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] pub use jemalloc::{Conf as JemallocConf, CONF as JEMALLOC_CONF}; // (for the program and the library: `main.rs`, `capi/`)
 #[cfg(feature = "server")] mod once;
+#[cfg(feature = "server")] mod origins;
 #[cfg(feature = "server")] mod metrics;
 #[cfg(feature = "server")] pub mod node;
 #[cfg(feature = "server")] pub mod library;

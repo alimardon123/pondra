@@ -285,7 +285,7 @@ async fn run(app: &App, role: Role, sql: &str, job: Option<String>) -> Result<cr
     // A transaction word alone, with no session, has nothing to hold it: refused by name. Several statements in one call
     // (BEGIN; …; COMMIT) run as one script, in a session of their own, so they are a transaction.
     let parts = crate::routines::split(sql).len();
-    if crate::temp::current().is_none() && parts == 1 && crate::txn::control(sql).is_some() {
+    if crate::temp::current().is_none() && parts == 1 && crate::text::control(sql).is_some() {
         return Err(crate::codes::coded("0A000", "a transaction needs a session: send initialize and keep the Mcp-Session-Id it gives"));
     }
     let who = crate::routines::Who { role, files: false, depth: 0 };
@@ -324,7 +324,7 @@ fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<V
 
 /// Changes data or a transaction (INSERT, CALL, BEGIN…): not for the query tool.
 fn is_write(sql: &str) -> bool {
-    crate::write::parse(sql).is_some() || crate::routines::runs_procedure(sql) || crate::txn::control(sql).is_some()
+    crate::write::parse(sql).is_some() || crate::routines::runs_procedure(sql) || crate::text::control(sql).is_some()
 }
 
 fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num_rows).sum() }

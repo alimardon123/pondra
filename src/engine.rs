@@ -17,7 +17,7 @@ use datafusion::logical_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion::logical_expr::{ColumnarValue, Documentation, Expr, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::physical_plan::analyze::AnalyzeExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -57,6 +57,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     ctx.register_udf(substr().as_ref().clone());
     let ctx = crate::pg_json::planned(ctx); // (Postgres's JSON: its operators ahead of the planners above, its functions)
     crate::pg_functions::register(&ctx); // format(), array_upper(), to_char(ts, 'YYYY-MM'): what Postgres's clients send
+    crate::pg_casts::register(&ctx); // gen_random_uuid(), uuidv7(), pondra_uuid(x), pg_typeof(x): the casts' functions, every session's
     ctx
 }
 
@@ -320,13 +321,24 @@ pub async fn sql(ctx: &SessionContext, sql: &str) -> anyhow::Result<datafusion::
 /// A user's statement planned as `sql` plans it, refused unless `may` allows its plan. `may` runs before
 /// anything does: a `CREATE TABLE … AS` runs as it is planned.
 pub async fn sql_checked(ctx: &SessionContext, sql: &str, may: impl Fn(&LogicalPlan) -> anyhow::Result<()>) -> anyhow::Result<datafusion::dataframe::DataFrame> {
+    let plan = planned(ctx, sql).await?;
+    may(&plan)?;
+    run(ctx, plan).await
+}
+
+/// A user's statement planned, and nothing run: `run` runs the plan. A caller that must judge the plan first, or hold a
+/// lock across the run, takes the two apart. Planning makes no change; a DDL statement takes effect when it runs.
+pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalPlan> {
     use datafusion::config::Dialect;
     let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
-    let plan = match crate::friendly::lambdas(sql).filter(|_| generic) {
+    Ok(match crate::friendly::lambdas(sql).filter(|_| generic) {
         Some(stmt) => ctx.state().statement_to_plan(stmt).await?,
         None => ctx.state().create_logical_plan(sql).await?,
-    };
-    may(&plan)?;
+    })
+}
+
+/// A planned statement run, as `sql_checked` runs it: the frame of its rows. A DDL statement takes effect here.
+pub async fn run(ctx: &SessionContext, plan: LogicalPlan) -> anyhow::Result<datafusion::dataframe::DataFrame> {
     Ok(text_unions(ctx.execute_logical_plan(plan).await?)?)
 }
 
@@ -352,8 +364,9 @@ pub async fn collect(df: datafusion::dataframe::DataFrame) -> anyhow::Result<Vec
 
 /// `EXPLAIN ANALYZE` run in this task. DataFusion's `AnalyzeExec` runs each input partition on a tokio task, and a
 /// page has no tokio runtime to spawn one on: it panics there and takes every table of the page with it. So the
-/// input runs here, one partition after another, and the answer is built as DataFusion builds it. Its names and
-/// estimates are made readable by `explain::answered`, on a node and a page alike.
+/// input's partitions run here, all at once (`in_task::stream`: a hash join's probe partitions wait for each other),
+/// and the answer is built as DataFusion builds it. Its names and estimates are made readable by `explain::answered`,
+/// on a node and a page alike.
 async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType>) -> anyhow::Result<Vec<RecordBatch>> {
     let task = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
@@ -363,11 +376,9 @@ async fn analyzed(df: datafusion::dataframe::DataFrame, level: Option<MetricType
     let input = exec.input().clone();
     let start = Instant::now();
     let mut rows = 0;
-    for partition in 0..input.output_partitioning().partition_count() {
-        let mut stream = input.execute(partition, task.clone())?;
-        while let Some(batch) = stream.next().await.transpose()? {
-            rows += batch.num_rows();
-        }
+    let mut stream = crate::in_task::stream(input, task.clone())?;
+    while let Some(batch) = stream.next().await.transpose()? {
+        rows += batch.num_rows();
     }
     let duration = Instant::now() - start;
     // (The planner works the metric types out from the statement's level or the session's; `AnalyzeExec` keeps

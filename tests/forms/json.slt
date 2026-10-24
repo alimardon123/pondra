@@ -1,0 +1,28 @@
+# Postgres's JSON at every form: operators, makers and set-returning functions (form-parity P4).
+query T
+SELECT '{"a": {"b": 2}}'::jsonb -> 'a' ->> 'b'
+----
+2
+
+query T
+SELECT jsonb_build_object('k', 1, 'l', 'x')::text
+----
+{"k": 1, "l": "x"}
+
+query T rowsort
+SELECT value::text FROM jsonb_array_elements('[1, "two", null]'::jsonb)
+----
+"two"
+1
+null
+
+query T rowsort
+SELECT key FROM jsonb_each('{"x": 1, "y": 2}'::jsonb)
+----
+x
+y
+
+query T
+SELECT pg_typeof('{}'::jsonb)
+----
+jsonb

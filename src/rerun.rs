@@ -848,7 +848,7 @@ async fn changed(lake: &Lake, source: &str, after: u64, upto: u64) -> Result<Dat
     let mut all = pick(new)?;
     let gone = crate::sys::deleted(source);
     if let (true, Some(dmeta)) = (meta.changed, lake.cat.get::<TableMeta>(&table_key(&gone)).await?) {
-        let t = crate::query::table_view(lake, &ctx, &gone, &crate::sys::with_sys(&dmeta), Some(upto)).await?;
+        let t = crate::query::table_view_once(lake, &ctx, &gone, Arc::new(crate::sys::with_sys(&dmeta)), Some(upto)).await?;
         all = all.union(pick(within(ctx.read_table(crate::query::named(&ctx, t, &dmeta, false)?)?)?)?)?;
     }
     let out = crate::change::taken_out(lake, source, after, Some(upto)).await?;

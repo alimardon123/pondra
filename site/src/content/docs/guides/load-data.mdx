@@ -158,11 +158,12 @@ pondra sql --dir lake "SELECT count(*) AS loaded FROM orders WHERE id BETWEEN 20
 files on your machine. It works while a node runs on the same lake: the shell joins it for the moment.
 `pondra sql --dir lake` reads the lake straight from the folder, with no node of its own. Files in
 buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/pondra/guides/files-and-other-lakes/).
-
 <Aside type="caution">
-A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses
-`FROM 'more.csv'` with "a path on the server's own disk". Only the program that started a node (the shell,
-`connect()` in Python or JavaScript) and `pondra sql` read your files.
+A relative name is read where you are. The shell, `pondra sql` and `connect()` in Python or JavaScript read your own
+folder. A client over HTTP, Postgres or Flight has no folder on the server, so it reads the lake's files instead (what
+`PUT /files/more.csv` wrote), as a page reads its own: `FROM 'more.csv'` from such a client is `files/more.csv`. A node
+never reads its own disk for a client's SQL: an absolute path from one is refused with SQLSTATE `42501`, "a path on the
+server's own disk".
 </Aside>
 
 `pondra sql` reads files and `read_csv(…)`, `read_parquet(…)` and `read_json(…)` in `INSERT … SELECT` and

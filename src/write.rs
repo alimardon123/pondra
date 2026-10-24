@@ -869,13 +869,12 @@ pub fn columns_sql(columns: &[ast::ColumnDef]) -> String {
 
 async fn declared_of(columns: &[ast::ColumnDef]) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> { declared(&columns_sql(columns)).await }
 
-/// Columns as SQL declares them (`"id" BIGINT, "name" VARCHAR`): their Arrow fields, as
-/// DataFusion types them.
+/// Columns as a node declares them (`ext_names::declared`), in the node's own session: its config and its settings'
+/// dialect, so DuckDB's `STRUCT(a INT)` reads here as it does in a query.
 pub async fn declared(cols: &str) -> Result<Vec<datafusion::arrow::datatypes::FieldRef>> {
     let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
     let ctx = crate::settings::apply(ctx).await?; // (the session's dialect: DuckDB's STRUCT(a INT), …)
-    ctx.sql(&format!("CREATE TABLE t ({cols})")).await.with_context(|| format!("the columns ({cols})"))?;
-    Ok(ctx.table("t").await?.schema().fields().iter().cloned().collect::<Vec<_>>())
+    crate::ext_names::declared(ctx, cols).await
 }
 
 /// The `sql_types` of a table made from `sql`, whose columns are `names`: the query's output columns in its order, as
@@ -1826,7 +1825,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
-    let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+    let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
         for mut d in ddls {
@@ -2484,7 +2483,7 @@ fn tries() -> u32 {
 /// job of the run before (`PONDRA_JOB`), so whoever wins the race records it once.
 fn job() -> &'static str {
     static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
+    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.

@@ -83,6 +83,7 @@ jobs:
       wait: ${{ steps.plan.outputs.wait }}
       site: ${{ steps.plan.outputs.site }}
       web: ${{ steps.plan.outputs.web }}
+      forms: ${{ steps.plan.outputs.forms }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -196,6 +197,10 @@ jobs:
           # (and a pull request's, or a train's, when the module itself, the core's list of modules or its
           # dependencies change: the unit tests compile the core without the server feature, but not for wasm32)
           if [ "$event" = pull_request ] && has '^(web/|tools/web_|src/lib\.rs$|Cargo\.toml$)'; then web=true; fi
+          # (one set of SQL cases on every form, tools/forms_check.py: whenever a form or the cases change, so the page's
+          # module is built for it too, beside linux-x64's build)
+          forms=false
+          if has "$bin|$pkg|^web/|^tests/forms/|^docs/forms\.json\$|^tools/(forms_check\.py|page_serve\.mjs|slt_check\.py|harness\.py)\$|$self"; then forms=true; web=true; fi
           if [ "$FULL" = true ] && has '^(deploy/|install\.(sh|ps1)$|src/service\.rs$|tools/(image|deploy_check|distribute|sign|package)\.py$|tools/ci_(artifact|build)\.sh$|\.github/workflows/(deploy|deploy-check|build)\.yml$)'; then deploy=true; fi
           if [ "$FULL" = true ] && { [ "$code" = true ] || [ "$deploy" = true ]; }; then full=true; fi
           upgrade=false; resilience=false; sharing=false; sso=false
@@ -209,12 +214,12 @@ jobs:
             if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings|sso)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false
-          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ]; then binary=true; fi
+          if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 4) | {part: "harness, \(.) of 3", shard: "\(.)/3"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
-          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
-            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
-          for k in binary full unit harness docs site web upgrade resilience sharing sso deploy; do
+          for k in binary full unit harness docs site web forms upgrade resilience sharing sso deploy; do
             if [ "${!k}" = true ]; then runs="$runs $k"; fi
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
@@ -292,6 +297,12 @@ jobs:
           [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" = "$v" ] || cargo install wasm-bindgen-cli --version "$v" --locked
       - run: bash tools/web_build.sh
       - run: node tools/web_check.mjs --sizes
+      - uses: actions/upload-artifact@v6 # (the forms check's page: not pondra-…, which release.yml takes)
+        with:
+          name: web-pkg
+          path: |
+            web/pkg/pondra_web.js
+            web/pkg/pondra_web_bg.wasm
 
   # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
   # so they start once it is built, never waiting for the slowest platform.
@@ -510,6 +521,43 @@ jobs:
           path: /tmp/pondra-*.stderr
           if-no-files-found: ignore
 
+  # One set of SQL cases on every form (tools/forms_check.py, reviews/form-parity.md): each answers as a node does, or
+  # refuses by the name docs/forms.json lists. The page in Node, a node in this process on a folder and in memory, and a
+  # node; the train's and main's runs add three nodes. From what linux-x64 and web built: no build of its own.
+  forms:
+    needs: [plan, linux, web]
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.web.result == 'success' && needs.plan.outputs.forms == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.plan.outputs.packages }}-linux-x64
+          path: dist
+      - uses: actions/download-artifact@v7
+        with:
+          name: web-pkg
+          path: web/pkg
+      - name: linux-x64's binary, and the library from its wheel
+        run: |
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin
+          unzip -p dist/*.whl 'pondra/_lib/libpondra_lib.so' > bin/libpondra_lib.so && ls -l bin
+      - run: pip install pyarrow==25.0.1 numpy # (tools/requirements.txt's pyarrow: slt_check.py reads the answers with it)
+      - run: python3 tools/forms_check.py --form page,inprocess,memory,server${{ github.event_name != 'pull_request' && ',cluster' || '' }} --bin bin/pondra --lib bin/libpondra_lib.so --out forms.json
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: forms-failures
+          path: forms.json
+          if-no-files-found: ignore
+
   # The tests of what the build made, each a workflow of its own (which also runs by hand), called
   # once linux-x64's build is done (deploy's once every platform's is). A test that waited for the
   # packages inside its own job held a runner all that time, and enough of them held every runner
@@ -554,7 +602,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, web, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, forms, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:

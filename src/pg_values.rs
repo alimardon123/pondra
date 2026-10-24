@@ -2,11 +2,9 @@
 //! (`pg::bind`), and the TIME and INTERVAL text Postgres prints (`pg::PgTime`, `pg::PgInterval`).
 //! Pure, with no portal and no pgwire encoder, so the unit tests at the end run alone.
 
-use datafusion::sql::sqlparser::ast::{self, VisitMut};
 use pgwire::api::Type;
 use crate::pg_bytea;
-use crate::pg_text::{array_literal, interval_text, time_text};
-use std::ops::ControlFlow;
+use crate::pg_text::{interval_text, time_text};
 
 // A parameter comes as its bytes, text or binary as the client chose. Binary is first written as the
 // text Postgres would have sent (`binary_text`); then `literal` reads that text strictly and writes
@@ -317,115 +315,9 @@ pub(crate) fn substitute(sql: &str, values: &[String]) -> String {
     out
 }
 
-// ---- Array literals: a string cast to an array type is read as Postgres reads it (`'{a,b}'::text[]`) ----
-
-/// Each string literal cast to an array type, read as Postgres reads an array literal and written as the array it
-/// names: `'{a,b}'::text[]`, `CAST('{1,2}' AS INT[])` and `TEXT[] '{a,b}'` become `CAST(make_array('a', 'b') AS TEXT[])`,
-/// a NULL element as NULL. Nothing else is changed. Before this a text array literal was a list of one string, so
-/// `doc ?| '{a,b}'::text[]` asked for the key `{a,b}`. Returns whether one was found; a malformed one is 22P02.
-pub(crate) fn array_literals(stmt: &mut ast::Statement) -> anyhow::Result<bool> {
-    let mut found = ArrayLiterals { found: false };
-    match stmt.visit(&mut found) {
-        ControlFlow::Break(e) => Err(e),
-        ControlFlow::Continue(()) => Ok(found.found),
-    }
-}
-
-/// The rewrite `array_literals` makes, in one walk over the statement.
-struct ArrayLiterals {
-    found: bool,
-}
-
-impl ast::VisitorMut for ArrayLiterals {
-    type Break = anyhow::Error;
-
-    fn post_visit_expr(&mut self, e: &mut ast::Expr) -> ControlFlow<anyhow::Error> {
-        let Some((text, data_type)) = array_text(e) else { return ControlFlow::Continue(()) };
-        match array_of(&text, &data_type) {
-            Ok(made) => {
-                *e = made;
-                self.found = true;
-                ControlFlow::Continue(())
-            }
-            Err(err) => ControlFlow::Break(err),
-        }
-    }
-}
-
-/// The text of a string literal cast to an array type, and that type (`'…'::t[]`, `CAST('…' AS t[])`, `t[] '…'`).
-fn array_text(e: &ast::Expr) -> Option<(String, ast::DataType)> {
-    match e {
-        ast::Expr::Cast { kind: ast::CastKind::Cast | ast::CastKind::DoubleColon, expr, data_type, .. } if is_array(data_type) => Some((string_of(expr)?, data_type.clone())),
-        ast::Expr::TypedString(typed) if is_array(&typed.data_type) => Some((string_value(&typed.value.value)?, typed.data_type.clone())),
-        _ => None,
-    }
-}
-
-fn is_array(t: &ast::DataType) -> bool { matches!(t, ast::DataType::Array(_)) }
-
-fn string_of(e: &ast::Expr) -> Option<String> {
-    match e {
-        ast::Expr::Value(v) => string_value(&v.value),
-        _ => None,
-    }
-}
-
-fn string_value(v: &ast::Value) -> Option<String> {
-    match v {
-        ast::Value::SingleQuotedString(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// `CAST(make_array(…) AS t)` for an array literal's elements: each a string, NULL where the literal has NULL.
-fn array_of(text: &str, data_type: &ast::DataType) -> anyhow::Result<ast::Expr> {
-    let items = array_literal(text)?.into_iter().map(|item| ast::Expr::value(item.map_or(ast::Value::Null, ast::Value::SingleQuotedString))).collect();
-    let made = crate::text::function("make_array", items);
-    Ok(ast::Expr::Cast { kind: ast::CastKind::Cast, expr: Box::new(made), data_type: data_type.clone(), array: false, format: None })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The statement `sql` reads as after `array_literals`: whether it had a cast, and its text (or the refusal's SQLSTATE
-    /// and words).
-    fn rewritten(sql: &str) -> Result<(bool, String), String> {
-        use datafusion::sql::sqlparser::{dialect::{GenericDialect, PostgreSqlDialect}, parser::Parser};
-        // (the generic dialect reads most of these; one that it refuses is read as Postgres reads it)
-        let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|_| Parser::parse_sql(&PostgreSqlDialect {}, sql));
-        let mut stmt = parsed.unwrap().remove(0);
-        match array_literals(&mut stmt) {
-            Ok(found) => Ok((found, crate::text::sql(&stmt))),
-            Err(e) => Err(format!("{} {e}", crate::codes::of(&e))),
-        }
-    }
-
-    #[test]
-    fn array_literals_read_as_postgres_reads_them() {
-        assert_eq!(rewritten("SELECT '{a,b}'::text[]"), Ok((true, "SELECT CAST(make_array('a', 'b') AS TEXT[])".to_string())));
-        assert_eq!(rewritten("SELECT CAST('{1,2}' AS INT[])"), Ok((true, "SELECT CAST(make_array('1', '2') AS INT[])".to_string())));
-        assert_eq!(rewritten(r#"SELECT TEXT[] '{a,"b,c",NULL}'"#), Ok((true, "SELECT CAST(make_array('a', 'b,c', NULL) AS TEXT[])".to_string())));
-        assert_eq!(rewritten("SELECT '{}'::text[]"), Ok((true, "SELECT CAST(make_array() AS TEXT[])".to_string())), "an empty one");
-        assert_eq!(rewritten("SELECT '{NULL}'::text[]"), Ok((true, "SELECT CAST(make_array(NULL) AS TEXT[])".to_string())));
-        assert_eq!(rewritten("SELECT '{it''s,\"x\\\"y\"}'::text[]"), Ok((true, "SELECT CAST(make_array('it''s', 'x\"y') AS TEXT[])".to_string())), "quotes and escapes");
-    }
-
-    #[test]
-    fn array_literals_leave_other_statements_as_they_are() {
-        let (found, _) = rewritten("SELECT 'a'::text, ARRAY[1, 2]::int[], x FROM t WHERE y = '{a}'").unwrap();
-        assert!(!found, "a string cast to text, an array built by ARRAY, and a literal not cast to an array: none");
-        let (found, _) = rewritten("SELECT doc ?| ARRAY['a', 'b'] FROM t").unwrap();
-        assert!(!found);
-    }
-
-    #[test]
-    fn array_literals_refuse_nested_and_malformed_literals() {
-        let nested = rewritten("SELECT '{{1,2},{3,4}}'::int[]").unwrap_err();
-        assert!(nested.starts_with("0A000"), "{nested}");
-        let malformed = rewritten("SELECT '{a,b'::text[]").unwrap_err();
-        assert_eq!(malformed, r#"22P02 malformed array literal: "{a,b""#);
-    }
 
     fn lit(t: Type, text: &str) -> String { literal(&t, text).unwrap_or_else(|e| format!("ERR {}: {e}", crate::codes::of(&e))) }
 

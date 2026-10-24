@@ -134,24 +134,10 @@ pub fn orderable(t: &DataType) -> bool {
 }
 
 /// The ranges covering a table's whole contents: its manifests' and its files'. What a query's
-/// planning knows about the values in each column (`query::Pruned::statistics`). Worked out once
-/// per version of the table — every query would otherwise re-parse every file's min and max.
-pub fn ranges(table: &str, manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Arc<Stats> {
-    use std::hash::{Hash, Hasher};
-    crate::per_node!(static SEEN: Mutex<lru::LruCache<String, (u64, Arc<Stats>)>> = Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap())); clear = |m| m.lock().unwrap_or_else(|e| e.into_inner()).clear());
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    files.iter().for_each(|f| f.path.hash(&mut h));
-    manifests.iter().for_each(|m| m.path.hash(&mut h));
-    let mark = h.finish();
-    if let Some((had, stats)) = SEEN.lock().unwrap().get(table) {
-        if *had == mark {
-            return stats.clone();
-        }
-    }
+/// planning knows about the values in each column (`query::facts`, kept once per version of the table).
+pub fn ranges(manifests: &[Manifest], files: &[DataFile], schema: &SchemaRef) -> Stats {
     let parts: Vec<&Stats> = manifests.iter().map(|m| &m.stats).chain(files.iter().map(|f| &f.stats)).collect();
-    let stats = Arc::new(union(&parts, schema));
-    SEEN.lock().unwrap().put(table.to_string(), (mark, stats.clone()));
-    stats
+    union(&parts, schema)
 }
 
 /// The ranges covering all of `parts` (a column missing from any of them has no range).
@@ -248,19 +234,25 @@ pub async fn files(lake: &Lake, m: &Manifest) -> Result<Vec<DataFile>> {
 }
 
 /// The files that can hold rows matching `filters`: manifests pruned first, then files.
-/// `manifests`: a subset to look in (a distributed query's slice), else the table's list.
+/// `manifests`: the list to look in (a distributed query's slice, or a table's list the caller holds), else the table's list.
 pub async fn pruned(lake: &Lake, meta: &TableMeta, manifests: Option<&[Manifest]>, filters: &[Expr], schema: &SchemaRef) -> Result<Vec<DataFile>> {
-    let listed = match manifests {
-        Some(m) => m.to_vec(),
-        None => list(lake, meta).await?,
+    let owned;
+    let listed: &[Manifest] = match manifests {
+        Some(m) => m,
+        None => {
+            owned = list(lake, meta).await?;
+            &owned
+        }
     };
     let kept = keep(&listed.iter().map(|m| &m.stats).collect::<Vec<_>>(), filters, schema);
     let wanted: Vec<&Manifest> = listed.iter().zip(kept).filter(|(_, k)| *k).map(|(m, _)| m).collect();
     let loads: Vec<_> = wanted.into_iter().map(|m| files(lake, m)).collect();
-    let loaded: Vec<Vec<DataFile>> = futures::StreamExt::buffered(futures::stream::iter(loads), 32).try_collect().await?;
-    let candidates: Vec<DataFile> = loaded.into_iter().flatten().chain(meta.files.iter().cloned()).collect();
-    let kept = keep(&candidates.iter().map(|f| &f.stats).collect::<Vec<_>>(), filters, schema);
-    let files: Vec<DataFile> = candidates.into_iter().zip(kept).filter(|(_, k)| *k).map(|(f, _)| f).collect();
+    let loaded: Vec<DataFile> = futures::StreamExt::buffered(futures::stream::iter(loads), 32).try_collect::<Vec<Vec<DataFile>>>().await?.into_iter().flatten().collect();
+    // (the entry's own files are judged where they are: only those kept are copied)
+    let kept = keep(&loaded.iter().chain(&meta.files).map(|f| &f.stats).collect::<Vec<_>>(), filters, schema);
+    let (from_lists, from_entry) = kept.split_at(loaded.len());
+    let mut files: Vec<DataFile> = loaded.into_iter().zip(from_lists).filter(|(_, k)| **k).map(|(f, _)| f).collect();
+    files.extend(meta.files.iter().zip(from_entry).filter(|(_, k)| **k).map(|(f, _)| f.clone()));
     let total = listed.iter().map(|m| m.files).sum::<u64>() + meta.files.len() as u64;
     crate::metrics::add(&crate::metrics::FILES_SCANNED, files.len() as u64);
     crate::metrics::add(&crate::metrics::FILES_SKIPPED, total - files.len() as u64);

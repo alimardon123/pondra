@@ -1,6 +1,7 @@
 //! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, as
 //! `fetch.rs` is one web origin's objects. A page keeps its files and its tables there (`Page::kept`), so they are there
-//! after a reload. Two pages on one origin given one folder share it, one writer at a time.
+//! after a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes
+//! one writer at a time, so two tabs never write over each other's tables.
 //!
 //! A write is whole or not at all. Over an existing file, Chromium keeps the old bytes until the new ones are closed. A
 //! new object is written under a temporary name (`{name}#writing`: object_store encodes `#`, so no object has one) and
@@ -153,11 +154,13 @@ impl From<String> for Failed {
     }
 }
 
-/// A JavaScript failure as a `Failed`: the browser names a missing object in the exception's `name`.
+/// A JavaScript failure as a `Failed`: the browser names a missing object in the exception's `name`, and a write over the
+/// site's quota as `QuotaExceededError`, which is said in the words the page keeps (`page::FULL`).
 fn failed(e: JsValue) -> Failed {
     let name = js::get(&e, "name").ok().and_then(|name| name.as_string()).unwrap_or_default();
     match name.as_str() {
         "NotFoundError" | "TypeMismatchError" => Failed::Missing,
+        "QuotaExceededError" => Failed::Words(format!("{}: {}", pondra::page::FULL, js::js_words(e))),
         _ => Failed::Words(js::js_words(e)),
     }
 }

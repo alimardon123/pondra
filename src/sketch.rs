@@ -114,7 +114,7 @@ pub fn min_max(cols: &[ArrayRef]) -> Option<(ScalarValue, ScalarValue)> {
     Some((lo.evaluate().ok()?, hi.evaluate().ok()?))
 }
 
-/// What the planner knows of rows held in memory, told as a lake's table tells it (`query::Pruned::count`): their rows and
+/// What the planner knows of rows held in memory, told as a lake's table tells it (`query::count`): their rows and
 /// bytes, and each column's NULLs, least and greatest value and distinct values. Everything is inexact, never exact: nothing
 /// may answer a query from it. A column whose type `min_max` refuses, or whose values are all NULL, keeps its range unknown.
 pub fn statistics(schema: &SchemaRef, batches: &[RecordBatch]) -> Statistics {

@@ -350,6 +350,55 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 }
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
+
+/// How long a producer's mark is kept after its last commit, from its name (0: kept for good, as every
+/// mark was before expiries). Three windows:
+/// - the named window, `copy::retention_ms` (64 days): a job a client named (`POST /sql?job=`,
+///   `POST /insert/{t}?job=`, the Python client's `job=`, `PONDRA_JOB`). The docs promise that a job sent
+///   again is applied once, and a daily load may be re-run days later;
+/// - the retry window, `retry_ms`: an id nobody named (it starts `auto-`, `log::auto_job`), a transaction's
+///   COMMIT and a COPY's chunks, unless a client named the transaction's job;
+/// - 0 for the rest: views', tasks', Kafka's and `/append`'s producers, and the records of COPY INTO files
+///   (`job:load:`) and of Iceberg snapshots (`job:iceberg:`), which their own code keeps or expires.
+///
+/// The retry window was checked against the paths that send each kind again, not taken on trust:
+/// - an `auto-` id is resent only by its client's own retries (the Python client's `retry_secs`, 60 s,
+///   python/pondra/client.py:186), by a fenced `pondra sql` starting over with its job (write.rs ~2299,
+///   `PONDRA_JOB` is passed on), and by the inbox: a leader committed the request and died before it deleted
+///   it, and the next writer waits out `alive`'s 30 s (cluster.rs:554, inbox.rs);
+/// - a transaction's COMMIT (`txn:{id}:{table}`, a fresh id per transaction: txn.rs `start`) is sent once, by
+///   the node that runs it (txn.rs `commit`: `write::post` to the leader, or `commit_here` on the leader), and
+///   a failed send goes back to the client as an error with the transaction gone, so nothing sends it again;
+///   a named transaction (`txn:job-{j}:`) is sent again by its client, so it takes the named window;
+/// - a COPY chunk (`copy:{job}`, pg.rs ~642) is appended once, and its error goes back to the client, which
+///   can't resume a COPY: nothing sends a chunk again.
+/// So the retry window covers all of them with room. It is `2 × max(PONDRA_LOCK_LEASE_SECS, 60 s)`.
+pub fn kept_ms(producer: &str) -> u64 {
+    let named = |job: &str| if job.starts_with("auto-") { retry_ms() } else { crate::copy::retention_ms() };
+    if let Some(job) = producer.strip_prefix("sql:") {
+        return named(job);
+    }
+    if let Some(job) = producer.strip_prefix("txn:job-") {
+        return named(job);
+    }
+    if producer.starts_with("txn:") || producer.starts_with("copy:") {
+        return retry_ms();
+    }
+    if producer.starts_with("job:load:") || producer.starts_with("job:iceberg:") {
+        return 0;
+    }
+    if let Some(job) = producer.strip_prefix("job:") {
+        return named(job);
+    }
+    0
+}
+
+/// The retry window (`kept_ms`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
+/// default), and at least a minute, so 120 s by default. It has no setting of its own.
+pub fn retry_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| 2 * crate::locks::lease().as_secs().max(60) * 1000)
+}
 pub fn data_key(seg: u64) -> String { format!("d/{seg:020}") } // small segments live inside the catalog
 pub fn json<T: Serialize>(v: &T) -> Vec<u8> { serde_json::to_vec(v).expect("serializable") }
 
@@ -593,8 +642,7 @@ impl std::fmt::Debug for Lake {
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
 pub fn memory_limit() -> usize {
-    let gb = crate::env::parse::<f64>("PONDRA_MEMORY_GB");
-    gb.map(|g| (g * (1u64 << 30) as f64) as usize).or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
+    crate::env::gib("PONDRA_MEMORY_GB").or_else(|| ram().map(|r| r / 3)).unwrap_or(4 << 30)
 }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
@@ -763,7 +811,13 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         std::fs::create_dir_all(url)?;
         let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
-        return Ok((dir.clone(), Arc::new(Counted(Arc::new(LocalFileSystem::new_with_prefix(&dir)?))), None));
+        // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
+        // overwrites, and a folder that refuses them never deletes those files. The soak of one local lake
+        // for 5 hours grew its catalog from 206 to 13,373 objects, and commits' p95 from 0.4 to 5.2 ms. The
+        // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
+        // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
+        // and a writer fenced by a newer one restarts (`fatal`).)
+        return Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None));
     };
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
@@ -868,6 +922,52 @@ impl object_store::MultipartUpload for CountedParts {
     async fn abort(&mut self) -> object_store::Result<()> { self.0.abort().await }
 }
 
+/// A local folder's store. `LocalFileSystem` refuses a conditional overwrite (`PutMode::Update`), and
+/// SlateDB's collector advances its boundary files with one: from the collector's second pass on, its
+/// manifest and compactions passes failed and deleted nothing. So an `Update` here is a head and an
+/// overwrite with the e-tag checked between them (a folder's version is its e-tag alone: `version` is
+/// None there); every other call is the folder's own.
+#[derive(Debug)]
+pub(crate) struct Local(pub(crate) LocalFileSystem);
+
+/// One process's conditional updates of a folder take turns here, so a check and the overwrite after it
+/// never interleave. (Not `Lake::replace`'s `ONE`, which is held across its own put.)
+static UPDATES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+impl std::fmt::Display for Local {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Local {
+    async fn put_opts(&self, at: &Path, body: object_store::PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
+        let PutMode::Update(version) = &opts.mode else { return self.0.put_opts(at, body, opts).await };
+        let _turn = UPDATES.lock().await;
+        let refused = |why: String| object_store::Error::Precondition { path: at.to_string(), source: why.into() };
+        let current = match self.0.head(at).await {
+            Ok(meta) => meta.e_tag,
+            Err(object_store::Error::NotFound { .. }) => return Err(refused("there is no object to update".into())),
+            Err(e) => return Err(e),
+        };
+        if current != version.e_tag {
+            return Err(refused(format!("its e-tag is {current:?}, not {:?}", version.e_tag)));
+        }
+        // (the attributes stay: LocalFileSystem refuses them by name, before it writes anything)
+        self.0.put_opts(at, body, PutOptions { mode: PutMode::Overwrite, ..opts }).await
+    }
+    async fn put_multipart_opts(&self, at: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(at, opts).await
+    }
+    async fn get_opts(&self, at: &Path, opts: object_store::GetOptions) -> object_store::Result<object_store::GetResult> { self.0.get_opts(at, opts).await }
+    async fn get_ranges(&self, at: &Path, ranges: &[std::ops::Range<u64>]) -> object_store::Result<Vec<bytes::Bytes>> { self.0.get_ranges(at, ranges).await }
+    fn delete_stream(&self, at: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> { self.0.delete_stream(at) }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> { self.0.list(prefix) }
+    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> { self.0.list_with_offset(prefix, offset) }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> { self.0.list_with_delimiter(prefix).await }
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: object_store::CopyOptions) -> object_store::Result<()> { self.0.copy_opts(from, to, opts).await }
+    async fn rename_opts(&self, from: &Path, to: &Path, opts: object_store::RenameOptions) -> object_store::Result<()> { self.0.rename_opts(from, to, opts).await }
+}
+
 /// What a node still catching up with its leader answers (57P03: it ran nothing, ask again or
 /// another node; `Lake::caught_up`).
 pub const CATCHING_UP: &str = "this node just started and is still catching up with its leader: try again in a moment, or ask another node";
@@ -908,7 +1008,6 @@ impl ObjectStore for ReadOnly {
 pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let ctx = crate::engine::session(config, rt);
     crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
-    crate::types::register(&ctx); // gen_random_uuid(), uuidv7(), pg_typeof(x)
     crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
     ctx
 }
@@ -1356,7 +1455,7 @@ impl Lake {
             Ok(r) => r,
             Err(object_store::Error::Precondition { .. }) => return Err(Changed.into()),
             Err(object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. }) => {
-                self.store.put_opts(&at, bytes.into(), opts(PutMode::Overwrite)).await? // (a local disk: checked just above)
+                self.store.put_opts(&at, bytes.into(), opts(PutMode::Overwrite)).await? // (a store with no conditional put: checked just above)
             }
             Err(e) => return Err(e.into()),
         };
@@ -1614,18 +1713,21 @@ const RECORDS: [&str; 2] = [crate::history::TABLE, crate::audit::TABLE];
 /// marked `QUIET`, or numbers taken (sequences' and row ids' blocks, a bulk write's commit:
 /// `log::commit`, marked too). Counting them, every remembered answer was forgotten every second on
 /// a lake nobody wrote to, again 50 ms after each `CREATE TABLE`, and once just after a new lake served.
+/// Producers' expiries and the old marks' pass (`log::EXPIRY`), and the marks they delete (`p/`), count
+/// neither way: a commit is as quiet as it is without them.
 fn quiet(d: &Delta) -> bool {
     let hex = |id: &str| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
+    let expiry = |k: &str| k.starts_with(crate::log::EXPIRY);
     let unread = |k: &str| {
         k == crate::users::KEYS
             || RECORDS.iter().any(|t| k.strip_prefix("t/") == Some(t) || k.strip_prefix("p/").and_then(|p| p.strip_prefix(t.trim_start_matches("pondra$"))).and_then(|p| p.strip_prefix('-')).is_some_and(hex))
     };
     let marked = d.puts.iter().any(|(k, _)| k == QUIET);
     let only = |s: &Segment| s.files.is_empty() && s.parts.keys().all(|t| RECORDS.contains(&t.as_str()));
-    d.deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/"))
+    d.deletes.iter().all(|k| k.starts_with("s/") || k.starts_with("d/") || k.starts_with("p/") || expiry(k))
         && (marked || d.puts.iter().any(|(k, _)| unread(k)))
         && d.puts.iter().all(|(k, v)| {
-            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || unread(k) || (marked && (k.starts_with("t/") || k.starts_with("sq/")))
+            matches!(k.as_str(), "c" | "n" | "b" | QUIET) || k.starts_with("d/") || unread(k) || expiry(k) || (marked && (k.starts_with("t/") || k.starts_with("sq/")))
                 || (k.starts_with("s/") && serde_json::from_slice::<Segment>(v).is_ok_and(|s| only(&s)))
         })
 }
@@ -1868,8 +1970,9 @@ impl Catalog {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
         // enough that compaction keeps up with the checkpoints.
         let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
-        // Every commit is a write-ahead-log object: clear those (and old manifests) every minute
-        // once a minute old, not SlateDB's every 10 minutes — thousands would sit in the bucket.
+        // Every commit is a write-ahead-log object: clear those, and the old manifests and compaction
+        // records, every minute once a minute old, not SlateDB's every 10 minutes — thousands would sit
+        // in the bucket. (On a bucket that is one more LIST a minute for the compaction records.)
         // (What a reader's checkpoint still needs stays.)
         // On a local disk, where listing costs nothing, the WAL goes every 5 s and the compactor's
         // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
@@ -1879,7 +1982,7 @@ impl Catalog {
         let gc = crate::env::parse("PONDRA_GC_SECS");
         let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
         let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
-        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
+        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compactions_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
         // (the compactor and the garbage collector start once the node serves: their first reads
         // were most of a cold start's, C5; `upkeep`)
         let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
@@ -2319,6 +2422,23 @@ impl Catalog {
         }
     }
 
+    /// The first `n` entries with keys in [from, to), in key order: a commit's bounded look at a range
+    /// (producers' expiries, the old marks' pass). In memory it takes only those `n` (the overlay's range,
+    /// `take`), never a copy of the whole range; without the whole catalog here, it reads all of it.
+    pub async fn scan_first(&self, from: &str, to: &str, n: usize) -> Result<Vec<(String, Bytes)>> {
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap();
+            return Ok(o.range(from.to_string()..to.to_string()).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).take(n).collect());
+        }
+        Ok(self.scan_raw(from, to).await?.into_iter().take(n).collect())
+    }
+
+    /// How many keys in [from, to) the catalog holds, when it holds the whole catalog in memory (the
+    /// leader's, and a follower's once seeded); counted in place, nothing copied. `None` otherwise.
+    pub fn count(&self, from: &str, to: &str) -> Option<usize> {
+        self.mirror.load(Relaxed).then(|| self.overlay.lock().unwrap().range(from.to_string()..to.to_string()).filter(|(_, (_, v))| v.is_some()).count())
+    }
+
     /// Leader: persist the catalog memtable if anything was committed since the last time. A
     /// restart then replays only the WAL written since, and the other nodes' views — which read
     /// no WAL — catch up (a follower whose commit stream broke reads from its view until then).
@@ -2499,6 +2619,33 @@ mod tests {
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &user), (QUIET, "true"), ("c", "9")]), "a table's rows, marked");
         assert!(!quiet_of(&[("p/audit-x", "1"), ("c", "9")]), "a producer only named like the audit log's");
         assert!(!quiet_of(&[("d/3", "x"), ("s/3", &audit), (&audit_p, "1"), ("v/a_view", "{}"), ("c", "9")]), "the audit log's rows with a view's entry");
+        // Expiries, the old marks' marker and the marks they delete count neither way (`log::EXPIRY`).
+        let expiry = |due: u64, p: &str| format!("{}{due:020}/{p}", crate::log::EXPIRY);
+        let quiet_with = |puts: &[(&str, &str)], deletes: &[&str]| quiet(&Delta { id: 9, puts: puts.iter().map(|(k, v)| (k.to_string(), Bytes::from(v.to_string()))).collect(), deletes: deletes.iter().map(|k| k.to_string()).collect() });
+        let (expiring, marker) = (expiry(5, "sql:auto-x"), format!("{}~old", crate::log::EXPIRY));
+        assert!(quiet_with(&[("d/4", "x"), ("s/4", &history), (&history_p, "1"), ("n", "5"), ("c", "9")], &[&expiring, "p/sql:auto-y"]), "the history's rows, with marks expiring and gone");
+        assert!(quiet_with(&[("d/4", "x"), ("s/4", &history), (&history_p, "1"), (&expiring, "1"), (&marker, "\"Done\""), ("n", "5"), ("c", "9")], &[]), "the history's rows, with expiries and the marker put");
+        assert!(quiet_with(&[(QUIET, "true"), (&expiring, "1"), ("n", "4"), ("b", "2"), ("c", "9")], &[]), "a row-id block taken, with an expiry put");
+        assert!(!quiet_with(&[("d/3", "x"), ("s/3", &user), (&expiring, "1"), ("n", "4"), ("c", "9")], &[]), "a table's rows keep the commit loud");
+        assert!(!quiet_with(&[("d/3", "x"), ("s/3", &user), ("c", "9")], &["p/sql:auto-y"]), "a table's rows keep the commit loud, with a mark gone");
+        assert!(!quiet_with(&[(&expiring, "1"), (&marker, "\"Done\""), ("n", "4"), ("c", "9")], &[]), "expiries alone are as loud as nothing: unmarked numbers are loud");
+    }
+
+    /// `scan_first` is the first keys of a range, in key order, and `count` counts the range as the catalog holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_first_takes_the_first_keys_of_a_range() -> Result<()> {
+        // (a lake opened to write: its commits are applied by `Lake::open`'s `commits`, which a bare
+        // `Catalog::writer` never starts, so its `commit` would wait for ever)
+        let dir = std::env::temp_dir().join(format!("pondra-scan-first-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        lake.cat.commit((0..5u8).map(|i| (format!("g/{i}"), vec![i])).chain([("h/x".to_string(), vec![9])]).collect(), &[]).await?;
+        let first: Vec<String> = lake.cat.scan_first("g/", "g0", 3).await?.into_iter().map(|(k, _)| k).collect();
+        assert_eq!(first, ["g/0", "g/1", "g/2"]);
+        assert_eq!(lake.cat.scan_first("g/", "g0", 99).await?.len(), 5);
+        assert_eq!(lake.cat.count("g/", "g0"), Some(5));
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
@@ -2507,12 +2654,58 @@ mod tests {
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
-        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
         let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
         assert!(cat.get_raw("d/1").await.is_err());
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// A folder's store takes the conditional overwrites SlateDB's collector makes (`Local`): an update with the
+    /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
+    /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
+    /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_folder_takes_conditional_overwrites() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
+        let at = Path::from("catalog/gc/manifest.boundary");
+        let bytes = |b: &'static [u8]| object_store::PutPayload::from_static(b);
+        let update = |e_tag: &str| PutOptions { mode: PutMode::Update(object_store::UpdateVersion { e_tag: Some(e_tag.into()), version: None }), ..Default::default() };
+        let refused = |r: object_store::Result<object_store::PutResult>| matches!(r, Err(object_store::Error::Precondition { .. }));
+
+        let created = store.put_opts(&at, bytes(b"1"), PutOptions { mode: PutMode::Create, ..Default::default() }).await?;
+        let again = store.put_opts(&at, bytes(b"x"), PutOptions { mode: PutMode::Create, ..Default::default() }).await;
+        assert!(matches!(again, Err(object_store::Error::AlreadyExists { .. })), "a create over an object: already there");
+        let first = created.e_tag.expect("an e-tag");
+        assert_eq!(store.head(&at).await?.e_tag.as_deref(), Some(first.as_str()), "a put's e-tag is the one a head gives");
+
+        let second = store.put_opts(&at, bytes(b"2"), update(&first)).await?;
+        assert_eq!(second.e_tag, store.head(&at).await?.e_tag, "an update's e-tag is the new object's");
+        let second = second.e_tag.expect("an e-tag");
+        let third = store.put_opts(&at, bytes(b"3"), update(&second)).await?.e_tag.expect("an e-tag");
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"3"), "the second update went through");
+
+        assert!(refused(store.put_opts(&at, bytes(b"4"), update(&first)).await), "an old e-tag: a precondition");
+        let missing = Path::from("catalog/gc/none.boundary");
+        assert!(refused(store.put_opts(&missing, bytes(b"5"), update("any")).await), "a missing object: a precondition");
+        assert!(store.head(&missing).await.is_err(), "and nothing was created");
+
+        let mut attributes = object_store::Attributes::new();
+        attributes.insert(object_store::Attribute::ContentType, "text/plain".into());
+        let tagged = PutOptions { attributes, ..update(&third) };
+        assert!(matches!(store.put_opts(&at, bytes(b"6"), tagged).await, Err(object_store::Error::NotImplemented { .. })), "an update with an attribute: refused by name");
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"3"), "and nothing changed");
+
+        let (a, b) = tokio::join!(store.put_opts(&at, bytes(b"7"), update(&third)), store.put_opts(&at, bytes(b"8"), update(&third)));
+        assert_eq!([a.is_ok(), b.is_ok()].iter().filter(|ok| **ok).count(), 1, "of two updates on one e-tag, one is made");
+        assert!(refused(if a.is_err() { a } else { b }), "the other is a precondition");
+        store.put_opts(&at, bytes(b"9"), PutOptions::default()).await?;
+        assert_eq!(store.get(&at).await?.bytes().await?, Bytes::from_static(b"9"), "an overwrite is as it was");
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
@@ -2523,7 +2716,7 @@ mod tests {
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
-        let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
+        let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
         let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;

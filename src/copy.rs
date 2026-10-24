@@ -50,9 +50,9 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     }
     let remote = scheme(to).is_some_and(|s| s != "file");
     match remote {
-        false => ensure!(owner(), "COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"),
+        false => ensure!(owner(), crate::codes::coded("42501", format!("COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"))),
         true => {
-            ensure!(owner() || covering(&list(lake).await?, to).is_some(), "{}", uncovered(to));
+            ensure!(owner() || covering(&list(lake).await?, to).is_some(), crate::codes::coded("42501", uncovered(to)));
             register(lake, to).await?;
         }
     }
@@ -237,7 +237,7 @@ const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "
 /// without FORCE: a file last changed before this window is skipped, as its record may be gone
 /// (Snowflake's 64 days of load metadata). `PONDRA_LOAD_RETENTION_SECS` shortens it, for tests; it is
 /// read once.
-fn retention_ms() -> u64 {
+pub(crate) fn retention_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| crate::env::parse::<u64>("PONDRA_LOAD_RETENTION_SECS").map_or(64 * 24 * 3600 * 1000, |s| s * 1000))
 }
@@ -340,7 +340,8 @@ struct Piece {
 async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) -> Result<(String, bool, Vec<Piece>)> {
     let (shown, spec, query_of) = match from {
         Source::Path(p) => {
-            let p = if scheme(p).is_none() { crate::ddl::full(p)? } else { p.clone() };
+            // (a relative path is the owner's folder's, made whole here; a client's is read as `objects` maps it: the lake's files)
+            let p = if scheme(p).is_none() && owner() { crate::ddl::full(p)? } else { p.clone() };
             let (format, mut reader) = match options.get("format") {
                 Some(f) => (f.to_lowercase(), BTreeMap::new()),
                 None => format_of(p.trim_end_matches('/')).context("COPY INTO: which FORMAT? (csv, parquet, json or arrow)")?,
@@ -360,7 +361,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
     };
     let positional = query_of.as_ref().is_some_and(|(f, r)| f == "csv" && r.get("header").is_some_and(|h| h == "false"));
     let listed = crate::ext::objects(lake, &spec).await?;
-    ensure!(!listed.is_empty(), "no files at {shown}");
+    ensure!(!listed.is_empty(), crate::codes::coded("42P01", format!("no file matches {shown}")));
     let mut pieces = vec![];
     for (url, o) in listed {
         let query = match (&query_of, from) {

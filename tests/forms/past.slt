@@ -1,0 +1,14 @@
+# A table's past: AT (VERSION => n) reads it as it was (form-parity P9).
+statement ok
+CREATE TABLE p (v INT)
+
+statement ok
+INSERT INTO p VALUES (1)
+
+statement ok
+INSERT INTO p VALUES (2)
+
+query I
+SELECT count(*) FROM p AT (VERSION => 1)
+----
+1

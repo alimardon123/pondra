@@ -31,7 +31,6 @@ enum At {
 /// _version`). As of a time, the rows made by then, and, of a row changed since, the version its
 /// first change after then replaced, if the row was made by then.
 pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u64>, sys: bool) -> Result<(String, Arc<dyn TableProvider>)> {
-    use crate::sys::with_sys;
     use crate::text::{CREATED, ROW_ID, UPDATED, VERSION};
     let spec = Spec::of(name)?;
     let t = &spec.table;
@@ -60,7 +59,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
     let user: Vec<Expr> = meta.columns.iter().map(|(c, _)| ident(c)).collect();
     let shown = |more: Vec<Expr>| user.iter().cloned().chain(more).collect::<Vec<_>>();
     let system = || if sys { [ROW_ID, VERSION, CREATED, UPDATED].map(col).to_vec() } else { vec![] };
-    let rows = ctx.read_table(crate::query::table_view(lake, ctx, t, &with_sys(&meta), upto).await?)?;
+    let rows = ctx.read_table(crate::query::table_view(lake, ctx, t, &meta, true, upto).await?)?;
     let made = match at {
         At::Version(n) => col(VERSION).lt_eq(lit(n)),
         At::Time(us) => col(UPDATED).lt_eq(ts(us)),
@@ -72,7 +71,7 @@ pub async fn table(lake: &Lake, ctx: &SessionContext, name: &str, upto: Option<u
         false => None,
     };
     if let Some(dmeta) = dmeta {
-        let d = ctx.read_table(crate::query::table_view(lake, ctx, &deleted, &with_sys(&dmeta), upto).await?)?;
+        let d = ctx.read_table(crate::query::table_view(lake, ctx, &deleted, &dmeta, true, upto).await?)?;
         let old = match at {
             At::Version(n) => d.clone().filter(col("_old_version").lt_eq(lit(n)).and(col(VERSION).gt(lit(n))))?,
             At::Time(us) => {

@@ -416,7 +416,7 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
 /// BEGIN, COMMIT, ROLLBACK and SAVEPOINT in SQL are refused, with or without a transaction id: a
 /// Flight SQL transaction is begun and ended by its own actions, as the protocol has it.
 fn no_sql_transaction(sql: &str) -> Result<(), Status> {
-    match crate::txn::control(sql) {
+    match crate::text::control(sql) {
         Some(_) => Err(status(crate::codes::coded("0A000", "Flight SQL's transactions are the protocol's own: BeginTransaction (ADBC: autocommit off), then EndTransaction (commit or rollback); BEGIN, COMMIT and ROLLBACK aren't run as SQL"))),
         None => Ok(()),
     }

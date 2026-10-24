@@ -50,7 +50,7 @@ A connection to a node takes these options:
 | `producer` | random | the name `append` writes under, for exactly-once |
 | `timeout` | 300 | seconds to wait for an answer |
 | `headers` | none | extra headers for every request |
-| `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once |
+| `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once, for 64 days (`PONDRA_LOAD_RETENTION_SECS`) |
 | `echo` | `True` | print what procedures print (their notices) as well as keep them in `db.notices` |
 | `retry_secs` | 60 | how long a call keeps trying while no node answers it (0: once) |
 

@@ -329,10 +329,12 @@ els.editor.addEventListener('keydown', (e) => {
 });
 
 // The page kept in the origin's private file system, under "pondra". A browser without that keeps nothing, and says so.
+// Any other refusal is the page's own words (a second tab finds the folder open, and `start` shows why).
 async function openPage() {
   try {
     return await Page.kept('pondra');
-  } catch {
+  } catch (e) {
+    if (!words(e).startsWith('this page has no private file system')) throw e;
     els.note.hidden = false;
     return new Page();
   }

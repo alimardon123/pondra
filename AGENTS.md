@@ -157,6 +157,7 @@ tools/    harness.py, cluster.py (tests), open_check.py (Delta + Iceberg readers
           written, spread), sim_gcs.py and sim_iceberg_rest.py (a local GCS and an Iceberg REST catalog),
           bench/files_tpch.py (TPC-H from files outside the lake against the lake's tables),
           files_s3_check.py (files in a real bucket), slt_check.py (DataFusion's sqllogictest files: D1),
+          forms_check.py (tests/forms/ on every form: each answers as a node does, or refuses as docs/forms.json lists),
           bench/nexmark.py (Nexmark's 20 queries, Pondra and Flink), frames_check.py (frames == Polars; SQL and
           Python mixed every way), spark_check.py (pondra.spark == PySpark), bench/tpch_frames.py (TPC-H as
           SQL, frames and PySpark code), asof_check.py (ASOF JOIN == DuckDB's, one node and three), stream_check.py (windows,
@@ -191,7 +192,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
   so data is queryable the moment it commits.
 - **The catalog** is a SlateDB key-value store inside the same bucket: `t/` tables, `s/` segments,
   `d/` inline segment data, `p/` producer progress (also Kafka producers, consumer-group offsets
-  and window emission), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
+  and window emission), `g/` the expiry of producers' marks (`g/{due}/{producer}` → its seq; `g/~old` the pass that
+  keyed marks from before expiries), `v/` views, `w/` session views' bounds, `k/` tasks, `x/` Delta and `i/`
   Iceberg publish state, `a/` lakes attached, `f/` functions, `r/` macros and procedures, `e/`
   secrets (sealed), `o/` catalogs attached from outside and `fd/` feeds (round 23), `sq/` sequences
   (round 34: only the sequencer writes them), `ix/` indexes (round 34), `ty/` types (round 34), `sh/` shares and `sr/` recipients (ADR-046), `m` members
@@ -2605,8 +2607,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `build.yml` builds arm64 for 64 KB pages). Under a steady stream of small commits mimalloc kept
    the pages each thread freed: at 240 commits a second a node grew about 50 MB a minute while what
    it held levelled off. jemalloc's threads give back what has been free for ten seconds. macOS and
-   Windows keep mimalloc. An allocator change shows TPC-H, TPC-DS and `harness.py memory` before and
-   after. `harness.py memory`: "its own memory levels off…" fails on mimalloc.
+   Windows keep mimalloc. jemalloc keeps its pages off transparent huge pages (`thp:never`, `jemalloc::CONF`,
+   given by both as `malloc_conf`): where the system makes every page huge (THP `always`, GitHub's runners), the
+   kernel joined each 2 MB range jemalloc had given back all but a page of into a huge page again, and a node
+   held 120–250 MB more than jemalloc counted over five hours (`reviews/soak-heap-33e136c.md`). An allocator
+   change shows TPC-H, TPC-DS and `harness.py memory` before and after. `harness.py memory`: "its own memory
+   levels off…" fails on mimalloc, and "jemalloc keeps its pages off huge pages" without `thp:never`.
 
 384. **A leader killed and started again takes the next term; only its own restart takes its term back**
    (`cluster::coming_back`): a node whose address leads the latest term takes it back only when the
@@ -2946,6 +2952,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    LRU of parsed entries by key (256, 16 MB of raw bytes), a hit when the bytes are the ones it was parsed from. A
    per-request read of one table's entry goes through `cat.meta`, not `cat.get::<TableMeta>`; whole scans of every
    entry, writes and restarts parse as before. `cargo test --lib store::`.
+430. **A write's retry mark goes once no resend can come** (`store::kept_ms`, `log::Producers`): a job a client named
+   is remembered for `copy::retention_ms` (64 days), an `auto-` id (`log::auto_job`, and the Python and JS clients'
+   own), a transaction's COMMIT and a COPY's chunks for `store::retry_ms` (twice the lock lease); every other producer
+   is kept for good. A mark goes by the expiry key it was committed with, only while its seq still matches, never in a
+   sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave a commit quiet.
+   A new kind of producer names its window in `kept_ms`. `cargo test --lib log:: store::`, harness `writes`.
+431. **A table version's planning facts are worked out once** (`query::facts`): its read schema, manifest list, ranges,
+   statistics and `hot::known`, kept by the parsed entry's `Arc` (a hit only while its `Weak` upgrades to that same
+   `Arc`) and whether system columns are in. `table_view` takes the catalog's `Arc`; a meta of a caller's own goes
+   through `table_view_once`, which keeps nothing. No query copies a table's whole entry on the plain scan path.
+   `cargo test --lib query::`, harness `scale`.
+432. **A lake's folder takes conditional overwrites** (`store::Local`): SlateDB's collector advances its manifest and
+   compactions boundary files with `PutMode::Update` before it deletes, and on a store that refuses one it deletes no
+   old manifest or compaction record, so the catalog grows for good (5 h at 25 inserts a second: 206 → 13,373 objects,
+   commits' p95 0.4 → 5.2 ms). A store a catalog opens on takes them; the boundary files stay on. SlateDB's errors
+   reach the `pondra` command's stderr (`cli::main`). `cargo test --lib store::`, harness `versions`.
 ## Tests: run these before and after any change
 
 ```bash
@@ -2969,6 +2991,7 @@ python3 tools/per_node_check.py         # every static per_node! or said to outl
 cargo test --release --test node_twice  # two lakes in one process, one after the other: nothing of the first in the second
 cargo test --release --test node_library       # a node in process: restarts in place, a vital loop's panic answered as 57P03, opened again
 python3 tools/inprocess_check.py --lib <pondra_lib> --bin <pondra> [--bench]   # pondra.open() in Python and open() in Node and Bun: every way in, 50 opens, a fork, a process gone without close; --bench: open, idle memory, 10 M rows into pandas against local() and DuckDB
+python3 tools/forms_check.py [--form page,memory] [--only keys] --bin <pondra> --lib <pondra_lib>   # tests/forms/*.slt on the server, three nodes, in process on a folder and in memory, and the page (web/pkg): the same answers, or a refusal docs/forms.json lists
 python3 tools/fuzz_doors.py --secs 60   # malformed input at HTTP, SQL, Postgres, Kafka and Flight: the node stays up
 python3 tools/resilience_check.py [storage cutoff clients doors disk cache server cli]   # every mode under failure: a failing bucket (faulty_s3.py), a cut-off leader, clients and doors through kills, full disks, pondra sql killed
 python3 tools/upgrade_check.py [lakes|format|drain|rolling|all] [--s3]   # every release's lake since 0.22 opens and answers as it did; newer formats refused; drains (a leader on a bucket with --s3); a rolling upgrade under load

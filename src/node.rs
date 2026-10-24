@@ -131,6 +131,7 @@ impl Node {
         std::thread::spawn(crate::memory::sweep_all);
         let serve_store = crate::env::flag("PONDRA_SERVE_STORE"); // (read once, here: the checks, the cluster and the store's door all take this start's answer)
         crate::served::checked(&dir, reader, auth.admin_set(), serve_store)?; // (who may serve or open a store: `served.rs`)
+        crate::origins::check()?; // (a page's origins that aren't origins stop the node here, before it joins or serves: `origins.rs`)
         let (_, store, _) = store::open_store(&dir)?;
         let t_start = std::time::Instant::now();
         let tr = |w: &str| store::trace(w, t_start);

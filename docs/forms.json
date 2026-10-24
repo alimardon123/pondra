@@ -1,0 +1,33 @@
+{
+ "about": "The one place a form may differ from a node (reviews/form-parity.md, ADR-072): tools/forms_check.py runs tests/forms/*.slt on every form and fails on any difference these lists don't name.",
+ "forms": {
+  "server": "a node over HTTP (pondra serve)",
+  "cluster": "three nodes on one lake, each query spread over them",
+  "inprocess": "a node in the caller's process, through the library (Python's and JavaScript's connect(path))",
+  "memory": "a node in the caller's process on a lake in memory (connect() with no path, DuckDB's :memory:)",
+  "page": "the browser's form (web/pkg's Page), one thread and no lake"
+ },
+ "refusals": [
+  {"form": "page", "file": "check.slt", "sqlstate": "0A000", "says": "a page doesn't keep CHECK", "why": "P1: a page's tables are DataFusion's MemTable, which keeps NOT NULL and DEFAULT only; kept on a page by rc.1 (the page's Keeper)", "owner": "L2"},
+  {"form": "page", "file": "defaults.slt", "sqlstate": "42703", "says": "No field named default", "why": "P2: DataFusion's INSERT takes no DEFAULT in VALUES; the column's default belongs in the core's write rules (rules::shape), as a node fills it", "owner": "L2"},
+  {"form": "page", "file": "enums.slt", "sqlstate": "0A000", "says": "a page makes no types yet \\(CREATE TYPE\\)", "why": "P4: a node keeps its types in its catalog (types.rs); a page keeps none, so its host has no enum labels to give the front", "owner": "L2"},
+  {"form": "page", "file": "generated.slt", "sqlstate": "0A000", "says": "a page doesn't keep GENERATED ALWAYS AS", "why": "No form takes computed columns yet: a node refuses them with 42P16, a page with 0A000; one code for both", "owner": "L2 (one code for both: L3)"},
+  {"form": "page", "file": "identity.slt", "sqlstate": "0A000", "says": "a page doesn't keep GENERATED ALWAYS AS IDENTITY", "why": "P1: as CHECK; kept on a page by rc.1", "owner": "L2"},
+  {"form": "page", "file": "json.slt", "sqlstate": "0A000", "says": "Unsupported SQL type JSONB", "why": "P4: `::jsonb` is rewritten by the node's types stage, reached through Host::types, which a page answers with nothing changed (front.rs; the front runs it on every form from F4, designs/l2-front-asks.md)", "owner": "L2"},
+  {"form": "page", "file": "keys.slt", "sqlstate": "0A000", "says": "a page doesn't keep PRIMARY KEY", "why": "P1: as CHECK; kept on a page by rc.1", "owner": "L2"},
+  {"form": "page", "file": "past.slt", "sqlstate": "0A000", "says": "a page keeps no table's past", "why": "P9: a page keeps each table's latest version only, with no log to read an older one from", "owner": "L2"},
+  {"form": "page", "file": "txn.slt", "sqlstate": "0A000", "says": "a page has no transactions yet \\(BEGIN\\)", "why": "A page runs each statement on its own (a node's transactions are txn.rs's): it refuses BEGIN, COMMIT, ROLLBACK and the savepoint words by name, so no caller goes on thinking a ROLLBACK undid its UPDATE", "owner": "L2"},
+  {"form": "page", "file": "unique.slt", "sqlstate": "0A000", "says": "a page doesn't keep UNIQUE", "why": "P1: as CHECK; kept on a page by rc.1", "owner": "L2"},
+  {"form": "page", "file": "vars.slt", "sqlstate": "0A000", "says": "a page has no variables yet \\(DECLARE\\)", "why": "DECLARE $x is a node's step before its engine (vars.rs, server-only); a page refuses it by name", "owner": "L2"},
+  {"form": "page", "file": "width.slt", "sqlstate": "42601", "says": "Inconsistent data length across values list", "why": "P2: a row narrower than its table takes the rest's defaults on a node (as in Postgres); DataFusion refuses it. The core's write rules (rules::shape)", "owner": "L2"},
+  {"form": "page", "file": "writes.slt", "sqlstate": "0A000", "says": "a page doesn't take MERGE yet", "why": "DataFusion has no MERGE; a node's is write.rs's, which a page lacks until the core's write rules (form parity §3)", "owner": "L2"}
+ ],
+ "server_only": {
+  "doors: a page answers through its one request API, with no sockets, servers, certificates or sign-ins": {"modules": ["auth", "console", "dbserver", "flight", "kafka", "live", "mcp", "metrics", "origins", "pages", "pg", "pg_catalog", "pg_copy", "pg_names", "pg_types", "pg_values", "public", "served", "server", "sharing", "sso", "sso_flow", "tls", "users", "vend"]},
+  "the lake: its object store, catalog and log (store.rs); a page keeps its tables in memory or in one private folder": {"modules": ["adopt", "audit", "avro", "backup", "branch", "bridge", "budget", "byte_range", "cache", "catalogs", "copy", "ddl", "delta", "ext", "feeds", "files", "find", "format", "fresh", "git", "hilbert", "history", "hot", "iceberg", "inbox", "index", "kafka_client", "lake_scan", "layout", "learned", "log", "manifest", "memory", "objects", "once", "past", "protect", "query", "ranges", "read_iceberg", "replace", "rerun", "runs", "serve", "shares", "store", "sync", "sys", "tasks", "tier", "views", "workspace", "write_outside"]},
+  "more than one node: a page is one": {"modules": ["cluster", "drain", "guard", "locks", "replica", "skew", "spill", "spmd"]},
+  "processes beside the node (Python's workers, Flight functions, model endpoints): a page starts none": {"modules": ["ai", "pyfn", "python", "udf"]},
+  "the program and its machine: commands, a service, a node's life in a process": {"modules": ["apply", "ci", "cli", "jemalloc", "library", "node", "panics", "project", "service", "shell", "status"]},
+  "rules written against the server that belong in the core (reviews/form-parity.md §2 to §4): until each moves, a page refuses what it can't keep by name, listed in refusals": {"modules": ["change", "constraints", "cursors", "defaults", "facts", "frugal", "held", "host", "json_rows", "literals", "oom", "path", "returning", "routines", "script", "seq", "settings", "temp", "txn", "types", "vars", "write"]}
+ }
+}

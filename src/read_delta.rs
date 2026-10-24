@@ -13,6 +13,7 @@ use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use datafusion::common::ScalarValue;
 use datafusion::object_store::{path::Path, ObjectStoreExt};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -377,18 +378,18 @@ fn arrow_type(t: &Value) -> Result<DataType> {
 fn file(root: &str, add: &Value, partitions: &[String], types: &HashMap<&str, DataType>) -> Result<DataFile> {
     let rel = add["path"].as_str().context("an add without a path")?;
     let path = if rel.contains("://") { unescape(rel) } else { format!("{root}/{}", unescape(rel)) }; // (the object's own name)
-    let stats: Value = add["stats"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
-    let physical = stats["numRecords"].as_u64();
+    let stats: Stats = add["stats"].as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    let physical = stats.rows;
     let dv = &add["deletionVector"];
     let gone = dv["cardinality"].as_u64().unwrap_or(0);
     let mut f = DataFile { path, bytes: add["size"].as_u64().unwrap_or_default(), rows: physical.map_or(add["size"].as_u64().unwrap_or_default() / 100, |n| n.saturating_sub(gone)), ..Default::default() };
     let mut nulls = Some(vec![]);
     for (c, t) in types.iter().filter(|(c, _)| !partitions.iter().any(|p| p == *c)) {
-        let bound = |v: &Value, max: bool| bound(v, t, max);
-        if let (Some(lo), Some(hi)) = (bound(&stats["minValues"][c], false), bound(&stats["maxValues"][c], true)) {
+        let bound = |raw: Option<&Box<RawValue>>, max: bool| raw.and_then(|r| text(r)).and_then(|s| bound(s, t, max));
+        if let (Some(lo), Some(hi)) = (bound(stats.min.get(*c), false), bound(stats.max.get(*c), true)) {
             f.stats.insert(c.to_string(), (lo, hi));
         }
-        match (stats["nullCount"][c].as_u64(), nulls.as_mut()) {
+        match (stats.nulls.get(*c).and_then(Value::as_u64), nulls.as_mut()) {
             (Some(0), _) => {}
             (Some(_), Some(n)) => n.push(c.to_string()),
             _ => nulls = None,
@@ -397,7 +398,7 @@ fn file(root: &str, add: &Value, partitions: &[String], types: &HashMap<&str, Da
     let mut values = vec![];
     for p in partitions {
         let v = add["partitionValues"][p].as_str().filter(|v| !v.is_empty()).map(str::to_string);
-        match v.as_deref().and_then(|v| bound(&Value::String(v.into()), &types[p.as_str()], false)) {
+        match v.as_deref().and_then(|v| bound(v.to_string(), &types[p.as_str()], false)) {
             Some(text) => drop(f.stats.insert(p.clone(), (text.clone(), text))),
             None => nulls.iter_mut().for_each(|n| n.push(p.clone())), // (NULL's partition: `IS NULL` finds it)
         }
@@ -422,22 +423,37 @@ fn file(root: &str, add: &Value, partitions: &[String], types: &HashMap<&str, Da
             }]
         }
     };
-    if !values.is_empty() || !deletes.is_empty() {
-        f.outside = Some(Box::new(Outside { values, deletes, rows: physical, seq: None }));
+    if !values.is_empty() || !deletes.is_empty() || physical.is_none() {
+        f.outside = Some(Box::new(Outside { values, deletes, rows: physical, seq: None, guessed: physical.is_none() }));
     }
     Ok(f)
+}
+
+/// A file's `stats` as the log writes them. Its bounds stay as the text Delta wrote (a `RawValue`), not as a `Value`:
+/// serde_json reads a number with a fraction as an f64, which would round a decimal's last digits.
+#[derive(serde::Deserialize, Default)]
+struct Stats {
+    #[serde(default, rename = "numRecords")] rows: Option<u64>,
+    #[serde(default, rename = "minValues")] min: HashMap<String, Box<RawValue>>,
+    #[serde(default, rename = "maxValues")] max: HashMap<String, Box<RawValue>>,
+    #[serde(default, rename = "nullCount")] nulls: HashMap<String, Value>,
+}
+
+/// A statistic's text as Delta wrote it: a string unquoted, a number or a boolean as its own digits (so a decimal keeps
+/// every one). Null, an object and an array bound nothing.
+fn text(raw: &RawValue) -> Option<String> {
+    let json = raw.get();
+    match json.as_bytes().first()? {
+        b'"' => serde_json::from_str(json).ok(),
+        b'{' | b'[' | b'n' => None,
+        _ => Some(json.to_string()),
+    }
 }
 
 /// A statistic (or partition value) as a file's range bound in the column's type, or None if it
 /// can't bound: floats (NaN), text cut short (Delta keeps 32 characters: a max may be a prefix).
 /// Timestamps are kept to the millisecond: a max is widened to the end of its millisecond.
-fn bound(v: &Value, t: &DataType, max: bool) -> Option<String> {
-    let text = match v {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        _ => return None,
-    };
+fn bound(text: String, t: &DataType, max: bool) -> Option<String> {
     if t.is_floating() || (max && matches!(t, DataType::Utf8) && text.chars().count() >= 32) {
         return None;
     }

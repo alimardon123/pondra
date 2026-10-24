@@ -357,7 +357,7 @@ def external():
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
             "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
-        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no files" in said["none"] \
+        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no file matches" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
     # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
     # a DELETE of an attached Delta table read "no table" with its path.
@@ -381,6 +381,16 @@ def external():
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
         and all(("through a node it started itself" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
         and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
+    # A client that isn't the program reads a relative name as a page does: the lake's own file of that name, as PUT wrote
+    # it, with the program's rows. A name no file is at answers 404, its SQLSTATE in the x-pondra-sqlstate header (the body
+    # is the words alone), and its words name the file as SQL wrote it.
+    theirs = anyone("SELECT * FROM 'reports/q1.csv'")
+    conn = http.client.HTTPConnection("127.0.0.1", other.port, timeout=30)
+    conn.request("POST", "/sql", b"SELECT * FROM 'nope.csv'")
+    resp = conn.getresponse()
+    nope_status, nope_code, nope_words = resp.status, resp.getheader("x-pondra-sqlstate"), resp.read().decode()
+    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows; a name no file is at: 404, 42P01"] = theirs == mine \
+        and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]
@@ -1591,7 +1601,8 @@ def memory():
     fails the threads' check. mimalloc still kept what the node freed (190 → 310 MB from the second
     minute to the fourth); jemalloc, the program's allocator on Linux (`main.rs`), gives it back and
     levels off at 120–130 MB by the third, and mimalloc fails the memory check. Its own memory is
-    RssAnon less what its bounded caches hold (`pondra_hot_bytes`, `pondra_cache_bytes`)."""
+    RssAnon less what its bounded caches hold (`pondra_hot_bytes`, `pondra_cache_bytes`). And jemalloc
+    keeps its pages off huge pages (`thp:never`, invariant 383), read from its own options at exit."""
     SECS_RUN = 240  # how long the producers run; the node's memory is sampled every 10 s meanwhile
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "0"}).start()
@@ -1649,6 +1660,9 @@ def memory():
         f"a node under small commits keeps at most four blocking threads a core, 16 at least ({allowed} threads in all)": most <= allowed,
         "its own memory levels off: its last minute at most 48 MB over its second": late <= early + 48,
     }
+    if os.uname().sysname == "Linux" and os.confstr("CS_GNU_LIBC_VERSION"):  # (jemalloc's: `jemalloc::CONF`)
+        said = subprocess.run([BIN, "--version"], env={**os.environ, "_RJEM_MALLOC_CONF": "stats_print:true"}, capture_output=True, text=True, timeout=60)
+        checks['jemalloc keeps its pages off huge pages (opt.thp "never"), whatever the system does'] = 'opt.thp: "never"' in said.stdout + said.stderr
     for name, good in checks.items():
         print(f"memory: {name}: {'OK' if good else 'FAIL'}")
     print(f"memory: {commits} commits ({rate:.0f} a second), {most} threads at most ({allowed} allowed), own memory {early:.0f} MB early, {late:.0f} MB in the last minute; samples {[round(m) for _, (m, _) in samples]}")

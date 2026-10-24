@@ -56,10 +56,11 @@ pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
-/// refuses, invariant 188). The first words stay, so `codes::of` still reads them.
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. Spilling is off on a page too (it has no
+/// disk), so the words for it are true of both.
 const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
-    ("(DiskManager is disabled)", "(PONDRA_SPILL_GB is 0: nothing spills)"),
+    ("(DiskManager is disabled)", "(nothing spills to disk: PONDRA_SPILL_GB is 0, or this is a page)"),
 ];
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
@@ -126,7 +127,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("is not a variable which can be viewed with 'show'") => "42704",                // undefined_object (Postgres: unrecognized configuration parameter)
         _ if has("is a session's:") => "55000",                                                 // (a SET, BEGIN or TEMP table sent with no session: send x-pondra-session)
         _ if has("violates check constraint") => "23514",                                       // check_violation
-        _ if has("is not null, and a row gives it no value") || has("violates not-null") => "23502", // not_null_violation
+        _ if has("is not null, and a row gives it no value") || has("violates not-null") || has("has null but schema specifies non-nullable") || has("declared as non-nullable but contains null") => "23502", // not_null_violation (a page's INSERT and UPDATE: DataFusion's and Arrow's words)
         _ if has("duplicate key") => "23505",                                                   // unique_violation
         _ if has("permission denied") || has("may not ") && (has("this user") || has("this token")) => "42501", // insufficient_privilege
         _ if has("wrong token") || has("password authentication failed") => "28P01",            // invalid_password
@@ -150,6 +151,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
+        _ if has(crate::page::FULL) => "53100",                                                 // disk_full (a page's browser storage is over its quota: `page::FULL`, `web/`'s words)
         _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
@@ -186,6 +188,7 @@ pub fn http(code: &str) -> u16 {
         "42P07" | "23505" => 409,                                         // already exists, duplicate key
         "53300" => 429,                                                   // too many of a user's queries at once (a quota)
         "0A000" => 501,                                                   // feature_not_supported
+        "54000" => 413,                                                   // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
@@ -210,6 +213,8 @@ mod tests {
         assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
         assert_eq!(of("orders.id is NOT NULL, and a row gives it no value"), "23502");
+        assert_eq!(of("Invalid batch column at '0' has null but schema specifies non-nullable"), "23502"); // (a page's INSERT of a NULL: DataFusion's words)
+        assert_eq!(of("Column 'id' is declared as non-nullable but contains null values"), "23502"); // (a page's UPDATE of one: Arrow's words)
         assert_eq!(of("permission denied: INSERT on t (GRANT INSERT ON t TO ann)"), "42501");
         assert_eq!(of("Invalid function 'nope'.\nDid you mean 'now'?"), "42883");
         assert_eq!(of("table t already exists"), "42P07");
@@ -242,6 +247,10 @@ mod tests {
         // a lake in memory past its spill cap, or the room its disk keeps (memory::full: the same way out for both)
         assert_eq!(of("Generic memory error: a lake in memory may spill 2 MB to disk and holds 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
         assert_eq!(of("Generic memory error: the disk a lake in memory spills to has 3 MB free, and a lake keeps 256 MB: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
+        // a page's browser storage over its quota, and a write the page then undid for it: disk_full, which HTTP answers 503
+        let full = of("Generic opfs error: this site's browser storage is full: Failed to execute 'write' on 'FileSystemWritableFileStream'");
+        assert_eq!((full, super::http(full)), ("53100", 503));
+        assert_eq!(of("t: the write was undone: the page couldn't keep it: Generic test error: this site's browser storage is full"), "53100");
     }
 
     #[test]
@@ -272,6 +281,7 @@ mod tests {
         assert_eq!(h("P0001"), 400); // raise_exception (a procedure's RAISE)
         assert_eq!(h("53300"), 429); // too many of a user's queries at once
         assert_eq!(h("0A000"), 501); // feature_not_supported
+        assert_eq!(h("54000"), 413); // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB)
         assert_eq!(h("57014"), 503); // query_canceled (timeout)
         assert_eq!(h("57P03"), 503); // cannot_connect_now (catching up / cut off)
         assert_eq!(h("58030"), 503); // io_error (bucket or node silent)
