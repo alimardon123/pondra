@@ -998,8 +998,9 @@ const JOINED = 'id,name,total\n1,a,15\n3,c,7\n';
 function joinSql(table) {
   return `SELECT o.id, o.name, sum(s.amount) AS total FROM ${table} o JOIN sales s ON s.id = o.id GROUP BY o.id, o.name ORDER BY o.id`;
 }
-// What a page refuses by name, before anything is sent to its node: a copy of the node's table, and a file joined with it.
-const REFUSED = ['CREATE TABLE copy AS SELECT * FROM sales', "SELECT count(*) FROM 'orders.csv' o JOIN sales s ON s.id = o.id"];
+// What a page refuses by name, before anything is sent to its node: a write into the node's table (a page's copy of it is
+// made from the node's rows instead, and the copy is checked below), and a file joined with it.
+const REFUSED = ['INSERT INTO sales VALUES (9, 9)', "SELECT count(*) FROM 'orders.csv' o JOIN sales s ON s.id = o.id"];
 
 // The checks in order. The node's tables are made first, and a step that needs the node's answer is left out when it gave
 // none; the report names the join only when every check of the node ran and passed.
@@ -1015,7 +1016,12 @@ async function nodeChecks(target, node) {
   await makeOrders('withNode');
   const joined = await ask('withNode: orders joined with sales', 'POST', '/sql?format=csv', undefined, joinSql('orders'), 'withNode');
   if (joined) judge('withNode: orders joined with sales', joined, { status: 200, sqlstate: null, out: want });
-  // (3) What the page can't keep is refused by name, on the same page.
+  // (3) A copy of the node's table, made from the node's rows: the node answers the query, and the copy holds its four rows
+  // (the node has no `copy`, so the count is the page's own table). Then what the page can't keep is refused by name.
+  const copied = await ask('withNode: CREATE TABLE copy', 'POST', '/sql', undefined, 'CREATE TABLE copy AS SELECT * FROM sales', 'withNode');
+  if (copied) judge('withNode: CREATE TABLE copy', copied, { status: 200, sqlstate: null });
+  const copies = await ask('withNode: count of the copy', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) AS n FROM copy', 'withNode');
+  if (copies) judge('withNode: count of the copy', copies, { status: 200, sqlstate: null, out: 'n\n4\n' });
   for (const text of REFUSED) {
     const refused = await ask(`withNode: ${text}`, 'POST', '/sql', undefined, text, 'withNode');
     if (refused) judge(`withNode: ${text}`, refused, { status: 501, sqlstate: '0A000' });

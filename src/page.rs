@@ -11,8 +11,9 @@ use crate::lake_files::{changed, content_type, not_found, there_already, under_f
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::{TryFutureExt, TryStreamExt};
+use datafusion::arrow::buffer::Buffer;
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
-use datafusion::arrow::ipc::{reader::FileReader, writer::{FileWriter, StreamWriter}};
+use datafusion::arrow::ipc::{reader::{FileReader, StreamDecoder}, writer::{FileWriter, StreamWriter}};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, Session, SchemaProvider, TableProvider};
 use datafusion::common::{Constraints, DFSchema, Statistics, TableReference};
@@ -27,7 +28,7 @@ use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DfStatement;
-use datafusion::sql::sqlparser::ast::{Query, SetExpr, Statement as SqlStatement};
+use datafusion::sql::sqlparser::ast::{CreateTable, Insert, ObjectName, Query, SetExpr, Statement as SqlStatement, TableObject};
 use serde_json::json;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -43,6 +44,9 @@ const TABLES: &str = "tables";
 /// The notes an Arrow file of a kept table carries: the table's name, and a column's default as SQL text.
 const TABLE_KEY: &str = "pondra.table";
 const DEFAULT_KEY: &str = "pondra.default";
+/// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
+/// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
+const NODE_ROWS: &str = "the node's rows";
 
 /// How a page's session is made: its target partitions (a page in a browser has one), where it keeps its files and its
 /// tables, and how it reaches the web.
@@ -108,6 +112,14 @@ pub struct Page {
 /// What a write to a page table found there, for `undo` to put back: the table and its rows, partition by partition.
 /// None when the name had no table, which the write makes.
 type Before = Option<(Arc<dyn TableProvider>, Vec<Vec<RecordBatch>>)>;
+
+/// What a page sends its node for a statement. A query goes as it is written. A fill (`CREATE TABLE … AS`, or `INSERT INTO`
+/// one of the page's own tables) sends only its query, and `write` is the statement with that query put for the node's
+/// rows, which the page runs once it has them (`filled`).
+enum Outgoing {
+    Query(Sent),
+    Fill { write: String, sent: Sent },
+}
 
 /// What a request answers, as ADR-061's contract says: a status, its headers (the node's names, in lower case) and its
 /// body. Every answer has a `content-type`. An error has its `x-pondra-sqlstate`; a file refused (409, 412, 404) has
@@ -230,18 +242,27 @@ impl Page {
     /// its own is planned; a write is run and kept (`write`) before the next one is planned.
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let turn = self.keeping.lock().await;
-        let (ctx, plan, changed) = match self.planned(text).await {
+        let planned = match self.planned(text).await {
             Ok(planned) => planned,
             // (a table the page lacks, and a node to ask: the node answers the statement, and the page gives its answer on)
             Err(e) if self.node.is_some() && crate::codes::of(&e) == "42P01" => {
                 drop(turn); // (asking the node changes nothing on the page: the next statement may plan meanwhile)
                 return match self.outgoing(text, format).await? {
-                    Some(sent) => self.ask(sent).await,
+                    Some(Outgoing::Query(sent)) => self.ask(sent).await,
+                    Some(Outgoing::Fill { write, sent }) => self.filled(&write, sent, format).await,
                     None => Err(e),
                 };
             }
             Err(e) => return Err(e),
         };
+        self.run_planned(turn, planned, format, crate::explain::asked(text)).await
+    }
+
+    /// A planned statement run, and its answer in `format`, as `sql` gives one: a write is run and kept (`write`) while the
+    /// turn is held, and a read lets the turn go first, so the next statement may plan while its rows are read. `explained`
+    /// says the statement is an EXPLAIN, whose rows are made readable (`explain::answered`).
+    async fn run_planned(&self, turn: futures::lock::MutexGuard<'_, ()>, planned: (SessionContext, LogicalPlan, Option<String>), format: Option<&str>, explained: bool) -> anyhow::Result<Answer> {
+        let (ctx, plan, changed) = planned;
         let batches = match changed {
             Some(name) => self.write(&ctx, plan, &name).await?,
             None => {
@@ -249,57 +270,134 @@ impl Page {
                 rows_of(&ctx, plan).await?
             }
         };
-        let batches = if crate::explain::asked(text) { crate::explain::answered(batches)? } else { batches };
+        let batches = if explained { crate::explain::answered(batches)? } else { batches };
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
-    /// What the page would send its node for `text` (`sql` sends it when the page can't plan the statement): None when the
-    /// statement names no table the page lacks, so the planner's own error stands (a file not put is 42P01 still). A
+    /// What the page would send its node for `text` (`sql` sends it when the page can't plan the statement), or None when
+    /// the statement names no table the node holds, so the planner's own error stands (a file not put is 42P01 still). A
     /// statement the front can't expand (a PIVOT over the node's tables) is not sent, for the same reason. Kept apart from
-    /// sending, so the snapshot path (4k-5) and `CREATE TABLE … AS` from the node's rows (4k-4) branch here later.
-    async fn outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Sent>> {
+    /// sending, so the snapshot path (4k-5) branches here later.
+    async fn outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Outgoing>> {
         let Ok(expanded) = crate::front::expand(&PageHost(self), text, &HashMap::new()).await else { return Ok(None) };
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
-        let (statement, named) = self.named_by(&expanded)?;
+        let statement = self.parsed(&expanded)?;
+        match self.fill_of(&statement)? {
+            Some((target, query)) => self.fill_outgoing(&statement, &target, query).await,
+            None => self.query_outgoing(text, format, &statement).await,
+        }
+    }
+
+    /// The query a statement that is not a fill sends its node, as it is written (`text`), with the page's tables it names.
+    /// A write that is not a query is refused by name, before anything is sent (its words say how to write it instead).
+    async fn query_outgoing(&self, text: &str, format: Option<&str>, statement: &DfStatement) -> anyhow::Result<Option<Outgoing>> {
+        let named = self.named(statement)?;
         if named.iter().all(|(home, _)| *home != Home::Node) {
             return Ok(None);
         }
-        // (refused by name, each before anything is sent: a node answers only a query, and not the page's files)
-        if query_of(&statement).is_none() {
-            return Err(crate::codes::coded("0A000", "a page sends its node only queries: write into the node's tables through a client of the node (CREATE TABLE … AS from the node's rows is not here yet)"));
+        if query_of(statement).is_none() {
+            return Err(crate::codes::coded("0A000", "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node"));
         }
-        if named.iter().any(|(home, _)| *home == Home::File) {
-            return Err(crate::codes::coded("0A000", "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')"));
+        let names = page_names(named)?;
+        let query = format.map(|f| format!("format={f}")).unwrap_or_default();
+        Ok(Some(Outgoing::Query(self.sent_for(text, query, &names).await?)))
+    }
+
+    /// The fill a statement is, if it is one: the table it writes (as the planner reads its name) and the query whose rows
+    /// it takes. A `CREATE TABLE … AS` is a fill whatever its target, since a table the page doesn't have yet is the
+    /// node's by name. An `INSERT INTO` is one only when its target is one of the page's own tables.
+    fn fill_of<'a>(&self, statement: &'a DfStatement) -> anyhow::Result<Option<(TableReference, &'a Query)>> {
+        let DfStatement::Statement(s) = statement else { return Ok(None) };
+        match &**s {
+            SqlStatement::CreateTable(CreateTable { name, query: Some(query), .. }) => Ok(Some((self.table_ref(name)?, query.as_ref()))),
+            SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), .. }) => {
+                let target = self.table_ref(name)?;
+                Ok((self.home(&target)? == Home::Page).then_some((target, query.as_ref())))
+            }
+            _ => Ok(None),
         }
-        let names: BTreeSet<String> = named.into_iter().filter(|(home, _)| *home == Home::Page).map(|(_, name)| name).collect();
+    }
+
+    /// A fill's send: the node is asked the fill's query alone (`fill_of`), so a file the statement names beside the node's
+    /// tables is refused, and a table named as the node's rows is refused too (the name `over_rows` gives the rows).
+    async fn fill_outgoing(&self, statement: &DfStatement, target: &TableReference, query: &Query) -> anyhow::Result<Option<Outgoing>> {
+        let named = self.named(&as_statement(query))?;
+        if named.iter().all(|(home, _)| *home != Home::Node) {
+            return Ok(None);
+        }
+        if target.table() == NODE_ROWS {
+            return Err(crate::codes::coded("0A000", format!("{}: a page gives its node's rows this name while it fills a table, so no table it makes may have it", crate::ext_names::quoted(NODE_ROWS))));
+        }
+        let names = page_names(named)?;
+        let write = self.over_rows(statement)?;
+        let sent = self.sent_for(&query.to_string(), "format=arrow".to_string(), &names).await?;
+        Ok(Some(Outgoing::Fill { write, sent }))
+    }
+
+    /// The fill's statement with its query put for the node's rows (`rows_query`), as SQL text the page plans: a `CREATE
+    /// TABLE t AS SELECT * FROM "the node's rows"`, or an `INSERT INTO t (cols) SELECT * FROM "the node's rows"`.
+    fn over_rows(&self, statement: &DfStatement) -> anyhow::Result<String> {
+        let mut write = statement.clone();
+        if let DfStatement::Statement(s) = &mut write {
+            match &mut **s {
+                SqlStatement::CreateTable(c) => c.query = Some(self.rows_query()?),
+                SqlStatement::Insert(i) => i.source = Some(self.rows_query()?),
+                _ => {}
+            }
+        }
+        Ok(write.to_string())
+    }
+
+    /// `SELECT * FROM` the node's rows, parsed as the page's session parses SQL: the query a fill's write puts in place of
+    /// its own.
+    fn rows_query(&self) -> anyhow::Result<Box<Query>> {
+        let sql = format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS));
+        let DfStatement::Statement(s) = self.parsed(&sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
+        let SqlStatement::Query(query) = *s else { anyhow::bail!("{sql} is not a query") };
+        Ok(query)
+    }
+
+    /// The request a page sends its node: `sql` as its JSON's `sql`, `query` as its query string, and the page's tables that
+    /// `names` name, each with its rows (`page_tables`), within `PONDRA_WEB_SEND_MB` (`within`).
+    async fn sent_for(&self, sql: &str, query: String, names: &BTreeSet<String>) -> anyhow::Result<Sent> {
         let (_, page) = self.default_schema()?;
-        let tables = page_tables(page.as_ref(), &names).await?;
+        let tables = page_tables(page.as_ref(), names).await?;
         let bytes: usize = tables.iter().flat_map(|(_, batches)| batches).map(|b| b.get_array_memory_size()).sum();
         within(bytes, crate::env::or("PONDRA_WEB_SEND_MB", 64))?;
         let streams = tables.iter().map(|(schema, batches)| stream_of(schema, batches)).collect::<anyhow::Result<Vec<_>>>()?;
         let quoted: Vec<String> = names.iter().map(|name| crate::ext_names::quoted(name)).collect();
-        let head = serde_json::to_vec(&json!({"sql": text, "tables": quoted}))?; // (as it was sent to the page, not expanded)
-        Ok(Some(Sent {
-            query: format.map(|f| format!("format={f}")).unwrap_or_default(),
-            content_type: request_body::CONTENT_TYPE,
-            body: request_body::write(&head, &streams),
-        }))
+        let head = serde_json::to_vec(&json!({"sql": sql, "tables": quoted}))?;
+        Ok(Sent { query, content_type: request_body::CONTENT_TYPE, body: request_body::write(&head, &streams) })
     }
 
-    /// The statement's tables with their homes (`Home`), as the page reads them, parsed as the page's session parses. Each
-    /// is named as SQL wrote it, with no default schema or catalog the page's own names carry.
-    fn named_by(&self, expanded: &str) -> anyhow::Result<(DfStatement, Vec<(Home, String)>)> {
+    /// The statement parsed as the page's session parses it (its dialect and identifier rules).
+    fn parsed(&self, expanded: &str) -> anyhow::Result<DfStatement> {
+        let state = self.ctx.state();
+        Ok(state.sql_to_statement(expanded, &state.config().options().sql_parser.dialect)?)
+    }
+
+    /// The tables a statement names, each with its home (`Home`), as the page reads them. Each is named as SQL wrote it,
+    /// with no default schema or catalog the page's own names carry.
+    fn named(&self, statement: &DfStatement) -> anyhow::Result<Vec<(Home, String)>> {
+        let mut named = vec![];
+        for name in self.ctx.state().resolve_table_references(statement)? {
+            named.push((self.home(&name)?, name.table().to_string()));
+        }
+        Ok(named)
+    }
+
+    /// Where the table `name` is (`home_of`), with the page's default schema and catalog.
+    fn home(&self, name: &TableReference) -> anyhow::Result<Home> {
         let state = self.ctx.state();
         let options = state.config().options();
-        let statement = state.sql_to_statement(expanded, &options.sql_parser.dialect)?;
         let (_, page) = self.default_schema()?;
-        let (catalog, schema) = (&options.catalog.default_catalog, &options.catalog.default_schema);
-        let named = state
-            .resolve_table_references(&statement)?
-            .iter()
-            .map(|name| (home_of(name, page.as_ref(), catalog, schema), name.table().to_string()))
-            .collect();
-        Ok((statement, named))
+        Ok(home_of(name, page.as_ref(), &options.catalog.default_catalog, &options.catalog.default_schema))
+    }
+
+    /// A table's name as the planner reads it: its identifiers normalized as the page's session normalizes them.
+    fn table_ref(&self, name: &ObjectName) -> anyhow::Result<TableReference> {
+        let normalize = self.ctx.state().config().options().sql_parser.enable_ident_normalization;
+        Ok(datafusion::sql::planner::object_name_to_table_reference(name.clone(), normalize)?)
     }
 
     /// One request to the page's node, and its answer as the node gave it. A node that doesn't answer is 08001, its words
@@ -307,6 +405,22 @@ impl Page {
     async fn ask(&self, sent: Sent) -> anyhow::Result<Answer> {
         let Some(node) = &self.node else { return Err(crate::codes::coded("08001", "the page has no node to ask")) };
         node(sent).await.map_err(|words| crate::codes::coded("08001", format!("the page's node didn't answer: {words}")))
+    }
+
+    /// A fill (`outgoing`): the node answers its query first, holding no turn, since asking changes nothing on the page. An
+    /// answer that isn't 200 is the page's answer as it is (the node's refusal, its code and words), and nothing is made.
+    /// A 200 is the node's rows (`node_rows`), and `write` is planned over them with the turn held, then run and kept as
+    /// any write is (`run_planned`). Known and left as is: a CTAS without OR REPLACE over a table the page already has
+    /// (IF NOT EXISTS does nothing, and the plain form is 42P07) still asks the node first.
+    async fn filled(&self, write: &str, sent: Sent, format: Option<&str>) -> anyhow::Result<Answer> {
+        let answered = self.ask(sent).await?;
+        if answered.status != 200 {
+            return Ok(answered);
+        }
+        let rows = node_rows(&answered)?;
+        let turn = self.keeping.lock().await;
+        let planned = self.planned_expanded(write, Some(rows)).await?;
+        self.run_planned(turn, planned, format, false).await
     }
 
     /// A statement read as a node reads it, planned and not run: the front, ASOF JOIN's marker, then planned on the
@@ -323,11 +437,20 @@ impl Page {
             return Err(crate::codes::coded("0A000", format!("{}: a page keeps no table's past (a node reads a table as it was)", crate::past_names::spelled(&expanded))));
         }
         let expanded = crate::asof::as_of(&expanded)?.into_owned();
-        rules(&expanded)?; // (a table rule a page can't keep is refused before anything is planned or read)
+        self.planned_expanded(&expanded, None).await
+    }
+
+    /// `expanded`, which the front has run already, planned as `planned` plans it. With `rows` (a fill's node rows), they are
+    /// the table `NODE_ROWS` for this statement alone (`Overlay::own`).
+    async fn planned_expanded(&self, expanded: &str, rows: Option<Arc<dyn TableProvider>>) -> anyhow::Result<(SessionContext, LogicalPlan, Option<String>)> {
+        rules(expanded)?; // (a table rule a page can't keep is refused before anything is planned or read)
         let (ctx, overlay) = self.statement()?;
-        crate::explain::prepare(&ctx, &expanded); // (an EXPLAIN's operators' expected rows, as a node's)
-        self.given(&overlay, &expanded).await?;
-        let plan = crate::engine::planned(&ctx, &expanded).await?;
+        if let Some(rows) = rows {
+            overlay.own(NODE_ROWS.to_string(), rows);
+        }
+        crate::explain::prepare(&ctx, expanded); // (an EXPLAIN's operators' expected rows, as a node's)
+        self.given(&overlay, expanded).await?;
+        let plan = crate::engine::planned(&ctx, expanded).await?;
         may(&plan)?;
         let changed = touched(&plan);
         Ok((ctx, plan, changed))
@@ -743,6 +866,31 @@ fn without_notes(notes: &HashMap<String, String>) -> HashMap<String, String> {
     notes.iter().filter(|(k, _)| ![TABLE_KEY, DEFAULT_KEY].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
+/// The rows a node answered a fill's query with, as a table the fill is planned over (`filled`): the rows of an Arrow stream,
+/// with the schema it names even when it has no rows. Any other answer is 08P01, and so is a stream that doesn't read. There
+/// is no size cap here: the page's memory line (a separate piece) stops a page that grows too far.
+fn node_rows(answer: &Answer) -> anyhow::Result<Arc<dyn TableProvider>> {
+    let said = answer.header("content-type");
+    if said != Some(crate::answer::content_type(Some("arrow"))) {
+        return Err(crate::codes::coded("08P01", format!("the page's node answered {}, not Arrow rows", said.unwrap_or("no content-type"))));
+    }
+    let (schema, batches) = stream_rows(answer.body.clone()).map_err(|e| crate::codes::coded("08P01", format!("the page's node answered Arrow rows that don't read: {e:#}")))?;
+    Ok(Arc::new(MemTable::try_new(schema, vec![batches])?))
+}
+
+/// The schema and the batches of an Arrow IPC stream, read as they are: the body becomes the stream's buffer without a copy.
+fn stream_rows(body: bytes::Bytes) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
+    let mut buffer = Buffer::from(body);
+    let mut decoder = StreamDecoder::new();
+    let mut batches = vec![];
+    while !buffer.is_empty() {
+        batches.extend(decoder.decode(&mut buffer)?);
+    }
+    decoder.finish()?;
+    let schema = decoder.schema().context("an Arrow stream with no schema")?;
+    Ok((schema, batches))
+}
+
 /// `batch` over `schema`: the same columns, under the schema's notes. A table's batches carry the table's schema exactly,
 /// as `MemTable::try_new` refuses batches whose notes the table's lack.
 fn over_schema(schema: &SchemaRef, batch: &RecordBatch) -> anyhow::Result<RecordBatch> {
@@ -828,6 +976,20 @@ fn query_of(statement: &DfStatement) -> Option<&Query> {
         DfStatement::Explain(e) => query_of(&e.statement),
         _ => None,
     }
+}
+
+/// A query as a statement, for `named` to read the names it holds.
+fn as_statement(query: &Query) -> DfStatement {
+    DfStatement::Statement(Box::new(SqlStatement::Query(Box::new(query.clone()))))
+}
+
+/// The page's own tables among a query's names (`named`), sorted, each once. A file among them is refused by name: a query
+/// a page sends names the page's tables and the node's, and a file is the page's to read, not the node's.
+fn page_names(named: Vec<(Home, String)>) -> anyhow::Result<BTreeSet<String>> {
+    if named.iter().any(|(home, _)| *home == Home::File) {
+        return Err(crate::codes::coded("0A000", "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')"));
+    }
+    Ok(named.into_iter().filter(|(home, _)| *home == Home::Page).map(|(_, name)| name).collect())
 }
 
 /// Whether a query writes: its body is a write (`text::write_of`, a `WITH … INSERT` among them), or it is a `SELECT … INTO`
@@ -2305,12 +2467,28 @@ mod tests {
         assert_eq!(again.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t".into()).await.body, "n\n20\n");
     }
 
-    /// A node for the tests: it keeps each request it is sent, and answers the count `3` as CSV, as a node would.
-    fn node_keeping(kept: Arc<std::sync::Mutex<Vec<Sent>>>) -> Node {
+    /// A node for the tests: it keeps each request it is sent, and answers what `answer` gives, as a node would.
+    fn node_keeping(kept: Arc<std::sync::Mutex<Vec<Sent>>>, answer: impl Fn() -> Answer + Send + Sync + 'static) -> Node {
         Arc::new(move |sent: Sent| -> Asked {
             kept.lock().unwrap().push(sent);
-            async { Ok(Answer { status: 200, headers: vec![("content-type", "text/csv".to_string())], body: "n\n3\n".into() }) }.boxed()
+            let answered = answer();
+            async { Ok(answered) }.boxed()
         })
+    }
+
+    /// The count `3` a node answers as CSV, as the tests' node does.
+    fn count_csv() -> Answer {
+        Answer { status: 200, headers: vec![("content-type", "text/csv".to_string())], body: "n\n3\n".into() }
+    }
+
+    /// The rows a node answers a fill's query with: ids 1 and 3 with their totals, as an Arrow stream (the node's own answer).
+    fn rows_answer() -> Answer {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        let ids: ArrayRef = Arc::new(Int64Array::from(vec![1, 3]));
+        let totals: ArrayRef = Arc::new(Int64Array::from(vec![15, 7]));
+        let batch = RecordBatch::try_from_iter([("id", ids), ("total", totals)]).unwrap();
+        let body = crate::answer::render(&[batch], Some("arrow"), |_| None).unwrap();
+        Answer { status: 200, headers: vec![("content-type", crate::answer::content_type(Some("arrow")).to_string())], body }
     }
 
     /// A page with the table `mine` (three ids, made by SQL) and `node` for the tables it doesn't have.
@@ -2334,7 +2512,7 @@ mod tests {
     #[tokio::test]
     async fn a_page_asks_its_node_for_a_table_it_does_not_have() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         let sql = "SELECT count(*) AS n FROM mine JOIN lake_orders USING (id)";
         let got = page.request("POST", "/sql?format=csv", &[], sql.into()).await;
         assert_eq!((got.status, got.header("content-type")), (200, Some("text/csv")));
@@ -2353,7 +2531,7 @@ mod tests {
     #[tokio::test]
     async fn the_node_reads_what_a_page_sends() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         let sql = "SELECT count(*) AS n FROM mine JOIN lake_orders USING (id)";
         page.request("POST", "/sql?format=csv", &[], sql.into()).await;
         let sent = kept.lock().unwrap();
@@ -2367,7 +2545,7 @@ mod tests {
     #[tokio::test]
     async fn explain_of_a_query_over_the_nodes_tables_is_sent() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         let got = page.request("POST", "/sql", &[], "EXPLAIN SELECT * FROM lake_orders".into()).await;
         assert_eq!(got.status, 200, "{:?}", got.body);
         assert_eq!(kept.lock().unwrap().len(), 1);
@@ -2377,7 +2555,7 @@ mod tests {
     #[tokio::test]
     async fn a_query_the_page_can_answer_never_leaves_it() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM mine".into()).await.body, "n\n3\n");
         assert!(kept.lock().unwrap().is_empty());
     }
@@ -2394,23 +2572,28 @@ mod tests {
     #[tokio::test]
     async fn a_file_not_put_is_still_42p01_with_a_node() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         let got = page.request("POST", "/sql", &[], "SELECT * FROM 'nope.csv'".into()).await;
         assert_eq!(got.header("x-pondra-sqlstate"), Some("42P01"));
         assert!(kept.lock().unwrap().is_empty());
     }
 
-    /// A page sends its node only queries, and never a file of its own: each is refused by name before anything is sent.
+    /// The writes a page does not send its node are refused by name, each before anything is sent: a write into the node's
+    /// table (its words say to write through a client of the node), a DELETE, a `WITH … INSERT`, a fill joined with a file,
+    /// and a fill into a table named as the node's rows.
     #[tokio::test]
-    async fn a_page_sends_its_node_only_queries() {
+    async fn a_page_refuses_the_writes_it_does_not_send() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         assert_eq!(put(&page, "x.csv", "id,v\n1,2\n").await.status, 200);
+        let words = page.request("POST", "/sql", &[], "INSERT INTO lake_orders SELECT * FROM mine".into()).await;
+        assert!(String::from_utf8_lossy(&words.body).contains("a client of the node"), "{:?}", words.body);
         for sql in [
-            "INSERT INTO mine SELECT * FROM lake_orders",
-            "WITH x AS (SELECT 1 AS id) INSERT INTO lake_orders SELECT * FROM x",
-            "SELECT * INTO t2 FROM lake_orders",
-            "SELECT * FROM 'x.csv' JOIN lake_orders USING (id)",
+            "INSERT INTO lake_orders SELECT * FROM mine",
+            "DELETE FROM mine WHERE id IN (SELECT id FROM lake_orders)",
+            "WITH x AS (SELECT * FROM lake_orders) INSERT INTO mine SELECT * FROM x",
+            "CREATE TABLE f AS SELECT * FROM 'x.csv' JOIN lake_orders USING (id)",
+            "CREATE TABLE \"the node's rows\" AS SELECT * FROM lake_orders",
         ] {
             let got = page.request("POST", "/sql", &[], sql.into()).await;
             assert_eq!(got.header("x-pondra-sqlstate"), Some("0A000"), "{sql}");
@@ -2418,11 +2601,85 @@ mod tests {
         assert!(kept.lock().unwrap().is_empty());
     }
 
+    /// A `CREATE TABLE … AS` from the node's rows: the node answers the query alone, the page keeps its rows as a table, and
+    /// the table is the page's own, so a query over it is answered by the page with nothing sent.
+    #[tokio::test]
+    async fn a_table_is_made_from_its_nodes_rows() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(kept.clone(), rows_answer)).await;
+        let sql = "CREATE TABLE totals AS SELECT m.id, sum(s.amount) AS total FROM mine m JOIN sales s USING (id) GROUP BY m.id";
+        let made = page.request("POST", "/sql", &[], sql.into()).await;
+        assert_eq!(made.status, 200, "{:?}", made.body);
+        {
+            let sent = kept.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].query, "format=arrow");
+            let (head, tables) = read_back(&sent[0]);
+            assert!(head["sql"].as_str().unwrap().contains("sales") && !head["sql"].as_str().unwrap().contains("CREATE"));
+            assert_eq!(head["tables"], json!(["\"mine\""]));
+            assert_eq!(tables[0].iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        }
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT * FROM totals ORDER BY id".into()).await;
+        assert_eq!(got.body, "id,total\n1,15\n3,7\n");
+        assert_eq!(kept.lock().unwrap().len(), 1);
+    }
+
+    /// An `INSERT INTO` one of the page's tables from the node's rows: the node's rows go into the table, columns and all.
+    #[tokio::test]
+    async fn an_insert_fills_a_table_of_the_page() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(kept.clone(), rows_answer)).await;
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t2 (id BIGINT, total BIGINT)".into()).await.status, 200);
+        let inserted = page.request("POST", "/sql", &[], "INSERT INTO t2 SELECT id, amount FROM sales".into()).await;
+        assert_eq!(inserted.status, 200, "{:?}", inserted.body);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM t2".into()).await.body, "n\n2\n");
+    }
+
+    /// A `CREATE OR REPLACE TABLE … AS` from the node's rows replaces the page's table of that name.
+    #[tokio::test]
+    async fn a_fill_replaces_a_page_table() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(kept.clone(), rows_answer)).await;
+        let replaced = page.request("POST", "/sql", &[], "CREATE OR REPLACE TABLE mine AS SELECT * FROM sales".into()).await;
+        assert_eq!(replaced.status, 200, "{:?}", replaced.body);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT * FROM mine ORDER BY id".into()).await.body, "id,total\n1,15\n3,7\n");
+    }
+
+    /// A node's refusal of a fill's query is the page's answer as it is, and nothing is made. A node's 200 that is not an
+    /// Arrow stream is 08P01, and nothing is made either.
+    #[tokio::test]
+    async fn a_fill_is_the_nodes_answer_when_it_is_not_rows() {
+        let refusing = Arc::new(std::sync::Mutex::new(vec![]));
+        let not_found = || Answer { status: 404, headers: vec![("content-type", TEXT.to_string()), ("x-pondra-sqlstate", "42P01".to_string())], body: "no table".into() };
+        let page = page_with_node(node_keeping(refusing.clone(), not_found)).await;
+        let got = page.request("POST", "/sql", &[], "CREATE TABLE totals AS SELECT * FROM sales".into()).await;
+        assert_eq!((got.status, got.header("x-pondra-sqlstate")), (404, Some("42P01")));
+        assert!(!page.default_schema().unwrap().1.table_exist("totals"));
+        let csv = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(csv.clone(), count_csv)).await;
+        let got = page.request("POST", "/sql", &[], "CREATE TABLE totals AS SELECT * FROM sales".into()).await;
+        assert_eq!(got.header("x-pondra-sqlstate"), Some("08P01"), "{:?}", got.body);
+        assert!(!page.default_schema().unwrap().1.table_exist("totals"));
+    }
+
+    /// A fill's table is kept with the page's other tables: a page kept over the same store has the table made from the
+    /// node's rows, with its rows, and asks the node for nothing to read it.
+    #[tokio::test]
+    async fn a_kept_page_keeps_a_table_made_from_its_nodes_rows() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let options = Options { store: Some(Arc::new(InMemory::new())), node: Some(node_keeping(kept.clone(), rows_answer)), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        assert_eq!(a.request("POST", "/sql", &[], "CREATE TABLE totals AS SELECT * FROM sales".into()).await.status, 200);
+        let b = Page::kept(&options).await.unwrap();
+        assert_eq!(b.request("POST", "/sql?format=csv", &[], "SELECT * FROM totals ORDER BY id".into()).await.body, "id,total\n1,15\n3,7\n");
+        assert_eq!(kept.lock().unwrap().len(), 1);
+    }
+
     /// A table with no rows is sent with its columns: a node joins it as it joins any table.
     #[tokio::test]
     async fn an_empty_table_is_sent_with_its_columns() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE e (id INT)".into()).await.status, 200);
         let sql = "SELECT count(*) AS n FROM e JOIN lake_orders USING (id)";
         assert_eq!(page.request("POST", "/sql?format=csv", &[], sql.into()).await.status, 200);
@@ -2438,7 +2695,7 @@ mod tests {
     #[tokio::test]
     async fn names_are_sent_as_the_page_holds_them() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
-        let page = page_with_node(node_keeping(kept.clone())).await;
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
         for sql in ["CREATE TABLE \"Mine\" AS SELECT 1 AS id", "CREATE TABLE public.mine2 AS SELECT 1 AS id"] {
             assert_eq!(page.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
         }
