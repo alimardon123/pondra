@@ -778,7 +778,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Statement::Drop { object_type, if_exists, names, cascade, purge, .. } => Stmt::Ddl(names.iter().map(object).map(|name| match object_type {
             ast::ObjectType::Schema => Some(Ddl::DropSchema { name, if_exists, cascade }),
-            ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists, purge }),
+            ast::ObjectType::Table => Some(Ddl::DropTable { name, if_exists, purge, made_by: None }),
             ast::ObjectType::View | ast::ObjectType::MaterializedView => Some(Ddl::DropView { name, if_exists }),
             ast::ObjectType::Database => Some(Ddl::DropDatabase { name: name.to_lowercase(), if_exists }),
             _ => None,
@@ -1443,13 +1443,10 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
         return Ok(None);
     }
     // (out of memory, once more frugally: the first try's files are never recorded, and the orphan sweep takes them)
-    let (columns, files) = crate::query::frugally(|frugal| async move {
-        if frugal {
-            crate::query::frugal(ctx);
-        }
-        in_order(ctx);
-        let df = crate::engine::sql(ctx, &crate::sys::planned(query)?).await?;
-        write_rows(lake, ctx, table, df, stamp).await
+    let (columns, files) = crate::query::frugally(ctx, |ctx| async move {
+        in_order(&ctx);
+        let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
+        write_rows(lake, &ctx, table, df, stamp).await
     }).await?;
     Ok(Some(Files { table: table.into(), job: job.into(), columns, files }))
 }
@@ -1625,7 +1622,7 @@ where
     let Some(q) = &c.query else { return defined };
     let out = run(Stmt::Insert(name.to_string(), q.to_string())).await;
     if out.is_err() {
-        undo_made(run, lake, name, job).await;
+        undo_made(run, name, job).await;
     }
     out
 }
@@ -1661,14 +1658,14 @@ where
         out = match rows {
             Ok(v) => v,
             Err(e) => {
-                undo_made(run, lake, &staged, job).await; // (nothing replaced: `name` is as it was)
+                undo_made(run, &staged, job).await; // (nothing replaced: `name` is as it was)
                 return Err(e);
             }
         };
     }
     let replace = crate::ddl::Ddl::ReplaceTable { name: name.to_string(), staged: staged.clone() };
     if let Err(e) = run(Stmt::Ddl(vec![replace])).await {
-        undo_made(run, lake, &staged, job).await;
+        undo_made(run, &staged, job).await;
         return Err(named(e, &staged, name));
     }
     if let Some(t) = out.get_mut("table") {
@@ -1677,16 +1674,14 @@ where
     Ok(out)
 }
 
-/// Drops the table a statement made under `name` after it failed or stopped: purged, as `drop_made` says (never another
+/// Drops the table a statement made under `name` after it failed or stopped: purged, as `made_drop` says (never another
 /// statement's table). The statement's own error stays its answer.
-async fn undo_made<F>(run: &F, lake: &Lake, name: &str, job: &str)
+async fn undo_made<F>(run: &F, name: &str, job: &str)
 where
     F: Fn(Stmt) -> futures::future::BoxFuture<'static, Result<Value>>,
 {
-    if let Some(drop) = drop_made(lake, name, job).await {
-        if let Err(e) = run(drop).await {
-            eprintln!("dropping {name}, a CREATE TABLE that failed: {e:#}");
-        }
+    if let Err(e) = run(made_drop(name, job)).await {
+        eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS failed didn't answer: {e:#}");
     }
 }
 
@@ -1784,20 +1779,12 @@ async fn seen_there(other: &Lake, mark: Option<String>) {
     let _ = other.refresh().await;
 }
 
-/// The drop after a `CREATE TABLE … AS SELECT`'s INSERT failed or stopped: the table it made, purged. Not when another
-/// statement's table is there under the name now (its `made_by` isn't `job`: a race, or a drop and a new table
-/// through another statement), which is that statement's rows. Read from this node's own catalog; with no table seen,
-/// the drop does nothing (IF EXISTS).
-async fn drop_made(lake: &Lake, name: &str, job: &str) -> Option<Stmt> {
-    let seen = async {
-        let (other, table) = crate::ddl::resolve(lake, name).await?;
-        let lake = other.unwrap_or_else(|| lake.arc());
-        lake.cat.get::<TableMeta>(&table_key(&table)).await
-    };
-    match seen.await {
-        Ok(Some(m)) if m.made_by.as_deref() != Some(job) => None,
-        _ => Some(Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.into(), if_exists: true, purge: true }])),
-    }
+/// The drop after a `CREATE TABLE … AS SELECT`'s INSERT failed or stopped: the table `job` made under `name`, purged. The
+/// leader decides which table that is (`ddl::drop_table`, under the lake's lock): this node may not see the table yet, and
+/// another statement's table under the name (its `made_by` isn't `job`: a race, or a drop and a new table through another
+/// statement) is that statement's rows, which it leaves.
+fn made_drop(name: &str, job: &str) -> Stmt {
+    Stmt::Ddl(vec![crate::ddl::Ddl::DropTable { name: name.into(), if_exists: true, purge: true, made_by: Some(job.into()) }])
 }
 
 /// A `CREATE TABLE … IF NOT EXISTS` that another statement made first, between its check and its definition (refused
@@ -1819,9 +1806,8 @@ impl Drop for Undo {
         // (carried: the drop runs as the caller that was stopped, with its sign-in and session, which tokio still
         // holds while a future is dropped)
         crate::panics::task(crate::auth::carried(async move {
-            let Some(drop) = drop_made(&app.lake, &name, &job).await else { return };
-            if let Err(e) = Box::pin(on_node_as(&app, drop, None, false)).await {
-                eprintln!("dropping {name}, a CREATE TABLE … AS SELECT that stopped before it answered: {e:#}");
+            if let Err(e) = Box::pin(on_node_as(&app, made_drop(&name, &job), None, false)).await {
+                eprintln!("left {name} as it is: the drop after its CREATE TABLE … AS, which stopped before it answered, didn't answer: {e:#}");
             }
         }));
     }

@@ -1453,7 +1453,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    it is planned) keeps its physical plan, keyed by its SQL, the rows' columns, the partitions and
    the lake's functions (`f/`). The rows are a table with no statistics (DataFusion answers a
    `count(*)` from exact ones), and each write resets every operator's state, as DataFusion runs a
-   recursive query's plan again, with that write's rows in the leaf. `harness.py flows`: "a kept
+   recursive query's plan again, with that write's rows in the leaf. A kept plan is taken out while
+   it runs and kept again only after its run succeeds (at most 8 a key): two writes at once never
+   share its operators' state. `harness.py flows`: "a kept
    plan keeps no write's count…" (1, 1, 1, 1, 1 with exact statistics) and "…nor its time" fail
    without them.
 201. **An inner join runs before a LEFT JOIN only when it reads nothing of the LEFT JOIN's padded side**
@@ -2196,8 +2198,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    is 2, 3.5 is 4); Arrow's cast drops it. `casts::Rounds`, an analyzer rule after type coercion,
    puts `pondra_whole` in every `CAST`, `::`, `TRY_CAST` and `arrow_cast` of a decimal with places
    or a float to an integer type, the casts coercion adds included, so every node, view and door
-   plans it alike; a value written into an integer column is rounded the same way (`query::strict`,
-   an UPDATE's and a MERGE's rows too: `change::part`), so a key an `ON CONFLICT` or a MERGE checks is
+   plans it alike; a value written into an integer column is rounded the same way (`casts::into`, through
+   `query::strict`: an UPDATE's and a MERGE's rows too, `change::part`, a folded constant and `setval`; JSON rows
+   at `/append` and from a topic, `json_rows`, exact past 2^53), so a key an `ON CONFLICT` or a MERGE checks is
    the key written. Spark's and Polars' names cut it toward zero, as those tools do: a session in Spark's
    dialect (`Rounds` puts `pondra_truncate` there instead), `spark_sql('…')`'s casts and `DIV` (`sparksql`),
    and the frames' casts to an integer (`_cast_sql`, `castSql`: Python's and JavaScript's write the same
@@ -2799,18 +2802,25 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
    pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
    of growth could pass the line: every 20 ms near it, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
-   machine's or container's memory; 0 is off, and a host's process has none) stops the oldest client query (`/sql`,
-   `/mcp`, pages, every Postgres statement) that has run 200 ms and started a tenth of the line lower: its future is dropped, it answers 53200, and its transaction
-   fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   machine's or container's memory; 0 is off, and a host's process has none) stops the client query (`/sql`, `/mcp`,
+   pages, every Postgres statement) that grew it. Of those that have run 200 ms and started a tenth of the line lower,
+   that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
+   the oldest. `oom::Meter` reads jemalloc's own thread counters around each poll, and DataFusion's spawned tasks are
+   metered too (its join-set tracer, `oom::start`), so nothing is counted per allocation. Its future is dropped, it
+   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
-   below half the line and stopping only after a second, CI's runner reached 1.75 GB). The same one watch gives the
+   below half the line and stopping only after a second, CI's runner reached 1.75 GB), and "the memory watch stops the
+   request that grew the node, not an older cheap one beside it…" (the cheap one was stopped by age). The same one watch gives the
    hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
    there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
-   decoded again and a query can't. A request takes the watch's last reading as it starts (`oom::seen`), never reads
-   the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the hot columns are let go
-   before a query is stopped".
+   decoded again and a query can't. After a trim it has jemalloc give its free pages back (`oom::purge`) and reads
+   resident memory again, never crediting what was freed: a query growing meanwhile takes those very pages, and with a
+   credit the node passed its line by what the cache gave back. A request takes the watch's last reading as it starts
+   (`oom::seen`), never reads the process itself. `harness.py hot`: "under a memory line below three fifths of RAM, the
+   hot columns are let go before a query is stopped", and "a query that needs more than the line is stopped near it,
+   even while the hot columns give memory back…" (with the credit: 128 MB held, a peak of 1,198 MB of a 1 GB line).
 418. **A table read cold tells the planner its columns' distinct values, as one read hot does** (`hot::told`): the
    cold branch of `HotFiles::scan` gives its Parquet scan's statistics, and each file group's, the catalog's distinct
    counts (`Known`, from the table's sketch and ranges), where the footers have none. DataFusion bounds a GROUP BY's
@@ -2831,7 +2841,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `PONDRA_SPILL_GB`, by default the disk's free space when the lake opens less what a lake keeps for itself
    (`store::lake_keeps`, invariant 220), not DataFusion's 100 GB; past it a query is refused with 53100, worded to
    raise `PONDRA_SPILL_GB` (`codes::words`), never DataFusion's `datafusion.runtime.*` (refused: invariant 188), and
-   the frugal retry doesn't run it again (`query::exhausted` leaves 53100 out: a frugal run spills to the same cap). `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
+   the frugal retry doesn't run it again (`query::exhausted` leaves 53100 out: a frugal run spills to the same cap).
+   The cap is looked at again as queries start, every 500 ms at most (`store::spill_room`), so a node started on a
+   full disk spills once room is freed. A shuffle's piece asks for its room before it is written (`store::spill_fits`;
+   under the setting, shuffles and spills together), and a step refused for room (any 53) is not run again on that
+   node: the query runs on the coordinator. `shuffle_spill.py --cap-gb`: "the shuffle's pieces on disk stayed within
+   the setting while it ran" (fails on the build before). `0`: nothing spills. Spills are written uncompressed: on this 4-core VM zstd
    cut a 10M-string sort's spill 2.5× but took 10–24% longer, lz4 5–9%. `harness.py scale`: "a query spills to
    PONDRA_SPILL_DIR, cleans up after, and past PONDRA_SPILL_GB is refused by name (53100)" (a folder not made yet);
    `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
@@ -2860,7 +2875,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    answers at once.
 422. **A window over whole partitions that ran out of memory is answered as a GROUP BY joined back to its rows, and
    only then** (`frugal::WholePartition`, `query::frugal`). A window's held rows refuse with "Resources exhausted"
-   (`held.rs`), which starts the frugal retry; its session carries `pondra_frugal.on` (`frugal::mark`), and only
+   (`held.rs`), which starts the frugal retry (`query::frugally`: a copy of the first try's session, its catalogs
+   shared, so it reads the same snapshot); its session carries `pondra_frugal.on` (`frugal::mark`), and only
    there does the rule turn a window whose every expression is `count`, `sum`, `avg`, `min`, `max`, `bool_and` or
    `bool_or` over one partition, with no order, FILTER or DISTINCT and the whole partition as its frame, into each
    partition's aggregates grouped by its keys and joined back on them (NULL equal to NULL), its rows on the side a
@@ -2907,6 +2923,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `harness.py objects`: "CREATE OR REPLACE TABLE t AS SELECT … FROM t reads the old t", "a CREATE OR REPLACE TABLE
    that fails leaves the old table as it was…", "…sent again with its job answers duplicate…"; `history_check.py`: "a
    follower reading t while the leader replaces it 20 times…: never 'no table t'".
+426. **A segment the catalog lists has its rows, so a reader that misses them waits** (`Catalog::inline`): a segment
+   and its inline rows (`d/`) are written in one commit and expired in one, but a follower's view can hold less than
+   its commit number for a moment while a new writer opens the lake, after its mirror let its streamed copy go. A
+   reader then reads again (20 ms, doubling to 500 ms, 10 s in all), its marks moved on between tries; a writer's miss,
+   or one past the wait, is still an error. A failover's reader once got "500: missing inline segment 19178".
+   `cargo test --lib store::tests::a_listed_segment_waits_for_its_inline_rows` (fails at its first read without it).
 ## Tests: run these before and after any change
 
 ```bash
