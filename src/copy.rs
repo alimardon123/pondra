@@ -340,7 +340,8 @@ struct Piece {
 async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) -> Result<(String, bool, Vec<Piece>)> {
     let (shown, spec, query_of) = match from {
         Source::Path(p) => {
-            let p = if scheme(p).is_none() { crate::ddl::full(p)? } else { p.clone() };
+            // (a relative path is the owner's folder's, made whole here; a client's is read as `objects` maps it: the lake's files)
+            let p = if scheme(p).is_none() && owner() { crate::ddl::full(p)? } else { p.clone() };
             let (format, mut reader) = match options.get("format") {
                 Some(f) => (f.to_lowercase(), BTreeMap::new()),
                 None => format_of(p.trim_end_matches('/')).context("COPY INTO: which FORMAT? (csv, parquet, json or arrow)")?,

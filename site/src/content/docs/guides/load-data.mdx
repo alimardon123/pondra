@@ -158,6 +158,7 @@ pondra sql --dir lake "SELECT count(*) AS loaded FROM orders WHERE id BETWEEN 20
 files on your machine. It works while a node runs on the same lake: the shell joins it for the moment.
 `pondra sql --dir lake` reads the lake straight from the folder, with no node of its own. Files in
 buckets, on HTTPS and in other engines' tables are in [Files and other lakes](/pondra/guides/files-and-other-lakes/).
+A relative name is read where you are: the shell, `pondra sql` and `connect()` read your own folder; a client over HTTP, Postgres or Flight reads the lake's files (what `PUT /files/…` wrote), as a page reads its own.
 
 <Aside type="caution">
 A node started with `pondra serve` never reads its own disk for a client's SQL, whoever asks: it refuses

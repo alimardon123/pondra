@@ -381,6 +381,16 @@ def external():
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
         and all(("through a node it started itself" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
         and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
+    # A client that isn't the program reads a relative name as a page does: the lake's own file of that name, as PUT wrote
+    # it, with the program's rows. A name no file is at answers 404, its SQLSTATE in the x-pondra-sqlstate header (the body
+    # is the words alone), and its words name the file as SQL wrote it.
+    theirs = anyone("SELECT * FROM 'reports/q1.csv'")
+    conn = http.client.HTTPConnection("127.0.0.1", other.port, timeout=30)
+    conn.request("POST", "/sql", b"SELECT * FROM 'nope.csv'")
+    resp = conn.getresponse()
+    nope_status, nope_code, nope_words = resp.status, resp.getheader("x-pondra-sqlstate"), resp.read().decode()
+    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows; a name no file is at: 404, 42P01"] = theirs == mine \
+        and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]

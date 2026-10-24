@@ -806,18 +806,20 @@ impl Page {
 
 /// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
 /// (`http://`, `https://`) as written (`reached` finds its origin's store), a relative path (`'x.csv'`, `'./d/*.parquet'`)
-/// in the working folder (`under_files`), and any other URL refused by name: a page reads the files it was given and the web.
-/// A `mem:` name that leaves `files/` (`..`, `%2E%2E`) is refused too: the page's kept tables are not SQL's to read.
+/// in the working folder (`lake_files::relative`, as a node reads a client's), and any other URL refused by name: a page
+/// reads the files it was given and the web. A `mem:` name that leaves `files/` (`..`, `%2E%2E`) is refused too: the
+/// page's kept tables are not SQL's to read.
 fn located(url: &str) -> anyhow::Result<String> {
     if is_web(url) {
         return Ok(url.to_string());
     }
     let made = if url.starts_with(WORKING) {
         url.to_string()
-    } else if url.contains("://") {
-        return Err(files_or_web(url));
     } else {
-        format!("mem:///{}", under_files(url.strip_prefix("./").unwrap_or(url))?)
+        match crate::lake_files::relative("mem:///", url) {
+            Some(r) => r?,
+            None => return Err(files_or_web(url)), // (a URL with a scheme, or an absolute path: a page has no disk)
+        }
     };
     // (`Url::parse` takes `..` out of a path, so the name is judged once parsed: `mem:///files/../tables/t` is `/tables/t`)
     if !url::Url::parse(&made)?.path().starts_with(FILES) {
@@ -2106,6 +2108,17 @@ mod tests {
         let body = std::str::from_utf8(&got.body).unwrap();
         assert_eq!(got.header("x-pondra-sqlstate"), Some("42P01"));
         assert!(body.contains("no file nope.csv was given to this page") && !body.contains("mem:///"), "{body}");
+    }
+
+    /// A page has no disk, so a name that starts at the disk's root is refused by name (0A000), as a URL with a scheme is:
+    /// it is not read as the page's own file of that name.
+    #[tokio::test]
+    async fn a_page_refuses_an_absolute_name() {
+        let page = Page::open(&Options::default());
+        for sql in ["SELECT * FROM '/x.csv'", "SELECT * FROM 'C:/x.csv'"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
+        }
     }
 
     #[tokio::test]

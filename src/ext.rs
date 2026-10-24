@@ -217,7 +217,7 @@ pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
     if !is(table) {
         return lake.cat.meta(&crate::store::table_key(table)).await.map(|m| m.map(Arc::unwrap_or_clone));
     }
-    let spec = spec(table).context("not a table of files")?;
+    let spec = for_caller(lake, spec(table).context("not a table of files")?)?;
     check(lake, &spec).await?;
     if let Ok(Some(m)) = LISTED.try_with(|l| l.borrow().get(table).cloned()) {
         return Ok(Some(m));
@@ -251,6 +251,19 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
         keep(t, m);
     }
     Ok(())
+}
+
+/// The spec's names as this caller reads them. The program that started the node reads its own folder, relative names
+/// too, as DuckDB does, so its names stay as they are. A client over the network has no folder on the server, so its
+/// relative names are read where a page reads them: in the lake's files (`lake_files::relative`, `PUT /files/…`'s
+/// place). A URL with a scheme, or an absolute path, stays as it is, and `check` decides it.
+fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
+    if owner() {
+        return Ok(spec);
+    }
+    let root = format!("{}/", lake.url.trim_end_matches('/'));
+    let urls = spec.urls.iter().map(|u| crate::lake_files::relative(&root, u).unwrap_or_else(|| Ok(u.clone()))).collect::<Result<Vec<_>>>()?;
+    Ok(Spec { urls, ..spec })
 }
 
 /// May this caller read these files? A path on this machine: only the program that started the
@@ -317,7 +330,9 @@ async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Resul
     .collect();
     folders.sort_unstable();
     folders.dedup();
-    folders.into_iter().try_for_each(|d| allowed(&secrets, &format!("{d}/")))
+    // (a data folder the client put in the lake's files is the lake's, as its files are: `own_file` says so, and only
+    // a name that stays in `files/` passes it, so a table there reads as a page reads it)
+    folders.into_iter().filter(|d| !own_file(lake, &format!("{d}/"))).try_for_each(|d| allowed(&secrets, &format!("{d}/")))
 }
 
 /// What to do about a URL no secret covers: the statement that would, for its store.
@@ -405,7 +420,8 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
 /// format): each one's full URL and its listing (its e-tag, size and time), sorted by name. Checked
 /// as a table's files are: a path of this machine only for the program that started the node.
 pub(crate) async fn objects(lake: &Lake, spec: &Spec) -> Result<Vec<(String, object_store_df::ObjectMeta)>> {
-    check(lake, spec).await?;
+    let spec = for_caller(lake, spec.clone())?;
+    check(lake, &spec).await?;
     let u = &spec.urls[0];
     register(lake, u).await?;
     let state = lake.session().state();
@@ -1562,6 +1578,56 @@ mod tests {
         let files = format!("{}/files", lake.url.trim_end_matches('/'));
         assert!(own_file(&lake, &format!("{files}/orders.csv")));
         assert!(!own_file(&lake, &format!("{files}/%2E%2E/catalog")), "an escaped .. reaches past files/");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// One statement as `pondra sql` runs it (`cli.rs`), for a caller that is the program that started the node or not:
+    /// its rows, or its error.
+    async fn run(lake: &Lake, owner: bool, sql: &str) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
+        let expanded = crate::routines::expand(lake, sql).await?;
+        let planned = crate::sys::planned(&expanded)?;
+        scope(owner, async {
+            anyhow::Ok(crate::query::session(lake, &expanded, "").await?.enable_url_table().sql(&planned).await?.collect().await?)
+        })
+        .await
+    }
+
+    /// The one integer a query answers (`SELECT sum(…) AS …`).
+    fn one_int(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
+        let column = batches[0].column(0);
+        column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("an integer").value(0)
+    }
+
+    /// A client over the network reads a relative name as a page reads it: a file of the lake's own, as `PUT /files/…`
+    /// wrote it. The program that started the node reads its own folder, so the same name is not the lake's file for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relative_name_is_the_lakes_file_for_a_client_and_the_owners_folder_for_its_program() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-relative-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        lake.put("files/orders.csv", b"id,qty\n1,2\n2,5\n".to_vec()).await?;
+        for sql in ["SELECT sum(qty) AS q FROM 'orders.csv'", "SELECT sum(qty) AS q FROM './orders.csv'"] {
+            assert_eq!(one_int(&run(&lake, false, sql).await?), 7, "{sql}");
+        }
+        let mine = format!("{}.csv", uuid::Uuid::new_v4());
+        lake.put(&format!("files/{mine}"), b"id,qty\n9,9\n".to_vec()).await?;
+        let err = run(&lake, true, &format!("SELECT * FROM '{mine}'")).await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42P01", "the owner reads its own folder, not the lake's files");
+
+        let err = run(&lake, false, "SELECT * FROM read_csv('/etc/hostname')").await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42501", "a path on the server's disk");
+        let err = run(&lake, false, "SELECT * FROM '../x.csv'").await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "0A000", "a name that leaves files/");
+        let escaped = format!("{}/files/%2E%2E/x.csv", lake.url);
+        let err = run(&lake, false, &format!("SELECT * FROM '{escaped}'")).await.unwrap_err();
+        assert_eq!(crate::codes::of(&err), "42501", "an escaped .. in a whole path");
+
+        let err = run(&lake, false, "SELECT * FROM 'missing.csv'").await.unwrap_err();
+        let said = crate::codes::words(&err);
+        assert_eq!(crate::codes::of(&err), "42P01");
+        assert!(said.contains("files/missing.csv") && !said.contains(&lake.url), "{said}");
+
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
