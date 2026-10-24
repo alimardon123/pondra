@@ -188,6 +188,7 @@ token is needed to read `/metrics`. [Deploy](/pondra/guides/deploy/) shows a Pro
   lake's format.
 - On the leader, `commits`, `commit_ms_p50` and `commit_ms_p95` say how long recent commits took, and
   `untiered_rows` how many rows wait to become Parquet.
+- On the leader, `pondra_producer_marks` counts the producers' marks kept in the catalog and `pondra_mark_expiries` the expiry keys that remove them: both stay flat under steady writes, as each mark goes once its window is up.
 
 ```bash
 curl -s localhost:8080/stats | python3 -c 'import json, sys; s = json.load(sys.stdin); print(s["lake"], s["role"], len(s["nodes"]))'

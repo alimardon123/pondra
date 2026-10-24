@@ -99,6 +99,7 @@ PROCESS = {
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
     "oom.rs:TRACER": "DataFusion's one join-set tracer for the process, set once: it reads the task-local of whichever request spawns",
+    "store.rs:MS": SETTING + " (PONDRA_LOCK_LEASE_SECS: the retry window, `store::retry_ms`)",
     "store.rs:ONE": LOCK,
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",

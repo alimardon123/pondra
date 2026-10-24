@@ -1826,7 +1826,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
-    let (lake, job) = (&app.lake, job.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+    let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
         for mut d in ddls {
@@ -2484,7 +2484,7 @@ fn tries() -> u32 {
 /// job of the run before (`PONDRA_JOB`), so whoever wins the race records it once.
 fn job() -> &'static str {
     static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))
+    JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.

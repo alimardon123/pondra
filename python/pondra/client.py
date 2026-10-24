@@ -294,7 +294,7 @@ class Pondra:
         format = format or ("arrow" if _has_arrow() else "json")
         changes = _changes(sql)
         if changes and not job:
-            job = f"{self.producer}-{next(self._auto)}"  # (sent again after a node went, it is applied once)
+            job = f"auto-{self.producer}-{next(self._auto)}"  # (sent again after a node went, it is applied once; `auto-`: kept for the retry window only)
         again = bool(changes) or _is_query(sql) and not re.search(r"(?i)\bstart\s*\(", _code(sql))  # (pondra.start runs something)
         path = f"/sql?format={format}" + (f"&job={urllib.parse.quote(job)}" if job else "") + (f"&catalog={catalog}" if catalog else "")
         if not params and not sent and not views:

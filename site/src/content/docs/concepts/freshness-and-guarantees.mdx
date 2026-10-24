@@ -53,7 +53,10 @@ SELECT count(*) AS rows_written FROM events;
 ```
 
 The batch went in once. A SQL write is made exactly-once with a **job** id: send the same job again
-and it is applied once.
+and it is applied once. A job id you name is remembered for 64 days (`PONDRA_LOAD_RETENTION_SECS`), so a
+load re-run days later is still applied once. A write sent without one gets an id that starts `auto-`,
+which is remembered for about two minutes (twice the lock lease, `PONDRA_LOCK_LEASE_SECS`, 60 s by
+default): a retry in that time is applied once, and after it the same id is a new write.
 
 <Tabs syncKey="lang">
   <TabItem label="Python">
