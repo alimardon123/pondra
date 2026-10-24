@@ -617,7 +617,7 @@ fn deal(files: &[Held], n: usize) -> Vec<Vec<(u32, u32)>> {
 }
 
 /// What the planner knows of a column of the batches: the table's least and greatest value and
-/// how many values it holds, as the table gives them to the join order (`query::Pruned::count`:
+/// how many values it holds, as the table gives them to the join order (`query::count`:
 /// its files' footers and its sketch), so a filter or a join over the batches is sized alike there
 /// and here. Without them DataFusion took a range of dates for every row, and a nation's name for
 /// a fifth of the nations. They are the catalog's, the same on every node whatever it holds in
