@@ -15,7 +15,7 @@ use crate::server::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::datatypes::{DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
@@ -327,22 +327,15 @@ impl Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("App") }
 }
 
-/// A COPY line the reader refused, as Postgres words it: a line of another width is 22P04 (`extra data after last expected
-/// column`, `missing data for column "c"`), a value its column's type can't read 22P02, each with the reader's words after.
-/// Anything else is as the reader says it.
+/// A COPY line the CSV reader refused, as Postgres words it: a line of another width is 22P04 (`pg_copy::width`),
+/// with the reader's words after. Anything else is as the reader says it. The reader reads every field as text
+/// (`load`), so a value its column can't take is refused by `pg_copy::typed`, not here.
 fn copy_refused(given: &[String], e: datafusion::arrow::error::ArrowError) -> anyhow::Error {
     static FIELDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"incorrect number of fields for line \d+, expected (\d+) got (\d+)").expect("a pattern"));
     let said = e.to_string();
-    if let Some((want, got)) = FIELDS.captures(&said).and_then(|c| Some((c[1].parse::<usize>().ok()?, c[2].parse::<usize>().ok()?))) {
-        let what = match given.get(got) {
-            Some(c) if got < want => format!("missing data for column \"{c}\""),
-            _ => "extra data after last expected column".into(),
-        };
-        return crate::codes::coded("22P04", format!("{what} ({said})"));
-    }
-    match said.contains("Error while parsing value") {
-        true => crate::codes::coded("22P02", said),
-        false => e.into(),
+    match FIELDS.captures(&said).and_then(|c| c[2].parse::<usize>().ok()) {
+        Some(got) => crate::codes::coded("22P04", format!("{} ({said})", crate::pg_copy::width(given, got))),
+        None => e.into(),
     }
 }
 
@@ -611,7 +604,7 @@ impl Backend {
             false => match p.copy.format.as_str() {
                 // (a line ends a row unless it's inside quotes: an even number of them before it)
                 "csv" => (0..p.data.len()).rev().filter(|&i| p.data[i] == b'\n').find(|&i| p.data[..i].iter().filter(|&&b| b == b'"').count() % 2 == 0).map_or(0, |i| i + 1),
-                _ => p.data.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1),
+                _ => crate::pg_copy::rows_end(&p.data), // (text format: a newline that no backslash escapes)
             },
         };
         let chunk: Vec<u8> = p.data.drain(..cut).collect();
@@ -620,18 +613,32 @@ impl Backend {
             return Ok(()); // (nothing, or text format's end marker `\.`)
         }
         let err = |e: anyhow::Error| user_error(e);
+        // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
+        let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
         let meta = self.app.lake.cat.get::<crate::store::TableMeta>(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let table = crate::answer::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
         let uuids = meta.logical().sql_types;
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
-        let null = regex::Regex::new(&format!("^{}$", regex::escape(&p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() })))).map_err(|e| err(e.into()))?;
-        let mut reader = datafusion::arrow::csv::ReaderBuilder::new(schema.clone()).with_header(header).with_delimiter(p.copy.delimiter.unwrap_or(if csv { ',' } else { '\t' }) as u8).with_null_regex(null);
-        if !csv {
-            reader = reader.with_quote(0); // (text format quotes nothing)
-        }
-        let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
-        for b in batches {
+        let null = p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() });
+        let delimiter = p.copy.delimiter.unwrap_or(if csv { ',' } else { '\t' }) as u8;
+        // each chunk as text columns, read as its format says; `pg_copy::typed` makes them the table's types
+        let sets: Vec<Vec<ArrayRef>> = match csv {
+            true => {
+                let null = regex::Regex::new(&format!("^{}$", regex::escape(&null))).map_err(|e| err(e.into()))?;
+                let as_text = Arc::new(Schema::new(schema.fields().iter().map(|f| Field::new(f.name(), DataType::Utf8, true)).collect::<Vec<_>>()));
+                let reader = datafusion::arrow::csv::ReaderBuilder::new(as_text).with_header(header).with_delimiter(delimiter).with_null_regex(null);
+                let batches = reader.build(std::io::Cursor::new(chunk)).map_err(|e| err(copy_refused(&given, e)))?.collect::<Result<Vec<_>, _>>().map_err(|e| err(copy_refused(&given, e)))?;
+                batches.iter().map(|b| b.columns().to_vec()).collect()
+            }
+            false => vec![crate::pg_copy::text_columns(text, &given, delimiter, &null, header).map_err(err)?],
+        };
+        for cols in sets {
+            // (a set with no rows is nothing to load: the CSV reader gives no batch for it)
+            if cols.first().is_none_or(|c| c.is_empty()) {
+                continue;
+            }
+            let b = crate::pg_copy::typed(cols, &schema).map_err(err)?;
             // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
             let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
@@ -1003,7 +1010,7 @@ impl postgres_types::ToSql for PgInterval {
 
 impl pgwire::types::ToSqlText for PgInterval {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(crate::pg_values::interval_text(self.months, self.days, self.micros).as_bytes());
+        out.extend_from_slice(crate::pg_text::interval_text(self.months, self.days, self.micros).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -1025,7 +1032,7 @@ impl postgres_types::ToSql for PgTime {
 
 impl pgwire::types::ToSqlText for PgTime {
     fn to_sql_text(&self, _: &Type, out: &mut bytes::BytesMut, _: &pgwire::types::format::FormatOptions) -> Result<postgres_types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
-        out.extend_from_slice(crate::pg_values::time_text(self.0).as_bytes());
+        out.extend_from_slice(crate::pg_text::time_text(self.0).as_bytes());
         Ok(postgres_types::IsNull::No)
     }
 }
@@ -1125,7 +1132,9 @@ impl Copy {
             return None; // (`COPY … TO 's3://…'`: files anywhere, the statement every door runs: ADR-026)
         }
         let parsed = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::PostgreSqlDialect {}, sql);
-        let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else { return Some(Err(user_error(anyhow::anyhow!("COPY: can't read {sql}")))) };
+        let Ok(Some(Statement::Copy { source, to, target, options, legacy_options, .. })) = parsed.map(|mut s| s.pop()) else {
+            return Some(Err(user_error(crate::pg_copy::not_one_byte(sql).unwrap_or_else(|| anyhow::anyhow!("COPY: can't read {sql}")))));
+        };
         if !matches!((to, &target), (true, CopyTarget::Stdout) | (false, CopyTarget::Stdin)) {
             return Some(Err(user_error(anyhow::anyhow!("COPY reads and writes the client's files: psql's \\copy, or COPY … TO STDOUT / FROM STDIN"))));
         }

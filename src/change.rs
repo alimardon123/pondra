@@ -545,7 +545,8 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
     let m = match &m.upsert {
         Some(u) => {
             let plain = u.merge(meta, m, false)?;
-            built = if repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
+            // (one row of VALUES, an ORM's upsert, can't repeat a key: no query of the source under the lake's lock)
+            built = if !crate::write::one_row(&u.query) && repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
                 // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
                 if u.update.is_some() {
@@ -667,10 +668,7 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
         Some(s) => one(old, s)?,
         None => None,
     };
-    let new = one(new, ids.clone())?;
-    if let Some(n) = &new {
-        crate::defaults::check(meta, table, n)?; // (an UPDATE may not empty a NOT NULL column)
-    }
+    let new = one(new, ids.clone())?.map(|n| crate::defaults::fit(meta, table, n)).transpose()?; // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
     if crate::constraints::needs_check(meta, plain) {
         crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain).await?; // (under the lake's lock: no other write of the table between)
     }

@@ -1,0 +1,1 @@
+{"add":{"path":"32bcf70e-c8f6-496f-9706-01fed9e9c5fc.parquet","partitionValues":{},"size":1622,"modificationTime":1792803222859,"dataChange":true,"stats":"{\"numRecords\":3,\"minValues\":{\"id\":30,\"name\":\"item-30\",\"qty\":300},\"maxValues\":{\"id\":32,\"name\":\"item-32\",\"qty\":320},\"nullCount\":{\"id\":0,\"name\":0,\"qty\":0},\"tightBounds\":true}"}}

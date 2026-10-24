@@ -865,7 +865,7 @@ async fn insert_rows(l: &Locks<'_>, stored: &TableMeta, query: &str, snapshot: u
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
         let rows = crate::write::rows_of(lake, lake, l.meta, query, Some(at), files).await?;
-        crate::defaults::check(stored, l.name, &rows)?;
+        let rows = crate::defaults::fit(stored, l.name, rows)?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
         Ok((rows, keys))
@@ -919,12 +919,12 @@ async fn change(l: &Locks<'_>, stored: &TableMeta, stmt: &Stmt, snapshot: u64) -
         },
         _ => None,
     };
-    let changed = match hit {
+    let mut changed = match hit {
         Some(c) => c,
         None => changing(l, stmt, snapshot).await?,
     };
-    if let Some(n) = changed.1.iter().find(|b| b.num_rows() > 0) {
-        crate::defaults::check(stored, l.name, n)?;
+    for b in changed.1.iter_mut().filter(|b| b.num_rows() > 0) {
+        *b = crate::defaults::fit(stored, l.name, b.clone())?; // (every batch of the new rows: as the table holds them)
     }
     Ok(changed)
 }

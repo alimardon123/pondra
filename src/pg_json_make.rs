@@ -1,16 +1,16 @@
 //! Postgres's functions that make JSON from values: `to_json`, `to_jsonb`, `row_to_json`, `json_build_object`,
 //! `jsonb_build_object`, `json_build_array`, `jsonb_build_array`, and the scalar forms of the aggregates
 //! (`pondra_json_agg(list, kind)` is what a later step makes `json_agg(x)` into: `array_agg(x)` and the kind of its
-//! elements). Each answer is text marked as JSON (`pg_types::MARK`: "json", or "jsonb" for the `jsonb_*` ones),
+//! elements). Each answer is text marked as JSON (`pg_functions::MARK`: "json", or "jsonb" for the `jsonb_*` ones),
 //! so the port sends it as json, and a function given another's answer writes it as it is. Text without the mark is a
 //! string and is quoted. The text is Postgres 16's, down to the spaces and the digits of a float (`json.c`, `jsonb.c`).
 //! `jsonb_text` is jsonb's own output: keys sorted, numbers as `numeric` prints them, and every `jsonb_*` answer goes
 //! through it. `pondra_as_jsonb` and `pondra_jsonb` (types.rs) answer the same way.
 use crate::codes::{coded, Coded};
-use crate::pg_json::is_text;
-use crate::pg_types::MARK;
-use crate::types::json_refusal;
-use crate::pg_values::{interval_text, time_text};
+use crate::pg_functions::MARK;
+use crate::pg_json::{is_text, json_refusal};
+use crate::pg_bytea;
+use crate::pg_text::{interval_text, time_text};
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::compute::cast;
@@ -36,7 +36,7 @@ use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session.
+/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session (`engine::session`).
 pub fn register(ctx: &SessionContext) {
     let one = || Signature::any(1, Volatility::Immutable);
     let two = || Signature::any(2, Volatility::Immutable);
@@ -508,11 +508,8 @@ fn interval(out: &mut String, a: &ArrayRef, i: usize) {
     json_string(out, &interval_text(months, days, micros));
 }
 
-/// Binary as Postgres's bytea text: `\x` and its hex digits, which JSON then escapes (`"\\x0102"`).
-fn bytea(out: &mut String, bytes: &[u8]) {
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    json_string(out, &format!("\\x{hex}"));
-}
+/// Binary as Postgres's bytea text (`pg_bytea::text`: `\x` and its hex digits), which JSON then escapes (`"\\x0102"`).
+fn bytea(out: &mut String, bytes: &[u8]) { json_string(out, &pg_bytea::text(bytes)); }
 
 /// A list as `[1,2]`, no spaces, each element by `value` with its item field's mark.
 fn list(out: &mut String, items: &ArrayRef, item: &Field) -> Result<()> {
@@ -789,6 +786,18 @@ fn read_whole(json: &str) -> Option<Node<'_>> {
     let node = read(json, &mut jiter, peek)?;
     jiter.finish().ok()?;
     Some(node)
+}
+
+/// Why `json` isn't JSON as Postgres's `json` takes it, as Postgres's SQLSTATE: 54001 past `MAX_DEPTH` levels, judged
+/// first as `parse` judges it (`depth_check`), so every check of a document (a write, `is_json`) takes the levels the
+/// functions read; then 22P02 for text that isn't JSON, by serde's reader, the faster walk, which takes any depth and
+/// what Postgres's `json` takes, a lone surrogate's escape too (only `jsonb` and reading the text refuse it, as
+/// Postgres's do). None when it is JSON.
+pub(crate) fn refused(json: &str) -> Option<&'static str> {
+    if depth_check(json).is_err() {
+        return Some("54001");
+    }
+    serde_json::from_str::<serde::de::IgnoredAny>(json).is_err().then_some("22P02")
 }
 
 /// Refuses a document nested past `MAX_DEPTH` levels, before anything is read: a bracket inside a string doesn't count,
@@ -1170,10 +1179,48 @@ mod tests {
                 assert_eq!(jsonb_text(&nested(MAX_DEPTH)).unwrap(), nested(MAX_DEPTH));
                 let refused = jsonb_text(&nested(MAX_DEPTH + 1)).unwrap_err();
                 assert_eq!(crate::codes::of(&anyhow::Error::new(refused)), "54001");
+                // (a write's check takes the levels the functions read)
+                assert_eq!(super::refused(&nested(MAX_DEPTH)), None);
+                assert_eq!(super::refused(&nested(MAX_DEPTH + 1)), Some("54001"));
+                // (a million open brackets are refused before anything is read)
+                assert_eq!(super::refused(&"[".repeat(1_000_000)), Some("54001"));
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn refused_says_what_parse_refuses() {
+        assert_eq!(super::refused(r#"[1, {"a": [true, null, "x\"y", -1.5e3]}]"#), None);
+        assert_eq!(super::refused(r#"{"é\u00e9\ud83d\ude00": "\n\u0041"}"#), None);
+        // (a lone surrogate's escape is JSON to Postgres's `json`, in a text or a key; only reading the text refuses it)
+        for lone in [r#""\ud800""#, r#"{"\ud800": 1}"#] {
+            assert_eq!(super::refused(lone), None, "{lone}");
+            assert!(parse(lone).is_err(), "{lone}");
+        }
+        for bad in ["[1,", r#"{"a" 1}"#, "tru", "1 2", "", r#""\q""#, r#""\u12""#, "[1]]"] {
+            assert!(parse(bad).is_err(), "{bad}");
+            assert_eq!(super::refused(bad), Some("22P02"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_document_200_levels_deep_is_read_and_is_json() {
+        let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(super::refused(&nested), None);
+        assert!(parse(&nested).is_ok());
+        assert!(crate::pg_json::is_json(&nested));
+    }
+
+    #[test]
+    fn is_json_agrees_with_refused() {
+        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
+        let (deep, too_deep) = (nested(200), nested(MAX_DEPTH + 1));
+        let docs: [&str; 8] = [r#"[1, {"a": [true, null, "x\"y", -1.5e3]}]"#, "[1,", r#"{"a" 1}"#, "tru", "1 2", "", &deep, &too_deep];
+        for doc in docs {
+            assert_eq!(crate::pg_json::is_json(doc), super::refused(doc).is_none(), "{}", doc.chars().take(20).collect::<String>());
+        }
     }
 
     #[tokio::test]

@@ -188,7 +188,7 @@ def lower(c):
 
 
 def length(c):
-    return _f("length", c, sql="character_length")
+    return _f("length", c)
 
 
 def trim(c):

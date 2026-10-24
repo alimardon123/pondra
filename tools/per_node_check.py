@@ -76,6 +76,7 @@ PROCESS = {
     "panics.rs:R": "the queries' runtime and the memory watch's, one each a process (ADR-061 §4): the node's tasks on them end with the node, the runtimes don't",
     "path.rs:HEADS": "regexes and constants",
     "path.rs:LATE": "regexes and constants",
+    "pg_bytea.rs:STRPOS": "a function's definition (strpos, position and instr over bytea and text), the same for every lake",
     "pg_json.rs:FUNCTIONS": "Postgres's JSON operators' and functions' definitions, made once: nothing of a lake",
     "pg_json_edit.rs:FUNCTIONS": "the JSON edits' definitions, made once: nothing of a lake",
     "pg_json_sets.rs:SETS": "the JSON set functions' names and columns, built into the binary",

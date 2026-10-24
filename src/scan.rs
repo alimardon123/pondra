@@ -4,9 +4,11 @@
 //! reader never decodes a deleted row; filters reach row groups and pages as for any Parquet.
 //! In the core, so a page reads with it too.
 use anyhow::{bail, ensure, Context, Result};
+use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use datafusion::catalog::Session;
-use datafusion::common::ScalarValue;
+use datafusion::common::pruning::PruningStatistics;
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::file_format::{parquet::ParquetFormat, FileFormat};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfigBuilder};
 use datafusion::datasource::{TableProvider, TableType};
@@ -338,6 +340,54 @@ async fn range(ctx: &datafusion::prelude::SessionContext, path: &str, offset: u6
     Ok(datafusion::object_store::ObjectStoreExt::get_range(&store, &datafusion::object_store::path::Path::parse(url.prefix().as_ref())?, offset..offset + size).await?)
 }
 
+/// Which containers (files, or a lake's manifests of them) `stats` says can hold rows matching all of `filters`, over
+/// `schema`. Anything they can't decide is kept.
+pub fn may_match(stats: &dyn PruningStatistics, filters: &[Expr], schema: &SchemaRef) -> Vec<bool> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    let all = vec![true; stats.num_containers()];
+    let Some(expr) = filters.iter().cloned().reduce(Expr::and) else { return all };
+    let unqualified = expr.transform(|e| Ok(match e {
+        Expr::Column(c) => Transformed::yes(Expr::Column(Column::new_unqualified(c.name))),
+        e => Transformed::no(e),
+    }));
+    let pruned = || -> Result<Vec<bool>> {
+        let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
+        let phys = datafusion::physical_expr::create_physical_expr(&unqualified?.data, &df_schema, &Default::default(), &Default::default())?;
+        Ok(datafusion::physical_optimizer::pruning::PruningPredicateBuilder::new().with_file_schema(schema.clone()).try_build(phys)?.prune(stats)?)
+    };
+    pruned().unwrap_or(all)
+}
+
+/// What a scan knows of each of its files before opening it: its columns' ranges (`statistics`) and its partition
+/// values. DataFusion's own check of a file reads only exact ranges, and these are bounds (a log's, which a deletion
+/// vector or a cut string leaves loose), kept inexact so no answer is read from them: so `Files` checks them itself.
+struct Known<'a> {
+    files: &'a [File],
+    schema: &'a SchemaRef, // the scan's: the files' columns, then the partition's (then the row number, never known)
+    in_files: usize,       // how many of its columns the files hold
+}
+
+impl Known<'_> {
+    fn values(&self, c: &Column, max: bool) -> Option<ArrayRef> {
+        let i = self.schema.index_of(&c.name).ok()?;
+        let null = ScalarValue::try_from(self.schema.field(i).data_type()).ok()?;
+        let value = |f: &File| match i.checked_sub(self.in_files) {
+            None => f.stats.column_statistics.get(i).and_then(|s| if max { &s.max_value } else { &s.min_value }.get_value().cloned()),
+            Some(p) => f.partition.get(p).filter(|v| !v.is_null()).cloned(),
+        };
+        ScalarValue::iter_to_array(self.files.iter().map(|f| value(f).unwrap_or_else(|| null.clone()))).ok()
+    }
+}
+
+impl PruningStatistics for Known<'_> {
+    fn min_values(&self, c: &Column) -> Option<ArrayRef> { self.values(c, false) }
+    fn max_values(&self, c: &Column) -> Option<ArrayRef> { self.values(c, true) }
+    fn num_containers(&self) -> usize { self.files.len() }
+    fn null_counts(&self, _: &Column) -> Option<ArrayRef> { None }
+    fn row_counts(&self) -> Option<ArrayRef> { None }
+    fn contained(&self, _: &Column, _: &std::collections::HashSet<ScalarValue>) -> Option<datafusion::arrow::array::BooleanArray> { None }
+}
+
 /// A table's data files, read as one.
 #[derive(Debug)]
 pub struct Files {
@@ -373,14 +423,25 @@ impl TableProvider for Files {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()]) // (row groups and pages skipped by them; the filter stays above)
     }
 
-    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, _: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // A file whose ranges hold no row the filters keep is left out unopened: over the web, a footer is a request.
+        let schema = self.schema();
+        let kept = may_match(&Known { files: &self.files, schema: &schema, in_files: self.file_schema.fields().len() }, filters, &schema);
+        let mut files: Vec<File> = self.files.iter().zip(kept).filter(|(_, k)| *k).map(|(f, _)| f.clone()).collect();
+        if files.is_empty() {
+            let projected = match projection {
+                Some(p) => Arc::new(schema.project(p)?),
+                None => schema,
+            };
+            return Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(projected)));
+        }
         let format = ParquetFormat::default().with_options(state.default_table_options().parquet);
         let table = datafusion::datasource::table_schema::TableSchema::builder(self.file_schema.clone()).with_table_partition_cols(self.partition.clone()).with_virtual_columns(self.row.clone().into_iter().collect::<Vec<_>>()).build();
         let source = format.file_source(table);
         // Files dealt to the partitions by size, each partition a run of them.
         let parts = state.config().target_partitions().max(1);
         let mut groups: Vec<(u64, Vec<datafusion::datasource::listing::PartitionedFile>)> = vec![(0, vec![]); parts];
-        let mut files = self.files.clone();
+        let count = files.len();
         files.sort_by(|a, b| b.size.cmp(&a.size).then(a.key.cmp(&b.key)));
         for f in files {
             let mut pf = datafusion::datasource::listing::PartitionedFile::new_from_meta(datafusion::object_store::ObjectMeta {
@@ -401,9 +462,8 @@ impl TableProvider for Files {
             least.0 += f.size;
             least.1.push(pf);
         }
-        let schema = self.schema();
         let known: Vec<_> = groups.iter().flat_map(|g| g.1.iter()).filter_map(|f| f.statistics.clone()).collect();
-        let stats = match known.len() == self.files.len() {
+        let stats = match known.len() == count {
             true => datafusion::common::Statistics::try_merge_iter(known.iter().map(|s| s.as_ref()), &schema)?,
             false => datafusion::common::Statistics::new_unknown(&schema),
         };

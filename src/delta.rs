@@ -12,9 +12,11 @@
 //! versions of a key between compactions, so they are published whenever a single file holds
 //! exactly one row per key: after each compaction (at most 8 tiering rounds apart).
 use crate::store::*;
+use crate::write_outside::stat_json;
 use anyhow::Result;
 use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
 use datafusion::arrow::json as arrow_json;
+use datafusion::common::ScalarValue;
 use object_store::{path::Path, ObjectStoreExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -238,6 +240,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
     // (once a column was renamed or dropped, Delta's column mapping stays on: it can't be turned off)
     let mapped = meta.mapped() || state.schema.contains(MAPPING_ID);
     let Some(schema) = table_schema(meta, mapped) else { return Ok(None) }; // a type Delta can't carry
+    let cols = columns(meta);
     // Only the manifests that came or went are read: their files are what the log gains or loses.
     let now: BTreeMap<String, u64> = parts.manifests.iter().map(|m| (m.path.clone(), m.files)).collect();
     let came: Vec<&crate::manifest::Manifest> = parts.manifests.iter().filter(|m| !state.manifests.contains_key(&m.path)).collect();
@@ -261,7 +264,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
     }
     let was = |p: &String| state.inline.contains_key(p) || lost.contains_key(p);
     let changed = |p: &String| was(p) && state.dvs.get(p) != dvs.get(p);
-    let adds: Vec<(String, u64, u64)> = want.iter().filter(|(p, _)| !was(p) || changed(p)).map(|(p, f)| (p.clone(), f.bytes, f.rows)).collect();
+    let adds: Vec<(String, &DataFile)> = want.iter().filter(|(p, _)| !was(p) || changed(p)).map(|(p, f)| (p.clone(), *f)).collect();
     let removes: Vec<String> = gone.keys().filter(|p| !want.contains_key(*p)).chain(want.keys().filter(|p| changed(p))).cloned().collect();
     if state.version.is_some() && adds.is_empty() && removes.is_empty() && state.schema == schema {
         return Ok(None);
@@ -283,7 +286,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
             actions.push(metadata(&state.id, table, &schema, ms, vectors));
         }
         actions.extend(removes.iter().map(|p| remove(p, ms, state.dvs.get(p), change)));
-        actions.extend(adds.iter().map(|(p, b, n)| add(p, *b, *n, ms, dvs.get(p), change)));
+        actions.extend(adds.iter().map(|(p, f)| add(p, f, &cols, ms, dvs.get(p), change)));
         let body = actions.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
         // Written once, never overwritten. If it's already there, an earlier attempt wrote it and
         // crashed before recording it: it was derived from committed state too, so whatever it
@@ -293,7 +296,7 @@ async fn publish(lake: &Lake, table: &str, meta: &TableMeta) -> Result<Option<(S
         }
         let earlier = lake.store.get(&Path::from(format!("{dir}_delta_log/{version:020}.json"))).await?.bytes().await?;
         let (added, removed) = applied(&earlier)?;
-        adds.retain(|(p, _, _)| !added.contains(p));
+        adds.retain(|(p, _)| !added.contains(p));
         removes.retain(|p| !removed.contains(p));
         state.schema = schema.clone();
         version += 1;
@@ -348,6 +351,7 @@ fn applied(commit: &[u8]) -> Result<(std::collections::HashSet<String>, std::col
 /// instead of replaying every JSON commit. Arrow's JSON reader builds the nested columns from
 /// the same action objects the commits use.
 async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, table: &str, meta: &TableMeta) -> Result<()> {
+    let cols = columns(meta);
     // The actions are built here, a manifest at a time, and written on a blocking thread: a table
     // of a million files never has all their paths in memory at once.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<Value>>(2);
@@ -370,10 +374,10 @@ async fn checkpoint(lake: &Lake, dir: &str, version: u64, state: &Published, tab
     for m in crate::manifest::list(lake, meta).await? {
         let files = crate::manifest::files(lake, &m).await?;
         let listed = files.iter().map(|f| (f.path.strip_prefix(dir).unwrap_or(&f.path), f));
-        tx.send(listed.map(|(p, f)| add(p, f.bytes, f.rows, 0, state.dvs.get(p), false)).collect()).await?;
+        tx.send(listed.map(|(p, f)| add(p, f, &cols, 0, state.dvs.get(p), false)).collect()).await?;
     }
     let inline = meta.files.iter().map(|f| (f.path.strip_prefix(dir).unwrap_or(&f.path), f)); // (as just published: `state.inline`)
-    tx.send(inline.map(|(p, f)| add(p, f.bytes, f.rows, state.inline.get(p).map_or(0, |x| x.1), state.dvs.get(p), false)).collect()).await?;
+    tx.send(inline.map(|(p, f)| add(p, f, &cols, state.inline.get(p).map_or(0, |x| x.1), state.dvs.get(p), false)).collect()).await?;
     drop(tx);
     let (buf, rows) = writing.await??;
     lake.put(&format!("{dir}_delta_log/{version:020}.checkpoint.parquet"), buf).await.ok(); // (a retry may find it written)
@@ -435,16 +439,64 @@ fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
     Some(schema.to_string())
 }
 
-/// A file into the log, with its rows (`numRecords`, which a reader needs for a file with a
-/// deletion vector) and its deletion vector, if rows of it were deleted by position; `change`:
-/// false when the commit only rewrote files.
-fn add(path: &str, bytes: u64, rows: u64, at: u64, dv: Option<&Value>, change: bool) -> Value {
-    let stats = json!({"numRecords": rows}).to_string();
-    let mut a = json!({"add": {"path": path, "partitionValues": {}, "size": bytes, "modificationTime": at, "dataChange": change, "stats": stats}});
+/// A file into the log, with its rows and statistics (`stats`) and its deletion vector, if rows of
+/// it were deleted by position; `change`: false when the commit only rewrote files.
+fn add(path: &str, f: &DataFile, cols: &[Column], at: u64, dv: Option<&Value>, change: bool) -> Value {
+    let mut a = json!({"add": {"path": path, "partitionValues": {}, "size": f.bytes, "modificationTime": at, "dataChange": change, "stats": stats(f, cols, dv.is_none()).to_string()}});
     if let Some(dv) = dv {
         a["add"]["deletionVector"] = dv.clone();
     }
     a
+}
+
+/// A file's statistics, which a reader skips the file by when a filter's values are outside its
+/// ranges (so it never fetches the file's footer): its rows, each column's min and max, and the
+/// columns it holds no NULL in. Its ranges still cover the rows deleted by its vector, so the
+/// bounds are tight only without one.
+fn stats(f: &DataFile, cols: &[Column], tight: bool) -> Value {
+    let ranges = file_ranges(cols, f);
+    let bound = |max: bool| -> serde_json::Map<String, Value> {
+        ranges.iter().filter_map(|r| Some((r.name.clone(), stat_json(if max { r.hi.as_ref() } else { r.lo.as_ref() }?, max)?))).collect()
+    };
+    let no_nulls: serde_json::Map<String, Value> = ranges.iter().filter(|r| r.no_nulls).map(|r| (r.name.clone(), json!(0))).collect();
+    json!({"numRecords": f.rows, "minValues": bound(false), "maxValues": bound(true), "nullCount": no_nulls, "tightBounds": tight})
+}
+
+/// A table column as the open formats publish it: its place among the stored columns (Iceberg's
+/// field id is that place + 1), its stored name (the key of Delta's statistics) and its type.
+pub(crate) struct Column {
+    pub i: usize,
+    pub name: String,
+    pub t: DataType,
+}
+
+/// A file's range in one column: its min and max (None when the text doesn't parse as the column's
+/// type, so that bound is left out), and whether the file holds no NULL in the column.
+pub(crate) struct Range {
+    pub i: usize,
+    pub name: String,
+    pub lo: Option<ScalarValue>,
+    pub hi: Option<ScalarValue>,
+    pub no_nulls: bool,
+}
+
+/// The table's columns the formats publish, worked out once per publish. Each keeps its place
+/// among ALL the stored columns, counted before the dropped and marker columns are skipped: after a
+/// DROP COLUMN, a later column's Iceberg field id must not land on another column's.
+/// A column whose type doesn't parse is left out: its files then publish no ranges for it, and the table is still published.
+pub(crate) fn columns(meta: &TableMeta) -> Vec<Column> {
+    let published = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c));
+    published.filter_map(|(i, (c, t))| Some(Column { i, name: c.clone(), t: crate::answer::dtype(t).ok()? })).collect()
+}
+
+/// A file's ranges, for the columns `cols` has a range for in the file's statistics. Both open
+/// formats publish these, so a file's bounds are the same in each.
+pub(crate) fn file_ranges(cols: &[Column], f: &DataFile) -> Vec<Range> {
+    cols.iter().filter_map(|c| {
+        let (lo, hi) = f.stats.get(&c.name)?;
+        let parse = |s: &String| ScalarValue::try_from_string(s.clone(), &c.t).ok();
+        Some(Range { i: c.i, name: c.name.clone(), lo: parse(lo), hi: parse(hi), no_nulls: f.nulls.as_ref().is_some_and(|n| !n.contains(&c.name)) })
+    }).collect()
 }
 
 fn remove(path: &str, at: u64, dv: Option<&Value>, change: bool) -> Value {

@@ -38,14 +38,17 @@ pub fn wanted(sql: &str) -> bool {
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
-    // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a
-    // bytea's hex form, `(a, b) IN (SELECT …)`, a DELETE or UPDATE with an alias, a character type's
-    // Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal `[…]` or `ARRAY[…]` (a `[` straight
-    // after a word, `)`, `]` or `"` is a subscript, `arr[1]`))
+    // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
+    // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
+    // `(a, b) IN (SELECT …)`, a DELETE or UPDATE with an alias, a character type's Postgres name,
+    // DEFAULT VALUES, LIKE … ESCAPE, an array literal `[…]` or `ARRAY[…]` (a `[` straight after a word,
+    // `)`, `]` or `"` is a subscript, `arr[1]`))
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|'\\x|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|^\s*(?:delete\s+from|update)\s+[\w."]+\s+(?:as\s+)?\w+\s|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
     });
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || alias_in_where(sql)
+    // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
+    static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -850,8 +853,8 @@ fn spell(t: &mut DataType) {
 /// A string literal written the way its type reads it, where DataFusion doesn't read Postgres's
 /// spelling: a timestamp's zone of one hour digit (`-0`, `+5`) gets two (`-00:00`, `+05:00`), since
 /// Arrow reads `±HH`, `±HHMM` and `±HH:MM` only; a NUMERIC's exponent is written out (`1E-7` is
-/// `0.0000001`); a bytea's hex form (`\xff00`) is `decode(…, 'hex')`. Some(text): the whole literal
-/// is `text` instead.
+/// `0.0000001`); a bytea literal in either of Postgres's forms (`\xff00`, or `a\\b` with its escapes) is
+/// its `X'…'` (`pg_bytea`). Some(text): the whole literal is `text` instead.
 fn literal(t: &DataType, s: &mut String) -> Result<Option<String>> {
     match t {
         DataType::Timestamp(..) => {
@@ -862,9 +865,7 @@ fn literal(t: &DataType, s: &mut String) -> Result<Option<String>> {
             }
         }
         DataType::Bytea => {
-            if let Some(hex) = s.strip_prefix("\\x") {
-                return bytea_hex(hex).map(Some);
-            }
+            return crate::pg_bytea::parse(s).map(|b| Some(crate::pg_bytea::sql(&b))).map_err(|e| crate::codes::coded(e.code, e.message));
         }
         _ if numeric(t) => {
             if let Some(plain) = plain_decimal(s)? {
@@ -937,18 +938,6 @@ fn plain_decimal(s: &str) -> Result<Option<String>> {
     let trimmed = out.trim_start_matches('0');
     let out = if trimmed.is_empty() || trimmed.starts_with('.') { format!("0{trimmed}") } else { trimmed.to_string() };
     Ok(Some(format!("{sign}{out}")))
-}
-
-/// A bytea's hex form (the digits after `\x`) as `decode(…, 'hex')`, which reads two digits a byte.
-/// Refused as Postgres refuses it (22P02): a digit that isn't hex, or an odd number of digits.
-fn bytea_hex(hex: &str) -> Result<String> {
-    if let Some(bad) = hex.chars().find(|c| !c.is_ascii_hexdigit()) {
-        return Err(crate::codes::coded("22P02", format!("invalid hexadecimal digit: \"{bad}\"")));
-    }
-    if hex.len() % 2 != 0 {
-        return Err(crate::codes::coded("22P02", "invalid hexadecimal data: odd number of digits"));
-    }
-    Ok(format!("decode('{hex}', 'hex')"))
 }
 
 /// `x LIKE 'p' ESCAPE '/'` (ILIKE and NOT LIKE alike), rewritten to LIKE's own backslash escape: the
@@ -1135,6 +1124,24 @@ fn expression(e: &mut Expr) -> Result<()> {
                         true => a[0].to_string(),
                         false => format!("{call}({}, {keys})", a[0]),
                     })?;
+                }
+                // (Postgres's bytea-only functions read a string literal as their first argument as a bytea, of any
+                // arity: `sha256('\x01')` hashes the byte 0x01, and `encode('\x01', 'hex')` is `01`, as Postgres does;
+                // a column or any other expression is left as it is)
+                (fname, _) if crate::pg_bytea::TAKES_BYTEA.contains(&fname) => {
+                    if let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. })) = a.first() {
+                        let bytes = crate::pg_bytea::parse(s).map_err(|e| crate::codes::coded(e.code, e.message))?;
+                        let lit = expr(&crate::pg_bytea::sql(&bytes))?;
+                        if let FunctionArguments::List(l) = &mut f.args {
+                            let first = l.args.iter_mut().find_map(|x| match x {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) => Some(arg),
+                                _ => None,
+                            });
+                            if let Some(arg) = first {
+                                *arg = lit;
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1752,15 +1759,38 @@ mod tests {
         assert_eq!(plain_decimal("-2.5e3").unwrap().as_deref(), Some("-2500"));
         assert_eq!(plain_decimal("0001e2").unwrap().as_deref(), Some("100"));
         assert_eq!(plain_decimal("12.5").unwrap(), None);
-        // (a bytea's hex form reads two digits a byte; Postgres's refusals for the rest)
-        assert_eq!(bytea_hex("ff00").unwrap(), "decode('ff00', 'hex')");
-        assert!(bytea_hex("f").is_err() && bytea_hex("fg").is_err());
+        // (a bytea literal in either of Postgres's forms is its X'…': `\xff00`, and the escape form's `a\\b`, whose
+        // `\\` is one backslash; a refusal is Postgres's own code and message, and the gate looks at the word)
+        let bytea = |sql: &str| typed_literal(&mut expr(sql).unwrap()).unwrap();
+        assert_eq!((bytea("CAST('\\xff00' AS BYTEA)"), bytea("CAST('a\\\\b' AS BYTEA)")), (Some("X'ff00'".to_string()), Some("X'615c62'".to_string())));
+        assert_eq!(typed_literal(&mut expr("CAST('a\\b' AS BYTEA)").unwrap()).unwrap_err().to_string(), "invalid input syntax for type bytea");
+        assert!(wanted("SELECT 'a\\\\b'::bytea"));
         // (LIKE's pattern with `/` as the escape, as backslash: `/%` is a literal %, `//` a literal /)
         assert_eq!(backslash_pattern("a/%b", Some('/')).unwrap(), "a\\%b");
         assert_eq!(backslash_pattern("a//b", Some('/')).unwrap(), "a/b");
         assert_eq!(backslash_pattern("a\\b", Some('/')).unwrap(), "a\\\\b");
         assert_eq!(backslash_pattern("a\\b", None).unwrap(), "a\\\\b");
         assert!(backslash_pattern("a/", Some('/')).is_err());
+    }
+
+    #[test]
+    fn sha_functions_take_a_bytea_literal() {
+        // (Postgres's sha functions take only a bytea: a string literal in their call is one, in either form; a column,
+        // another function and a literal that isn't a bytea are as Postgres answers them)
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("sha256('\\x01')").unwrap(), "sha256(X'01')");
+        assert_eq!(call("encode('\\x01', 'hex')").unwrap(), "encode(X'01', 'hex')");
+        assert_eq!(call("get_byte('ab', 0)").unwrap(), "get_byte(X'6162', 0)");
+        assert_eq!(call("decode('ff', 'hex')").unwrap(), "decode('ff', 'hex')");
+        assert_eq!(call("sha512('a\\\\b')").unwrap(), "sha512(X'615c62')");
+        assert_eq!(call("sha256(t.a)").unwrap(), "sha256(t.a)");
+        assert_eq!(call("md5('\\x01')").unwrap(), "md5('\\x01')");
+        let refusal = call("sha256('\\x0')").unwrap_err();
+        assert_eq!((crate::codes::of(&refusal), refusal.to_string()), ("22023", "invalid hexadecimal data: odd number of digits".to_string()));
+        assert!(wanted("SELECT sha256('\\x01')"));
     }
 
     #[test]

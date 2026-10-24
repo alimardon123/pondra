@@ -6,10 +6,9 @@
 //! the ones that look odd: a path that reaches nothing changes nothing, and only a path element that is NULL or not an
 //! integer where an array is, or a path into a scalar, is refused. `pg_json::operator` plans `-` and `#-` onto these.
 use crate::codes::coded;
-use crate::pg_catalog::{function, marked};
-use crate::pg_json::{index_of, is_integer, is_text, lists, JSON_SPACE};
+use crate::pg_functions::{function, marked};
+use crate::pg_json::{index_of, is_integer, is_text, json_refusal, lists, skip, JSON_SPACE};
 use crate::pg_json_make::{as_text, depth_check, fail, find, in_jsonb_order, is_null_at, json_string, parse, per_row, refuse, text_at, write, Node};
-use crate::types::json_refusal;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Int64Type};
@@ -37,7 +36,7 @@ pub(crate) static FUNCTIONS: LazyLock<Vec<Arc<ScalarUDF>>> = LazyLock::new(|| {
     ]
 });
 
-/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session.
+/// Adds the functions to a session. `pg_json::register` calls it, so they are in every session (`engine::session`).
 pub fn register(ctx: &SessionContext) {
     for f in FUNCTIONS.iter() {
         ctx.register_udf(f.as_ref().clone());
@@ -451,7 +450,7 @@ fn stripped(jiter: &mut Jiter, doc: &str, peek: Peek, out: &mut String) -> Optio
         out.push('}');
     } else {
         let start = jiter.current_index();
-        jiter.known_skip(peek).ok()?;
+        skip(jiter, peek).ok()?;
         out.push_str(doc.get(start..jiter.current_index())?.trim_matches(JSON_SPACE));
     }
     Some(())
@@ -510,7 +509,7 @@ fn overflow() -> DataFusionError { refuse("22003", "value overflows numeric form
 mod tests {
     use super::*;
     use crate::codes::Coded;
-    use crate::pg_values::array_literal;
+    use crate::pg_text::array_literal;
 
     /// A path literal (`{b,1}`) as the functions take it.
     fn path(text: &str) -> Vec<Option<String>> { array_literal(text).unwrap() }

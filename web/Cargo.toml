@@ -14,6 +14,12 @@ pondra = { path = "..", default-features = false }
 wasm-bindgen = "=0.2.128" # (the same version as the wasm-bindgen command line that binds it: tools/web_build.sh checks)
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+# A web origin's store (fetch.rs): object_store at DataFusion's version, so the core takes this crate's stores (`cargo tree -i object_store` shows one 0.13).
+object_store = { version = "0.13", default-features = false }
+async-trait = "0.1"
+futures = "0.3"
+url = "2"
+bytes = "1"
 # What the core's dependencies need in a page: the clock from JavaScript's Date (std's panics on wasm32-unknown-unknown),
 # random numbers from the browser's crypto.
 chrono = { version = "0.4", default-features = false, features = ["wasmbind", "clock"] }

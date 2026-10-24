@@ -327,3 +327,138 @@ fn quoted_part(cs: &[char], start: usize, s: &str) -> Result<(String, usize), St
     }
     Ok((part, i + 1))
 }
+
+// ---- Intervals, times and array literals: Postgres's text for them, as the port writes and reads them (`pg.rs`,
+// the JSON functions, `pg_values.rs`'s parameters and casts) ----
+
+/// An interval in Postgres's own text (`postgres` style): `1 year 2 mons 3 days 04:05:06.000004`.
+/// A negative clock after days shows its `+`, as Postgres writes it (`-1 days +00:00:03`).
+pub(crate) fn interval_text(months: i64, days: i64, micros: i64) -> String {
+    let unit = |n: i64, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    let mut parts = vec![];
+    if months / 12 != 0 {
+        parts.push(unit(months / 12, "year"));
+    }
+    if months % 12 != 0 {
+        parts.push(unit(months % 12, "mon"));
+    }
+    if days != 0 {
+        parts.push(unit(days, "day"));
+    }
+    if micros != 0 || parts.is_empty() {
+        let sign = if micros < 0 { "-" } else if days < 0 { "+" } else { "" };
+        parts.push(format!("{sign}{}", clock(micros.unsigned_abs())));
+    }
+    parts.join(" ")
+}
+
+/// A time of day as Postgres writes it: `12:34:56.789`, with no fraction for a whole second.
+pub(crate) fn time_text(us: i64) -> String { clock(us.unsigned_abs()) }
+
+/// `hh:mm:ss` and the fraction of a second that is left (`.789`, `.000004`; none for a whole second).
+fn clock(us: u64) -> String {
+    let fraction = match us % 1_000_000 {
+        0 => String::new(),
+        f => format!(".{f:06}").trim_end_matches('0').to_string(),
+    };
+    format!("{:02}:{:02}:{:02}{fraction}", us / 3_600_000_000, us / 60_000_000 % 60, us / 1_000_000 % 60)
+}
+
+/// Postgres's text array literal (`{a,"b,c",NULL}`): a bare NULL is a NULL element, a quoted one is text, a bare
+/// element is trimmed of its spaces, and `{}` has no elements. Nested braces are refused by name (0A000) for now.
+pub(crate) fn array_literal(s: &str) -> anyhow::Result<Vec<Option<String>>> {
+    let malformed = || crate::codes::coded("22P02", format!("malformed array literal: \"{s}\""));
+    let body = s.trim().strip_prefix('{').and_then(|b| b.strip_suffix('}')).ok_or_else(malformed)?;
+    let mut rest = body.trim_start();
+    let mut items = Vec::new();
+    if rest.is_empty() {
+        return Ok(items);
+    }
+    loop {
+        if rest.starts_with('{') {
+            return Err(crate::codes::coded("0A000", format!("nested array literals are not supported yet: \"{s}\"")));
+        }
+        let (item, after) = if rest.starts_with('"') { quoted_item(rest) } else { bare_item(rest) }.ok_or_else(malformed)?;
+        items.push(item);
+        let after = after.trim_start();
+        if after.is_empty() {
+            return Ok(items);
+        }
+        rest = after.strip_prefix(',').ok_or_else(malformed)?.trim_start();
+    }
+}
+
+/// A quoted element at the start of `s`, its escapes undone, and the text after its closing quote.
+fn quoted_item(s: &str) -> Option<(Option<String>, &str)> {
+    let mut out = String::new();
+    let mut chars = s[1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((Some(out), &s[2 + i..])),
+            '\\' => out.push(chars.next()?.1),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// A bare element at the start of `s`: up to the next comma, trimmed, with `\x` read as `x`. A bare NULL is NULL,
+/// and an empty element (`{a,,b}`) is malformed.
+fn bare_item(s: &str) -> Option<(Option<String>, &str)> {
+    let mut end = s.len();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            ',' => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let raw = s[..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let item = if raw.eq_ignore_ascii_case("NULL") { None } else { Some(unescaped(raw)) };
+    Some((item, &s[end..]))
+}
+
+/// `s` with each `\x` read as `x`.
+fn unescaped(s: &str) -> String {
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in s.chars() {
+        if c == '\\' && !escaped {
+            escaped = true;
+        } else {
+            out.push(c);
+            escaped = false;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_text_is_postgres_style() {
+        assert_eq!(interval_text(14, 3, 14_706_000_004), "1 year 2 mons 3 days 04:05:06.000004");
+        assert_eq!(interval_text(0, 0, 0), "00:00:00");
+        assert_eq!(interval_text(0, -1, 3_000_004), "-1 days +00:00:03.000004");
+        assert_eq!(interval_text(0, 1, -1_500_000), "1 day -00:00:01.5");
+    }
+
+    #[test]
+    fn time_text_cuts_the_fraction_as_postgres_does() {
+        assert_eq!(time_text(45_296_789_000), "12:34:56.789");
+        assert_eq!(time_text(45_296_000_000), "12:34:56");
+        assert_eq!(time_text(0), "00:00:00");
+        assert_eq!(time_text(86_399_999_999), "23:59:59.999999");
+    }
+}
