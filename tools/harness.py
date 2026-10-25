@@ -19152,14 +19152,15 @@ def find():
     checks["every word in one field"] = any(r.get("object") == "orders" and r["name"] == "amount" for r in both) \
         and not any(r["is"] == "object" and r["name"] == "revenue" for r in both)
 
-    # concepts, under other products' names; a kind leaves them out
+    # concepts, under other products' names; a kind leaves them out ('pipeline' is the task graph: a 1.0 task is a pipeline of one step)
     fk = q("SELECT * FROM pondra.find('foreign key')")
     pipe = q("SELECT * FROM pondra.find('pipeline')")
     fk_link = q("SELECT * FROM pondra.find('foreign key', kind => 'link')")
     info["concepts"] = [fk, pipe, fk_link]
-    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the flow pattern; a kind leaves them out"] = \
+    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the task graph pattern (not the flow); a kind leaves them out"] = \
         any(r["is"] == "part" and r["kind"] == "link" and r.get("matched") == "also" and r.get("object") is None for r in fk) \
-        and any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) and not any(r.get("object") is None for r in fk_link)
+        and any(r["is"] == "pattern" and r["kind"] == "task graph" for r in pipe) and not any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) \
+        and not any(r.get("object") is None for r in fk_link)
 
     # an attached lake's objects
     prod = q("SELECT * FROM pondra.find('products')")
