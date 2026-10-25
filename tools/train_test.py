@@ -522,6 +522,25 @@ def conflict_with_main(path):
 
 
 @case
+def refused_without_conflict(path):
+    """A merge git refuses with no conflict (unrelated histories): that PR leaves with what git said; the next rides."""
+    with Scenario(path) as sc:
+        git(sc.work, "checkout", "-q", "--orphan", "pr1")
+        git(sc.work, "rm", "-rfq", ".")
+        write_commit(sc.work, {"other.txt": "elsewhere\n"}, "unrelated")
+        git(sc.work, "push", "-q", sc.bare, "HEAD:refs/pull/1/head")
+        sc.gh.prs[1] = {"title": "unrelated", "draft": False, "labels": ["train"], "files": ["other.txt"], "open": True}
+        sc.open_pr(2, "second", {"b.txt": "two\n"})
+        out = sc.step()
+        expect(sc.train_heads() == [2], f"train merged {sc.train_heads()}")
+        expect(sc.labels(1) == [], f"labels of #1: {sc.labels(1)}")
+        expect(sc.comments(1) == ["This pull request doesn't merge onto main: git refused the merge with no conflict "
+                                  "(`fatal: refusing to merge unrelated histories`). Label it train again once that "
+                                  "is fixed." + FOOTER], f"comments {sc.comments(1)}")
+        expect("dropped #1: git refused the merge: fatal: refusing to merge unrelated histories" in out, out)
+
+
+@case
 def pushed_while_riding(path):
     """Green, but a PR's lane pushed more while it rode: what rode lands, and its comment says the rest is open."""
     with Scenario(path) as sc:

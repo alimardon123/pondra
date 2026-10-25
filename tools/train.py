@@ -353,12 +353,13 @@ class Train:
                             "-m", f"Train-Head: {p.number} {sha}", "-m", f"Train-Base: {base}", "FETCH_HEAD"],
                            capture_output=True, text=True)
         if r.returncode:
-            if not git("diff", "--name-only", "--diff-filter=U"):
-                raise RuntimeError(f"git merge of #{p.number} failed: {r.stderr.strip()}")
-            git("merge", "--abort")
+            # (a merge git refused with no conflict, unrelated histories say, is the PR's too: it leaves the train
+            # with what git said, and the train goes on without it)
+            refused = None if git("diff", "--name-only", "--diff-filter=U") else (r.stderr.strip() or r.stdout.strip())
+            git_ok("merge", "--abort")   # (there's none to abort when git refused to start it)
             git("reset", "--hard", "HEAD")
             git("clean", "-fd")
-            return self.conflict(p, merged)
+            return self.conflict(p, merged, refused)
         if git_ok("diff", "--quiet", "HEAD^1", "HEAD"):
             git("reset", "--hard", "HEAD^")   # the merge changed nothing: take it back
             return self.nothing_to_land(p)
@@ -369,9 +370,14 @@ class Train:
         self.comment(p.number, "Nothing to land: main, or a pull request ahead of it in the train, already has its changes.")
         say(f"dropped #{p.number}: nothing to land")
 
-    def conflict(self, p, merged):
+    def conflict(self, p, merged, refused=None):
         after = f" after {', '.join(f'#{n}' for n in merged)} in the train" if merged else ""
         self.unlabel(p, "train")
+        if refused:
+            said = " ".join(refused.split())[:300]
+            self.comment(p.number, f"This pull request doesn't merge onto main{after}: git refused the merge with no "
+                                   f"conflict (`{said}`). Label it train again once that is fixed.")
+            return say(f"dropped #{p.number}: git refused the merge: {said}")
         self.comment(p.number, f"This pull request doesn't merge onto main{after}: merge main into it, "
                                "then label it train again.")
         say(f"dropped #{p.number}: conflicts")

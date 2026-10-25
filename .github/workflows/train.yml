@@ -51,8 +51,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: main
-          fetch-depth: 0 # (merges need history; the files are fetched as merges need them)
-          filter: blob:none
+          # (merges need history and its files: all of them, about 20 MB. Without the files (`filter: blob:none`) a
+          # merge fetched each as it needed it, and on 10-25 GitHub refused one, so every step failed on #217's merge)
+          fetch-depth: 0
       - env:
           GH_TOKEN: ${{ github.token }}
           SLOTS: ${{ vars.CI_SLOTS || 3 }} # (ci-slots.yml says why)
