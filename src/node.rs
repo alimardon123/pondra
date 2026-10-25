@@ -148,7 +148,7 @@ impl Held {
             if self.detach.get().is_some() {
                 // (untracked: the next `abort_all` of this process must not stop a close half done)
                 let l = l.clone();
-                tokio::spawn(async move { let _ = l.cat.close().await; });
+                panics::untracked(async move { let _ = l.cat.close().await; });
                 tr("catalog (detached)");
             } else {
                 let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
@@ -185,7 +185,7 @@ struct Beside(Option<tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>>)
 /// A speculative open nothing keeps: it finishes, then its catalog closes, in a task of its own (untracked, so no
 /// `abort_all` cuts the close short, and the poller stops with the close).
 fn close_after(open: tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>) {
-    tokio::spawn(async move {
+    panics::untracked(async move {
         if let Ok(Ok(lake)) = open.await {
             let _ = lake.cat.close().await;
         }
@@ -196,7 +196,7 @@ impl Beside {
     fn start(dir: &str, guest: Option<Guest>) -> Beside {
         Beside(matches!(guest, Some(Guest::Reads)).then(|| {
             let dir = dir.to_string();
-            tokio::spawn(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
+            panics::untracked(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
         }))
     }
 

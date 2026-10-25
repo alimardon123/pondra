@@ -181,6 +181,13 @@ pub fn task<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> t
     tracked(tokio::spawn(f))
 }
 
+/// Start a task the node's stop must not end (`abort_all`), which ends by itself: a catalog's close, or a guest's open that
+/// closes after (`node.rs`). Cut midway, a close leaves its flush half done and an open its reader's poller running for
+/// ever. Anything else starts with [`spawn`] or [`task`].
+pub fn untracked<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
+    tokio::spawn(f)
+}
+
 // What this node started (`spawn`, `task`, `aside`), so a node stopped in a process ends it all
 // (ADR-061 §4): the runtime outlives the node, and a loop left on it would go on writing its lake.
 crate::per_node!(static STARTED: std::sync::Mutex<Started> = std::sync::Mutex::new(Started { tasks: Vec::new(), prune_at: 0 }));

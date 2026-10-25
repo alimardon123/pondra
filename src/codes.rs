@@ -145,6 +145,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("can't cast value") || has("too large to store in a decimal") || int_overflow_text(&t) => "22003", // (Arrow's words for a number that doesn't fit: a value cast to a narrower integer, a decimal's precision, digits that overflow an integer)
         _ if has("csv error") => "22P04", // bad_copy_file_format (a file read as CSV is malformed: Arrow's words, e.g. a line with more fields than the schema has)
+        _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
@@ -171,6 +172,10 @@ fn int_overflow_text(t: &str) -> bool {
     let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && after.starts_with(" to value of int")
 }
+
+/// Whether lowercase `t` holds Arrow's words for NaN cast to a decimal (`cannot cast string 'nan' to value of decimal128(5, 2)
+/// type`): a decimal here holds numbers only, so it is refused as `casts::into` refuses it (0A000), wherever the cast is made.
+fn nan_into_decimal(t: &str) -> bool { t.contains("cannot cast string 'nan' to value of decimal") }
 
 /// The SQLSTATE of one of Postgres's condition names (a script's `EXCEPTION WHEN unique_violation`).
 pub fn named(name: &str) -> Option<&'static str> {
@@ -250,6 +255,7 @@ mod tests {
         assert_eq!(of("Cast error: Cannot cast string 'abc' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '1.5' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '4.4.5' to value of Decimal128(38, 10) type"), "22P02");
+        assert_eq!(of("Cast error: Cannot cast string 'NaN' to value of Decimal128(5, 2) type"), "0A000"); // (a page's INSERT, `CAST('NaN' AS NUMERIC)`)
         assert_eq!(of("Arrow error: Csv error: incorrect number of fields for line 1, expected 0 got more than 0"), "22P04"); // (a read_csv over a file of blank lines: a malformed file, not a 500)
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)

@@ -2772,7 +2772,7 @@ pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
         }
         on
     });
-    static STAGES: std::sync::LazyLock<Stages> = std::sync::LazyLock::new(|| Mutex::new((Instant::now(), vec![])));
+    crate::per_node!(static STAGES: Stages = Mutex::new((Instant::now(), vec![])); clear = |s| *s.lock().unwrap_or_else(|e| e.into_inner()) = (Instant::now(), vec![]));
     let now = Instant::now();
     if !*ON {
         return now;

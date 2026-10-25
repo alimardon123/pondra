@@ -38,8 +38,8 @@ statement error 42704
 SELECT enum_range(NULL::mood)
 
 # NaN is Postgres's numeric value; a decimal column here holds numbers only, so a NaN written into one is refused by name
-# (0A000) where the write casts it (`casts::into`: a text or float value of a table or file). A literal that the planner folds
-# keeps the planner's own words (22P02), as it did before.
+# (0A000) where the write casts it (`casts::into`: a text or float value of a table or file). Where the planner casts it (a
+# page's INSERT, a literal it folds) the code is the same, with the planner's words.
 statement ok
 CREATE TABLE money (v NUMERIC(5, 2))
 
