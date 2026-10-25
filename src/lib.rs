@@ -135,7 +135,6 @@ mod rules;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod oom;
 #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] mod jemalloc;
-#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] pub use jemalloc::{Conf as JemallocConf, CONF as JEMALLOC_CONF}; // (for the program and the library: `main.rs`, `capi/`)
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod origins;
 #[cfg(feature = "server")] mod metrics;

@@ -1694,7 +1694,7 @@ def memory():
         f"a node under small commits keeps at most four blocking threads a core, 16 at least ({allowed} threads in all)": most <= allowed,
         "its own memory levels off: its last minute at most 48 MB over its second": late <= early + 48,
     }
-    if os.uname().sysname == "Linux" and os.confstr("CS_GNU_LIBC_VERSION"):  # (jemalloc's: `jemalloc::CONF`)
+    if os.uname().sysname == "Linux" and os.confstr("CS_GNU_LIBC_VERSION"):  # (jemalloc's, built in: `.cargo/config.toml`)
         said = subprocess.run([BIN, "--version"], env={**os.environ, "_RJEM_MALLOC_CONF": "stats_print:true"}, capture_output=True, text=True, timeout=60)
         checks['jemalloc keeps its pages off huge pages (opt.thp "never"), whatever the system does'] = 'opt.thp: "never"' in said.stdout + said.stderr
     for name, good in checks.items():
