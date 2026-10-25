@@ -7,16 +7,17 @@ name: train
 # fast-forward: main is then exactly the tree CI tested, and GitHub marks each pull request merged. A failed build,
 # unit test or check stops the run the minute it fails; a red run whose failures can flake (the suites that run
 # nodes) is run again once. Then, unless main fails the same way or moved since, the train is halved and its first
-# half tested alone, so one pull request can't hold the others for long. A pull request labelled in the first ten
-# minutes of a train's run joins it (the train is cut again). A pull request whose workflows aren't main's can't ride
-# (the workflow's token may not push a workflow): it takes `ci` as before.
+# half tested alone, so one pull request can't hold the others for long. A pull request labelled in the first five
+# minutes of a train's run joins it (the train is cut again); one labelled later rides a car stacked on the train, its
+# merges on the train's tip with a run of their own, and lands right after it. A pull request whose workflows aren't
+# main's can't ride (the workflow's token may not push a workflow): it takes `ci` as before.
 #
 # A run steps on a `train` label, at the end of every build run, every 15 minutes, and by hand. The train's own build
 # run ends without starting one (GitHub starts no workflow_run for a run the workflow's token began) and the schedule
 # can lag by hours, so while the train waits on its own run a step looks again each minute (--wait), landing a green
-# run within a minute of its end; after 50 minutes it starts this workflow once more to go on. One at a time. Main's
-# copy runs, on a checkout of main: a pull request's code is merged, never run. The repository variable TRAIN = off
-# stops it.
+# run within a minute of its end; after 50 minutes, or once main has another tools/train.py, it starts this workflow
+# once more to go on. One at a time. Main's copy runs, on a checkout of main: a pull request's code is merged, never
+# run. The repository variable TRAIN = off stops it.
 # A pull request that changes the conductor runs its tests (tools/train_test.py) instead.
 on:
   pull_request_target:

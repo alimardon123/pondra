@@ -39,11 +39,11 @@ on:
 # Main's pushes share one too, without stopping the run that goes: a push waits while it runs, and
 # drops a push that waited before it, so main builds its newest commit, never each merge of a busy
 # hour (the account's runners are shared with the owner's other work, 2026-10-16). A run started by
-# hand (a release's) has a group of its own, as has another label added. The train's runs share one
-# (train.yml): a train cut again stops the run of the one before. The run a landed train starts on main
-# is main's.
+# hand (a release's) has a group of its own, as has another label added. A train's run has one for its
+# commit (train.yml): a car stacked on the train runs beside the train's own run, and tools/train.py stops
+# the runs of a train it cuts again. The run a landed train starts on main is main's.
 concurrency:
-  group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && 'main') || (github.ref == 'refs/heads/train' && 'train') || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  group: build-${{ github.event.pull_request.number || ((github.event_name == 'push' || inputs.mode == 'main') && 'main') || (github.ref == 'refs/heads/train' && format('train-{0}', github.sha)) || github.run_id }}${{ github.event.action == 'labeled' && github.event.label.name != 'ci' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/train' }}
 
 jobs:
