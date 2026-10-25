@@ -223,10 +223,10 @@ impl Merge {
         }
         if let Some(u) = &self.upsert {
             let (names, said): (Vec<String>, Said) = match u.columns.is_empty() {
-                true => (crate::write::implicit(&table, crate::write::rows_width(&u.query)).to_vec(), Said::Positional),
+                true => (crate::write::implicit(&table, crate::rules::rows::rows_width(&u.query)).to_vec(), Said::Positional),
                 false => (u.columns.clone(), Said::Named),
             };
-            let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::write::defaulted(&u.query, *i)).map(|(_, n)| n.clone()).collect();
+            let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::rules::rows::defaulted(&u.query, *i)).map(|(_, n)| n.clone()).collect();
             if let Some((assigned, _)) = &u.update {
                 match assigned.is_empty() {
                     // (the names its rows give, minus the conflict key: a DEFAULT is not given, so not set either)
@@ -309,7 +309,7 @@ impl Merge {
     /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a row past it is hidden from reads, and not
     /// from the key's lookup), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
     /// point read gives up for those too); a conflict target that is the key; one row of values that read no table
-    /// (`write::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
+    /// (`rules::rows::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
     /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
     /// `_deleted` or a system name. INSERT OR REPLACE's empty SET is every given column but the key's, as its rows give
     /// them; a SET that is empty then is DO NOTHING.
@@ -323,10 +323,10 @@ impl Merge {
         if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
             return None;
         }
-        if !crate::write::constant_row(&u.query) || !self.on_key(stored) {
+        if !crate::rules::rows::constant_row(&u.query) || !self.on_key(stored) {
             return None;
         }
-        let width = crate::write::rows_width(&u.query);
+        let width = crate::rules::rows::rows_width(&u.query);
         let given: Vec<String> = match u.columns.is_empty() {
             true => {
                 let columns: Vec<String> = stored.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
@@ -417,13 +417,13 @@ impl Upsert {
     /// The columns the rows give: the statement's own, else the table's first columns, as many as the rows give (`write::implicit`).
     /// The rows must be as wide as those (42601, in Postgres's words, not DataFusion's), and must give the conflict's columns.
     fn given(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
-        let width = crate::write::rows_width(&self.query);
+        let width = crate::rules::rows::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
             true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(),
             false => self.columns.clone(),
         };
         if let Some(w) = width.filter(|&w| w != given.len()) {
-            return Err(crate::write::width_refused(target, given.len(), w));
+            return Err(crate::rules::rows::width_refused(target, given.len(), w));
         }
         let on = self.on_columns(meta, target)?;
         ensure!(on.iter().all(|c| given.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
@@ -462,7 +462,7 @@ impl Upsert {
 fn q(c: &str) -> String { format!("\"{}\"", c.replace('"', "\"\"")) }
 
 /// The name an upsert's proposed rows have in the sessions its MERGE's clauses plan in (`session`): `excluded` reads them.
-const PROPOSED_TABLE: &str = "__proposed";
+const PROPOSED_TABLE: &str = "__pondra_proposed";
 
 tokio::task_local! {
     /// The change's SQL may read files on this machine (`MERGE … USING 'new.csv'` from the shell's
@@ -472,12 +472,12 @@ tokio::task_local! {
 
 tokio::task_local! {
     /// The proposed rows of the upsert whose MERGE is planned here (`merge`): each session its clauses make holds them as
-    /// `__proposed`.
+    /// `__pondra_proposed`.
     static PROPOSED: Arc<RecordBatch>;
 }
 
 /// A session for the change's queries, as of `upto`. Under a MERGE's clauses (`PROPOSED`), it holds the proposed rows as
-/// `__proposed`, registered as `query::SENT`'s tables are.
+/// `__pondra_proposed`, registered as `query::SENT`'s tables are.
 async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelude::SessionContext> {
     let ctx = crate::query::session_at(lake, sql, "", Some(upto)).await?;
     let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { ctx.enable_url_table() } else { ctx };
@@ -686,7 +686,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
             let on = u.on_columns(meta, &m.target)?;
             let mut rows = proposed_rows(lake, table, meta, &Arc::new(meta.to_rules()?), &given, &u.query, upto).await?;
             // (one row of VALUES, an ORM's upsert, can't repeat a key: its rows aren't looked at for one)
-            if !crate::write::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
+            if !crate::rules::rows::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
                 // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
                 if u.update.is_some() {

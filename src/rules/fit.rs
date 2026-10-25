@@ -112,10 +112,17 @@ pub fn evaluate(base: &SessionContext, rows: &RecordBatch, expr: &str) -> Result
 
 /// `expr` over `rows`, whose columns `schema` names: qualified names among them (`t.v` and `excluded.v` for an upsert's
 /// old and proposed row, one batch of both), so the same name may be in it twice. It is analyzed as a query's expression
-/// is (`analyzed`), so it answers what SQL answers: a cast of a fraction to an integer rounds (invariant 293). None if it
-/// doesn't plan over them (an unqualified name the schema holds twice is ambiguous, and SQL works it out instead).
+/// is (`analyzed`), unless the analyzer's rules can't change it (`optimize::analyzed_alone`), so it answers what SQL answers:
+/// a cast of a fraction to an integer rounds (invariant 293). None if it doesn't plan over them (an unqualified name the
+/// schema holds twice is ambiguous, and SQL works it out instead).
 pub fn evaluate_in(base: &SessionContext, rows: &RecordBatch, schema: &datafusion::common::DFSchema, expr: &str) -> Result<Option<ArrayRef>> {
-    let Ok(e) = base.parse_sql_expr(expr, schema).and_then(|e| analyzed(base, e, schema)) else { return Ok(None) };
+    let Ok(e) = base.parse_sql_expr(expr, schema) else { return Ok(None) };
+    let Ok(e) = (match crate::optimize::analyzed_alone(&e, schema) {
+        true => Ok(e),
+        false => analyzed(base, e, schema),
+    }) else {
+        return Ok(None);
+    };
     let Ok(phys) = base.create_physical_expr(e, schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
 }

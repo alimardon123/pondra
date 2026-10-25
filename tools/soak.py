@@ -20,10 +20,12 @@ and then, and what drifts over time measured.
   acknowledgement, the lake's objects (a folder's; a bucket's every 30 minutes).
 
   At the end the load stops and it checks: every acknowledged batch once and `kv` as the model,
-  on every node; the views equal their rows; the log drained (no rows left untiered within two
-  minutes); memory flat (each node process that lived ten samples: its own memory, less its
-  caches (the hot columns, and what `pondra_cache_bytes` counts), the lower quartile of the last
-  tenth of its life within 1.5x of its second tenth's, after the warm-up, plus 64 MB). It reports the
+  on every node; no read torn (each producer's batches a prefix); writes going on through every stop
+  (no batch waited a minute for its acknowledgement, counting one still waiting); the views equal
+  their rows; the log drained (no rows left untiered within two minutes); memory flat (each node
+  process that lived ten samples: its own memory, less its caches (the hot columns, and what
+  `pondra_cache_bytes` counts), the lower quartile of the last tenth of its life within 1.5x of its
+  second tenth's, after the warm-up, plus 64 MB). It reports the
   lake's objects (data files, log segments, the catalog's) and every stop's longest wait, with when
   the node exited and, for a leader, when another led.
   Prints the checks as JSON (and writes them to --out) and exits 1 if one fails. It prices what the
@@ -37,9 +39,10 @@ its checks, stops the nodes (followers, then the leader: drained, stepping down)
 the next leg needs (the lake, every producer's acknowledged batches, the model, the time so far) to
 STATE, keeping the lake; --resume STATE starts the next on that lake, the load going on where it
 stopped. The lake lives the whole day; each node process lives a leg at most. A leg whose memory
-alone drifted still saves, so the day goes on and is checked whole. --steady stops and kills no
-node: each node process lives the whole leg, which is what memory over hours is measured on (the
-day's last leg: soak.yml).
+drifted, whose reads were torn or whose writes stalled still saves when its lake holds every batch,
+so the day goes on and is checked whole (on 10-25 a torn read stopped a day after 3 legs of 5).
+--steady stops and kills no node: each node process lives the whole leg, which is what memory over
+hours is measured on (the day's last leg: soak.yml).
 """
 import argparse, collections, json, os, random, re, shutil, sys, tempfile, threading, time, uuid
 
@@ -242,7 +245,7 @@ def main():
                 "longest_ack_s": load.longest(mark), "acked": sum(load.acked.values()),
                 "torn": len(load.torn), **({"objects": listed} if listed else {})}
         for m in moves:  # (a stop's longest wait, once its batches have all been answered)
-            if "window" in m and m["window"][1] < mark:
+            if "window" in m and m["window"][1] < mark and not load.waiting(*m["window"]):
                 m["longest_ack_s"] = load.longest(*m.pop("window"))
         mark = time.time()  # (the next line's waits start here: a stop below counts in it)
         samples.append(line)
@@ -281,7 +284,8 @@ def main():
     # (…and on every node once the log drained: a batch lost from the tail would leave no gap)
     held = lambda x: sorted((r["producer"], r["n"]) for r in x.q("SELECT producer, count(*) AS n FROM ev GROUP BY producer"))
     everywhere = all(held(x) == sorted((p, seq * size) for p, seq in load.acked.items()) for x in live)
-    checks["every acknowledged batch once, no torn read"] = not result["lost or twice"] and not result["torn reads"] and everywhere
+    checks["every acknowledged batch once, on every node"] = not result["lost or twice"] and everywhere
+    checks["no torn read: every read saw each producer's batches as a prefix"] = not result["torn reads"]
     checks["the keyed table equals its model, on every node"] = kv == ups.model and same("SELECT k, v FROM kv ORDER BY k")
     checks["the views equal their rows, on every node"] = (live[0].q("SELECT * FROM per_producer ORDER BY producer") == live[0].q("SELECT producer, count(*) AS n, max(seq) AS mx FROM ev GROUP BY producer ORDER BY producer")
                                                          and live[0].q("SELECT count(*) AS n FROM tens") == live[0].q("SELECT count(*) AS n FROM ev WHERE i = 0 AND seq % 10 = 0")
@@ -320,12 +324,15 @@ def main():
     cost = lambda w: {"requests": round(dollars_a_month(rates, 0, w), 2), "storage": round(dollars_a_month({}, gb, w), 2), "total": round(dollars_a_month(rates, gb, w), 2)}
     # (a build before reads were counted reports none: its requests' price leaves them out, and says so)
     info["dollars a month (list prices)"] = {"prices": LABEL, "stored_gb": round(gb, 3), **{w: cost(w) for w in PRICES}, **({} if "read" in rates else {"note": "this build doesn't count reads (GET, HEAD): requests leave them out"})}
-    info["longest wait for an acknowledgement, s"] = max((s["longest_ack_s"] for s in samples), default=0)
+    # (a move's wait counts once its batches were answered: a sample's, only the batches sent since the one before)
+    info["longest wait for an acknowledgement, s"] = max([s["longest_ack_s"] for s in samples] + [m.get("longest_ack_s", 0) for m in moves], default=0)
+    checks["writes go on through every stop: no batch waited a minute for its acknowledgement"] = info["longest wait for an acknowledgement, s"] < 60
     info["minutes"] = round((time.time() - start) / 60, 1)
     # (followers first: the leader then drains, steps down, and the next leg's nodes lead at once)
     [x.stop() for x in sorted(live, key=lambda x: role_or(x, role) == "leader")]
     ok = all(checks.values())
-    correct = all(v for k, v in checks.items() if not k.startswith("memory"))  # (memory alone drifting: the day goes on)
+    # (what the lake holds: memory drifting, a torn read or a stall leaves it whole, so the day goes on)
+    correct = all(v for k, v in checks.items() if not k.startswith(("memory", "no torn read", "writes go on")))
     legs = was["legs"] + [{"ok": ok, "checks": checks, "minutes": info["minutes"]}]
     out = {"ok": ok and all(leg["ok"] for leg in legs), "checks": checks, "info": info, "lake": lake, **({"legs": legs} if len(legs) > 1 or A.save else {})}
     json.dump(out, open(A.out, "w"), indent=1)

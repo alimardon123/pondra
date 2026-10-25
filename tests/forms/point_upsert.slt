@@ -231,7 +231,7 @@ SELECT k, v, n FROM pu WHERE k = 51
 ----
 
 # A SET's cast of a fraction to an integer rounds, on the point path as in a planned statement (invariant 293): a one-key
-# UPDATE's and a one-row upsert's. A row whose value reads a table is worked out by the planned MERGE, after the key's lock.
+# UPDATE's and a one-row upsert's.
 statement ok
 CREATE TABLE pc (k INT PRIMARY KEY, n INT, d DOUBLE PRECISION)
 
@@ -313,6 +313,12 @@ INSERT INTO pn VALUES (1, 1, 0, 'toolong') ON CONFLICT (k) DO NOTHING
 
 statement error 22001
 INSERT INTO pn VALUES (2, 1, 0, 'y'), (1, 1, 0, 'toolong') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement error 23514
+INSERT INTO pn VALUES (2, 1, 0, 'x'), (1, -1, 0, 'y') ON CONFLICT (k) DO NOTHING
+
+statement error 22001
+INSERT INTO pn VALUES (2, 1, 0, 'y'), (1, 1, 0, 'toolong') ON CONFLICT (k) DO NOTHING
 
 # A key given twice: DO NOTHING keeps its first row, as Postgres inserts the first and finds the second conflicting; DO UPDATE refuses.
 statement count 1

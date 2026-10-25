@@ -93,6 +93,24 @@ pub fn analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     rules
 }
 
+/// Whether the analyzer's rules may answer `e`, an expression over `schema`, otherwise than planning it alone does
+/// (`create_physical_expr`, which coerces types as the analyzer's type coercion does): a cast (`casts::Rounds` rounds one to
+/// an integer), a float or a decimal among its columns and literals (`FloatsWin`, `WholeLiterals`), or anything whose type
+/// comes from elsewhere (a function, a parameter, a subquery). An expression of none of these, `n + 1` over an integer or
+/// `excluded.v` over text, skips the analyzer (`rules::fit::evaluate_in`). A rule that rewrites anything else says so here.
+pub fn analyzed_alone(e: &Expr, schema: &DFSchema) -> bool {
+    let fractional = |t: &DataType| t.is_floating() || matches!(t, DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..));
+    !e.exists(|x| {
+        Ok(match x {
+            Expr::Column(_) => x.get_type(schema).map_or(true, |t| fractional(&t)),
+            Expr::Literal(v, _) => fractional(&v.data_type()),
+            Expr::BinaryExpr(_) | Expr::Not(_) | Expr::Negative(_) | Expr::IsNull(_) | Expr::IsNotNull(_) | Expr::Alias(_) => false,
+            _ => true,
+        })
+    })
+    .unwrap_or(false)
+}
+
 /// With `datafusion.optimizer.max_passes = 0` (DataFusion's way to see a plan unoptimized), every
 /// function call is written as what it runs as. `arrow_cast`, `coalesce`, `nvl2` and a few more exist
 /// only as the CAST or CASE the optimizer's simplifier makes of them, and failed with an internal
