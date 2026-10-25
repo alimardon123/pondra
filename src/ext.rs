@@ -293,10 +293,22 @@ fn own_file(lake: &Lake, u: &str) -> bool {
 /// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
 /// spec's own URLs? A catalog that vouches for its files' credentials is asked nothing here.
 pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
-    if owner() || own_file(lake, url) {
+    check_urls(lake, &[url]).await
+}
+
+/// May the caller read `urls`, files a table's own metadata names by their whole URL (an Iceberg table's manifest list and
+/// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
+/// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
+pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
+    if owner() {
         return Ok(());
     }
-    allowed(&list(lake).await?, url)
+    let asked: Vec<&str> = urls.iter().copied().filter(|u| !own_file(lake, u) && crate::catalogs::scoped(u).is_none()).collect();
+    if asked.is_empty() {
+        return Ok(());
+    }
+    let secrets = list(lake).await?;
+    asked.into_iter().try_for_each(|u| allowed(&secrets, u))
 }
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
@@ -466,6 +478,9 @@ impl crate::reach::Reach for Lake {
         store(self, url)
     }
     fn session(&self) -> datafusion::prelude::SessionContext { Lake::session(self) }
+    fn named(&self, urls: &[&str]) -> impl std::future::Future<Output = Result<()>> + Send {
+        check_urls(self, urls)
+    }
 }
 
 /// A table read from another engine's log, as a node's table (its columns, names and files; the rest is the

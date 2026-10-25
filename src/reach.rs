@@ -13,6 +13,13 @@ pub trait Reach: Sync {
     fn store(&self, url: &str) -> impl Future<Output = Result<(Arc<dyn ObjectStore>, Path)>> + Send;
     /// A session to read Parquet with (a checkpoint's actions).
     fn session(&self) -> SessionContext;
+    /// May `urls` be read: files a table's own log names by their whole URL (a checkpoint's sidecars), which the table's
+    /// own place doesn't cover. A node asks as it asks of a table's other files (`ext::check_urls`); a page reads only
+    /// what its program gave it and the web, with no credentials of its own, so it asks nothing.
+    fn named(&self, urls: &[&str]) -> impl Future<Output = Result<()>> + Send {
+        let _ = urls;
+        async { Ok(()) }
+    }
 }
 
 /// An object's bytes (a log's commit, a manifest), through its store. `Ok(None)`: no object there.

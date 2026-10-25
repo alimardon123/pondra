@@ -120,14 +120,18 @@ pub async fn resolve_metadata(lake: &Lake, url: &str, at: &str, meta: &Value, op
     let mut out = TableMeta { columns: columns.iter().map(|(n, _, t)| (n.clone(), crate::answer::type_name(t))).collect(), ..Default::default() };
     out.outside = Some(crate::scan::Table { field_ids: columns.iter().map(|(n, id, _)| (n.clone(), *id)).collect(), name_mapping: meta["properties"]["schema.name-mapping.default"].as_str().map(str::to_string) });
     let Some(snapshot) = snapshot(meta, options)? else { return Ok(out) }; // (no snapshot yet: no rows)
-    let manifests: Vec<Value> = match snapshot["manifest-list"].as_str() {
-        Some(list) => crate::avro::records(&crate::reach::get(lake, &place(list)).await?)?,
+    // (the manifest list and the manifests are named by the table's metadata, wherever it likes: each is the caller's to
+    // read, as the table's files are, before the node reads it with its own credentials)
+    let manifests: Vec<Value> = match snapshot["manifest-list"].as_str().map(place) {
+        Some(list) => {
+            crate::ext::check_url(lake, &list).await?;
+            crate::avro::records(&crate::reach::get(lake, &list).await?)?
+        }
         None => snapshot["manifests"].as_array().into_iter().flatten().map(|m| serde_json::json!({"manifest_path": m, "content": 0, "sequence_number": 0})).collect(), // (v1)
     };
-    let mut reads = vec![];
-    for m in &manifests {
-        reads.push(manifest(lake, place(m["manifest_path"].as_str().context("a manifest without its path")?)));
-    }
+    let paths = manifests.iter().map(|m| m["manifest_path"].as_str().map(place).context("a manifest without its path")).collect::<Result<Vec<_>>>()?;
+    crate::ext::check_urls(lake, &paths.iter().map(String::as_str).collect::<Vec<_>>()).await?;
+    let reads: Vec<_> = paths.into_iter().map(|p| manifest(lake, p)).collect();
     let entries: Vec<Arc<Vec<Value>>> = futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::buffered(futures::stream::iter(reads), 16)).await.into_iter().collect::<Result<_>>()?;
     let read: Vec<(&Value, Arc<Vec<Value>>)> = manifests.iter().zip(entries).collect();
     let (mut data, mut positions, mut equality) = (vec![], vec![], vec![]);
@@ -224,7 +228,11 @@ pub async fn metadata(lake: &Lake, url: &str, version: Option<&str>) -> Result<(
             let hint = String::from_utf8(crate::reach::get(lake, &format!("{url}/metadata/version-hint.text")).await?.to_vec())?;
             match hint.trim().parse::<i64>() {
                 Ok(v) => Some(v),
-                Err(_) => return read(format!("{url}/metadata/{}", hint.trim())).await,
+                Err(_) => {
+                    let at = format!("{url}/metadata/{}", hint.trim());
+                    crate::ext::check_url(lake, &at).await?; // (the hint names a file, which may be anywhere: `..`, or a whole URL in it)
+                    return read(at).await;
+                }
             }
         }
         None => None,

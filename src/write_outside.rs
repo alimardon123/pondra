@@ -438,7 +438,11 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
         let current = meta["current-snapshot-id"].as_i64().filter(|id| *id >= 0);
         let snapshot = |id: i64| meta["snapshots"].as_array().into_iter().flatten().find(|s| s["snapshot-id"].as_i64() == Some(id)).cloned();
         let mut list = match current.and_then(snapshot).filter(|_| !replace) {
-            Some(s) => crate::avro::records(&crate::reach::get(lake, s["manifest-list"].as_str().context("a snapshot without its manifest list")?).await?)?,
+            Some(s) => {
+                let list = s["manifest-list"].as_str().context("a snapshot without its manifest list")?;
+                crate::ext::check_url(lake, list).await?; // (named by the table's metadata, wherever it likes: the caller's to read, as `read_iceberg` asks)
+                crate::avro::records(&crate::reach::get(lake, list).await?)?
+            }
             None => vec![],
         };
         list.push(json!({"manifest_path": manifest_path, "manifest_length": manifest_len, "partition_spec_id": spec_id, "content": 0, "sequence_number": seq, "min_sequence_number": seq,
