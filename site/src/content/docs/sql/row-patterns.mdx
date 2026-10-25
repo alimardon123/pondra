@@ -60,6 +60,7 @@ next match starts: from the last row that `up` matched, so day 10 is in two matc
 | `ONE ROW PER MATCH` or `ALL ROWS PER MATCH` | one row per match, or every row of each match. See [rows per match](#one-row-and-all-rows) |
 | `AFTER MATCH SKIP` | where the search for the next match starts. See [skipping](#after-match-skip) |
 | `PATTERN` | the symbols, and how they follow each other. See [the pattern](#the-pattern) |
+| `WITHIN` | after `PATTERN`: the most time a match may span, by the first `ORDER BY` key, a date or a timestamp. See [WITHIN](#within) |
 | `DEFINE` | the condition each symbol needs on a row. See [DEFINE](#define) |
 
 ## Measures
@@ -250,6 +251,55 @@ ORDER BY m, day;
 The down rows (days 6, 11, 12, 15, 16) are in each match, so `d` and `fl` are as before, but they are not
 among the rows given.
 
+## WITHIN
+
+`WITHIN INTERVAL` goes after `PATTERN`. It limits how long a match may run: every row of a match must be at most the
+interval after the match's first row. The time is the first `ORDER BY` key, which must be a date or a timestamp, in
+ascending order. A row past the interval ends that way of matching, and the search goes on with the others: a shorter
+repetition, or a later start, is tried in the standard's order.
+
+```sql
+CREATE TABLE ticker_ts (symbol TEXT, day INT, ts TIMESTAMP, price INT);
+INSERT INTO ticker_ts VALUES ('ACME',1,TIMESTAMP '2026-03-02 01:00:00',12),('ACME',2,TIMESTAMP '2026-03-02 02:00:00',17),('ACME',3,TIMESTAMP '2026-03-02 03:00:00',19),('ACME',4,TIMESTAMP '2026-03-02 04:00:00',21),('ACME',5,TIMESTAMP '2026-03-02 05:00:00',25),('ACME',6,TIMESTAMP '2026-03-02 06:00:00',12),('ACME',7,TIMESTAMP '2026-03-02 07:00:00',15),('ACME',8,TIMESTAMP '2026-03-02 08:00:00',20),('ACME',9,TIMESTAMP '2026-03-02 09:00:00',24),('ACME',10,TIMESTAMP '2026-03-02 10:00:00',25),('ACME',11,TIMESTAMP '2026-03-02 11:00:00',19),('ACME',12,TIMESTAMP '2026-03-02 12:00:00',15),('ACME',13,TIMESTAMP '2026-03-02 13:00:00',25),('ACME',14,TIMESTAMP '2026-03-02 14:00:00',25),('ACME',15,TIMESTAMP '2026-03-02 15:00:00',14),('ACME',16,TIMESTAMP '2026-03-02 16:00:00',12),('ACME',17,TIMESTAMP '2026-03-02 17:00:00',14),('ACME',18,TIMESTAMP '2026-03-02 18:00:00',24),('ACME',19,TIMESTAMP '2026-03-02 19:00:00',23),('ACME',20,TIMESTAMP '2026-03-02 20:00:00',22);
+```
+
+Day `d` is at `d:00` on 2 March 2026, so an hour here is a day. The same ticker, with a four-hour limit:
+
+```sql
+SELECT symbol, start_day, bottom_day, end_day
+FROM ticker_ts MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY ts
+  MEASURES
+    strt.day AS start_day,
+    LAST(down.day) AS bottom_day,
+    LAST(up.day) AS end_day
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt down+ up+) WITHIN INTERVAL '4' HOUR
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY start_day;
+```
+
+```text
+symbol  start_day  bottom_day  end_day
+ACME    5          6           9
+ACME    10         12          13
+ACME    14         16          18
+```
+
+Without the limit, the match from day 5 runs to day 10. With it, the match stops at day 9, the last day within four hours
+of day 5: day 10 is five hours on. The match from day 14 reaches day 18, exactly four hours on, and the limit includes it.
+
+- The limit includes its end: a row exactly the interval after the first row is in the match.
+- A row with no time (`NULL`) is in no match with `WITHIN`.
+- The query is refused without an `ORDER BY` (`42601`: `WITHIN reads the first ORDER BY: add one, a date or a timestamp`),
+  with a descending `ORDER BY` (`0A000`: `WITHIN reads the first ORDER BY ascending`), and with a key that isn't a time,
+  such as an `INT` (`42804`: `WITHIN reads the first ORDER BY as a time, and <type> isn't one: order by a date or a timestamp`).
+
 ## DEFINE
 
 `DEFINE` gives each symbol a condition on a row. A condition that is NULL is false.
@@ -287,6 +337,7 @@ These are refused by the standard or by how the answer is shaped. Each refusal s
 | `FINAL` in a `DEFINE`, such as `b AS FINAL LAST(b.price) < 10` | refused, `42601`: `FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL` | drop `FINAL LAST`: write `b AS b.price < 10`, which reads the row itself (`LAST` in a `DEFINE` is refused too) |
 | `WITH UNMATCHED ROWS` with `{- -}` | refused, `42601` | use `SHOW EMPTY MATCHES`, or keep the rows in the pattern |
 | `PARTITION BY` an expression | refused, `0A000`: `takes columns; compute <e> in a subquery` | compute it in a subquery, and partition by its name |
+| a measure named like a column of the table, in `ALL ROWS PER MATCH`, such as `strt.day AS price` over `ticker` | refused, `42701`: `the measure price has the name of a column of ticker; ALL ROWS PER MATCH gives both, so name the measure otherwise` | name the measure otherwise, such as `start_price` |
 
 ## Not supported yet
 
@@ -295,7 +346,6 @@ These don't run yet. Each has a way to write the same question.
 | What you write | What happens | What to write instead |
 |---|---|---|
 | a `DEFINE` that reads another symbol's rows, `b AS b.price < a.price` | refused, `0A000`: `DEFINE b reads the match so far (a.price), which isn't supported yet: compare with the row before, PREV(price)` | compare with `PREV` or `NEXT` of the same column, or with a value in the row itself |
-| `WITHIN INTERVAL` | `WITHIN isn't supported yet`: refused, `42601`, at the word `WITHIN` | `WHERE` on the answer. That drops long matches from the answer, but the search still finds them, so a long match can hide the matches it overlaps |
 | an aggregate with its own `ORDER BY` in `ALL ROWS PER MATCH` | refused, `0A000` | drop it: the rows already come in the match's order |
 | a subquery in `MEASURES` or `DEFINE` | refused, `0A000` | compute the value in a subquery, and join it on the rows |
 | a window function in a measure | refused, `0A000` | compute the window in a subquery, and read its column in the measure |
