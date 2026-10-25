@@ -10,8 +10,9 @@ script, because a process holds one node and its settings are fixed by its first
 this checkout's python/ first on its path. The JavaScript children (i to n) are in inprocess_check.mjs, run by
 Node, or by Bun for n (RUNNERS); o reads the library's symbols here, with nm.
 
-a. "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake held
-   in memory, with nothing written in the temporary folder or here, and a new open a new lake"
+a. "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; no HTTP client
+   loaded (http.client, urllib, ssl, email, inspect); its lake held in memory, with nothing written in the
+   temporary folder or here, and a new open a new lake"
 b. "a lake opened, written, closed and opened again in this process: its rows"
 c. "connect() while a node is open here: the same lake another connection to it (sessions apart, one closed and
    the other still answering), another lake and another memory lake a node each beside this process, a URL a
@@ -87,6 +88,7 @@ def child_sql():
     db.sql("CREATE TABLE t (id INT, name TEXT)")
     db.sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     facts = {"count": db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"], "pandas": None, "polars": None}
+    facts["http"] = sorted(m for m in ("email", "http.client", "inspect", "ssl", "urllib.error", "urllib.request") if m in sys.modules)  # (before the door check below imports urllib itself)
     if has("pandas") and has("pyarrow"):
         import pandas
         db.write_table("p", pandas.DataFrame({"x": [1, 2]}))
@@ -476,6 +478,7 @@ def judge_sql(f):
     yield f["lake"] == ":memory:" and not f["while_open"] and not f["after_close"], \
         f"its lake ({f['lake']}) is held in memory: nothing written in the temporary folder or here, open or closed: {f['while_open'] + f['after_close'] or 'none'}"
     yield f["fresh"] == 0, f"open(':memory:') after close is a new lake: {f['fresh']} tables named t (0)"
+    yield f["http"] == [], f"connect() and its queries load no HTTP client: {', '.join(f['http']) or 'none of http.client, urllib, ssl, email, inspect'} imported"
 
 
 def judge_reopen(f):

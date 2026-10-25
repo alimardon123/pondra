@@ -3,9 +3,7 @@ beside it (`_child`). Queries become frames (`frame.py`); writes, scripts and pr
 import atexit
 import base64, contextlib
 import datetime as _dt
-import http.client
 import importlib.util
-import inspect
 import io
 import itertools
 import json
@@ -13,19 +11,13 @@ import math
 import os
 import re
 import select
-import shutil
 import socket
 import struct
-import subprocess
 import sys
 import sysconfig
-import tempfile
-import textwrap
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import warnings
 
@@ -129,6 +121,33 @@ _TRY_AGAIN = {"57P01", "57P03", "58030", "08000", "08001", "08003", "08006"}
 _GONE = "08006"  # (connection_failure: the node holding the session went)
 
 
+class _Refused(Exception):
+    """A node's answer of 400 or more, as `_call` reads it: its status, headers and body. `_Kept` and the node in
+    this process (`inprocess.opener`) raise it; urllib's own HTTPError becomes one in `_send`."""
+
+    def __init__(self, code, headers, body):
+        super().__init__(code)
+        self.code, self.headers, self.body = code, headers, body
+
+
+class _Request:
+    """A request as `_call` makes it: what `_Kept` and the node in this process read of urllib's Request (urllib's
+    opener gets its own copy, `_send`), so a connection to the node in this process imports no HTTP client."""
+
+    def __init__(self, full_url, data=None, headers=None, method="GET"):
+        self.full_url, self.data, self.method = full_url, data, method
+        self.headers = {name.capitalize(): value for name, value in (headers or {}).items()}  # (as urllib's Request names them)
+
+    def get_method(self):
+        return self.method
+
+    def header_items(self):
+        return list(self.headers.items())
+
+    def has_header(self, name):
+        return name.capitalize() in self.headers
+
+
 class _Kept:
     """Requests over one connection per node and thread, kept open for the next: urllib opens and
     closes one for every request, which cost a quarter of a millisecond each and left a socket
@@ -139,6 +158,7 @@ class _Kept:
         self.context, self.local = context, threading.local()
 
     def __call__(self, req, timeout=None):
+        import http.client, urllib.error  # (only a request over HTTP gets here)
         u = urllib.parse.urlsplit(req.full_url)
         if getattr(self.local, "pid", None) != os.getpid():  # (a forked process opens its own)
             self.local.pid, self.local.kept = os.getpid(), {}
@@ -168,7 +188,7 @@ class _Kept:
         else:
             kept[(u.scheme, u.netloc)] = c
         if r.status >= 400:
-            raise urllib.error.HTTPError(req.full_url, r.status, r.reason, r.headers, io.BytesIO(body))
+            raise _Refused(r.status, r.headers, body)
         return _Read(body, r.headers)
 
 
@@ -204,19 +224,43 @@ class Pondra:
         self.seq, self._auto = 0, itertools.count(1)
         self.session = uuid.uuid4().hex  # (this connection's temporary tables and views: the node's, until close())
         self._headers, self._job, self._jobs, self._temp = dict(headers or {}), job, itertools.count(1), {}
-        # nodes on this machine are reached directly, whatever proxy the environment names
-        local = all(urllib.parse.urlsplit(u).hostname in ("127.0.0.1", "localhost", "::1") for u in urls)
-        handlers = [urllib.request.ProxyHandler({})] if local else []
-        context = None
-        if ca:  # (a node's own certificate, or its authority's: a PEM file to trust besides the system's)
-            import ssl
-            context = ssl.create_default_context(cafile=ca)
-            handlers.append(urllib.request.HTTPSHandler(context=context))
-        self._open = urllib.request.build_opener(*handlers).open if handlers else urllib.request.urlopen
-        proxies = {} if local else urllib.request.getproxies()
-        proxied = any(p.scheme in proxies and not urllib.request.proxy_bypass(p.hostname) for p in map(urllib.parse.urlsplit, urls))
-        self._kept = None if proxied else _Kept(context)  # (one connection a node and thread, kept open)
+        self._ca, self._http_ways = ca, None  # (`_http_ways`: made by the first request over HTTP, see `_http`)
         _last = self
+
+    def _http(self):
+        """How a request goes over HTTP: urllib's opener, and `_Kept` where no proxy is in the way. Made by the first
+        request that goes over HTTP: a connection to the node in this process never makes it."""
+        if self._http_ways is None:
+            import urllib.request
+            # nodes on this machine are reached directly, whatever proxy the environment names
+            local = all(urllib.parse.urlsplit(u).hostname in ("127.0.0.1", "localhost", "::1") for u in self.urls)
+            handlers = [urllib.request.ProxyHandler({})] if local else []
+            context = None
+            if self._ca:  # (a node's own certificate, or its authority's: a PEM file to trust besides the system's)
+                import ssl
+                context = ssl.create_default_context(cafile=self._ca)
+                handlers.append(urllib.request.HTTPSHandler(context=context))
+            open_ = urllib.request.build_opener(*handlers).open if handlers else urllib.request.urlopen
+            proxies = {} if local else urllib.request.getproxies()
+            proxied = any(p.scheme in proxies and not urllib.request.proxy_bypass(p.hostname) for p in map(urllib.parse.urlsplit, self.urls))
+            self._http_ways = (open_, None if proxied else _Kept(context))  # (one connection a node and thread, kept open)
+        return self._http_ways
+
+    def _send(self, req, stream):
+        """One request, sent once: to the node in this process, or over HTTP. A node's answer of 400 or more is a
+        `_Refused`."""
+        inproc = getattr(self, "_inproc", None)
+        if inproc:  # (a node in this process answers through its router, with no socket, answers that stream too)
+            return inproc(req, stream=stream)
+        import urllib.error, urllib.request
+        open_, kept = self._http()
+        if kept and not stream:
+            return kept(req, timeout=self.timeout)
+        try:
+            return open_(urllib.request.Request(req.full_url, data=req.data, headers=req.headers, method=req.method),
+                         timeout=None if stream else self.timeout)
+        except urllib.error.HTTPError as e:
+            raise _Refused(e.code, e.headers, e.read()) from None
 
     def _call(self, method, path, body=b"", headers=None, stream=False, again=None):
         """One request. A node that is gone, or turns it away unrun, hands it to the next of
@@ -233,22 +277,20 @@ class Pondra:
         deadline, wait, tried = time.monotonic() + self.retry_secs, 0.1, 0
         while True:
             url = self._held or self.url
-            req = urllib.request.Request(url + path, data=body if method == "POST" else None, headers=h, method=method)
+            req = _Request(url + path, data=body if method == "POST" else None, headers=h, method=method)
             try:
-                # (a node in this process answers through its router, with no socket, answers that stream too)
-                inproc = getattr(self, "_inproc", None)
-                r = inproc(req, stream=stream) if inproc else (self._open if stream or not self._kept else self._kept)(req, timeout=None if stream else self.timeout)
+                r = self._send(req, stream)
                 out = r if stream else r.read()
-            except urllib.error.HTTPError as e:
+            except _Refused as e:
                 self._reached = True
                 self._heard(e.headers)
                 self._holds(url, path, e.headers)
                 code = e.headers.get("x-pondra-sqlstate") if e.headers else None
-                error = PondraError(f"{e.code}: {e.read().decode(errors='replace')}", code, e.code)
+                error = PondraError(f"{e.code}: {e.body.decode(errors='replace')}", code, e.code)
                 unrun = e.code == 503 and e.headers.get("retry-after") or code == "57P03"  # (stopping, or a leader cut off: it ran nothing)
                 if not (unrun or again and (e.code in (502, 504) or code in _TRY_AGAIN)):
                     raise error from None
-            except (urllib.error.URLError, OSError) as e:
+            except OSError as e:  # (a URLError is one: a connection that failed, or a read that did)
                 unrun = isinstance(getattr(e, "reason", e), ConnectionRefusedError)  # (nobody there: it ran nothing)
                 if not (unrun or again) or not self._reached and len(self.urls) == 1:
                     raise  # (a node never reached is a wrong address or one not started: said at once)
@@ -527,6 +569,7 @@ class Pondra:
         dict of columns for a table function); the imports, helper functions and constants it uses
         from where it is defined go with it. It is handed back as it was: it still runs here."""
         def make(f):
+            import inspect
             sig = inspect.signature(f)
             params = {p.name: (_sql_type_of(p.annotation) or "ANY", p.default) for p in sig.parameters.values()}
             ret = returns or _sql_type_of(sig.return_annotation)
@@ -545,6 +588,7 @@ class Pondra:
         imports, helper functions and constants it uses from where it is defined go with it. (A
         first parameter named `con` gets the connection, as in 0.22.) It is handed back as it was."""
         def make(f):
+            import inspect
             ps = list(inspect.signature(f).parameters.values())
             ps = ps[1:] if ps and ps[0].name == "con" else ps
             params = {}
@@ -710,6 +754,7 @@ class Pondra:
         self.retry_secs = retry_secs
         p = getattr(self, "process", None)
         if p and p.poll() is None:
+            import subprocess
             p.stdin.close()
             try:
                 p.wait(15)
@@ -820,6 +865,7 @@ class Run:
 
 def _params(params):
     """`name TYPE [DEFAULT value], …` from {name: type} or {name: (type, default)}."""
+    import inspect
     out = []
     for k, t in (params or {}).items():
         t, default = t if isinstance(t, tuple) else (t, inspect.Parameter.empty)
@@ -842,6 +888,7 @@ def _sql_type_of(t):
     """A Python annotation's SQL type: str VARCHAR, int BIGINT, float DOUBLE, bool BOOLEAN, date
     DATE, datetime TIMESTAMP, bytes BYTEA, Decimal DECIMAL, list[T] T[], dict VARIANT; a SQL type
     as it is. None: no annotation, or one SQL has no type for (a pyarrow array: any value)."""
+    import inspect
     import typing
     if t is None or t is inspect.Parameter.empty or t is inspect.Signature.empty:
         return None
@@ -880,6 +927,8 @@ def _module_of(f, lambda_name="udf"):
     connection — is refused, with the fix."""
     import ast
     import builtins
+    import inspect
+    import textwrap
     import types
     imports, consts, sources, done = [], [], [], set()
 
@@ -972,6 +1021,7 @@ def _child(dir="lake", port=None, token=None, flags=(), timeout=120, python=True
     Its SQL may read files on this machine (`SELECT * FROM 'jan.csv'`), as DuckDB's may, and its Python
     procedures run with this Python (`python=False`: none). `flags`: more `pondra serve` options, such as
     `["--memory-gb", "2"]`; `env`: settings by their variables' names."""
+    import subprocess, tempfile
     port, owner = port or _free_port(), uuid.uuid4().hex
     if "://" not in dir and dir != ":memory:":
         os.makedirs(dir, exist_ok=True)
@@ -1021,7 +1071,10 @@ def binary():
             places.append(os.path.join(sysconfig.get_path("scripts", scheme) if scheme else sysconfig.get_path("scripts"), name))
         except KeyError:
             pass
-    found = next((p for p in places if p and os.path.isfile(p)), None) or shutil.which(name)
+    found = next((p for p in places if p and os.path.isfile(p)), None)
+    if not found:
+        import shutil  # (the last resort: a pondra on PATH)
+        found = shutil.which(name)
     if not found:
         raise RuntimeError("no pondra binary: pip install pondra (it ships one), or set PONDRA_BIN")
     return found
