@@ -1,0 +1,145 @@
+---
+title: Change data capture
+description: Keep a Pondra table equal to a Postgres table with Debezium Server and Pondra's Kafka port, exactly once, through snapshots, restarts and crashes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+To keep a Pondra table equal to a Postgres table, run [Debezium Server](https://debezium.io/documentation/reference/stable/operations/debezium-server.html)
+with its Kafka sink pointed at a node's [Kafka port](/guides/kafka/). Debezium reads Postgres's logical replication and
+sends each change as a change event; the node turns each one into an upsert or a delete on a table with the same
+primary key. There is no Kafka cluster in between, and no code to write.
+
+```bash norun
+pondra serve lake --kafka 127.0.0.1:9092
+```
+
+The result is **exactly once**: the Pondra table holds every row of the source once, at its latest version. Debezium
+sends each change at least once (after a crash it sends again what it hadn't saved as sent), and a table with a key
+takes a change it already has as the same row again. The node itself applies a batch its producer retries only once
+(an idempotent producer, as below). `tools/cdc_check.py` checks this end to end: an initial snapshot of 20,000 rows,
+50,000 mixed changes (inserts, updates, deletes, primary keys that change, a 500-change transaction), Debezium killed
+mid-stream, the node killed mid-stream, and a clean restart. After each, the two tables are compared row by row and
+value by value. On a shared 4-core machine, Pondra was equal to the source within 1.5 s of the last change, and a
+change was readable in Pondra 0.4 s after its commit in Postgres (p50; p99 0.9 s).
+
+<Aside>
+This is 1.0's path for change data capture. A direct Postgres and MySQL connection, with no Debezium, comes in 1.1.
+</Aside>
+
+## Postgres
+
+Logical replication on, a user that may replicate, and a publication of the tables to follow:
+
+```text
+# postgresql.conf
+wal_level = logical
+max_replication_slots = 4
+max_wal_senders = 4
+```
+
+```sql norun
+CREATE ROLE dbz LOGIN REPLICATION PASSWORD '…';
+GRANT USAGE ON SCHEMA shop TO dbz;
+GRANT SELECT ON ALL TABLES IN SCHEMA shop TO dbz;
+CREATE PUBLICATION pondra_pub FOR TABLE shop.orders, shop.items;
+```
+
+`pg_hba.conf` must let `dbz` connect from where Debezium runs, for `replication` too.
+
+## Pondra
+
+Make each table with the source's columns and **its primary key**: a change event names its row by the key, and a
+delete can't be applied to a table without one. The same `CREATE TABLE` text works on both sides.
+
+```sql
+CREATE SCHEMA shop;
+CREATE TABLE shop.orders (id bigint PRIMARY KEY, customer text, amount numeric(12,2), paid boolean, placed timestamptz, note jsonb, ref uuid);
+CREATE TABLE shop.items (order_id bigint, line int, sku text, qty int, unit_price numeric(12,2), PRIMARY KEY (order_id, line));
+```
+
+## Debezium Server
+
+Debezium Server is one Java program (Java 21). Unpack its distribution, put this in its `config/application.properties`,
+and start it with `run.sh` from that folder:
+
+```properties
+debezium.sink.type=kafka
+debezium.sink.kafka.producer.bootstrap.servers=127.0.0.1:9092
+debezium.sink.kafka.producer.enable.idempotence=true
+debezium.sink.kafka.producer.acks=all
+debezium.sink.kafka.producer.key.serializer=org.apache.kafka.common.serialization.StringSerializer
+debezium.sink.kafka.producer.value.serializer=org.apache.kafka.common.serialization.StringSerializer
+debezium.format.key=json
+debezium.format.value=json
+debezium.format.key.schemas.enable=false
+debezium.format.value.schemas.enable=false
+
+debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector
+debezium.source.database.hostname=127.0.0.1
+debezium.source.database.port=5432
+debezium.source.database.user=dbz
+debezium.source.database.password=…
+debezium.source.database.dbname=postgres
+debezium.source.plugin.name=pgoutput
+debezium.source.publication.name=pondra_pub
+debezium.source.publication.autocreate.mode=disabled
+debezium.source.slot.name=pondra_cdc
+debezium.source.topic.prefix=pg
+debezium.source.table.include.list=shop.orders,shop.items
+debezium.source.snapshot.mode=initial
+debezium.source.decimal.handling.mode=string
+debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore
+debezium.source.offset.storage.file.filename=data/offsets.dat
+debezium.source.offset.flush.interval.ms=1000
+
+debezium.transforms=route
+debezium.transforms.route.type=org.apache.kafka.connect.transforms.RegexRouter
+debezium.transforms.route.regex=pg[.](.*)
+debezium.transforms.route.replacement=$1
+```
+
+What each part is for:
+
+- **The producer is idempotent** (`enable.idempotence=true`, `acks=all`): a batch Debezium's producer sends again after
+  a lost answer is applied once.
+- **Topics are table names.** Debezium names a topic `prefix.schema.table` (`pg.shop.orders`); the `RegexRouter`
+  transform drops the prefix, so it is `shop.orders`, the Pondra table.
+- **Numbers stay exact**: `decimal.handling.mode=string` sends a `numeric` as its digits, which the table's
+  `numeric(12,2)` column takes as they are. Debezium's default sends them as bytes.
+- **JSON with or without its schema**: Kafka Connect's `{"schema": …, "payload": …}` (`schemas.enable=true`) works the
+  same; without it, each message is smaller.
+- **Offsets in a file**: where Debezium has got to. After a crash it starts from the last offset it saved (each second
+  here), so it sends some changes again; the table takes them as the same rows.
+
+On its first start, Debezium makes the replication slot, copies each table's rows (the snapshot), then follows the
+changes. Every row arrives with its key, and the tables in Pondra fill as SQL can see:
+
+```sql norun
+SELECT count(*) FROM shop.orders;
+```
+
+## What arrives, and how
+
+- **An insert or an update** is the row as it is now: an upsert by the key.
+- **A delete** removes the key's row. The tombstone Debezium sends after it (a null value) removes nothing more.
+- **An update that changes a primary key** arrives from Debezium as a delete of the old key and an insert of the new
+  one, and is applied that way.
+- **A transaction's changes** arrive as one change each, in order. Readers can see a transaction's first changes
+  before its last.
+- **Types:** a `jsonb` and a `uuid` column are text in Pondra, as its own tables keep them, so `ref` reads
+  `'a0ee…'` and `note` reads its JSON text. `timestamptz` is UTC.
+- **TRUNCATE isn't carried.** Debezium leaves it out by default (`skipped.operations=t`), and Pondra doesn't apply one
+  it is sent. After a `TRUNCATE` on the source, run the same `TRUNCATE`
+  on the Pondra table. The changes after it arrive and are applied as before.
+
+## Check it yourself
+
+`tools/cdc_check.py` runs the whole path on one machine, with Postgres 16 and Debezium Server it is given:
+
+```bash norun
+python3 tools/cdc_check.py --debezium ./debezium-server --pg-bin /usr/lib/postgresql/16/bin --bin pondra
+```
+
+It prints `ok <phase>` for each phase (snapshot, stream, kill-debezium, kill-pondra, clean-restart, truncate, after-truncate), with
+the time Pondra took to equal the source, and the lag. Without Debezium or Postgres it says `skipped` and exits 0.

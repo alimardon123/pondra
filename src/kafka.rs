@@ -665,7 +665,13 @@ fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Opt
             // (a table without a key can't tell which row went: appending `before` would bring it back)
             "d" if !keyed => bail!("a change event deletes a row, and only a table with a key knows which: create this table with a PRIMARY KEY (the source's)"),
             "d" => deleted(v["before"].take()),
-            _ => return Ok(None), // (a truncate)
+            // (a truncate: not applied yet, and said, so a table that kept its rows isn't a surprise; Debezium sends one
+            // only with `skipped.operations=none`)
+            "t" => {
+                eprintln!("kafka: a change event truncates a table: Pondra doesn't apply a truncate from Kafka yet (TRUNCATE the table in Pondra too)");
+                return Ok(None);
+            }
+            _ => return Ok(None),
         };
     }
     if !v.is_null() {
