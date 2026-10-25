@@ -20860,6 +20860,12 @@ def variables():
     checks["pondra.variables lists them (name, value, type, declared), never a remembered answer; SET is still a setting"] = \
         got["listed"] == [{"name": "day", "value": "2026-09-29", "type": "Date32", "declared": "DATE"}] \
         and got["listed again"] == [{"name": "day", "value": "2026-09-30", "type": "Date32", "declared": "DATE"}]
+    # A struct variable's field is `$s.a` (1.1 reads a pipeline's `$daily.rows` so); a field of a value that is no struct is
+    # refused by DataFusion's words, so the form is kept free for 1.1 and means nothing else in the meantime (R5).
+    got["field"] = q("DECLARE $s = named_struct('a', 1); SELECT $s.a AS v", {})
+    got["field of a date"] = _raises_text(lambda: q("DECLARE $d = DATE '2026-09-30'; SELECT $d.from AS v", {}))
+    checks["$s.a reads a struct variable's field; a field of a DATE is refused (not a struct): the form stays free for 1.1"] = \
+        got["field"] == [{"v": 1}] and "is not Struct" in got["field of a date"]
     # A file's parameters, and runs.
     daily = ("-- The day to load\nDECLARE PARAMETER $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE PARAMETER $min DOUBLE DEFAULT 0;\n"
              "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
