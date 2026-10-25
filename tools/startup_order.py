@@ -173,6 +173,20 @@ def mark(a):
     print(f"{sum(p in cold for p in listed)} of {len(listed)} listed functions are cold somewhere", file=sys.stderr)
 
 
+def from_disk(*paths):
+    """Drop the files from the page cache, so the next start reads them from disk as after a boot. A file just
+    written by a build or an install is held so that its code faults in in bigger pieces: the library as pip had
+    just installed it (e0f40d0's wheel) kept 47 MB of code resident at its first answer, the same file copied with
+    `cat` 26 MB, and read from disk 18 MB, as the program is."""
+    for path in paths:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd) # (a page not yet written back stays: only clean ones are dropped)
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+
+
 def resident_code(pid, path):
     """MB of the program's own executable mappings resident in the process (what the kernel faulted in, read-ahead
     and fault-around included)."""
@@ -223,6 +237,7 @@ def library_code(lib, lake):
 
 
 def check(a):
+    from_disk(a.bin, *[a.lib] if a.lib else [])
     with tempfile.TemporaryDirectory(prefix="pondra-startup-") as tmp:
         port = free_port()
         p = start([a.bin], port, f"{tmp}/lake", 60)
