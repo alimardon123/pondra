@@ -129,6 +129,7 @@ Pages marked *(planned)* aren't written yet.
 | `iceberg-rest.mdx` | the Iceberg REST catalog: routes, namespaces, what writers may commit | `src/iceberg.rs` |
 | `mcp.mdx` | MCP's look-up: the tools, the wire, errors (connecting an agent is `guides/agents.mdx`'s) | `src/mcp.rs` |
 | `environment.mdx` | every `PONDRA_*` environment variable, with its default | `grep -rn 'PONDRA_' src python js` |
+| `stability.mdx` | what 1.x keeps stable, what may change in any release, how something is deprecated, which releases get fixes | `src/format.rs`, `tools/upgrade_check.py` |
 
 ## Who owns a topic that many pages touch
 

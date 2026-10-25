@@ -8,7 +8,7 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 A node told to stop finishes what it is doing first, and a leader hands over at once. That makes an
 upgrade simple: replace the nodes one at a time while the cluster keeps serving and taking writes.
 A new release opens every older release's lake, and an older release refuses a lake that a newer
-one has moved on.
+one has moved on. [What stays stable](/pondra/reference/stability/) says what every 1.x release keeps working.
 
 ## Before you upgrade
 
@@ -236,6 +236,7 @@ can't read. Until something moves it, the release before still opens it.
 | 2 | 0.33 | a materialized view that works its answers out as it is read (`avg`, `stddev`, `HAVING`, …) |
 | 3 | 0.34 | a lake's own keys sealed by a master key every node shares (`PONDRA_SECRET_KEY`, `PONDRA_KMS_COMMAND`, or the admin token when neither is set): from the first write in a lake the release makes, otherwise by its leader once every node knows format 3 |
 | 4 | 0.34 | a grant on another database (`GRANT … ON DATABASE`, `GRANT CLONE ON DATABASE`), which a node of 0.33 can't read: made only once every node knows format 4 |
+| 5 | 0.35 | an identity provider (`CREATE IDENTITY PROVIDER`), which a node of 0.34 would ignore: made only once every node knows format 5 |
 
 An older release refuses a newer lake by name, before it reads anything. The message has this shape,
 with the lake, its format and the release that wrote it filled in:
