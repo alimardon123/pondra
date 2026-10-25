@@ -871,11 +871,11 @@ impl ast::Visitor for Found {
     }
 }
 
-/// Whether some SELECT of `stmt` has a value name of a JSON call written bare, as `e` and not `e.value`. `types::rewrite`
+/// Whether some SELECT of `stmt` has a value name of a JSON call written bare, as `e` and not `e.value`. `pg_casts::rewrite`
 /// asks the catalog for the columns only for such a statement.
 pub fn bare_aliases(stmt: &Statement) -> bool { ast::Visit::visit(stmt, &mut Found::default()).is_break() }
 
-/// Rewrites a statement's set-returning calls where SQL comes in (`types::rewrite`), and whether it changed any. What
+/// Rewrites a statement's set-returning calls where SQL comes in (`pg_casts::rewrite`), and whether it changed any. What
 /// Postgres refuses, and what this engine doesn't take yet, is refused before anything changes. The names of changed
 /// SELECT items are kept as written (`names_kept`). `columns` are the lower-case names of the columns the statement's
 /// relations have (`pg_trace::columns_named`): a bare value name (`bare_aliases`) is written `name.value` unless one of

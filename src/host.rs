@@ -8,7 +8,6 @@ use crate::pg_trace::Ty;
 use crate::store::{Lake, TableMeta};
 use crate::ddl;
 use anyhow::Result;
-use datafusion::sql::sqlparser::ast::Statement;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -41,16 +40,12 @@ impl Host for Lake {
 
     async fn enum_labels(&self, name: &str) -> Option<Vec<String>> { crate::types::labels(self, name).await }
 
-    // (The two below wrap free functions for the same reason as `own`: their passes ask queries.)
-    fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { types_of(self, stmts) }
-
+    // (The one below wraps a free function for the same reason as `own`: its pass asks queries.)
     fn ask(&self, sql: &str) -> impl Future<Output = Result<datafusion::prelude::DataFrame>> + Send { ask_of(self, sql) }
 
     // (a node's watch is its own, `oom.rs`: the frame is collected as it is)
     async fn collect(&self, frame: datafusion::prelude::DataFrame) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> { Ok(frame.collect().await?) }
 }
-
-async fn types_of(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> { crate::types::rewrite(lake, stmts).await }
 
 /// What the front's passes ask, planned as the node plans a query: expanded, ASOF JOIN's marker, the caller's session.
 async fn ask_of(lake: &Lake, sql: &str) -> Result<datafusion::prelude::DataFrame> {
