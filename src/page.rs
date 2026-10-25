@@ -294,7 +294,8 @@ impl Page {
 
     /// `open`, with its memory watch given: `open` reads the line from the settings, and a test gives a small one.
     fn with_watch(options: &Options, watch: Option<Watch>) -> Page {
-        let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1));
+        // (the page's catalog is `page`, as its host and `GET /objects` name it: an error then says `page.public.t`)
+        let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1)).with_default_catalog_and_schema("page", "public");
         // A page's Parquet strings are plain, as the files hold them: views were no faster in a page and held 230 MB
         // more at SF1 (measured in web-4g). The session's Parquet options are the ones a file read takes (`ext_names::file_format`).
         config.options_mut().execution.parquet.schema_force_view_types = false;
@@ -2580,6 +2581,18 @@ mod tests {
         assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
         let body = std::str::from_utf8(&got.body).unwrap();
         assert!(body.contains("orders AT (VERSION => 1)"), "{body}");
+    }
+
+    /// The page's catalog is `page`, as `GET /objects` names it: a missing table's words say `page.public.…` (not
+    /// DataFusion's `datafusion`), and a three-part name in it reads the page's table.
+    #[tokio::test]
+    async fn a_pages_catalog_is_page() {
+        let page = page_with_tables().await;
+        let missing = page.request("POST", "/sql", &[], "SELECT * FROM nope".into()).await;
+        assert_eq!(missing.status, 404);
+        assert!(String::from_utf8_lossy(&missing.body).contains("'page.public.nope'"), "{}", String::from_utf8_lossy(&missing.body));
+        let whole = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM page.public.orders".into()).await;
+        assert_eq!((whole.status, String::from_utf8_lossy(&whole.body).as_ref()), (200, "n\n3\n"));
     }
 
     #[tokio::test]
