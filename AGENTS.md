@@ -1066,7 +1066,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    every part, with and without an extension.
 139. **A view of files is a view** (`StoredView.external`, `ext.rs`): `CREATE EXTERNAL TABLE` stores
    `SELECT … FROM read_*(…)`, copies nothing, and `INSERT` into one over a folder is `COPY … TO
-   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::from_cli` calls
+   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::through_bucket_statement` calls
    `view_write` too); an `INSERT` into any other view is refused, never a table made. A folder's
    keys are declared (`hive_types`), so an empty folder has its columns. The `ext:` tables such
    views read are deregistered in listing sessions. `harness.py external`.
@@ -1963,7 +1963,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
-   `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   `write::through_bucket_statement`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
    to anything a project's last finished apply declared (`apply::declared`), unless
    `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
@@ -2141,7 +2141,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    text reads crm.t… SHOW COLUMNS…".
 287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
    x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
-   its leader had (`seen_here`), and in `from_cli`. `CREATE TABLE … AS SELECT` defines its table first;
+   its leader had (`seen_here`), and in `write::through_bucket_statement`. `CREATE TABLE … AS SELECT` defines its table first;
    `POST /insert/{t}`, the bulk door, still makes one (`record`). A file, another engine's attached table
    and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
    name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
@@ -2861,7 +2861,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
    `spill::tests`.
 
-420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
+420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `create_as`, which `pondra sql` takes through the inbox too). Its table
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
    statement answers, and the answer stays the statement's own error. A request stopped before the INSERT answers
    (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
