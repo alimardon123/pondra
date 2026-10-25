@@ -1855,7 +1855,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
             return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
-        let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
+        let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
     }
@@ -1870,7 +1870,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             Some(Request::Table(name, _)) => Some(table_key(name)),
             _ => None,
         };
-        let out = deliver(&other.url, Some(req), &stmt, &job, false).await;
+        let out = deliver(&other.url, req, &job, false).await;
         if out.is_ok() {
             seen_there(&other, mark).await;
         }
@@ -2085,47 +2085,32 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
 
 // ---------------------------------------------------------------- from any machine
 
-/// `pondra sql --dir … "<write>"` on any machine. This process does the work (local files too:
-/// `SELECT * FROM 'jan.parquet'`), then the leader records it: over HTTP; through the bucket
-/// inbox if this machine can't reach it; or, when nobody leads, this process leads for the moment
-/// it takes, under its own term, so a node starting meanwhile waits for it. It never takes over
-/// from a live leader.
-/// The lake at `dir`, made first if there is none (`pondra sql --dir new "CREATE TABLE t AS SELECT
-/// * FROM 'x.csv'"`): this process leads for a moment, writing nothing but an empty catalog.
-pub async fn made(dir: &str) -> Result<Arc<Lake>> {
-    if let Ok(lake) = Lake::open(dir, false, false).await {
-        return Ok(lake);
-    }
-    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await?;
-    Lake::open(dir, false, false).await
-}
-
 /// `pondra lead`: lead the lake at `dir` once, making it if it's new, for what waits in its inbox
 /// (or nothing, when someone leads it already: they answer the bell). No reader of the lake is
 /// opened and no statement run, so a node's CREATE DATABASE, a branch's first commit and a write
 /// to a lake nobody leads pay for one lead, not two and four catalogs opened.
 pub async fn lead_only(dir: &str) -> Result<()> {
-    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await.map(drop)
+    deliver(dir, None, "", true).await.map(drop)
 }
 
-pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+/// `pondra sql`'s write to a lake whose leader is alive but doesn't answer from the guest's start (`cli.rs`'s `through_inbox`):
+/// the statement is checked here as a node's door checks it and prepared as the leader takes it, then each request is sent as
+/// a one-off writer sends it (`deliver`): over HTTP if this machine reaches the leader after all, else through the bucket's
+/// inbox, or led here when nobody leads. Each request sets its lake's node key first (`through_bucket_one`).
+pub(crate) async fn through_bucket_statement(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why); // (said as a node says it)
     }
-    let mut stmt = stmt;
-    if let Ok(lake) = Lake::open(dir, false, false).await {
-        stmt = crate::protect::door(&lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
-        if let Some((query, to, options)) = crate::ext::view_write(&lake, &stmt).await? {
-            let out = crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
-            return Ok(j!({"rows": out["copied"]}));
-        }
+    let stmt = crate::protect::door(lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
+    if let Some((query, to, options)) = crate::ext::view_write(lake, &stmt).await? {
+        let out = crate::copy::copy_to(lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
+        return Ok(j!({"rows": out["copied"]}));
     }
     let stmt = match stmt {
-        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
+        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            let lake = Lake::open(dir, false, false).await?;
-            crate::seq::check_every(&lake, &t, rows_width(&query)).await?;
-            if !is_there(&lake, &t).await? {
+            crate::seq::check_every(lake, &t, rows_width(&query)).await?;
+            if !is_there(lake, &t).await? {
                 return Err(no_table(&t));
             }
             Stmt::Insert(t, query)
@@ -2133,87 +2118,51 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         s => s,
     };
     if let Stmt::Create(c) = &stmt {
-        if Lake::open(dir, false, false).await.is_ok() && Box::pin(created(dir, c)).await?.is_some() {
+        if matches!(there(lake, c).await?, Some(true)) {
             return Ok(j!({"table": object(&c.name), "exists": true})); // (CREATE TABLE IF NOT EXISTS of one that's there)
         }
     }
     match stmt {
         Stmt::CopyTo(query, to, options) => {
-            let lake = Lake::open(dir, false, false).await?;
+            let lake = lake.clone();
             crate::ext::scope(true, async move { crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await }).await // (its user's own machine)
         }
-        // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, one statement at a time from this shell.
+        // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, each one sent through the bucket.
         Stmt::Create(c) if c.query.is_some() || c.or_replace => {
-            let lake = Lake::open(dir, false, false).await?;
-            let dir = dir.to_string();
+            let owned = lake.clone();
             let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
-                let dir = dir.clone();
-                Box::pin(async move { one_from_cli(&dir, s).await })
+                let owned = owned.clone();
+                Box::pin(async move { through_bucket_one(&owned, s).await })
             };
-            create_as(run, &lake, &c, job(), true, &mut |_: &str| {}).await
+            create_as(run, lake, &c, job(), true, &mut |_: &str| {}).await
         }
         Stmt::Create(c) => {
             let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
-            raced(if_not_exists, &name, one_from_cli(dir, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the shell's job)
+            raced(if_not_exists, &name, through_bucket_one(lake, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the job)
         }
         Stmt::Ddl(ddls) => {
             let mut out = j!({});
             for d in ddls {
-                out = Box::pin(one_from_cli(dir, Stmt::Ddl(vec![d]))).await?;
+                out = through_bucket_one(lake, Stmt::Ddl(vec![d])).await?;
             }
             Ok(out)
         }
-        stmt => one_from_cli(dir, stmt).await,
+        stmt => through_bucket_one(lake, stmt).await,
     }
 }
 
-/// The shell's CREATE TABLE of a table that's there: Some (left, IF NOT EXISTS); None goes on (OR REPLACE is `create_as`'s,
-/// and a table not there is made next). Refused otherwise.
-async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
-    let lake = Lake::open(dir, false, false).await?;
-    Ok(there(&lake, c).await?.filter(|left| *left).map(|_| ()))
-}
-
-/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
-/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
-/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
-/// answers nothing without it: S21).
-async fn cli_key(lake: &Lake) -> Option<String> {
-    for _ in 0..50 {
-        if let Ok(k) = crate::users::node_key(lake).await {
-            return Some(k);
-        }
-        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
-        match crate::users::kept(lake).await {
-            "none" if led => {} // (not made yet: wait for them)
-            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        lake.refresh().await.ok()?;
-    }
-    None
-}
-
-async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+/// One request of a statement, sent as `through_bucket_statement` describes: to the lake it writes (an attached lake's leader,
+/// if the name is one), under this process's job, so a retry of it is answered as a duplicate. The node key set is the target
+/// lake's (each lake has its own), before its leader is called (`cluster::signed`: a key set already is kept).
+async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
+    let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
+    let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
     let job = job().to_string();
-    // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
-    let (req, stmt, to) = match Lake::open(dir, false, false).await {
-        Ok(lake) => {
-            crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
-            let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
-            let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
-            if !crate::env::is_set("PONDRA_TOKEN") && !crate::env::is_set("PONDRA_ADMIN_TOKEN") && crate::cluster::node_key().is_none() {
-                // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
-                // leader on the network answers nothing unsigned. `cluster::http` sends it.)
-                if let Some(k) = cli_key(&target).await {
-                    crate::cluster::set_node_key(k);
-                }
-            }
-            (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
-        }
-        Err(_) => (None, stmt, dir.to_string()),
-    };
-    deliver(&to, req, &stmt, &job, true).await
+    crate::cluster::signed(&target).await;
+    match prepare(lake, &target, &table, &stmt, &job, true).await? {
+        Some(req) => deliver(&target.url, Some(req), &job, true).await,
+        None => Ok(j!({"duplicate": true})), // (a retry: the write it asks is recorded already)
+    }
 }
 
 tokio::task_local! {
@@ -2233,19 +2182,20 @@ pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value
 }
 
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
-pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
+pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(req), "", false).await }
 
 /// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
 /// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
 /// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
 pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
-    BUCKET.scope((), deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", true)).await
+    BUCKET.scope((), deliver(dir, Some(req), job(), true)).await
 }
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
-/// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own.
-async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: &str, one_off: bool) -> Result<Value> {
+/// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own. `req` None is
+/// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
+async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req).await; // (a lake on another server: ADR-058)
     }
@@ -2257,11 +2207,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     tokio::time::sleep(Duration::from_secs(1)).await; // another `pondra sql` is recording: wait
                     continue;
                 }
-                if req.is_none() {
-                    let lake = Lake::open(dir, false, false).await?;
-                    req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
-                }
-                let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
+                let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
@@ -2274,14 +2220,14 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                 }
             }
             _ if !one_off => {
-                let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
+                let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
                 if let Some(v) = crate::inbox::send(&store, r, Some(dir)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             t => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
-                return match lead(dir, &store, term.n, req, stmt, job).await {
+                return match lead(dir, &store, term.n, req).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
@@ -2379,8 +2325,8 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
-    let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
+async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Result<Value> {
+    let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
     // (never sent without one: this server's own key, or its user's token, must not go to another
@@ -2482,16 +2428,13 @@ pub(crate) fn job() -> &'static str {
     JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
-/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.
-async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>, stmt: &Stmt, job: &str) -> Result<Value> {
+/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go. `req` None records
+/// nothing (`lead_only`).
+async fn lead(dir: &str, store: &Store, term: u64, req: Option<Request>) -> Result<Value> {
     let marks = crate::cluster::mark_every(store.clone(), term);
     let lake = Lake::open(dir, true, false).await?; // (the catalog's writer: fences any older one)
     crate::replica::recover(&lake, "", term, None).await?;
     let (seq, lock) = (Sequencer::start(lake.clone(), None).await?, Mutex::new(()));
-    let req = match req {
-        Some(r) => r,
-        None => prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?,
-    };
     let out = match req {
         Some(r) => {
             let flush = matches!(r, Request::Flush(_));
