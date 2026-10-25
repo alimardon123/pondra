@@ -112,6 +112,9 @@ pub fn move_lake(m: Move) -> anyhow::Result<()> {
 pub(crate) struct Held {
     term: OnceLock<(store::Store, u64)>,
     lake: OnceLock<Arc<store::Lake>>,
+    /// Set by a guest that only reads: its catalog closes in a task of its own, which the answer doesn't wait for (a
+    /// reader owes nothing: no term, nothing to make durable, and the close waits on its poller's cycle in flight).
+    detach: OnceLock<()>,
 }
 
 impl Held {
@@ -142,8 +145,15 @@ impl Held {
         panics::abort_all();
         tr("tasks");
         if let Some(l) = lake {
-            let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
-            tr("catalog");
+            if self.detach.get().is_some() {
+                // (untracked: the next `abort_all` of this process must not stop a close half done)
+                let l = l.clone();
+                tokio::spawn(async move { let _ = l.cat.close().await; });
+                tr("catalog (detached)");
+            } else {
+                let _ = tokio::time::timeout(Duration::from_secs(5), l.cat.close()).await;
+                tr("catalog");
+            }
         }
         if let Some((store, n)) = term {
             cluster::step_down(store, *n).await;
@@ -168,15 +178,25 @@ pub struct Node {
 }
 
 /// A guest that reads opens its lake beside its term look (`Node::start`): this is that open, made at the same time as the
-/// look and kept if the look finds no leader to stream from. One that finds a leader drops it (aborted: the requests it sent
-/// are all it cost), and opens its lake streamed after the look.
+/// look and kept if the look finds no leader to stream from. One that finds a leader lets it finish and closes it, as
+/// `close_after` does: an open is never aborted midway, since a reader dropped midway runs its poller for ever.
 struct Beside(Option<tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>>);
+
+/// A speculative open nothing keeps: it finishes, then its catalog closes, in a task of its own (untracked, so no
+/// `abort_all` cuts the close short, and the poller stops with the close).
+fn close_after(open: tokio::task::JoinHandle<anyhow::Result<Arc<store::Lake>>>) {
+    tokio::spawn(async move {
+        if let Ok(Ok(lake)) = open.await {
+            let _ = lake.cat.close().await;
+        }
+    });
+}
 
 impl Beside {
     fn start(dir: &str, guest: Option<Guest>) -> Beside {
         Beside(matches!(guest, Some(Guest::Reads)).then(|| {
             let dir = dir.to_string();
-            crate::panics::task(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
+            tokio::spawn(async move { store::Lake::open_polled(&dir, false, false, store::READER_ONE_SNAPSHOT).await })
         }))
     }
 
@@ -185,7 +205,7 @@ impl Beside {
     async fn keep(&mut self, streamed: bool) -> Option<anyhow::Result<Arc<store::Lake>>> {
         let open = self.0.take()?;
         if streamed {
-            open.abort();
+            close_after(open);
             return None;
         }
         Some(match open.await {
@@ -198,7 +218,7 @@ impl Beside {
 impl Drop for Beside {
     fn drop(&mut self) {
         if let Some(open) = self.0.take() {
-            open.abort(); // (a start that ends before its look does, with an error, drops the open)
+            close_after(open); // (a start that ends before its look does, with an error, lets the open finish, then closes it)
         }
     }
 }
@@ -309,6 +329,9 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
+        if guest == Some(Guest::Reads) && !streamed {
+            let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`)
+        }
         tr("the lake open");
         for spec in &attached {
             attach(&lake, spec, &addr, lives).await?;

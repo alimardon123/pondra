@@ -37,6 +37,7 @@ fn run() {
         reads_claim_nothing(&lake_text, &lake).await;
         a_node_leads_right_after(&lake_text, &lake).await;
         follows_a_live_leader(&lake_text, &dir).await;
+        reads_that_follow_leave_no_task(&lake_text, &dir).await;
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -167,5 +168,37 @@ async fn follows_a_live_leader(lake_text: &str, dir: &Path) {
 
     finish(guest).await;
     assert_eq!(count_at(&leader_url).await, Some(2), "the leader has both rows after the guest finishes");
+    leader.kill();
+}
+
+/// 5. Reads that follow a live leader leave no task behind: the runtime's alive tasks after the first such read, and after
+/// 20 more, are the same. Each read's speculative open is let finish and closed, and its streamed lake closes with the guest.
+async fn reads_that_follow_leave_no_task(lake_text: &str, dir: &Path) {
+    let leader_addr = free_addr();
+    let leader_url = format!("http://{leader_addr}");
+    let mut leader = Leader::start(lake_text, &leader_addr, &dir.join("leader-tasks.stderr"));
+    assert!(count_at(&leader_url).await.is_some(), "the leader in its own process answers within 30 s");
+    let alive = || tokio::runtime::Handle::current().metrics().num_alive_tasks();
+    // (the count is worth something only if it sees a live task: one that sleeps, spawned for this check)
+    let sentinel = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(600)).await });
+    assert!(alive() >= 1, "the runtime's alive-task count sees a spawned task");
+    sentinel.abort();
+    let mut first = None;
+    for read in 1..=21 {
+        let guest = open(Options::guest(lake_text, vec![], Guest::Reads)).await;
+        let count = sql(&guest, "SELECT count(*) AS n FROM t").await;
+        assert_eq!(count.0, 200, "read {read} following the leader: {}", count.1);
+        finish(guest).await;
+        tokio::time::sleep(Duration::from_millis(300)).await; // (what finish let go ends in its own time)
+        let now = alive();
+        match first {
+            None => first = Some(now),
+            Some(f) if read == 21 => {
+                eprintln!("alive tasks: {f} after the first guest read that follows, {now} after 20 more");
+                assert!(now <= f, "reads that follow a live leader leave tasks behind: {f} after the first, {now} after 21");
+            }
+            Some(_) => {}
+        }
+    }
     leader.kill();
 }
