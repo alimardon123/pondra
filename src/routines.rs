@@ -423,7 +423,7 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
 /// parameters or its graph's values, bound as it runs, never as it is made.
 pub fn makes_code(sql: &str) -> bool {
-    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:task|procedure|function|macro)\b").expect("a regex"));
+    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:task|pipeline|procedure|function|macro)\b").expect("a regex"));
     HEAD.is_match(crate::text::first_word(sql))
 }
 

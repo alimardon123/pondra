@@ -22204,6 +22204,8 @@ def doors():
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
             "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
+            "CREATE PIPELINE, refused by name, 0A000": (["CREATE PIPELINE d_pipe AS BEGIN STEP a AS SELECT 1; END"], lambda r: r == "0A000"),
+            "SHOW PIPELINES, refused by name, 0A000": (["SHOW PIPELINES"], lambda r: r == "0A000"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -22311,7 +22313,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000"), ("come in 1.1", "0A000")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an

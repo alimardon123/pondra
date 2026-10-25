@@ -2310,13 +2310,13 @@ fn not_kept_as(what: &str) -> anyhow::Error {
 /// of the kind. Words are whole and read past comments, so a table named `merged` or a string `'begin'` is not one of them.
 fn not_taken(sql: &str) -> anyhow::Result<()> {
     let words = crate::text::first_words(sql, 4);
-    if begins(&words, &["DECLARE"]) {
+    if crate::text::begins(&words, &["DECLARE"]) {
         return Err(crate::codes::coded("0A000", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"));
     }
-    if begins(&words, &["MERGE"]) {
+    if crate::text::begins(&words, &["MERGE"]) {
         return Err(crate::codes::coded("0A000", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"));
     }
-    match NODE_STATEMENTS.into_iter().find(|(pattern, _)| begins(&words, pattern)) {
+    match NODE_STATEMENTS.into_iter().find(|(pattern, _)| crate::text::begins(&words, pattern)) {
         Some((pattern, what)) => Err(crate::codes::coded("0A000", what.replace("{}", &pattern.join(" ")))),
         None => Ok(()),
     }
@@ -2385,11 +2385,6 @@ const NODE_STATEMENTS: [(&[&str], &str); 44] = [
     (&["CREATE", "OR", "REPLACE", "MATERIALIZED"], NO_MATERIALIZED_VIEWS),
     (&["DROP", "MATERIALIZED", "VIEW"], NO_MATERIALIZED_VIEWS),
 ];
-
-/// Whether `words` begin with `pattern`'s words (`text::first_words` gives them upper-cased, as a pattern is written).
-fn begins(words: &[String], pattern: &[&str]) -> bool {
-    words.len() >= pattern.len() && words.iter().zip(pattern).all(|(word, p)| word == p)
-}
 
 /// What a page's SQL may do. A page's tables are its own, in memory: `CREATE TABLE` (with `AS`, `OR REPLACE` and `IF
 /// NOT EXISTS`), `DROP TABLE`, and INSERT, UPDATE and DELETE into a page's own table are what it takes. `CREATE EXTERNAL

@@ -68,6 +68,7 @@ pub enum Relation<H: ?Sized> {
 
 /// The front:
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
+    crate::kept::refused(sql)?; // (1.1's statements, refused by name at every door in the same words: `kept.rs`)
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),
         Own::Go(sql) => sql,

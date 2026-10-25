@@ -41,6 +41,11 @@ pub fn first_words(sql: &str, n: usize) -> Vec<String> {
     first_word(sql).trim_end_matches(';').split_whitespace().take(n).map(|w| w.to_uppercase()).collect()
 }
 
+/// Whether `words` begin with `pattern`'s words (`first_words` gives them upper-cased, as a pattern is written).
+pub fn begins(words: &[String], pattern: &[&str]) -> bool {
+    words.len() >= pattern.len() && words.iter().zip(pattern).all(|(word, p)| word == p)
+}
+
 /// The words a `BEGIN` may take after its first (`control`).
 const BEGIN_WORDS: [&str; 14] = ["WORK", "TRANSACTION", "ISOLATION", "LEVEL", "READ", "WRITE", "ONLY", "REPEATABLE", "SERIALIZABLE", "COMMITTED", "UNCOMMITTED", "SNAPSHOT", "DEFERRABLE", "NOT"];
 

@@ -234,6 +234,9 @@ const KINDS: &[(&str, Parse)] = &[
     ("call", call_into),
     ("async", async_),
     ("await", await_),
+    ("step", pipeline_word), // (a pipeline's words, refused by name: `kept.rs`)
+    ("parallel", pipeline_word),
+    ("wait", pipeline_word),
 ];
 
 struct Reader<'a> {
@@ -1161,6 +1164,17 @@ enum Jump {
     Leave(Option<String>),
     Iterate(Option<String>),
     Return(Option<String>),
+}
+
+/// A pipeline's statement in a script (`STEP`, `PARALLEL`, `WAIT FOR`), refused by name with its line: `kept.rs` says the words.
+/// Any other `WAIT` is a statement like the rest, and is left to the plain statement it is.
+fn pipeline_word(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
+    let line = r.line(r.at());
+    let (word, next) = (r.word_at(r.i), r.word_at(r.i + 1));
+    match word.and_then(|w| crate::kept::pipeline_part(&w, next.as_deref())) {
+        Some(why) => Err(crate::codes::coded("0A000", format!("line {line}: {why}"))),
+        None => Ok(None),
+    }
 }
 
 fn leave(r: &mut Reader, _: Option<String>) -> Result<Option<Box<dyn Step>>> {
