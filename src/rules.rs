@@ -6,6 +6,7 @@ pub mod alter;
 pub mod create;
 pub mod fit;
 pub mod keys;
+pub mod rows;
 pub mod typed;
 
 use anyhow::{bail, Result};
