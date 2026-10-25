@@ -3271,6 +3271,7 @@ dependencies = [
  "object_store 0.14.2",
  "parquet",
  "pgwire",
+ "pondra-tokio-web",
  "postgres-types",
  "prost",
  "regex",
@@ -3314,6 +3315,17 @@ name = "pondra-launcher"
 version = "0.34.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "pondra-tokio-web"
+version = "0.34.0"
+dependencies = [
+ "futures",
+ "js-sys",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

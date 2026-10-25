@@ -1,0 +1,15 @@
+[package]
+name = "pondra-tokio-web"
+version = "0.34.0"
+edition = "2021"
+publish = false
+description = "tokio's time and task calls over a browser's clock and event loop: the page's stand-in for tokio (designs/page-same-core.md section 2)"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# (tokio's sync, macros, rt and io-util: the same code the node runs. Its time, net, fs and signal are not here: the page's are below.)
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "io-util"] }
+wasm-bindgen = "=0.2.128" # (the same version as the wasm-bindgen command line: web/Cargo.toml's)
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+futures = "0.3"
