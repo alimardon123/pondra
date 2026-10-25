@@ -303,7 +303,12 @@ async fn schema_in(lake: &Lake, db: &str, s: &str) -> Result<()> {
     if ddl::has_schema(&found, s).await? {
         return Ok(());
     }
-    Err(coded("3F000", format!("no schema {s} in {db} (CREATE SCHEMA {s})")))
+    // (pondra is the system's and no one's to make: its words are `ddl::no_schema`'s; any other schema says how to make it, here)
+    let why = match s.eq_ignore_ascii_case(ddl::SYSTEM_SCHEMA) {
+        true => ddl::no_schema(s),
+        false => format!("no schema {s} in {db} (CREATE SCHEMA {s})"),
+    };
+    Err(coded("3F000", why))
 }
 
 /// `sql` read as statements, with the past's and DuckDB's forms first (as `front::expand` reads them).

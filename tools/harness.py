@@ -3512,6 +3512,20 @@ def schemas():
     q("CREATE SCHEMA dbo", 2)
     checks["a schema must exist before its tables; CREATE SCHEMA on a follower"] = "CREATE SCHEMA dbo" in (before or "") and q("CREATE SCHEMA IF NOT EXISTS dbo", 1)["unchanged"] \
         and err("CREATE SCHEMA dbo") is not None and err("DROP SCHEMA public") is not None
+    # pondra is the system's schema: no schema of a user's takes its name, in any case (42939), and its tables still answer
+    # (status, the SQLSTATE in its header, the message as text: the node's own words, not a repr)
+    def answer(s):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse(); body = r.read().decode(errors="replace")
+        return r.status, r.getheader("x-pondra-sqlstate"), body
+    pondra_refused = [answer(s) for s in ("CREATE SCHEMA pondra", "CREATE SCHEMA IF NOT EXISTS Pondra", 'CREATE SCHEMA "PONDRA"')]
+    checks["CREATE SCHEMA pondra, in any case, is refused 42939 (pondra is the system's schema); pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_refused) and isinstance(q("SELECT * FROM pondra.tasks"), list)
+    # a write into a pondra table says the system's words (read-only, 25006 as a backup's write), and no CREATE SCHEMA hint that CREATE SCHEMA pondra refuses
+    st, code, body = answer("INSERT INTO pondra.runs (id) VALUES (1)")
+    checks["a write into pondra.runs: refused 25006, in the system's words (read-only), with no CREATE SCHEMA hint"] = \
+        st != 200 and code == "25006" and "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only" in body and "CREATE SCHEMA" not in body
     q("CREATE TABLE t (k BIGINT, v DOUBLE)", 1)
     q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 2)
     q("INSERT INTO t VALUES (1, 1.0), (2, 2.0)", 1)

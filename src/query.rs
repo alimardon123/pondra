@@ -1350,7 +1350,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         ctx.register_catalog(ns, catalog);
     }
     if crate::runs::mentioned(&text) && default.schema("pondra").is_none() {
-        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a schema of the lake's own called pondra wins)
+        // (`pondra.runs`, `pondra.routines`, `pondra.tasks`; a lake's own schema called pondra is one made before 1.0, which wins as it did: 1.0 refuses a new one, 42939)
         use datafusion::catalog::SchemaProvider;
         let system = Arc::new(MemorySchemaProvider::new());
         for (name, table) in crate::runs::tables(lake).await?.into_iter().chain(crate::users::tables(lake).await?).chain(crate::objects::tables(lake, &text).await?).chain(crate::copy::tables(lake, &text).await?) {
