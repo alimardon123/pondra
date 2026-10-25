@@ -163,7 +163,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
-        _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
+        _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
         _ => "XX000",                                                                          // internal_error
     }
@@ -248,6 +248,7 @@ mod tests {
         assert_eq!(of("constraint \"c\" of relation \"t\" does not exist"), "42704");
         assert_eq!(of("t already has a column w"), "42701");
         assert_eq!(of("key is t's key column: it stays"), "0A000");
+        assert_eq!(of("a is t's last column (DROP TABLE t)"), "0A000");
         assert_eq!(of("ALTER TABLE t ADD COLUMN d … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE t SET d = …)"), "0A000");
         assert_eq!(of("v is a view: write to the tables it reads"), "42809");
         assert_eq!(of("t is a table"), "42809");

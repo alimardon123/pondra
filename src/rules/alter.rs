@@ -101,6 +101,16 @@ pub fn check_renamed(condition: &str, from: &str, to: &str) -> String {
 /// Whether a CHECK's condition reads the column `column`: a drop of the column takes the check with it, as in Postgres.
 pub fn check_reads(condition: &str, column: &str) -> bool { condition_of(condition).is_some_and(|e| names_column(&e, column)) }
 
+/// `ALTER [MATERIALIZED] VIEW [IF EXISTS] v RENAME TO w`, as the node's text takes it (the parser takes only ALTER VIEW … AS):
+/// the two names as written, or None for any other statement. The node and a page rename a view by it.
+pub fn view_rename(sql: &str) -> Option<(String, String)> {
+    static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
+    });
+    let c = VIEW_RENAME.captures(sql)?;
+    Some((c[3].to_string(), c[4].to_string()))
+}
+
 /// A CHECK's condition, read back from its text: the whole text, or None.
 fn condition_of(text: &str) -> Option<ast::Expr> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
@@ -123,6 +133,14 @@ mod tests {
         assert!(check_reads("abs(t.m) < 3", "m"));
         assert!(!check_reads("nm > 0", "m"));
         assert!(!check_reads("'m' <> name", "m"));
+    }
+
+    #[test]
+    fn a_view_rename_is_read_as_the_node_reads_it() {
+        assert_eq!(view_rename("ALTER VIEW v RENAME TO w"), Some(("v".into(), "w".into())));
+        assert_eq!(view_rename("alter materialized view if exists \"BigV\" rename to public.w;"), Some(("\"BigV\"".into(), "public.w".into())));
+        assert_eq!(view_rename("ALTER VIEW v AS SELECT 1"), None);
+        assert_eq!(view_rename("ALTER TABLE t RENAME TO u"), None);
     }
 
     #[test]

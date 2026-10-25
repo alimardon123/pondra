@@ -41,6 +41,8 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock, PoisonError};
 use std::task::Poll;
 
+mod alter; // (ALTER TABLE, ALTER VIEW … RENAME TO and TRUNCATE: `alter_statement`, `truncated`)
+
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
 const FILES: &str = "/files/";
@@ -359,6 +361,12 @@ impl Page {
         if let Some(answer) = self.view_statement(text).await? {
             return Ok(answer);
         }
+        if let Some(answer) = self.alter_statement(text).await? {
+            return Ok(answer);
+        }
+        // (a TRUNCATE is its table's DELETE: the DELETE it becomes is planned and run as any DELETE is)
+        let deleted = self.truncated(text)?;
+        let text = deleted.as_deref().unwrap_or(text);
         let planned = match self.planned(text).await {
             Ok(planned) => planned,
             // (a node to ask: the node answers a statement the page can't plan, or can't expand over a node's table, and the page
@@ -1357,7 +1365,7 @@ impl Page {
             if outer.contains(&name) || !crate::text::mentions(text, &name) {
                 continue;
             }
-            let inner = [outer, &[name.clone()]].concat();
+            let inner = [outer, std::slice::from_ref(&name)].concat();
             let read = Box::pin(self.views_for(&query, &inner)).await?;
             let query = crate::front::expand(&PageHost(self), &query, &read).await?;
             for key in [format!("page.public.{name}"), format!("public.{name}"), name] {
@@ -2904,7 +2912,6 @@ mod tests {
             "INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING",
             "CREATE TEMP TABLE x (id INT)",
             "CREATE TABLE s (id SERIAL)",
-            "ALTER TABLE t ADD COLUMN w INT",
         ] {
             let got = page.request("POST", "/sql", &[], sql.into()).await;
             assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
