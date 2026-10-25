@@ -50,15 +50,17 @@ A connection to a node takes these options:
 | `producer` | random | the name `append` writes under, for exactly-once |
 | `timeout` | 300 | seconds to wait for an answer |
 | `headers` | none | extra headers for every request |
-| `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once, for 64 days (`PONDRA_LOAD_RETENTION_SECS`) |
+| `job` | none | a job id: the connection's writes are numbered under it, so a retry is applied once, for 64 days (`PONDRA_LOAD_RETENTION_SECS`), unless the name starts `auto-` (the clients' own ids: about two minutes) |
 | `echo` | `True` | print what procedures print (their notices) as well as keep them in `db.notices` |
-| `retry_secs` | 60 | how long a call keeps trying while no node answers it (0: once) |
+| `retry_secs` | 60 | how long a call keeps trying while no node answers it (0: once); a write it sends again inside that time is applied once |
 
 Given a cluster's nodes, a connection rides out one going away. A call that no node ran (nobody
 there, a node stopping, a leader cut off from its bucket) goes to the next node, and so does one a
 node may have run if sending it again can't apply it twice: a query, an `append`, and a single
 `INSERT`, `UPDATE`, `DELETE` or `MERGE`, which the connection sends with a job. It keeps trying for
-`retry_secs`; a single address that has never answered is said at once.
+`retry_secs`; a single address that has never answered is said at once. The job's id says until when it may be
+sent again (its first send plus `retry_secs`, as `auto-until<seconds>-…`), and the node keeps the job's record
+until then plus two minutes, a day at most, so a resend is applied once.
 
 ```python norun
 db = pondra.connect(["http://10.0.0.1:8080", "http://10.0.0.2:8080", "http://10.0.0.3:8080"])

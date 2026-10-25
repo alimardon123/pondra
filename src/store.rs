@@ -418,30 +418,30 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 
-/// How long a producer's mark is kept after its last commit, from its name (0: kept for good, as every
-/// mark was before expiries). Three windows:
+/// How long a producer's mark is kept after its last commit, from its name and the time `now` (ms; 0: kept for
+/// good, as every mark was before expiries). Three windows:
 /// - the named window, `copy::retention_ms` (64 days): a job a client named (`POST /sql?job=`,
-///   `POST /insert/{t}?job=`, the Python client's `job=`, `PONDRA_JOB`). The docs promise that a job sent
-///   again is applied once, and a daily load may be re-run days later;
-/// - the retry window, `retry_ms`: an id nobody named (it starts `auto-`, `log::auto_job`), a transaction's
-///   COMMIT and a COPY's chunks, unless a client named the transaction's job;
+///   `POST /insert/{t}?job=`, the Python client's `job=`, `PONDRA_JOB`) whose name doesn't start `auto-`. The docs
+///   promise that a job sent again is applied once, and a daily load may be re-run days later;
+/// - the retry window (`job_kept`): an id that starts `auto-` (the clients' own: `auto-until<S>-` ids, which say
+///   their last resend time, `client_until`, and the others, `log::auto_job`'s and the older clients'), a
+///   transaction's COMMIT and a COPY's chunks, unless a client named the transaction's job;
 /// - 0 for the rest: views', tasks', Kafka's and `/append`'s producers, and the records of COPY INTO files
 ///   (`job:load:`) and of Iceberg snapshots (`job:iceberg:`), which their own code keeps or expires.
 ///
 /// The retry window was checked against the paths that send each kind again, not taken on trust:
-/// - an `auto-` id is resent only by its client's own retries (the Python client's `retry_secs`, 60 s,
-///   python/pondra/client.py:186), by a fenced `pondra sql` starting over with its job (write.rs ~2299,
-///   `PONDRA_JOB` is passed on), and by the inbox: a leader committed the request and died before it deleted
-///   it, and the next writer waits out `alive`'s 30 s (cluster.rs:554, inbox.rs);
+/// - an `auto-` id is resent only by its client's own retries (the clients' `retry_secs`, python/pondra/client.py,
+///   js/index.js), by a fenced `pondra sql` starting over with its job (write.rs ~2299, `PONDRA_JOB` is passed on),
+///   and by the inbox: a leader committed the request and died before it deleted it, and the next writer waits out
+///   `alive`'s 30 s (cluster.rs:554, inbox.rs);
 /// - a transaction's COMMIT (`txn:{id}:{table}`, a fresh id per transaction: txn.rs `start`) is sent once, by
 ///   the node that runs it (txn.rs `commit`: `write::post` to the leader, or `commit_here` on the leader), and
 ///   a failed send goes back to the client as an error with the transaction gone, so nothing sends it again;
 ///   a named transaction (`txn:job-{j}:`) is sent again by its client, so it takes the named window;
 /// - a COPY chunk (`copy:{job}`, pg.rs ~642) is appended once, and its error goes back to the client, which
 ///   can't resume a COPY: nothing sends a chunk again.
-/// So the retry window covers all of them with room. It is `2 × max(PONDRA_LOCK_LEASE_SECS, 60 s)`.
-pub fn kept_ms(producer: &str) -> u64 {
-    let named = |job: &str| if job.starts_with("auto-") { retry_ms() } else { crate::copy::retention_ms() };
+pub fn kept_ms(producer: &str, now: u64) -> u64 {
+    let named = |job: &str| job_kept(job, now);
     if let Some(job) = producer.strip_prefix("sql:") {
         return named(job);
     }
@@ -460,7 +460,35 @@ pub fn kept_ms(producer: &str) -> u64 {
     0
 }
 
-/// The retry window (`kept_ms`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
+/// The window of a job id, from its name (`kept_ms`):
+/// - `auto-until<S>-…` (a client's id, `S` its last resend time in unix seconds: its first send plus its `retry_secs`):
+///   the mark is kept until `S` plus the retry window, so a resend that is still allowed finds it. Measured from `now`
+///   (a commit): `max(retry_ms, S - now) + retry_ms`, and 24 hours at most, whatever `S` says;
+/// - any other `auto-…` id: the clients' own ids (`log::auto_job`, an older client's `auto-{producer}-{n}`, and the
+///   Python client's `producer=`, which is the user's own name, so an `auto-` name a user picks lands here too): the
+///   retry window, whatever follows the prefix;
+/// - any other job: a name a client chose, which is kept for the named window (`copy::retention_ms`).
+fn job_kept(job: &str, now: u64) -> u64 {
+    if let Some(until_s) = client_until(job) {
+        let left = until_s.saturating_mul(1000).saturating_sub(now);
+        return left.max(retry_ms()).saturating_add(retry_ms()).min(UNTIL_CAP_MS);
+    }
+    if job.starts_with("auto-") {
+        return retry_ms();
+    }
+    crate::copy::retention_ms()
+}
+
+/// The most a mark is kept for its client's deadline (`job_kept`): a day.
+const UNTIL_CAP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// `S` of a job id `auto-until<S>-…` (digits, then a dash), if it is one: the last moment its client may send it again.
+pub fn client_until(job: &str) -> Option<u64> {
+    let (digits, _) = job.strip_prefix("auto-until")?.split_once('-')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().unwrap_or(u64::MAX))
+}
+
+/// The retry window (`job_kept`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
 /// default), and at least a minute, so 120 s by default. It has no setting of its own.
 pub fn retry_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();

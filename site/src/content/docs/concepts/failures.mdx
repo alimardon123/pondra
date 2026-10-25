@@ -32,7 +32,8 @@ bootstrap.servers=10.0.0.1:9092,10.0.0.2:9092,10.0.0.3:9092         # a Kafka pr
 
 The Python and JavaScript clients send a call to the next node when no node ran it, and also when
 running it twice couldn't apply it twice: a query, an `append`, and a single `INSERT`, `UPDATE`,
-`DELETE` or `MERGE`, which they send with a job. They keep trying for `retry_secs` (60 by default).
+`DELETE` or `MERGE`, which they send with a job. They keep trying for `retry_secs` (60 by default), and a
+write they send again inside that time is applied once: the job id says how long the node must remember it.
 A connection whose node holds its session (a transaction, temporary tables, `SET`, variables) stays
 on that node, and if the node goes, its next call fails with SQLSTATE `08006`: the session is gone,
 and nothing of an open transaction was applied. See [Python](/pondra/reference/python/#connect) and

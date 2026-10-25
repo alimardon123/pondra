@@ -634,7 +634,7 @@ const PER_COMMIT: usize = 10_000;
 
 fn expiry_key(due: u64, producer: &str) -> String { format!("{EXPIRY}{due:020}/{producer}") }
 
-/// A job id nobody named. It starts `auto-`, which says it is a retry-only id (`store::kept_ms`).
+/// A job id for a write that names none: `auto-` and 32 hex digits, kept for the retry window (`store::kept_ms`).
 pub fn auto_job() -> String { format!("auto-{}", uuid::Uuid::new_v4().simple()) }
 
 /// Where the old marks' pass is (`OLD_MARKS`): `Cursor` at the last `p/` key it swept ("p/" before the
@@ -695,7 +695,7 @@ impl Producers {
         let now = self.now();
         let (mut puts, mut dropped) = (vec![], vec![]);
         for (p, s) in seqs {
-            let kept = kept_ms(p);
+            let kept = kept_ms(p, now);
             if kept > 0 {
                 puts.push((expiry_key(now + kept, p), json(s)));
             }
@@ -721,7 +721,7 @@ impl Producers {
         let page = lake.cat.scan_first(&format!("{after}\0"), "p0", PER_COMMIT).await?;
         for (key, _) in &page {
             let producer = &key[2..];
-            let kept = kept_ms(producer);
+            let kept = kept_ms(producer, now);
             if kept == 0 || seqs.contains_key(producer) {
                 continue;
             }
@@ -1055,18 +1055,25 @@ mod tests {
         }
     }
 
-    /// `kept_ms` by kind and by job: the named window for a job a client named, the retry window for an id
-    /// nobody named and for a transaction or a COPY, nothing for the rest (`store::kept_ms`).
+    /// `kept_ms` by kind and by job: the named window for a job a client named (its name not starting `auto-`), the retry
+    /// window for an id that starts `auto-` (a client's own, whatever follows it) and for a transaction or a COPY, nothing
+    /// for the rest.
     #[test]
     fn kept_ms_is_by_kind_and_job() {
         let (named, retry) = (crate::copy::retention_ms(), retry_ms());
         assert_eq!(retry, 2 * crate::locks::lease().as_secs().max(60) * 1000, "twice the lease, at least a minute");
         assert!(auto_job().starts_with("auto-"));
-        assert_eq!(kept_ms(&format!("sql:{}", auto_job())), retry, "an id nobody named");
+        assert_eq!(kept_ms(&format!("sql:{}", auto_job()), 0), retry, "a client's own id (log::auto_job)");
         for (producer, kept) in [
             ("sql:orders-7", named),
             ("sql:auto-1", retry),
+            ("sql:auto-untilx-1", retry),
+            ("sql:auto-until-1", retry),
+            ("sql:auto-alice-1", retry),
+            ("sql:autos-1", named),
             ("sql:x:auto-y", named),
+            ("sql:auto-py-abc-1", retry),
+            ("sql:auto-js-9b1deb4d-3b7-4", retry),
             ("txn:job-nightly:orders", named),
             ("txn:job-auto-9:orders", retry),
             ("txn:0123456789abcdef0123456789abcdef:orders", retry),
@@ -1081,8 +1088,22 @@ mod tests {
             ("feed:view:0", 0),
             ("py-abc", 0),
         ] {
-            assert_eq!(kept_ms(producer), kept, "{producer}");
+            assert_eq!(kept_ms(producer, 0), kept, "{producer}");
         }
+    }
+
+    /// A client's `auto-until<S>-` id keeps its mark to its last resend time S plus the retry window, counted from the
+    /// commit: at least the window, 24 hours at most, whatever S says (`store::job_kept`).
+    #[test]
+    fn kept_ms_follows_the_clients_deadline() {
+        let retry = retry_ms();
+        let until = |s: u64, now: u64| kept_ms(&format!("sql:auto-until{s}-py-abc-1"), now);
+        assert_eq!(client_until("auto-until1700000000-py-abc-1"), Some(1_700_000_000));
+        assert_eq!(until(300, 0), 300_000 + retry, "retry_secs 300, committed at once: its deadline, then the window");
+        assert_eq!(until(300, 1_000), 299_000 + retry, "committed a second later: the same deadline");
+        assert_eq!(until(10, 0), 2 * retry, "a deadline sooner than the window: the window, then the window again");
+        assert_eq!(until(10, 500_000), 2 * retry, "a deadline already past: the same");
+        assert_eq!(until(u64::MAX / 2, 0), 24 * 60 * 60 * 1000, "a day at most");
     }
 
     /// A mark goes at its window's end (its commit plus `kept_ms`), and only then: its key is what says when.
@@ -1090,14 +1111,14 @@ mod tests {
     async fn a_mark_goes_once_its_window_is_up() -> Result<()> {
         let (dir, lake) = fresh().await?;
         let mut s = Seq::start(&lake, 0).await?;
-        assert!(!duplicate(&s.send(0, &[("sql:auto-a", 1)]).await));
-        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-a").await, Some(1), "its expiry key, due its window from its commit");
+        assert!(!duplicate(&s.send(0, &[("sql:auto-py-a-1", 1)]).await));
+        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-a-1").await, Some(1), "its expiry key, due its window from its commit");
         s.send(retry_ms() - 1, &[("kafka:k", 1)]).await;
-        assert_eq!(mark(&lake, "sql:auto-a").await, Some(1), "not due yet");
+        assert_eq!(mark(&lake, "sql:auto-py-a-1").await, Some(1), "not due yet");
         s.send(retry_ms(), &[("kafka:k", 2)]).await;
-        assert_eq!(mark(&lake, "sql:auto-a").await, None, "due: gone");
-        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-a").await, None, "and its key with it");
-        assert!(!duplicate(&s.send(retry_ms() + 1, &[("sql:auto-a", 1)]).await), "past its window a resend is taken as new");
+        assert_eq!(mark(&lake, "sql:auto-py-a-1").await, None, "due: gone");
+        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-a-1").await, None, "and its key with it");
+        assert!(!duplicate(&s.send(retry_ms() + 1, &[("sql:auto-py-a-1", 1)]).await), "past its window a resend is taken as new");
         done(lake, dir).await
     }
 
@@ -1107,15 +1128,15 @@ mod tests {
     async fn a_producer_committed_again_keeps_its_mark_to_the_last_window() -> Result<()> {
         let (dir, lake) = fresh().await?;
         let mut s = Seq::start(&lake, 0).await?;
-        s.send(0, &[("sql:auto-b", 1)]).await;
-        s.send(100_000, &[("sql:auto-b", 2)]).await;
+        s.send(0, &[("sql:auto-py-b-1", 1)]).await;
+        s.send(100_000, &[("sql:auto-py-b-1", 2)]).await;
         s.send(retry_ms() + 5_000, &[("kafka:k", 1)]).await;
-        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-b").await, None, "the first key went");
-        assert_eq!(mark(&lake, "sql:auto-b").await, Some(2), "the mark stays");
+        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-b-1").await, None, "the first key went");
+        assert_eq!(mark(&lake, "sql:auto-py-b-1").await, Some(2), "the mark stays");
         s.send(100_000 + retry_ms() - 1, &[("kafka:k", 2)]).await;
-        assert_eq!(mark(&lake, "sql:auto-b").await, Some(2), "its last window is not up");
+        assert_eq!(mark(&lake, "sql:auto-py-b-1").await, Some(2), "its last window is not up");
         s.send(100_000 + retry_ms(), &[("kafka:k", 3)]).await;
-        assert_eq!(mark(&lake, "sql:auto-b").await, None, "its last window is up");
+        assert_eq!(mark(&lake, "sql:auto-py-b-1").await, None, "its last window is up");
         done(lake, dir).await
     }
 
@@ -1124,8 +1145,30 @@ mod tests {
     async fn a_resend_inside_the_window_is_a_duplicate() -> Result<()> {
         let (dir, lake) = fresh().await?;
         let mut s = Seq::start(&lake, 0).await?;
-        s.send(0, &[("sql:auto-c", 1)]).await;
-        assert!(duplicate(&s.send(retry_ms() / 2, &[("sql:auto-c", 1)]).await));
+        s.send(0, &[("sql:auto-py-c-1", 1)]).await;
+        assert!(duplicate(&s.send(retry_ms() / 2, &[("sql:auto-py-c-1", 1)]).await));
+        done(lake, dir).await
+    }
+
+    /// A write whose answer is lost is resent by a client that set `retry_secs` to 300 three minutes on, and it is
+    /// applied once: its id says its last resend time (S, its first send at 1 s plus 300 s), so its mark is kept to S
+    /// plus the window. Past that, a resend is taken as new (no client sends it then). An older client's id, with no
+    /// deadline, keeps the short window only, so the same resend finds no mark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resend_three_minutes_on_is_applied_once_with_the_clients_deadline() -> Result<()> {
+        let (dir, lake) = fresh().await?;
+        let mut s = Seq::start(&lake, 0).await?;
+        let job = "sql:auto-until301-py-abc-1";
+        assert!(!duplicate(&s.send(1_000, &[(job, 1)]).await), "the first attempt commits; its answer is lost");
+        assert!(duplicate(&s.send(180_000, &[(job, 1)]).await), "resent at 3 minutes: a duplicate, applied once");
+        assert_eq!(mark(&lake, job).await, Some(1), "still kept: the deadline is 301 s");
+        assert!(duplicate(&s.send(301_000 + retry_ms() - 1, &[(job, 1)]).await), "inside the window after the deadline");
+        s.send(301_000 + retry_ms(), &[("kafka:k", 1)]).await; // (a commit at the mark's due time settles it: then it is gone)
+        assert!(!duplicate(&s.send(301_000 + retry_ms() + 1_000, &[(job, 1)]).await), "past it, no client sends it: taken as new");
+        let older = "sql:auto-py-old-1";
+        assert!(!duplicate(&s.send(400_000, &[(older, 1)]).await));
+        s.send(400_000 + retry_ms(), &[("kafka:k", 2)]).await;
+        assert!(!duplicate(&s.send(580_000, &[(older, 1)]).await), "an id with no deadline keeps the short window only");
         done(lake, dir).await
     }
 
@@ -1146,14 +1189,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn nothing_expires_in_a_new_sequencers_first_window() -> Result<()> {
         let (dir, lake) = fresh().await?;
-        lake.cat.commit(vec![(producer_key("sql:auto-old"), json(&1u64)), (expiry_key(100_000, "sql:auto-old"), json(&1u64))], &[]).await?;
+        lake.cat.commit(vec![(producer_key("sql:auto-py-old"), json(&1u64)), (expiry_key(100_000, "sql:auto-py-old"), json(&1u64))], &[]).await?;
         let mut s = Seq::start(&lake, 50_000).await?;
         s.send(100_500, &[("kafka:k", 1)]).await;
-        assert_eq!(mark(&lake, "sql:auto-old").await, Some(1), "due, but inside this sequencer's first window");
+        assert_eq!(mark(&lake, "sql:auto-py-old").await, Some(1), "due, but inside this sequencer's first window");
         s.send(50_000 + retry_ms() - 1, &[("kafka:k", 2)]).await;
-        assert_eq!(mark(&lake, "sql:auto-old").await, Some(1), "still inside it");
+        assert_eq!(mark(&lake, "sql:auto-py-old").await, Some(1), "still inside it");
         s.send(50_000 + retry_ms(), &[("kafka:k", 3)]).await;
-        assert_eq!(mark(&lake, "sql:auto-old").await, None, "past it, the due mark goes");
+        assert_eq!(mark(&lake, "sql:auto-py-old").await, None, "past it, the due mark goes");
         done(lake, dir).await
     }
 
@@ -1162,17 +1205,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_old_marks_pass_keys_each_mark_once() -> Result<()> {
         let (dir, lake) = fresh().await?;
-        lake.cat.commit(vec![(producer_key("sql:auto-a"), json(&1u64)), (producer_key("sql:nightly"), json(&3u64)), (producer_key("kafka:k"), json(&1u64))], &[]).await?;
+        lake.cat.commit(vec![(producer_key("sql:auto-py-a-1"), json(&1u64)), (producer_key("sql:nightly"), json(&3u64)), (producer_key("kafka:k"), json(&1u64))], &[]).await?;
         let mut s = Seq::start(&lake, 0).await?;
         s.send(0, &[("kafka:z", 1)]).await;
-        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-a").await, Some(1), "a retry-window mark, due its window from the pass");
+        assert_eq!(expiry(&lake, retry_ms(), "sql:auto-py-a-1").await, Some(1), "a retry-window mark, due its window from the pass");
         assert_eq!(expiry(&lake, crate::copy::retention_ms(), "sql:nightly").await, Some(3), "a named job's mark, due the named window");
         assert_eq!(expiry(&lake, retry_ms(), "kafka:k").await, None, "kept for good: no key");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "the pass is finished");
         s.send(1, &[("kafka:z", 2)]).await;
         assert_eq!(lake.cat.count(EXPIRY, "g/~"), Some(2), "a finished pass adds nothing more");
         s.send(retry_ms(), &[("kafka:z", 3)]).await;
-        assert_eq!(mark(&lake, "sql:auto-a").await, None, "its key is due: the mark goes");
+        assert_eq!(mark(&lake, "sql:auto-py-a-1").await, None, "its key is due: the mark goes");
         assert_eq!(mark(&lake, "sql:nightly").await, Some(3), "a named job's mark stays for its window");
         done(lake, dir).await
     }
@@ -1181,7 +1224,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_old_marks_pass_takes_ten_thousand_a_commit_and_resumes() -> Result<()> {
         let (dir, lake) = fresh().await?;
-        lake.cat.commit((0..=PER_COMMIT).map(|i| (producer_key(&format!("sql:auto-{i:05}")), json(&1u64))).collect(), &[]).await?;
+        lake.cat.commit((0..=PER_COMMIT).map(|i| (producer_key(&format!("sql:auto-py-py-{i:05}")), json(&1u64))).collect(), &[]).await?;
         let mut s = Seq::start(&lake, 0).await?;
         s.send(0, &[("kafka:z", 1)]).await;
         assert_eq!(lake.cat.count(EXPIRY, "g/~"), Some(PER_COMMIT), "the first 10 000 keyed by one commit");

@@ -1798,6 +1798,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
     let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
@@ -1905,7 +1906,14 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => rows_sql(m, &stmt)?, // (a RETURNING's rows: worked out here)
+        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => {
+            // A resend whose job's mark is still kept is answered as the duplicate it is, before its statement runs again (the
+            // leader's log would answer the same, once the rows were worked out: `Ack::duplicate`).
+            if named && matches!(stmt, Stmt::Insert(..)) && sent(lake, &job).await? {
+                return Ok(j!({"duplicate": true}));
+            }
+            rows_sql(m, &stmt)? // (a RETURNING's rows: worked out here)
+        }
         (_, Stmt::Insert(_, query)) => {
             let to = app.to();
             let stamped = stamp(lake, &table, Some(&to)).await?;

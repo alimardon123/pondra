@@ -2954,12 +2954,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    LRU of parsed entries by key (256, 16 MB of raw bytes), a hit when the bytes are the ones it was parsed from. A
    per-request read of one table's entry goes through `cat.meta`, not `cat.get::<TableMeta>`; whole scans of every
    entry, writes and restarts parse as before. `cargo test --lib store::`.
-430. **A write's retry mark goes once no resend can come** (`store::kept_ms`, `log::Producers`): a job a client named
-   is remembered for `copy::retention_ms` (64 days), an `auto-` id (`log::auto_job`, and the Python and JS clients'
-   own), a transaction's COMMIT and a COPY's chunks for `store::retry_ms` (twice the lock lease); every other producer
-   is kept for good. A mark goes by the expiry key it was committed with, only while its seq still matches, never in a
-   sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave a commit quiet.
-   A new kind of producer names its window in `kept_ms`. `cargo test --lib log:: store::`, harness `writes`.
+430. **A write's retry mark goes once no resend can come** (`store::kept_ms(producer, now)`, `log::Producers`): a job a
+   client named is remembered for `copy::retention_ms` (64 days), unless its name starts `auto-`; an id that starts
+   `auto-` (a client's own: `log::auto_job`'s `auto-` and 32 hex digits, an older client's `auto-{producer}-{n}`, or a
+   user's `auto-` name) is remembered for `store::retry_ms` (twice the lock lease), as are a transaction's COMMIT and
+   a COPY's chunks; an `auto-until<S>-…` id (the Python and JS clients') until `S` (its last resend time, unix
+   seconds) plus the retry window, counted from the commit, a day at most. Every other producer is kept for good. A mark goes by the expiry key it was committed with, only while its seq
+   still matches, never in a sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave
+   a commit quiet. A mark that is due but not yet expired by a commit still answers a resend as a duplicate (`commit`
+   checks before `settle`). A job's request answers `{"duplicate":true}` before its statement runs when its mark is kept
+   (`write::run_listed`). A new kind of producer names its window in `kept_ms`.
+   `cargo test --release --lib log:: store::`, harness `writes`.
 431. **A table version's planning facts are worked out once** (`query::facts`): its read schema, manifest list, ranges,
    statistics and `hot::known`, kept by the parsed entry's `Arc` (a hit only while its `Weak` upgrades to that same
    `Arc`) and whether system columns are in. `table_view` takes the catalog's `Arc`; a meta of a caller's own goes
