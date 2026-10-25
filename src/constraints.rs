@@ -16,7 +16,7 @@
 //! replaces or deletes, so an UPDATE or an upsert of a key still replaces its row, and the loading
 //! doors keep doing so, which is what a keyed stream is.
 use crate::log::{Ack, Append, Outcome, Sequencer, Src, To};
-use crate::rules::keys::{once, shown, twice, violated};
+use crate::rules::keys::{once, pkey, shown, twice, violated};
 use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Result};
 use datafusion::arrow::array::{Array, RecordBatch};
@@ -60,12 +60,13 @@ pub fn door(meta: &TableMeta, table: &str) -> Result<()> {
 ///
 /// `plain`: the rows are a plain INSERT's. Then a keyed table's key must be new: two rows of one key
 /// are refused, and so is a key a live row of the table holds (`key_checked`). Nothing is replaced,
-/// so the rows of the keys they give stay.
-pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>, plain: bool) -> Result<()> {
+/// so the rows of the keys they give stay. `shaped`: the new rows are a plain INSERT's that `rules::shape` made for
+/// this table (`How::Insert`), so no two of them give one key, and that test isn't made again.
+pub async fn check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: Option<&RecordBatch>, plain: bool, shaped: bool) -> Result<()> {
     let Some(new) = new.filter(|n| n.num_rows() > 0) else { return Ok(()) };
     let named = meta.logical();
     if plain && key_checked(meta) {
-        key_check(lake, table, meta, old, new).await?;
+        key_check(lake, table, meta, old, new, shaped).await?;
     }
     for c in named.constraints.iter().filter(|c| c.enforced && c.kind == Kind::Unique) {
         if let Some(key) = twice(new, &c.columns, &named.key)? {
@@ -86,8 +87,8 @@ fn sql_key(meta: &TableMeta) -> Vec<String> { meta.key.iter().map(|c| meta.name_
 /// A new row whose key one of the `old` rows had is no new key (an UPDATE keeps its key, a swap moves
 /// two keys between rows, a key the change deletes is free), so it is not looked up. Every new row
 /// still counts for the first test. `meta` is the table as it is stored; `new` and `old` are in SQL's
-/// column names. The table is read as this node has it now.
-pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch) -> Result<()> {
+/// column names. The table is read as this node has it now. `shaped`: as `check`'s.
+pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&RecordBatch>, new: &RecordBatch, shaped: bool) -> Result<()> {
     let kept: Vec<Option<bool>> = match old.filter(|o| o.num_rows() > 0) {
         None => vec![None; new.num_rows()], // (a plain INSERT's: nothing taken away, and no key's text to make)
         Some(o) => {
@@ -96,7 +97,7 @@ pub async fn key_check(lake: &Lake, table: &str, meta: &TableMeta, old: Option<&
             crate::txn::key_texts(new, &key)?.iter().map(|k| gone.contains(k).then_some(false)).collect()
         }
     };
-    key_check_over(lake, table, meta, new, &kept).await
+    key_check_over(lake, table, meta, new, &kept, shaped).await
 }
 
 /// A change's new rows of one key are refused as a plain INSERT's are (`once`). `change::run` calls it for a MERGE whose
@@ -115,9 +116,16 @@ pub fn distinct_keys(meta: &TableMeta, table: &str, new: &[RecordBatch]) -> Resu
 /// as this node has it now, `held`). A plain INSERT in a transaction is checked this way at its statement, as Postgres checks it,
 /// so a SAVEPOINT can roll the refusal back. Under READ COMMITTED its keys are its locks by then, so a key another transaction
 /// committed while it waited is held; COMMIT checks every key again either way.
-pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &RecordBatch, kept: &[Option<bool>]) -> Result<()> {
+///
+/// `shaped`: `new` are rows `rules::shape` made for a plain INSERT (`How::Insert`): no two of them give one key, so that test
+/// isn't made again.
+pub async fn key_check_over(lake: &Lake, table: &str, meta: &TableMeta, new: &RecordBatch, kept: &[Option<bool>], shaped: bool) -> Result<()> {
     let key = sql_key(meta);
-    let (name, key) = once(table, &key, new)?;
+    // (rows `rules::shape` made for a plain INSERT give no key twice: it looked, its step 8)
+    let name = match shaped {
+        true => pkey(table),
+        false => once(table, &key, new)?.0,
+    };
     let columns = key.iter().map(|c| new.column_by_name(c).cloned().ok_or_else(|| anyhow::anyhow!("no column {c}"))).collect::<Result<Vec<_>>>()?;
     if let Some(i) = kept.iter().position(|k| *k == Some(true)) {
         return Err(violated(&name, &key, shown(&columns, i)));
@@ -405,7 +413,7 @@ async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: Reco
     // (an empty batch still moves its producer's seq: `change::appends` has nothing to append for it)
     let mut pending = match batch.num_rows() {
         0 => vec![Append { table: table.into(), src: src.clone(), batch: RecordBatch::new_empty(crate::answer::schema(&meta.logical_columns())?), ack: tokio::sync::oneshot::channel().0 }],
-        _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "", false).await?.0, // (a loader's rows: upserts)
+        _ => crate::change::appends(lake, seq, table, &meta, vec![], vec![batch], "", false, false).await?.0, // (a loader's rows: upserts)
     };
     let table_append = pending.first_mut().ok_or_else(|| anyhow::anyhow!("no rows for {table}"))?;
     table_append.src = src;
@@ -455,4 +463,46 @@ pub fn decode(body: bytes::Bytes) -> Result<(String, Src, RecordBatch)> {
     let rows = crate::log::decode(body.get(4 + n..).ok_or_else(|| anyhow::anyhow!("an append cut short"))?)?;
     let batch = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("an append with no rows"))?;
     Ok((table, src, batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+
+    async fn fresh() -> Result<(std::path::PathBuf, Arc<Lake>)> {
+        let dir = std::env::temp_dir().join(format!("pondra-shaped-key-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        Ok((dir, lake))
+    }
+
+    #[tokio::test]
+    async fn a_key_shape_found_once_is_not_looked_for_again() -> Result<()> {
+        let (dir, lake) = fresh().await?;
+        let meta = TableMeta {
+            columns: vec![("id".into(), "Int64".into()), ("v".into(), "Utf8".into())],
+            key: vec!["id".into()],
+            ids: true,
+            ..Default::default()
+        };
+        let rows = |ids: Vec<i64>| -> Result<RecordBatch> {
+            let n = ids.len();
+            let v: ArrayRef = Arc::new(StringArray::from(vec!["x"; n]));
+            Ok(RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from(ids)) as ArrayRef), ("v", v)])?)
+        };
+        let two = rows(vec![1, 1])?;
+        // (both keys taken away by the writer: nothing is looked up in the table)
+        let gone = vec![Some(false), Some(false)];
+        let err = key_check_over(&lake, "s.t", &meta, &two, &gone, false).await.err().expect("a key twice");
+        assert_eq!(crate::codes::of(&err), "23505");
+        assert!(crate::codes::words(&err).contains(r#""t_pkey": Key (id)=(1)"#), "{}", crate::codes::words(&err));
+        key_check_over(&lake, "s.t", &meta, &two, &gone, true).await?;
+        let kept = rows(vec![1])?;
+        let err = key_check_over(&lake, "s.t", &meta, &kept, &[Some(true)], true).await.err().expect("a key the writer keeps");
+        assert_eq!(crate::codes::of(&err), "23505");
+        assert!(crate::codes::words(&err).contains(r#""t_pkey""#), "{}", crate::codes::words(&err));
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

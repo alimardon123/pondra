@@ -74,6 +74,9 @@ impl Table {
     /// Does any column have a DEFAULT? Only then does a loading door work out which rows left a column out.
     pub fn fills(&self) -> bool { self.columns.iter().any(|c| c.default.is_some()) }
 
+    /// Does a write's rows meet a rule of this table: NOT NULL, a CHECK, an enum or a held type? Otherwise `checked` has nothing to do.
+    pub fn ruled(&self) -> bool { !self.checks.is_empty() || self.columns.iter().any(|c| c.not_null || c.held.is_some() || c.labels.is_some()) }
+
     /// The columns a loading door's rows left out, for `shape`: none when no column has a DEFAULT (`fills`), else each column
     /// with a DEFAULT that `given` doesn't name (by SQL's name).
     pub fn left_out(&self, given: &[String]) -> LeftOut {
@@ -91,10 +94,8 @@ impl Table {
 /// A write's rows as they come: by position (`INSERT INTO t VALUES …`), by name with the columns or rows that left a column
 /// out (`LeftOut`, a loading door's), or whole, in the table's columns already (an UPDATE's or MERGE's new versions).
 pub enum Rows {
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Positional(RecordBatch),
     Named(RecordBatch, LeftOut),
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Whole(RecordBatch),
 }
 
@@ -105,12 +106,13 @@ pub enum LeftOut {
     PerRow(HashMap<String, BooleanArray>),
 }
 
-/// What the rows are for: a plain INSERT, a loading door's rows, or an UPDATE's or MERGE's new versions.
+/// What the rows are for, which says whether `shape` looks for a key given twice among them (step 8): a plain INSERT (`Insert`:
+/// it looks, when the table's key is checked); rows whose writer looks for that itself, later (`Load`: a loading door's, an
+/// INSERT whose key check comes after its row locks, R8, or after it asks whether its job is in, and a temporary table's INSERT,
+/// whose key is checked over all its rows, R6); or an UPDATE's or MERGE's new versions (`Change`).
 pub enum How {
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Insert,
     Load,
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Change,
 }
 
@@ -166,8 +168,7 @@ pub async fn fill<H: Host>(t: &Table, rows: RecordBatch, left_out: impl Fn(&str)
 /// first by name). `name` is the table's, for the words. `rows` are under SQL's names when `sql_names`, else under the stored
 /// ones. A row whose delete marker is set passes the CHECKs and the NOT NULLs.
 pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: &SessionContext) -> Result<()> {
-    let ruled = !t.checks.is_empty() || t.columns.iter().any(|c| c.not_null || c.held.is_some() || c.labels.is_some());
-    if !ruled || rows.num_rows() == 0 {
+    if !t.ruled() || rows.num_rows() == 0 {
         return Ok(());
     }
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
@@ -347,6 +348,17 @@ mod tests {
         assert!(!table(&["id"], vec![(plain("id"), DataType::Int64)], &[]).checked());
         let unique = Table { unique: vec![("a_key".into(), vec!["a".into()])], ..table(&[], vec![(plain("a"), DataType::Int64)], &[]) };
         assert!(unique.checked());
+    }
+
+    #[test]
+    fn a_table_is_ruled_when_a_write_meets_a_rule() {
+        assert!(!table(&[], vec![(plain("a"), DataType::Int64)], &[]).ruled());
+        assert!(table(&[], vec![(plain("a"), DataType::Int64)], &[("a_pos", "a > 0")]).ruled(), "a CHECK");
+        assert!(keyed().ruled(), "a key's column is NOT NULL");
+        let held = Column { held: Some("jsonb".into()), ..plain("j") };
+        assert!(table(&[], vec![(held, DataType::Utf8)], &[]).ruled(), "a held type");
+        let labelled = Column { labels: Some((None, vec!["x".into()])), ..plain("e") };
+        assert!(table(&[], vec![(labelled, DataType::Utf8)], &[]).ruled(), "an enum's labels");
     }
 
     #[test]

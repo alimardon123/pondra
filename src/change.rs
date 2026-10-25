@@ -527,7 +527,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     if !matches!(stmt, crate::write::Stmt::Insert(..)) {
         crate::write::identity(lake, &stmt).await?;
     }
-    let stored: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
+    let stored = lake.cat.meta(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?; // (as parsed once a version: `rules` is the memo)
     let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)
     let view = lake.cat.get::<crate::views::View>(&crate::views::view_key(&table)).await?;
     ensure!(view.is_none(), "{table} is a view's: change the table it follows");
@@ -541,9 +541,19 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         crate::write::Stmt::Update(_, set, Some(cond)) if !append => crate::txn::point_change(lake, &table, &stored, None, set, cond).await?, // (one key: no planning, ADR-036 §6)
         _ => None,
     };
-    let (old, new) = match point {
-        Some(p) => p,
-        None => rows_of(lake, &table, &meta, &stmt, upto).await?,
+    let insert = matches!(stmt, crate::write::Stmt::Insert(..) | crate::write::Stmt::InsertInto(..));
+    // (a retried INSERT's job is answered before its rows are worked out again: they would meet its own rows)
+    if insert && !job.is_empty() && crate::write::sent(lake, job).await? {
+        return Ok(j!({"duplicate": true}));
+    }
+    let (old, new) = match (point, &stmt) {
+        (Some(p), _) => p,
+        (None, crate::write::Stmt::Insert(_, query)) => (vec![], vec![inserted(lake, &table, &stored, query, upto).await?]),
+        (None, crate::write::Stmt::InsertInto(t, names, query)) => {
+            let query = crate::write::whole_rows(lake, t, names, query).await?;
+            (vec![], vec![inserted(lake, &table, &stored, &query, upto).await?])
+        }
+        (None, _) => rows_of(lake, &table, &meta, &stmt, upto).await?,
     };
     // Only a change that takes rows back asks what follows the table: one of no rows is answered as
     // Postgres does (DELETE 0), and one that only adds rows (an INSERT, a MERGE that matched none)
@@ -575,7 +585,14 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
             crate::constraints::distinct_keys(&stored, &table, &new)?;
         }
     }
-    commit(lake, seq, &table, &stored, old, new, job, plain).await
+    commit(lake, seq, &table, &stored, old, new, job, plain, insert).await
+}
+
+/// A plain INSERT's rows into `table` (one with an enforced UNIQUE: `constraints.rs`), as of `upto`, shaped once
+/// (`write::rows`, `How::Insert`: no key twice among them).
+async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, query: &str, upto: u64) -> Result<RecordBatch> {
+    let rules = stored.rules()?;
+    Ok(crate::write::rows(lake, &session(lake, query, upto).await?, &rules, table, query, crate::rules::How::Insert).await?.into_rows())
 }
 
 /// What an UPDATE, DELETE or MERGE of `table` changes, as of commit `upto`: the old versions of
@@ -589,11 +606,6 @@ pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::w
         }
         crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
         crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
-        crate::write::Stmt::Insert(_, query) => (vec![], vec![crate::write::rows(lake, &session(lake, query, upto).await?, meta, query).await?]), // (a checked table's: `constraints.rs`)
-        crate::write::Stmt::InsertInto(t, names, query) => {
-            let query = crate::write::whole_rows(lake, t, names, query).await?;
-            (vec![], vec![crate::write::rows(lake, &session(lake, &query, upto).await?, meta, &query).await?])
-        }
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     })
 }
@@ -753,14 +765,15 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
 /// The change as one commit: new versions and new rows into the table; the old versions into
 /// `{t}$deleted` (an append table) or as delete markers (a keyed one). `meta` as stored; the rows
 /// are under their SQL names (the log takes them so: `log::pack`). `plain`: a plain INSERT's rows.
+/// `shaped`: the rows are a plain INSERT's that `run` shaped for `meta`, its job found new first.
 #[allow(clippy::too_many_arguments)]
-async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str, plain: bool) -> Result<Value> {
+async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str, plain: bool, shaped: bool) -> Result<Value> {
     // A retried job's change is in already: say so before the key check, which would find the
     // change's own rows and refuse a retried plain INSERT (23505) where the job is a duplicate.
-    if !job.is_empty() && lake.cat.get::<u64>(&producer_key(&format!("sql:{job}"))).await?.unwrap_or(0) > 0 {
+    if !shaped && !job.is_empty() && lake.cat.get::<u64>(&producer_key(&format!("sql:{job}"))).await?.unwrap_or(0) > 0 {
         return Ok(j!({"duplicate": true}));
     }
-    let (pending, (replaced, added, inserted)) = appends(lake, seq, table, meta, old, new, &format!("sql:{job}"), plain).await?;
+    let (pending, (replaced, added, inserted)) = appends(lake, seq, table, meta, old, new, &format!("sql:{job}"), plain, shaped).await?;
     if pending.is_empty() {
         return Ok(j!({"rows": 0}));
     }
@@ -784,9 +797,11 @@ pub async fn submit(lake: &Lake, seq: &Sequencer, pending: &[Append]) -> Result<
 /// A change of `table` as appends, stamped (producer `{producer}` and `{producer}:deleted`, seq 1):
 /// and its counts, (rows replaced, rows added, of them new). None to append: nothing changes.
 /// `plain`: the new rows are a plain INSERT's (their keys must be new: `constraints::check`); a
-/// loader's, a view's or a transaction's own changes are not.
+/// loader's, a view's or a transaction's own changes are not. `shaped`: the new rows are a plain INSERT's that `run`
+/// shaped for `meta` under this same lock (`How::Insert`): they aren't checked again, and no key is looked for twice
+/// among them again.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str, plain: bool) -> Result<(Vec<Append>, (usize, usize, usize))> {
+pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str, plain: bool, shaped: bool) -> Result<(Vec<Append>, (usize, usize, usize))> {
     let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let (replaced, added) = (rows(&old), rows(&new));
     if replaced + added == 0 {
@@ -804,9 +819,9 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
         Some(s) => one(old, s)?,
         None => None,
     };
-    let new = one(new, ids.clone())?.map(|n| crate::defaults::fit(meta, table, n)).transpose()?; // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
+    let new = one(new, ids.clone())?.map(|n| if shaped { Ok(n) } else { crate::defaults::fit(meta, table, n) }).transpose()?; // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
     if crate::constraints::needs_check(meta, plain) {
-        crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain).await?; // (under the lake's lock: no other write of the table between)
+        crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain, shaped).await?; // (under the lake's lock: no other write of the table between)
     }
     let inserted = new.as_ref().and_then(|n| Some(n.column_by_name(ROW_ID)?.null_count())).unwrap_or(0); // (new rows: no id yet)
     let src = |p: &str| Src { producer: format!("{producer}{p}"), seq: 1, prev: None };

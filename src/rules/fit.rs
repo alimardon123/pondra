@@ -42,7 +42,7 @@ fn with_seconds(c: &ArrayRef) -> Result<ArrayRef> {
 }
 
 /// The columns an INSERT without a column list fills, as Postgres takes them: the first `width` of the table's (all of
-/// them when the width isn't known, or isn't smaller). The rest take their DEFAULTs (`fitted`).
+/// them when the width isn't known, or isn't smaller). The rest take their DEFAULTs (`rules::shape`).
 pub fn implicit(columns: &[String], width: Option<usize>) -> &[String] {
     match width {
         Some(n) if n < columns.len() => &columns[..n],
@@ -50,7 +50,7 @@ pub fn implicit(columns: &[String], width: Option<usize>) -> &[String] {
     }
 }
 
-/// A query's rows as the table's columns, in its order and types (`rows` fits them with `fitted`; the tests of `literals.rs`
+/// A query's rows as the table's columns, in its order and types (`shape` fits them, by position; the tests of `literals.rs`
 /// fit a literal's rows with this, where no table has defaults to fill).
 #[cfg(test)]
 pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> { fit_with(target, all).map(|(batch, _)| batch) }
@@ -62,7 +62,7 @@ pub fn by_position(target: &datafusion::arrow::datatypes::Schema) -> impl Iterat
     target.fields().iter().filter(|f| f.name() != "_deleted")
 }
 
-/// `fit`, and the names of the columns the rows left out at the end: NULL in the batch until `fitted` gives them their
+/// `fit`, and the names of the columns the rows left out at the end: NULL in the batch until `shape` gives them their
 /// DEFAULTs. A batch's `_deleted` column is the table's marker, by name; its other columns fill the table's others in
 /// order (`by_position`).
 pub fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<String>)> {
@@ -86,7 +86,7 @@ pub fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, V
         match given.len() > 0 {
             true => strict(given.next().expect("counted"), f.data_type()),
             false => {
-                padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `fitted`)
+                padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `shape`)
                 Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows()))
             }
         }

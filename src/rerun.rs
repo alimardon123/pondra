@@ -773,7 +773,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
             turn.upto.store(now, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
-        let (mut pending, _) = crate::change::appends(lake, seq, view, &meta, vec![old], vec![new], &producer, false).await?; // (a view's rows: upserts)
+        let (mut pending, _) = crate::change::appends(lake, seq, view, &meta, vec![old], vec![new], &producer, false, false).await?; // (a view's rows: upserts)
         if pending.is_empty() {
             // (nothing came out different: only its progress moves, both parts' together)
             let empty = |table: String, s: SchemaRef| crate::log::Append { table, src: crate::log::Src { producer: String::new(), seq: 0, prev: None }, batch: RecordBatch::new_empty(s), ack: tokio::sync::oneshot::channel().0 };

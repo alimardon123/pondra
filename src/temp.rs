@@ -92,6 +92,7 @@ const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres c
 
 struct Table {
     meta: TableMeta, // its definition as a lake table's is (columns, PRIMARY KEY, NOT NULL, DEFAULT, CHECK, the typed columns): every write is checked as a lake table's is
+    rules: Arc<crate::rules::Table>, // (its rules, made once at CREATE: every write's rows are shaped for them)
     rows: Vec<RecordBatch>, // its columns, then its system columns (`sys.rs`)
     next: i64,              // the next row id
     version: i64,           // the last change's number (its rows' `_version`)
@@ -388,7 +389,8 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
     }
     crate::defaults::definition(&columns, &defaults, &checks).await.map_err(crate::write::definition)?; // (checked as CREATE TABLE checks them: 42P16 when wrong)
     let meta = TableMeta { columns, key, sql_types, not_null, defaults, checks, ids: true, ..Default::default() };
-    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { meta, rows: vec![], next: 1, version: 0 })))?;
+    let rules = Arc::new(meta.to_rules()?);
+    with(s, true, |x| Ok(x.tables.insert(name.clone(), Table { meta, rules, rows: vec![], next: 1, version: 0 })))?;
     let rows = match &c.query {
         Some(q) => insert(app, s, &name, None, &q.to_string(), files).await?["rows"].clone(),
         None => j!(0),
@@ -398,7 +400,7 @@ async fn create(app: &App, s: &str, c: &ast::CreateTable, files: bool) -> Result
 
 /// `INSERT INTO name [(columns)] query`.
 async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query: &str, files: bool) -> Result<Value> {
-    let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.meta.clone()).with_context(|| format!("no temporary table {name}"))?;
+    let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
             let all = crate::rules::rows::row_columns(meta.columns.iter().map(|(c, _)| c.clone()), n);
@@ -409,21 +411,26 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    let batch = crate::write::rows(&app.lake, &ctx, &meta, &query).await?;
-    let n = batch.num_rows();
-    apply(s, name, HashSet::new(), vec![batch])?;
+    let rows = crate::write::rows(&app.lake, &ctx, &rules, name, &query, crate::rules::How::Load).await?; // (Load: its key is checked over all its rows, `check_key`: R6)
+    let n = rows.rows().num_rows();
+    apply(s, name, HashSet::new(), vec![rows])?;
     Ok(j!({"rows": n}))
 }
 
-/// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, applied here.
+/// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, shaped for the table's rules, applied here.
 async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
-    let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.meta.clone()).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
+    let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
     let (old, new) = crate::change::rows_of(&app.lake, name, &meta, stmt, app.lake.visible()).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
     let (replaced, added) = (count(&old), count(&new));
     let gone: HashSet<i64> = old.iter().filter_map(|b| b.column_by_name(crate::text::ROW_ID)).flat_map(|c| c.as_primitive::<Int64Type>().iter().flatten().collect::<Vec<_>>()).collect();
-    apply(s, name, gone, new)?;
+    let host = crate::defaults::Node(&app.lake);
+    let mut shaped = Vec::with_capacity(new.len());
+    for b in new {
+        shaped.push(crate::rules::shape(&rules, name, crate::rules::Rows::Whole(b), crate::rules::How::Change, &host).await?);
+    }
+    apply(s, name, gone, shaped)?;
     Ok(j!({"rows": replaced + inserted, "updated": added - inserted, "deleted": replaced + inserted - added, "inserted": inserted}))
 }
 
@@ -431,14 +438,14 @@ async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
 /// changed row keeps): one change, within the memory temporary tables may take. The rows are made and
 /// checked outside the sessions' lock, so a big change never stalls another session; they are put in
 /// place only if the table is still as it was read, else made again from what it is now.
-fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Result<()> {
+fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<crate::rules::Shaped>) -> Result<()> {
     static BUDGET: LazyLock<usize> = LazyLock::new(|| crate::env::or("PONDRA_TEMP_MB", 1024usize) << 20);
     loop {
-        let (meta, old, next, version) = with(s, false, |x| {
+        let (meta, rules, old, next, version) = with(s, false, |x| {
             let t = x.tables.get(name).with_context(|| format!("no temporary table {name}"))?;
-            Ok((t.meta.clone(), t.rows.clone(), t.next, t.version))
+            Ok((t.meta.clone(), t.rules.clone(), t.rows.clone(), t.next, t.version))
         })?;
-        let (rows, next) = changed(&meta, name, &old, &gone, &new, next, version + 1)?;
+        let (rows, next) = changed(&meta, &rules, name, &old, &gone, &new, next, version + 1)?;
         let others: usize = SESSIONS.lock().unwrap().iter().flat_map(|(k, x)| x.tables.iter().filter(move |(n, _)| k != s || *n != name)).map(|(_, t)| t.bytes()).sum();
         let bytes: usize = rows.iter().map(|b| b.get_array_memory_size()).sum();
         ensure!(others + bytes <= *BUDGET, "temporary tables on this node would hold {} MB, past PONDRA_TEMP_MB ({} MB): a lake table holds more", (others + bytes) >> 20, *BUDGET >> 20);
@@ -457,8 +464,10 @@ fn apply(s: &str, name: &str, gone: HashSet<i64>, new: Vec<RecordBatch>) -> Resu
 }
 
 /// `old` without the rows `gone` names, and with `new` as change `version`, each new row given its id (from
-/// `next` unless it keeps one) and checked as its table checks it: the rows, and the next row id.
-fn changed(meta: &TableMeta, name: &str, old: &[RecordBatch], gone: &HashSet<i64>, new: &[RecordBatch], mut next: i64, version: i64) -> Result<(Vec<RecordBatch>, i64)> {
+/// `next` unless it keeps one) and cast to its table's types: the rows, and the next row id. `new` come shaped by `rules`
+/// (`rules::shape` checked them), so they are not checked again unless the table's rules are not the ones they were shaped for.
+#[allow(clippy::too_many_arguments)]
+fn changed(meta: &TableMeta, rules: &Arc<crate::rules::Table>, name: &str, old: &[RecordBatch], gone: &HashSet<i64>, new: &[crate::rules::Shaped], mut next: i64, version: i64) -> Result<(Vec<RecordBatch>, i64)> {
     let now = crate::log::now_ms() as i64 * 1000;
     let mut rows = vec![];
     for b in old {
@@ -467,7 +476,13 @@ fn changed(meta: &TableMeta, name: &str, old: &[RecordBatch], gone: &HashSet<i64
         rows.push(datafusion::arrow::compute::filter_record_batch(b, &keep)?);
     }
     let (schema, n) = (schema_of(meta)?, meta.columns.len());
-    for b in new.iter().filter(|b| b.num_rows() > 0) {
+    for s in new.iter().filter(|s| s.rows().num_rows() > 0) {
+        // (shaped for the table as it is: `shape` checked them. Rows shaped for a definition it no longer has, made again
+        // meanwhile, are checked again, as the log checks them: R9)
+        let b = match crate::rules::Table::same(s.table(), rules) {
+            true => s.rows().clone(),
+            false => crate::rules::checked(rules, name, s.rows().clone(), true, crate::defaults::base())?,
+        };
         let len = b.num_rows();
         let fresh = |c: Option<&ArrayRef>, next: &mut i64| -> Vec<i64> {
             let given = c.map(|c| c.as_primitive::<Int64Type>().clone());
@@ -483,9 +498,7 @@ fn changed(meta: &TableMeta, name: &str, old: &[RecordBatch], gone: &HashSet<i64
         let mut columns: Vec<ArrayRef> = b.columns()[..n].to_vec();
         columns.extend([Arc::new(Int64Array::from(ids)) as ArrayRef, Arc::new(Int64Array::from(vec![version; len])), time(created), time(vec![now; len])]);
         let columns = columns.iter().zip(schema.fields()).map(|(c, f)| datafusion::arrow::compute::cast(c, f.data_type())).collect::<Result<_, _>>()?; // (as the table's types)
-        let batch = RecordBatch::try_new(schema.clone(), columns)?;
-        let batch = crate::defaults::fit(meta, name, batch)?; // (every write lands here: a value its column can't hold is refused as a lake table refuses it)
-        rows.push(batch);
+        rows.push(RecordBatch::try_new(schema.clone(), columns)?);
     }
     check_key(name, &meta.columns, &meta.key, &rows)?;
     Ok((rows, next))
@@ -532,7 +545,7 @@ mod tests {
             ids: true,
             ..Default::default()
         };
-        let table = Table { meta, rows: vec![], next: 1, version: 0 };
+        let table = Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 };
         SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), table);
         SESSION.sync_scope(Some(s.to_string()), || {
             assert_eq!(columns_of("tt"), Some(vec![("u".to_string(), Some("uuid".to_string())), ("v".to_string(), Some("varchar(3)".to_string())), ("n".to_string(), None)]));
@@ -542,9 +555,27 @@ mod tests {
         SESSIONS.lock().unwrap().remove(s);
     }
 
-    #[test]
-    fn a_temporary_table_refuses_what_its_not_null_and_checks_refuse() {
-        // (its writes are checked as a lake table's are: `apply` runs `defaults::fit`, which runs `rules::checked`, over each batch)
+    /// The tests' host: CHECKs planned in the node's base session, and no DEFAULT to fill.
+    struct Checks;
+
+    impl crate::rules::Host for Checks {
+        fn base(&self) -> &datafusion::prelude::SessionContext { crate::defaults::base() }
+        async fn values(&self, _: &str, _: usize) -> Result<ArrayRef> { anyhow::bail!("no DEFAULT in these tests") }
+    }
+
+    /// Rows of two Int32 columns, `a` and `c`, as a write gives them.
+    fn ac_batch(a: Vec<Option<i32>>, c: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("a", DataType::Int32, true),
+            datafusion::arrow::datatypes::Field::new("c", DataType::Int32, true),
+        ]));
+        let columns: Vec<ArrayRef> = vec![Arc::new(datafusion::arrow::array::Int32Array::from(a)), Arc::new(datafusion::arrow::array::Int32Array::from(c))];
+        RecordBatch::try_new(schema, columns).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_temporary_table_refuses_what_its_not_null_and_checks_refuse() {
+        // (its writes are shaped as a lake table's are: `rules::shape` checks each batch before `apply` puts it in place)
         let s = "unit-temp-checks";
         let meta = TableMeta {
             columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())],
@@ -553,22 +584,38 @@ mod tests {
             ids: true,
             ..Default::default()
         };
-        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { meta, rows: vec![], next: 1, version: 0 });
-        let batch = |a: Vec<Option<i32>>, c: Vec<i32>| {
-            let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-                datafusion::arrow::datatypes::Field::new("a", DataType::Int32, true),
-                datafusion::arrow::datatypes::Field::new("c", DataType::Int32, true),
-            ]));
-            let columns: Vec<ArrayRef> = vec![Arc::new(datafusion::arrow::array::Int32Array::from(a)), Arc::new(datafusion::arrow::array::Int32Array::from(c))];
-            RecordBatch::try_new(schema, columns).unwrap()
-        };
-        let null_a = apply(s, "tt", HashSet::new(), vec![batch(vec![None], vec![1])]).unwrap_err();
+        let rules = Arc::new(meta.to_rules().unwrap());
+        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: rules.clone(), meta, rows: vec![], next: 1, version: 0 });
+        let null_a = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![None], vec![1])), crate::rules::How::Change, &Checks).await.err().expect("a NULL in NOT NULL");
         assert!(format!("{null_a:#}").contains("tt.a is NOT NULL"), "{null_a:#}");
-        let bad_c = apply(s, "tt", HashSet::new(), vec![batch(vec![Some(1)], vec![-5])]).unwrap_err();
+        let bad_c = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1)], vec![-5])), crate::rules::How::Change, &Checks).await.err().expect("a CHECK");
         assert!(format!("{bad_c:#}").contains("violates check constraint \"tt_c_check\""), "{bad_c:#}");
-        apply(s, "tt", HashSet::new(), vec![batch(vec![Some(1), Some(2)], vec![5, 6])]).unwrap();
+        let good = crate::rules::shape(&rules, "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1), Some(2)], vec![5, 6])), crate::rules::How::Change, &Checks).await.unwrap();
+        apply(s, "tt", HashSet::new(), vec![good]).unwrap();
         let kept: usize = SESSIONS.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
         assert_eq!(kept, 2, "the refused writes left nothing; the good rows are there");
+        SESSIONS.lock().unwrap().remove(s);
+    }
+
+    #[tokio::test]
+    async fn rows_shaped_for_another_definition_are_checked_again() {
+        // (rows shaped for a definition the table no longer has are checked again, as the log checks its rows: R9)
+        let s = "unit-temp-redefined";
+        let meta = TableMeta {
+            columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())],
+            not_null: vec!["a".into()],
+            checks: vec![("tt_c_check".into(), "c > 0".into())],
+            ids: true,
+            ..Default::default()
+        };
+        let mut loose = meta.clone();
+        loose.checks.clear();
+        let shaped = crate::rules::shape(&Arc::new(loose.to_rules().unwrap()), "tt", crate::rules::Rows::Whole(ac_batch(vec![Some(1)], vec![-5])), crate::rules::How::Change, &Checks).await.unwrap();
+        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().tables.insert("tt".to_string(), Table { rules: Arc::new(meta.to_rules().unwrap()), meta, rows: vec![], next: 1, version: 0 });
+        let refused = apply(s, "tt", HashSet::new(), vec![shaped]).unwrap_err();
+        assert!(format!("{refused:#}").contains("violates check constraint \"tt_c_check\""), "{refused:#}");
+        let kept: usize = SESSIONS.lock().unwrap()[s].tables["tt"].rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(kept, 0, "nothing is kept");
         SESSIONS.lock().unwrap().remove(s);
     }
 }

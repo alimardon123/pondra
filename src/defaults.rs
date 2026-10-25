@@ -59,28 +59,6 @@ pub async fn definition(columns: &[(String, String)], defaults: &std::collection
     Ok(())
 }
 
-/// A bulk INSERT's rows (under their stored names), checked as they stream into files.
-pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
-    use futures::StreamExt;
-    let Some(meta) = meta.as_ref().filter(|m| ruled(m)) else { return rows };
-    let (schema, table) = (rows.schema(), table.to_string());
-    let t = match meta.to_rules() {
-        Ok(t) => t,
-        Err(e) => {
-            let one = futures::stream::once(async move { Err::<datafusion::arrow::array::RecordBatch, _>(datafusion::error::DataFusionError::External(e.into())) });
-            return Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, one));
-        }
-    };
-    let checked = rows.map(move |b| {
-        let b = b?;
-        crate::rules::checked(&t, &table, b, false, &BASE).map_err(|e| datafusion::error::DataFusionError::External(e.into()))
-    });
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, checked))
-}
-
-/// Does the table have defaults (under SQL's names)?
-pub fn any(meta: &TableMeta) -> bool { !meta.defaults.is_empty() }
-
 /// A node as the write rules' host (`rules::Host`): a CHECK is planned in `BASE`, and a DEFAULT's values in a session of the
 /// lake's own, where `nextval` is the lake's sequence.
 pub struct Node<'a>(pub &'a crate::store::Lake);
@@ -118,18 +96,6 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
         Err(e) => bail!("{column} DEFAULT {expr}: {e} (a default is an expression of constants and built-in functions, such as now() or uuid())"),
     }
 }
-
-/// `rows` with defaults put where the write left a column out: `left_out(column)` says in which
-/// rows (None: in none).
-pub async fn fill(lake: &crate::store::Lake, meta: &TableMeta, rows: RecordBatch, left_out: impl Fn(&str) -> Option<BooleanArray>) -> Result<RecordBatch> {
-    if !any(meta) || rows.num_rows() == 0 {
-        return Ok(rows);
-    }
-    crate::rules::fill(&meta.to_rules()?, rows, left_out, &Node(lake)).await
-}
-
-/// Every row left `column` out (a batch without it).
-pub fn all(n: usize) -> BooleanArray { BooleanArray::from(vec![true; n]) }
 
 /// JSON lines: for each default's column, the rows whose object hasn't the key.
 pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::HashMap<String, BooleanArray>> {

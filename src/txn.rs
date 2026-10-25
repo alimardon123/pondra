@@ -769,23 +769,23 @@ fn conflict(table: &str) -> anyhow::Error {
     crate::codes::coded("40001", format!("could not serialize access due to concurrent update of {table}: try the transaction again"))
 }
 
-/// The rows of an INSERT as the table takes them, worked out as of commit `at` by `query` (`write::rows_of`) and checked by the
-/// table's rules (NOT NULL, CHECK, the types). `meta` is the table as SQL names it, `stored` as it is kept.
-async fn checked_rows(lake: &Lake, name: &str, meta: &TableMeta, stored: &Arc<TableMeta>, query: &str, at: u64, files: bool) -> Result<RecordBatch> {
-    let rows = crate::write::rows_of(lake, lake, meta, query, Some(at), files).await?;
-    let rules = stored.rules()?;
-    crate::rules::checked(&rules, name, rows, true, crate::defaults::base())
+/// The rows of an INSERT as the table takes them, worked out as of commit `at` by `query` (`write::rows_of`) and shaped once by
+/// the table's rules (NOT NULL, CHECK, the types), as `How::Load`: no key is looked at here. `stored` is the table as it is kept.
+async fn checked_rows(lake: &Lake, name: &str, stored: &Arc<TableMeta>, query: &str, at: u64, files: bool) -> Result<RecordBatch> {
+    Ok(crate::write::rows_of(lake, lake, &stored.rules()?, name, query, Some(at), files, crate::rules::How::Load).await?.into_rows())
 }
 
 /// An INSERT's rows, worked out as of a read point and, under READ COMMITTED, with the keys they write locked (ADR-067 §3).
 /// The query may have read a key another transaction changed while the lock waited (a counter's `n + 1`, an upsert's
-/// `ON CONFLICT`): then the rows are worked out again as of the commit the locks were granted at (`passes`).
-async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
+/// `ON CONFLICT`): then the rows are worked out again as of the commit the locks were granted at (`passes`). The rows are
+/// shaped once, by `rules::shape` (`Load`: their keys are looked at after the locks, as before: R8).
+async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapshot: u64, files: bool) -> Result<(crate::rules::Shaped, u64, Option<Keys>)> {
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
-        let rows = checked_rows(lake, l.name, l.meta, stored, query, at, files).await?;
+        // (`Load`: the rows' keys are looked at after the locks, `key_check` and `key_check_over`, as before: R8)
+        let rows = crate::write::rows_of(lake, lake, &stored.rules()?, l.name, query, Some(at), files, crate::rules::How::Load).await?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
-        let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
+        let keys = if rows.rows().num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(rows.rows()))? };
         Ok((rows, keys))
     })
     .await
@@ -837,7 +837,7 @@ async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, m: &crate::change:
     let Some(query) = m.upsert_query() else { return Ok(None) };
     let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `change::session`)
     let sql = crate::write::whole_rows_of(lake, name, stored, &p.given, query).await?;
-    let proposed = checked_rows(lake, name, meta, stored, &sql, snapshot, files).await?;
+    let proposed = checked_rows(lake, name, stored, &sql, snapshot, files).await?;
     let inserted = inserted_row(meta, &proposed)?;
     let Ok(mut keys) = keys_of(&proposed, &meta.key) else { return Ok(None) };
     let Some(key) = keys.pop() else { return Ok(None) };
@@ -981,11 +981,11 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
                 // A plain INSERT's keys are checked at the statement, where Postgres checks them, so a SAVEPOINT can roll the
                 // refusal back: a key this transaction's own rows hold is refused, one it took away is free (`ByKey`), and the
                 // rest are looked up in the table as it is now. COMMIT checks them again (`write_changes`).
-                let texts = key_texts(&rows, &meta.key)?;
+                let texts = key_texts(rows.rows(), &meta.key)?;
                 let kept = with_txn(|t| t.by_key.get(&name).map(|by| by.kept(&texts))).flatten().unwrap_or_else(|| vec![None; texts.len()]);
-                crate::constraints::key_check_over(lake, &name, &stored, &rows, &kept).await?;
+                crate::constraints::key_check_over(lake, &name, &stored, rows.rows(), &kept, false).await?;
             }
-            (vec![], vec![rows], at, keys)
+            (vec![], vec![rows.into_rows()], at, keys)
         }
         None => change(&l, &stored, stmt, snapshot).await?,
     };
@@ -1089,20 +1089,20 @@ async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str
     let sql = crate::write::rows_sql(&meta, stmt)?;
     let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false);
     let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
-    let (batch, _, _) = insert_rows(&l, &stored, &sql, lake.visible(), files).await?;
+    let (rows, _, _) = insert_rows(&l, &stored, &sql, lake.visible(), files).await?;
     // (the lock's grant brought this node up to its leader's commit, so a retry whose append landed while it waited is seen
     // here: the check before the locks can't see it, and the key check would meet the job's own rows)
     if crate::write::sent(lake, job).await? {
         return Ok(j!({"duplicate": true}));
     }
-    crate::constraints::key_check(lake, &name, &stored, None, &batch).await?; // (under the locks: the rows the other writer committed are here)
-    crate::returning::wrote(&[], std::slice::from_ref(&batch));
-    let n = batch.num_rows();
+    crate::constraints::key_check(lake, &name, &stored, None, rows.rows(), false).await?; // (under the locks: the rows the other writer committed are here)
+    crate::returning::wrote(&[], std::slice::from_ref(rows.rows()));
+    let n = rows.rows().num_rows();
     pause_for_tests().await;
     let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
     let log = app.log()?;
     hold.sending(); // (from here its locks go with its answer, not before: the next writer must see this append)
-    let ack = match log.append(name.clone(), src, batch).await {
+    let ack = match log.append_shaped(name.clone(), src, rows).await {
         Ok(ack) => ack,
         Err(e) => {
             if crate::log::unanswered(&e) {
@@ -1639,7 +1639,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
+        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true, false).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
         pending.extend(p);
     }
     if pending.is_empty() {
