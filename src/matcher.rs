@@ -1,7 +1,7 @@
-//! `MATCH_RECOGNIZE`'s matcher (ADR-073, phase 1): `pondra_match` and `pondra_matches`, window functions that answer,
-//! for each row of a partition (sorted by the query's ORDER BY), the match the row is in. `pattern.rs` writes them: the
-//! pattern goes in as its text (in the spec, a JSON literal, which `read` reads), and each symbol's DEFINE as a Boolean column (a symbol with none is
-//! always true).
+//! `MATCH_RECOGNIZE`'s matcher (ADR-073): `pondra_match` and `pondra_matches`, window functions that answer, for each
+//! row of a partition (sorted by the query's ORDER BY), the match the row is in, and `pondra_nav`, which reads a
+//! measure's value at the rows of a match. `pattern.rs` writes them: the pattern goes in as its text (in the spec, a
+//! JSON literal, which `read` reads), and each symbol's DEFINE as a Boolean column (a symbol with none is always true).
 //!
 //! The pattern runs as a Pike VM: threads in the standard's order of preference (the leftmost start; a greedy
 //! repetition takes more and a reluctant one fewer; the first alternative before the next), one thread per state per
@@ -9,9 +9,9 @@
 
 use crate::codes::coded;
 use anyhow::{anyhow, Context, Result};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray, UInt32Array};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DfResult};
@@ -33,6 +33,9 @@ const STATES: usize = 10_000;
 struct Spec {
     pattern: String,
     skip: Skip,
+    /// WITH UNMATCHED ROWS: a row in no match is given once more, as `pondra_matches`' one NULL item.
+    #[serde(default)]
+    unmatched: bool,
 }
 
 /// AFTER MATCH SKIP: where the search for the next match goes on. A symbol is named, as the pattern names it.
@@ -80,6 +83,7 @@ struct Plan {
     syms: Vec<String>,
     code: Vec<Inst>,
     skip: Skip,
+    unmatched: bool,
 }
 
 /// The plan of a spec, refused by name when it is malformed or too big.
@@ -89,7 +93,7 @@ fn compile(text: &str) -> Result<Plan> {
     let mut c = Compiler { code: vec![] };
     c.emit(&pattern, false)?;
     c.push(Inst::Match)?;
-    Ok(Plan { syms, code: c.code, skip: spec.skip })
+    Ok(Plan { syms, code: c.code, skip: spec.skip, unmatched: spec.unmatched })
 }
 
 /// Writes a pattern's program: a sequence is its parts in order, and a choice is a Split that prefers its first branch.
@@ -414,16 +418,26 @@ fn structs(items: &[Option<Mem>], syms: &[String]) -> Result<StructArray> {
     Ok(StructArray::try_new(fields(), arrays, Some(valid))?)
 }
 
-/// The answer for each row: its first membership (`pondra_match`), or all of them (`pondra_matches`, a list per row).
-fn answer(rows: &[Vec<Mem>], syms: &[String], all: bool) -> Result<ArrayRef> {
+/// The answer for each row: its first membership (`pondra_match`), or all of them (`pondra_matches`, a list per row). With
+/// `unmatched`, a row in no match gives a list of one NULL item, so `unnest` keeps the row with its fields NULL.
+fn answer(rows: &[Vec<Mem>], syms: &[String], all: bool, unmatched: bool) -> Result<ArrayRef> {
     if !all {
         let first: Vec<Option<Mem>> = rows.iter().map(|r| r.first().copied()).collect();
         return Ok(Arc::new(structs(&first, syms)?) as ArrayRef);
     }
-    let flat: Vec<Option<Mem>> = rows.iter().flatten().map(|m| Some(*m)).collect();
+    let mut flat: Vec<Option<Mem>> = vec![];
+    let mut lens = vec![];
+    for r in rows {
+        let items: Vec<Option<Mem>> = match r.is_empty() && unmatched {
+            true => vec![None],
+            false => r.iter().map(|m| Some(*m)).collect(),
+        };
+        lens.push(items.len());
+        flat.extend(items);
+    }
     let item = Arc::new(Field::new("item", struct_type(), true));
     let values: ArrayRef = Arc::new(structs(&flat, syms)?);
-    let lists = ListArray::try_new(item, OffsetBuffer::from_lengths(rows.iter().map(Vec::len)), values, None)?;
+    let lists = ListArray::try_new(item, OffsetBuffer::from_lengths(lens), values, None)?;
     Ok(Arc::new(lists) as ArrayRef)
 }
 
@@ -470,7 +484,7 @@ impl Evaluator {
     /// The answer for `n` rows. `values[0]` is the spec, then one condition column per symbol.
     fn run(&mut self, values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         if n == 0 {
-            return answer(&[], &[], self.all);
+            return answer(&[], &[], self.all, false);
         }
         if self.plan.is_none() {
             self.plan = Some(compile(&spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?)?);
@@ -480,7 +494,7 @@ impl Evaluator {
         for k in 0..plan.syms.len() {
             cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
         }
-        answer(&partition(plan, &cond, n)?, &plan.syms, self.all)
+        answer(&partition(plan, &cond, n)?, &plan.syms, self.all, plan.unmatched)
     }
 }
 
@@ -520,11 +534,83 @@ impl WindowUDFImpl for Matcher {
     }
 }
 
-/// Registers `pondra_match` and `pondra_matches` with a session (`engine::session`).
+/// `pondra_nav(value, keep, m, first, final)`, called over one match's rows in their order: at each row, `value` at the
+/// m-th (from 0) of the rows where `keep` is true, counted from the first (`first`) or from the last, among the rows up to
+/// this one (or all the match's, when `final`). NULL where there are not m+1. DataFusion's own first_value and last_value
+/// refuse a FILTER in a window, which is why this exists.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct Navigate {
+    signature: Signature,
+}
+
+impl WindowUDFImpl for Navigate {
+    fn name(&self) -> &str { "pondra_nav" }
+
+    fn signature(&self) -> &Signature { &self.signature }
+
+    fn partition_evaluator(&self, _args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
+        Ok(Box::new(NavEvaluator))
+    }
+
+    fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
+        let t = field_args.input_fields()[0].data_type().clone();
+        Ok(Arc::new(Field::new(field_args.name(), t, true)))
+    }
+}
+
+/// The evaluator of `pondra_nav`: the whole partition at once, as `Evaluator` reads its matches.
+#[derive(Debug)]
+struct NavEvaluator;
+
+impl PartitionEvaluator for NavEvaluator {
+    fn uses_window_frame(&self) -> bool { false }
+
+    fn supports_bounded_execution(&self) -> bool { false }
+
+    fn evaluate_all(&mut self, values: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
+        nav(values, n).map_err(external)
+    }
+}
+
+/// `pondra_nav` over `n` rows; `values` are its five columns. The kept rows are listed once, and each row then takes its
+/// answer's place from the list, so a partition costs its rows (`take` moves the values, with no frame scans).
+fn nav(values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
+    if n == 0 {
+        return Ok(values[0].slice(0, 0));
+    }
+    let keep = bools(&values[1])?;
+    let m = usize::try_from(first_int(&values[2])?).context("MATCH_RECOGNIZE: pondra_nav's m is a count of rows")?;
+    let first = bools(&values[3])?[0];
+    let fin = bools(&values[4])?[0];
+    let kept: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
+    let mut up_to = 0;
+    let mut at: Vec<Option<u32>> = Vec::with_capacity(n);
+    for &kept_here in &keep {
+        up_to += usize::from(kept_here);
+        let count = if fin { kept.len() } else { up_to };
+        let pick = match (m < count, first) {
+            (false, _) => None,
+            (true, true) => kept.get(m).copied(),
+            (true, false) => kept.get(count - 1 - m).copied(),
+        };
+        at.push(pick.map(|j| j as u32));
+    }
+    Ok(take(values[0].as_ref(), &UInt32Array::from(at), None)?)
+}
+
+/// A literal argument (the same in every row), read from its first row as a whole number.
+fn first_int(column: &ArrayRef) -> Result<i64> {
+    let ints = cast(column, &DataType::Int64)?;
+    let ints = ints.as_any().downcast_ref::<Int64Array>().context("MATCH_RECOGNIZE: pondra_nav reads a whole number")?;
+    ints.iter().next().flatten().context("MATCH_RECOGNIZE: pondra_nav's m is NULL")
+}
+
+/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`).
 pub fn register(ctx: &SessionContext) {
     for all in [false, true] {
         ctx.register_udwf(WindowUDF::from(Matcher { all, signature: Signature::variadic_any(Volatility::Immutable) }));
     }
+    ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
 }
 
 /// A PATTERN's text as a pattern, and the symbols it names in the order they first appear (a symbol's number is its place
@@ -947,5 +1033,71 @@ mod tests {
         );
         assert_eq!(refused("\"a"), "MATCH_RECOGNIZE: PATTERN (\"a): a quoted name isn't closed with \"");
         assert_eq!(refused("a{-b"), "MATCH_RECOGNIZE: PATTERN (a{-b): expected -} after b");
+    }
+
+    /// `pondra_nav` over one partition's rows: the value, the keep flags, then m, first and final for each row.
+    fn nav_of(value: &[Option<i64>], keep: &[Option<bool>], m: i64, first: bool, fin: bool) -> Vec<Option<i64>> {
+        let n = value.len();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(value.to_vec())),
+            Arc::new(BooleanArray::from(keep.to_vec())),
+            Arc::new(Int64Array::from(vec![m; n])),
+            Arc::new(BooleanArray::from(vec![first; n])),
+            Arc::new(BooleanArray::from(vec![fin; n])),
+        ];
+        let out = nav(&cols, n).unwrap();
+        out.as_any().downcast_ref::<Int64Array>().unwrap().iter().collect()
+    }
+
+    const VALUE: [Option<i64>; 4] = [Some(10), Some(20), Some(30), Some(40)];
+    const KEEP: [Option<bool>; 4] = [Some(true), Some(false), Some(true), Some(true)];
+
+    #[test]
+    fn nav_running_reads_up_to_each_row() {
+        assert_eq!(nav_of(&VALUE, &KEEP, 0, true, false), [Some(10); 4]);
+        assert_eq!(nav_of(&VALUE, &KEEP, 0, false, false), [Some(10), Some(10), Some(30), Some(40)]);
+    }
+
+    #[test]
+    fn nav_final_reads_the_whole_match() {
+        assert_eq!(nav_of(&VALUE, &KEEP, 0, true, true), [Some(10); 4]);
+        assert_eq!(nav_of(&VALUE, &KEEP, 0, false, true), [Some(40); 4]);
+    }
+
+    #[test]
+    fn nav_counts_m_from_the_first_or_the_last() {
+        assert_eq!(nav_of(&VALUE, &KEEP, 2, true, false), [None, None, None, Some(40)]);
+        assert_eq!(nav_of(&VALUE, &KEEP, 2, false, true), [Some(10); 4]);
+        assert_eq!(nav_of(&VALUE, &KEEP, 1, false, false), [None, None, Some(10), Some(30)]);
+    }
+
+    #[test]
+    fn nav_takes_a_null_keep_as_false() {
+        let keep = [None, Some(true), None];
+        assert_eq!(nav_of(&[Some(1), Some(2), Some(3)], &keep, 0, true, false), [None, Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn nav_with_no_kept_row_is_null() {
+        assert_eq!(nav_of(&[Some(1), Some(2)], &[Some(false), None], 0, false, true), [None, None]);
+    }
+
+    #[test]
+    fn with_unmatched_rows_pondra_matches_gives_a_null_item() {
+        let syms = vec!["a".to_string()];
+        let rows = vec![vec![], vec![Mem { m: 1, sym: Some(0), seq: Some(1), excluded: false }]];
+        let out = answer(&rows, &syms, true, true).unwrap();
+        let lists = out.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(lists.value(0).len(), 1);
+        assert!(lists.value(0).is_null(0));
+        assert!(lists.value(1).is_valid(0));
+        let plain = answer(&rows, &syms, true, false).unwrap();
+        assert_eq!(plain.as_any().downcast_ref::<ListArray>().unwrap().value(0).len(), 0);
+    }
+
+    #[test]
+    fn the_spec_reads_unmatched() {
+        assert!(compile(r#"{"pattern":"a","skip":{"to":"past_last"},"unmatched":true}"#).unwrap().unmatched);
+        assert!(!compile(&spec("a", PAST)).unwrap().unmatched);
     }
 }

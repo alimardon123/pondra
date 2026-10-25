@@ -22701,14 +22701,16 @@ def dialects():
 
 
 def patterns():
-    """MATCH_RECOGNIZE (ADR-073, phase 1): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random
-    queries (every pattern operator, every skip rule, empty matches, four partitions of 0-25 rows) against a reference
-    matcher of that file's own, the fixed examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets,
-    FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an
-    exclusion), and the refusals by name. Section 5, the doors: the ticker over the Postgres port equals HTTP; a
-    10,000-row table over 50 symbols answers the same from three nodes (?spread=1) as from one, and spreads; a stored
-    view and a materialized view equal the query, the view kept live through new rows. Without the matcher every
-    statement here is refused (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
+    """MATCH_RECOGNIZE (ADR-073): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random queries
+    (every pattern operator, every skip rule, empty matches, ONE ROW and ALL ROWS PER MATCH in its three forms with
+    RUNNING and FINAL measures, four partitions of 0-25 rows) against a reference matcher of that file's own, the fixed
+    examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets, FINAL and RUNNING, ties in five runs, an
+    empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS
+    PER MATCH, WITH UNMATCHED ROWS under TO NEXT ROW), and the refusals by name. Section 5, the doors: the ticker and
+    its ALL ROWS form over the Postgres port equal HTTP's; a 10,000-row table over 50 symbols answers the same from
+    three nodes (?spread=1) as from one, and spreads, in both rows-per-match forms; a stored view and a materialized
+    view equal the query, the view kept live through new rows. Without the matcher every statement here is refused
+    (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
     import patterns_check as pc
     import psycopg
     checks, info = {}, {}
@@ -22719,10 +22721,10 @@ def patterns():
     checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions) answer as the reference does, or 22000 where it does"] = ok
     fixed = pc.fixed_checks(A.port)
     info["fixed missed"] = [k for k, v in fixed.items() if not v]
-    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion: the answers written in patterns_check.py"] = all(fixed.values())
+    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW): the answers written in patterns_check.py, names and rows"] = all(fixed.values())
     refused = pc.refusal_checks(A.port)
     info["refusals missed"] = [k for k, v in refused.items() if not v]
-    checks["refusals by name: ALL ROWS PER MATCH, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states"] = all(refused.values())
+    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states"] = all(refused.values())
     # section 5: the ticker over the Postgres port, then three nodes on a lake of their own
     ticker_q = pc.FIXED[0]["query"]
     want = pc.post_sql(A.port, ticker_q)["value"]
@@ -22731,6 +22733,15 @@ def patterns():
         cols = [d.name for d in cur.description]
         over_pg = [dict(zip(cols, r)) for r in cur.fetchall()]
     checks["the ticker's matches over the Postgres port equal HTTP's, and there are the three of the brief"] = over_pg == want and len(want) == 3
+    # ALL ROWS PER MATCH over the Postgres port: the same column names and rows as HTTP's (the rows of the brief's 15)
+    answered = pc.post_sql(A.port, pc.ALL_ROWS_Q, arrow=True)
+    all_names, all_rows = answered["value"] if answered["ok"] else (None, None)
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:
+        cur = c.execute(pc.ALL_ROWS_Q)
+        pg_names = [d.name for d in cur.description]
+        pg_rows = [tuple(r) for r in cur.fetchall()]
+    checks["ALL ROWS PER MATCH (the ticker, RUNNING and FINAL) over the Postgres port: the same column names and rows as HTTP's, 15 rows"] = \
+        bool(answered["ok"]) and pg_names == all_names and pg_rows == all_rows and len(all_rows) == 15
     node.kill()
     lake = new_lake()
     nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]
@@ -22773,6 +22784,19 @@ def patterns():
     others = [call(p, "POST", "/sql?spread=1", spread_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
     checks["the 10,000-row query over 50 symbols: each of three nodes with ?spread=1 == one node, and the query spread"] = \
         bool(one) and three == one and all(o == one for o in others) and info["spread on node 2"]
+    # the same rows-per-match as ALL ROWS PER MATCH (RUNNING and FINAL), repartitioned by symbol: equal, and spread
+    all_spread_q = ("SELECT symbol, day, m, d, n FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+                    "MEASURES MATCH_NUMBER() AS m, LAST(down.price) AS d, FINAL count(*) AS n ALL ROWS PER MATCH "
+                    "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+                    "up AS up.price > PREV(up.price)) ORDER BY symbol, m, day")
+    one_all = call(A.port, "POST", "/sql?spread=0", all_spread_q.encode(), timeout=120)
+    before = spreads(A.port + 1)
+    three_all = call(A.port + 1, "POST", "/sql?spread=1", all_spread_q.encode(), timeout=120)
+    spread_all = spreads(A.port + 1) - before > 0
+    others_all = [call(p, "POST", "/sql?spread=1", all_spread_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
+    info["ALL ROWS rows over 50 symbols"] = len(one_all) if isinstance(one_all, list) else None
+    checks["the ALL ROWS query over the same 10,000 rows: each of three nodes with ?spread=1 == one node, and it spread"] = \
+        bool(one_all) and three_all == one_all and all(o == one_all for o in others_all) and spread_all
     # views: a stored view and a materialized view of the brief's query, the materialized one kept live
     view_q = ticker_q.rsplit(" ORDER BY ", 1)[0]
     q(f"CREATE VIEW ticker_v AS {view_q}")

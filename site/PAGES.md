@@ -107,6 +107,7 @@ Pages marked *(planned)* aren't written yet.
 | `index.mdx` | the dialect (DataFusion's, Postgres's forms, DuckDB's and Spark's spellings) and a map of the SQL pages | |
 | `statements.mdx` | every statement, its syntax and an example; what is refused by name. *Splits by category (planned).* | `src/write.rs` (`parse`), `src/routines.rs`, the modules' `statement()` |
 | `functions.mdx` | the functions Pondra adds to DataFusion's (JSON, vectors, files, AI, Spark's, `pondra.*`) | `src/udf.rs`, `src/files.rs`, `src/ai.rs` |
+| `row-patterns.mdx` | `MATCH_RECOGNIZE`: the clauses, `ONE ROW` and `ALL ROWS PER MATCH` with their empty-match and unmatched options, the pattern's operators, `DEFINE`, `RUNNING` and `FINAL`, the aggregates, and what isn't supported yet with what to write instead | ADR-073, `src/pattern.rs`, `src/matcher.rs` |
 | `table-options.mdx` | every `WITH (…)` option of tables, materialized views and functions | the ADRs |
 | `system-tables.mdx` | system columns and every `pondra.*` table | ADR-020, ADR-027, ADR-048 |
 | `glossary.mdx` | every kind, part and pattern, written from `GET /kinds` (`tools/docs_check.py --write-glossary`) | `src/objects.rs` |

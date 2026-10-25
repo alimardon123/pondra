@@ -1,0 +1,307 @@
+---
+title: Row patterns
+description: MATCH_RECOGNIZE finds runs of rows in order, such as a price that falls and then recovers, and reports each run. Every clause is covered, and what isn't supported yet.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`MATCH_RECOGNIZE` finds runs of rows that follow a pattern you write, such as a price that falls and
+then rises, and reports each run as one row or as every row in it. Use it when the answer depends on
+the order of rows and `GROUP BY` can't say where a run starts and ends. It follows the standard (SQL:2016,
+ISO/IEC 19075-5), as Trino does.
+
+## A first example: a price dip and its recovery
+
+This table holds one stock's price for 20 days. The pattern is a row (`strt`), then one or more days
+the price falls (`down+`), then one or more days it rises (`up+`).
+
+```sql
+CREATE TABLE ticker (symbol TEXT, day INT, price INT);
+INSERT INTO ticker VALUES ('ACME',1,12),('ACME',2,17),('ACME',3,19),('ACME',4,21),('ACME',5,25),('ACME',6,12),('ACME',7,15),('ACME',8,20),('ACME',9,24),('ACME',10,25),('ACME',11,19),('ACME',12,15),('ACME',13,25),('ACME',14,25),('ACME',15,14),('ACME',16,12),('ACME',17,14),('ACME',18,24),('ACME',19,23),('ACME',20,22);
+
+SELECT symbol, start_day, bottom_day, end_day
+FROM ticker MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY day
+  MEASURES
+    strt.day AS start_day,
+    LAST(down.day) AS bottom_day,
+    LAST(up.day) AS end_day
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt down+ up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY start_day;
+```
+
+```text
+symbol  start_day  bottom_day  end_day
+ACME    5          6           10
+ACME    10         12          13
+ACME    14         16          18
+```
+
+Read the clauses in this order. `PARTITION BY` and `ORDER BY` say which rows form a sequence and in what
+order. `PATTERN` says what the rows must look like. `DEFINE` says what each symbol means on a row: `down`
+is a row whose price is below the row before's. `MEASURES` names the values to report for each match.
+`ONE ROW PER MATCH` reports one row per match. `AFTER MATCH SKIP TO LAST up` says where the search for the
+next match starts: from the last row that `up` matched, so day 10 is in two matches.
+
+## The clauses
+
+| Clause | What it does |
+|---|---|
+| `PARTITION BY` | splits the rows by these columns; each part is matched on its own. Columns only: compute anything else in a subquery |
+| `ORDER BY` | the order of the rows within each part. In a table, rows with the same value go in the order they were written |
+| `MEASURES` | the values reported for each match, or for each row of a match |
+| `ONE ROW PER MATCH` or `ALL ROWS PER MATCH` | one row per match, or every row of each match. See [rows per match](#one-row-and-all-rows) |
+| `AFTER MATCH SKIP` | where the search for the next match starts. See [skipping](#after-match-skip) |
+| `PATTERN` | the symbols, and how they follow each other. See [the pattern](#the-pattern) |
+| `DEFINE` | the condition each symbol needs on a row. See [DEFINE](#define) |
+
+## Measures
+
+A measure is an expression over the rows of a match. Name it with `AS`.
+
+- `FIRST(v.col)` and `LAST(v.col)` give the first and last row of variable `v` in the match. `FIRST(col)`
+  and `LAST(col)` without a variable use all the match's rows. A column with a variable and no function,
+  `v.col`, is `LAST(v.col)`.
+- `count(*)` counts the match's rows; `count(v.*)` counts the rows of `v`. `sum`, `avg`, `min` and `max`
+  work over `v.col` the same way: `avg(down.price)` is the average price of the `down` rows.
+- `CLASSIFIER()` is the variable of the match's last row, and `MATCH_NUMBER()` is the match's number, from 1.
+
+```sql
+SELECT symbol, start_day, avg_down, n
+FROM ticker MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY day
+  MEASURES
+    strt.day AS start_day,
+    avg(down.price) AS avg_down,
+    count(*) AS n
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt down+ up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY start_day;
+```
+
+```text
+symbol  start_day  avg_down  n
+ACME    5          12.0      6
+ACME    10         17.0      4
+ACME    14         13.0      5
+```
+
+## ONE ROW and ALL ROWS
+
+`ONE ROW PER MATCH` gives one row per match: the partition's columns, then the measures. It is the usual
+answer: one line per run.
+
+`ALL ROWS PER MATCH` gives every matched row, with the measures as that row sees them. The columns are the
+`PARTITION BY` columns, the `ORDER BY` columns, the measures, then the table's other columns. A measure is
+*running* by default: it covers the match's rows up to this one. Write `FINAL` before a measure to cover the
+whole match.
+
+```sql
+SELECT symbol, day, m, c, d, fl
+FROM ticker MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY day
+  MEASURES
+    MATCH_NUMBER() AS m,
+    CLASSIFIER() AS c,
+    LAST(down.price) AS d,
+    FINAL LAST(price) AS fl
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt down+ up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY m, day;
+```
+
+```text
+symbol  day  m  c     d     fl
+ACME    5    1  strt  NULL  25
+ACME    6    1  down  12    25
+ACME    7    1  up    12    25
+ACME    8    1  up    12    25
+ACME    9    1  up    12    25
+ACME    10   1  up    12    25
+ACME    10   2  strt  NULL  25
+ACME    11   2  down  19    25
+ACME    12   2  down  15    25
+ACME    13   2  up    15    25
+ACME    14   3  strt  NULL  24
+ACME    15   3  down  14    24
+ACME    16   3  down  12    24
+ACME    17   3  up    12    24
+ACME    18   3  up    12    24
+```
+
+An *empty* match is a match with no rows, from a pattern that can match nothing, such as `a*`. `ONE ROW PER
+MATCH` shows it as a row. In `ALL ROWS PER MATCH`, the empty-match option decides:
+
+- `SHOW EMPTY MATCHES` (the default): an empty match gives one row, where it was found, with
+  `MATCH_NUMBER()` set and every other measure over no rows: `CLASSIFIER()` and the navigations are NULL,
+  `count(*)` is 0.
+- `OMIT EMPTY MATCHES`: an empty match gives no row.
+- `WITH UNMATCHED ROWS`: as `SHOW EMPTY MATCHES`, and each row that is in no match is given once more, with
+  every measure NULL.
+
+```sql
+CREATE TABLE flags (day INT, flag BOOLEAN);
+INSERT INTO flags VALUES (1, FALSE), (2, TRUE), (3, TRUE), (4, FALSE), (5, TRUE);
+
+SELECT day, mn, s, e, n, flag
+FROM flags MATCH_RECOGNIZE (
+  ORDER BY day
+  MEASURES MATCH_NUMBER() AS mn, FIRST(day) AS s, LAST(day) AS e, count(*) AS n
+  ALL ROWS PER MATCH WITH UNMATCHED ROWS
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a+)
+  DEFINE a AS flag
+)
+ORDER BY day;
+```
+
+```text
+day  mn    s     e     n     flag
+1    NULL  NULL  NULL  NULL  false
+2    1     2     2     1     true
+3    1     2     3     2     true
+4    NULL  NULL  NULL  NULL  false
+5    2     5     5     1     true
+```
+
+Days 1 and 4 are in no match (day 1 is `false`, and `a+` needs a `true` row), so they are given with NULLs.
+
+`WITH UNMATCHED ROWS` can't go with an exclusion (`{- -}`): a row left out of the answer would be neither
+in a match nor unmatched. Use `SHOW EMPTY MATCHES`, or keep the rows in the pattern.
+
+## AFTER MATCH SKIP
+
+After a match, the search for the next one starts at the row the skip names. The default is
+`AFTER MATCH SKIP PAST LAST ROW`: the next search starts after the match's last row, so no row is in two
+matches.
+
+- `AFTER MATCH SKIP TO NEXT ROW` starts the next search at the row after the match's first row. Matches
+  may overlap, and a row can be in several.
+- `AFTER MATCH SKIP TO FIRST v` and `AFTER MATCH SKIP TO LAST v` start at the first or last row of variable
+  `v` in the match. `v` must be a symbol of the pattern that has a row in the match. Where that row is the
+  match's first row, the search would not move, so it is an error.
+
+<Aside type="caution">
+`TO FIRST v` and `TO LAST v` are an error when `v` has no row in the match, or when it is the match's first
+row. Write the skip to a later symbol, or use `PAST LAST ROW`.
+</Aside>
+
+## The pattern
+
+A pattern is a list of symbols, each a name from `DEFINE`, and operators between them.
+
+| Written | Meaning |
+|---|---|
+| `a b` | `a`, then `b` |
+| `a \| b` | `a` or `b`; the left one is tried first |
+| `(a b)` | a group |
+| `a*`, `a+`, `a?` | zero or more, one or more, zero or one |
+| `a{2}`, `a{2,}`, `a{,3}`, `a{2,3}` | exactly 2, at least 2, up to 3, between 2 and 3 |
+| `a+?`, `a*?`, `a??`, `a{2,3}?` | the same, reluctant: as few as match |
+| `PERMUTE(a, b, c)` | its parts in any order, the order written tried first; a part can be any pattern |
+| `^`, `$` | the partition's first row, and the point after its last row |
+| `{- b+ -}` | `b`'s rows are in the match for the measures, but not given in `ALL ROWS PER MATCH` |
+
+Where a choice exists, the standard's order decides: the first alternative that completes a match wins,
+and a greedy repetition takes as many rows as it can. A symbol with no `DEFINE` matches any row.
+
+An exclusion, `{- … -}`, can hold any pattern. In the ALL ROWS example below, `{- down+ -}` leaves the down rows out of
+the answer, not out of the match.
+
+```sql
+SELECT symbol, day, m, c, d, fl
+FROM ticker MATCH_RECOGNIZE (
+  PARTITION BY symbol
+  ORDER BY day
+  MEASURES
+    MATCH_NUMBER() AS m,
+    CLASSIFIER() AS c,
+    LAST(down.price) AS d,
+    FINAL LAST(price) AS fl
+  ALL ROWS PER MATCH
+  AFTER MATCH SKIP TO LAST up
+  PATTERN (strt {- down+ -} up+)
+  DEFINE
+    down AS down.price < PREV(down.price),
+    up AS up.price > PREV(up.price)
+)
+ORDER BY m, day;
+```
+
+The down rows (days 6, 11, 12, 15, 16) are in each match, so `d` and `fl` are as before, but they are not
+among the rows given.
+
+## DEFINE
+
+`DEFINE` gives each symbol a condition on a row. A condition that is NULL is false.
+
+- `PREV(col)` and `PREV(col, n)` read the row `n` before in the partition; `NEXT(col, n)` reads the row `n`
+  after. The first row has no `PREV`, and the last has no `NEXT`: the condition is then false.
+- A condition can read its own row, and `PREV` and `NEXT` of the partition. It can't read another symbol's
+  rows. See [not supported yet](#not-supported-yet).
+
+## RUNNING and FINAL
+
+In `ALL ROWS PER MATCH`, a measure is `RUNNING` unless you write `FINAL`. `RUNNING` covers the match's rows
+up to the row; `FINAL` covers the whole match. In `ONE ROW PER MATCH` the two are the same, since there is one
+row, at the end of the match. `FINAL` is for `MEASURES`: a `DEFINE` reads the rows so far.
+
+## Aggregates in measures
+
+`count`, `sum`, `avg`, `min` and `max` of a variable's column, and `count(*)`, work in `MEASURES` as above.
+In `ALL ROWS PER MATCH` they run over the rows up to the given row, or over the whole match with `FINAL`.
+Excluded rows count in every aggregate. `PREV` and `NEXT` take their lag and lead columns inside an aggregate, as in
+`sum(PREV(price))`. `FIRST` and `LAST` don't: aggregate the column over its variable instead.
+
+## Materialized views
+
+A materialized view over `MATCH_RECOGNIZE` is kept current by running it whole on each change, as views without a `GROUP BY`
+by key are. Keeping it by key, so that only the partitions that changed are run again, comes later.
+
+## What's refused
+
+These are refused by the standard or by how the answer is shaped. Each refusal says what to write.
+
+| What you write | What happens | What to write instead |
+|---|---|---|
+| `ALL ROWS PER MATCH` ordered by an expression | refused, `0A000`: `gives the ORDER BY columns; compute <e> in a subquery and order by its name` | compute the expression in a subquery, and order by its name |
+| `FINAL` in a `DEFINE`, such as `b AS FINAL LAST(b.price) < 10` | refused, `42601`: `FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL` | drop `FINAL LAST`: write `b AS b.price < 10`, which reads the row itself (`LAST` in a `DEFINE` is refused too) |
+| `WITH UNMATCHED ROWS` with `{- -}` | refused, `42601` | use `SHOW EMPTY MATCHES`, or keep the rows in the pattern |
+| `PARTITION BY` an expression | refused, `0A000`: `takes columns; compute <e> in a subquery` | compute it in a subquery, and partition by its name |
+
+## Not supported yet
+
+These don't run yet. Each has a way to write the same question.
+
+| What you write | What happens | What to write instead |
+|---|---|---|
+| a `DEFINE` that reads another symbol's rows, `b AS b.price < a.price` | refused, `0A000`: `DEFINE b reads the match so far (a.price), which isn't supported yet: compare with the row before, PREV(price)` | compare with `PREV` or `NEXT` of the same column, or with a value in the row itself |
+| `WITHIN INTERVAL` | `WITHIN isn't supported yet`: refused, `42601`, at the word `WITHIN` | `WHERE` on the answer. That drops long matches from the answer, but the search still finds them, so a long match can hide the matches it overlaps |
+| an aggregate with its own `ORDER BY` in `ALL ROWS PER MATCH` | refused, `0A000` | drop it: the rows already come in the match's order |
+| a subquery in `MEASURES` or `DEFINE` | refused, `0A000` | compute the value in a subquery, and join it on the rows |
+| a window function in a measure | refused, `0A000` | compute the window in a subquery, and read its column in the measure |
+| `FIRST` or `LAST` inside an aggregate, `sum(LAST(down.price))` | refused, `0A000`: `last inside an aggregate isn't supported yet: aggregate the column over its variable instead` | aggregate the column over its variable, `sum(down.price)` |
+
+<Aside>
+A `MATCH_RECOGNIZE` query with `PARTITION BY` on a cluster is shuffled by its partition key: each node
+takes some of the partitions. The answer is the same as on one node. See [clusters](/pondra/guides/clusters/).
+</Aside>

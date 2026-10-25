@@ -1,6 +1,6 @@
 # ADR-073: Row patterns (`MATCH_RECOGNIZE`)
 
-**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, 2026-10-25) · **Builds on:**
+**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, #231; ALL ROWS PER MATCH and its options, 2026-10-25) · **Builds on:**
 ADR-017 (watermarks), ADR-052 (`EMIT FINAL`), ADR-056 and ADR-059 (views that run their query
 again, by key), ADR-072 (one engine in every form) · **Lane:** the coordinator's call (L6 owns the
 SQL front; L1 owns `rerun.rs`, `views.rs`, `store.rs`)
@@ -62,8 +62,10 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
      match's last row's, `CLASSIFIER()` the last row's symbol, `MATCH_NUMBER()` the match.
      `ALL ROWS PER MATCH` is every matched row with its measures as windows over `(PARTITION BY
      key, match ORDER BY __seq)`: `RUNNING` (the default) frames to the current row, `FINAL` to the
-     match's end. A last value that keeps NULLs is taken as `last_value(CASE WHEN __symbol = 'v'
-     THEN named_struct('v', x) END IGNORE NULLS)['v']`, so a NULL in the last `v` row stays NULL.
+     match's end. A navigation there is `pondra_nav(x, keep, m, first, final)`, a window function that reads
+     the m-th kept row from the first or the last, up to the row or over the whole match, in one pass
+     (DataFusion's `first_value` and `last_value` take no `FILTER` in a window); an aggregate is the
+     same aggregate, its `FILTER` kept, as a window framed to the row or to the match's end.
      `SHOW EMPTY MATCHES`, `OMIT EMPTY MATCHES` and `WITH UNMATCHED ROWS` are filters on what the
      matcher answered. `RUNNING` and `FINAL` before a measure, which sqlparser doesn't read, are
      taken in the text first, as `friendly.rs` takes DuckDB's spellings. `PATTERN (…)` is read by Pondra's own
