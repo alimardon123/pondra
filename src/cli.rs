@@ -608,10 +608,7 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Lead { dir } => write::lead_only(&dir).await?,
-        Cmd::Backup { lake, to, retention_days } => {
-            let stmt = write::Stmt::Ddl(vec![ddl::Ddl::BackupDatabase { database: None, to, retention_days }]);
-            println!("{}", serde_json::to_string_pretty(&write::from_cli(&lake, stmt).await?)?);
-        }
+        Cmd::Backup { lake, to, retention_days } => sql_on_guest(&lake, &backup_sql(&to, retention_days), &[]).await?,
         Cmd::Restore { from, to, at } => {
             let at = at.as_deref().map(backup::instant).transpose()?;
             println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
@@ -648,9 +645,10 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `pondra sql`: one statement, asked of a guest node of the lake (`node::Options::guest`), which answers it as `POST /sql`
-/// does, and ends. A plain query or an export (`COPY … TO`) reads; anything else may write, and leads the lake for the
-/// moment if nobody does. The output is what the node gives: the notices its procedures printed, then the answer.
+/// `pondra sql`, and `pondra backup` (its one statement, `backup_sql`): one statement, asked of a guest node of the lake
+/// (`node::Options::guest`), which answers it as `POST /sql` does, and ends. A plain query or an export (`COPY … TO`) reads;
+/// anything else may write, and leads the lake for the moment if nobody does. The output is what the node gives: the
+/// notices its procedures printed, then the answer.
 async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
     // `USE` sets a session's path, and this command has no session (`path.rs`).
     anyhow::ensure!(!path::is_use(query) && path::set_schema(query).is_none(), "{}", settings::NO_SESSION);
@@ -692,34 +690,55 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     Ok(())
 }
 
-/// A write whose lake's leader is alive but doesn't answer from this machine (`node::Unreached`): it goes through the
-/// bucket's inbox, as `write::from_cli` sends it, and the leader records it, or this process leads for a moment. The
-/// inbox carries one statement that writes, so a text of several, a CALL, a script or a setting is refused by name.
+/// A write whose lake's leader is alive but doesn't answer from this machine's guest start (`node::Unreached`): it is
+/// sent as a one-off writer sends it (`write::through_bucket_statement`): over HTTP if this machine reaches the leader after
+/// all, else through the bucket's inbox, where the leader records it, or this process leads for a moment. The inbox carries
+/// one statement that writes, so a text of several, a CALL, a script or a setting is refused by name.
 async fn through_inbox(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
     let refused = |why: &str| anyhow::anyhow!("{}, and {why}", node::Unreached);
     if routines::split(query).len() > 1 {
         return Err(refused("this text is several statements: the inbox takes one statement at a time, so send each one by itself"));
     }
-    // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then a write. A write to a folder with
-    // no lake yet makes one.
-    let lake = match write::parse(query) {
-        Some(_) => write::made(dir).await?,
-        None => store::Lake::open(dir, false, false).await?,
+    // As a node takes SQL: a write to a folder with no lake yet makes one, led for a moment as `pondra lead` leads it.
+    let lake = match (write::parse(query).is_some(), store::Lake::open(dir, false, false).await) {
+        (_, Ok(lake)) => lake,
+        (true, Err(_)) => {
+            write::lead_only(dir).await?;
+            store::Lake::open(dir, false, false).await?
+        }
+        (false, Err(e)) => return Err(e),
     };
     for spec in attached {
         node::attach(&lake, spec, "", false).await?;
     }
     ddl::sync(&lake, "", false).await?;
+    // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then a write.
     let query = routines::expand(&lake, query).await?;
     let Some(stmt) = write::parse(&query) else {
         return Err(refused("this statement isn't a write the inbox carries (a CALL, a script or a setting): it needs the leader"));
     };
-    println!("{}", ext::scope(true, write::from_cli(dir, stmt)).await?); // (its user's own machine: its files, its credentials)
+    println!("{}", ext::scope(true, write::through_bucket_statement(&lake, stmt)).await?); // (its user's own machine: its files, its credentials)
     Ok(())
+}
+
+/// The statement `pondra backup` runs on the lake: `BACKUP DATABASE TO 'to' [WITH (retention_days = n)]`, its place quoted
+/// the way SQL quotes a string (a `'` doubled), which `write::parse` reads back.
+fn backup_sql(to: &str, retention_days: Option<u64>) -> String {
+    let keep = retention_days.map(|d| format!(" WITH (retention_days = {d})")).unwrap_or_default();
+    format!("BACKUP DATABASE TO '{}'{keep}", to.replace('\'', "''"))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_backup_names_its_place_as_sql_quotes_it() {
+        assert_eq!(super::backup_sql("backups/till", None), "BACKUP DATABASE TO 'backups/till'");
+        let sql = super::backup_sql("it's/here", Some(3));
+        assert_eq!(sql, "BACKUP DATABASE TO 'it''s/here' WITH (retention_days = 3)");
+        let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&sql) else { panic!("a backup statement: {sql}") };
+        assert!(matches!(&ds[..], [crate::ddl::Ddl::BackupDatabase { database: None, to, retention_days: Some(3) }] if to == "it's/here"), "{sql}");
+    }
+
     #[test]
     fn a_command_mistyped() {
         for (word, c) in [("serv", "serve"), ("sevre", "serve"), ("sorve", "serve"), ("aply", "apply"), ("stauts", "status")] {
