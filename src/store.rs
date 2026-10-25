@@ -1762,6 +1762,95 @@ fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
     (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
 
+/// The keys the node holds, each with the commit that put it and its value (None: deleted, kept as a tombstone where the
+/// node doesn't hold the whole catalog). It counts the live producers' marks (`p/`) and expiries (`g/`, not the old marks'
+/// `g/~` pass) as they change, under the same lock, so a scrape reads two numbers instead of scanning the range
+/// (`Catalog::tallies`). Every change goes through the methods below, which keep the counts.
+#[derive(Default)]
+struct Overlay {
+    map: BTreeMap<String, (u64, Option<Bytes>)>,
+    marks: usize,
+    expiries: usize,
+}
+
+impl std::ops::Deref for Overlay {
+    type Target = BTreeMap<String, (u64, Option<Bytes>)>;
+    fn deref(&self) -> &Self::Target { &self.map }
+}
+
+impl Overlay {
+    /// Puts `k` as `v`, whatever was there.
+    fn set(&mut self, k: String, v: (u64, Option<Bytes>)) {
+        let (was, is) = (self.map.get(&k).is_some_and(|(_, old)| old.is_some()), v.1.is_some());
+        self.map.insert(k.clone(), v);
+        self.tally(&k, was, is);
+    }
+
+    /// Puts `k` as `v` if nothing is there.
+    fn insert_absent(&mut self, k: String, v: (u64, Option<Bytes>)) {
+        if !self.map.contains_key(&k) {
+            self.set(k, v);
+        }
+    }
+
+    fn remove(&mut self, k: &str) {
+        if let Some((_, v)) = self.map.remove(k) {
+            self.tally(k, v.is_some(), false);
+        }
+    }
+
+    /// Keeps the entries `keep` says to keep.
+    fn retain(&mut self, mut keep: impl FnMut(&str, &(u64, Option<Bytes>)) -> bool) {
+        let (mut marks, mut expiries) = (0, 0);
+        self.map.retain(|k, v| {
+            let kept = keep(k, v);
+            if !kept && v.1.is_some() {
+                match Self::family(k) {
+                    Some(true) => marks += 1,
+                    Some(false) => expiries += 1,
+                    None => {}
+                }
+            }
+            kept
+        });
+        self.marks -= marks;
+        self.expiries -= expiries;
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        (self.marks, self.expiries) = (0, 0);
+    }
+
+    /// Whether `k` is a producer's mark (`Some(true)`), an expiry (`Some(false)`), or neither.
+    fn family(k: &str) -> Option<bool> {
+        if k.starts_with("p/") {
+            Some(true)
+        } else if k.starts_with(crate::log::EXPIRY) && !k.starts_with("g/~") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A key went from live (`was`) to live or deleted (`is`): counted if it is one of the two families.
+    fn tally(&mut self, k: &str, was: bool, is: bool) {
+        if was == is {
+            return;
+        }
+        let count = match Self::family(k) {
+            Some(true) => &mut self.marks,
+            Some(false) => &mut self.expiries,
+            None => return,
+        };
+        if is {
+            *count += 1;
+        } else {
+            *count -= 1;
+        }
+    }
+}
+
 /// The catalog is a SlateDB key-value store inside the lake.
 /// One process holds the writer (SlateDB fences out any other); any number can read.
 pub struct Catalog {
@@ -1783,7 +1872,7 @@ pub struct Catalog {
     // deleted), each with its commit number, are laid over our own view of the catalog, which is
     // a few seconds behind. A read uses them only if our view isn't ahead of the stream (else
     // they could be older than what the view has) and, after a gap, once the view passed `hold`.
-    overlay: Mutex<BTreeMap<String, (u64, Option<Bytes>)>>,
+    overlay: Mutex<Overlay>,
     view: (AtomicU64, AtomicU64), // our own view's "c" and the "n" it had at or before that "c"
     pruned: AtomicU64,            // streamed changes up to this commit were dropped (the view has them)
     pins: Mutex<BTreeMap<u64, usize>>, // scans in progress, by the view "c" they started from
@@ -2146,7 +2235,10 @@ impl Catalog {
         let mut all = collect(db.scan(b"".to_vec()..b"d/".to_vec()).await.map_err(fatal)?).await?;
         all.extend(collect(db.scan(b"d0".to_vec()..vec![0xff]).await.map_err(fatal)?).await?);
         trace("the catalog in memory", t0);
-        cat.overlay.get_mut().unwrap().extend(all.into_iter().map(|(k, v)| (k, (c, Some(v)))));
+        let overlay = cat.overlay.get_mut().unwrap();
+        for (k, v) in all {
+            overlay.set(k, (c, Some(v)));
+        }
         cat.streamed.store(c, Relaxed);
         cat.loud.store(c, Relaxed);
         cat.mirror.store(true, Relaxed);
@@ -2268,10 +2360,12 @@ impl Catalog {
         // (The leader reads inline data from its own store; everyone else keeps it until their
         // view has it. With the whole catalog here, a deleted key is simply gone.)
         let writer = self.is_writer();
-        o.extend(d.puts.iter().filter(|(k, _)| !(writer && k.starts_with("d/"))).map(|(k, v)| (k.clone(), (d.id, Some(v.clone())))));
+        for (k, v) in d.puts.iter().filter(|(k, _)| !(writer && k.starts_with("d/"))) {
+            o.set(k.clone(), (d.id, Some(v.clone())));
+        }
         match self.mirror.load(Relaxed) {
-            true => d.deletes.iter().for_each(|k| drop(o.remove(k))),
-            false => o.extend(d.deletes.iter().map(|k| (k.clone(), (d.id, None)))),
+            true => d.deletes.iter().for_each(|k| o.remove(k)),
+            false => d.deletes.iter().for_each(|k| o.set(k.clone(), (d.id, None))),
         }
         self.streamed.fetch_max(d.id, Relaxed);
         if !quiet(d) {
@@ -2328,10 +2422,10 @@ impl Catalog {
             if self.mirror.load(Relaxed) {
                 // The mirror answers every read but inline data without our view, so commits the
                 // view already has must still arrive through the stream: `pruned` stays put.
-                o.retain(|k, (id, _)| *id > upto || !k.starts_with("d/"));
+                o.retain(|k, v| v.0 > upto || !k.starts_with("d/"));
             } else {
                 self.pruned.fetch_max(upto, Relaxed);
-                o.retain(|_, (id, _)| *id > upto);
+                o.retain(|_, v| v.0 > upto);
             }
         }
         if self.follows && !self.mirror.load(Relaxed) && self.hold.load(Relaxed) <= c {
@@ -2362,11 +2456,11 @@ impl Catalog {
             return Ok(());
         }
         // Streamed changes newer than the snapshot win; everything older gives way to it.
-        o.retain(|k, (id, _)| *id > c || k.starts_with("d/"));
+        o.retain(|k, v| v.0 > c || k.starts_with("d/"));
         for (k, v) in all {
-            o.entry(k).or_insert((c, Some(v)));
+            o.insert_absent(k, (c, Some(v)));
         }
-        o.retain(|_, (_, v)| v.is_some()); // (deleted keys: absent from the whole catalog)
+        o.retain(|_, v| v.1.is_some()); // (deleted keys: absent from the whole catalog)
         self.pruned.fetch_max(c, Relaxed); // older streamed commits are in the snapshot
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
@@ -2568,10 +2662,14 @@ impl Catalog {
         Ok(self.scan_raw(from, to).await?.into_iter().take(n).collect())
     }
 
-    /// How many keys in [from, to) the catalog holds, when it holds the whole catalog in memory (the
-    /// leader's, and a follower's once seeded); counted in place, nothing copied. `None` otherwise.
-    pub fn count(&self, from: &str, to: &str) -> Option<usize> {
-        self.mirror.load(Relaxed).then(|| self.overlay.lock().unwrap().range(from.to_string()..to.to_string()).filter(|(_, (_, v))| v.is_some()).count())
+    /// The producers' marks (`p/` keys) and the expiries (`g/` keys) the catalog holds, when it holds the whole catalog in
+    /// memory (the leader's, and a follower's once seeded); `None` otherwise. Counted as the overlay changes, so this is two
+    /// numbers, not a scan under the lock (`Overlay`).
+    pub fn tallies(&self) -> Option<(usize, usize)> {
+        self.mirror.load(Relaxed).then(|| {
+            let o = self.overlay.lock().unwrap();
+            (o.marks, o.expiries)
+        })
     }
 
     /// Leader: persist the catalog memtable if anything was committed since the last time. A
@@ -2822,7 +2920,7 @@ mod tests {
         let first: Vec<String> = lake.cat.scan_first("g/", "g0", 3).await?.into_iter().map(|(k, _)| k).collect();
         assert_eq!(first, ["g/0", "g/1", "g/2"]);
         assert_eq!(lake.cat.scan_first("g/", "g0", 99).await?.len(), 5);
-        assert_eq!(lake.cat.count("g/", "g0"), Some(5));
+        assert_eq!(lake.cat.tallies().map(|t| t.1), Some(5), "five expiries; `h/x` is neither");
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())

@@ -1213,10 +1213,41 @@ mod tests {
         assert_eq!(expiry(&lake, retry_ms(), "kafka:k").await, None, "kept for good: no key");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "the pass is finished");
         s.send(1, &[("kafka:z", 2)]).await;
-        assert_eq!(lake.cat.count(EXPIRY, "g/~"), Some(2), "a finished pass adds nothing more");
+        assert_eq!(lake.cat.tallies().map(|t| t.1), Some(2), "a finished pass adds nothing more");
         s.send(retry_ms(), &[("kafka:z", 3)]).await;
         assert_eq!(mark(&lake, "sql:auto-py-a-1").await, None, "its key is due: the mark goes");
         assert_eq!(mark(&lake, "sql:nightly").await, Some(3), "a named job's mark stays for its window");
+        done(lake, dir).await
+    }
+
+    /// The gauges (`Catalog::tallies`) are the scan's counts after commits, expiries and a restart: the overlay counts its keys
+    /// as they change, so a scrape reads two numbers and no range is scanned under the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gauges_are_the_scans_counts_after_commits_and_expiries() -> Result<()> {
+        // (marks: `p/` keys, expiries: `g/` keys before the old marks' marker, counted as a scan counts them)
+        async fn scanned(lake: &Lake) -> Result<Option<(usize, usize)>> {
+            let marks = lake.cat.scan_first("p/", "p0", usize::MAX).await?.len();
+            let expiries = lake.cat.scan_first(EXPIRY, "g/~", usize::MAX).await?.len();
+            Ok(Some((marks, expiries)))
+        }
+        let (dir, lake) = fresh().await?;
+        let mut s = Seq::start(&lake, 0).await?;
+        s.send(0, &[("sql:auto-py-a-1", 1), ("kafka:k", 1)]).await;
+        s.send(10, &[("sql:auto-py-b-1", 1)]).await;
+        s.send(20, &[("sql:auto-py-a-1", 2)]).await; // (a's next mark: its first expiry stays until it is due)
+        lake.cat.commit(vec![(producer_key("emit:v"), json(&1u64))], &[]).await?; // (a view's progress: a `p/` key too)
+        assert_eq!(lake.cat.tallies(), Some((4, 3)), "four marks, three expiries");
+        assert_eq!(lake.cat.tallies(), scanned(&lake).await?);
+        s.send(120_010, &[("kafka:k", 2)]).await; // (due: a's first expiry, whose seq is gone, and b's, which goes with b's mark)
+        assert_eq!(lake.cat.tallies(), Some((3, 1)));
+        assert_eq!(lake.cat.tallies(), scanned(&lake).await?);
+        s.send(200_000, &[("kafka:k", 3)]).await; // (a's last expiry is due: its mark goes)
+        assert_eq!(lake.cat.tallies(), Some((2, 0)));
+        assert_eq!(lake.cat.tallies(), scanned(&lake).await?);
+        drop(s);
+        lake.cat.close().await?;
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?; // (a restart as the leader counts what the catalog holds)
+        assert_eq!(lake.cat.tallies(), scanned(&lake).await?, "after a restart");
         done(lake, dir).await
     }
 
@@ -1227,11 +1258,11 @@ mod tests {
         lake.cat.commit((0..=PER_COMMIT).map(|i| (producer_key(&format!("sql:auto-py-py-{i:05}")), json(&1u64))).collect(), &[]).await?;
         let mut s = Seq::start(&lake, 0).await?;
         s.send(0, &[("kafka:z", 1)]).await;
-        assert_eq!(lake.cat.count(EXPIRY, "g/~"), Some(PER_COMMIT), "the first 10 000 keyed by one commit");
+        assert_eq!(lake.cat.tallies().map(|t| t.1), Some(PER_COMMIT), "the first 10 000 keyed by one commit");
         assert_ne!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")), "not finished yet");
         let mut s = Seq::start(&lake, 1).await?; // (a new leader: the cursor is in the catalog)
         s.send(1, &[("kafka:z", 2)]).await;
-        assert_eq!(lake.cat.count(EXPIRY, "g/~"), Some(PER_COMMIT + 1), "the rest keyed, each once");
+        assert_eq!(lake.cat.tallies().map(|t| t.1), Some(PER_COMMIT + 1), "the rest keyed, each once");
         assert_eq!(lake.cat.get::<serde_json::Value>(OLD_MARKS).await?, Some(serde_json::json!("Done")));
         done(lake, dir).await
     }
