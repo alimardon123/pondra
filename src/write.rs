@@ -1776,7 +1776,7 @@ async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &st
 /// the value is DEFAULT. What each form gives is what Postgres takes (`change::Merge::written` for a MERGE and the INSERT …
 /// ON CONFLICT and OR … forms, `rules::rows::defaulted` for the DEFAULTs in VALUES). A name no lake here holds is Ok: its own path answers.
 pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
-    use crate::rules::keys::{given, set, Said};
+    use crate::rules::keys::{given, set};
     if !matches!(stmt, Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Merge(_)) {
         return Ok(());
     }
@@ -1788,17 +1788,11 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
         return Ok(());
     }
     let t = meta.rules()?;
-    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
     match stmt {
-        // (a positional `INSERT INTO t query`: the table's first columns the rows have, as `implicit` takes them)
-        Stmt::Insert(_, query) => given(&t, &table, implicit(&columns, crate::rules::rows::rows_width(query)), Said::Positional),
-        // (`INSERT INTO t (names) query`: the columns named, or the table's first ones the rows have, as `whole_rows` takes them;
-        // a value that says DEFAULT is not given)
-        Stmt::InsertInto(_, names, query) => {
-            let names: Vec<String> = if names.is_empty() { implicit(&columns, crate::rules::rows::rows_width(query)).to_vec() } else { names.clone() };
-            let given_names: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::rules::rows::defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
-            given(&t, &table, &given_names, Said::Named)
-        }
+        // (a positional `INSERT INTO t query` and `INSERT INTO t (names) query`, as the core reads each: a value that says DEFAULT
+        // is not given, and the first columns the rows have are the ones a positional row gives)
+        Stmt::Insert(_, query) => crate::rules::keys::inserted(&t, &table, &[], query),
+        Stmt::InsertInto(_, names, query) => crate::rules::keys::inserted(&t, &table, names, query),
         Stmt::Update(_, assigned, _) => set(&t, &assigned.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>()),
         Stmt::Merge(m) => {
             let written = m.written(&t);
