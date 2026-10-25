@@ -29,42 +29,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// (the statement-side parts of an identity column and its options: `rules/create.rs`, which the page reads too)
+pub use crate::rules::create::{identity_of, options_sql, serial_type, shape, Identity, Opt, Shape};
+
 type Result<T> = anyhow::Result<T>;
 
 pub fn key(name: &str) -> String { format!("sq/{name}") }
 
-/// One option as written (`INCREMENT BY 2`, `NO MAXVALUE`, `AS integer`); a later one of a kind wins.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Opt {
-    As(String),
-    Increment(i64),
-    Min(Option<i64>),
-    Max(Option<i64>),
-    Start(i64),
-    Cache(i64),
-    Cycle(bool),
-}
-
-impl Opt {
-    pub fn rank(&self) -> usize { [matches!(self, Opt::As(_)), matches!(self, Opt::Increment(_)), matches!(self, Opt::Min(_)), matches!(self, Opt::Max(_)), matches!(self, Opt::Start(_)), matches!(self, Opt::Cache(_)), matches!(self, Opt::Cycle(_))].iter().position(|m| *m).unwrap_or(0) }
-    fn sql(&self) -> String {
-        match self {
-            Opt::As(t) => format!("AS {t}"),
-            Opt::Increment(n) => format!("INCREMENT BY {n}"),
-            Opt::Min(Some(n)) => format!("MINVALUE {n}"),
-            Opt::Min(None) => "NO MINVALUE".into(),
-            Opt::Max(Some(n)) => format!("MAXVALUE {n}"),
-            Opt::Max(None) => "NO MAXVALUE".into(),
-            Opt::Start(n) => format!("START WITH {n}"),
-            Opt::Cache(n) => format!("CACHE {n}"),
-            Opt::Cycle(true) => "CYCLE".into(),
-            Opt::Cycle(false) => "NO CYCLE".into(),
-        }
-    }
-}
-
-/// The options as SQL, each kind once (the last written), in Postgres's order.
 /// The options a `CREATE SEQUENCE` statement declares, or None when it isn't one (an apply compares them).
 pub fn declared(sql: &str) -> Option<Vec<Opt>> {
     match statement(sql) {
@@ -76,11 +47,6 @@ pub fn declared(sql: &str) -> Option<Vec<Opt>> {
     }
 }
 
-pub fn options_sql(declared: &[Opt]) -> String {
-    let last: Vec<&Opt> = (0..7).filter_map(|r| declared.iter().rev().find(|o| o.rank() == r)).collect();
-    last.iter().map(|o| o.sql()).collect::<Vec<_>>().join(" ")
-}
-
 /// A sequence as the catalog keeps it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Sequence {
@@ -90,45 +56,6 @@ pub struct Sequence {
     pub version: u64, // the commit that made or last changed it: a node's block from before goes
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owned: Option<String>, // `table.column`: an identity column's
-}
-
-/// What a sequence's options come to.
-pub struct Shape {
-    pub start: i64,
-    pub increment: i64,
-    pub min: i64,
-    pub max: i64,
-    pub cache: i64,
-    pub cycle: bool,
-    pub as_type: &'static str, // its type: BIGINT, INTEGER or SMALLINT (the catalog's `seqtypid`)
-}
-
-/// The options worked out, Postgres's defaults where none is given, and checked.
-pub fn shape(declared: &[Opt]) -> Result<Shape> {
-    let last = |f: fn(&Opt) -> Option<Option<i64>>| declared.iter().rev().find_map(f);
-    let as_type = match declared.iter().rev().find_map(|o| if let Opt::As(t) = o { Some(t.to_lowercase()) } else { None }).as_deref() {
-        None | Some("bigint" | "int8" | "long") => "BIGINT",
-        Some("integer" | "int" | "int4") => "INTEGER",
-        Some("smallint" | "int2" | "short") => "SMALLINT",
-        Some(t) => bail!("a sequence counts in smallint, integer or bigint, not {t}"),
-    };
-    let (lo, hi) = match as_type {
-        "SMALLINT" => (i16::MIN as i64, i16::MAX as i64),
-        "INTEGER" => (i32::MIN as i64, i32::MAX as i64),
-        _ => (i64::MIN, i64::MAX),
-    };
-    let increment = last(|o| if let Opt::Increment(n) = o { Some(Some(*n)) } else { None }).flatten().unwrap_or(1);
-    ensure!(increment != 0, "INCREMENT must not be zero");
-    let min = last(|o| if let Opt::Min(n) = o { Some(*n) } else { None }).flatten().unwrap_or(if increment > 0 { 1 } else { lo });
-    let max = last(|o| if let Opt::Max(n) = o { Some(*n) } else { None }).flatten().unwrap_or(if increment > 0 { hi } else { -1 });
-    ensure!(lo <= min && max <= hi, "MINVALUE ({min}) and MAXVALUE ({max}) must be within {as_type}'s range");
-    ensure!(min < max, "MINVALUE ({min}) must be less than MAXVALUE ({max})");
-    let start = last(|o| if let Opt::Start(n) = o { Some(Some(*n)) } else { None }).flatten().unwrap_or(if increment > 0 { min } else { max });
-    ensure!((min..=max).contains(&start), "START value ({start}) must be between MINVALUE ({min}) and MAXVALUE ({max})");
-    let cache = last(|o| if let Opt::Cache(n) = o { Some(Some(*n)) } else { None }).flatten().unwrap_or(1);
-    ensure!(cache >= 1, "CACHE ({cache}) must be greater than zero");
-    let cycle = declared.iter().rev().find_map(|o| if let Opt::Cycle(c) = o { Some(*c) } else { None }).unwrap_or(false);
-    Ok(Shape { start, increment, min, max, cache, cycle, as_type })
 }
 
 /// `CREATE SEQUENCE` again, as declared.
@@ -274,25 +201,6 @@ pub fn in_order(sql: &str) -> Option<String> {
     (out != sql).then(|| out.into_owned())
 }
 
-/// The parser's options (an identity column's), checked.
-pub fn options(given: &[ast::SequenceOptions]) -> Result<Vec<Opt>> {
-    use ast::SequenceOptions as S;
-    let n = |e: &ast::Expr| e.to_string().replace(' ', "").parse::<i64>().with_context(|| format!("{e}: a sequence's options are whole numbers"));
-    let mut out = vec![];
-    for o in given {
-        out.push(match o {
-            S::IncrementBy(e, _) => Opt::Increment(n(e)?),
-            S::MinValue(e) => Opt::Min(e.as_ref().map(n).transpose()?),
-            S::MaxValue(e) => Opt::Max(e.as_ref().map(n).transpose()?),
-            S::StartWith(e, _) => Opt::Start(n(e)?),
-            S::Cache(e) => Opt::Cache(n(e)?),
-            S::Cycle(no) => Opt::Cycle(!no),
-        });
-    }
-    shape(&out)?;
-    Ok(out)
-}
-
 /// Leader: carry one out (under the lake's lock); the counters move in the sequencer (`Held`).
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     match c {
@@ -399,8 +307,7 @@ pub async fn check_current(lake: &Lake, name: &str) -> Result<()> {
 /// An identity column's sequence, made with its table (leader): `{table}_{column}_seq`, or the
 /// first `…_seq1`, `…_seq2` no relation or sequence has. Its name, for the column's default.
 pub async fn owned(lake: &Lake, table: &str, column: &str, declared: Vec<Opt>) -> Result<String> {
-    let (schema, t) = crate::text::split(table);
-    let base = crate::text::join(schema, &format!("{t}_{column}_seq"));
+    let base = crate::rules::create::identity_sequence(table, column);
     for i in 0.. {
         let name = if i == 0 { base.clone() } else { format!("{base}{i}") };
         if !relation(lake, &name).await? && lake.cat.get::<Sequence>(&key(&name)).await?.is_none() {
@@ -430,65 +337,6 @@ pub async fn drop_owned(lake: &Lake, meta: &TableMeta) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// An identity column, as its table keeps it (`TableMeta::identity`, by stored name).
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct Identity {
-    pub always: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub declared: Vec<Opt>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub sequence: String,
-}
-
-impl Identity {
-    /// How `CREATE TABLE` says it.
-    pub fn sql(&self) -> String {
-        let options = options_sql(&self.declared);
-        format!("GENERATED {} AS IDENTITY{}", if self.always { "ALWAYS" } else { "BY DEFAULT" }, if options.is_empty() { String::new() } else { format!(" ({options})") })
-    }
-}
-
-/// A column of `CREATE TABLE` that is an identity: ALWAYS or not, and its options. A computed
-/// column (`GENERATED ALWAYS AS (expr)`) isn't taken yet, and says so.
-pub fn identity_of(c: &ast::ColumnDef) -> Result<Option<Identity>> {
-    let mut out = None;
-    for o in &c.options {
-        out = match &o.option {
-            ast::ColumnOption::Generated { generation_expr: Some(e), .. } => return Err(crate::codes::coded("0A000", format!("{} … GENERATED ALWAYS AS ({e}): computed columns aren't taken yet (a view can compute it)", c.name))),
-            ast::ColumnOption::Generated { generated_as, sequence_options, .. } => {
-                let always = matches!(generated_as, ast::GeneratedAs::Always);
-                Some(Identity { always, declared: options(sequence_options.as_deref().unwrap_or_default())?, ..Default::default() })
-            }
-            ast::ColumnOption::Identity(ast::IdentityPropertyKind::Identity(p) | ast::IdentityPropertyKind::Autoincrement(p)) => {
-                let declared = match &p.parameters {
-                    Some(ast::IdentityPropertyFormatKind::FunctionCall(x) | ast::IdentityPropertyFormatKind::StartAndIncrement(x)) => options(&[ast::SequenceOptions::StartWith(x.seed.clone(), true), ast::SequenceOptions::IncrementBy(x.increment.clone(), true)])?,
-                    None => vec![],
-                };
-                Some(Identity { declared, ..Default::default() })
-            }
-            ast::ColumnOption::DialectSpecific(t) if matches!(&t[..], [w] if ["AUTO_INCREMENT", "AUTOINCREMENT"].contains(&w.to_string().to_uppercase().as_str())) => Some(Identity::default()),
-            _ => out,
-        };
-    }
-    if let ast::DataType::Custom(n, a) = &c.data_type {
-        if a.is_empty() && ["serial", "bigserial", "smallserial", "serial4", "serial8", "serial2"].contains(&n.to_string().to_lowercase().as_str()) {
-            out = out.or(Some(Identity::default()));
-        }
-    }
-    Ok(out)
-}
-
-/// The types `serial` stands for.
-pub fn serial_type(t: &ast::DataType) -> Option<&'static str> {
-    let ast::DataType::Custom(n, a) = t else { return None };
-    match (a.is_empty(), n.to_string().to_lowercase().as_str()) {
-        (true, "serial" | "serial4") => Some("INTEGER"),
-        (true, "bigserial" | "serial8") => Some("BIGINT"),
-        (true, "smallserial" | "serial2") => Some("SMALLINT"),
-        _ => None,
-    }
 }
 
 /// `INSERT` giving `columns` (as SQL names them): refused if one is an ALWAYS identity (428C9). `meta` as stored or `logical()`.

@@ -32,3 +32,22 @@ SELECT id, v FROM k
 ----
 1 new
 2 b
+
+# A key named unquoted in mixed case is the column SQL names: in lower case.
+statement ok
+CREATE TABLE mk (Id INT PRIMARY KEY, V TEXT)
+
+statement ok
+INSERT INTO mk VALUES (1, 'a')
+
+statement error 23505
+INSERT INTO mk VALUES (1, 'again')
+
+statement ok
+INSERT INTO mk VALUES (1, 'b'), (2, 'c') ON CONFLICT DO NOTHING
+
+query IT rowsort
+SELECT id, v FROM mk
+----
+1 a
+2 c

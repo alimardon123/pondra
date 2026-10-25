@@ -26,47 +26,8 @@ use std::future::Future;
 use std::sync::{Arc, Weak};
 
 pub use crate::rules::keys::absent;
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct Constraint {
-    pub name: String,
-    pub kind: Kind,
-    pub columns: Vec<String>, // stored names (SQL's in a table's spec and in `logical()`)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub references: Option<(String, Vec<String>)>, // a foreign key's table and its columns, as written
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub enforced: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum Kind {
-    Unique,
-    PrimaryKey,
-    ForeignKey,
-}
-
-impl Constraint {
-    /// The same constraint with its columns named another way (stored names to SQL's, or back).
-    pub fn named(&self, n: &dyn Fn(&String) -> String) -> Constraint { Constraint { columns: self.columns.iter().map(n).collect(), ..self.clone() } }
-
-    /// As `CREATE TABLE` and `ALTER TABLE … ADD` write it.
-    pub fn sql(&self, ident: &dyn Fn(&str) -> String) -> String { format!("CONSTRAINT {} {}", ident(&self.name), self.def(ident)) }
-
-    /// Without its name, as Postgres's `pg_get_constraintdef` writes it.
-    pub fn def(&self, ident: &dyn Fn(&str) -> String) -> String {
-        let list = |c: &[String]| c.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
-        let what = match self.kind {
-            Kind::Unique => format!("UNIQUE ({})", list(&self.columns)),
-            Kind::PrimaryKey => format!("PRIMARY KEY ({})", list(&self.columns)),
-            Kind::ForeignKey => {
-                let (t, c) = self.references.clone().unwrap_or_default();
-                format!("FOREIGN KEY ({}) REFERENCES {t}{}", list(&self.columns), if c.is_empty() { String::new() } else { format!("({})", list(&c)) })
-            }
-        };
-        format!("{what}{}", if self.enforced { "" } else { " NOT ENFORCED" })
-    }
-}
+// (the statement-side parts: `rules/create.rs`)
+pub use crate::rules::create::{informational, of, Constraint, Kind};
 
 /// Does a write to this table have to be checked on the leader (an enforced UNIQUE)?
 pub fn checked(meta: &TableMeta) -> bool { meta.constraints.iter().any(|c| c.enforced) }
@@ -87,91 +48,6 @@ pub fn door(meta: &TableMeta, table: &str) -> Result<()> {
     match meta.constraints.iter().find(|c| c.enforced) {
         Some(c) => bail!("{table} has UNIQUE ({}): it takes rows through SQL's INSERT, UPDATE and MERGE, which check them on the leader", c.columns.iter().map(|s| meta.name_of(s)).collect::<Vec<_>>().join(", ")),
         None => Ok(()),
-    }
-}
-
-/// Is a PRIMARY KEY (a column's or the table's) said NOT ENFORCED: a fact, not the table's key?
-pub fn informational(c: &Option<ast::ConstraintCharacteristics>) -> bool { matches!(c, Some(c) if c.enforced == Some(false)) }
-
-/// The UNIQUE, NOT ENFORCED PRIMARY KEY and FOREIGN KEY constraints a `CREATE TABLE` declares
-/// (columns by SQL's names), named as Postgres names them when they aren't: `{table}_{columns}_key`,
-/// `{table}_pkey`, `{table}_{columns}_fkey`.
-pub fn declared(c: &ast::CreateTable, table: &str) -> Result<Vec<Constraint>> {
-    let mut out: Vec<Constraint> = vec![];
-    for col in &c.columns {
-        let one = vec![crate::text::ident(&col.name)];
-        for o in &col.options {
-            let named = |n: &Option<ast::Ident>| n.as_ref().or(o.name.as_ref()).map(crate::text::ident);
-            match &o.option {
-                ast::ColumnOption::Unique(u) => out.push(unique(named(&u.name), one.clone(), u, table)?),
-                ast::ColumnOption::PrimaryKey(p) if informational(&p.characteristics) => out.push(fact(named(&p.name), Kind::PrimaryKey, one.clone(), None, table)),
-                ast::ColumnOption::ForeignKey(f) => out.push(foreign(named(&f.name), one.clone(), f, table)?),
-                _ => {}
-            }
-        }
-    }
-    for k in &c.constraints {
-        if let Some(k) = of(k, table)? {
-            out.push(k);
-        }
-    }
-    let keys = c.columns.iter().flat_map(|c| &c.options).filter(|o| matches!(o.option, ast::ColumnOption::PrimaryKey(_))).count() + c.constraints.iter().filter(|k| matches!(k, ast::TableConstraint::PrimaryKey(_))).count();
-    ensure!(keys <= 1, "multiple primary keys for table \"{table}\" are not allowed"); // (two columns' PRIMARY KEYs made one key of both)
-    let mut names = std::collections::HashSet::new();
-    for k in out.iter_mut() {
-        let base = k.name.clone();
-        k.name = (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}{}", i - 1) }).find(|n| names.insert(n.clone())).expect("a free name");
-    }
-    Ok(out)
-}
-
-/// A table constraint (`CONSTRAINT … UNIQUE (a, b)`, `… FOREIGN KEY …`, a NOT ENFORCED PRIMARY
-/// KEY) as kept; None for the others (an enforced PRIMARY KEY is the table's key, a CHECK is a
-/// check).
-pub fn of(k: &ast::TableConstraint, table: &str) -> Result<Option<Constraint>> {
-    let cols = |c: &[ast::IndexColumn]| c.iter().map(|i| match &i.column.expr {
-        ast::Expr::Identifier(i) => Ok(crate::text::ident(i)),
-        e => bail!("{e}: a constraint is on columns"),
-    }).collect::<Result<Vec<_>>>();
-    let name = |n: &Option<ast::Ident>| n.as_ref().map(crate::text::ident);
-    Ok(match k {
-        ast::TableConstraint::Unique(u) => Some(unique(name(&u.name), cols(&u.columns)?, u, table)?),
-        ast::TableConstraint::PrimaryKey(p) if informational(&p.characteristics) => Some(fact(name(&p.name), Kind::PrimaryKey, cols(&p.columns)?, None, table)),
-        ast::TableConstraint::ForeignKey(f) => Some(foreign(name(&f.name), f.columns.iter().map(crate::text::ident).collect(), f, table)?),
-        _ => None,
-    })
-}
-
-fn unique(name: Option<String>, columns: Vec<String>, u: &ast::UniqueConstraint, table: &str) -> Result<Constraint> {
-    if matches!(u.nulls_distinct, ast::NullsDistinctOption::NotDistinct) {
-        return Err(crate::codes::coded("0A000", "UNIQUE NULLS NOT DISTINCT isn't taken yet: a UNIQUE column holds any number of NULLs, as by default"));
-    }
-    deferred(&u.characteristics)?;
-    Ok(Constraint { name: name.unwrap_or_else(|| format!("{table}_{}_key", columns.join("_"))), kind: Kind::Unique, columns, references: None, enforced: !informational(&u.characteristics) })
-}
-
-fn foreign(name: Option<String>, columns: Vec<String>, f: &ast::ForeignKeyConstraint, table: &str) -> Result<Constraint> {
-    let refs = format!("REFERENCES {}", f.foreign_table);
-    if !informational(&f.characteristics) {
-        // (a feature not taken yet, not a fault: SQLSTATE 0A000, as the other "not taken" refusals)
-        return Err(crate::codes::coded("0A000", format!("{} {refs}: a reference isn't checked yet; say NOT ENFORCED to keep it as a fact about the data (BI tools and the planner read it)", columns.join(", "))));
-    }
-    let to = (crate::text::object(&f.foreign_table), f.referred_columns.iter().map(crate::text::ident).collect());
-    Ok(fact(name, Kind::ForeignKey, columns, Some(to), table))
-}
-
-fn fact(name: Option<String>, kind: Kind, columns: Vec<String>, references: Option<(String, Vec<String>)>, table: &str) -> Constraint {
-    let name = name.unwrap_or_else(|| match kind {
-        Kind::PrimaryKey => format!("{table}_pkey"),
-        _ => format!("{table}_{}_fkey", columns.join("_")),
-    });
-    Constraint { name, kind, columns, references, enforced: false }
-}
-
-fn deferred(c: &Option<ast::ConstraintCharacteristics>) -> Result<()> {
-    match c {
-        Some(c) if c.deferrable == Some(true) => Err(crate::codes::coded("0A000", "DEFERRABLE: a constraint is checked at each statement")),
-        _ => Ok(()),
     }
 }
 
