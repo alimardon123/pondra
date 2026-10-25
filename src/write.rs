@@ -936,7 +936,7 @@ pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<
 async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let table = stmt.table();
-    let m: TableMeta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?.logical(); // (as SQL names it)
+    let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {

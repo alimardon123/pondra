@@ -1119,7 +1119,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
-    let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let meta = app.lake.table_meta(name).await?;
     let rules = meta.rules()?;
     let schema = rules.schema.clone(); // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
@@ -1166,7 +1166,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
-    if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
+    if app.lake.table_meta_if(name).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
@@ -1260,7 +1260,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
     crate::auth::check_all(&name)?; // (a user's: the whole row)
     let lake = &app.lake;
-    let meta = lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
