@@ -32,9 +32,6 @@ impl std::fmt::Display for Bad {
 
 impl std::error::Error for Bad {}
 
-/// Postgres writes a bytea's hex digits in lower case.
-const DIGITS: &[u8; 16] = b"0123456789abcdef";
-
 /// A bytea from Postgres's text for it: the hex form `\x…` or the escape form. Refused as Postgres refuses it.
 pub fn parse(text: &str) -> Result<Vec<u8>, Bad> {
     match text.strip_prefix("\\x") {
@@ -100,7 +97,7 @@ fn invalid() -> Bad { bad("22P02", "invalid input syntax for type bytea") }
 fn bad(code: &'static str, message: impl Into<String>) -> Bad { Bad { code, message: message.into() } }
 
 /// A bytea as Postgres writes it: `\x` and lower-case hex.
-pub fn text(bytes: &[u8]) -> String { format!("\\x{}", digits(bytes)) }
+pub fn text(bytes: &[u8]) -> String { format!("\\x{}", crate::text::hex(bytes)) }
 
 /// A bytea as `encode(…, 'escape')` writes it: a 0x00 byte and every byte from 0x80 up as `\ooo`, a backslash as
 /// `\\`, and every other byte as itself.
@@ -117,22 +114,12 @@ pub fn escape(bytes: &[u8]) -> String {
 }
 
 /// A bytea as a SQL literal DataFusion reads as Binary: `X'01ff'` (`X''` for none).
-pub fn sql(bytes: &[u8]) -> String { format!("X'{}'", digits(bytes)) }
+pub fn sql(bytes: &[u8]) -> String { format!("X'{}'", crate::text::hex(bytes)) }
 
 /// Postgres's functions whose first argument only a bytea takes: a string literal there is a bytea literal, read as
 /// `parse` reads it (friendly.rs's `expression`). `get_bit` and `set_bit` are not here: Postgres has them over a bit
 /// string too, which wins for a bare literal.
 pub const TAKES_BYTEA: &[&str] = &["sha224", "sha256", "sha384", "sha512", "encode", "get_byte", "set_byte", "convert_from"];
-
-/// The hex digits of `bytes`, two a byte, in lower case.
-fn digits(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(char::from(DIGITS[usize::from(b >> 4)]));
-        out.push(char::from(DIGITS[usize::from(b & 15)]));
-    }
-    out
-}
 
 /// The bytes as UTF-8 text, or Postgres's 22021 naming them (`convert_from`, and text from the Postgres port).
 pub fn utf8(bytes: &[u8]) -> Result<String, Bad> { checked_utf8(bytes).map(str::to_string) }
@@ -314,8 +301,9 @@ pub fn strpos() -> Arc<ScalarUDF> {
 /// functions that DataFusion doesn't have. `pg_functions::register` calls it.
 pub fn register(ctx: &SessionContext) {
     ctx.register_udf(strpos().as_ref().clone());
+    // `byte_length` is `octet_length`: a binary's bytes, and a text's as DataFusion counts them (UTF-8 bytes).
+    ctx.register_udf(or_bytes(datafusion::functions::string::octet_length(), Over::Octets).with_aliases(["byte_length"]));
     for (inner, over) in [
-        (datafusion::functions::string::octet_length(), Over::Octets),
         (datafusion::functions::string::bit_length(), Over::Bits),
         (datafusion::functions::string::btrim(), Over::Trim(Side::Both)),
         (datafusion::functions::string::ltrim(), Over::Trim(Side::Leading)),
@@ -571,7 +559,7 @@ fn decode(a: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
 /// `encode(bytes, format)`: the bytes as text in one of Postgres's formats. `base64pad` is DataFusion's name, kept.
 fn encode_as(bytes: &[u8], format: &str) -> DfResult<String> {
     match format.to_ascii_lowercase().as_str() {
-        "hex" => Ok(digits(bytes)),
+        "hex" => Ok(crate::text::hex(bytes)),
         "base64" => Ok(base64_lines(bytes)),
         "base64pad" => Ok(STANDARD.encode(bytes)),
         "escape" => Ok(escape(bytes)),

@@ -6,7 +6,7 @@ use crate::text::function;
 use anyhow::Result;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::sql::sqlparser::ast::{self, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Statement, VisitMut, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -128,6 +128,59 @@ impl VisitorMut for Casts {
             *data_type = ast::DataType::Varchar(None);
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
+/// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
+/// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
+/// (`'A0EE…'::uuid` is `'a0ee…'`), anything else by `pondra_uuid(x)` (`TRY_CAST`: `pondra_uuid(x,
+/// true)`, NULL for what isn't one). A string compared with a uuid or written into one is read as one, and
+/// `pg_typeof(x)` of one is 'uuid' (`pg_trace::rewrite`), before the casts it may read are written out.
+/// Whether anything changed.
+pub(crate) async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -> Result<bool> {
+    let mut read = false;
+    for s in stmts.iter_mut() {
+        // (a bare name of a JSON call's rows is its value unless a relation has a column of that name: the catalog is asked
+        // only for a statement with such a name)
+        let columns = match crate::pg_json_sets::bare_aliases(s) {
+            true => crate::pg_trace::columns_named(host, s).await,
+            false => None,
+        };
+        read |= crate::pg_json_sets::sets(s, columns.as_ref())?; // (set-returning JSON functions: rows of a document, before the casts they may read)
+        read |= crate::pg_trace::rewrite(host, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
+    }
+    for s in stmts.iter_mut() {
+        read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)
+    }
+    for s in stmts.iter_mut() {
+        read |= crate::pg_text::array_literals(s)?; // (a string cast to an array type reads as Postgres reads an array literal)
+    }
+    let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], typed: false, collecting: true, failed: None };
+    for s in stmts.iter_mut() {
+        let _ = s.visit(&mut f); // (the first pass only collects the names)
+    }
+    if f.named.is_empty() && !f.typed {
+        return Ok(read);
+    }
+    for n in std::mem::take(&mut f.named) {
+        if let Some(labels) = host.enum_labels(&n).await {
+            f.types.insert(n, labels);
+        }
+    }
+    if let Some(n) = f.labelled.iter().find(|n| !f.types.contains_key(*n)) {
+        return Err(crate::codes::coded("42704", format!("type \"{n}\" does not exist"))); // (not DataFusion's "Invalid function 'enum_range'")
+    }
+    if f.types.is_empty() && !f.typed {
+        return Ok(read);
+    }
+    f.collecting = false;
+    for s in stmts.iter_mut() {
+        let _ = s.visit(&mut f);
+    }
+    match f.failed {
+        Some(e) => Err(e),
+        None => Ok(true),
     }
 }
 

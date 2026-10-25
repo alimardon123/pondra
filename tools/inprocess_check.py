@@ -10,15 +10,16 @@ script, because a process holds one node and its settings are fixed by its first
 this checkout's python/ first on its path. The JavaScript children (i to n) are in inprocess_check.mjs, run by
 Node, or by Bun for n (RUNNERS); o reads the library's symbols here, with nm.
 
-a. "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; its lake held
-   in memory, with nothing written in the temporary folder or here, and a new open a new lake"
+a. "pondra.connect() with no path: SQL, a frame, pandas in and out, a file here, a live query; no HTTP client
+   loaded (http.client, urllib, ssl, email, inspect); its lake held in memory, with nothing written in the
+   temporary folder or here, and a new open a new lake"
 b. "a lake opened, written, closed and opened again in this process: its rows"
 c. "connect() while a node is open here: the same lake another connection to it (sessions apart, one closed and
    the other still answering), another lake and another memory lake a node each beside this process, a URL a
    connection; local() and open() warn that they go at 1.0"
 d. "a misspelt setting is refused naming the nearest"
 e. "a setting changed on a later open is refused naming it"
-f. "50 opens and closes leave no threads or open files" (Linux)
+f. "50 opens and closes leave no threads or open files, and each close takes under 100 ms" (Linux)
 g. "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still
    answers" (Linux and macOS)
 h. "the library asks for no static TLS, so any process loads it" (Linux)
@@ -87,6 +88,7 @@ def child_sql():
     db.sql("CREATE TABLE t (id INT, name TEXT)")
     db.sql("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
     facts = {"count": db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"], "pandas": None, "polars": None}
+    facts["http"] = sorted(m for m in ("email", "http.client", "inspect", "ssl", "urllib.error", "urllib.request") if m in sys.modules)  # (before the door check below imports urllib itself)
     if has("pandas") and has("pyarrow"):
         import pandas
         db.write_table("p", pandas.DataFrame({"x": [1, 2]}))
@@ -275,7 +277,9 @@ def child_cycles():
         db.sql("CREATE TABLE IF NOT EXISTS t (id INT)")
         db.sql("INSERT INTO t VALUES (1)")
         n = db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"]
+        t = time.perf_counter()
         db.close()
+        closes.append(time.perf_counter() - t)
         return n
 
     def switches():  # (every time a thread of this process was woken)
@@ -293,11 +297,13 @@ def child_cycles():
         time.sleep(2)  # (a node left running, or a task of its, wakes its threads while nothing is open)
         return len(os.listdir("/proc/self/task")), len(os.listdir("/proc/self/fd")), switches() - before
 
+    closes = []
     rows = [cycle()]
     first = census()
     rows += [cycle() for _ in range(49)]
     last = census()
-    return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows}
+    return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows,
+            "close_ms": round(statistics.median(closes) * 1000, 1)}
 
 
 def child_quiet():
@@ -472,6 +478,7 @@ def judge_sql(f):
     yield f["lake"] == ":memory:" and not f["while_open"] and not f["after_close"], \
         f"its lake ({f['lake']}) is held in memory: nothing written in the temporary folder or here, open or closed: {f['while_open'] + f['after_close'] or 'none'}"
     yield f["fresh"] == 0, f"open(':memory:') after close is a new lake: {f['fresh']} tables named t (0)"
+    yield f["http"] == [], f"connect() and its queries load no HTTP client: {', '.join(f['http']) or 'none of http.client, urllib, ssl, email, inspect'} imported"
 
 
 def judge_reopen(f):
@@ -508,6 +515,7 @@ def judge_cycles(f):
     (w0, w1) = f["wakeups"]
     yield w1 <= w0 + 20, f"nothing of the 50 runs once they are closed: {w0} then {w1} wakeups of the process's threads in 2 s idle (at most 20 more)"
     yield set(f["rows"]) == {1} and len(f["rows"]) == 50, "every cycle's lake answered its count (1)"
+    yield f["close_ms"] < 100, f"a close takes {f['close_ms']} ms, the median of the 50 (under 100: no wait for a client the HTTP door never had)"
 
 
 def judge_fork(f):

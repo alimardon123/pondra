@@ -8,8 +8,10 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use datafusion::arrow::datatypes::Schema;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::spill_file::{SpillFile, TempFileFactory};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
@@ -556,39 +558,66 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 
 /// Where DataFusion's spills go, and how much of the disk they may take (`spill_cap`). Not the
 /// OS temp folder, which is held in memory on many Linux systems, where a spill frees nothing. The
-/// folder is the user's own, under the disk with the room (`memory::spill_base`), and folders of
-/// processes that ended are swept from it. The cap is the free space when the lake opens, less the room
-/// a lake keeps, or the setting in GB; it is looked at again as queries start (`spill_room`). `0` turns
-/// spilling off: a query that needs it is refused (53200). A negative setting is no setting.
+/// first spill makes the folder and DataFusion's own directory in it (`Spills`): a lake that never
+/// spills makes neither, so nothing is written when it opens. The folder is the user's own, under the
+/// disk with the room (`memory::spill_base`), and folders of processes that ended are swept from it.
+/// The cap is the free space when the first spill makes the disk, less the room a lake keeps, or the
+/// setting in GB; it is looked at again as queries start (`spill_room`). `0` turns spilling off: a
+/// query that needs it is refused (53200). A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder {
     if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
-    let folder = spill_folder().ok();
-    let builder = match folder {
-        Some(path) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![path.to_path_buf()])),
-        None => DiskManagerBuilder::default(), // (no folder: the OS temp folder, as before)
-    };
     // (a merge of spilled runs takes at most an eighth of its partition's share, about 4 MB a run read at once: unlimited,
     // as DataFusion has it, each partition's merge took the whole pool and a window over its rows was refused)
     // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
     let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
-    let builder = builder.with_max_spill_merge_fan_in(fan_in);
-    match spill_cap(folder) {
-        Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
-        None => builder,
+    // (the lake's own manager holds no file: `Spills` makes the one that does, with this fan-in too, since sorts read it here)
+    DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(Arc::new(Spills { fan_in, made: std::sync::OnceLock::new() }))).with_max_spill_merge_fan_in(fan_in)
+}
+
+/// DataFusion's spill disk for one lake, made by its first spill (`TempFileFactory`): the same manager `spill_disk`
+/// would have built when the lake opened, in the spill folder (or the OS temp folder, where there is none), with
+/// `fan_in` and the cap of `spill_cap`. `made` holds it once it is built, or the reason it could not be. It is
+/// registered (`register_spiller`) when it is made, so `spill_room` caps it and `spill_fits` counts what it holds.
+struct Spills {
+    fan_in: usize,
+    made: std::sync::OnceLock<Result<Arc<DiskManager>, String>>,
+}
+
+impl TempFileFactory for Spills {
+    fn create_temp_file(&self, description: &str) -> datafusion::error::Result<Arc<dyn SpillFile>> {
+        let made = self.made.get_or_init(|| {
+            let folder = spill_folder().ok();
+            let builder = match folder {
+                Some(path) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![path.to_path_buf()])),
+                None => DiskManagerBuilder::default(), // (no folder: the OS temp folder, as before)
+            };
+            let builder = builder.with_max_spill_merge_fan_in(self.fan_in);
+            let builder = match spill_cap(folder) {
+                Some(cap) => builder.with_max_temp_directory_size(cap), // (where the platform can't say, DataFusion's own 100 GB stays)
+                None => builder,
+            };
+            let disk = Arc::new(builder.build().map_err(|e| e.to_string())?);
+            register_spiller(&disk);
+            Ok(disk)
+        });
+        match made {
+            Ok(disk) => disk.create_tmp_file(description),
+            Err(why) => Err(DataFusionError::ResourcesExhausted(format!("no spill folder to spill to while {description}: {why}"))),
+        }
     }
 }
 
 /// `gb` gibibytes, in bytes.
 fn gb_bytes(gb: f64) -> u64 { (gb * (1u64 << 30) as f64) as u64 }
 
-/// The disk managers of this process's lakes, held weakly: a lake that goes takes its manager with it.
-/// `Lake::open` adds each one (unless spilling is off), `spill_room` sets their caps, `spill_fits` counts
-/// what they hold.
+/// The disk managers that hold this process's lakes' spill files (one for each lake, made by its first spill: `Spills`),
+/// held weakly: a lake that goes takes its manager with it. `register_spiller` adds each one (unless spilling is off),
+/// `spill_room` sets their caps, `spill_fits` counts what they hold.
 static SPILLERS: Mutex<Vec<Weak<DiskManager>>> = Mutex::new(Vec::new());
 
-/// Adds a lake's disk manager to `SPILLERS`. A disabled one has no cap to set, so it is left out.
+/// Adds a spill disk to `SPILLERS`, once `Spills` has made it. A disabled one has no cap to set, so it is left out.
 fn register_spiller(disk: &Arc<DiskManager>) {
     if spill_gb() != Some(0.0) {
         SPILLERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::downgrade(disk));
@@ -616,7 +645,7 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
 /// Sets every live lake's cap from the disk as it is now (`room_cap`).
 fn set_room(gb: Option<f64>) {
     let shuffled = gb.map_or(0, |_| crate::spill::held()); // (shuffles count only under the setting: without it the disk's free room says it all)
-    let disk = spill_folder().ok().and_then(space);
+    let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     for manager in live_spillers() {
         if let Some(cap) = room_cap(gb, manager.used_disk_space(), shuffled, disk) {
             let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
@@ -1107,7 +1136,6 @@ impl Lake {
         let kept = (Arc::new(Footers::new(DEFAULT_METADATA_CACHE_LIMIT).with_name("DefaultFileMetadataCache")), Arc::new(FileStatistics::new(DEFAULT_FILE_STATISTICS_MEMORY_LIMIT).with_name("DefaultFileStatisticsCache")));
         let caches = CacheManagerConfig::default().with_list_files_cache_limit(0).with_file_metadata_cache(Some(kept.0.clone())).with_file_statistics_cache(Some(kept.1.clone()));
         let rt = RuntimeEnvBuilder::new().with_memory_pool(pool).with_cache_manager(caches).with_disk_manager_builder(spill_disk()).build_arc()?;
-        register_spiller(&rt.disk_manager);
         let disk = bucket.as_ref().filter(|_| !memory).and_then(|_| disk_tier(&url, &store));
         let mut cached_store = None;
         if let Some((bucket_url, held)) = bucket.as_ref().filter(|_| memory) {
@@ -1368,7 +1396,7 @@ impl Lake {
     /// are the same for every query, so they are made once (`made`) and copied; each copy gets
     /// catalogs of its own, so the tables a query registers are its alone.
     pub fn session_with(&self, partitions: usize) -> SessionContext {
-        spill_room(); // (the spill disk's room as it is now: `spill_disk` looked at it once, when the lake opened)
+        spill_room(); // (the spill disk's room as it is now: `Spills` looked at it once, when the first spill made the disk)
         let state = self.sessions.lock().unwrap().entry(partitions).or_insert_with(|| self.made(partitions).state()).clone();
         let catalog = datafusion::execution::SessionStateDefaults::default_catalog(state.config(), state.table_factories(), state.runtime_env());
         let ctx = crate::engine::with_catalog(state, Arc::new(catalog));
@@ -2991,6 +3019,28 @@ mod tests {
         assert!(cap >= manager.used_disk_space() + (1 << 20), "a cap of {cap} with the disk's room");
         set_room(Some(1.0));
         assert!(manager.max_temp_directory_size() <= gb_bytes(1.0), "the setting caps the spills");
+    }
+
+    /// A lake's spill disk shows no directory of DataFusion's until something spills: its first spill file is made
+    /// in the spill folder, and the folder is the one the spill made (`spill_folder`, this process's).
+    #[test]
+    fn a_lake_makes_no_spill_folder_until_it_spills() {
+        if spill_gb() == Some(0.0) {
+            return; // (spilling is off: there is no spill disk to make)
+        }
+        let m = Arc::new(spill_disk().build().expect("a spill disk"));
+        assert!(m.temp_dir_paths().is_empty(), "no directory before a spill");
+        assert!(m.tmp_files_enabled());
+        let f = m.create_tmp_file("a test").expect("a spill file");
+        let path = f.path().expect("a local file").to_path_buf();
+        assert!(path.exists(), "{path:?}");
+        if let Ok(folder) = spill_folder() {
+            assert!(path.starts_with(folder), "{path:?} is not in {folder:?}");
+        }
+        // (DataFusion counts a write's bytes on the manager that made the file, through the file's own writer: not asserted here)
+        let mut writer = f.open_writer().expect("a writer");
+        std::io::Write::write_all(&mut writer, &[7u8; 10]).expect("10 bytes written");
+        writer.finish().expect("finished");
     }
 
     /// A shuffle's piece asks for its room first (`spill_fits`): what doesn't fit is refused with 53100, and the

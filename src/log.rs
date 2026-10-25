@@ -294,11 +294,14 @@ impl Log {
         if crate::backup::frozen(&self.lake) {
             return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
         }
-        let batch = match self.lake.cat.get::<TableMeta>(&table_key(&table)).await? {
+        let batch = match self.lake.cat.meta(&table_key(&table)).await? {
             Some(m) if crate::constraints::checked(&m) => {
                 return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), &m, table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
             }
-            Some(m) => crate::defaults::fit(&m, &table, batch)?, // (NOT NULL, and jsonb in its own form, whichever door the rows came in by)
+            Some(m) => {
+                let rules = m.rules()?;
+                crate::rules::checked(&rules, &table, batch, true, crate::defaults::base())? // (NOT NULL, and jsonb in its own form, whichever door the rows came in by)
+            }
             None => batch,
         };
         let (ack, rx) = oneshot::channel();

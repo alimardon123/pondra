@@ -8,8 +8,12 @@ name: startup
 # Each night that the code changed since the commit the list names, this builds the program and the library as
 # linux-x64 ships them (a dist zigbuild: main's cache, the same flags), but unstripped and with the program's objects
 # kept (`-C save-temps`, on the last two crates only, so no dependency is built again). It traces both under callgrind
-# (tools/startup_order.py trace), marks the functions LLVM made cold (mark), and when the list changed puts it on the
-# branch `startup-list` with a pull request labeled `train`: the train merges it once its run is green, like a lane's.
+# (tools/startup_order.py trace), marks the functions LLVM made cold (mark), and when the list changed links the
+# program with it as main does and checks its resident code (check), then puts it on the branch `startup-list` with a
+# pull request labeled `train`: the train merges it once its run is green, like a lane's. A pull request's build has no
+# layout, so this check is the only one a new list gets before main's build.
+# The list says the rustc that built what it traced, and zig is pinned (tools/zig-requirements.txt), so a toolchain or
+# linker bump makes it due as a code change does (the 10-24 audit's L12).
 # A pull request a token makes starts no workflow, so it rides at the train's next step (another lane's label, a run
 # ending, or its schedule).
 on:
@@ -38,12 +42,20 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # (the commit the list was traced on, to tell whether the code changed since)
-      - name: Whether the code changed since the list was traced
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+      - name: Whether the code or the toolchain changed since the list was traced
         id: due
         run: |
           at=$(sed -n 's/^# Traced on \([0-9a-f]\{40\}\)\.$/\1/p' tools/startup.txt)
-          if [ -n "$at" ] && git cat-file -e "$at^{commit}" 2>/dev/null && git diff --quiet "$at" HEAD -- src capi Cargo.toml Cargo.lock build.rs; then
-            echo "The list was traced on $at, and the code hasn't changed since."
+          by=$(sed -n 's/^# Built by \(rustc .*\)\.$/\1/p' tools/startup.txt)
+          # (build.yml's `bin`: the program and the library, their build scripts and the linker's pin)
+          if [ -n "$at" ] && git cat-file -e "$at^{commit}" 2>/dev/null \
+            && git diff --quiet "$at" HEAD -- src capi launcher brand build.rs tools/startup_layout.rs tools/zig-requirements.txt Cargo.toml Cargo.lock \
+            && [ "$by" = "$(rustc --version)" ]; then
+            echo "The list was traced on $at by $by, and neither the code nor the toolchain has changed since."
             echo "due=false" >> "$GITHUB_OUTPUT"
           else
             echo "due=true" >> "$GITHUB_OUTPUT"
@@ -51,11 +63,6 @@ jobs:
       - name: Room for the build's kept objects # (several copies of the program's bitcode: tools nobody here uses go)
         if: steps.due.outputs.due == 'true'
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        if: steps.due.outputs.due == 'true'
-        with:
-          toolchain: stable
-          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.due.outputs.due == 'true'
         with:
@@ -71,7 +78,7 @@ jobs:
           RUSTFLAGS: -A linker_messages # (build.yml's, so main's cached dependencies are this build's)
         run: |
           sudo apt-get install -y valgrind
-          pip install ziglang cargo-zigbuild
+          pip install -r tools/zig-requirements.txt
           # (`-C strip=none` after the profile's own strip: these two crates keep their names, the rest is cached)
           cargo-zigbuild rustc --profile dist --target "$ZIG_TARGET" -p pondra-capi --lib -- -C strip=none
           cargo-zigbuild rustc --profile dist --target "$ZIG_TARGET" -p pondra --bin pondra -- -C strip=none -C save-temps
@@ -81,31 +88,51 @@ jobs:
           cp tools/startup.txt "$RUNNER_TEMP/before.txt"
           python tools/startup_order.py trace --bin "$OUT/pondra" --lib "$OUT/libpondra_lib.so"
           python tools/startup_order.py mark --objects "$OUT/deps"
-      - name: The new list on the train
+      - name: Whether the list changed
         if: steps.due.outputs.due == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
+        id: list
         run: |
           names() { grep -v '^#' "$1" | sed 's/^unlikely\.//' | sort; }
           new=$(comm -13 <(names "$RUNNER_TEMP/before.txt") <(names tools/startup.txt) | wc -l)
           gone=$(comm -23 <(names "$RUNNER_TEMP/before.txt") <(names tools/startup.txt) | wc -l)
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "gone=$gone" >> "$GITHUB_OUTPUT"
           if [ "$new" = 0 ] && [ "$gone" = 0 ]; then
             echo "The list holds what the program and the library run: nothing to change."
-            exit 0
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: The program linked with the new list, its resident code checked # (as build.yml's `The startup layout held`)
+        if: steps.list.outputs.changed == 'true'
+        env:
+          RUSTFLAGS: -A linker_messages
+          PONDRA_STARTUP_LAYOUT: "1"
+        run: |
+          df -h /
+          cargo-zigbuild rustc --profile dist --target "$ZIG_TARGET" -p pondra --bin pondra -- -C strip=none
+          python tools/startup_order.py check --bin "$OUT/pondra" --most-mb 31 --list tools/startup.txt | tee "$RUNNER_TEMP/check.json"
+      - name: The new list on the train
+        if: steps.list.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW: ${{ steps.list.outputs.new }}
+          GONE: ${{ steps.list.outputs.gone }}
+        run: |
+          names() { grep -v '^#' "$1" | sed 's/^unlikely\.//' | sort; }
           at=$(git rev-parse HEAD)
           git switch -c startup-list
           git add tools/startup.txt
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit -q -m "The startup list traced again on ${at:0:7}: $new functions it was missing, $gone gone"
+            commit -q -m "The startup list traced again on ${at:0:7}: $NEW functions it was missing, $GONE gone"
           # (a token's push is refused when its diff touches .github/workflows, as a force-push from last night's base onto
           # a newer main's would: the branch goes and comes back new, as train.py pushes, and last night's PR closes with it)
           git push origin --delete startup-list 2>/dev/null || true
           git push origin startup-list
           total=$(names tools/startup.txt | wc -l)
           cold=$(grep -c '^unlikely\.' tools/startup.txt || true)
+          code=$(jq -r .resident_code_mb "$RUNNER_TEMP/check.json")
           printf '%s\n\n%s\n' \
-            "Before: tools/startup.txt was traced on an older main, and $new of the functions a node now runs to its first answer and 5 s idle weren't in it, so the Linux builds that ship kept them spread through the program's code." \
-            "After: it lists the $total functions the program and the library run, traced on $at ($gone gone; $cold marked cold). Made by .github/workflows/startup.yml; main's build reports the resident code it gives (\`The startup layout held\`)." > "$RUNNER_TEMP/body.md"
+            "Before: tools/startup.txt was traced on an older main, and $NEW of the functions a node now runs to its first answer and 5 s idle weren't in it, so the Linux builds that ship kept them spread through the program's code." \
+            "After: it lists the $total functions the program and the library run, traced on $at ($GONE gone; $cold marked cold). Linked with it, the program keeps $code MB of code resident at its first answer (main's build fails past 31). Made by .github/workflows/startup.yml; main's build reports it again (\`The startup layout held\`)." > "$RUNNER_TEMP/body.md"
           title="The startup list traced again on ${at:0:7}"
           gh pr create --head startup-list --base main --label train --title "$title" --body-file "$RUNNER_TEMP/body.md"

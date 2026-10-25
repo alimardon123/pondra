@@ -621,7 +621,7 @@ impl Backend {
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
         let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let table = crate::answer::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
-        let uuids = meta.logical().sql_types;
+        let rules = meta.rules().map_err(err)?;
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() });
@@ -647,7 +647,7 @@ impl Backend {
             // the table's columns in its order, those not given their DEFAULT, or null
             let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
             let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
-            let b = crate::types::spelled(b, &uuids).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
+            let b = crate::rules::typed::spelled(&rules, b, true).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
             let b = crate::defaults::fill(&self.app.lake, &meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
             p.rows += b.num_rows() as u64;
             p.seq += 1;

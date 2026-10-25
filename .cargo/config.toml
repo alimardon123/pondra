@@ -1,0 +1,10 @@
+[env]
+# jemalloc's options, built into it (`--with-malloc-conf`, after the crate's `background_thread:true`), so the
+# program and the library export no `malloc_conf` for another jemalloc in a host's process to read (invariant
+# 383, `inprocess_check.py`). `_RJEM_MALLOC_CONF` (a heap leg's profiling) still adds to them at start.
+#
+# `thp:never`: its pages stay off transparent huge pages. Where the system makes every page huge (THP `always`,
+# as on GitHub's runners), the kernel joined each 2 MB range that jemalloc had given back all but a page of into
+# one huge page again. Over five hours a node held 120–250 MB more than jemalloc counted
+# (`reviews/soak-heap-33e136c.md`); with `thp:never`, 2–12 MB (`reviews/soak-heap-d9c739f.md`).
+JEMALLOC_SYS_WITH_MALLOC_CONF = "thp:never"

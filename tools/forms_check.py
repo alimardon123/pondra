@@ -29,7 +29,7 @@ that no longer comes (take it out of forms.json). It also fails when src/lib.rs 
 that forms.json's `server_only` doesn't list with the reason a page lacks it, or lists one that every form builds.
 Exit 1 on a failure.
 """
-import argparse, http.client, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.error, urllib.request, uuid
+import argparse, http.client, json, os, re, shutil, subprocess, sys, tempfile, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -89,11 +89,12 @@ class InProcess:
             raise RuntimeError(f"no library at {os.environ.get('PONDRA_LIBRARY')}: connect() gave a node beside this process, not in it")
 
     def request(self, method, path, headers, body):
+        from pondra import client
         try:
-            r = self.db._inproc(urllib.request.Request("http://in.process" + path, data=body, method=method, headers=headers))
+            r = self.db._inproc(client._Request("http://in.process" + path, data=body, method=method, headers=headers))
             return r.status, {k.lower(): v for k, v in r.headers.items()}, r.read()
-        except urllib.error.HTTPError as e:
-            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.read()
+        except client._Refused as e:  # (a refusal, as the node in this process answers one: `Pondra._call` reads it so)
+            return e.code, {k.lower(): v for k, v in e.headers.items()}, e.body
 
     def put(self, path, text, session):
         """A file the program that started the node gives: written into its working folder."""

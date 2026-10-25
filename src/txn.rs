@@ -862,11 +862,12 @@ fn conflict(table: &str) -> anyhow::Error {
 /// An INSERT's rows, worked out as of a read point and, under READ COMMITTED, with the keys they write locked (ADR-067 §3).
 /// The query may have read a key another transaction changed while the lock waited (a counter's `n + 1`, an upsert's
 /// `ON CONFLICT`): then the rows are worked out again as of the commit the locks were granted at (`passes`).
-async fn insert_rows(l: &Locks<'_>, stored: &TableMeta, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
+async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
         let rows = crate::write::rows_of(lake, lake, l.meta, query, Some(at), files).await?;
-        let rows = crate::defaults::fit(stored, l.name, rows)?;
+        let rules = stored.rules()?;
+        let rows = crate::rules::checked(&rules, l.name, rows, true, crate::defaults::base())?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
         Ok((rows, keys))
@@ -912,7 +913,7 @@ async fn point(l: &Locks<'_>, key: &[String], set_to: &[(String, String)], snaps
 /// The rows an UPDATE, DELETE or MERGE changes, with the commit they were read at and the keys they lock: one key's by the
 /// serving path's point read when the statement is an UPDATE of one key (`point`), else by planning (`changing`). The new
 /// versions meet the table's NOT NULL and DEFAULT (invariant 130).
-async fn change(l: &Locks<'_>, stored: &TableMeta, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
+async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
     let hit = match stmt {
         Stmt::Update(_, set, Some(cond)) => match point_key(&l.app.lake, l.name, stored, set, cond).await? {
             Some(key) => point(l, &key, set, snapshot).await?,
@@ -924,8 +925,9 @@ async fn change(l: &Locks<'_>, stored: &TableMeta, stmt: &Stmt, snapshot: u64) -
         Some(c) => c,
         None => changing(l, stmt, snapshot).await?,
     };
+    let rules = stored.rules()?;
     for b in changed.1.iter_mut().filter(|b| b.num_rows() > 0) {
-        *b = crate::defaults::fit(stored, l.name, b.clone())?; // (every batch of the new rows: as the table holds them)
+        *b = crate::rules::checked(&rules, l.name, b.clone(), true, crate::defaults::base())?; // (every batch of the new rows: as the table holds them)
     }
     Ok(changed)
 }
@@ -939,9 +941,9 @@ fn tally(old: &[RecordBatch], new: &[RecordBatch]) -> Value {
 }
 
 /// A table's stored meta, which must hold row ids (made by Pondra 0.19 or later).
-async fn stored_table(lake: &Lake, name: &str) -> Result<TableMeta> {
-    let stored: TableMeta = lake.cat.get(&table_key(name)).await?.with_context(|| format!("no table {name}"))?;
-    ensure!(stored.logical().ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
+async fn stored_table(lake: &Lake, name: &str) -> Result<Arc<TableMeta>> {
+    let stored = lake.cat.meta(&table_key(name)).await?.with_context(|| format!("no table {name}"))?;
+    ensure!(stored.ids, "{name} holds rows from before row ids (made before Pondra 0.19): copy it once and change the copy");
     Ok(stored)
 }
 

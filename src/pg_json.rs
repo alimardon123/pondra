@@ -3,10 +3,11 @@
 //! of the others, so they are planned here, ahead of its planner (`engine::session`), when the left side is text. `->>` and
 //! every operator on another type keep the planning they have. The answers follow Postgres 16: a document's text is
 //! kept as written (`types.rs`), so `->` and `#>` answer the value's text as the document has it. Text that isn't JSON
-//! answers NULL where a walk meets it; `@>`, `<@`, `?`, `?|` and `?&` read the whole document and refuse it (22P02).
+//! answers NULL where a walk meets it; `@>` and `<@` read the whole document and refuse it (22P02), and `?`, `?|` and `?&`
+//! read the top level only as far as their answer needs, refusing text that isn't JSON where they read it.
 //! `text` groups the operators the way Postgres does, where SQL comes in (`path::door`).
 use crate::pg_functions::{follows_json, function, marked, text_arg, texts_out, MARK};
-use crate::pg_json_make::{self, as_text, fail, is_null_at, jsonb_text, parse, refuse, same_in_every_row, text_at, Node};
+use crate::pg_json_make::{self, as_text, depth_check, fail, is_null_at, jsonb_text, parse, refuse, same_in_every_row, text_at, Node};
 use crate::pg_text::array_literal;
 use datafusion::arrow::array::{Array, ArrayAccessor, ArrayRef, AsArray, BooleanArray, Int32Array, StringArray};
 use datafusion::arrow::compute::cast;
@@ -692,15 +693,72 @@ fn exact(number: &str) -> anyhow::Result<String> {
     Ok(if text.contains('.') { text.trim_end_matches('0').trim_end_matches('.').to_string() } else { text })
 }
 
-/// `?`: does the key exist? A key of an object, a string element of an array, or the document itself when it is a
-/// string (Postgres treats a scalar string as an array of one element); any other scalar holds none.
-fn has_key(doc: &Node, key: &str) -> bool {
-    match doc {
-        Node::Object(members) => pg_json_make::find(members, key).is_ok(),
-        Node::List(items) => items.iter().any(|v| matches!(v, Node::Text(s) if s == key)),
-        Node::Text(s) => s == key,
-        _ => false,
+/// Whether `doc` holds any (`all` false) or all (`all` true) of `keys` at its top level. A key is held as an object's
+/// key, as a string element of an array, or as the document itself when it is a string (Postgres treats a scalar string
+/// as an array of one element); any other scalar holds none. The top level is read once, member by member or element by
+/// element, each value the reader doesn't compare passed over by `skip`, and the reading stops after the member or element
+/// that makes the answer known: one key found for `?|`, every key for `?&`. Text that isn't JSON is refused where it is
+/// read, as `parse` refuses it. With no keys, nothing is read.
+fn holds(doc: &str, keys: &[&str], all: bool) -> anyhow::Result<bool> {
+    if keys.is_empty() {
+        return Ok(all);
     }
+    depth_check(doc)?;
+    let refused = || crate::codes::coded("22P02", json_refusal(doc));
+    let answered = |hits: usize| if all { hits == keys.len() } else { hits > 0 };
+    let mut seen = vec![false; keys.len()];
+    let mut hits = 0;
+    let mut jiter = Jiter::new(doc.as_bytes());
+    match jiter.peek().map_err(|_| refused())? {
+        Peek::String => {
+            hits += mark(jiter.known_str().map_err(|_| refused())?, keys, &mut seen);
+            if answered(hits) {
+                return Ok(true);
+            }
+        }
+        Peek::Object => {
+            let mut next = jiter.known_object().map_err(|_| refused())?.map(|name| mark(name, keys, &mut seen));
+            while let Some(found) = next {
+                hits += found;
+                let peek = jiter.peek().map_err(|_| refused())?;
+                skip(&mut jiter, peek).map_err(|_| refused())?;
+                if answered(hits) {
+                    return Ok(true);
+                }
+                next = jiter.next_key().map_err(|_| refused())?.map(|name| mark(name, keys, &mut seen));
+            }
+        }
+        Peek::Array => {
+            let mut next = jiter.known_array().map_err(|_| refused())?;
+            while let Some(peek) = next {
+                if peek == Peek::String {
+                    hits += mark(jiter.known_str().map_err(|_| refused())?, keys, &mut seen);
+                    if answered(hits) {
+                        return Ok(true);
+                    }
+                } else {
+                    skip(&mut jiter, peek).map_err(|_| refused())?;
+                }
+                next = jiter.array_step().map_err(|_| refused())?;
+            }
+        }
+        peek => skip(&mut jiter, peek).map_err(|_| refused())?,
+    }
+    jiter.finish().map_err(|_| refused())?;
+    Ok(false)
+}
+
+/// Marks each of `keys` that is `name` as seen, and returns how many were not seen before (a key given twice is found
+/// twice).
+fn mark(name: &str, keys: &[&str], seen: &mut [bool]) -> usize {
+    let mut found = 0;
+    for (key, done) in keys.iter().zip(seen.iter_mut()) {
+        if !*done && *key == name {
+            *done = true;
+            found += 1;
+        }
+    }
+    found
 }
 
 /// `?`, one key.
@@ -710,7 +768,7 @@ fn exists(a: &[ArrayRef], n: usize) -> anyhow::Result<ArrayRef> {
         if is_null_at(&docs, i) || is_null_at(&keys, i) {
             return Ok(None);
         }
-        Ok(Some(has_key(&parse(text_at(&docs, i))?, text_at(&keys, i))))
+        Ok(Some(holds(text_at(&docs, i), &[text_at(&keys, i)], false)?))
     });
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
@@ -724,9 +782,8 @@ fn any_all(a: &[ArrayRef], n: usize, all: bool) -> anyhow::Result<ArrayRef> {
             return Ok(None);
         }
         let Some(row) = keys.at(i) else { return Ok(None) };
-        let doc = parse(text_at(&docs, i))?;
-        let mut found = row.iter().flatten().map(|k| has_key(&doc, k));
-        Ok(Some(if all { found.all(|f| f) } else { found.any(|f| f) }))
+        let row: Vec<&str> = row.iter().flatten().map(String::as_str).collect();
+        Ok(Some(holds(text_at(&docs, i), &row, all)?))
     });
     Ok(Arc::new(BooleanArray::from(out.collect::<anyhow::Result<Vec<_>>>()?)))
 }
@@ -1190,7 +1247,7 @@ mod tests {
 
     #[test]
     fn existence_as_postgres() {
-        let e = |doc: &str, key: &str| has_key(&parse(doc).unwrap(), key);
+        let e = |doc: &str, key: &str| holds(doc, &[key], false).unwrap();
         assert!(e(r#"{"a":1,"a":2}"#, "a"), "a duplicate key still exists");
         assert!(e(r#"["foo", "bar"]"#, "foo"));
         assert!(!e(r#"["foo", ["bar"]]"#, "bar"), "not in a nested array");
@@ -1202,12 +1259,14 @@ mod tests {
         assert!(!e(r#"{"a":1}"#, "b"));
         assert!(e(r#""foo""#, "foo"), "a scalar string is an array of one element");
         assert!(!e("5", "5"), "a scalar number holds no key");
+        assert!(!e(r#"{"b":{"a":1}}"#, "a"), "a key only in a nested object");
+        assert!(e(r#"{"a\"b":1}"#, "a\"b"), "an escaped key is read as its text");
+        assert!(e(r#"{"a":1}"#, "a"));
+        assert!(e(r#"["a\nb"]"#, "a\nb"), "a string element with an escape");
         // ?| and ?& over lists: an empty list, and NULL keys, left out
         let any_all = |doc: &str, keys: &[Option<&str>], all: bool| {
-            let doc = parse(doc).unwrap();
-            let keys: Vec<Option<String>> = keys.iter().map(|k| k.map(str::to_string)).collect();
-            let mut found = keys.iter().flatten().map(|k| has_key(&doc, k));
-            if all { found.all(|f| f) } else { found.any(|f| f) }
+            let keys: Vec<&str> = keys.iter().flatten().copied().collect();
+            holds(doc, &keys, all).unwrap()
         };
         assert!(!any_all(r#"{"a":1}"#, &[], false), "?| of no keys is false");
         assert!(any_all(r#"{"a":1}"#, &[], true), "?& of no keys is true");
@@ -1217,6 +1276,18 @@ mod tests {
         assert!(!any_all(r#"{"a":1}"#, &[Some("a"), Some("x")], true));
         assert!(!any_all(r#"{"a":1}"#, &[None], false));
         assert!(any_all(r#"{"a":1}"#, &[None], true));
+        // (a found key answers ?| at once, and ?& only when every key is found: a missing last key makes it false)
+        assert!(any_all(r#"{"a":1,"b":2}"#, &[Some("a"), Some("x")], false));
+        assert!(!any_all(r#"{"a":1,"b":2}"#, &[Some("a"), Some("b"), Some("x")], true), "?& with the last key missing");
+        assert!(any_all(r#"{"a":1,"b":2}"#, &[Some("b"), Some("a")], true));
+        // (with no keys nothing is read, so text that isn't JSON answers)
+        assert!(!holds("[1,", &[], false).unwrap());
+        assert!(holds("[1,", &[], true).unwrap());
+        // (text that isn't JSON is refused as parse refuses it, where it is read)
+        let refusal = holds(r#"{"a":"#, &["a"], false).unwrap_err();
+        assert_eq!(code(&refusal), "22P02");
+        assert_eq!(refusal.to_string(), json_refusal(r#"{"a":"#));
+        assert_eq!(code(&holds(r#"{"b":1,"a":"#, &["a"], false).unwrap_err()), "22P02");
     }
 
     /// `@>` over one row of two documents, as the function answers it (the answer, or its refusal).
@@ -1241,7 +1312,7 @@ mod tests {
         assert_eq!(contains_one(&deep, r#"{"a": [1]}"#).unwrap(), Some(false), "not the value it holds");
         assert_eq!(exists_one(&deep, "a").unwrap(), Some(true));
         assert_eq!(exists_one(&deep, "c").unwrap(), Some(false));
-        assert!(!has_key(&parse(&nested(300)).unwrap(), "a"), "an array of arrays holds no key");
+        assert!(!holds(&nested(300), &["a"], false).unwrap(), "an array of arrays holds no key");
     }
 
     #[test]

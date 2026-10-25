@@ -6,56 +6,31 @@
 use crate::ddl::Change;
 use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast;
 use serde_json::{json, Value};
 
 /// Refuse rows that leave a NOT NULL column empty. `rows` are under SQL's names; `meta` is as
 /// stored. A delete marker (`_deleted`) carries only its key, and passes.
-pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> { check_named(meta, table, rows, true) }
-
-/// What a door runs on rows it is about to keep: written as the table holds them (`types::as_held`), then checked as
-/// `check` does, with each column as the table holds it.
-pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
-    let rows = crate::types::as_held(meta, rows, true)?;
-    check(meta, table, &rows)?;
-    Ok(rows)
-}
-
-fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: bool) -> Result<()> {
-    if (meta.not_null.is_empty() && meta.checks.is_empty() && meta.enums.is_empty() && meta.sql_types.is_empty()) || rows.num_rows() == 0 {
+pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> {
+    if !ruled(meta) || rows.num_rows() == 0 {
         return Ok(());
     }
-    let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
-    let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
-    crate::types::check(meta, rows, sql_names, &marker)?; // (an enum's labels, a uuid's form)
-    if !meta.checks.is_empty() {
-        // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
-        let named = match sql_names || !meta.mapped() {
-            true => rows.clone(),
-            false => {
-                let fields: Vec<_> = rows.schema().fields().iter().map(|f| std::sync::Arc::new(f.as_ref().clone().with_name(meta.name_of(f.name())))).collect();
-                RecordBatch::try_new(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), rows.columns().to_vec())?
-            }
-        };
-        let all = crate::query::conform(&named, &crate::answer::schema(&meta.logical_columns())?)?;
-        for (name, c) in &meta.checks {
-            let bad = breaking(&all, c)?;
-            if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
-                return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{table}\" violates check constraint \"{name}\": CHECK ({c})"), "23514")));
-            }
-        }
-    }
-    for stored in &meta.not_null {
-        let name = meta.name_of(stored);
-        let Some(c) = rows.column_by_name(if sql_names { name } else { stored }).filter(|c| c.null_count() > 0) else { continue };
-        if (0..c.len()).any(|i| c.is_null(i) && !marker(i)) {
-            bail!("{table}.{name} is NOT NULL, and a row gives it no value");
-        }
-    }
-    Ok(())
+    crate::rules::checks(&meta.to_rules()?, table, rows, true, &BASE)
 }
+
+/// What a door runs on rows it is about to keep: written as the table holds them (`rules::typed::as_held`), then checked as
+/// `check` does, with each column as the table holds it.
+pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
+    if !ruled(meta) || rows.num_rows() == 0 {
+        return Ok(rows);
+    }
+    crate::rules::checked(&meta.to_rules()?, table, rows, true, &BASE)
+}
+
+/// Does the table have a rule a write's rows meet: NOT NULL, a CHECK, an enum or a held type?
+fn ruled(meta: &TableMeta) -> bool { !meta.not_null.is_empty() || !meta.checks.is_empty() || !meta.enums.is_empty() || !meta.sql_types.is_empty() }
 
 /// The session CHECKs, DEFAULTs and expectations are planned in: every function a query's session has but the lake's
 /// (`store::functions`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
@@ -64,30 +39,20 @@ fn check_named(meta: &TableMeta, table: &str, rows: &RecordBatch, sql_names: boo
 static BASE: std::sync::LazyLock<SessionContext> =
     std::sync::LazyLock::new(|| crate::store::functions(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
 
+/// The session a node plans a CHECK in (`BASE`), for the write rules' callers (`rules::checked`).
+pub fn base() -> &'static SessionContext { &BASE }
+
 /// A session with BASE's functions, for what registers functions of its own (`nextval`): what holds the lake must never
 /// go into BASE, which every check shares (invariants 199, 301).
 fn copy() -> SessionContext { SessionContext::new_with_state(BASE.state()) }
 
 /// `expr` over `rows` (their columns by name), a value for each row; None if it doesn't plan
 /// over them alone (a qualified name, a subquery: SQL works it out instead).
-pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
-    use datafusion::common::DFSchema;
-    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let Ok(e) = BASE.parse_sql_expr(expr, &schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
-    let Ok(phys) = BASE.create_physical_expr(e, &schema) else { return Ok(None) };
-    Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
-}
+pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> { crate::rules::fit::evaluate(&BASE, rows, expr) }
 
 /// Which of `rows` break `check`, a condition over their columns by name: those it is false for
 /// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
-pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
-    use datafusion::common::DFSchema;
-    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let expr = BASE.parse_sql_expr(check, &schema).and_then(crate::optimize::whole_literals)?;
-    let value = BASE.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
-    let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
-    Ok(b.iter().map(|v| Some(v == Some(false))).collect())
-}
+pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> { crate::rules::fit::breaking(&BASE, rows, check) }
 
 /// A table's DEFAULTs and CHECKs, checked as its CREATE checks them: a default gives one value of its column's type,
 /// and a CHECK is a condition over the table's columns. A lake table's CREATE (`write::create_table`) and a temporary
@@ -107,13 +72,18 @@ pub async fn definition(columns: &[(String, String)], defaults: &std::collection
 /// A bulk INSERT's rows (under their stored names), checked as they stream into files.
 pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
-    let Some(meta) = meta.clone().filter(|m| !m.not_null.is_empty() || !m.checks.is_empty() || !m.enums.is_empty() || !m.sql_types.is_empty()) else { return rows };
+    let Some(meta) = meta.as_ref().filter(|m| ruled(m)) else { return rows };
     let (schema, table) = (rows.schema(), table.to_string());
+    let t = match meta.to_rules() {
+        Ok(t) => t,
+        Err(e) => {
+            let one = futures::stream::once(async move { Err::<datafusion::arrow::array::RecordBatch, _>(datafusion::error::DataFusionError::External(e.into())) });
+            return Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, one));
+        }
+    };
     let checked = rows.map(move |b| {
         let b = b?;
-        let b = crate::types::as_held(&meta, b, false).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
-        check_named(&meta, &table, &b, false).map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
-        Ok(b)
+        crate::rules::checked(&t, &table, b, false, &BASE).map_err(|e| datafusion::error::DataFusionError::External(e.into()))
     });
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, checked))
 }
@@ -121,19 +91,22 @@ pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Op
 /// Does the table have defaults (under SQL's names)?
 pub fn any(meta: &TableMeta) -> bool { !meta.defaults.is_empty() }
 
-/// The value of `column`'s default for each of `n` new rows (as the column's type), or None if it
-/// has none. Each row gets its own (`uuid()` differs row to row).
-pub async fn values(lake: &crate::store::Lake, meta: &TableMeta, column: &str, n: usize) -> Result<Option<ArrayRef>> {
-    let Some(stored) = meta.stored(column) else { return Ok(None) };
-    let (Some(expr), Some((_, _, t))) = (meta.defaults.get(stored), meta.live().find(|(s, _, _)| *s == stored)) else { return Ok(None) };
-    let ctx = copy();
-    if crate::seq::calls(expr) {
-        crate::seq::register(&ctx, lake.arc()); // (an identity's `nextval('t_id_seq')`)
+/// A node as the write rules' host (`rules::Host`): a CHECK is planned in `BASE`, and a DEFAULT's values in a session of the
+/// lake's own, where `nextval` is the lake's sequence.
+pub struct Node<'a>(pub &'a crate::store::Lake);
+
+impl crate::rules::Host for Node<'_> {
+    fn base(&self) -> &SessionContext { &BASE }
+
+    async fn values(&self, expr: &str, n: usize) -> Result<ArrayRef> {
+        let ctx = copy();
+        if crate::seq::calls(expr) {
+            crate::seq::register(&ctx, self.0.arc()); // (an identity's `nextval('t_id_seq')`)
+        }
+        let batches = ctx.sql(&format!("SELECT {expr} AS v FROM range({n})")).await?.collect().await?;
+        let rows: Vec<ArrayRef> = batches.iter().map(|b| b.column(0).clone()).collect();
+        Ok(datafusion::arrow::compute::concat(&rows.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?)
     }
-    let batches = ctx.sql(&format!("SELECT {expr} AS v FROM range({n})")).await?.collect().await?;
-    let rows: Vec<ArrayRef> = batches.iter().map(|b| b.column(0).clone()).collect();
-    let all = datafusion::arrow::compute::concat(&rows.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?;
-    Ok(Some(crate::query::strict(&all, &crate::answer::dtype(t)?)?))
 }
 
 /// A default's expression checked when the table is made: it gives one value of the column's type.
@@ -162,13 +135,7 @@ pub async fn fill(lake: &crate::store::Lake, meta: &TableMeta, rows: RecordBatch
     if !any(meta) || rows.num_rows() == 0 {
         return Ok(rows);
     }
-    let mut columns = rows.columns().to_vec();
-    for (i, f) in rows.schema().fields().iter().enumerate() {
-        let Some(mask) = left_out(f.name()).filter(|m| m.true_count() > 0 && m.len() == rows.num_rows()) else { continue };
-        let Some(v) = values(lake, meta, f.name(), rows.num_rows()).await? else { continue };
-        columns[i] = datafusion::arrow::compute::kernels::zip::zip(&mask, &v, &columns[i])?;
-    }
-    Ok(RecordBatch::try_new(rows.schema(), columns)?)
+    crate::rules::fill(&meta.to_rules()?, rows, left_out, &Node(lake)).await
 }
 
 /// Every row left `column` out (a batch without it).

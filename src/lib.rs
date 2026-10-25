@@ -34,7 +34,6 @@ mod front;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
 mod friendly;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the set functions' rewrite: a node's door calls it)
 mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
@@ -49,14 +48,13 @@ mod pg_json;
 mod pg_json_make;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_json_edit;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_json_sets;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_text;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
 mod pg_oids;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the visitor that rewrites a statement's casts is a node's until the front runs it)
 mod pg_casts;
+mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
 mod held;
@@ -137,7 +135,6 @@ mod rules;
 #[cfg(feature = "server")] mod objects;
 #[cfg(feature = "server")] mod oom;
 #[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] mod jemalloc;
-#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))] pub use jemalloc::{Conf as JemallocConf, CONF as JEMALLOC_CONF}; // (for the program and the library: `main.rs`, `capi/`)
 #[cfg(feature = "server")] mod once;
 #[cfg(feature = "server")] mod origins;
 #[cfg(feature = "server")] mod metrics;

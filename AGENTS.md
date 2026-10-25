@@ -2607,10 +2607,12 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `build.yml` builds arm64 for 64 KB pages). Under a steady stream of small commits mimalloc kept
    the pages each thread freed: at 240 commits a second a node grew about 50 MB a minute while what
    it held levelled off. jemalloc's threads give back what has been free for ten seconds. macOS and
-   Windows keep mimalloc. jemalloc keeps its pages off transparent huge pages (`thp:never`, `jemalloc::CONF`,
-   given by both as `malloc_conf`): where the system makes every page huge (THP `always`, GitHub's runners), the
-   kernel joined each 2 MB range jemalloc had given back all but a page of into a huge page again, and a node
-   held 120–250 MB more than jemalloc counted over five hours (`reviews/soak-heap-33e136c.md`). An allocator
+   Windows keep mimalloc. jemalloc keeps its pages off transparent huge pages (`thp:never`, built into it by
+   `.cargo/config.toml`'s `JEMALLOC_SYS_WITH_MALLOC_CONF`, so neither exports a `malloc_conf` that another jemalloc
+   in a host's process could read: `inprocess_check.py`'s "what it defines"): where the system makes every page
+   huge (THP `always`, GitHub's runners), the kernel joined each 2 MB range jemalloc had given back all but a page
+   of into a huge page again, and a node held 120–250 MB more than jemalloc counted over five hours
+   (`reviews/soak-heap-33e136c.md`). An allocator
    change shows TPC-H, TPC-DS and `harness.py memory` before and after. `harness.py memory`: "its own memory
    levels off…" fails on mimalloc, and "jemalloc keeps its pages off huge pages" without `thp:never`.
 
