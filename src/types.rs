@@ -28,6 +28,7 @@ use serde_json::{json as j, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use crate::pg_casts::{quoted, Casts};
+use crate::front::Host;
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -203,6 +204,9 @@ async fn find(lake: &Lake, name: &str) -> Result<Option<(String, Type)>> {
     Ok(lake.cat.get::<Type>(&key(&local)).await?.map(|t| (local, t)))
 }
 
+/// The labels of the enum type `name` names in this lake, in order (`Host::enum_labels`); None when there is no such type.
+pub(crate) async fn labels(lake: &Lake, name: &str) -> Option<Vec<String>> { find(lake, name).await.ok().flatten().map(|(_, t)| t.labels) }
+
 /// The tables (their catalog keys and entries) with a column of this type, dropped columns aside.
 async fn users(lake: &Lake, name: &str) -> Result<Vec<(String, TableMeta)>> {
     let all = lake.cat.scan::<TableMeta>("t/", "t0").await?;
@@ -313,7 +317,7 @@ pub use crate::pg_casts::uuid_of;
 /// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
 /// (`'A0EE…'::uuid` is `'a0ee…'`), anything else by `pondra_uuid(x)` (`TRY_CAST`: `pondra_uuid(x,
 /// true)`, NULL for what isn't one). A string compared with a uuid or written into one is read as one, and
-/// `pg_typeof(x)` of one is 'uuid' (`pg_types::rewrite`), before the casts it may read are written out.
+/// `pg_typeof(x)` of one is 'uuid' (`pg_trace::rewrite`), before the casts it may read are written out.
 /// Whether anything changed.
 pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
     let mut read = false;
@@ -321,11 +325,11 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
         // (a bare name of a JSON call's rows is its value unless a relation has a column of that name: the catalog is asked
         // only for a statement with such a name)
         let columns = match crate::pg_json_sets::bare_aliases(s) {
-            true => crate::pg_types::columns_named(lake, s).await,
+            true => crate::pg_trace::columns_named(lake, s).await,
             false => None,
         };
         read |= crate::pg_json_sets::sets(s, columns.as_ref())?; // (set-returning JSON functions: rows of a document, before the casts they may read)
-        read |= crate::pg_types::rewrite(lake, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
+        read |= crate::pg_trace::rewrite(lake, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
     }
     for s in stmts.iter_mut() {
         read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)
@@ -341,8 +345,8 @@ pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
         return Ok(read);
     }
     for n in std::mem::take(&mut f.named) {
-        if let Ok(Some((_, t))) = find(lake, &n).await {
-            f.types.insert(n, t.labels);
+        if let Some(labels) = lake.enum_labels(&n).await {
+            f.types.insert(n, labels);
         }
     }
     if let Some(n) = f.labelled.iter().find(|n| !f.types.contains_key(*n)) {

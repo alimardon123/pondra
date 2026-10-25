@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// them alike; a host answers only what it keeps (routines, attached catalogs, the views with measures it can read,
 /// types of its own). Every method is required, so a host says what it keeps rather than inherit a silent "none"
 /// (reviews/form-parity.md §2).
-pub trait Host: Sync {
+pub trait Host: Send + Sync {
     /// The lake's name, the first part of a three-part name (`text::local_in`).
     fn name(&self) -> String;
     /// The host's own statements, asked before anything else (a node's `SHOW CREATE`, `pondra.find`, `RESTORE`, …):
@@ -36,6 +36,12 @@ pub trait Host: Sync {
     /// The views with measures a statement may read, by every name it may give one (`sales`, `crm.sales`, an
     /// attached lake's `other.sales` and `other.public.sales`): a node's from its lake's views.
     fn measure_views(&self, sql: &str) -> impl Future<Output = Result<Arc<HashMap<String, Arc<Definition>>>>> + Send;
+    /// What a name is to the host, for the front's traces (`pg_trace`): a relation's columns, or a stored view's query.
+    /// None: not a relation here (a CTE, a file, a table function, an unknown name).
+    fn relation(&self, name: &str) -> impl Future<Output = Option<Relation<Self>>> + Send;
+    /// An enum type's labels, in order; None: no such type.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front asks it from F4: designs/l2-front-asks.md)
+    fn enum_labels(&self, name: &str) -> impl Future<Output = Option<Vec<String>>> + Send;
     /// An enum's casts as text (`types::rewrite`): whether it changed anything.
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
     /// A query the front's passes ask before they can write theirs (`friendly`: a `PIVOT`'s values, the columns
@@ -52,6 +58,15 @@ pub enum Own {
     #[cfg_attr(not(feature = "server"), allow(dead_code))] // (only a node's own statements answer: a lake-less build has none)
     Answer(String),
     Go(String),
+}
+
+/// What a name is to the host, for the front's traces (`pg_trace`): a relation's columns by SQL name, each with the
+/// Postgres type it holds as text (none: its Arrow type says), or a stored view's query, with the lake it is in when
+/// that is another, attached one (its query names that lake's tables).
+pub enum Relation<H: ?Sized> {
+    Columns(crate::pg_trace::Cols),
+    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (only a node has views: a lake-less build makes none)
+    View { sql: String, lake: Option<Arc<H>> },
 }
 
 /// The front:

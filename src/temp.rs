@@ -251,7 +251,7 @@ pub fn own(stmt: &Stmt) -> bool {
 }
 
 /// The columns of the current session's temporary table `name`, with the SQL type each holds as text, if there is one
-/// (`pg_types::of` reads them before a lake table of the name: a temporary table shadows it).
+/// (a node's `Host::relation`, in host.rs, reads them before a lake table of the name: a temporary table shadows it).
 pub fn columns_of(name: &str) -> Option<Vec<(String, Option<String>)>> {
     peek(&current()?, |x| x.tables.get(name).map(|t| t.meta.columns.iter().map(|(c, _)| (c.clone(), t.meta.sql_types.get(c).cloned())).collect()))
 }
@@ -273,14 +273,13 @@ pub fn register(ctx: &SessionContext, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// The session's temporary views `sql` names, and those they name.
+/// The session's temporary views `sql` names, and those they name. They are copied out of `SESSIONS` and looked for after
+/// it is let go, so one session's query never holds every other session's statements up.
 pub fn views(sql: &str) -> Vec<(String, String)> {
-    let Some(s) = current() else { return vec![] };
-    let all = SESSIONS.lock().unwrap();
-    let Some(x) = all.get(&s) else { return vec![] };
+    let Some(views) = current().and_then(|s| peek(&s, |x| (!x.views.is_empty()).then(|| x.views.clone()))) else { return vec![] };
     let (mut text, mut out) = (sql.to_string(), Vec::<(String, String)>::new());
     loop {
-        let more: Vec<(String, String)> = x.views.iter().filter(|(n, _)| !out.iter().any(|(m, _)| m == *n) && mentions(&text, n)).map(|(n, v)| (n.clone(), v.clone())).collect();
+        let more: Vec<(String, String)> = views.iter().filter(|(n, _)| !out.iter().any(|(m, _)| m == *n) && mentions(&text, n)).map(|(n, v)| (n.clone(), v.clone())).collect();
         if more.is_empty() {
             return out;
         }

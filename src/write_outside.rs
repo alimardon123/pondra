@@ -607,5 +607,5 @@ pub(crate) fn bound_bytes(v: &ScalarValue) -> Option<String> {
         ScalarValue::Boolean(Some(x)) => vec![*x as u8],
         _ => return None,
     };
-    Some(b.iter().map(|x| format!("{x:02x}")).collect())
+    Some(crate::text::hex(&b))
 }

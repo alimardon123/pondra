@@ -261,7 +261,7 @@ pub fn blob_id(bytes: &[u8]) -> String {
     let mut ctx = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
     ctx.update(format!("blob {}\0", bytes.len()).as_bytes());
     ctx.update(bytes);
-    ctx.finish().as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    crate::text::hex(ctx.finish().as_ref())
 }
 
 /// `'sales'` or `'files/sales'`: the folder of the workspace it names. The workspace itself, and the

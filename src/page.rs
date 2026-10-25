@@ -7,7 +7,7 @@
 
 use crate::expander::Routine;
 use crate::ext_names::Attached;
-use crate::front::{Host, Own};
+use crate::front::{Host, Own, Relation};
 use crate::measures::Definition;
 use crate::request_body;
 use crate::lake_files::{changed, content_type, not_found, there_already, under_files};
@@ -1438,6 +1438,17 @@ impl Host for PageHost<'_> {
             }
         }
         Ok(out)
+    }
+
+    // (a page table's columns carry no Postgres type: a MemTable holds Arrow types, and the page keeps no view to trace)
+    async fn relation(&self, name: &str) -> Option<Relation<Self>> {
+        let table = self.0.ctx.table_provider(name).await.ok()?;
+        Some(Relation::Columns(table.schema().fields().iter().map(|f| (f.name().clone(), None)).collect()))
+    }
+
+    // (a page makes no types, so no enum has labels here: an enum a page names is refused at its CREATE, by name)
+    async fn enum_labels(&self, _name: &str) -> Option<Vec<String>> {
+        None
     }
 
     // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
