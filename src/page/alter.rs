@@ -92,15 +92,18 @@ impl Page {
         if crate::text::first_words(text, 1).first().map(String::as_str) != Some("ALTER") {
             return Ok(None);
         }
+        // (DDL: in an open transaction it runs at once, `at_once`)
         if let Some((from, to)) = view_rename(crate::text::first_word(text)) {
-            return self.rename_to(&object_of(&from)?, &object_of(&to)?).await.map(Some);
+            let (from, to) = (object_of(&from)?, object_of(&to)?);
+            return self.at_once_run("ALTER VIEW", &[], self.rename_to(&from, &to)).await.map(Some);
         }
         let Some(SqlStatement::AlterTable(a)) = self.statement_of(text) else { return Ok(None) };
+        let name = self.table_named(&a.name)?;
         if let [AlterTableOperation::RenameTable { table_name }] = &a.operations[..] {
             let (RenameTableNameKind::To(to) | RenameTableNameKind::As(to)) = table_name;
-            return self.rename_to(&a.name, to).await.map(Some);
+            return self.at_once_run("ALTER TABLE", &[&name], self.rename_to(&a.name, to)).await.map(Some);
         }
-        self.alter_table(&a).await.map(Some)
+        self.at_once_run("ALTER TABLE", &[&name], self.alter_table(&a)).await.map(Some)
     }
 
     /// The DELETE a TRUNCATE is: `TRUNCATE [TABLE] t` of one of the page's tables, as `sql` plans and runs a DELETE. None for any
@@ -123,7 +126,7 @@ impl Page {
 
     /// A name a statement gives a page table, as the page's one schema reads it: its table, or 42P01 for a name in another schema
     /// (a table of another schema is no page table).
-    fn table_named(&self, name: &ObjectName) -> anyhow::Result<String> {
+    pub(super) fn table_named(&self, name: &ObjectName) -> anyhow::Result<String> {
         let reference = self.table_ref(name)?;
         let state = self.ctx.state();
         let options = state.config().options();
@@ -142,10 +145,12 @@ impl Page {
     }
 
     /// The rules a CREATE TABLE `c` makes over `schema` (`made_table`), with its text kept: None when the table has nothing a
-    /// write could break (`has_rules`), as `ruled_made` gives none.
-    fn ruled_with(&self, c: &CreateTable, schema: &SchemaRef) -> anyhow::Result<Option<Ruled>> {
+    /// write could break (`has_rules`), as `ruled_made` gives none. The counters are the table's own (`carried`): an ALTER
+    /// changes a table's columns, not its sequences, so its identity columns go on counting where they were.
+    fn ruled_with(&self, c: &CreateTable, schema: &SchemaRef, carried: Option<&Ruled>) -> anyhow::Result<Option<Ruled>> {
         let table = self.made_table(c, schema)?;
-        Ok(has_rules(&table).then(|| Ruled { create: SqlStatement::CreateTable(c.clone()).to_string(), table: Arc::new(table) }))
+        let counters = carried.map(|r| r.counters.clone()).unwrap_or_default();
+        Ok(has_rules(&table).then(|| Ruled { create: SqlStatement::CreateTable(c.clone()).to_string(), table: Arc::new(table), counters }))
     }
 
     /// An ALTER TABLE of one page table: its actions in order, on the table as it is (`Altering`), and kept once if any of them
@@ -176,6 +181,10 @@ impl Page {
                     return Err(crate::codes::coded("0A000", format!("a page adds a column at the end of {name}: ADD COLUMN takes no FIRST or AFTER")));
                 }
                 let column = crate::text::ident(&column_def.name);
+                // (an identity column's counter starts with its table, and a page makes one with the table, not in an ADD COLUMN)
+                if matches!(crate::rules::create::identity_of(column_def), Ok(Some(_))) {
+                    return Err(crate::codes::coded("0A000", "a page adds no identity column yet: make the table with it"));
+                }
                 if fills_existing(column_def) {
                     anyhow::bail!(owes_rows(name, &column));
                 }
@@ -231,12 +240,12 @@ impl Page {
             Some(r) => {
                 let mut c = self.create_of(&r.create)?;
                 c.columns.push(column.clone());
-                self.ruled_with(&c, &schema)?
+                self.ruled_with(&c, &schema, Some(r))?
             }
             None => {
                 let mut c = self.create_of(&text)?;
                 c.name = ident_name(name);
-                self.ruled_with(&c, &schema)?
+                self.ruled_with(&c, &schema, None)?
             }
         };
         altering.ruled = ruled;
@@ -267,7 +276,7 @@ impl Page {
             Some(r) => {
                 let mut c = self.create_of(&r.create)?;
                 drop_from(&mut c, column);
-                self.ruled_with(&c, &schema)?
+                self.ruled_with(&c, &schema, Some(r))?
             }
             None => None,
         };
@@ -300,7 +309,7 @@ impl Page {
                     }
                 }
                 rename_column_in(&mut c, from, to);
-                self.ruled_with(&c, &schema)?
+                self.ruled_with(&c, &schema, Some(r))?
             }
             None => None,
         };
@@ -339,7 +348,7 @@ impl Page {
             Some(r) => {
                 let mut c = self.create_of(&r.create)?;
                 c.name = ident_name(&to);
-                Some(Ruled { create: SqlStatement::CreateTable(c).to_string(), table: r.table.clone() })
+                Some(Ruled { create: SqlStatement::CreateTable(c).to_string(), table: r.table.clone(), counters: r.counters.clone() })
             }
             None => None,
         };

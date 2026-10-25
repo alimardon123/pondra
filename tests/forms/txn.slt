@@ -28,3 +28,126 @@ query IT
 SELECT id, v FROM a ORDER BY id
 ----
 1 x
+
+# A savepoint: ROLLBACK TO goes back to it and keeps it, RELEASE forgets it. DDL runs at once (ADR-067 §8), so the table
+# made after the savepoint stays, and the row written into it goes with the ROLLBACK TO.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO a VALUES (3, 'kept')
+
+statement ok
+SAVEPOINT s
+
+statement ok
+UPDATE a SET v = 'gone' WHERE id = 3
+
+statement ok
+INSERT INTO a VALUES (4, 'gone')
+
+statement ok
+CREATE TABLE b (n INT)
+
+statement ok
+INSERT INTO b VALUES (1)
+
+statement ok
+ROLLBACK TO SAVEPOINT s
+
+statement ok
+RELEASE SAVEPOINT s
+
+statement ok
+COMMIT
+
+query IT
+SELECT id, v FROM a ORDER BY id
+----
+1 x
+3 kept
+
+query I
+SELECT count(*) FROM b
+----
+0
+
+# A failed statement fails its transaction: the ones after it are refused (25P02) until it ends, and its COMMIT is a
+# ROLLBACK. A savepoint that isn't there fails it too (3B001).
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO a VALUES (5, 'gone')
+
+statement error 42P01
+SELECT * FROM no_such_table
+
+statement error 25P02
+SELECT 1
+
+statement ok
+COMMIT
+
+statement ok
+BEGIN
+
+statement error 3B001
+ROLLBACK TO SAVEPOINT nowhere
+
+statement error 25P02
+INSERT INTO a VALUES (5, 'gone')
+
+statement ok
+ROLLBACK
+
+query IT
+SELECT id, v FROM a ORDER BY id
+----
+1 x
+3 kept
+
+# DDL on a table the transaction has written is refused: the writes were made against the shape it would change.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO a VALUES (5, 'pending')
+
+statement error 0A000
+ALTER TABLE a ADD COLUMN w INT
+
+statement ok
+ROLLBACK
+
+# READ ONLY refuses a write (25006); SERIALIZABLE isn't kept (0A000); DDL under REPEATABLE READ is refused (0A000); a
+# savepoint word outside a transaction is 25P01.
+statement ok
+BEGIN READ ONLY
+
+statement error 25006
+INSERT INTO a VALUES (6, 'no')
+
+statement ok
+ROLLBACK
+
+statement error 0A000
+BEGIN ISOLATION LEVEL SERIALIZABLE
+
+statement ok
+BEGIN ISOLATION LEVEL REPEATABLE READ
+
+statement error 0A000
+CREATE TABLE d (n INT)
+
+statement ok
+ROLLBACK
+
+statement error 25P01
+SAVEPOINT s
+
+query IT
+SELECT id, v FROM a ORDER BY id
+----
+1 x
+3 kept

@@ -151,8 +151,8 @@ Useful `serve` flags (give every node the same ones: any of them may lead):
 - `--flight 0.0.0.0:8815`: also speak Arrow Flight and Flight SQL.
 - `--memory-gb 24`: memory for queries (default: a third of the machine's); sorts, aggregations
   and joins that need more spill to the temp directory. The columns kept decoded in memory
-  (`PONDRA_HOT_GB`, a quarter of it by default) come out of the same budget and give way to
-  queries; `PONDRA_HOT_GB=0` turns them off.
+  (`PONDRA_HOT_GB`, a quarter of it by default; for a lake held in memory, all of it, within the
+  memory line) come out of the same budget and give way to queries; `PONDRA_HOT_GB=0` turns them off.
 - `PONDRA_CODEC=lz4|zstd|snappy|none`: how Parquet files are compressed. LZ4 by default — it
   decodes fastest, so scans are CPU-cheap; `zstd` where storage or bandwidth costs more than CPU.
 - `--read-token`, `--write-token`, `--admin-token`: access control (none set = open). Over
