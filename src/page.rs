@@ -222,8 +222,8 @@ impl Page {
         Ok(page)
     }
 
-    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is; a table
-    /// written later under that name replaces it.
+    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is, and its
+    /// table's name can't be written (`unwritable`) while the file is there, so no write takes the file's rows away.
     pub fn unread(&self) -> &[(String, String)] {
         &self.unread
     }
@@ -540,6 +540,7 @@ impl Page {
     /// one step, so a stop leaves those as they were; but a CREATE OR REPLACE TABLE … AS takes the old table away before it
     /// collects, and taking `before` copies no rows, so it is taken for every write.
     async fn write(&self, ctx: &SessionContext, plan: LogicalPlan, name: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        self.unwritable(name).await?;
         let before = self.before(name).await?;
         let batches = match rows_of(ctx, plan, self.watch.as_ref()).await {
             Ok(batches) => batches,
@@ -548,6 +549,18 @@ impl Page {
         match self.written(name).await {
             Ok(()) => Ok(batches),
             Err(e) => Err(self.undone(name, before, e, ": the page couldn't keep it").await),
+        }
+    }
+
+    /// Refuses a write to a table whose kept file `kept` couldn't read (`unread`), while that file is in the store: a write
+    /// keeps the table it leaves, or forgets a dropped one, over that same file, so the rows the file holds would be gone.
+    /// Once the file is removed, the name is the page's again.
+    async fn unwritable(&self, name: &str) -> anyhow::Result<()> {
+        let at = kept_at(name);
+        let Some((path, why)) = self.unread.iter().find(|(path, _)| path.as_str() == at.as_ref()) else { return Ok(()) };
+        match self.files.head(&at).await {
+            Err(StoreError::NotFound { .. }) => Ok(()),
+            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the table can't be written until the file is removed"))),
         }
     }
 
@@ -2704,6 +2717,18 @@ mod tests {
         let unread = b.unread();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].0.ends_with("tables/bad.arrow"), "{unread:?}");
+        // (a write to its name, which would keep or forget a table over that file, is refused while the file is there)
+        for sql in ["CREATE TABLE IF NOT EXISTS bad AS SELECT 1 AS x", "CREATE OR REPLACE TABLE bad AS SELECT 1 AS x", "DROP TABLE IF EXISTS bad"] {
+            let answer = b.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((answer.status, answer.header("x-pondra-sqlstate")), (409, Some("55000")), "{sql}");
+            assert!(String::from_utf8_lossy(&answer.body).contains("tables/bad.arrow"), "{sql}: {:?}", answer.body);
+        }
+        assert_eq!(store.get(&Path::from("tables/bad.arrow")).await.unwrap().bytes().await.unwrap().as_ref(), b"not arrow");
+        assert_eq!(names_listed(&b.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["t"]);
+        // (once the file is removed, the name is the page's again)
+        store.delete(&Path::from("tables/bad.arrow")).await.unwrap();
+        assert_eq!(b.request("POST", "/sql", &[], "CREATE TABLE bad AS SELECT 1 AS x".into()).await.status, 200);
+        assert!(store.head(&Path::from("tables/bad.arrow")).await.is_ok());
     }
 
     /// A page with no store keeps nothing: a page kept over no store is an empty page, as `open` makes one, and a table
