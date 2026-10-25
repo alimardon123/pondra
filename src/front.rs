@@ -40,10 +40,7 @@ pub trait Host: Send + Sync {
     /// None: not a relation here (a CTE, a file, a table function, an unknown name).
     fn relation(&self, name: &str) -> impl Future<Output = Option<Relation<Self>>> + Send;
     /// An enum type's labels, in order; None: no such type.
-    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front asks it from F4: designs/l2-front-asks.md)
     fn enum_labels(&self, name: &str) -> impl Future<Output = Option<Vec<String>>> + Send;
-    /// An enum's casts as text (`types::rewrite`): whether it changed anything.
-    fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send;
     /// A query the front's passes ask before they can write theirs (`friendly`: a `PIVOT`'s values, the columns
     /// `COLUMNS(…)` and `SUMMARIZE` read), planned as the host plans a user's query, after its front. Its rows are
     /// read only if the pass needs them.
@@ -119,7 +116,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
             }
         }
     }
-    let typed = host.types(&mut stmts).await?; // (`'sad'::mood`, `enum_range(NULL::mood)`: an enum's casts as text)
+    let typed = crate::pg_casts::rewrite(host, &mut stmts).await?; // (JSON's set functions, uuid and json casts, pg_typeof, a lateral generate_series, array literals, an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(host, &mut stmts).await?;
     if !expands && !friendly && !typed {

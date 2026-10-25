@@ -14,7 +14,7 @@
 //! Postgres's catalog lists it as Postgres does (`pg_type`, `pg_enum`, the column's type and
 //! `information_schema`: `pg_catalog.rs`), while the wire sends the values as text. Where SQL comes
 //! in, a cast to it is a cast to text (a literal checked against its labels) and `enum_range`,
-//! `enum_first` and `enum_last` are its labels (`rewrite`).
+//! `enum_first` and `enum_last` are its labels (`pg_casts::rewrite`).
 //!
 //! `UUID`, `JSON` and `JSONB` are held as text too, as Delta, Spark, Snowflake and BigQuery hold
 //! one: every reader and client reads a string, and a uuid compares, sorts and joins as one. Each
@@ -43,15 +43,14 @@ use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::sql::sqlparser::ast::{self, Statement, VisitMut};
+use datafusion::sql::sqlparser::ast::{self, Statement};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use crate::text::is_uuid;
-use crate::pg_casts::{quoted, Casts};
-use crate::front::Host;
+use crate::pg_casts::quoted;
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -475,59 +474,6 @@ pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn
         }
     }
     Ok(())
-}
-
-/// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
-/// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
-/// labels. A cast to `uuid` is the uuid written the one way a column holds it: a literal at once
-/// (`'A0EE…'::uuid` is `'a0ee…'`), anything else by `pondra_uuid(x)` (`TRY_CAST`: `pondra_uuid(x,
-/// true)`, NULL for what isn't one). A string compared with a uuid or written into one is read as one, and
-/// `pg_typeof(x)` of one is 'uuid' (`pg_trace::rewrite`), before the casts it may read are written out.
-/// Whether anything changed.
-pub async fn rewrite(lake: &Lake, stmts: &mut [Statement]) -> Result<bool> {
-    let mut read = false;
-    for s in stmts.iter_mut() {
-        // (a bare name of a JSON call's rows is its value unless a relation has a column of that name: the catalog is asked
-        // only for a statement with such a name)
-        let columns = match crate::pg_json_sets::bare_aliases(s) {
-            true => crate::pg_trace::columns_named(lake, s).await,
-            false => None,
-        };
-        read |= crate::pg_json_sets::sets(s, columns.as_ref())?; // (set-returning JSON functions: rows of a document, before the casts they may read)
-        read |= crate::pg_trace::rewrite(lake, s).await?; // (strings read as uuids, pg_typeof, JSON makers' arguments)
-    }
-    for s in stmts.iter_mut() {
-        read |= crate::lateral::functions(s)?; // (`generate_series(1, t.n)` in a FROM: a LATERAL subquery it can plan)
-    }
-    for s in stmts.iter_mut() {
-        read |= crate::pg_text::array_literals(s)?; // (a string cast to an array type reads as Postgres reads an array literal)
-    }
-    let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], typed: false, collecting: true, failed: None };
-    for s in stmts.iter_mut() {
-        let _ = s.visit(&mut f); // (the first pass only collects the names)
-    }
-    if f.named.is_empty() && !f.typed {
-        return Ok(read);
-    }
-    for n in std::mem::take(&mut f.named) {
-        if let Some(labels) = lake.enum_labels(&n).await {
-            f.types.insert(n, labels);
-        }
-    }
-    if let Some(n) = f.labelled.iter().find(|n| !f.types.contains_key(*n)) {
-        return Err(crate::codes::coded("42704", format!("type \"{n}\" does not exist"))); // (not DataFusion's "Invalid function 'enum_range'")
-    }
-    if f.types.is_empty() && !f.typed {
-        return Ok(read);
-    }
-    f.collecting = false;
-    for s in stmts.iter_mut() {
-        let _ = s.visit(&mut f);
-    }
-    match f.failed {
-        Some(e) => Err(e),
-        None => Ok(true),
-    }
 }
 
 /// `CREATE TYPE name AS ENUM (…)`, as `SHOW CREATE TYPE` writes it.

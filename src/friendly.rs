@@ -705,7 +705,7 @@ impl VisitorMut for Friendly {
         match s {
             Statement::CreateTable(c) => {
                 for col in c.columns.iter_mut() {
-                    spell(&mut col.data_type); // (a JSON column keeps its type: `types::rewrite` holds it as text, checked)
+                    spell(&mut col.data_type); // (a JSON column keeps its type: `pg_casts::rewrite` holds it as text, checked)
                 }
             }
             Statement::AlterTable(a) => {

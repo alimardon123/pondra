@@ -292,10 +292,12 @@ impl Page {
         let turn = self.keeping.lock().await;
         let planned = match self.planned(text).await {
             Ok(planned) => planned,
-            // (a table the page lacks, and a node to ask: the node answers the statement, and the page gives its answer on)
-            Err(e) if self.node.is_some() && crate::codes::of(&e) == "42P01" => {
+            // (a node to ask: the node answers a statement the page can't plan, or can't expand over a node's table, and the page
+            // gives its answer on)
+            Err(e) if self.node.is_some() => {
+                let missing = crate::codes::of(&e) == "42P01";
                 drop(turn); // (asking the node changes nothing on the page: the next statement may plan meanwhile)
-                return match self.outgoing(text, format).await? {
+                return match self.outgoing(text, format, missing).await? {
                     Some(Outgoing::Query(sent)) => self.ask(sent).await,
                     Some(Outgoing::Fill { write, sent }) => self.filled(&write, sent, format).await,
                     None => Err(e),
@@ -322,16 +324,36 @@ impl Page {
         Ok(Answer::ok(crate::answer::content_type(format), crate::answer::render(&batches, format, |_| None)?))
     }
 
-    /// What the page would send its node for `text` (`sql` sends it when the page can't plan the statement), or None when
-    /// the statement names no table the node holds, so the planner's own error stands (a file not put is 42P01 still). A
-    /// statement the front can't expand (a PIVOT over the node's tables) is not sent, for the same reason. Kept apart from
-    /// sending, so the snapshot path (4k-5) branches here later.
-    async fn outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Outgoing>> {
-        let Ok(expanded) = crate::front::expand(&PageHost(self), text, &HashMap::new()).await else { return Ok(None) };
-        let expanded = crate::asof::as_of(&expanded)?.into_owned();
-        let statement = self.parsed(&expanded)?;
+    /// What the page would send its node for `text` (`sql` sends it when the page can't plan the statement, or the front can't
+    /// expand it), or None when the statement names no table the node holds, so the planner's own error stands (a file not put
+    /// is 42P01 still). `missing` says the planner found no table. A statement the front can't expand over a node's table (a
+    /// whole row of one, or its enum) is sent as written, and a page's own refusal, or a statement over its files, stands.
+    /// Kept apart from sending, so the snapshot path (4k-5) branches here later.
+    async fn outgoing(&self, text: &str, format: Option<&str>, missing: bool) -> anyhow::Result<Option<Outgoing>> {
+        let (expanded, raw) = match crate::front::expand(&PageHost(self), text, &HashMap::new()).await {
+            Ok(_) if !missing => return Ok(None), // (the planner's or a rule's refusal over what the page has: the page's own answer)
+            Ok(expanded) => (crate::asof::as_of(&expanded)?.into_owned(), false),
+            // (a page's own refusal, and a statement over its files, keep the front's error: only the front makes a file's name the page's)
+            Err(_) if not_taken(text).is_err() || crate::ext_names::mentions(text) => return Ok(None),
+            // (the front failed on what only the node may know, a node table's whole row or its enum: the text as written says
+            // whether a node table is named)
+            Err(_) => (text.to_string(), true),
+        };
+        let statement = match self.parsed(&expanded) {
+            Ok(statement) => statement,
+            Err(_) if raw => return Ok(None),
+            Err(e) => return Err(e),
+        };
         match self.fill_of(&statement)? {
-            Some((target, query)) => self.fill_outgoing(&statement, &target, query).await,
+            Some((target, query)) => {
+                // (the fill's query as the text writes it, when it parses: the front's rewrites were made without the node's column types)
+                let written = match self.parsed(text) {
+                    Ok(as_written) => self.fill_of(&as_written).ok().flatten().map(|(_, q)| q.to_string()),
+                    Err(_) => None,
+                };
+                let sent = written.unwrap_or_else(|| query.to_string());
+                self.fill_outgoing(&statement, &target, query, &sent).await
+            }
             None => self.query_outgoing(text, format, &statement).await,
         }
     }
@@ -366,9 +388,9 @@ impl Page {
         }
     }
 
-    /// A fill's send: the node is asked the fill's query alone (`fill_of`), so a file the statement names beside the node's
-    /// tables is refused, and a table named as the node's rows is refused too (the name `over_rows` gives the rows).
-    async fn fill_outgoing(&self, statement: &DfStatement, target: &TableReference, query: &Query) -> anyhow::Result<Option<Outgoing>> {
+    /// A fill's send: the node is asked the fill's query alone (`fill_of`), as `sent` writes it, so a file the statement names
+    /// beside the node's tables is refused, and a table named as the node's rows is refused too (the name `over_rows` gives the rows).
+    async fn fill_outgoing(&self, statement: &DfStatement, target: &TableReference, query: &Query, sent: &str) -> anyhow::Result<Option<Outgoing>> {
         let named = self.named(&as_statement(query))?;
         if named.iter().all(|(home, _)| *home != Home::Node) {
             return Ok(None);
@@ -378,7 +400,7 @@ impl Page {
         }
         let names = page_names(named)?;
         let write = self.over_rows(statement)?;
-        let sent = self.sent_for(&query.to_string(), "format=arrow".to_string(), &names).await?;
+        let sent = self.sent_for(sent, "format=arrow".to_string(), &names).await?;
         Ok(Some(Outgoing::Fill { write, sent }))
     }
 
@@ -1425,11 +1447,6 @@ impl Host for PageHost<'_> {
         Ok(Arc::default())
     }
 
-    // (the Postgres passes a node runs here move into the front itself: designs/l2-front-asks.md, F4)
-    async fn types(&self, _stmts: &mut [datafusion::sql::sqlparser::ast::Statement]) -> anyhow::Result<bool> {
-        Ok(false)
-    }
-
     async fn columns(&self, tables: BTreeSet<String>) -> anyhow::Result<HashMap<String, Vec<String>>> {
         let mut out = HashMap::new();
         for name in tables {
@@ -1635,6 +1652,35 @@ mod tests {
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE d (a INT, b TEXT)".into()).await.status, 200);
         let front = crate::front::expand(&PageHost(&page), "INSERT INTO d DEFAULT VALUES", &HashMap::new()).await.unwrap();
         assert!(front.contains("VALUES (DEFAULT, DEFAULT)"), "{front}");
+    }
+
+    /// The Postgres passes run in a page's front as they run on a node: a JSON cast, `pg_typeof`, JSON's set functions, a lateral
+    /// `generate_series`, an array literal, and the refusals a node gives, each answered as a node answers it.
+    #[tokio::test]
+    async fn a_pages_front_runs_the_postgres_passes() {
+        let page = page_with_tables().await;
+        let answers = [
+            (r#"SELECT '{"b":1,"a":2}'::jsonb AS j"#, json!([{"j": r#"{"a": 2, "b": 1}"#}])),
+            ("SELECT pg_typeof(1) AS t", json!([{"t": "bigint"}])),
+            (r#"SELECT key, value FROM json_each_text('{"a":"x","b":"y"}') ORDER BY key"#, json!([{"key": "a", "value": "x"}, {"key": "b", "value": "y"}])),
+            ("SELECT count(*) AS n FROM orders o, generate_series(1, o.qty) g", json!([{"n": 21}])),
+            ("SELECT '{a,b}'::text[] AS a", json!([{"a": ["a", "b"]}])),
+        ];
+        for (sql, want) in answers {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            let body = String::from_utf8_lossy(&got.body).into_owned();
+            assert_eq!(got.status, 200, "{sql}: {body}");
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&got.body).unwrap(), want, "{sql}: {body}");
+        }
+        for (sql, code, words) in [
+            ("SELECT CAST('nope' AS UUID)", "22P02", r#"invalid input syntax for type uuid: "nope""#),
+            ("SELECT enum_range(NULL::mood)", "42704", r#"type "mood" does not exist"#),
+        ] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            let body = String::from_utf8_lossy(&got.body).into_owned();
+            assert_eq!(got.header("x-pondra-sqlstate"), Some(code), "{sql}: {body}");
+            assert!(body.contains(words), "{sql}: {body}");
+        }
     }
 
     /// `MEASURE()` with no view with measures to read is refused on a page as on a node: the front runs the measure pass
@@ -2996,6 +3042,46 @@ mod tests {
             assert_eq!(got.header("x-pondra-sqlstate"), Some("0A000"), "{sql}");
         }
         assert!(kept.lock().unwrap().is_empty());
+    }
+
+    /// A front error over a statement that names a node's table is the node's to answer, as written: a whole row of the node's
+    /// table, or its enum, which only the node can see. The page's own tables, and its own refusals, stay the page's.
+    #[tokio::test]
+    async fn a_front_error_over_a_node_table_goes_to_the_node() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(kept.clone(), count_csv)).await;
+        for (i, sql) in ["SELECT json_agg(s) AS n FROM lake_orders s", "SELECT enum_range(NULL::mood) AS n FROM lake_orders"].into_iter().enumerate() {
+            let got = page.request("POST", "/sql?format=csv", &[], sql.into()).await;
+            assert_eq!(got.status, 200, "{sql}: {}", String::from_utf8_lossy(&got.body));
+            assert_eq!(got.body, "n\n3\n", "{sql}");
+            let sent = kept.lock().unwrap();
+            assert_eq!(sent.len(), i + 1, "{sql}");
+            let (head, _) = read_back(sent.last().unwrap());
+            assert_eq!(head["sql"].as_str(), Some(sql), "{sql}");
+        }
+        let got = page.request("POST", "/sql?format=csv", &[], "SELECT json_agg(s) AS n FROM mine s".into()).await;
+        assert_eq!(got.status, 200, "{}", String::from_utf8_lossy(&got.body));
+        assert_eq!(kept.lock().unwrap().len(), 2);
+        let merged = "MERGE INTO mine USING lake_orders o ON mine.id = o.id WHEN MATCHED THEN DELETE";
+        let got = page.request("POST", "/sql", &[], merged.into()).await;
+        let body = String::from_utf8_lossy(&got.body).into_owned();
+        assert_eq!(got.header("x-pondra-sqlstate"), Some("0A000"), "{body}");
+        assert!(body.contains("MERGE"), "{body}");
+        assert_eq!(kept.lock().unwrap().len(), 2);
+    }
+
+    /// A fill over a node's table sends the node its query as written: the front's rewrites of it were made without the node's
+    /// column types, so `json_agg` of a node's column is not sent as the page's own maker.
+    #[tokio::test]
+    async fn a_fill_over_a_node_table_sends_its_query_as_written() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let page = page_with_node(node_keeping(kept.clone(), rows_answer)).await;
+        page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT json_agg(id) AS d FROM lake_orders".into()).await;
+        let sent = kept.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (head, _) = read_back(&sent[0]);
+        let sql = head["sql"].as_str().unwrap();
+        assert!(sql.contains("json_agg(") && !sql.contains("pondra_json_agg"), "{sql}");
     }
 
     /// A `CREATE TABLE … AS` from the node's rows: the node answers the query alone, the page keeps its rows as a table, and
