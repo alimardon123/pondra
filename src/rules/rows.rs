@@ -2,7 +2,7 @@
 //! DEFAULT or a column a row leaves out takes (`rows_for`), and the 42601 a row of the wrong width gets (`width_refused`).
 //! A node (`write.rs`, `change.rs`, `temp.rs`) and a page (`page.rs`) write their rows by these, so they answer alike.
 //! Nothing here reads files, storage or the catalog.
-use anyhow::{bail, ensure, Result};
+use anyhow::Result;
 use datafusion::sql::sqlparser::ast;
 
 /// Is this text the word DEFAULT (any case, spaces aside)? A quoted `"default"` is a column's name.
@@ -81,9 +81,11 @@ pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), a
 pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, default: &dyn Fn(&str) -> Option<String>) -> Result<String> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     if let Some(n) = names.iter().find(|n| !columns.contains(n)) {
-        bail!("INSERT INTO {table} ({n}): no such column ({})", columns.join(", "));
+        return Err(crate::codes::coded("42703", format!("column \"{n}\" of relation \"{table}\" does not exist (its columns: {})", columns.join(", "))));
     }
-    ensure!(names.iter().collect::<std::collections::HashSet<_>>().len() == names.len(), "INSERT INTO {table}: a column named twice");
+    if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
+        return Err(crate::codes::coded("42701", format!("column \"{n}\" specified more than once (INSERT INTO {table})")));
+    }
     let at = |c: &String| names.iter().position(|n| n == c);
     Parser::new(&GenericDialect {}).try_with_sql(query)?.parse_query()?; // (what's wrong with it, said)
     let q = |c: &str| format!("\"{}\"", c.replace('"', "\"\""));
@@ -146,5 +148,16 @@ mod tests {
         assert_eq!(implicit(&names, Some(3)), ["a", "b", "c"]);
         assert_eq!(implicit(&names, Some(5)), ["a", "b", "c"]);
         assert_eq!(implicit(&names, None), ["a", "b", "c"]);
+    }
+
+    /// A column the table hasn't, or one named twice, is refused as Postgres refuses it (42703, 42701), on every form.
+    #[test]
+    fn a_column_named_wrong_or_twice_is_refused_with_postgres_codes() {
+        let columns: Vec<String> = ["a", "b"].iter().map(|n| n.to_string()).collect();
+        let none = |_: &str| None;
+        let unknown = rows_for("t", &columns, &["nope".to_string()], "VALUES (1)", &none).unwrap_err();
+        assert_eq!((crate::codes::of(&unknown), unknown.to_string().starts_with("column \"nope\" of relation \"t\" does not exist")), ("42703", true));
+        let twice = rows_for("t", &columns, &["a".to_string(), "a".to_string()], "VALUES (1, 2)", &none).unwrap_err();
+        assert_eq!(crate::codes::of(&twice), "42701");
     }
 }
