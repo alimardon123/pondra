@@ -101,10 +101,12 @@ pub fn check_renamed(condition: &str, from: &str, to: &str) -> String {
 /// Whether a CHECK's condition reads the column `column`: a drop of the column takes the check with it, as in Postgres.
 pub fn check_reads(condition: &str, column: &str) -> bool { condition_of(condition).is_some_and(|e| names_column(&e, column)) }
 
-/// A CHECK's condition, read back from its text.
+/// A CHECK's condition, read back from its text: the whole text, or None.
 fn condition_of(text: &str) -> Option<ast::Expr> {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    Parser::new(&GenericDialect {}).try_with_sql(text).ok()?.parse_expr().ok()
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
+    let mut parser = Parser::new(&GenericDialect {}).try_with_sql(text).ok()?;
+    let condition = parser.parse_expr().ok()?;
+    (parser.peek_token().token == Token::EOF).then_some(condition) // (an expression is read up to where it ends: the rest must be nothing)
 }
 
 #[cfg(test)]

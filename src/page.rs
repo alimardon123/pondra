@@ -2928,7 +2928,7 @@ mod tests {
 
     /// A page keeps views as a node does: a view reads its tables as they are now (after an INSERT, and after CREATE OR
     /// REPLACE TABLE), a view reads another, CREATE OR REPLACE changes it, and the refusals are a node's words. DROP TABLE of
-    /// a table a view reads is refused unless CASCADE, which drops the view.
+    /// a table a view reads is refused unless CASCADE, which drops the views that read it, and the views that read those.
     #[tokio::test]
     async fn a_page_keeps_views_over_its_tables_as_they_are_now() {
         let page = Page::open(&Options::default());
@@ -2965,10 +2965,11 @@ mod tests {
         assert_eq!(body(&sql("DROP VIEW IF EXISTS nov").await), r#"{"view":"nov","dropped":false}"#);
         let listed = page.request("GET", "/objects", &[], bytes::Bytes::new()).await;
         assert_eq!(names_listed(&listed), ["t", "v", "w"]);
+        assert_eq!(sql("DROP VIEW w").await.status, 200);
+        assert_eq!(sql("CREATE VIEW w AS SELECT a FROM v").await.status, 200);
         assert_eq!(sql("DROP TABLE t CASCADE").await.status, 200);
-        assert_eq!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["w"], "CASCADE dropped v, which read t");
-        assert_eq!(sql("SELECT n FROM w").await.status, 404, "w reads v, which is gone");
-        assert_eq!(body(&sql("DROP VIEW w").await), r#"{"view":"w","dropped":true}"#);
+        assert!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await).is_empty(), "CASCADE dropped v, which read t, and w, which read v");
+        assert_eq!(sql("SELECT a FROM w").await.status, 404);
     }
 
     /// A kept page keeps its views, and a page opened on the same store reads them again.
