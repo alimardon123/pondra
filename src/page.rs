@@ -43,6 +43,7 @@ use std::task::Poll;
 
 mod alter; // (ALTER TABLE, ALTER VIEW … RENAME TO and TRUNCATE: `alter_statement`, `truncated`)
 mod counters; // (an identity column's counter, and `nextval` over the counters: `Counter`, `Nextval`)
+mod txn; // (BEGIN … COMMIT or ROLLBACK, and savepoints: `control`, `gate`, `at_once`)
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
@@ -161,6 +162,8 @@ pub struct Page {
     unread: Vec<(String, String)>, // (the kept files `kept` couldn't read, each as its path and the words of why)
     ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>>, // (each page table's rules, by its name: `Ruled`, kept with the table's file; `nextval` reads the counters in them)
     views: std::sync::Mutex<BTreeMap<String, String>>, // (each view's query, by its name: `view_statement`; a statement reads them through the front, `views_for`)
+    txn: std::sync::Mutex<Option<txn::Txn>>, // (the open transaction, if any: `page::txn`)
+    notes: std::sync::Mutex<Vec<String>>, // (what the statement running now says beside its answer: `note`)
 }
 
 /// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), that statement's text, which a kept
@@ -335,7 +338,7 @@ impl Page {
         // statement's, so a statement's `nextval` reaches the same counters)
         let ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>> = Default::default();
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(counters::Nextval::new(ruled.clone())));
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default() }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default(), txn: Default::default(), notes: Default::default() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -365,7 +368,34 @@ impl Page {
     /// rows in `format` (an answer with no rows keeps its columns, as `engine::collect` gives them: invariant 88). An
     /// EXPLAIN's rows are made readable as a node's are (`explain::answered`). A read lets the next statement plan once
     /// its own is planned; a write is run and kept (`write`) before the next one is planned.
+    ///
+    /// In an open transaction (`page::txn`), the statement meets its checks first (`gate`), and one that fails fails the
+    /// transaction. A transaction word is the transaction's (`control`). What the statement says beside its answer (a
+    /// transaction's warning, DDL's notice) comes as `x-pondra-notices`, as a node's HTTP sends it.
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
+        self.notes();
+        let answer = match crate::text::control(text) {
+            Some(word) => {
+                let _turn = self.keeping.lock().await;
+                Box::pin(self.control(word, text)).await
+            }
+            None => {
+                let out = match self.gate(text) {
+                    Ok(()) => Box::pin(self.statement_sql(text, format)).await, // (on the heap: a statement's future is deep, and a request's sits on its caller's stack)
+                    Err(e) => Err(e),
+                };
+                out.inspect_err(|e| self.failed(e))
+            }
+        }?;
+        let notes = self.notes();
+        Ok(match notes.is_empty() {
+            true => answer,
+            false => answer.with("x-pondra-notices", serde_json::to_string(&notes)?),
+        })
+    }
+
+    /// `sql` of a statement that is not a transaction word.
+    async fn statement_sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let turn = self.keeping.lock().await;
         if let Some(answer) = self.view_statement(text).await? {
             return Ok(answer);
@@ -804,11 +834,20 @@ impl Page {
     /// them all, and a DELETE or UPDATE rewrites the table in one step, so a stop leaves those as they were; but a CREATE OR
     /// REPLACE TABLE … AS takes the old table away before it collects, and taking `before` copies no rows, so it is taken for
     /// every write. The rules are put back with the table (`undo`).
+    ///
+    /// In an open transaction (`page::txn`), an INSERT, UPDATE or DELETE is the transaction's: the table is kept at its COMMIT,
+    /// not now (`in_txn`). A CREATE or DROP is DDL, which runs at once and is kept now (`at_once`).
     async fn write(&self, ctx: &SessionContext, plan: LogicalPlan, name: &str, ruled: Option<Ruled>) -> anyhow::Result<Vec<RecordBatch>> {
         self.unwritable(name).await?;
+        let change = change_of(&plan);
+        let note = match change {
+            Change::Create { .. } => self.at_once("CREATE TABLE", &[name])?,
+            Change::Drop => self.at_once("DROP TABLE", &[name])?,
+            _ => None,
+        };
         let before = self.before(name).await?;
         let had = self.ruled_of(name);
-        let change = change_of(&plan);
+        let held = note.is_none() && self.in_txn(name, &before, &had);
         let batches = match rows_of(ctx, plan, self.watch.as_ref()).await {
             Ok(batches) => batches,
             Err(e) => return Err(self.undone(name, before, had, e, "").await),
@@ -816,10 +855,18 @@ impl Page {
         if let Err(e) = self.kept_rules(name, &before, ruled, change).await {
             return Err(self.refused(name, before, had, e).await);
         }
-        match self.written(name).await {
-            Ok(()) => Ok(batches),
-            Err(e) => Err(self.undone(name, before, had, e, ": the page couldn't keep it").await),
+        let kept = match held {
+            true => self.registered(name).await.map(|_| ()),
+            false => self.written(name).await,
+        };
+        if let Err(e) = kept {
+            return Err(self.undone(name, before, had, e, ": the page couldn't keep it").await);
         }
+        // (a CREATE IF NOT EXISTS that found its table ran nothing, so it says nothing)
+        if let Some(note) = note.filter(|_| !matches!(change, Change::Create { if_not_exists: true }) || before.is_none()) {
+            self.note(note);
+        }
+        Ok(batches)
     }
 
     /// The rules of the page table `name` after its rows are in (`write`): a CREATE that made the table takes the rules it made
@@ -973,12 +1020,9 @@ impl Page {
     /// under `tables/` (`kept_at`) that `kept` reads back. A table the statement dropped has neither, so its file goes. A
     /// page in memory keeps nothing: a copy of each table beside it would double what it holds.
     async fn written(&self, name: &str) -> anyhow::Result<()> {
-        let (_, page) = self.default_schema()?;
-        let Some(table) = page.table(name).await? else {
+        let Some(table) = self.registered(name).await? else {
             return if self.keeps { self.forget(name).await } else { Ok(()) };
         };
-        page.deregister_table(name)?;
-        register_page_table(page.as_ref(), name.to_string(), inner(&table).clone())?;
         if !self.keeps {
             return Ok(());
         }
@@ -987,6 +1031,16 @@ impl Page {
         let file = table_file(name, table.as_ref(), &batches, self.ruled_of(name).as_ref())?;
         self.files.put_opts(&kept_at(name), PutPayload::from(file), PutOptions { mode: PutMode::Overwrite, ..Default::default() }).await?;
         Ok(())
+    }
+
+    /// The page's table `name`, registered again (`written`) so its statistics are worked out afresh, and not kept: a write in
+    /// a transaction is kept at its COMMIT. None when the page has no table by that name.
+    async fn registered(&self, name: &str) -> anyhow::Result<Option<Arc<dyn TableProvider>>> {
+        let (_, page) = self.default_schema()?;
+        let Some(table) = page.table(name).await? else { return Ok(None) };
+        page.deregister_table(name)?;
+        register_page_table(page.as_ref(), name.to_string(), inner(&table).clone())?;
+        Ok(Some(table))
     }
 
     /// A table the statement dropped: its file goes. A table that was never kept has none, which is fine.
@@ -1276,10 +1330,13 @@ impl Page {
         }
         let Some(statement) = self.statement_of(text) else { return Ok(None) };
         match statement {
-            SqlStatement::CreateView(c) if !c.materialized => self.create_view(c).await.map(Some),
-            SqlStatement::Drop { object_type: ObjectType::View, if_exists, names, cascade, .. } => self.drop_views(&names, if_exists, cascade).await.map(Some),
+            SqlStatement::CreateView(c) if !c.materialized => self.at_once_run("CREATE VIEW", &[], self.create_view(c)).await.map(Some),
+            SqlStatement::Drop { object_type: ObjectType::View, if_exists, names, cascade, .. } => self.at_once_run("DROP VIEW", &[], self.drop_views(&names, if_exists, cascade)).await.map(Some),
             SqlStatement::Drop { object_type: ObjectType::Table, if_exists, names, cascade, .. } => {
                 for name in &names {
+                    if let Ok(table) = self.table_named(name) {
+                        self.at_once("DROP TABLE", &[&table])?; // (before CASCADE drops a view: the DROP itself is `write`'s)
+                    }
                     if !if_exists {
                         self.not_a_view(name, "no table ", "")?;
                     }
@@ -2229,13 +2286,10 @@ fn not_kept_as(what: &str) -> anyhow::Error {
 }
 
 /// The statements a page doesn't take yet, refused by name before anything is parsed (ADR-072: a form that can't do a thing
-/// says so, and says what to write instead). A transaction word, DECLARE, MERGE, the type statements and a node's own
+/// says so, and says what to write instead). DECLARE, MERGE, the type statements and a node's own
 /// statements (users, tasks, shares, …) each name what to write in its place; DataFusion's own words for them name nothing
 /// of the kind. Words are whole and read past comments, so a table named `merged` or a string `'begin'` is not one of them.
 fn not_taken(sql: &str) -> anyhow::Result<()> {
-    if let Some(word) = crate::text::control(sql) {
-        return Err(crate::codes::coded("0A000", format!("a page has no transactions yet ({word}): each statement it runs is its own, so run them one at a time, or in a transaction on a node")));
-    }
     let words = crate::text::first_words(sql, 4);
     if begins(&words, &["DECLARE"]) {
         return Err(crate::codes::coded("0A000", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"));
@@ -2990,8 +3044,7 @@ mod tests {
         let page = Page::open(&Options::default());
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
         let refused = [
-            "BEGIN", "begin transaction;", "START TRANSACTION", "COMMIT", "END", "ROLLBACK", "ROLLBACK TO SAVEPOINT a", "SAVEPOINT a",
-            "RELEASE a", "/* {\"app\": \"dbt\"} */ commit;", "DECLARE $x = 1", "declare $mode = 'full'",
+            "DECLARE $x = 1", "declare $mode = 'full'",
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "CREATE TYPE mood AS ENUM ('sad', 'ok')", "DROP TYPE mood",
             "CREATE USER ann WITH PASSWORD 'x'", "grant select on t to ann", "CREATE TASK k SCHEDULE '1 minute' AS SELECT 1",
             "CREATE SHARE s", "BACKUP DATABASE db TO 'x'", "ATTACH 'x' AS y", "CREATE SECRET s (TYPE s3)", "CREATE SEQUENCE q",
@@ -3005,7 +3058,6 @@ mod tests {
             assert!(body.starts_with("a page"), "{sql}: {body}");
         }
         for (sql, words) in [
-            ("BEGIN", "a page has no transactions yet (BEGIN): each statement it runs is its own, so run them one at a time, or in a transaction on a node"),
             ("DECLARE $x = 1", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"),
             ("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"),
             ("CREATE TYPE mood AS ENUM ('sad', 'ok')", "a page makes no types yet (CREATE TYPE): make the column text, or keep the type on a node"),
@@ -3144,6 +3196,92 @@ mod tests {
         assert_eq!(csv(&b, "SELECT id, v FROM b ORDER BY id").await, "id,v\n10,x\n15,y\n");
         let refused = ask(&b, "INSERT INTO k (id, v) VALUES (9, 'z')").await;
         assert_eq!(refused.header("x-pondra-sqlstate"), Some("428C9"), "{}", body(&refused));
+    }
+
+    /// The code a refused statement answers.
+    async fn code(page: &Page, sql: &str) -> String {
+        let got = ask(page, sql).await;
+        assert_ne!(got.status, 200, "{sql}: {}", body(&got));
+        got.header("x-pondra-sqlstate").unwrap_or_default().to_string()
+    }
+
+    /// A page's transactions, as a node's: COMMIT keeps the writes, ROLLBACK puts every table back (a DELETE's, an UPDATE's and
+    /// an INSERT's), and a savepoint is gone back to with ROLLBACK TO and forgotten with RELEASE. A failed statement fails the
+    /// transaction: the ones after it answer 25P02 and its COMMIT is a ROLLBACK. READ ONLY refuses a write (25006), SERIALIZABLE
+    /// is refused by name, and a savepoint word outside a transaction is 25P01. DDL runs at once: ROLLBACK leaves it, with a
+    /// notice that says so, and DDL on a table the transaction wrote is refused.
+    #[tokio::test]
+    async fn a_page_keeps_transactions_as_a_node_does() {
+        let page = Page::open(&Options::default());
+        ran(&page, "CREATE TABLE a (id INT PRIMARY KEY, v TEXT)").await;
+        ran(&page, "INSERT INTO a VALUES (1, 'x'), (2, 'y')").await;
+        let begun = ask(&page, "BEGIN").await;
+        assert_eq!(body(&begun), r#"{"transaction":"begin"}"#);
+        for sql in ["INSERT INTO a VALUES (3, 'z')", "UPDATE a SET v = 'w' WHERE id = 1", "DELETE FROM a WHERE id = 2"] {
+            ran(&page, sql).await;
+        }
+        assert_eq!(csv(&page, "SELECT id, v FROM a ORDER BY id").await, "id,v\n1,w\n3,z\n");
+        ran(&page, "ROLLBACK").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM a ORDER BY id").await, "id,v\n1,x\n2,y\n");
+
+        ran(&page, "BEGIN").await;
+        ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
+        ran(&page, "SAVEPOINT s").await;
+        ran(&page, "UPDATE a SET v = 'gone' WHERE id = 3").await;
+        ran(&page, "INSERT INTO a VALUES (4, 'gone')").await;
+        ran(&page, "CREATE TABLE b (n INT)").await;
+        ran(&page, "INSERT INTO b VALUES (1)").await;
+        ran(&page, "ROLLBACK TO SAVEPOINT s").await;
+        ran(&page, "RELEASE SAVEPOINT s").await;
+        assert_eq!(code(&page, "ROLLBACK TO SAVEPOINT s").await, "3B001");
+        assert_eq!(code(&page, "SELECT 1").await, "25P02");
+        let ended = ask(&page, "COMMIT").await;
+        assert_eq!(body(&ended), r#"{"transaction":"rollback"}"#);
+        assert_eq!(csv(&page, "SELECT id, v FROM a ORDER BY id").await, "id,v\n1,x\n2,y\n");
+        assert_eq!(csv(&page, "SELECT count(*) AS n FROM b").await, "n\n0\n"); // (its CREATE ran at once; its INSERT was rolled back)
+
+        ran(&page, "BEGIN").await;
+        ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
+        assert_eq!(code(&page, "INSERT INTO a VALUES (3, 'twice')").await, "23505");
+        assert_eq!(code(&page, "INSERT INTO a VALUES (5, 'after')").await, "25P02");
+        ran(&page, "ROLLBACK").await;
+        ran(&page, "BEGIN").await;
+        ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
+        assert_eq!(code(&page, "ALTER TABLE a ADD COLUMN w INT").await, "0A000"); // (and the transaction is failed: the refusal is its statement's)
+        ran(&page, "ROLLBACK").await;
+        ran(&page, "BEGIN").await;
+        let made = ask(&page, "CREATE TABLE c (n INT)").await;
+        assert_eq!(made.header("x-pondra-notices"), Some(r#"["CREATE TABLE ran at once: DDL isn't part of a transaction here, and ROLLBACK won't undo it"]"#));
+        ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
+        ran(&page, "COMMIT").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM a ORDER BY id").await, "id,v\n1,x\n2,y\n3,kept\n");
+
+        ran(&page, "BEGIN READ ONLY").await;
+        assert_eq!(code(&page, "INSERT INTO a VALUES (6, 'no')").await, "25006");
+        ran(&page, "ROLLBACK").await;
+        assert_eq!(code(&page, "BEGIN ISOLATION LEVEL SERIALIZABLE").await, "0A000");
+        assert_eq!(code(&page, "SAVEPOINT s").await, "25P01");
+        let none = ask(&page, "COMMIT").await;
+        assert_eq!(none.header("x-pondra-notices"), Some(r#"["WARNING: there is no transaction in progress"]"#));
+        ran(&page, "BEGIN ISOLATION LEVEL REPEATABLE READ").await;
+        assert_eq!(code(&page, "CREATE TABLE d (n INT)").await, "0A000");
+        ran(&page, "ROLLBACK").await;
+    }
+
+    /// A kept page keeps a transaction's writes at its COMMIT, and none of a ROLLBACK's: a page kept over the same store reads
+    /// the tables as the last COMMIT left them.
+    #[tokio::test]
+    async fn a_kept_page_keeps_what_a_transaction_commits() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        ran(&a, "CREATE TABLE t (id INT, v TEXT)").await;
+        for sql in ["BEGIN", "INSERT INTO t VALUES (1, 'kept')", "COMMIT", "BEGIN", "INSERT INTO t VALUES (2, 'gone')", "ROLLBACK", "BEGIN", "INSERT INTO t VALUES (3, 'open')"] {
+            ran(&a, sql).await;
+        }
+        drop(a);
+        let b = Page::kept(&options).await.unwrap();
+        assert_eq!(csv(&b, "SELECT id, v FROM t ORDER BY id").await, "id,v\n1,kept\n");
     }
 
     /// A page fills a narrow row, and a DEFAULT in VALUES, as a node does: a row that names fewer columns, or says DEFAULT, takes

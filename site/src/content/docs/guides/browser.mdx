@@ -68,6 +68,12 @@ identity, a `CHECK` or `UNIQUE` on it is refused, as on a node. A rename takes t
 `UNIQUE` and its `CHECK`s read the column by its new name), and a dropped column takes its `UNIQUE` and `CHECK`s with
 it. A column of a table that a view reads isn't renamed or dropped until the view is. `TRUNCATE t` empties a table.
 
+Transactions work as on a node: `BEGIN` … `COMMIT` keeps the writes between them, `ROLLBACK` undoes them, and
+`SAVEPOINT`, `ROLLBACK TO` and `RELEASE` work within one. A statement that fails fails its transaction: the ones after
+it are refused (`25P02`) until `ROLLBACK`. `BEGIN READ ONLY` refuses writes (`25006`). DDL runs at once and `ROLLBACK`
+doesn't undo it, as on a node, and the answer says so in `x-pondra-notices`. A kept page keeps a transaction's tables
+when it commits.
+
 ## Files people give it
 
 A file put under `/files/` is read by its name, as on a node. It can be CSV, Parquet, JSON or Arrow:
@@ -170,7 +176,7 @@ const page = new Page();
 ## What a page doesn't do yet
 
 <Aside>
-A page refuses these with `0A000`: transactions (`BEGIN`), `DECLARE`, `CREATE TYPE`, `MERGE` and
+A page refuses these with `0A000`: `DECLARE`, `CREATE TYPE`, `MERGE` and
 `INSERT … ON CONFLICT`, a table's past (`AT (VERSION => …)`), SQL functions and sequences, and the
 `ALTER TABLE` forms beyond the ones above (a column's type or default, constraints). Users and grants, tasks, shares,
 secrets, backups, attached lakes, materialized views and `COPY` are a node's, and a page refuses them the same way,

@@ -92,15 +92,18 @@ impl Page {
         if crate::text::first_words(text, 1).first().map(String::as_str) != Some("ALTER") {
             return Ok(None);
         }
+        // (DDL: in an open transaction it runs at once, `at_once`)
         if let Some((from, to)) = view_rename(crate::text::first_word(text)) {
-            return self.rename_to(&object_of(&from)?, &object_of(&to)?).await.map(Some);
+            let (from, to) = (object_of(&from)?, object_of(&to)?);
+            return self.at_once_run("ALTER VIEW", &[], self.rename_to(&from, &to)).await.map(Some);
         }
         let Some(SqlStatement::AlterTable(a)) = self.statement_of(text) else { return Ok(None) };
+        let name = self.table_named(&a.name)?;
         if let [AlterTableOperation::RenameTable { table_name }] = &a.operations[..] {
             let (RenameTableNameKind::To(to) | RenameTableNameKind::As(to)) = table_name;
-            return self.rename_to(&a.name, to).await.map(Some);
+            return self.at_once_run("ALTER TABLE", &[&name], self.rename_to(&a.name, to)).await.map(Some);
         }
-        self.alter_table(&a).await.map(Some)
+        self.at_once_run("ALTER TABLE", &[&name], self.alter_table(&a)).await.map(Some)
     }
 
     /// The DELETE a TRUNCATE is: `TRUNCATE [TABLE] t` of one of the page's tables, as `sql` plans and runs a DELETE. None for any
@@ -123,7 +126,7 @@ impl Page {
 
     /// A name a statement gives a page table, as the page's one schema reads it: its table, or 42P01 for a name in another schema
     /// (a table of another schema is no page table).
-    fn table_named(&self, name: &ObjectName) -> anyhow::Result<String> {
+    pub(super) fn table_named(&self, name: &ObjectName) -> anyhow::Result<String> {
         let reference = self.table_ref(name)?;
         let state = self.ctx.state();
         let options = state.config().options();
