@@ -17,9 +17,9 @@
 //!    bucket here;
 //! 5. then the HTTP door closes (`close_door`, from `Held::stop`): an answer still being written goes
 //!    out whole, for at most what is left of `PONDRA_DRAIN_SECS` (and at least 250 ms, for the last
-//!    bytes hyper holds), and the streams that never end by themselves (a commit feed, a watch, a live
-//!    query) end there, their clients reconnecting to another node. Last, a leader gives up its term,
-//!    so the next leader takes over at once.
+//!    bytes hyper holds, once it took a connection), and the streams that never end by themselves (a
+//!    commit feed, a watch, a live query) end there, their clients reconnecting to another node.
+//!    Last, a leader gives up its term, so the next leader takes over at once.
 //!
 //! A connection is served on a task of its own, which a node's stop doesn't end: in a process that
 //! goes on after the node stops (a library, a lake moved), one still writing past the bound stays up
@@ -38,6 +38,8 @@ crate::per_node!(static IN_FLIGHT: RwLock<Arc<AtomicUsize>> = RwLock::default())
 // are counted from it); and whether a second signal came.
 crate::per_node!(static DOOR: tokio::sync::watch::Sender<Door> = tokio::sync::watch::channel(Door::Unopened).0);
 crate::per_node!(static DRAIN_START: Mutex<Option<tokio::time::Instant>> = Mutex::new(None));
+// Whether the HTTP door took a connection: only then may a client still be reading an answer's last bytes.
+crate::per_node!(static TOOK: AtomicBool = AtomicBool::new(false));
 crate::per_node!(static HURRIED: AtomicBool = AtomicBool::new(false));
 
 /// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.
@@ -111,6 +113,9 @@ pub fn hurry() { HURRIED.store(true, SeqCst); }
 /// The HTTP door is serving (its task, when it starts): `close_door` waits for it to close.
 pub(crate) fn door_open() { DOOR.send_replace(Door::Open); }
 
+/// The HTTP door took a connection (`tls::Doors`): its close waits the 250 ms that let an answer's last bytes out.
+pub(crate) fn took() { TOOK.store(true, SeqCst); }
+
 /// The HTTP door's serve has ended (its task, when it ends).
 pub(crate) fn door_closed() { DOOR.send_replace(Door::Closed); }
 
@@ -138,7 +143,8 @@ fn door_bound() -> Duration {
 
 /// Closes the HTTP door (`Held::stop`, once the leader has checkpointed): the streams that never end by themselves end
 /// (`endless`), and the answers being written go out whole. Returns once the door has closed or `door_bound` has passed,
-/// and at least 250 ms after it began, which lets the last bytes hyper holds reach the client.
+/// and at least 250 ms after it began, which lets the last bytes hyper holds reach the client, when the door took a
+/// connection (a library's, asked in its process, mostly takes none: its close took 0.26 s for this wait alone).
 pub async fn close_door() {
     let opened = *DOOR.borrow() != Door::Unopened;
     if !opened {
@@ -155,7 +161,7 @@ pub async fn close_door() {
     let bound = door_bound();
     let mut door = DOOR.subscribe();
     let shut = tokio::time::timeout(bound, async { drop(door.wait_for(|d| *d == Door::Closed).await) }).await.is_ok();
-    if !HURRIED.load(SeqCst) {
+    if !HURRIED.load(SeqCst) && TOOK.load(SeqCst) {
         tokio::time::sleep_until(started + Duration::from_millis(250)).await;
     }
     if !shut {
