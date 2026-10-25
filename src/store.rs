@@ -710,7 +710,7 @@ pub struct Lake {
     pub backlog: std::sync::atomic::AtomicU64, // leader: rows in the log not yet tiered (all tables)
     pub rt: Arc<RuntimeEnv>,         // shared by all queries: object store registry + Parquet metadata cache
     tail: Mutex<Tail>, // decoded log rows
-    pub tails: Mutex<(lru::LruCache<String, Arc<crate::query::Tail>>, usize)>, // tables' tails as queries read them (`query::Tail`); total bytes
+    pub tails: Mutex<(lru::LruCache<(String, String), Arc<crate::query::Tail>>, usize)>, // tables' tails as queries read them (`query::Tail`), each keyed by its table and then its form (`of.1`); total bytes
     kept: (Arc<Footers>, Arc<FileStatistics>), // DataFusion's caches of Parquet footers and of files' statistics (`rt`'s)
     pub disk: Option<Arc<crate::cache::Disk>>, // lakes on object storage: the local SSD tier
     pub groups: crate::serve::Groups,          // decoded row groups for key lookups

@@ -128,6 +128,7 @@ async fn tail_segments(lake: &Lake, table: &str, after: u64, upto: Option<u64>, 
 pub struct Tail {
     of: (u64, String),       // the table's `tiered` mark, and the schema and flags it was read with
     through: u64,            // every segment up to here is in it
+    /// Its batches share one schema `Arc`, the first kept batch's, so a scan can compare them by pointer.
     rows: Vec<RecordBatch>,
     ends: Vec<(u64, usize)>, // each segment with rows of the table, and the rows up to its end
     bytes: usize,
@@ -153,12 +154,14 @@ impl Tail {
     }
 
     fn add(&mut self, segs: Vec<(u64, Vec<RecordBatch>)>, s: &SchemaRef) -> Result<()> {
+        let schema = self.rows.first().map_or_else(|| s.clone(), |b| b.schema());
         let (mut new, mut total) = (vec![], self.ends.last().map_or(0, |e| e.1));
         for (n, batches) in segs {
             let before = total;
             for b in batches.iter().filter(|b| b.num_rows() > 0) {
                 total += b.num_rows();
-                new.push(conform(b, s)?);
+                let b = conform(b, &schema)?;
+                new.push(if Arc::ptr_eq(b.schema_ref(), &schema) { b } else { b.with_schema(schema.clone())? });
             }
             if total > before {
                 self.ends.push((n, total));
@@ -172,7 +175,7 @@ impl Tail {
         let rows: usize = self.rows[self.rows.len() - small..].iter().map(|b| b.num_rows()).sum();
         if small > 1 && rows >= TAIL_BATCH {
             let tail = self.rows.split_off(self.rows.len() - small);
-            let all = datafusion::arrow::compute::concat_batches(s, &tail)?;
+            let all = datafusion::arrow::compute::concat_batches(&schema, &tail)?;
             self.bytes += all.get_array_memory_size();
             self.bytes = self.bytes.saturating_sub(tail.iter().map(|b| b.get_array_memory_size()).sum());
             self.rows.extend((0..all.num_rows()).step_by(TAIL_BATCH).map(|at| all.slice(at, TAIL_BATCH.min(all.num_rows() - at))));
@@ -188,7 +191,8 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
         return Ok(vec![]); // (a slice of a spread query that reads no log)
     }
     let of = (after, format!("{keyed} {sys} {:?}", s.fields()));
-    let kept = lake.tails.lock().unwrap().0.get(table).filter(|t| t.of == of).cloned();
+    let key = (table.to_string(), of.1.clone());
+    let kept = lake.tails.lock().unwrap().0.get(&key).filter(|t| t.of == of).cloned();
     if let (Some(t), Some(u)) = (&kept, upto) {
         if u <= t.through {
             return Ok(t.upto(u));
@@ -200,21 +204,38 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
     t.through = t.through.max(seen);
     let rows = t.upto(upto.unwrap_or(u64::MAX));
     if t.bytes <= TAILS {
-        let t = Arc::new(t);
-        let mut c = lake.tails.lock().unwrap();
-        // (a newer mark wins: a slice read at an older one, as its coordinator saw it, keeps none)
-        if c.0.peek(table).is_none_or(|o| t.of.0 > o.of.0 || (t.of.0 == o.of.0 && (t.of.1 != o.of.1 || t.through > o.through))) {
-            c.1 += t.bytes;
-            if let Some(old) = c.0.put(table.to_string(), t) {
-                c.1 -= old.bytes;
-            }
-            while c.1 > TAILS && c.0.len() > 1 {
-                let Some((_, old)) = c.0.pop_lru() else { break };
-                c.1 -= old.bytes;
-            }
-        }
+        keep(&mut lake.tails.lock().unwrap(), table, Arc::new(t));
     }
     Ok(rows)
+}
+
+/// Keeps `t` as its table's tail of its form, in the cache `c` (with its total bytes). A newer
+/// mark wins over what is kept for the form. Nothing is kept while any form of the table has a
+/// newer mark: a slice read at an older one, as its coordinator saw it, keeps none, whichever
+/// form it reads. A kept tail drops the other forms' tails of the table at an older mark, and
+/// past `TAILS` the least recently used go.
+fn keep(c: &mut (lru::LruCache<(String, String), Arc<Tail>>, usize), table: &str, t: Arc<Tail>) {
+    if c.0.iter().any(|(k, o)| k.0 == table && o.of.0 > t.of.0) {
+        return;
+    }
+    let key = (table.to_string(), t.of.1.clone());
+    if c.0.peek(&key).is_some_and(|o| t.of.0 < o.of.0 || (t.of.0 == o.of.0 && t.through <= o.through)) {
+        return;
+    }
+    c.1 += t.bytes;
+    if let Some(old) = c.0.put(key, t.clone()) {
+        c.1 -= old.bytes;
+    }
+    let older: Vec<(String, String)> = c.0.iter().filter(|(k, o)| k.0 == table && k.1 != t.of.1 && o.of.0 < t.of.0).map(|(k, _)| k.clone()).collect();
+    for k in older {
+        if let Some(old) = c.0.pop(&k) {
+            c.1 -= old.bytes;
+        }
+    }
+    while c.1 > TAILS && c.0.len() > 1 {
+        let Some((_, old)) = c.0.pop_lru() else { break };
+        c.1 -= old.bytes;
+    }
 }
 
 /// All rows of a table (files ∪ tail up to `upto`); upsert tables carry `_ord` (0 for files).
@@ -1476,7 +1497,7 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, Facts, FactsMemo};
+    use super::{exhausted, keep, Facts, FactsMemo, Tail};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
     use std::sync::Arc;
@@ -1541,5 +1562,89 @@ mod tests {
         assert!(!exhausted(&anyhow::Error::new(cap)));
         // The memory watch's stop (`oom::OOM`) says "out of memory", not "Resources exhausted": not retried either.
         assert!(!exhausted(&anyhow::anyhow!("{}", crate::oom::OOM)));
+    }
+
+    /// A tail of `form` at mark `of` through segment `through`, `bytes` long (the cache keeps only sizes here).
+    fn tail(form: &str, of: u64, through: u64, bytes: usize) -> Arc<Tail> {
+        Arc::new(Tail { of: (of, form.to_string()), through, rows: vec![], ends: vec![], bytes })
+    }
+
+    fn key(table: &str, form: &str) -> (String, String) { (table.to_string(), form.to_string()) }
+
+    fn cache() -> (lru::LruCache<(String, String), Arc<Tail>>, usize) { (lru::LruCache::unbounded(), 0) }
+
+    fn kept_bytes(c: &(lru::LruCache<(String, String), Arc<Tail>>, usize)) -> usize { c.0.iter().map(|(_, t)| t.bytes).sum() }
+
+    #[test]
+    fn two_forms_of_one_table_at_one_mark_are_both_kept() {
+        let mut c = cache();
+        keep(&mut c, "t", tail("keyed sys", 5, 9, 100));
+        keep(&mut c, "t", tail("keyed", 5, 9, 40));
+        assert_eq!(c.0.len(), 2, "one tail per form");
+        assert_eq!(c.0.peek(&key("t", "keyed sys")).map(|t| t.bytes), Some(100), "found by its form");
+        assert_eq!(c.0.peek(&key("t", "keyed")).map(|t| t.bytes), Some(40), "found by its form");
+        assert_eq!(c.1, 140);
+        assert_eq!(c.1, kept_bytes(&c));
+    }
+
+    #[test]
+    fn a_newer_mark_for_one_form_drops_the_others_older_entry() {
+        let mut c = cache();
+        keep(&mut c, "t", tail("a", 5, 9, 100));
+        keep(&mut c, "t", tail("b", 5, 9, 40));
+        keep(&mut c, "u", tail("b", 1, 1, 8)); // (another table's tail is not dropped)
+        keep(&mut c, "t", tail("a", 6, 7, 30));
+        assert!(c.0.peek(&key("t", "b")).is_none(), "b at mark 5 is older than a's new mark 6");
+        assert!(c.0.peek(&key("u", "b")).is_some(), "another table keeps its tail");
+        assert_eq!(c.0.len(), 2);
+        assert_eq!(c.1, 38, "the total is the kept entries' bytes");
+        assert_eq!(c.1, kept_bytes(&c));
+    }
+
+    #[test]
+    fn an_older_mark_is_not_kept_for_a_form_with_no_entry() {
+        let mut c = cache();
+        keep(&mut c, "t", tail("a", 6, 7, 100));
+        keep(&mut c, "t", tail("b", 5, 9, 40));
+        assert!(c.0.peek(&key("t", "b")).is_none(), "b at mark 5 is older than the table's mark 6");
+        assert_eq!(c.0.len(), 1);
+        assert_eq!(c.1, 100, "the total is a's bytes");
+        assert_eq!(c.1, kept_bytes(&c));
+    }
+
+    #[test]
+    fn an_entry_at_an_older_mark_is_not_kept() {
+        let mut c = cache();
+        keep(&mut c, "t", tail("a", 5, 9, 100));
+        keep(&mut c, "t", tail("a", 3, 9, 50)); // an older mark
+        keep(&mut c, "t", tail("a", 5, 8, 60)); // the same mark, fewer segments
+        let kept = c.0.peek(&key("t", "a")).expect("kept");
+        assert_eq!((kept.of.0, kept.through, kept.bytes), (5, 9, 100), "the newer entry stays");
+        assert_eq!(c.1, 100);
+        keep(&mut c, "t", tail("a", 5, 12, 150)); // the same mark, more segments
+        assert_eq!(c.0.peek(&key("t", "a")).map(|t| t.through), Some(12), "a longer tail at the same mark replaces it");
+        assert_eq!(c.1, 150);
+    }
+
+    #[test]
+    fn a_tails_batches_share_the_first_kept_batchs_schema() {
+        use datafusion::arrow::array::{ArrayRef, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        let fresh = || Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let batch = |schema: &Arc<Schema>, values: Vec<i64>| {
+            let column: ArrayRef = Arc::new(Int64Array::from(values));
+            RecordBatch::try_new(schema.clone(), vec![column]).unwrap()
+        };
+        // Two `Arc`s of one schema, as two segments' batches may carry them.
+        let (first, second) = (fresh(), fresh());
+        assert!(!Arc::ptr_eq(&first, &second));
+        let mut t = Tail { of: (1, "f".to_string()), through: 0, rows: vec![], ends: vec![], bytes: 0 };
+        t.add(vec![(1, vec![batch(&first, vec![1, 2])])], &first).unwrap();
+        t.add(vec![(2, vec![batch(&second, vec![3])])], &fresh()).unwrap();
+        let kept = t.rows[0].schema();
+        assert_eq!(t.rows.len(), 2);
+        assert!(t.rows.iter().all(|b| Arc::ptr_eq(b.schema_ref(), &kept)), "every kept batch has the first kept batch's schema");
+        assert_eq!(t.rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 }
