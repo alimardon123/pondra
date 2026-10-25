@@ -378,24 +378,64 @@ async function keptRefused(Page) {
 }
 
 // A page's query past its memory line is stopped (SQLSTATE 53200), and the page answers the next query. The settings are fixed
-// once per module, so this runs in a child process of its own, given `memory_max_gb` 0.1 and a query pool (`memory_gb`) above
-// it, so the watch stops the query, not the pool; the child answers as JSON. Its first query grows the page past the line
-// (array_agg over 50 M values, between whose batches the page's query yields), and the child is killed after 60 s, however
-// it ends.
+// once per module, so this runs in a child process of its own (`inChild`), given `memory_max_gb` 0.1 and a query pool
+// (`memory_gb`) above it, so the watch stops the query, not the pool. Its first query grows the page past the line
+// (array_agg over 50 M values, between whose batches the page's query yields).
 async function memoryChecks() {
+  const answers = await inChild('memory', '{ memory_max_gb: 0.1, memory_gb: 1 }', `
+    const past = await answer('SELECT array_agg(value) AS a FROM range(50000000)');
+    const after = await answer('SELECT 1 AS n');
+    return { past, after };
+  `);
+  if (!answers) return;
+  const before = failed.length;
+  judge('memory: a query past its line', asJudged(answers.past), { status: 503, sqlstate: '53200', says: 'memory_max_gb' });
+  // (the next query is checked without a judge of its own: the memory check is one check)
+  if (answers.after.status !== 200 || answers.after.text !== 'n\n1\n') {
+    failed.push('memory: the next query');
+    console.error(`memory: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
+  }
+  if (failed.length === before) report.memory = 'a query past its 0.1 GB line stopped with 53200, and the next one answered';
+}
+
+// A node's answer past the room a page has for it is not read (the node's `big` is a view of 20 M rows, 160 MB as Arrow and
+// more as CSV, past a 0.1 GB line): a query's answer and a copy's rows are each 53200, naming the room, and the next small
+// answer is read. In a child process of its own, as `memoryChecks`.
+async function nodeMemoryChecks(node) {
+  const before = failed.length;
+  const made = await ask('node: big', 'POST', '/sql', undefined, 'CREATE VIEW big AS SELECT value AS v FROM range(20000000)', undefined, node);
+  if (made) judge('node: big', made, { status: 200, sqlstate: null });
+  if (!made || failed.length > before) return;
+  const answers = await inChild('node memory', `{ node: ${JSON.stringify(node.url)}, memory_max_gb: 0.1, memory_gb: 1 }`, `
+    const query = await answer('SELECT v FROM big');
+    const copy = await answer('CREATE TABLE mine AS SELECT * FROM big');
+    const after = await answer('SELECT count(*) AS n FROM big');
+    return { query, copy, after };
+  `);
+  if (!answers) return;
+  const past = { status: 503, sqlstate: '53200', says: 'room for' };
+  judge('node memory: a query past the room', asJudged(answers.query), past);
+  judge('node memory: a copy past the room', asJudged(answers.copy), past);
+  judge('node memory: the next answer', asJudged(answers.after), { status: 200, sqlstate: null, out: 'n\n20000000\n' });
+  if (failed.length === before) report.node_memory = "a node's answer past the page's room stopped with 53200, and the next one was read";
+}
+
+// A page made with the options `opts` (JavaScript text) in a child process of its own, as the settings are fixed once per
+// module: `body` runs with `answer(sql)` (POST /sql as CSV: its status, headers and text) and returns what the child
+// answers, as JSON. The child is killed after 60 s, however it ends. Null, after naming the failure under `name`, when the
+// child doesn't run or answer.
+async function inChild(name, opts, body) {
   const module = pathToFileURL(join(pkg, 'pondra_web.js')).href;
   const code = `
     import { readFile } from 'node:fs/promises';
     const { default: init, Page } = await import(${JSON.stringify(module)});
     await init({ module_or_path: await readFile(${JSON.stringify(join(pkg, 'pondra_web_bg.wasm'))}) });
-    const page = new Page({ memory_max_gb: 0.1, memory_gb: 1 });
+    const page = new Page(${opts});
     const answer = async (sql) => {
       const a = await page.request('POST', '/sql?format=csv', {}, sql);
       return { status: a.status, headers: a.headers, text: new TextDecoder().decode(a.body) };
     };
-    const past = await answer('SELECT array_agg(value) AS a FROM range(50000000)');
-    const after = await answer('SELECT 1 AS n');
-    process.stdout.write(JSON.stringify({ past, after }));
+    process.stdout.write(JSON.stringify(await (async () => { ${body} })()));
   `;
   const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
@@ -412,29 +452,24 @@ async function memoryChecks() {
   try {
     await once(child, 'exit');
   } catch (e) {
-    failed.push('memory');
-    console.error(`memory: the page's child did not run: ${e}`);
-    return;
+    failed.push(name);
+    console.error(`${name}: the page's child did not run: ${e}`);
+    return null;
   } finally {
     clearTimeout(timer);
   }
-  let answers = null;
   try {
-    answers = JSON.parse(out);
+    return JSON.parse(out);
   } catch {
-    failed.push('memory');
-    console.error(`memory: the page's child did not answer: ${JSON.stringify(out)} ${errors}`);
-    return;
+    failed.push(name);
+    console.error(`${name}: the page's child did not answer: ${JSON.stringify(out)} ${errors}`);
+    return null;
   }
-  const before = failed.length;
-  const as = (a) => ({ status: a.status, headers: a.headers, body: enc.encode(a.text) });
-  judge('memory: a query past its line', as(answers.past), { status: 503, sqlstate: '53200', says: 'memory_max_gb' });
-  // (the next query is checked without a judge of its own: the memory check is one check)
-  if (answers.after.status !== 200 || answers.after.text !== 'n\n1\n') {
-    failed.push('memory: the next query');
-    console.error(`memory: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
-  }
-  if (failed.length === before) report.memory = 'a query past its 0.1 GB line stopped with 53200, and the next one answered';
+}
+
+// A child's answer (`inChild`) as `judge` reads one.
+function asJudged(a) {
+  return { status: a.status, headers: a.headers, body: enc.encode(a.text) };
 }
 
 // The kept page in Chromium (`Page.kept`): its files and tables are kept in the origin's private file system, so they are
@@ -1043,6 +1078,7 @@ async function nodeRun(target) {
   }
   try {
     await nodeChecks(target, node);
+    if (!IN_BROWSER) await nodeMemoryChecks(node);
   } finally {
     await node.stop();
   }
