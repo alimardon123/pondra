@@ -142,6 +142,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
         ms.sort_by(f64::total_cmp);
         let q = |p: f64| ms.get(((ms.len() as f64 * p) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0.0);
         metric("commit_ms", "gauge", "recent catalog commit latency", &[("{quantile=\"0.5\"}".into(), q(0.5)), ("{quantile=\"0.99\"}".into(), q(0.99))]);
+        metric("catalog_unflushed_seconds", "gauge", "seconds the catalog has held commits that no flush has persisted yet (0 when it has none): an alarm, since a new leader replays that long a WAL", &one(app.lake.cat.unflushed_seconds()));
         // Producers' marks and the expiry keys that will remove them (`log::Producers`): flat under steady writes.
         if let Some((marks, expiries)) = app.lake.cat.tallies() {
             metric("producer_marks", "gauge", "producers' marks in the catalog (p/): one per producer with a commit kept, a job's or a transaction's or a COPY's", &one(marks as f64));
