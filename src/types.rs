@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use crate::pg_casts::{quoted, Casts};
 use crate::front::Host;
+use crate::rules::create::{enum_labels, labelled};
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -187,16 +188,6 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     }
 }
 
-/// Labels an enum may have: some, each once, none empty or too long (Postgres's 63 bytes).
-fn labelled(labels: &[String]) -> Result<()> {
-    ensure!(!labels.is_empty(), "an enum has at least one label: ENUM ('a', 'b')");
-    for (i, l) in labels.iter().enumerate() {
-        ensure!(!l.is_empty() && l.len() <= 63, "invalid enum label \"{l}\": labels are 1 to 63 bytes long");
-        ensure!(!labels[..i].contains(l), "enum label \"{l}\" used more than once");
-    }
-    Ok(())
-}
-
 /// The type a name resolves to in this lake.
 async fn find(lake: &Lake, name: &str) -> Result<Option<(String, Type)>> {
     let (other, local) = crate::ddl::resolve(lake, name).await?;
@@ -216,13 +207,7 @@ async fn users(lake: &Lake, name: &str) -> Result<Vec<(String, TableMeta)>> {
 /// A column's declared type, if it is an enum: `ENUM('a', 'b')`, or a type of this lake's.
 pub async fn of(lake: &Lake, t: &ast::DataType) -> Result<Option<Enum>> {
     Ok(match t {
-        ast::DataType::Enum(members, _) => {
-            let labels: Vec<String> = members.iter().map(|m| match m {
-                ast::EnumMember::Name(n) | ast::EnumMember::NamedValue(n, _) => n.clone(),
-            }).collect();
-            labelled(&labels)?;
-            Some(Enum { of: None, labels })
-        }
+        ast::DataType::Enum(..) => enum_labels(t)?.map(|labels| Enum { of: None, labels }),
         ast::DataType::Custom(name, args) if args.is_empty() => {
             let name = crate::text::object(name);
             find(lake, &name).await?.map(|(of, t)| Enum { of: Some(of), labels: t.labels })
@@ -270,29 +255,6 @@ pub fn shown(m: &TableMeta, column: &str, arrow: &str) -> String {
     }
 }
 
-/// A column's declared type, if it is one held as text that isn't an enum: `uuid`, `json`, `jsonb`, or
-/// `varchar(n)` for a length (`VARCHAR(n)`, `CHARACTER VARYING(n)`, `NVARCHAR(n)`). An array of uuids is
-/// refused by name (a list's items aren't checked yet).
-pub fn sql_type(t: &ast::DataType) -> Result<Option<String>> {
-    use ast::{ArrayElemTypeDef as A, CharacterLength as L, DataType as D};
-    match t {
-        D::Uuid => Ok(Some("uuid".into())),
-        D::JSON => Ok(Some("json".into())),
-        D::JSONB => Ok(Some("jsonb".into())),
-        D::Varchar(Some(L::IntegerLength { length, .. }))
-        | D::CharacterVarying(Some(L::IntegerLength { length, .. }))
-        | D::CharVarying(Some(L::IntegerLength { length, .. }))
-        | D::Nvarchar(Some(L::IntegerLength { length, .. })) => match *length {
-            0 => Err(crate::codes::coded("22023", format!("{t}: a length is at least 1"))),
-            n => Ok(Some(format!("varchar({n})"))),
-        },
-        D::Array(A::AngleBracket(e) | A::SquareBracket(e, _) | A::Parenthesis(e)) if matches!(**e, D::Uuid) => {
-            Err(crate::codes::coded("0A000", "UUID[]: an array of uuids isn't kept yet (TEXT[] holds them as text, or a table of its own holds one a row)"))
-        }
-        _ => Ok(None),
-    }
-}
-
 /// A type as `ALTER COLUMN … TYPE` writes it, as `sql_type` keeps it (None for one it doesn't, or
 /// one it can't read).
 pub fn declared(written: &str) -> Result<Option<String>> {
@@ -309,6 +271,8 @@ pub fn grows(had: Option<&str>, wanted: &str) -> bool {
 }
 
 pub use crate::rules::typed::{held, length};
+
+pub use crate::rules::create::sql_type;
 
 pub use crate::pg_casts::uuid_of;
 
