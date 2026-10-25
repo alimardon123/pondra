@@ -118,12 +118,7 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     None
 }
 
-/// A name as SQL resolves it (`S` is `s`, `"S"` is `S`), as `nextval('…')` and `ALTER` give it.
-pub fn object_of(name: &str) -> String {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
-    parsed.map(|n| crate::text::object(&n)).unwrap_or_else(|_| name.to_lowercase())
-}
+pub use crate::text::object_of;
 
 /// Leader: carry one out (under the lake's lock); the counters move in the sequencer (`Held`).
 pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {

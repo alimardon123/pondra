@@ -9,6 +9,7 @@ pub mod keys;
 pub mod rows;
 pub mod txn;
 pub mod typed;
+pub mod types;
 
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
