@@ -4,9 +4,10 @@ name: resilience
 # going the whole time: a bucket that errs, slows, loses replies and goes down; a leader cut off
 # from it alone; the Python and JavaScript clients, Postgres, Kafka and Arrow Flight through nodes killed; a
 # lake's disk and the nodes' cache disk full; a database's node and its server killed; `pondra
-# sql` killed mid-INSERT. Every acknowledged write must be there once, on every node. It runs the
-# binary the build workflow made for this commit: nothing is compiled here. Its parts run one after
-# another on one runner (eight minutes in all).
+# sql` killed mid-INSERT; the leader's catalog compactor answered a 409, as R2 did on 10-25. Every
+# acknowledged write must be there once, on every node. It runs the binary the build workflow made for
+# this commit: nothing is compiled here. Its parts run on two runners side by side, about five minutes
+# each (one after another on one runner, 9.4 minutes on 10-25, longer than any harness shard).
 #
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`) and what it
 # puts under failure changes: the node, the clients, the check itself. By hand too.
@@ -28,7 +29,15 @@ env:
 
 jobs:
   check:
-    name: resilience
+    name: resilience (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix: # (each part's seconds on 10-25: storage 113, cutoff 65, server 29 | restart 69, clients 34, doors 37, flight 32, disk 66, cache 72, cli 17)
+        include:
+          - name: a bucket
+            parts: storage cutoff catalog server
+          - name: nodes, clients, disks
+            parts: restart clients doors flight disk cache cli
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -51,11 +60,11 @@ jobs:
       - name: The checks (the disks are mounted with sudo)
         env:
           PONDRA_BIN: ${{ github.workspace }}/bin/pondra
-        run: python tools/resilience_check.py # (every part)
+        run: python tools/resilience_check.py ${{ matrix.parts }}
       - name: The nodes' logs, when a check failed
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: resilience-logs
+          name: resilience-logs-${{ strategy.job-index }}
           path: /tmp/pondra-*.stderr
           if-no-files-found: ignore
