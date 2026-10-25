@@ -76,16 +76,27 @@ pub struct Options {
     /// The page's live heap bytes, read by the program that runs the page (`web/` counts its allocator's). The watch reads
     /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
     pub memory: Option<Memory>,
+    /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
+    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `LINE`.
+    pub line: Option<usize>,
 }
 
 /// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
 pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
 
 /// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
-/// (`watched`). A page's line is set by `PONDRA_MEMORY_MAX_GB` (`memory_line`).
+/// (`watched`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`memory_line`).
 struct Watch {
     live: Memory,
     line: usize,
+}
+
+impl Watch {
+    /// The bytes a query may grow the page by now: to its line, and at least the tenth of the line `watched` lets any
+    /// query grow, so a page past its line still takes a small answer.
+    fn room(&self) -> usize {
+        self.line.saturating_sub((self.live)()).max(self.line / 10)
+    }
 }
 
 /// A page's way to the web: a store for an origin. The program that runs the page gives it, so the core holds no
@@ -107,11 +118,15 @@ pub struct Sent {
     pub query: String,
     pub content_type: &'static str,
     pub body: bytes::Bytes,
+    /// The most bytes of answer the page has room for: its memory line less what it holds as it asks (`Watch::room`), or
+    /// None when its memory isn't watched. The program that runs the page reads no more of an answer than that, and gives
+    /// `past_room` in its place, so a node's answer never grows the page past its line.
+    pub room: Option<usize>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { partitions: 1, store: None, web: None, node: None, memory: None }
+        Options { partitions: 1, store: None, web: None, node: None, memory: None, line: None }
     }
 }
 
@@ -175,6 +190,12 @@ impl Answer {
     }
 }
 
+/// The answer a page gives in place of its node's answer past the room it had for it (`Sent::room`): 53200, as for a query
+/// the watch stops, and the page answers the next one.
+pub fn past_room(room: usize) -> Answer {
+    failed(crate::codes::coded("53200", format!("out of memory: the node's answer is more than the {} MB the page has room for, so the page didn't read it (memory_max_gb)", room >> 20)))
+}
+
 /// An error as an answer: its status, its SQLSTATE and its words, as every door gives them (`codes::answer`; a page's
 /// caller sees all the words, so no line is cut).
 fn failed(e: anyhow::Error) -> Answer {
@@ -222,17 +243,17 @@ impl Page {
         Ok(page)
     }
 
-    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is; a table
-    /// written later under that name replaces it.
+    /// The kept files `kept` couldn't read, each as its path and the words of why. The file is left as it is, and its
+    /// table's name can't be written (`unwritable`) while the file is there, so no write takes the file's rows away.
     pub fn unread(&self) -> &[(String, String)] {
         &self.unread
     }
 
     /// A page with no tables, its session a node's (`engine::session`) with the partitions asked for. Its files are the
     /// store's, as they are kept there; with no store given they are in memory. Its memory is watched when it was given a
-    /// `memory`, against the line its settings give (`memory_line`).
+    /// `memory`, against the line its settings or its device give (`memory_line`).
     pub fn open(options: &Options) -> Page {
-        let watch = options.memory.as_ref().zip(memory_line()).map(|(live, line)| Watch { live: live.clone(), line });
+        let watch = options.memory.as_ref().zip(memory_line(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
         Page::with_watch(options, watch)
     }
 
@@ -246,7 +267,7 @@ impl Page {
         // them a fraction. Nothing spills, since a page has no disk to spill to: an operator past the pool is refused (53200).
         let runtime = RuntimeEnvBuilder::new()
             .with_cache_manager(CacheManagerConfig::default().with_list_files_cache_limit(0)) // (a file put again is listed again)
-            .with_memory_pool(Arc::new(GreedyMemoryPool::new(query_memory())))
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(query_memory(options.line))))
             .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled))
             .build_arc()
             .expect("a runtime");
@@ -437,7 +458,7 @@ impl Page {
         let streams = tables.iter().map(|(schema, batches)| stream_of(schema, batches)).collect::<anyhow::Result<Vec<_>>>()?;
         let quoted: Vec<String> = names.iter().map(|name| crate::ext_names::quoted(name)).collect();
         let head = serde_json::to_vec(&json!({"sql": sql, "tables": quoted}))?;
-        Ok(Sent { query, content_type: request_body::CONTENT_TYPE, body: request_body::write(&head, &streams) })
+        Ok(Sent { query, content_type: request_body::CONTENT_TYPE, body: request_body::write(&head, &streams), room: None })
     }
 
     /// The statement parsed as the page's session parses it (its dialect and identifier rules).
@@ -470,10 +491,12 @@ impl Page {
         Ok(datafusion::sql::planner::object_name_to_table_reference(name.clone(), normalize)?)
     }
 
-    /// One request to the page's node, and its answer as the node gave it. A node that doesn't answer is 08001, its words
-    /// saying which (`node` names it, and a browser's refusal reads the same).
-    async fn ask(&self, sent: Sent) -> anyhow::Result<Answer> {
+    /// One request to the page's node, and its answer as the node gave it, within the room the page has for it
+    /// (`Sent::room`). A node that doesn't answer is 08001, its words saying which (`node` names it, and a browser's refusal
+    /// reads the same).
+    async fn ask(&self, mut sent: Sent) -> anyhow::Result<Answer> {
         let Some(node) = &self.node else { return Err(crate::codes::coded("08001", "the page has no node to ask")) };
+        sent.room = self.watch.as_ref().map(Watch::room);
         node(sent).await.map_err(|words| crate::codes::coded("08001", format!("the page's node didn't answer: {words}")))
     }
 
@@ -540,6 +563,7 @@ impl Page {
     /// one step, so a stop leaves those as they were; but a CREATE OR REPLACE TABLE … AS takes the old table away before it
     /// collects, and taking `before` copies no rows, so it is taken for every write.
     async fn write(&self, ctx: &SessionContext, plan: LogicalPlan, name: &str) -> anyhow::Result<Vec<RecordBatch>> {
+        self.unwritable(name).await?;
         let before = self.before(name).await?;
         let batches = match rows_of(ctx, plan, self.watch.as_ref()).await {
             Ok(batches) => batches,
@@ -548,6 +572,18 @@ impl Page {
         match self.written(name).await {
             Ok(()) => Ok(batches),
             Err(e) => Err(self.undone(name, before, e, ": the page couldn't keep it").await),
+        }
+    }
+
+    /// Refuses a write to a table whose kept file `kept` couldn't read (`unread`), while that file is in the store: a write
+    /// keeps the table it leaves, or forgets a dropped one, over that same file, so the rows the file holds would be gone.
+    /// Once the file is removed, the name is the page's again.
+    async fn unwritable(&self, name: &str) -> anyhow::Result<()> {
+        let at = kept_at(name);
+        let Some((path, why)) = self.unread.iter().find(|(path, _)| path.as_str() == at.as_ref()) else { return Ok(()) };
+        match self.files.head(&at).await {
+            Err(StoreError::NotFound { .. }) => Ok(()),
+            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the table can't be written until the file is removed"))),
         }
     }
 
@@ -892,27 +928,29 @@ async fn rows_of(ctx: &SessionContext, plan: LogicalPlan, watch: Option<&Watch>)
     watched(watch, async move { crate::engine::collect(crate::engine::run(ctx, plan).await?).await }).await
 }
 
-/// `inner`, held to the page's memory watch: at each poll, before `inner` is polled, a page past its line and grown by a
-/// tenth of the line since the first poll is stopped. The query is answered 53200 and its future dropped, so its memory goes
-/// with it, while the page answers the rest. Growth is what the query did, not what the page holds: a query that starts past
-/// the line and grows nothing is not stopped. A page's query yields between batches (DataFusion's cooperative streams, which
-/// `web/`'s build turns on), so the watch gets to look between them. With no watch, `inner` runs as it is.
+/// `inner`, held to the page's memory watch: at each poll, before `inner` is polled, a page past its line whose query has
+/// grown it by a tenth of the line is stopped. The query is answered 53200 and its future dropped, so its memory goes with
+/// it, while the page answers the rest. A query's growth is what its own polls grew the page by (the live bytes after each
+/// poll less before it), not what the page holds: a page runs one poll at a time, so two queries at once each count their
+/// own, and a query that starts past the line and grows nothing is not stopped. A page's query yields between batches
+/// (DataFusion's cooperative streams, which `web/`'s build turns on), so the watch gets to look between them. With no watch,
+/// `inner` runs as it is.
 async fn watched<T>(watch: Option<&Watch>, inner: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     let Some(watch) = watch else { return inner.await };
     let margin = watch.line / 10; // (`oom::pick`'s margin, a node's)
     let mut inner = Some(Box::pin(inner));
-    let mut started = None; // (the reading at the first poll: what the query grew from)
+    let mut grown = 0usize; // (what this query's polls grew the page by, less what they let go)
     std::future::poll_fn(move |cx| {
         let now = (watch.live)();
-        let from = *started.get_or_insert(now);
-        if now >= watch.line && now.saturating_sub(from) >= margin {
+        if now >= watch.line && grown >= margin {
             inner = None; // (the query's memory goes with its future, before anything else is read)
             return Poll::Ready(Err(stopped()));
         }
-        match inner.as_mut() {
-            Some(future) => future.as_mut().poll(cx),
-            None => Poll::Ready(Err(stopped())), // (never polled once it has answered: an answer is the stop's)
-        }
+        let Some(future) = inner.as_mut() else { return Poll::Ready(Err(stopped())) }; // (never polled once it has answered: an answer is the stop's)
+        let polled = future.as_mut().poll(cx);
+        let after = (watch.live)();
+        grown = grown.saturating_add(after.saturating_sub(now)).saturating_sub(now.saturating_sub(after));
+        polled
     })
     .await
 }
@@ -922,18 +960,23 @@ fn stopped() -> anyhow::Error {
     crate::codes::coded("53200", PAGE_OOM)
 }
 
-/// The page's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, 3 GiB by default (`LINE`), and None when it is 0 (the watch is off,
-/// as on a node).
-fn memory_line() -> Option<usize> {
-    let bytes = crate::env::gib("PONDRA_MEMORY_MAX_GB").unwrap_or(LINE);
+/// The page's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else the line its `device` has (`Options::line`), else 3 GiB
+/// (`LINE`), and None when it is 0 (the watch is off, as on a node).
+fn memory_line(device: Option<usize>) -> Option<usize> {
+    line_of(crate::env::gib("PONDRA_MEMORY_MAX_GB"), device)
+}
+
+/// `memory_line` of the line `set` and the device's line, as the setting and `Options::line` give them.
+fn line_of(set: Option<usize>, device: Option<usize>) -> Option<usize> {
+    let bytes = set.or(device).unwrap_or(LINE);
     (bytes > 0).then_some(bytes)
 }
 
 /// The most query memory a page's pool holds: `PONDRA_MEMORY_GB`, else two thirds of the line (of the default line when the
 /// watch is off, so the pool is never empty). What DataFusion counts is the big hash tables and sort buffers, so the rest of
 /// the line is for what it doesn't count.
-fn query_memory() -> usize {
-    crate::env::gib("PONDRA_MEMORY_GB").unwrap_or_else(|| memory_line().unwrap_or(LINE) / 3 * 2)
+fn query_memory(device: Option<usize>) -> usize {
+    crate::env::gib("PONDRA_MEMORY_GB").unwrap_or_else(|| memory_line(device).unwrap_or(LINE) / 3 * 2)
 }
 
 /// A table's batches, partition by partition, as its memory table holds them (`inner`); None for another provider's table.
@@ -2704,6 +2747,18 @@ mod tests {
         let unread = b.unread();
         assert_eq!(unread.len(), 1, "{unread:?}");
         assert!(unread[0].0.ends_with("tables/bad.arrow"), "{unread:?}");
+        // (a write to its name, which would keep or forget a table over that file, is refused while the file is there)
+        for sql in ["CREATE TABLE IF NOT EXISTS bad AS SELECT 1 AS x", "CREATE OR REPLACE TABLE bad AS SELECT 1 AS x", "DROP TABLE IF EXISTS bad"] {
+            let answer = b.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((answer.status, answer.header("x-pondra-sqlstate")), (409, Some("55000")), "{sql}");
+            assert!(String::from_utf8_lossy(&answer.body).contains("tables/bad.arrow"), "{sql}: {:?}", answer.body);
+        }
+        assert_eq!(store.get(&Path::from("tables/bad.arrow")).await.unwrap().bytes().await.unwrap().as_ref(), b"not arrow");
+        assert_eq!(names_listed(&b.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["t"]);
+        // (once the file is removed, the name is the page's again)
+        store.delete(&Path::from("tables/bad.arrow")).await.unwrap();
+        assert_eq!(b.request("POST", "/sql", &[], "CREATE TABLE bad AS SELECT 1 AS x".into()).await.status, 200);
+        assert!(store.head(&Path::from("tables/bad.arrow")).await.is_ok());
     }
 
     /// A page with no store keeps nothing: a page kept over no store is an empty page, as `open` makes one, and a table
@@ -2841,6 +2896,41 @@ mod tests {
         })
     }
 
+    /// The watch stops the query that grew the page, not one beside it: a query that grows nothing finishes while another
+    /// grows the page past its line between its polls, and one whose own polls grow the page is stopped, 53200.
+    #[tokio::test]
+    async fn the_watch_stops_the_query_that_grew_the_page() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let live = held.clone();
+        let watch = Watch { live: Arc::new(move || live.load(Ordering::SeqCst)), line: 1000 };
+        let other = held.clone();
+        let beside = tokio::spawn(async move {
+            for _ in 0..4 {
+                other.fetch_add(400, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+        let quiet = watched(Some(&watch), async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            anyhow::Ok(())
+        });
+        assert!(quiet.await.is_ok());
+        beside.await.unwrap();
+        assert_eq!(held.load(Ordering::SeqCst), 1600);
+        let mine = held.clone();
+        let greedy = watched(Some(&watch), async move {
+            for _ in 0..100 {
+                mine.fetch_add(200, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+            anyhow::Ok(())
+        });
+        assert_eq!(crate::codes::of(&greedy.await.unwrap_err()), "53200");
+        assert!(held.load(Ordering::SeqCst) < 2000, "stopped at its first poll past its tenth");
+    }
+
     /// A page watched with `live` against a line of `line` (the test's own: `Page::open` would read the settings').
     fn watched_page(store: Option<Arc<dyn ObjectStore>>, live: Memory, line: usize) -> Page {
         Page::with_watch(&Options { store, ..Default::default() }, Some(Watch { live, line }))
@@ -2971,6 +3061,38 @@ mod tests {
 
     /// The node reads what a page sends as it reads its own requests: the statement, and the page's table as a table.
     #[cfg(feature = "server")]
+    /// A page tells its node the room it has for the answer (`Sent::room`): its line less what it holds, at least a tenth of
+    /// the line, and none when its memory isn't watched. What the page answers in place of an answer past it (`past_room`)
+    /// is 53200, as a query the watch stops, naming the room and the setting.
+    #[tokio::test]
+    async fn a_page_asks_its_node_within_the_room_it_has() {
+        let kept = Arc::new(std::sync::Mutex::new(vec![]));
+        let held = Arc::new(AtomicUsize::new(300));
+        let live = held.clone();
+        let options = Options { node: Some(node_keeping(kept.clone(), count_csv)), ..Default::default() };
+        let page = Page::with_watch(&options, Some(Watch { live: Arc::new(move || live.load(Ordering::SeqCst)), line: 1000 }));
+        let sql = "SELECT count(*) AS n FROM lake_orders";
+        for holds in [300, 950, 5000] {
+            held.store(holds, Ordering::SeqCst);
+            assert_eq!(page.request("POST", "/sql?format=csv", &[], sql.into()).await.body, "n\n3\n");
+        }
+        let unwatched = page_with_node(node_keeping(kept.clone(), count_csv)).await;
+        assert_eq!(unwatched.request("POST", "/sql?format=csv", &[], sql.into()).await.body, "n\n3\n");
+        let rooms: Vec<Option<usize>> = kept.lock().unwrap().iter().map(|sent| sent.room).collect();
+        assert_eq!(rooms, [Some(700), Some(100), Some(100), None]);
+        let past = past_room(3 << 20);
+        assert_eq!((past.status, past.header("x-pondra-sqlstate")), (503, Some("53200")));
+        let words = String::from_utf8_lossy(&past.body);
+        assert!(words.contains("3 MB") && words.contains("memory_max_gb"), "{words}");
+    }
+
+    /// A page's memory line is its setting's, else its device's (`Options::line`), else 3 GiB; 0 turns the watch off.
+    #[test]
+    fn a_pages_line_is_its_settings_then_its_devices() {
+        assert_eq!((line_of(None, None), line_of(None, Some(1 << 30))), (Some(LINE), Some(1 << 30)));
+        assert_eq!((line_of(Some(2 << 30), Some(1 << 30)), line_of(Some(0), Some(1 << 30))), (Some(2 << 30), None));
+    }
+
     #[tokio::test]
     async fn the_node_reads_what_a_page_sends() {
         let kept = Arc::new(std::sync::Mutex::new(vec![]));
