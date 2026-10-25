@@ -377,11 +377,11 @@ impl Page {
         let answer = match crate::text::control(text) {
             Some(word) => {
                 let _turn = self.keeping.lock().await;
-                self.control(word, text).await
+                Box::pin(self.control(word, text)).await
             }
             None => {
                 let out = match self.gate(text) {
-                    Ok(()) => self.statement_sql(text, format).await,
+                    Ok(()) => Box::pin(self.statement_sql(text, format)).await, // (on the heap: a statement's future is deep, and a request's sits on its caller's stack)
                     Err(e) => Err(e),
                 };
                 out.inspect_err(|e| self.failed(e))
@@ -3247,9 +3247,12 @@ mod tests {
         ran(&page, "ROLLBACK").await;
         ran(&page, "BEGIN").await;
         ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
-        assert_eq!(code(&page, "ALTER TABLE a ADD COLUMN w INT").await, "0A000");
+        assert_eq!(code(&page, "ALTER TABLE a ADD COLUMN w INT").await, "0A000"); // (and the transaction is failed: the refusal is its statement's)
+        ran(&page, "ROLLBACK").await;
+        ran(&page, "BEGIN").await;
         let made = ask(&page, "CREATE TABLE c (n INT)").await;
         assert_eq!(made.header("x-pondra-notices"), Some(r#"["CREATE TABLE ran at once: DDL isn't part of a transaction here, and ROLLBACK won't undo it"]"#));
+        ran(&page, "INSERT INTO a VALUES (3, 'kept')").await;
         ran(&page, "COMMIT").await;
         assert_eq!(csv(&page, "SELECT id, v FROM a ORDER BY id").await, "id,v\n1,x\n2,y\n3,kept\n");
 
