@@ -2969,7 +2969,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    statistics and `hot::known`, kept by the parsed entry's `Arc` (a hit only while its `Weak` upgrades to that same
    `Arc`) and whether system columns are in. `table_view` takes the catalog's `Arc`; a meta of a caller's own goes
    through `table_view_once`, which keeps nothing. No query copies a table's whole entry on the plain scan path.
-   `cargo test --lib query::`, harness `scale`.
+   The memo keeps 256 versions and 64 MB of manifests (`query::facts_bytes`: each manifest's path and statistics), the
+   least recently used going first; a version past the budget is planned without it (`cache_bytes{cache="facts"}`).
+   `cargo test --release --lib query::`, harness `scale`.
 432. **A lake's folder takes conditional overwrites** (`store::Local`): SlateDB's collector advances its manifest and
    compactions boundary files with `PutMode::Update` before it deletes, and on a store that refuses one it deletes no
    old manifest or compaction record, so the catalog grows for good (5 h at 25 inserts a second: 206 → 13,373 objects,
