@@ -1311,6 +1311,22 @@ impl Lake {
         Ok(())
     }
 
+    /// Table `name`'s entry; None only once this node holds what its leader had committed when it started (`caught_up`):
+    /// a node just started, or a follower whose leader was just restarted, may not hold a table yet, and says so (57P03:
+    /// a client asks again) rather than that there is none. An entry it holds answers at once.
+    pub async fn table_meta_if(&self, name: &str) -> Result<Option<Arc<TableMeta>>> {
+        if let Some(meta) = self.cat.meta(&table_key(name)).await? {
+            return Ok(Some(meta));
+        }
+        self.caught_up().await?;
+        self.cat.meta(&table_key(name)).await
+    }
+
+    /// Table `name`'s entry, or "no table" (42P01), as [`Lake::table_meta_if`] decides it.
+    pub async fn table_meta(&self, name: &str) -> Result<Arc<TableMeta>> {
+        self.table_meta_if(name).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))
+    }
+
     /// Non-leaders: catch up with our own catalog view (and prune what it now holds).
     pub async fn refresh(&self) -> Result<()> {
         self.cat.refresh().await?;
