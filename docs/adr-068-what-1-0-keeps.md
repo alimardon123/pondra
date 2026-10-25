@@ -41,6 +41,12 @@ From 1.0, releases are `major.minor.patch`.
 variables, log lines, speed, and the console's look. A preview says so in its reference page and in
 `pondra.kinds`; it graduates in a minor release, or goes.
 
+**What 1.1 grows rather than replaces.** 1.1 grows the task into the pipeline: a 1.0 task is a
+pipeline of one step with no migration; `pondra.tasks` stays; `pondra.runs` gains a row per step
+(designs/etl-and-bi-tools.md §2). A chart's settings, as the console saves them in a SQL file or a
+notebook (`src/console/chart.js`), only grow: a new setting has a default that draws as before, and
+every saved chart opens as it was saved, in a dashboard's tile too.
+
 **Security comes first.** A fix that can't keep a behaviour that is itself the hole may change it in a
 patch. The release notes say what changed and why.
 

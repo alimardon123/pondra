@@ -282,14 +282,22 @@ extension or an admin. An app's user gets only the grants its manifest asks, sho
   platform and the browser** (DuckDB builds eight), tests it, signs it, and publishes one JSON with
   the docs site.
 
-### 9. Our ETL and BI are extensions
+### 9. Our ETL and BI: objects in the core, what draws them as extensions
 
-They are built on the public API only, as the console's own parts already are (invariant 145): if
-our BI needs something an extension can't reach, the API is incomplete and gets it. They ship inside
-the binary (invariant 138: no CDN; they are JavaScript, SQL and kinds, so small), on by default, and
-each can be turned off and replaced by another. Their objects (dashboards, pipelines) are `KINDS`
-entries and their files claim project folders (`dashboards/`, `pipelines/`), so branch, apply,
-status and capture treat them as tables (ADR-060 §9).
+The pipeline and the dashboard are objects of the core, because every door and every form needs them
+(ADR-072): the pipeline and its runner (the task's, grown), the dashboard, its cache and `pondra.tile`.
+What draws and edits them is two default extensions, `pipelines` and `dashboards`: the console's
+canvas, editor, viewer and palette, the YAML schemas, and `register.chart`'s drawing. They are built
+on the public API only, as the console's own parts already are (invariant 145): if they need
+something an extension can't reach, the API is incomplete and gets it. They ship inside the binary
+(invariant 138: no CDN; they are JavaScript, SQL and kinds, so small), on by default, and each can be
+turned off and replaced by another (`UNINSTALL dashboards; INSTALL superset;`). The objects are
+`KINDS` entries and their files are a project's `objects/**/*.yaml` (`objects/sales/overview.dashboard.yaml`),
+so branch, apply, status and capture treat them as tables (ADR-060 §9). Until 1.1 brings them, 1.0
+refuses those files and the statements by name.
+
+This amends the first version of this section (2026-10-24), which made the whole tools extensions;
+designs/etl-and-bi-tools.md §5 says why.
 
 ### 10. Whole tools as extensions: Superset, Metabase, Grafana, dbt
 

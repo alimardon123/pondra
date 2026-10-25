@@ -207,8 +207,8 @@ shapes (the rules for new kinds, ADR-049):
   statement, `SHOW CREATE` writes it back, `on_clone` says what a branch does with it, and `project`
   says whether a project may declare it. Apply, export, status and capture read the entry.
 - **A file the tool keeps** (a canvas, a report's layout, a notebook): the tool registers the project
-  folder it owns (`dashboards/`, say). Apply writes those files into the database's workspace, and each
-  save is a version (`files::keep`). Status and drift treat them as objects.
+  files it owns (a pipeline canvas's layout, say). Apply writes those files into the database's
+  workspace, and each save is a version (`files::keep`). Status and drift treat them as objects.
 - **A pattern** (an ontology, a flow, a task graph): it stores nothing of its own, so it travels with
   the objects it is read from.
 
