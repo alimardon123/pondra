@@ -229,3 +229,31 @@ ROLLBACK
 query ITI
 SELECT k, v, n FROM pu WHERE k = 51
 ----
+
+# A SET's cast of a fraction to an integer rounds, on the point path as in a planned statement (invariant 293): a one-key
+# UPDATE's and a one-row upsert's. A row whose value reads a table is worked out by the planned MERGE, after the key's lock.
+statement ok
+CREATE TABLE pc (k INT PRIMARY KEY, n INT, d DOUBLE PRECISION)
+
+statement ok
+INSERT INTO pc VALUES (1, 0, 2.7), (2, 0, 2.7)
+
+statement count 1
+UPDATE pc SET n = CAST(d AS INT) WHERE k = 1
+
+statement count 1
+INSERT INTO pc VALUES (2, 0, 3.6) ON CONFLICT (k) DO UPDATE SET n = CAST(excluded.d AS INT)
+
+query II
+SELECT k, n FROM pc ORDER BY k
+----
+1 3
+2 4
+
+statement count 1
+INSERT INTO pc VALUES (1, (SELECT n FROM pc WHERE k = 2) + 1, 0) ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+query II
+SELECT k, n FROM pc WHERE k = 1
+----
+1 5

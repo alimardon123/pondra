@@ -1056,6 +1056,21 @@ fn plain_values(query: &str) -> Option<ast::Values> {
 /// A query that is one row of `VALUES`: its rows can't hold a key twice (`change::merge` asks nothing more of them).
 pub(crate) fn one_row(query: &str) -> bool { plain_values(query).is_some_and(|v| v.rows.len() == 1) }
 
+/// A query that is one row of `VALUES` whose values read nothing but themselves: no subquery, and no function but the
+/// statement's time (`now()`, `current_date`, …), where a function may be a routine that reads a table. A one-row upsert's
+/// row is worked out once, before its key's lock (`txn::upsert_point`), so a value that read a table would read it before
+/// the lock, where the planned MERGE reads it after: such a row stays with the planned MERGE.
+pub(crate) fn constant_row(query: &str) -> bool {
+    const TIME: [&str; 6] = ["now", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"];
+    let Some(v) = plain_values(query).filter(|v| v.rows.len() == 1) else { return false };
+    let reads = ast::visit_expressions(&v, |e| match e {
+        ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } => std::ops::ControlFlow::Break(()),
+        ast::Expr::Function(f) if !TIME.iter().any(|t| f.name.to_string().eq_ignore_ascii_case(t)) => std::ops::ControlFlow::Break(()),
+        _ => std::ops::ControlFlow::Continue(()),
+    });
+    reads.is_continue()
+}
+
 /// The width of a query's rows, when the query fixes it: a plain `VALUES` whose rows share one width, or a query whose
 /// body is a SELECT (the leftmost of a set operation) with no `*`, `t.*` or `COLUMNS(…)` among its items. None for any
 /// other query, which takes the table's columns as they come.
@@ -2463,6 +2478,9 @@ mod tests {
         assert_eq!(rows_width("SELECT 1 UNION SELECT 2"), Some(1));
         assert_eq!(rows_width("VALUES (1) ORDER BY 1"), None);
         assert!(one_row("VALUES (1, 'a')") && !one_row("VALUES (1), (2)") && !one_row("SELECT 1") && !one_row("VALUES (1) ORDER BY 1"));
+        assert!(constant_row("VALUES (1, 'a', -2.5, CAST('3' AS INT), DATE '2026-10-25', now(), CURRENT_DATE, $1)"));
+        assert!(!constant_row("VALUES (1, (SELECT n FROM c WHERE id = 1) + 1)") && !constant_row("VALUES ((SELECT max(id) + 1 FROM t), 'x')"));
+        assert!(!constant_row("VALUES (1, lookup(2))") && !constant_row("VALUES (1, EXISTS (SELECT 1))") && !constant_row("VALUES (1), (2)"));
         let names: Vec<String> = ["a", "b", "c"].iter().map(|n| n.to_string()).collect();
         assert_eq!(implicit(&names, Some(1)), ["a"]);
         assert_eq!(implicit(&names, Some(2)), ["a", "b"]);
