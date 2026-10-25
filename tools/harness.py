@@ -7490,7 +7490,8 @@ def hot():
     Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
     held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`).
     Last, a table read cold (a hot budget no file fits: PONDRA_HOT_GB=0.000001) sizes its GROUP BY by its
-    columns' distinct values (`hot::told`)."""
+    columns' distinct values (`hot::told`). Last, a lake in memory holds every file hot once its first query's loads
+    settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -7605,6 +7606,28 @@ def hot():
     finally:
         cold.kill()
         clean_up()
+    # A lake in memory holds every file hot once its first query's loads settle (`hot.rs`): its files are in memory
+    # already, so its cache takes the query memory's room, and a file loads on its first read. Under a query memory of
+    # 0.333 GB (a quarter of it, 89 MB, held five of nine files and left the rest in Parquet), its 10M rows (160 MB of the
+    # two columns a GROUP BY reads) are held whole once the first query's background loads are done; the first query
+    # itself reads Parquet, as before.
+    mem = Node(":memory:", A.port, env={"PONDRA_MEMORY_GB": "0.333"}).start()
+    try:
+        mq = lambda s: call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-session": "hot-memory-lake-01"})
+        mq("CREATE TABLE mh AS SELECT x AS id, x % 1000 AS k, CAST(x * 7919 % 100003 AS DOUBLE) / 100.0 AS v FROM range(10000000) AS g(x)")
+        group = "SELECT k, count(*) AS n, sum(v) AS s FROM mh GROUP BY k"
+        answer = mq(group + " -- first")  # (its loads of the cold files start in the background, and busy counts them)
+        deadline = time.time() + 20
+        while metrics_of(A.port).get("pondra_hot_loading_files", 0) and time.time() < deadline:
+            time.sleep(0.5)
+        nxt = "\n".join(r.get("plan", "") for r in mq("EXPLAIN ANALYZE " + group + " -- next"))  # (every plan's text: ANALYZE's is "Plan with Metrics")
+        seen["a lake in memory, the plan once its first query's loads settle"] = [l.strip()[:160] for l in nxt.splitlines() if "DataSourceExec" in l]
+        checks["a lake in memory holds every file hot once its first query's loads settle (no Parquet scan in the next plan, 10M rows held)"] = \
+            "file_groups" not in nxt and "partition_sizes=" in nxt and len(answer) == 1000 and all(r["n"] == 10000 for r in answer)
+        checks["a lake in memory's cache holds its files whole (the hot gauge: 160 MB of the two columns)"] = \
+            160_000_000 <= (metrics_of(A.port).get("pondra_hot_bytes", 0) or 0) <= 170_000_000
+    finally:
+        mem.kill()
     # Under a memory line, the decoded columns are let go before a query is stopped (`oom.rs`): see hot_under_line.
     line_checks, line_seen = hot_under_line()
     checks.update(line_checks)

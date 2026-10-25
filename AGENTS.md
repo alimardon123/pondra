@@ -1725,8 +1725,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    537 MB after 25 minutes, of a table of a few tens). `harness.py hot`: "a merge's replaced files
    leave memory". A table whose columns are held keeps each file it writes as written (`tier::Encoding` → `Hot::put`, in the
    reader's 8,192-row batches, at most 64 MB a file outside the budget until it is put), so a merge's file
-   takes the replaced files' place at once; a lake held in memory loads a file on its first read.
-   `harness.py hot`: "rows tiered into a hot table's file are held at once".
+   takes the replaced files' place at once. A lake held in memory (`memory://`) has a budget of the query memory instead of a
+   quarter of it, within the memory line (`room_for`), and loads a file on its first read, not its second, so once the first
+   query's background loads settle every file it holds is hot (a quarter held the first files loaded and left the rest in
+   Parquet); the first query itself reads Parquet, as before. A scan's loads wait for its query (`gated`: each file of the
+   scan's plan holds an `Arc` of the sender as a typed extension, so the loads start when the last of those files goes, with
+   the query's plan; no plan node is added, so optimizer rules see the scan they always did): they start when the query is
+   over, so no query pays for the loads it starts. `harness.py hot`: "rows tiered into a hot table's file are held at once",
+   "a lake in memory holds every file hot once its first query's loads settle".
 234. **A sequence's values are durable before any is handed out, and only the sequencer moves it**
    (`seq.rs`, `sq/{name}`): `nextval` takes a block in a commit of the sequencer's own (`Flush::sequence`,
    `seq::Held`), answered once durable, so a value given out is never given again, through a
