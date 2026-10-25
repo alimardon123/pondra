@@ -9,12 +9,18 @@ publish = false # (not on crates.io yet: pip and npm carry the binary)
 
 [features]
 default = ["server"]
-# A node: the catalog in the bucket, the doors (HTTP, Postgres, Kafka, Flight), the cluster and the
-# command line. Without it the library is the parts a browser build shares (`src/lib.rs`).
-server = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:axum", "dep:toml", "dep:clap", "dep:mimalloc",
-          "dep:chrono-tz", "dep:postgres-types", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:zstd",
-          "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:tokio-rustls",
-          "dep:rustls-platform-verifier", "dep:sysinfo", "dep:libc", "dep:windows-service", "dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tower", "dep:http-body-util", "dep:moka", "dep:log"]
+# A node: the lake and its doors. Without it the library is the parts a browser build shares (`src/lib.rs`).
+server = ["lake", "doors"]
+# What answers a statement: the store, catalog, log, writes, DDL, transactions, queries, views and the rest
+# (designs/page-same-core.md §1). A page is to build it too: the deps here that a page can't build (SlateDB, moka,
+# aws-lc-rs, sysinfo, libc) go behind the platform layer, and `cargo check --no-default-features --features lake`
+# counts what is left.
+lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
+        "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka"]
+# What listens, dials a member, runs a process or touches the OS: the HTTP, Postgres, Kafka and Flight doors, the
+# cluster, the command line and the service. A module is `lake` unless it is one of these.
+doors = ["lake", "dep:axum", "dep:clap", "dep:mimalloc", "dep:pgwire", "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls",
+         "dep:rustls-platform-verifier", "dep:windows-service", "dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tower", "dep:http-body-util", "dep:log"]
 # jemalloc's heap profiling and statistics built in (Linux), for a soak whose nodes dump their
 # heaps: soak.yml's `binary: heap`, read by tools/heap_report.py. Off unless asked: a node built
 # with it profiles nothing until `_RJEM_MALLOC_CONF` says `prof:true`.
