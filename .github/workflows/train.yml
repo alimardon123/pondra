@@ -4,9 +4,11 @@ name: train
 # with one CI run. A lane labels its pull request `train` once its own checks passed. tools/train.py merges the
 # queued ones (oldest first, six at most) onto main in the branch `train`, runs build.yml on it once (planned as a
 # pull request's `ci` run: build.yml's `mode`), and when that run is green moves main to the train's tip, a
-# fast-forward: main is then exactly the tree CI tested, and GitHub marks each pull request merged. A red run is run
-# again once; then, unless main fails the same way or moved since, the train is halved and its first half tested
-# alone, so one pull request can't hold the others for long. A pull request whose workflows aren't main's can't ride
+# fast-forward: main is then exactly the tree CI tested, and GitHub marks each pull request merged. A failed build,
+# unit test or check stops the run the minute it fails; a red run whose failures can flake (the suites that run
+# nodes) is run again once. Then, unless main fails the same way or moved since, the train is halved and its first
+# half tested alone, so one pull request can't hold the others for long. A pull request labelled in the first ten
+# minutes of a train's run joins it (the train is cut again). A pull request whose workflows aren't main's can't ride
 # (the workflow's token may not push a workflow): it takes `ci` as before.
 #
 # A run steps on a `train` label, at the end of every build run, every 15 minutes, and by hand. The train's own build

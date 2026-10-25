@@ -4,9 +4,12 @@
 A lane labels its PR `train` once its own checks passed. The conductor merges the queued PRs, in
 order, onto main in a branch named `train`, starts CI on that branch once, and when that run is green
 moves main to the train's tip (a fast-forward). So main becomes exactly the tree CI tested, and GitHub
-marks each PR merged by itself. A red run is retried once, then the train is halved (its first half is
-tested alone), so one PR can't hold the others for long. `riding` marks the PRs in the train now; only
-this script adds or removes it.
+marks each PR merged by itself. A check that can't flake (the build, the unit tests and static checks, the
+forms check: anything outside FLAKY) fails the train the minute it fails: the run is stopped and judged then,
+with no rerun. A red run whose failures can flake (the suites that run nodes) is retried once. Then the train
+is halved (its first half is tested alone), so one PR can't hold the others for long. A PR labelled in the
+first minutes of a train's run (JOIN) joins it: the train is cut again with it. `riding` marks the PRs in the
+train now; only this script adds or removes it.
 
   python3 tools/train.py step [--dry-run] [--wait MINUTES]
 
@@ -35,6 +38,12 @@ WORKFLOW_NOTE = ("This pull request's workflows aren't main's (it changes one, o
                  "again, or label it ci if it changes a workflow.")
 RED = ("failure", "timed_out", "startup_failure")  # job conclusions that count against the train
 POLL = 60  # seconds between the steps of a wait
+# The jobs whose failure can be a flake, so a red one is run again once before anyone is blamed: the suites that run
+# nodes against the clock. From 10-24 12:00 to 10-25 18:00 reruns turned 4 of 8 red trains green, all in these
+# (resilience 3 times, upgrade once, a harness part that hung). Any other job that fails a step fails the same way
+# again: two red trains that day waited out a whole run and a rerun on a static check that failed in its first minute.
+FLAKY = ("suite", "resilience", "upgrade", "sso", "sharing")
+JOIN = 10 * 60  # seconds into a train's run in which a newly labelled PR joins it (the build alone takes 14 minutes)
 
 
 class GitHubError(Exception):
@@ -145,8 +154,20 @@ class Train:
             r["event"] == "pull_request" or (r["event"] == "workflow_dispatch" and r["head_branch"] == "train")))
 
     def failed_jobs(self, run_id):
+        """The run's failed jobs, so far, as {name: final}. A failure is final when a step failed in a job outside
+        FLAKY: running it again changes nothing. A job that died with no failed step (its runner lost) may flake."""
         jobs = self.gh.api("GET", f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100&filter=latest")["jobs"]
-        return [j["name"] for j in jobs if j["conclusion"] in RED]
+        return {j["name"]: not j["name"].startswith(FLAKY) and any(s.get("conclusion") in RED for s in j.get("steps") or [])
+                for j in jobs if j["conclusion"] in RED}
+
+    def bisecting(self, tip):
+        """Whether the train's run before this one failed: then this train was cut from a red one (halved, or cut
+        again on a moved main) to test its riders alone, and nobody joins it."""
+        prev = next((r for r in self.runs() if r["event"] == "workflow_dispatch" and r["head_branch"] == "train"
+                     and r["head_sha"] != tip), None)
+        if prev is None or prev["conclusion"] == "success":
+            return False
+        return prev["conclusion"] in ("failure", "timed_out") or any(self.failed_jobs(prev["id"]).values())
 
     def main_failed(self):
         """The jobs that failed in main's latest run that ran. A red train that fails the same way isn't the train's."""
@@ -206,6 +227,14 @@ class Train:
             git_ok("push", "origin", "--delete", "train")
             git("push", "origin", "train")
 
+    def cancel(self, run):
+        """Stops the train's run. A 409 means it ended in the meantime: the next step reads how."""
+        try:
+            self.write("POST", f"repos/{self.repo}/actions/runs/{run['id']}/cancel")
+        except GitHubError as e:
+            if e.status != 409:
+                raise
+
     def dispatch(self, ref, mode):
         if self.dry:
             print(f"dry run: dispatch build.yml on {ref} (mode {mode})")
@@ -235,8 +264,9 @@ class Train:
         return self.cut(self.queue(prs))
 
     def follow(self, riding):
-        """Riders exist, so the train's run decides: green lands it, a run going waits, and a red one is
-        rerun once, then judged against main's own run, then halved."""
+        """Riders exist, so the train's run decides: green lands it, a run going waits (or is stopped, for a final
+        failure or a PR that joins), and a red one is rerun once if it may have flaked, then judged against main's
+        own run, then halved."""
         git("fetch", "origin", "main")
         tip = self.fetch_train()
         merges, base = self.train_merges(tip) if tip else ([], None)
@@ -253,15 +283,30 @@ class Train:
                 return say("waiting: run not listed yet")
             say("dispatched the train again: its run was never listed")
             return self.dispatch("train", "train")
+        failed = self.failed_jobs(run["id"])
+        final = [name for name, last in failed.items() if last]
         if run["status"] != "completed":
-            return say("waiting: run going")
+            young = not final and self.tip_age(tip) <= JOIN and not self.bisecting(tip)
+            joining = [p for p in self.queue() if "riding" not in p.labels][:6 - len(prs)] if young else []
+            if joining:
+                # Cut again with them after the riders: the riders lose the minutes run so far, the joiners a run's wait.
+                self.cancel(run)
+                say(f"{' '.join(f'#{p.number}' for p in joining)} joined the train: cutting it again")
+                self.waiting = False
+                return self.cut(prs + joining)
+            if not final:
+                return say("waiting: run going")
+            if set(final) & self.main_failed():
+                return say(f"waiting: main fails the same way: {', '.join(final)}")
+            # A check that can't flake failed: the rest of the run changes nothing, so it stops and is judged now.
+            self.cancel(run)
+            say(f"stopped the train's run: {', '.join(final)} failed")
         self.waiting = False
         if run["conclusion"] == "success":
             return self.land(prs, heads, run, tip)
-        failed = self.failed_jobs(run["id"])
-        if run["conclusion"] not in ("failure", "timed_out") or not failed:
+        if not failed:
             return self.cut(self.queue())   # cancelled, skipped, or red with no job to blame: cut and run it again
-        if run["run_attempt"] == 1:
+        if run["run_attempt"] == 1 and not final:
             # One rerun before blaming anyone: a flaky job isn't the train's fault.
             self.write("POST", f"repos/{self.repo}/actions/runs/{run['id']}/rerun-failed-jobs")
             self.waiting = True
@@ -277,8 +322,9 @@ class Train:
         return self.halve(prs, run, failed)
 
     def halve(self, prs, run, failed):
-        """A red train on its second attempt: a single PR is dropped with its failed jobs; more are halved, the
-        first half cut and tested alone, and the rest keep their train label and wait in the queue."""
+        """A red train judged (on its second attempt, or at a final failure): a single PR is dropped with its failed
+        jobs; more are halved, the first half cut and tested alone, and the rest keep their train label and wait in
+        the queue."""
         names = ", ".join(failed)
         if len(prs) == 1:
             p = prs[0]
