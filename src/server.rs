@@ -1527,7 +1527,7 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
-            OFFSET.is_match(text) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         };
         let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
