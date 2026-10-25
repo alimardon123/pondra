@@ -129,7 +129,8 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("hot_batches_skipped_total", "counter", "batches of hot columns scans skipped by their ranges", &one(crate::hot::SKIPPED.load(Relaxed) as f64));
     let mut caches: Vec<(String, f64)> = app.lake.cached_bytes().iter().map(|(c, b)| (format!("{{cache=\"{c}\"}}"), *b as f64)).collect();
     caches.push(("{cache=\"answers\"}".into(), app.results.held() as f64));
-    metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers", &caches);
+    caches.push(("{cache=\"facts\"}".into(), crate::query::facts_held() as f64));
+    metric("cache_bytes", "gauge", "what each bounded cache holds now: objects' byte ranges, decoded log rows, tables' tails, row groups for lookups, the catalog's blocks, Parquet footers, files' statistics, remembered answers, planning facts' manifest lists", &caches);
     metric("resident_bytes", "gauge", "resident memory of the process", &one(crate::store::resident().unwrap_or(0) as f64));
     let held: Vec<(String, f64)> = allocator().into_iter().map(|(k, b)| (format!("{{kind=\"{k}\"}}"), b as f64)).collect();
     if !held.is_empty() {
@@ -142,7 +143,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
         let q = |p: f64| ms.get(((ms.len() as f64 * p) as usize).min(ms.len().saturating_sub(1))).copied().unwrap_or(0.0);
         metric("commit_ms", "gauge", "recent catalog commit latency", &[("{quantile=\"0.5\"}".into(), q(0.5)), ("{quantile=\"0.99\"}".into(), q(0.99))]);
         // Producers' marks and the expiry keys that will remove them (`log::Producers`): flat under steady writes.
-        if let (Some(marks), Some(expiries)) = (app.lake.cat.count("p/", "p0"), app.lake.cat.count(crate::log::EXPIRY, "g/~")) {
+        if let Some((marks, expiries)) = app.lake.cat.tallies() {
             metric("producer_marks", "gauge", "producers' marks in the catalog (p/): one per producer with a commit kept, a job's or a transaction's or a COPY's", &one(marks as f64));
             metric("mark_expiries", "gauge", "expiry keys (g/) waiting: each goes with its mark once its window is up", &one(expiries as f64));
         }

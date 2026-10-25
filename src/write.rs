@@ -486,10 +486,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
     }
-    // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS.
-    static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
-    });
     // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
     static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
@@ -541,8 +537,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
     let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
-    if let Some(c) = (head == "alter").then(|| VIEW_RENAME.captures(first_word(sql))).flatten() {
-        return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
+    // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS (`rules::alter::view_rename`).
+    if let Some((from, to)) = (head == "alter").then(|| crate::rules::alter::view_rename(first_word(sql))).flatten() {
+        return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&from), to: name(&to) }]));
     }
     // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
     static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
@@ -716,10 +713,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
-                Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
-            }
-            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
+            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::rules::alter::fills_existing(c) => Stmt::Invalid(crate::rules::alter::owes_rows(&a.name.to_string(), &c.name.to_string())),
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => match crate::rules::alter::beside_type(c) {
+                Some(what) => Stmt::Invalid(crate::rules::alter::not_alone(&a.name.to_string(), &c.name.to_string(), &what)), // (a CHECK or a key: not dropped unsaid)
+                None => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
+            },
             // (renames, drops and types: the catalog's names change, the files never do: ADR-022)
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
@@ -938,13 +936,13 @@ pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<
 async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let table = stmt.table();
-    let m: TableMeta = lake.cat.get::<TableMeta>(&table_key(&table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?.logical(); // (as SQL names it)
+    let m: TableMeta = (*lake.table_meta(&table).await?).clone().logical(); // (as SQL names it)
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists) => {
             if m.columns.iter().any(|(c, _)| c == column) {
-                ensure!(*if_not_exists, "{table} already has a column {column}");
+                ensure!(*if_not_exists, crate::rules::alter::has_column(&table, column));
                 return Ok(None);
             }
             let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
@@ -1408,11 +1406,12 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
 /// `rows` with its first `given` columns cast to the table's types, batch by batch, by `query::strict`, the cast INSERT
 /// makes of a value: a value that won't go is the stream's error, with Postgres's words and SQLSTATE. The columns after
 /// them are already of their types (a DEFAULT, or NULL, cast in the plan). `schema` is the stream's: every column's type.
+/// A value a CSV reader refuses as its column's type (`read_csv`'s `types`) gets the same words (`casts::parse_refusal`).
 fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: SchemaRef, given: usize) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
     let out = schema.clone();
     let cast = rows.map(move |b| -> datafusion::error::Result<RecordBatch> {
-        let mut columns = b?.columns().to_vec();
+        let mut columns = b.map_err(|e| crate::casts::parse_refusal(&e.to_string()).unwrap_or(e))?.columns().to_vec();
         for (column, field) in columns.iter_mut().zip(schema.fields()).take(given) {
             // (a refusal is the DataFusion error `casts::into` made, kept as it is: `codes::of` finds its code)
             *column = crate::query::strict(column, field.data_type()).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {
@@ -1697,7 +1696,6 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
 /// A statement once the session's own tables and its transaction have had their turn (`on_node_listed`): written here
 /// or by the leader.
 async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
-    ensure!(!app.cluster.reader, "read-only node");
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
@@ -1705,6 +1703,12 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     if crate::backup::frozen(&app.lake) && !crate::backup::reads_only(&stmt) {
         return Err(crate::backup::refused(Some(&app.lake.url)));
     }
+    // (COPY … TO reads the lake and writes no lake: a reader may export, as Postgres's read-only transactions allow it)
+    if let Stmt::CopyTo(query, to, options) = &stmt {
+        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
+    }
+    // (above a view of a folder's write: a reader writes no file either)
+    ensure!(!app.cluster.reader, "read-only node");
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
@@ -1722,13 +1726,11 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         s => s,
     };
-    if let Stmt::CopyTo(query, to, options) = &stmt {
-        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
-    }
     if let Stmt::CopyInto(table, from, options) = &stmt {
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
     let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
@@ -1784,7 +1786,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
             return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
-        let out = deliver(&o.url, Some(Some(Request::Change(sql, job.clone(), sent))), &stmt, &job, false).await?;
+        let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
         return Ok(out);
     }
@@ -1799,7 +1801,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
             Some(Request::Table(name, _)) => Some(table_key(name)),
             _ => None,
         };
-        let out = deliver(&other.url, Some(req), &stmt, &job, false).await;
+        let out = deliver(&other.url, req, &job, false).await;
         if out.is_ok() {
             seen_there(&other, mark).await;
         }
@@ -1837,7 +1839,14 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
     let sql = match (&meta, &stmt) {
-        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => rows_sql(m, &stmt)?, // (a RETURNING's rows: worked out here)
+        (Some(m), _) if through_log(m, &stmt) || crate::returning::asked() => {
+            // A resend whose job's mark is still kept is answered as the duplicate it is, before its statement runs again (the
+            // leader's log would answer the same, once the rows were worked out: `Ack::duplicate`).
+            if named && matches!(stmt, Stmt::Insert(..)) && sent(lake, &job).await? {
+                return Ok(j!({"duplicate": true}));
+            }
+            rows_sql(m, &stmt)? // (a RETURNING's rows: worked out here)
+        }
         (_, Stmt::Insert(_, query)) => {
             let to = app.to();
             let stamped = stamp(lake, &table, Some(&to)).await?;
@@ -1893,7 +1902,7 @@ async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &st
     }
 }
 
-/// The identity check every SQL write meets once, however it came (`on_node_listed`, `from_cli`, and the leader's
+/// The identity check every SQL write meets once, however it came (`on_node_listed`, `through_bucket_statement`, and the leader's
 /// `change::run`): an ALWAYS identity column is given no value by an INSERT (428C9), and set by no UPDATE or MERGE, unless
 /// the value is DEFAULT. What each form gives is what Postgres takes (`change::Merge::written` for a MERGE and the INSERT …
 /// ON CONFLICT and OR … forms, `defaulted` for the DEFAULTs in VALUES). A name no lake here holds is Ok: its own path answers.
@@ -2051,50 +2060,32 @@ pub async fn handle(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, req: Request
 
 // ---------------------------------------------------------------- from any machine
 
-/// `pondra sql --dir … "<write>"` on any machine. This process does the work (local files too:
-/// `SELECT * FROM 'jan.parquet'`), then the leader records it: over HTTP; through the bucket
-/// inbox if this machine can't reach it; or, when nobody leads, this process leads for the moment
-/// it takes, under its own term, so a node starting meanwhile waits for it. It never takes over
-/// from a live leader.
-/// The lake at `dir`, made first if there is none (`pondra sql --dir new "CREATE TABLE t AS SELECT
-/// * FROM 'x.csv'"`): this process leads for a moment, writing nothing but an empty catalog.
-pub async fn made(dir: &str) -> Result<Arc<Lake>> {
-    if let Ok(lake) = Lake::open(dir, false, false).await {
-        return Ok(lake);
-    }
-    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await?;
-    Lake::open(dir, false, false).await
-}
-
 /// `pondra lead`: lead the lake at `dir` once, making it if it's new, for what waits in its inbox
 /// (or nothing, when someone leads it already: they answer the bell). No reader of the lake is
 /// opened and no statement run, so a node's CREATE DATABASE, a branch's first commit and a write
 /// to a lake nobody leads pay for one lead, not two and four catalogs opened.
 pub async fn lead_only(dir: &str) -> Result<()> {
-    deliver(dir, Some(None), &Stmt::Invalid(String::new()), "", true).await.map(drop)
+    deliver(dir, None, "", true).await.map(drop)
 }
 
-pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+/// `pondra sql`'s write to a lake whose leader is alive but doesn't answer from the guest's start (`cli.rs`'s `through_inbox`):
+/// the statement is checked here as a node's door checks it and prepared as the leader takes it, then each request is sent as
+/// a one-off writer sends it (`deliver`): over HTTP if this machine reaches the leader after all, else through the bucket's
+/// inbox, or led here when nobody leads. Each request sets its lake's node key first (`through_bucket_one`).
+pub(crate) async fn through_bucket_statement(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why); // (said as a node says it)
     }
-    let mut stmt = stmt;
-    if let Ok(lake) = Lake::open(dir, false, false).await {
-        stmt = crate::protect::door(&lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
-        if matches!(stmt, Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Merge(_)) {
-            crate::ddl::sync(&lake, "", false).await?; // (the lakes ATTACH made: a name in one resolves once they are here, as `one_from_cli` takes them)
-            identity(&lake, &stmt).await?; // (as a node's: every SQL write's identity, here before `whole_rows` rewrites an INSERT INTO t (names))
-        }
-        if let Some((query, to, options)) = crate::ext::view_write(&lake, &stmt).await? {
-            let out = crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
-            return Ok(j!({"rows": out["copied"]}));
-        }
+    let stmt = crate::protect::door(lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
+    identity(lake, &stmt).await?; // (as a node's: every SQL write's identity, here before `whole_rows` rewrites an INSERT INTO t (names))
+    if let Some((query, to, options)) = crate::ext::view_write(lake, &stmt).await? {
+        let out = crate::copy::copy_to(lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
+        return Ok(j!({"rows": out["copied"]}));
     }
     let stmt = match stmt {
-        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
+        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
-            let lake = Lake::open(dir, false, false).await?;
-            if !is_there(&lake, &t).await? {
+            if !is_there(lake, &t).await? {
                 return Err(no_table(&t));
             }
             Stmt::Insert(t, query)
@@ -2102,87 +2093,51 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         s => s,
     };
     if let Stmt::Create(c) = &stmt {
-        if Lake::open(dir, false, false).await.is_ok() && Box::pin(created(dir, c)).await?.is_some() {
+        if matches!(there(lake, c).await?, Some(true)) {
             return Ok(j!({"table": object(&c.name), "exists": true})); // (CREATE TABLE IF NOT EXISTS of one that's there)
         }
     }
     match stmt {
         Stmt::CopyTo(query, to, options) => {
-            let lake = Lake::open(dir, false, false).await?;
+            let lake = lake.clone();
             crate::ext::scope(true, async move { crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await }).await // (its user's own machine)
         }
-        // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, one statement at a time from this shell.
+        // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, each one sent through the bucket.
         Stmt::Create(c) if c.query.is_some() || c.or_replace => {
-            let lake = Lake::open(dir, false, false).await?;
-            let dir = dir.to_string();
+            let owned = lake.clone();
             let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
-                let dir = dir.clone();
-                Box::pin(async move { one_from_cli(&dir, s).await })
+                let owned = owned.clone();
+                Box::pin(async move { through_bucket_one(&owned, s).await })
             };
-            create_as(run, &lake, &c, job(), true, &mut |_: &str| {}).await
+            create_as(run, lake, &c, job(), true, &mut |_: &str| {}).await
         }
         Stmt::Create(c) => {
             let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
-            raced(if_not_exists, &name, one_from_cli(dir, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the shell's job)
+            raced(if_not_exists, &name, through_bucket_one(lake, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the job)
         }
         Stmt::Ddl(ddls) => {
             let mut out = j!({});
             for d in ddls {
-                out = Box::pin(one_from_cli(dir, Stmt::Ddl(vec![d]))).await?;
+                out = through_bucket_one(lake, Stmt::Ddl(vec![d])).await?;
             }
             Ok(out)
         }
-        stmt => one_from_cli(dir, stmt).await,
+        stmt => through_bucket_one(lake, stmt).await,
     }
 }
 
-/// The shell's CREATE TABLE of a table that's there: Some (left, IF NOT EXISTS); None goes on (OR REPLACE is `create_as`'s,
-/// and a table not there is made next). Refused otherwise.
-async fn created(dir: &str, c: &ast::CreateTable) -> Result<Option<()>> {
-    let lake = Lake::open(dir, false, false).await?;
-    Ok(there(&lake, c).await?.filter(|left| *left).map(|_| ()))
-}
-
-/// The lake's key for its nodes, for `pondra sql` with no token. A leader makes it beside serving
-/// (C5), so one that has just started may not have it in the bucket yet: while one leads and the key
-/// isn't there, the lake is read again every 200 ms, for 10 s at most (a node a program started
-/// answers nothing without it: S21).
-async fn cli_key(lake: &Lake) -> Option<String> {
-    for _ in 0..50 {
-        if let Ok(k) = crate::users::node_key(lake).await {
-            return Some(k);
-        }
-        let led = matches!(latest(&lake.store).await, Ok(Some(t)) if !t.addr.is_empty() && alive(&lake.store, &t).await);
-        match crate::users::kept(lake).await {
-            "none" if led => {} // (not made yet: wait for them)
-            _ => return crate::users::node_key(lake).await.ok(), // (made meanwhile, or no leader to wait for)
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        lake.refresh().await.ok()?;
-    }
-    None
-}
-
-async fn one_from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
+/// One request of a statement, sent as `through_bucket_statement` describes: to the lake it writes (an attached lake's leader,
+/// if the name is one), under this process's job, so a retry of it is answered as a duplicate. The node key set is the target
+/// lake's (each lake has its own), before its leader is called (`cluster::signed`: a key set already is kept).
+async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
+    let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
+    let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
     let job = job().to_string();
-    // (A lake with no catalog yet can't be read: then the work is done once this process leads.)
-    let (req, stmt, to) = match Lake::open(dir, false, false).await {
-        Ok(lake) => {
-            crate::ddl::sync(&lake, "", false).await?; // (lakes attached by ATTACH: read here too)
-            let (other, table) = crate::ddl::resolve(&lake, &stmt.table()).await?;
-            let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
-            if !crate::env::is_set("PONDRA_TOKEN") && !crate::env::is_set("PONDRA_ADMIN_TOKEN") && crate::cluster::node_key().is_none() {
-                // (no token: the lake's own key for its nodes, which whoever holds the lake can read; a
-                // leader on the network answers nothing unsigned. `cluster::http` sends it.)
-                if let Some(k) = cli_key(&target).await {
-                    crate::cluster::set_node_key(k);
-                }
-            }
-            (Some(prepare(&lake, &target, &table, &stmt, &job, true).await?), stmt, target.url.clone())
-        }
-        Err(_) => (None, stmt, dir.to_string()),
-    };
-    deliver(&to, req, &stmt, &job, true).await
+    crate::cluster::signed(&target).await;
+    match prepare(lake, &target, &table, &stmt, &job, true).await? {
+        Some(req) => deliver(&target.url, Some(req), &job, true).await,
+        None => Ok(j!({"duplicate": true})), // (a retry: the write it asks is recorded already)
+    }
 }
 
 tokio::task_local! {
@@ -2202,19 +2157,20 @@ pub async fn send_as(dir: &str, req: Request, key: Option<&str>) -> Result<Value
 }
 
 /// Have the leader of the lake at `dir` record `req` (made on this node), however it's reached.
-pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", false).await }
+pub async fn send(dir: &str, req: Request) -> Result<Value> { deliver(dir, Some(req), "", false).await }
 
 /// Have the leader of the lake at `dir` record `req`, through the bucket alone: its inbox, or this
 /// process leading for a moment when nobody does. For a caller with no token (`pondra token`, which
 /// the leader would refuse over HTTP): whoever can write the bucket owns the lake (invariant 18).
 pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
-    BUCKET.scope((), deliver(dir, Some(Some(req)), &Stmt::Invalid(String::new()), "", true)).await
+    BUCKET.scope((), deliver(dir, Some(req), job(), true)).await
 }
 
 /// Have the leader of the lake at `dir` record a write: over HTTP, through the bucket inbox if it
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
-/// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own.
-async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: &str, one_off: bool) -> Result<Value> {
+/// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own. `req` None is
+/// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
+async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req).await; // (a lake on another server: ADR-058)
     }
@@ -2226,11 +2182,7 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                     tokio::time::sleep(Duration::from_secs(1)).await; // another `pondra sql` is recording: wait
                     continue;
                 }
-                if req.is_none() {
-                    let lake = Lake::open(dir, false, false).await?;
-                    req = Some(prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?);
-                }
-                let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
+                let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
@@ -2243,14 +2195,14 @@ async fn deliver(dir: &str, mut req: Option<Option<Request>>, stmt: &Stmt, job: 
                 }
             }
             _ if !one_off => {
-                let Some(Some(r)) = &req else { return Ok(j!({"duplicate": true})) };
+                let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
                 if let Some(v) = crate::inbox::send(&store, r, Some(dir)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             t => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
-                return match lead(dir, &store, term.n, req, stmt, job).await {
+                return match lead(dir, &store, term.n, req).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
@@ -2348,8 +2300,8 @@ pub(crate) fn read_only_refused(dir: &str) -> anyhow::Error {
 /// A lake on another server, read here with a read-only key (ADR-058): nothing here writes its
 /// bucket (no inbox, no term claimed), and only a branch's pin goes to its leader, at its
 /// ENDPOINT, with the pondra secret's token or the branch's own key.
-async fn across(dir: &str, r: &crate::store::Reach, req: Option<Option<Request>>) -> Result<Value> {
-    let Some(Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. }))) = req else {
+async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Result<Value> {
+    let Some(req @ Request::Ddl(crate::ddl::Ddl::Pin { .. } | crate::ddl::Ddl::Unpin { .. })) = req else {
         return Err(read_only_refused(dir));
     };
     // (never sent without one: this server's own key, or its user's token, must not go to another
@@ -2397,14 +2349,20 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
     }
     if !res.status().is_success() {
         // (the leader's refusal keeps its SQLSTATE: a follower's client tells it apart as the leader's would)
-        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(crate::codes::received);
-        let said = format!("the leader at {addr}: {}", res.text().await?);
-        return Err(match code {
-            Some(code) => crate::codes::coded(code, said),
-            None => anyhow::anyhow!("{said}"),
-        });
+        let sqlstate = res.headers().get("x-pondra-sqlstate").cloned();
+        return Err(refusal(sqlstate.as_ref(), format!("the leader at {addr}: {}", res.text().await?)));
     }
     Ok(res.json().await?)
+}
+
+/// The error a node's answer that isn't a success is, as a client takes it: the answer's words, with the SQLSTATE its
+/// `x-pondra-sqlstate` header names (none: the words alone). Shared by a follower's forwarded write (`post_as`) and a
+/// guest's answer (cli.rs), so both give the same error.
+pub(crate) fn refusal(sqlstate: Option<&axum::http::HeaderValue>, said: String) -> anyhow::Error {
+    match sqlstate.and_then(|v| v.to_str().ok()).and_then(crate::codes::received) {
+        Some(code) => crate::codes::coded(code, said),
+        None => anyhow::anyhow!("{said}"),
+    }
 }
 
 /// A failure to reach the leader at all (not an answer from it).
@@ -2428,8 +2386,8 @@ fn summary(flush: bool, v: Value) -> Result<Value> {
     Ok(if acks.iter().all(|a| a.duplicate) { j!({"duplicate": true}) } else { j!({"committed": true}) })
 }
 
-/// Was this writer fenced out of the catalog by a newer one?
-fn fenced(e: &anyhow::Error) -> bool {
+/// Was this writer fenced out of the catalog by a newer one? (`pondra sql`'s guest asks it of an answer's words too.)
+pub(crate) fn fenced(e: &anyhow::Error) -> bool {
     e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
 }
 
@@ -2445,16 +2403,13 @@ pub(crate) fn job() -> &'static str {
     JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
-/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go.
-async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>, stmt: &Stmt, job: &str) -> Result<Value> {
+/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go. `req` None records
+/// nothing (`lead_only`).
+async fn lead(dir: &str, store: &Store, term: u64, req: Option<Request>) -> Result<Value> {
     let marks = crate::cluster::mark_every(store.clone(), term);
     let lake = Lake::open(dir, true, false).await?; // (the catalog's writer: fences any older one)
     crate::replica::recover(&lake, "", term, None).await?;
     let (seq, lock) = (Sequencer::start(lake.clone(), None).await?, Mutex::new(()));
-    let req = match req {
-        Some(r) => r,
-        None => prepare(&lake, &lake, &stmt.table(), stmt, job, true).await?,
-    };
     let out = match req {
         Some(r) => {
             let flush = matches!(r, Request::Flush(_));

@@ -85,9 +85,10 @@ class FakeGitHub(GitHub):
         self.prs = {}         # number -> {"title", "draft", "labels": [names], "files": [paths], "open"}
         self.comments = {}    # number -> [bodies]
         self.runs = []        # as the runs endpoint lists them, newest first
-        self.jobs = {}        # run id -> [{"name", "conclusion"}]
+        self.jobs = {}        # run id -> [{"name", "conclusion", "steps"}]
         self.dispatches = []  # (ref, mode)
         self.reruns = []      # run ids
+        self.cancels = []     # run ids
         self.writes = []      # (method, path) of every write made through api
         self.later = 0        # train.yml runs started (a wait's hand-over)
 
@@ -129,6 +130,11 @@ class FakeGitHub(GitHub):
             return {"jobs": self.jobs.get(int(m[1]), [])}
         if (m := re.fullmatch(rf"{base}/actions/runs/(\d+)/rerun-failed-jobs", route)) and method == "POST":
             self.reruns.append(int(m[1]))
+            return {}
+        if (m := re.fullmatch(rf"{base}/actions/runs/(\d+)/cancel", route)) and method == "POST":
+            self.cancels.append(int(m[1]))
+            run = next(r for r in self.runs if r["id"] == int(m[1]))
+            run.update(status="completed", conclusion="cancelled")
             return {}
         raise GitHubError(404, '{"message": "Not Found"}', f"gh: Not Found (HTTP 404) (fake: {method} {route})")
 
@@ -208,12 +214,15 @@ class Scenario:
         git(self.work, "push", "-q", self.bare, "HEAD:refs/heads/main")
 
     def add_run(self, run_id, sha, *, event="workflow_dispatch", branch="train", status="completed",
-                conclusion="failure", attempt=1, failed=("tests",)):
-        """A build run as the runs endpoint lists it, with the jobs that failed in it."""
+                conclusion="failure", attempt=1, failed=None, lost=()):
+        """A build run as the runs endpoint lists it, with the jobs that failed in it: `failed` with a failed step
+        (by default "tests", when the run failed), `lost` with none, as when a runner is lost."""
+        failed = (("tests",) if conclusion == "failure" else ()) if failed is None else failed
         self.gh.runs.insert(0, {"id": run_id, "event": event, "head_branch": branch, "head_sha": sha,
                                 "status": status, "conclusion": conclusion, "run_attempt": attempt,
                                 "html_url": run_url(run_id)})
-        self.gh.jobs[run_id] = [{"name": name, "conclusion": "failure"} for name in failed]
+        self.gh.jobs[run_id] = ([{"name": name, "conclusion": "failure", "steps": [{"name": "a check", "conclusion": "failure"}]}
+                                 for name in failed] + [{"name": name, "conclusion": "failure", "steps": []} for name in lost])
 
     def step(self, dry=False):
         """One call of step. Returns the lines it printed."""
@@ -330,17 +339,196 @@ def conflict_rides_alone(path):
 
 @case
 def red_attempt_1_reruns(path):
-    """Red run, attempt 1: one rerun of its failed jobs, and nothing else."""
+    """Red run, attempt 1, in a job that can flake: one rerun of its failed jobs, and nothing else."""
     with Scenario(path) as sc:
         sc.riders()
-        sc.add_run(7, sc.tip(), attempt=1, failed=("tests",))
+        sc.add_run(7, sc.tip(), attempt=1, failed=("suite (harness, 1 of 3)",))
         before, writes = sc.state(), len(sc.gh.writes)
         out = sc.step()
         expect(sc.gh.reruns == [7], f"reruns {sc.gh.reruns}")
         expect(sc.gh.writes[writes:] == [("POST", f"repos/{REPO}/actions/runs/7/rerun-failed-jobs")],
                f"writes {sc.gh.writes[writes:]}")
         expect(sc.state() == before, "the rerun changed more than the rerun")
-        expect("rerun the train's failed jobs: tests" in out, out)
+        expect("rerun the train's failed jobs: suite (harness, 1 of 3)" in out, out)
+
+
+@case
+def lost_runner_reruns(path):
+    """Red run, attempt 1, a job that can't flake but died with no failed step (its runner lost): one rerun."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(7, sc.tip(), attempt=1, failed=(), lost=("unit tests",))
+        out = sc.step()
+        expect(sc.gh.reruns == [7] and "rerun the train's failed jobs: unit tests" in out, out)
+
+
+@case
+def final_failure_no_rerun(path):
+    """Red run, attempt 1, a check that can't flake failed a step: no rerun, the PR is dropped at once."""
+    with Scenario(path) as sc:
+        sc.open_pr(1, "first", {"a.txt": "one\n"})
+        sc.step()
+        sc.add_run(7, sc.tip(), attempt=1, failed=("forms", "resilience / resilience"))
+        out = sc.step()
+        expect(sc.gh.reruns == [] and sc.labels(1) == [], f"reruns {sc.gh.reruns}, labels {sc.labels(1)}")
+        expect("dropped #1: forms, resilience / resilience" in out, out)
+
+
+@case
+def final_failure_mid_run(path):
+    """A check that can't flake fails while the run goes: the run is stopped and the train halved in that step."""
+    with Scenario(path) as sc:
+        for n in (1, 2, 3):
+            sc.open_pr(n, f"pr {n}", {f"f{n}.txt": f"{n}\n"})
+        sc.step()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None, failed=("unit tests",))
+        out = sc.step()
+        expect(sc.gh.cancels == [9] and sc.gh.reruns == [], f"cancels {sc.gh.cancels}, reruns {sc.gh.reruns}")
+        expect(sc.train_heads() == [1, 2], f"train merged {sc.train_heads()}")
+        expect("stopped the train's run: unit tests failed" in out and "halved the train: 3 to 2" in out, out)
+        sc.add_run(10, sc.tip(), status="in_progress", conclusion=None, failed=("suite (harness, 2 of 3)",))
+        out = sc.step()   # a job that can flake failed: the run goes on to its end, and #3 rides a car behind it
+        expect(sc.gh.cancels == [9] and "stacked #3 on the train's run" in out, out)
+        expect(sc.train_heads() == [1, 2, 3] and sc.labels(3) == ["riding", "train"], f"{sc.train_heads()}")
+
+
+@case
+def final_failure_mid_run_as_main(path):
+    """A check that can't flake fails while the run goes, and main's latest run failed it too: nothing is stopped."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None, failed=("unit tests",))
+        sc.add_run(3, sc.main_sha(), event="push", branch="main", failed=("unit tests",))
+        before = sc.state()
+        out = sc.step()
+        expect(sc.gh.cancels == [] and sc.state() == before, f"cancels {sc.gh.cancels}")
+        expect("waiting: main fails the same way: unit tests" in out, out)
+
+
+@contextlib.contextmanager
+def old_train():
+    """A clock past JOIN: the train's run looks older than the minutes in which a PR joins it."""
+    real_now = train.now
+    train.now = lambda: real_now() + train.JOIN + 60
+    try:
+        yield
+    finally:
+        train.now = real_now
+
+
+def stacked(sc):
+    """PRs 1 and 2 ride with their run 9 going, past JOIN, and PR 3 is labelled: a step stacks it as a car of its
+    own, whose run is 10. Returns the merge commit #2's car ends at."""
+    sc.riders()
+    front = sc.tip()
+    sc.add_run(9, front, status="in_progress", conclusion=None)
+    sc.open_pr(3, "third", {"c.txt": "three\n"})
+    with old_train():
+        out = sc.step()
+    expect("stacked #3 on the train's run" in out and sc.gh.cancels == [], out)
+    expect(sc.train_heads() == [1, 2, 3] and sc.gh.bare_rev("refs/heads/train^1") == front, f"{sc.train_heads()}")
+    expect(sc.labels(3) == ["riding", "train"] and sc.gh.dispatches[-1] == ("train", "train"), f"{sc.labels(3)}")
+    sc.add_run(10, sc.tip(), status="in_progress", conclusion=None)
+    return front
+
+
+@case
+def joins_a_young_run(path):
+    """A PR labelled in the first minutes of the train's run joins it: the run is stopped, the train cut again with
+    it after the riders. Later it rides a car stacked on the train."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None)
+        sc.open_pr(3, "third", {"c.txt": "three\n"})
+        time.sleep(1.1)   # (a train cut again in the same second is the same commit: git dates to the second)
+        out = sc.step()
+        expect(sc.gh.cancels == [9] and sc.train_heads() == [1, 2, 3], f"cancels {sc.gh.cancels}, {sc.train_heads()}")
+        expect("#3 joined the train: cutting it again" in out and "cut #1 #2 #3" in out, out)
+        sc.add_run(10, sc.tip(), status="in_progress", conclusion=None)
+        sc.open_pr(4, "fourth", {"d.txt": "four\n"})
+        with old_train():
+            out = sc.step()
+        expect(sc.gh.cancels == [9] and sc.train_heads() == [1, 2, 3, 4], f"cancels {sc.gh.cancels}, {sc.train_heads()}")
+        expect("stacked #4 on the train's run" in out, out)
+
+
+@case
+def stacked_car_lands_after(path):
+    """A car stacked on the train: the front car's green run lands its two PRs, #3 rides on; its own run lands it."""
+    with Scenario(path) as sc:
+        front = stacked(sc)
+        sc.gh.runs[1].update(status="completed", conclusion="success")   # (run 9)
+        out = sc.step()
+        expect(sc.main_sha() == front and "landed #1 #2" in out and "#3 ride on" in out, out)
+        expect(sc.labels(1) == [] and sc.labels(3) == ["riding", "train"] and sc.gh.cancels == [], f"{sc.labels(3)}")
+        dispatched = len(sc.gh.dispatches)
+        out = sc.step()   # #3's run going, on the main it was stacked on
+        expect("waiting: run going" in out and len(sc.gh.dispatches) == dispatched, out)
+        tip = sc.tip()
+        sc.gh.runs[0].update(status="completed", conclusion="success")   # (run 10)
+        out = sc.step()
+        expect(sc.main_sha() == tip and "landed #3" in out and sc.labels(3) == [], out)
+        expect(sc.comments(3)[-1] == f"Landed with the train's run {run_url(10)}." + FOOTER, f"{sc.comments(3)}")
+
+
+@case
+def stacked_car_green_first(path):
+    """The stacked car's run is green while the front car's goes: everything lands at once, the front's run stops."""
+    with Scenario(path) as sc:
+        stacked(sc)
+        tip = sc.tip()
+        sc.gh.runs[0].update(status="completed", conclusion="success")   # (run 10)
+        out = sc.step()
+        expect(sc.main_sha() == tip and "landed #1 #2 #3" in out and sc.gh.cancels == [9], out)
+        expect(all(sc.labels(n) == [] for n in (1, 2, 3)), "labels left")
+
+
+@case
+def front_car_red(path):
+    """The front car fails a check that can't flake: both cars' runs stop, the front is halved, #3 waits in the queue."""
+    with Scenario(path) as sc:
+        stacked(sc)
+        sc.gh.jobs[9] = [{"name": "unit tests", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
+        time.sleep(1.1)
+        out = sc.step()
+        expect(sorted(sc.gh.cancels) == [9, 10], f"cancels {sc.gh.cancels}")
+        expect(sc.train_heads() == [1] and sc.labels(3) == ["train"], f"{sc.train_heads()} {sc.labels(3)}")
+        expect("halved the train: 2 to 1" in out, out)
+
+
+@case
+def stacked_car_red(path):
+    """The car behind fails a check that can't flake: its run stops, and once the front lands it is judged."""
+    with Scenario(path) as sc:
+        front = stacked(sc)
+        sc.gh.jobs[10] = [{"name": "forms", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
+        out = sc.step()
+        expect(sc.gh.cancels == [10] and "stopped the run of the car ending at #3: forms failed" in out, out)
+        sc.gh.runs[1].update(status="completed", conclusion="success")   # (run 9)
+        out = sc.step()
+        expect(sc.main_sha() == front and "landed #1 #2" in out and "#3 ride on" in out, out)
+        out = sc.step()
+        expect("dropped #3: forms" in out and sc.labels(3) == [] and sc.tip() is not None, out)
+
+
+@case
+def cars_at_most_two(path):
+    """Two cars run: a PR labelled now waits for a car to land; with the slots taken none is stacked either."""
+    with Scenario(path) as sc:
+        stacked(sc)
+        sc.open_pr(4, "fourth", {"d.txt": "four\n"})
+        with old_train():
+            out = sc.step()
+        expect("waiting: run going" in out and sc.train_heads() == [1, 2, 3], out)
+    with Scenario(os.path.join(path, "slots")) as sc:
+        sc.riders()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None)
+        sc.add_run(20, "0" * 40, event="pull_request", branch="pr-x", status="in_progress", conclusion=None)
+        sc.add_run(21, "0" * 40, event="pull_request", branch="pr-y", status="queued", conclusion=None)
+        sc.open_pr(3, "third", {"c.txt": "three\n"})
+        with old_train():
+            out = sc.step()
+        expect("waiting: run going" in out and sc.train_heads() == [1, 2], out)
 
 
 @case
@@ -406,6 +594,18 @@ def main_moved_recut(path):
         expect(sc.labels(1) == ["riding", "train"] and sc.labels(2) == ["riding", "train"], "labels changed")
         expect(not any("Landed" in c for n in (1, 2) for c in sc.comments(n)), "a PR was called landed")
         expect("main moved since the cut" in out, out)
+
+
+@case
+def main_moved_mid_run(path):
+    """Main moved while the train's run goes: it can't land, so the run stops and the train is cut again on it now."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None)
+        sc.push_main({"other.txt": "other\n"}, "a workflow's merge")
+        out = sc.step()
+        expect(sc.gh.cancels == [9] and sc.gh.bare_rev("refs/heads/train^1^1") == sc.main_sha(), f"{sc.gh.cancels}")
+        expect(sc.train_heads() == [1, 2] and "main moved since the cut: cutting the train again" in out, out)
 
 
 @case
@@ -570,7 +770,7 @@ def red_main_moved(path):
         expect(sc.train_heads() == [1, 2, 3], f"train merged {sc.train_heads()}")
         expect(sc.gh.bare_rev("refs/heads/train^1^1^1") == sc.main_sha(), "the new train isn't cut on the new main")
         expect(all(c == [] for c in sc.gh.comments.values()), f"comments {sc.gh.comments}")
-        expect("cutting the red train again" in out, out)
+        expect("main moved since the cut: cutting the train again" in out, out)
 
 
 @case
@@ -604,11 +804,12 @@ def main_changed_a_workflow(path):
         sc.step()
         expect(sc.gh.dispatches[dispatched:] == [] and not any("riding" in sc.labels(n) for n in (1, 2, 3)),
                f"dispatches {sc.gh.dispatches}, labels {[sc.labels(n) for n in (1, 2, 3)]}")
-        for n in (1, 2, 3):
+        for n in (1, 2):
             expect(sc.comments(n)[-1] == WORKFLOW + FOOTER, f"#{n}: {sc.comments(n)}")
         sc.open_pr(4, "fourth", {"d.txt": "four\n"})   # (branched from the new main)
         time.sleep(1.1)
         sc.step()
+        expect(sc.comments(3)[-1] == WORKFLOW + FOOTER, f"#3: {sc.comments(3)}")
         expect(sc.train_heads() == [4] and sc.gh.bare_rev("refs/heads/train^1") == sc.main_sha(), f"{sc.train_heads()}")
 
 
@@ -709,6 +910,20 @@ def wait_hands_over(path):
         expect(pauses == [60, 60, 60] and out.count("waiting: run going") == 4, f"pauses {pauses}: {out}")
         expect(sc.gh.later == 1 and "waited 3 minutes" in out, f"started {sc.gh.later}: {out}")
         expect(sc.state() == before and len(sc.gh.writes) == writes, "a wait changed state while the run went")
+
+
+@case
+def wait_new_conductor(path):
+    """--wait while main gets another copy of the conductor: the wait hands over to it at once, once."""
+    with Scenario(path) as sc:
+        sc.push_main({"tools/train.py": "one\n"}, "a conductor")
+        git(sc.clone, "fetch", "-q", "origin")
+        sc.riders()
+        sc.add_run(5, sc.tip(), status="in_progress", conclusion=None)
+        with clock(lambda n: sc.push_main({"tools/train.py": "two\n"}, "another conductor")) as pauses:
+            out = sc.conduct(50)
+        expect(pauses == [60] and sc.gh.later == 1, f"pauses {pauses}, started {sc.gh.later}: {out}")
+        expect("main has a new conductor" in out, out)
 
 
 @case

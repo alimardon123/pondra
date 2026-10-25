@@ -4,7 +4,7 @@ use crate::data_file::DataFile;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
-use datafusion::arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::SessionState;
 use datafusion::object_store::{ObjectMeta, ObjectStore};
@@ -28,7 +28,7 @@ const PREFIX: &str = "ext:";
 
 pub fn is(name: &str) -> bool { name.starts_with(PREFIX) }
 
-fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to_vec(spec).expect("a spec"))) }
+pub(crate) fn name(spec: &Spec) -> String { format!("{PREFIX}{}", B64.encode(serde_json::to_vec(spec).expect("a spec"))) }
 
 pub fn spec(name: &str) -> Option<Spec> { serde_json::from_slice(&B64.decode(name.strip_prefix(PREFIX)?).ok()?).ok() }
 
@@ -97,14 +97,15 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     }
     for (name, e) in a.named {
         let value = match (name.to_lowercase().as_str(), e) {
-            ("columns" | "hive_types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
+            ("columns" | "hive_types" | "types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
+            ("types", _) => bail!("{f}: types names each column's type in a struct, types => {{'zip': 'VARCHAR'}} (DuckDB's list form isn't read)"),
             _ => literal(e),
         };
         options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
     }
     ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
     let known: Vec<&str> = match format {
-        "csv" => [CSV_OPTIONS, LISTING_OPTIONS].concat(),
+        "csv" => [CSV_OPTIONS, LISTING_OPTIONS, &["types"][..]].concat(),
         "delta" => vec!["version"],
         "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
         _ => LISTING_OPTIONS.to_vec(),
@@ -112,6 +113,10 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
         bail!("{f} has no option {k}: {}", known.join(", "));
+    }
+    if options.contains_key("types") {
+        ensure!(!options.contains_key("columns"), "{f}: types and columns: columns names every column's type, so types would do nothing");
+        ensure!(!options.get("all_varchar").is_some_and(|v| v != "false"), "{f}: types and all_varchar => true: one is enough (all_varchar reads every column as text)");
     }
     Ok(Some(name(&Spec { urls, format: format.into(), options })))
 }
@@ -370,6 +375,20 @@ fn merged(each: Vec<Schema>) -> Result<SchemaRef> {
     }
 }
 
+/// The schema with the types `types` names replaced (`read_csv`'s `types`): the other columns stay as inferred. A name
+/// the files don't have is refused, naming it and the columns they have.
+pub fn retyped(schema: &SchemaRef, types: &[(String, DataType)]) -> Result<SchemaRef> {
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    for (name, t) in types {
+        let Some(field) = fields.iter_mut().find(|f| f.name() == name) else {
+            let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+            bail!("types names {name}, which the files don't have: their columns are {}", columns.join(", "))
+        };
+        *field = Arc::new(field.as_ref().clone().with_data_type(t.clone()));
+    }
+    Ok(Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())))
+}
+
 /// An Arrow IPC file's schema, from its footer (two small reads), or None for a stream. DataFusion reads a file
 /// fetched as a stream as if it were one, taking the 64-byte padding arrow-rs writes after the magic for the
 /// schema's length ("Unable to read IPC message schema"), on a page and on a bucket alike.
@@ -571,14 +590,14 @@ pub async fn declared(ctx: SessionContext, cols: &str) -> Result<Vec<FieldRef>> 
 }
 
 /// A table's columns as `(name, type)`, the types as `answer::type_name` writes them.
-fn named(fields: &[FieldRef]) -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() }
+pub(crate) fn named(fields: &[FieldRef]) -> Vec<(String, String)> { fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect() }
 
 /// A table of files, from the spec's listing to its files' footers: its columns (the Hive folders' keys too) and its
 /// data files. A node's `resolve` and a page's `register` both call it, so the same files are read the same way on
 /// either. Declared columns are the table's: CSV and JSON read their files by them (by position, and by name), Parquet
 /// by name. With no file yet, declared columns make an empty table; without them, `none` says what no file is (and
 /// gives None when columns are declared, as the caller's words for it).
-pub async fn files_table(state: &SessionState, spec: &Spec, declared: Option<Vec<FieldRef>>, hive_types: &[FieldRef], none: impl Fn(&str) -> Option<anyhow::Error>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
+pub async fn files_table(state: &SessionState, spec: &Spec, declared: Option<Vec<FieldRef>>, hive_types: &[FieldRef], types: Option<&[(String, DataType)]>, none: impl Fn(&str) -> Option<anyhow::Error>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
     let found = listed(state, spec, &none).await?; // (declared: none yet is an empty table)
     if found.is_empty() {
         return Ok(([named(declared.as_deref().unwrap_or_default()), named(hive_types)].concat(), vec![]));
@@ -588,6 +607,11 @@ pub async fn files_table(state: &SessionState, spec: &Spec, declared: Option<Vec
     let schema = match (&declared, spec.format.as_str()) {
         (Some(d), "csv" | "json") => Arc::new(Schema::new(d.clone())),
         _ => schema_of(state, spec, &found).await?,
+    };
+    // `types => {'zip': 'VARCHAR'}` (`read_csv`, DuckDB's): the named columns are read as those types, the rest as inferred.
+    let schema = match types {
+        Some(types) => retyped(&schema, types)?,
+        None => schema,
     };
     let mut columns = named(declared.as_deref().unwrap_or(&schema.fields()[..]));
     // (a column read as another type than the file's: its ranges are the file's type's, so none is kept)
@@ -715,5 +739,64 @@ mod tests {
         let schema = schema_of(&ctx.state(), &spec, &found).await.unwrap();
         assert_eq!((schema.fields().len(), schema.field(0).data_type()), (1, &DataType::Int64));
         assert!(schema.metadata().is_empty());
+    }
+
+    /// The table factor of `FROM <sql>`, as the expander takes it.
+    fn table_of(sql: &str) -> TableFactor {
+        use datafusion::sql::sqlparser::{ast::{SetExpr, Statement}, dialect::GenericDialect, parser::Parser};
+        let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, &format!("SELECT * FROM {sql}")) else { panic!("{sql}") };
+        let Statement::Query(q) = stmts.remove(0) else { panic!("a query") };
+        let SetExpr::Select(s) = *q.body else { panic!("a select") };
+        s.from.into_iter().next().expect("a table").relation
+    }
+
+    /// `types` is a struct of the columns and their types, kept in the spec as `"name" TYPE, …`. The list form, a string,
+    /// `types` with `columns` or with `all_varchar => true`, and `types` on a format but CSV are refused.
+    #[test]
+    fn types_is_a_struct_of_the_columns_and_their_types() {
+        let name = table(&table_of("read_csv('a.csv', types => {'zip': 'VARCHAR', 'n': 'INT'})")).unwrap().unwrap();
+        assert_eq!(spec(&name).unwrap().options["types"], "\"zip\" VARCHAR, \"n\" INT");
+        assert!(table(&table_of("read_csv('a.csv', types => {'zip': 'VARCHAR'}, all_varchar => false)")).is_ok());
+        for sql in ["read_csv('a.csv', types => ['VARCHAR', 'INT'])", "read_csv('a.csv', types => 'zip VARCHAR')"] {
+            assert!(table(&table_of(sql)).unwrap_err().to_string().contains("struct"), "{sql}");
+        }
+        let with_columns = table(&table_of("read_csv('a.csv', types => {'zip': 'VARCHAR'}, columns => {'zip': 'VARCHAR'})")).unwrap_err();
+        assert!(with_columns.to_string().contains("columns"), "{with_columns}");
+        let all_text = table(&table_of("read_csv('a.csv', types => {'zip': 'VARCHAR'}, all_varchar => true)")).unwrap_err();
+        assert!(all_text.to_string().contains("all_varchar"), "{all_text}");
+        assert!(table(&table_of("read_parquet('a.parquet', types => {'zip': 'VARCHAR'})")).is_err());
+    }
+
+    /// `retyped` replaces the named columns' types and keeps the others; a name the files don't have is refused, naming
+    /// it and the columns they have.
+    #[test]
+    fn types_replace_the_named_columns_and_refuse_a_name_the_files_lack() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("zip", DataType::Int64, true), Field::new("n", DataType::Int64, true)]));
+        let typed = retyped(&schema, &[("zip".to_string(), DataType::Utf8)]).unwrap();
+        let kinds: Vec<(&str, DataType)> = typed.fields().iter().map(|f| (f.name().as_str(), f.data_type().clone())).collect();
+        assert_eq!(kinds, [("zip", DataType::Utf8), ("n", DataType::Int64)]);
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64, "the schema it was given is as it was");
+        let err = retyped(&schema, &[("nope".to_string(), DataType::Utf8)]).unwrap_err();
+        assert_eq!(err.to_string(), "types names nope, which the files don't have: their columns are zip, n");
+    }
+
+    /// A CSV read with its text column as text and its integer column as an integer keeps `007`, and a value the integer
+    /// won't take is the reader's error, which `casts::parse_refusal` reads as Postgres's refusal.
+    #[tokio::test]
+    async fn csv_columns_are_read_as_the_types_given() {
+        use datafusion::arrow::array::StringArray;
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        store.put(&Path::from("c/a.csv"), PutPayload::from(bytes::Bytes::from("zip,n\n007,1\n"))).await.unwrap();
+        store.put(&Path::from("c/b.csv"), PutPayload::from(bytes::Bytes::from("zip,n\n02134,2.5\n"))).await.unwrap();
+        ctx.register_object_store(&url::Url::parse("mem://").unwrap(), store);
+        let spec = Spec { urls: vec!["mem:///c/a.csv".to_string()], format: "csv".to_string(), options: BTreeMap::new() };
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("zip", DataType::Utf8, true), Field::new("n", DataType::Int32, true)]));
+        let batches = read_files(&ctx, &[("mem:///c/a.csv", "")], &schema, &spec).await.unwrap().collect().await.unwrap();
+        let zip = batches[0].column_by_name("zip").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(zip.value(0), "007");
+        let err = read_files(&ctx, &[("mem:///c/b.csv", "")], &schema, &spec).await.unwrap().collect().await.unwrap_err();
+        let refusal = crate::casts::parse_refusal(&err.to_string()).expect("the reader's refusal, in its words");
+        assert_eq!(crate::codes::words(&anyhow::Error::from(refusal)), r#"invalid input syntax for type integer: "2.5""#);
     }
 }

@@ -1066,7 +1066,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    every part, with and without an extension.
 139. **A view of files is a view** (`StoredView.external`, `ext.rs`): `CREATE EXTERNAL TABLE` stores
    `SELECT … FROM read_*(…)`, copies nothing, and `INSERT` into one over a folder is `COPY … TO
-   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::from_cli` calls
+   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::through_bucket_statement` calls
    `view_write` too); an `INSERT` into any other view is refused, never a table made. A folder's
    keys are declared (`hive_types`), so an empty folder has its columns. The `ext:` tables such
    views read are deregistered in listing sessions. `harness.py external`.
@@ -1963,7 +1963,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
-   `write::from_cli`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   `write::through_bucket_statement`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
    to anything a project's last finished apply declared (`apply::declared`), unless
    `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
@@ -2141,7 +2141,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    text reads crm.t… SHOW COLUMNS…".
 287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
    x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
-   its leader had (`seen_here`), and in `from_cli`. `CREATE TABLE … AS SELECT` defines its table first;
+   its leader had (`seen_here`), and in `write::through_bucket_statement`. `CREATE TABLE … AS SELECT` defines its table first;
    `POST /insert/{t}`, the bulk door, still makes one (`record`). A file, another engine's attached table
    and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
    name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
@@ -2861,7 +2861,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `memory::tests::sweep_removes_a_folder_whose_process_ended_and_keeps_the_rest`, `own_dir_is_this_users_alone…`,
    `spill::tests`.
 
-420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `from_cli`). Its table
+420. **A `CREATE TABLE … AS SELECT` that fails leaves no table** (`write::run_listed`, `Undo`; `create_as`, which `pondra sql` takes through the inbox too). Its table
    is made first (`Stmt::Define`), so an INSERT of its rows that fails, for any reason, drops it, purged, before the
    statement answers, and the answer stays the statement's own error. A request stopped before the INSERT answers
    (the memory watch drops its future: invariant 417) drops it from `Undo`'s `drop`, as its caller. Left there, the
@@ -2954,17 +2954,24 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    LRU of parsed entries by key (256, 16 MB of raw bytes), a hit when the bytes are the ones it was parsed from. A
    per-request read of one table's entry goes through `cat.meta`, not `cat.get::<TableMeta>`; whole scans of every
    entry, writes and restarts parse as before. `cargo test --lib store::`.
-430. **A write's retry mark goes once no resend can come** (`store::kept_ms`, `log::Producers`): a job a client named
-   is remembered for `copy::retention_ms` (64 days), an `auto-` id (`log::auto_job`, and the Python and JS clients'
-   own), a transaction's COMMIT and a COPY's chunks for `store::retry_ms` (twice the lock lease); every other producer
-   is kept for good. A mark goes by the expiry key it was committed with, only while its seq still matches, never in a
-   sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave a commit quiet.
-   A new kind of producer names its window in `kept_ms`. `cargo test --lib log:: store::`, harness `writes`.
+430. **A write's retry mark goes once no resend can come** (`store::kept_ms(producer, now)`, `log::Producers`): a job a
+   client named is remembered for `copy::retention_ms` (64 days), unless its name starts `auto-`; an id that starts
+   `auto-` (a client's own: `log::auto_job`'s `auto-` and 32 hex digits, an older client's `auto-{producer}-{n}`, or a
+   user's `auto-` name) is remembered for `store::retry_ms` (twice the lock lease), as are a transaction's COMMIT and
+   a COPY's chunks; an `auto-until<S>-…` id (the Python and JS clients') until `S` (its last resend time, unix
+   seconds) plus the retry window, counted from the commit, a day at most. Every other producer is kept for good. A mark goes by the expiry key it was committed with, only while its seq
+   still matches, never in a sequencer's first retry window; at most 10 000 a commit (`Catalog::scan_first`), and expiries leave
+   a commit quiet. A mark that is due but not yet expired by a commit still answers a resend as a duplicate (`commit`
+   checks before `settle`). A job's request answers `{"duplicate":true}` before its statement runs when its mark is kept
+   (`write::run_listed`). A new kind of producer names its window in `kept_ms`.
+   `cargo test --release --lib log:: store::`, harness `writes`.
 431. **A table version's planning facts are worked out once** (`query::facts`): its read schema, manifest list, ranges,
    statistics and `hot::known`, kept by the parsed entry's `Arc` (a hit only while its `Weak` upgrades to that same
    `Arc`) and whether system columns are in. `table_view` takes the catalog's `Arc`; a meta of a caller's own goes
    through `table_view_once`, which keeps nothing. No query copies a table's whole entry on the plain scan path.
-   `cargo test --lib query::`, harness `scale`.
+   The memo keeps 256 versions and 64 MB of manifests (`query::facts_bytes`: each manifest's path and statistics), the
+   least recently used going first; a version past the budget is planned without it (`cache_bytes{cache="facts"}`).
+   `cargo test --release --lib query::`, harness `scale`.
 432. **A lake's folder takes conditional overwrites** (`store::Local`): SlateDB's collector advances its manifest and
    compactions boundary files with `PutMode::Update` before it deletes, and on a store that refuses one it deletes no
    old manifest or compaction record, so the catalog grows for good (5 h at 25 inserts a second: 206 → 13,373 objects,

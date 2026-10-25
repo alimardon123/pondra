@@ -257,8 +257,8 @@ RESTORE TABLE prices TO TIMESTAMP AS OF $before;
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create a transient table | `CREATE TRANSIENT TABLE t (…)`: the same as `CREATE TABLE`, for SQL written for Snowflake |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
-| Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type` |
-| Rename a column | `ALTER TABLE t RENAME COLUMN a TO b` |
+| Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type`. The rows there read NULL, so the column takes its type alone: add a constraint after (`ADD CONSTRAINT`), and fill it with `UPDATE` before `SET NOT NULL` |
+| Rename a column | `ALTER TABLE t RENAME COLUMN a TO b`. Its key, `UNIQUE` and `CHECK`s follow it; a dropped column takes its `UNIQUE` and `CHECK`s along |
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
 | Widen a column | `ALTER TABLE t ALTER COLUMN c TYPE BIGINT` |

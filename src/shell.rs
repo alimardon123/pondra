@@ -87,7 +87,7 @@ pub async fn script(dir: &str, url: Option<&str>, token: Option<&str>, body: ser
 
 /// What the procedures a statement called printed (`x-pondra-notices`), a line each, to print
 /// before its answer.
-fn notices(headers: &reqwest::header::HeaderMap) -> String {
+pub(crate) fn notices(headers: &reqwest::header::HeaderMap) -> String {
     let said: Vec<String> = headers.get("x-pondra-notices").and_then(|h| serde_json::from_slice(h.as_bytes()).ok()).unwrap_or_default();
     said.iter().map(|n| format!("{n}\n")).collect()
 }

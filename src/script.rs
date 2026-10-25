@@ -361,7 +361,14 @@ static OPENER: LazyLock<regex::Regex> = LazyLock::new(|| {
 pub fn is(sql: &str) -> bool {
     let s = crate::text::first_word(sql);
     // (one that doesn't read is the runner's too: it says why)
-    OPENER.is_match(s) && parse(s).map_or(true, |all| !(all.len() == 1 && all[0].1.plain().is_some())) || names_identifier(s)
+    may_open(s) && OPENER.is_match(s) && parse(s).map_or(true, |all| !(all.len() == 1 && all[0].1.plain().is_some())) || names_identifier(s)
+}
+
+/// Might `s` open with one of OPENER's words, a label or a `$`? A plain statement opens with none of them, so OPENER's
+/// regex is compiled for no query. (Non-ASCII is left to the regex: a label may hold it.)
+fn may_open(s: &str) -> bool {
+    let word = crate::text::head(s);
+    !s.is_ascii() || s.starts_with('$') || s.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').trim_start().starts_with(':') || KINDS.iter().any(|(w, _)| *w == word)
 }
 
 fn names_identifier(s: &str) -> bool { s.as_bytes().windows(10).any(|w| w.eq_ignore_ascii_case(b"identifier")) && IDENTIFIER.is_match(s) }

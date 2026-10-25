@@ -36,3 +36,21 @@ SELECT count(*) FROM s, generate_series(1, s.qty) g
 
 statement error 42704
 SELECT enum_range(NULL::mood)
+
+# NaN is Postgres's numeric value; a decimal column here holds numbers only, so a NaN written into one is refused by name
+# (0A000) where the write casts it (`casts::into`: a text or float value of a table or file). Where the planner casts it (a
+# page's INSERT, a literal it folds) the code is the same, with the planner's words.
+statement ok
+CREATE TABLE money (v NUMERIC(5, 2))
+
+statement ok
+CREATE TABLE raw (v VARCHAR)
+
+statement ok
+INSERT INTO raw VALUES ('NaN')
+
+statement error 0A000
+INSERT INTO money SELECT v FROM raw
+
+statement error 22003
+INSERT INTO money VALUES ('1000')

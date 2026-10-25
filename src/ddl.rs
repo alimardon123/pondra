@@ -658,7 +658,9 @@ pub async fn lakes_in(folder: &str) -> Result<Vec<(String, String)>> {
             out
         }
     };
-    let mut out: Vec<(String, String)> = names.into_iter().filter(|n| database_name(n).is_ok()).map(|n| (n.clone(), format!("{folder}/{n}"))).collect();
+    // (a name starting `_` is refused for a new database only: one made before that rule is still listed, and attached
+    // at start, with a line saying so: `attach_found`)
+    let mut out: Vec<(String, String)> = names.into_iter().filter(|n| check(n).is_ok()).map(|n| (n.clone(), format!("{folder}/{n}"))).collect();
     out.sort();
     Ok(out)
 }
@@ -714,7 +716,7 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
     let mut found = vec![];
     for (name, dir) in lakes {
         let (name, Ok(dir)) = (name.to_lowercase(), full(&dir)) else { continue };
-        let taken = dir == home.url || database_name(&name).is_err() || name == lake_name(home)
+        let taken = dir == home.url || check(&name).is_err() || name == lake_name(home)
             || home.attached.read().unwrap().iter().any(|(n, _)| *n == name)
             || !matches!(home.cat.get::<Attachment>(&attachment_key(&name)).await, Ok(None))
             || has_schema(home, &name).await.unwrap_or(true);
@@ -722,7 +724,12 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
             continue;
         }
         match attach(home, &name, &dir, me, true, false).await {
-            Ok(()) => found.push(name),
+            Ok(()) => {
+                if name.starts_with('_') {
+                    eprintln!("database {name} in {folder} starts with _, a name a new database may not take (database_name): it was made before that rule, and stays attached");
+                }
+                found.push(name)
+            }
             Err(e) => eprintln!("attaching {name} ({dir}), found in {folder}: {e:#}"),
         }
     }
@@ -1326,21 +1333,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
         return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
     }
-    // Postgres's codes for a column a view uses: a drop is 2BP01, a type change or a rename 0A000.
-    let code = match change {
-        Change::Drop { .. } => "2BP01",
-        _ => "0A000",
-    };
+    // (Postgres's codes for a column a view uses: `rules::alter::used_by`)
     let readers = readers(lake, &name).await?;
     if !readers.is_empty() {
-        let words = match readers.as_slice() {
-            [one] => format!("{name} is used by {one}, which names its columns: drop it first"),
-            _ => format!("{name} is used by {}, which name its columns: drop them first", readers.join(", ")),
-        };
-        return Err(crate::codes::coded(code, words));
+        return Err(crate::rules::alter::used_by(&name, &readers, matches!(change, Change::Drop { .. })));
     }
     let Some(stored) = m.stored(column).map(str::to_string) else {
-        ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
+        ensure!(matches!(change, Change::Drop { if_exists: true }), crate::rules::alter::no_column(&name, column));
         return Ok(j!({"table": name, "unchanged": true}));
     };
     let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')));
@@ -1348,11 +1347,14 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         Change::Rename(to) => {
             ensure!(!to.is_empty(), "a column needs a name");
             ensure!(!system(&to), "{to} is a system column's name");
-            ensure!(m.stored(&to).is_none(), "{name} already has a column {to}");
+            ensure!(m.stored(&to).is_none(), crate::rules::alter::has_column(&name, &to));
             match to == stored {
                 true => m.names.remove(&stored),
                 false => m.names.insert(stored.clone(), to.clone()),
             };
+            for (_, condition) in &mut m.checks {
+                *condition = crate::rules::alter::check_renamed(condition, column, &to); // (its checks are in SQL's names: they follow it)
+            }
             j!({"renamed": column, "to": to})
         }
         Change::Drop { .. } => {
@@ -1363,12 +1365,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 _ if m.order.as_ref() == Some(&stored) => "order_by",
                 _ => "",
             };
-            ensure!(role.is_empty(), "{column} is {name}'s {role} column: it stays");
-            ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), "{column} is {name}'s last column (DROP TABLE {name})");
+            ensure!(role.is_empty(), crate::rules::alter::stays(&name, column, role));
+            ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), crate::rules::alter::last_column(&name, column));
             m.cluster.retain(|c| *c != stored);
             m.merge.remove(&stored);
             m.names.remove(&stored);
             crate::constraints::without_column(&mut m, &stored); // (its UNIQUE and the facts naming it go with it, as in Postgres)
+            m.checks.retain(|(_, condition)| !crate::rules::alter::check_reads(condition, column)); // (and its checks)
             m.dropped.push(stored.clone());
             j!({"dropped": column})
         }
@@ -1556,6 +1559,25 @@ mod tests {
         assert!(lake.cat.get::<TableMeta>(&table_key("t")).await?.is_none(), "the job's own table was kept");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A database made before names starting `_` were refused is still listed in its folder, under its name, so it is
+    /// attached at start and opened by name as before; a new one with that name is refused (`database_name`). The
+    /// server's own folder (`_pondra`) has no catalog, so it is not listed.
+    #[tokio::test]
+    async fn an_old_underscore_database_is_listed_and_a_new_one_refused() -> Result<()> {
+        let folder = std::env::temp_dir().join(format!("pondra-lakes-{}", uuid::Uuid::new_v4()));
+        for name in ["_x", "ok", "_pondra"] {
+            std::fs::create_dir_all(folder.join(name))?;
+        }
+        std::fs::create_dir_all(folder.join("_x").join("catalog"))?;
+        std::fs::create_dir_all(folder.join("ok").join("catalog"))?;
+        let found = lakes_in(folder.to_str().unwrap()).await?;
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).collect();
+        std::fs::remove_dir_all(&folder)?;
+        assert_eq!(names, vec!["_x", "ok"], "listed as before #183; the server's own folder is not a database");
+        assert_eq!(crate::codes::of(&database_name("_x").unwrap_err()), "42602", "a new one is refused");
         Ok(())
     }
 

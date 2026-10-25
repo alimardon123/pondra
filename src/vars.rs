@@ -80,8 +80,8 @@ pub fn change(sql: &str) -> Option<Change> {
     static SET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(?:\$|set\s+\$|set\s+variable\s+\$?)([a-z_]\w*)\s*(?::=|=|\bto\b)\s*(.*?)\s*;?\s*$").expect("a regex"));
     static RESET: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^reset\s+(?:\$|variable\s+\$?)([a-z_]\w*)\s*;?\s*$").expect("a regex"));
     let s = crate::text::first_word(sql);
-    if !s.starts_with(['$', 'd', 'D', 's', 'S', 'r', 'R']) {
-        return None;
+    if !(s.starts_with('$') || matches!(crate::text::head(sql).as_str(), "declare" | "set" | "reset")) {
+        return None; // (the three regexes are for a statement that begins so: a query compiles none of them)
     }
     let some = |t: &str| Some(t.trim().to_string()).filter(|t| !t.is_empty());
     if let Some(c) = DECLARE.captures(s) {
