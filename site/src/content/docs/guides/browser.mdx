@@ -53,6 +53,10 @@ in the body.
 Tables are made, written and dropped as on a node. `PRIMARY KEY`, `UNIQUE`, `CHECK` and `VARCHAR(n)` refuse
 the rows a node refuses, with the same codes (`23505`, `23514`, `22001`).
 
+Views are made and dropped as on a node. A view reads its tables as they are when it is read, and it can read
+another view. `DROP TABLE` refuses a table that a view reads (`2BP01`), and `DROP TABLE … CASCADE` drops those views
+too. A kept page keeps its views.
+
 ## Files people give it
 
 A file put under `/files/` is read by its name, as on a node. It can be CSV, Parquet, JSON or Arrow:
@@ -70,7 +74,7 @@ input.onchange = async () => {
 file is deleted (`DELETE /files/orders.csv`). `GET /files/{name}` gives a file back with its `etag`. A `PUT` to a
 name that has a file is refused (`409`) unless it sends `If-Match` with that `etag`, and then it replaces the file
 only if nobody changed it since (`412` otherwise). `GET /objects` lists the page's tables with their rows and
-bytes.
+bytes, and its views.
 
 ## Keep tables across reloads
 
@@ -155,9 +159,9 @@ const page = new Page();
 ## What a page doesn't do yet
 
 <Aside>
-A page refuses these with `0A000`: views (`CREATE VIEW`), `ALTER TABLE`, transactions (`BEGIN`), `DECLARE`,
-`CREATE TYPE`, `MERGE` and `INSERT … ON CONFLICT`, identity columns, a table's past (`AT (VERSION => …)`), SQL
-functions and sequences. Users and grants, tasks, shares, secrets, backups, attached lakes and `COPY` are a node's,
-and a page refuses them the same way, saying where to do each. `DEFAULT` in `VALUES` and a row narrower than its
+A page refuses these with `0A000`: `ALTER TABLE`, transactions (`BEGIN`), `DECLARE`, `CREATE TYPE`, `MERGE` and
+`INSERT … ON CONFLICT`, identity columns, a table's past (`AT (VERSION => …)`), SQL functions and sequences. Users
+and grants, tasks, shares, secrets, backups, attached lakes, materialized views and `COPY` are a node's, and a page
+refuses them the same way, saying where to do each. `DEFAULT` in `VALUES` and a row narrower than its
 table fail with DataFusion's words.
 </Aside>

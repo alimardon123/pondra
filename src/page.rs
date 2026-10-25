@@ -34,9 +34,9 @@ use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DfStatement;
-use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, Insert, ObjectName, ObjectNamePart, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
+use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateView, Insert, ObjectName, ObjectNamePart, ObjectType, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, OnceLock, PoisonError};
 use std::task::Poll;
@@ -48,6 +48,8 @@ const FILES: &str = "/files/";
 const WORKING: &str = "mem:///files/";
 /// The folder a page's tables are kept in, beside `files/` in its store. SQL never reads it (`located`).
 const TABLES: &str = "tables";
+/// Where a kept page keeps its views, one file each (`view_at`).
+const VIEWS: &str = "views";
 /// The notes an Arrow file of a kept table carries: the table's name, a column's default as SQL text, and the CREATE TABLE
 /// text its rules are made from (`CREATE_KEY`, when the table has rules).
 const TABLE_KEY: &str = "pondra.table";
@@ -153,6 +155,7 @@ pub struct Page {
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
     unread: Vec<(String, String)>, // (the kept files `kept` couldn't read, each as its path and the words of why)
     ruled: std::sync::Mutex<HashMap<String, Ruled>>, // (each page table's rules, by its name: `Ruled`, kept with the table's file)
+    views: std::sync::Mutex<BTreeMap<String, String>>, // (each view's query, by its name: `view_statement`; a statement reads them through the front, `views_for`)
 }
 
 /// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), and that statement's text,
@@ -275,6 +278,12 @@ impl Page {
                 page.unread.push((object.location.to_string(), crate::codes::words(&e)));
             }
         }
+        let listed = page.files.list(Some(&Path::from(VIEWS))).try_collect::<Vec<_>>().await?;
+        for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".json")) {
+            if let Err(e) = page.view_back(&object.location).await {
+                page.unread.push((object.location.to_string(), crate::codes::words(&e)));
+            }
+        }
         Ok(page)
     }
 
@@ -315,7 +324,7 @@ impl Page {
         };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled: Default::default() }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled: Default::default(), views: Default::default() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -347,6 +356,9 @@ impl Page {
     /// its own is planned; a write is run and kept (`write`) before the next one is planned.
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let turn = self.keeping.lock().await;
+        if let Some(answer) = self.view_statement(text).await? {
+            return Ok(answer);
+        }
         let planned = match self.planned(text).await {
             Ok(planned) => planned,
             // (a node to ask: the node answers a statement the page can't plan, or can't expand over a node's table, and the page
@@ -387,7 +399,7 @@ impl Page {
     /// whole row of one, or its enum) is sent as written, and a page's own refusal, or a statement over its files, stands.
     /// Kept apart from sending, so the snapshot path (4k-5) branches here later.
     async fn outgoing(&self, text: &str, format: Option<&str>, missing: bool) -> anyhow::Result<Option<Outgoing>> {
-        let (expanded, raw) = match crate::front::expand(&PageHost(self), text, &HashMap::new()).await {
+        let (expanded, raw) = match crate::front::expand(&PageHost(self), text, &self.views_for(text, &[]).await?).await {
             Ok(_) if !missing => return Ok(None), // (the planner's or a rule's refusal over what the page has: the page's own answer)
             Ok(expanded) => (crate::asof::as_of(&expanded)?.into_owned(), false),
             // (a page's own refusal, and a statement over its files, keep the front's error: only the front makes a file's name the page's)
@@ -558,9 +570,15 @@ impl Page {
     /// another statement. The name of the page table it changes, if any (`touched`), comes back with the plan: `sql`
     /// keeps that table once the plan has run.
     async fn planned(&self, text: &str) -> anyhow::Result<Planned> {
+        self.planned_as(text, &[]).await
+    }
+
+    /// `planned`, with the views in `outer` left out of those the statement reads: a view's own query, planned as it is
+    /// made, doesn't read the view (`view_plans`).
+    async fn planned_as(&self, text: &str, outer: &[String]) -> anyhow::Result<Planned> {
         let row = crate::extension::row(text).transpose()?; // (DuckDB's INSTALL and LOAD: a row naming what happened, `extension.rs`)
         let text = row.as_deref().unwrap_or(text);
-        let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
+        let expanded = crate::front::expand(&PageHost(self), text, &self.views_for(text, outer).await?).await?;
         // (a page keeps no table's past, so `AT (…)` is refused by name: left alone, it would fail as an unknown table "at:…")
         if crate::past_names::mentioned(&expanded) {
             return Err(crate::codes::coded("0A000", format!("{}: a page keeps no table's past (a node reads a table as it was)", crate::past_names::spelled(&expanded))));
@@ -810,11 +828,15 @@ impl Page {
     /// keeps the table it leaves, or forgets a dropped one, over that same file, so the rows the file holds would be gone.
     /// Once the file is removed, the name is the page's again.
     async fn unwritable(&self, name: &str) -> anyhow::Result<()> {
-        let at = kept_at(name);
+        self.unread_there(name, &kept_at(name), "table").await
+    }
+
+    /// `unwritable` of the kept file at `at`, which holds the `what` (a table or a view) named `name`.
+    async fn unread_there(&self, name: &str, at: &Path, what: &str) -> anyhow::Result<()> {
         let Some((path, why)) = self.unread.iter().find(|(path, _)| path.as_str() == at.as_ref()) else { return Ok(()) };
-        match self.files.head(&at).await {
+        match self.files.head(at).await {
             Err(StoreError::NotFound { .. }) => Ok(()),
-            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the table can't be written until the file is removed"))),
+            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the {what} can't be written until the file is removed"))),
         }
     }
 
@@ -1140,8 +1162,249 @@ impl Page {
             }
             objects.push(object);
         }
+        for name in self.views.lock().unwrap_or_else(PoisonError::into_inner).keys() {
+            objects.push(json!({"catalog": "page", "schema": "public", "name": name, "kind": "view"}));
+        }
         Ok(Answer::ok(JSON, serde_json::to_vec(&json!({"objects": objects, "files": WORKING}))?))
     }
+}
+
+/// A page's views. DataFusion's own view keeps a plan made once, over the tables as they were then, and a page registers
+/// a table again after each write (`written`), so a page keeps each view's query as text (`views`) and the front reads it
+/// into each statement that names the view (`views_for`), as a node's front reads a request's own views.
+impl Page {
+    /// The page's view statements, answered here before anything is planned: CREATE VIEW and DROP VIEW, and the
+    /// statements a view's name changes (a DROP TABLE of a table a view reads, a CREATE TABLE or INSERT naming a view), in
+    /// a node's words. None for every other statement, and for one that doesn't parse, which the planner answers.
+    async fn view_statement(&self, text: &str) -> anyhow::Result<Option<Answer>> {
+        if !text.to_ascii_lowercase().contains("view") && self.views_held().is_empty() {
+            return Ok(None);
+        }
+        let Some(statement) = self.statement_of(text) else { return Ok(None) };
+        match statement {
+            SqlStatement::CreateView(c) if !c.materialized => self.create_view(c).await.map(Some),
+            SqlStatement::Drop { object_type: ObjectType::View, if_exists, names, cascade, .. } => self.drop_views(&names, if_exists, cascade).await.map(Some),
+            SqlStatement::Drop { object_type: ObjectType::Table, if_exists, names, cascade, .. } => {
+                for name in &names {
+                    if !if_exists {
+                        self.not_a_view(name, "no table ", "")?;
+                    }
+                    self.read_by(name, cascade).await?;
+                }
+                Ok(None)
+            }
+            SqlStatement::CreateTable(c) => self.not_a_view(&c.name, "", " is a view").map(|_| None),
+            SqlStatement::Insert(Insert { table: TableObject::TableName(name), .. }) => self.not_a_view(&name, "", " is a view: write to the tables it reads").map(|_| None),
+            _ => Ok(None),
+        }
+    }
+
+    /// `text` as one SQL statement, as written or once DuckDB's forms are made SQL that parses (`friendly::text`), or None.
+    fn statement_of(&self, text: &str) -> Option<SqlStatement> {
+        let parsed = self.parsed(text).ok().or_else(|| self.parsed(&crate::friendly::text(text).ok()?).ok());
+        match parsed? {
+            DfStatement::Statement(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// CREATE VIEW: the view's query, planned now as a statement would read it (`view_plans`), so a view that can't be read
+    /// is refused when it is made, then held and kept. A name a table or a view has is refused in a node's words; with IF
+    /// NOT EXISTS, an existing view is a node's answer and nothing changes.
+    async fn create_view(&self, c: CreateView) -> anyhow::Result<Answer> {
+        let name = self.view_name(&c.name)?;
+        if self.default_schema()?.1.table_exist(&name) {
+            anyhow::bail!("{name} is a table");
+        }
+        let exists = self.views_held().contains_key(&name);
+        if exists && c.if_not_exists {
+            return answered(json!({"name": name, "exists": true}));
+        }
+        if exists && !c.or_replace {
+            anyhow::bail!("view {name} already exists (CREATE OR REPLACE VIEW)");
+        }
+        let query = match c.columns.is_empty() {
+            true => c.query.to_string(),
+            false => {
+                let columns = c.columns.iter().map(|column| column.name.to_string()).collect::<Vec<_>>().join(", ");
+                format!("SELECT * FROM ({}) AS {}({columns})", c.query, crate::ext_names::quoted(&name))
+            }
+        };
+        self.view_plans(&name, &query).await?;
+        self.unread_there(&name, &view_at(&name), "view").await?;
+        self.keep_view(&name, Some(&query)).await?;
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).insert(name.clone(), query);
+        answered(json!({"view": name}))
+    }
+
+    /// Plans the query of the view `name` as a statement would read it, without the view itself. A page with a node refuses
+    /// a view over the node's tables by name: a page's view reads the page's own tables and files.
+    async fn view_plans(&self, name: &str, query: &str) -> anyhow::Result<()> {
+        match self.planned_as(query, &[name.to_string()]).await {
+            Ok(_) => Ok(()),
+            Err(e) if self.node.is_some() && crate::codes::of(&e) == "42P01" => Err(crate::codes::coded("0A000", format!("{name}: a page's view reads the page's own tables and files, and this one names a table the page doesn't have: make a page table of the node's rows first (CREATE TABLE … AS SELECT …)"))),
+            Err(e) => Err(e.context("the view's query")),
+        }
+    }
+
+    /// DROP VIEW, of each view named: it goes, and so does its kept file. A name with no view is refused in a node's words,
+    /// or with IF EXISTS answered as not dropped. A view another reads may go, as on a node; the other then fails when read,
+    /// unless CASCADE drops it too.
+    async fn drop_views(&self, names: &[ObjectName], if_exists: bool, cascade: bool) -> anyhow::Result<Answer> {
+        let mut answer = json!({});
+        for name in names {
+            let name = self.view_name(name)?;
+            if !self.views_held().contains_key(&name) {
+                anyhow::ensure!(if_exists, "no view {name}");
+                answer = json!({"view": name, "dropped": false});
+                continue;
+            }
+            if cascade {
+                self.cascade(&name, 0).await?;
+            }
+            self.forget_view(&name).await?;
+            answer = json!({"view": name, "dropped": true});
+        }
+        answered(answer)
+    }
+
+    /// A view that goes: its kept file, then the view.
+    async fn forget_view(&self, name: &str) -> anyhow::Result<()> {
+        self.unread_there(name, &view_at(name), "view").await?;
+        self.keep_view(name, None).await?;
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        Ok(())
+    }
+
+    /// A DROP TABLE of `table` while views read it is refused in a node's words (`ddl::drop_table`); with CASCADE, those
+    /// views go first, as a node drops them.
+    async fn read_by(&self, table: &ObjectName, cascade: bool) -> anyhow::Result<()> {
+        let table = self.table_ref(table)?.table().to_string();
+        let readers = self.readers(&table)?;
+        if readers.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            let listed = readers.iter().map(|view| format!("view {view}")).collect::<Vec<_>>().join(", ");
+            anyhow::bail!("{table} is read by {listed}: DROP TABLE {table} CASCADE drops them too, or drop them first");
+        }
+        self.cascade(&table, 0).await
+    }
+
+    /// CASCADE: the views that read `name` go, each after the views that read it, as a node drops them
+    /// (`routines::views_reading`).
+    async fn cascade(&self, name: &str, depth: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(depth < 16, "{name}: views that read views that read it, 16 deep: drop them by hand");
+        for view in self.readers(name)? {
+            if self.views_held().contains_key(&view) {
+                Box::pin(self.cascade(&view, depth + 1)).await?;
+                self.forget_view(&view).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The views whose queries name the page table or view `table`, in name order.
+    fn readers(&self, table: &str) -> anyhow::Result<Vec<String>> {
+        let state = self.ctx.state();
+        let options = state.config().options();
+        let (catalog, schema) = (&options.catalog.default_catalog, &options.catalog.default_schema);
+        let mut readers = vec![];
+        for (view, query) in self.views_held() {
+            let Some(statement) = self.statement_of(&query) else { continue };
+            let named = state.resolve_table_references(&DfStatement::Statement(Box::new(statement)))?;
+            if named.iter().any(|n| n.table() == table && n.schema().is_none_or(|s| s == schema) && n.catalog().is_none_or(|c| c == catalog)) {
+                readers.push(view);
+            }
+        }
+        Ok(readers)
+    }
+
+    /// Refuses `name` when a view has it: a node's words, `before` and `after` the name.
+    fn not_a_view(&self, name: &ObjectName, before: &str, after: &str) -> anyhow::Result<()> {
+        let name = self.table_ref(name)?.table().to_string();
+        match self.views_held().contains_key(&name) {
+            true => anyhow::bail!("{before}{name}{after}"),
+            false => Ok(()),
+        }
+    }
+
+    /// A view's name as the planner reads it, in the page's one schema; a name in another schema or catalog is refused by
+    /// name.
+    fn view_name(&self, name: &ObjectName) -> anyhow::Result<String> {
+        let reference = self.table_ref(name)?;
+        let state = self.ctx.state();
+        let options = state.config().options();
+        let here = reference.schema().is_none_or(|s| s == options.catalog.default_schema) && reference.catalog().is_none_or(|c| c == options.catalog.default_catalog);
+        match here {
+            true => Ok(reference.table().to_string()),
+            false => Err(crate::codes::coded("0A000", format!("{reference}: a page has one schema, public, so its views are made there"))),
+        }
+    }
+
+    /// The page's views, each name with its query: a copy, so no lock is held past it.
+    fn views_held(&self) -> BTreeMap<String, String> {
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The views `text` names, each as the front reads it (its own views read first, so a view may read another), by
+    /// every name a statement may give it (`v`, `public.v`, `page.public.v`): what the front puts in a statement's place
+    /// of each. `outer` are the views being read already, left out, so a view that names itself, or one that reads it,
+    /// is a missing table rather than a loop.
+    async fn views_for(&self, text: &str, outer: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut views = HashMap::new();
+        for (name, query) in self.views_held() {
+            if outer.contains(&name) || !crate::text::mentions(text, &name) {
+                continue;
+            }
+            let inner = [outer, &[name.clone()]].concat();
+            let read = Box::pin(self.views_for(&query, &inner)).await?;
+            let query = crate::front::expand(&PageHost(self), &query, &read).await?;
+            for key in [format!("page.public.{name}"), format!("public.{name}"), name] {
+                views.insert(key, query.clone());
+            }
+        }
+        Ok(views)
+    }
+
+    /// Keeps the view `name`'s query in a kept page's store (`view_at`), or with None forgets it. A page in memory keeps
+    /// nothing.
+    async fn keep_view(&self, name: &str, query: Option<&str>) -> anyhow::Result<()> {
+        if !self.keeps {
+            return Ok(());
+        }
+        let at = view_at(name);
+        match query {
+            Some(query) => {
+                let file = serde_json::to_vec(&json!({"name": name, "query": query}))?;
+                self.files.put_opts(&at, PutPayload::from(file), PutOptions { mode: PutMode::Overwrite, ..Default::default() }).await?;
+            }
+            None => match self.files.delete(&at).await {
+                Ok(()) | Err(StoreError::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(())
+    }
+
+    /// Reads the kept view at `at` back into the page. Nothing is planned: a view whose tables are gone fails when read.
+    async fn view_back(&self, at: &Path) -> anyhow::Result<()> {
+        let file = self.files.get(at).await?.bytes().await?;
+        let kept: serde_json::Value = serde_json::from_slice(&file).context("it is not a kept view")?;
+        let (Some(name), Some(query)) = (kept["name"].as_str(), kept["query"].as_str()) else { anyhow::bail!("it has no name and query, so it is not a kept view") };
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string(), query.to_string());
+        Ok(())
+    }
+}
+
+/// An answer of one JSON object, as a node answers a statement that isn't a query.
+fn answered(object: serde_json::Value) -> anyhow::Result<Answer> {
+    Ok(Answer::ok(JSON, serde_json::to_vec(&object)?))
+}
+
+/// Where a kept page keeps the view `name`: its name and query, as JSON.
+fn view_at(name: &str) -> Path {
+    Path::from_iter([VIEWS, format!("{name}.json").as_str()])
 }
 
 /// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
@@ -2656,6 +2919,73 @@ mod tests {
         assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
         let body = std::str::from_utf8(&got.body).unwrap();
         assert!(body.contains("orders AT (VERSION => 1)"), "{body}");
+    }
+
+    /// The text of an answer's body.
+    fn body(answer: &Answer) -> String {
+        String::from_utf8_lossy(&answer.body).into_owned()
+    }
+
+    /// A page keeps views as a node does: a view reads its tables as they are now (after an INSERT, and after CREATE OR
+    /// REPLACE TABLE), a view reads another, CREATE OR REPLACE changes it, and the refusals are a node's words. DROP TABLE of
+    /// a table a view reads is refused unless CASCADE, which drops the view.
+    #[tokio::test]
+    async fn a_page_keeps_views_over_its_tables_as_they_are_now() {
+        let page = Page::open(&Options::default());
+        let sql = |text: &str| page.request("POST", "/sql?format=csv", &[], text.to_string().into());
+        assert_eq!(sql("CREATE TABLE t (a INT, b VARCHAR)").await.status, 200);
+        assert_eq!(sql("INSERT INTO t VALUES (1, 'x'), (2, 'y')").await.status, 200);
+        let made = sql("CREATE VIEW v AS SELECT a FROM t WHERE a > 1").await;
+        assert_eq!((made.status, body(&made).as_str()), (200, r#"{"view":"v"}"#));
+        assert_eq!(body(&sql("SELECT count(*) AS n FROM v").await), "n\n1\n");
+        assert_eq!(sql("INSERT INTO t VALUES (3, 'z')").await.status, 200);
+        assert_eq!(body(&sql("SELECT count(*) AS n FROM v").await), "n\n2\n", "the view reads the rows the INSERT added");
+        assert_eq!(sql("CREATE VIEW w (n) AS SELECT count(*) FROM v").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n2\n");
+        assert_eq!(body(&sql("SELECT n FROM page.public.w").await), "n\n2\n");
+        assert_eq!(sql("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (5, 'q'), (6, 'r'), (7, 's')) AS x(a, b)").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n3\n", "the view reads the table made again");
+        assert_eq!(sql("CREATE OR REPLACE VIEW v AS SELECT a FROM t WHERE a > 6").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n1\n", "w reads v as it is now");
+        for (text, words) in [
+            ("CREATE VIEW v AS SELECT 1", "view v already exists (CREATE OR REPLACE VIEW)"),
+            ("CREATE VIEW t AS SELECT 1", "t is a table"),
+            ("CREATE TABLE v (a INT)", "v is a view"),
+            ("INSERT INTO v VALUES (1)", "v is a view: write to the tables it reads"),
+            ("DROP VIEW nov", "no view nov"),
+            ("DROP TABLE v", "no table v"),
+            ("DROP TABLE t", "t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"),
+        ] {
+            let got = sql(text).await;
+            assert_ne!(got.status, 200, "{text}");
+            assert_eq!(body(&got), words, "{text}");
+        }
+        assert!(body(&sql("CREATE VIEW bad AS SELECT * FROM nothere").await).starts_with("the view's query: "));
+        assert_eq!(body(&sql("CREATE VIEW IF NOT EXISTS v AS SELECT 2").await), r#"{"name":"v","exists":true}"#);
+        assert_eq!(body(&sql("DROP VIEW IF EXISTS nov").await), r#"{"view":"nov","dropped":false}"#);
+        let listed = page.request("GET", "/objects", &[], bytes::Bytes::new()).await;
+        assert_eq!(names_listed(&listed), ["t", "v", "w"]);
+        assert_eq!(sql("DROP TABLE t CASCADE").await.status, 200);
+        assert_eq!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["w"], "CASCADE dropped v, which read t");
+        assert_eq!(sql("SELECT n FROM w").await.status, 404, "w reads v, which is gone");
+        assert_eq!(body(&sql("DROP VIEW w").await), r#"{"view":"w","dropped":true}"#);
+    }
+
+    /// A kept page keeps its views, and a page opened on the same store reads them again.
+    #[tokio::test]
+    async fn a_kept_page_keeps_its_views() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        for text in ["CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) AS x(id)", "CREATE VIEW big AS SELECT id FROM t WHERE id > 1", "CREATE VIEW gone AS SELECT 1 AS one"] {
+            assert_eq!(a.request("POST", "/sql", &[], text.into()).await.status, 200, "{text}");
+        }
+        assert_eq!(a.request("POST", "/sql", &[], "DROP VIEW gone".into()).await.status, 200);
+        drop(a);
+        let b = Page::kept(&options).await.unwrap();
+        assert!(b.unread().is_empty(), "{:?}", b.unread());
+        assert_eq!(body(&b.request("POST", "/sql?format=csv", &[], "SELECT id FROM big ORDER BY id".into()).await), "id\n2\n3\n");
+        assert_eq!(names_listed(&b.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["t", "big"]);
     }
 
     /// The page's catalog is `page`, as `GET /objects` names it: a missing table's words say `page.public.…` (not

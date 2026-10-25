@@ -119,6 +119,7 @@ pub fn received(code: &str) -> Option<&'static str> {
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
     let has = |w: &str| t.contains(w);
+    let first_said = |w: &str| t.split_once(' ').is_some_and(|(_, rest)| rest.starts_with(w)); // (`v is a view…`: what a name is, said first)
     match () {
         _ if has("could not serialize") => "40001",                                             // serialization_failure
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
@@ -135,10 +136,12 @@ fn by_words(text: &str) -> &'static str {
         _ if has("inconsistent data length across values list") => "42601", // (a VALUES whose rows differ in width: Postgres says syntax_error too)
         _ if has("no field named") || has("column") && has("not found") || has("no column ") => "42703", // undefined_column
         _ if has("invalid function") || has("function") && (has("not found") || has("does not exist")) || has("no function ") => "42883", // undefined_function
-        _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
+        _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("no view ") || has("relation") && has("does not exist") => "42P01", // undefined_table
         _ if has("no schema ") || has("schema") && has("does not exist") => "3F000",            // invalid_schema_name
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
+        _ if has(" is read by ") => "2BP01",                                                     // dependent_objects_still_exist (DROP TABLE that a view or a task reads)
+        _ if first_said("is a view") || first_said("is a table") => "42809",                    // wrong_object_type (a view's name where a table's goes, or the other way)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
         _ if has("multiple primary keys") => "42P16",                                          // invalid_table_definition
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
@@ -236,6 +239,11 @@ mod tests {
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
+        assert_eq!(of("t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"), "2BP01");
+        assert_eq!(of("no view nov"), "42P01");
+        assert_eq!(of("v is a view: write to the tables it reads"), "42809");
+        assert_eq!(of("t is a table"), "42809");
+        assert_ne!(of("no topic t on this Pondra node: a topic is a table (CREATE TABLE t …)"), "42809"); // (said of a topic, not a name)
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
         assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");

@@ -908,7 +908,8 @@ impl VisitorMut for Expander<'_> {
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
             q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
-            let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(object(name)), columns: vec![], at: None }));
+            let shown = name.0.last().and_then(|part| part.as_ident()).map_or_else(|| object(name), crate::text::ident); // (`FROM page.public.v` reads as v, as in Postgres)
+            let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(shown), columns: vec![], at: None }));
             *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
             return ControlFlow::Continue(());
         }
