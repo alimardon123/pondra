@@ -294,7 +294,8 @@ impl Page {
 
     /// `open`, with its memory watch given: `open` reads the line from the settings, and a test gives a small one.
     fn with_watch(options: &Options, watch: Option<Watch>) -> Page {
-        let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1));
+        // (the page's catalog is `page`, as its host and `GET /objects` name it: an error then says `page.public.t`)
+        let mut config = SessionConfig::new().with_target_partitions(options.partitions.max(1)).with_default_catalog_and_schema("page", "public");
         // A page's Parquet strings are plain, as the files hold them: views were no faster in a page and held 230 MB
         // more at SF1 (measured in web-4g). The session's Parquet options are the ones a file read takes (`ext_names::file_format`).
         config.options_mut().execution.parquet.schema_force_view_types = false;
@@ -1816,9 +1817,9 @@ fn not_kept_as(what: &str) -> anyhow::Error {
 }
 
 /// The statements a page doesn't take yet, refused by name before anything is parsed (ADR-072: a form that can't do a thing
-/// says so, and says what to write instead). A transaction word, DECLARE, MERGE and the type statements each name what to
-/// write in its place; DataFusion's own words for them name nothing of the kind. Words are whole and read past comments, so
-/// a table named `merged` or a string `'begin'` is not one of them.
+/// says so, and says what to write instead). A transaction word, DECLARE, MERGE, the type statements and a node's own
+/// statements (users, tasks, shares, …) each name what to write in its place; DataFusion's own words for them name nothing
+/// of the kind. Words are whole and read past comments, so a table named `merged` or a string `'begin'` is not one of them.
 fn not_taken(sql: &str) -> anyhow::Result<()> {
     if let Some(word) = crate::text::control(sql) {
         return Err(crate::codes::coded("0A000", format!("a page has no transactions yet ({word}): each statement it runs is its own, so run them one at a time, or in a transaction on a node")));
@@ -1830,14 +1831,81 @@ fn not_taken(sql: &str) -> anyhow::Result<()> {
     if begins(&words, &["MERGE"]) {
         return Err(crate::codes::coded("0A000", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"));
     }
-    match TYPE_STATEMENTS.into_iter().find(|pattern| begins(&words, pattern)) {
-        Some(pattern) => Err(crate::codes::coded("0A000", format!("a page makes no types yet ({}): make the column text, or keep the type on a node", pattern.join(" ")))),
+    if let Some(pattern) = TYPE_STATEMENTS.into_iter().find(|pattern| begins(&words, pattern)) {
+        return Err(crate::codes::coded("0A000", format!("a page makes no types yet ({}): make the column text, or keep the type on a node", pattern.join(" "))));
+    }
+    match NODE_STATEMENTS.into_iter().find(|(pattern, _)| begins(&words, pattern)) {
+        Some((pattern, what)) => Err(crate::codes::coded("0A000", what.replace("{}", &pattern.join(" ")))),
         None => Ok(()),
     }
 }
 
 /// The words of the statements that make or drop a type, as `not_taken` reads them.
 const TYPE_STATEMENTS: [&[&str]; 4] = [&["CREATE", "TYPE"], &["CREATE", "OR", "REPLACE", "TYPE"], &["DROP", "TYPE"], &["ALTER", "TYPE"]];
+
+const NO_USERS: &str = "a page has no users or grants ({}): a page is one person's, so sign in to a node for users and grants";
+const NO_TASKS: &str = "a page runs no tasks ({}): tasks run on a node";
+const NO_SHARES: &str = "a page shares nothing ({}): share a table from a node";
+const NO_BACKUPS: &str = "a page has no backups ({}): a kept page's tables are in its folder; back up a node's database";
+const NO_LAKES: &str = "a page attaches no lakes ({}): read a lake's published tables with read_delta('https://…'), or attach the lake on a node";
+const NO_SECRETS: &str = "a page keeps no secrets ({}): whoever runs the page can read what it holds, so keep secrets on a node";
+const NO_SEQUENCES: &str = "a page has no sequences yet ({}): number rows with row_number() OVER (…), or keep the sequence on a node";
+const NO_FUNCTIONS: &str = "a page has no functions of its own yet ({}): write the expression into the query, or make the function on a node";
+const NO_PROCEDURES: &str = "a page has no procedures ({}): run the statements one at a time, or call the procedure on a node";
+const NO_COPY: &str = "a page has no COPY: put a file with PUT /files/{name} and read it by name, and ask /sql?format=csv (or parquet) for a file of an answer";
+const USE_SCHEMA: &str = "a page has one schema, public ({}): name the table itself, as page.public.t";
+const NO_SCHEMAS: &str = "a page has one schema, public ({}): make the tables there, or make databases and schemas on a node";
+const NO_COMMENTS: &str = "a page keeps no comments ({}): keep them on a node";
+const NO_MATERIALIZED_VIEWS: &str = "a page keeps no materialized views ({}): make a table of the query (CREATE TABLE … AS), or keep the view current on a node";
+
+/// A node's statements, which a page doesn't have: each pattern's words, and what the refusal says. `{}` is the statement's
+/// words as the pattern spells them (`CREATE USER`).
+const NODE_STATEMENTS: [(&[&str], &str); 44] = [
+    (&["CREATE", "USER"], NO_USERS),
+    (&["ALTER", "USER"], NO_USERS),
+    (&["DROP", "USER"], NO_USERS),
+    (&["CREATE", "ROLE"], NO_USERS),
+    (&["DROP", "ROLE"], NO_USERS),
+    (&["GRANT"], NO_USERS),
+    (&["REVOKE"], NO_USERS),
+    (&["CREATE", "TASK"], NO_TASKS),
+    (&["CREATE", "OR", "REPLACE", "TASK"], NO_TASKS),
+    (&["ALTER", "TASK"], NO_TASKS),
+    (&["DROP", "TASK"], NO_TASKS),
+    (&["EXECUTE", "TASK"], NO_TASKS),
+    (&["CREATE", "SHARE"], NO_SHARES),
+    (&["ALTER", "SHARE"], NO_SHARES),
+    (&["DROP", "SHARE"], NO_SHARES),
+    (&["CREATE", "RECIPIENT"], NO_SHARES),
+    (&["DROP", "RECIPIENT"], NO_SHARES),
+    (&["BACKUP"], NO_BACKUPS),
+    (&["RESTORE"], NO_BACKUPS),
+    (&["ATTACH"], NO_LAKES),
+    (&["DETACH"], NO_LAKES),
+    (&["CREATE", "SECRET"], NO_SECRETS),
+    (&["CREATE", "OR", "REPLACE", "SECRET"], NO_SECRETS),
+    (&["CREATE", "TEMPORARY", "SECRET"], NO_SECRETS),
+    (&["DROP", "SECRET"], NO_SECRETS),
+    (&["CREATE", "SEQUENCE"], NO_SEQUENCES),
+    (&["DROP", "SEQUENCE"], NO_SEQUENCES),
+    (&["CREATE", "FUNCTION"], NO_FUNCTIONS),
+    (&["CREATE", "OR", "REPLACE", "FUNCTION"], NO_FUNCTIONS),
+    (&["DROP", "FUNCTION"], NO_FUNCTIONS),
+    (&["CREATE", "PROCEDURE"], NO_PROCEDURES),
+    (&["CREATE", "OR", "REPLACE", "PROCEDURE"], NO_PROCEDURES),
+    (&["DROP", "PROCEDURE"], NO_PROCEDURES),
+    (&["CALL"], NO_PROCEDURES),
+    (&["COPY"], NO_COPY),
+    (&["USE"], USE_SCHEMA),
+    (&["CREATE", "DATABASE"], NO_SCHEMAS),
+    (&["DROP", "DATABASE"], NO_SCHEMAS),
+    (&["CREATE", "SCHEMA"], NO_SCHEMAS),
+    (&["DROP", "SCHEMA"], NO_SCHEMAS),
+    (&["COMMENT", "ON"], NO_COMMENTS),
+    (&["CREATE", "MATERIALIZED", "VIEW"], NO_MATERIALIZED_VIEWS),
+    (&["CREATE", "OR", "REPLACE", "MATERIALIZED"], NO_MATERIALIZED_VIEWS),
+    (&["DROP", "MATERIALIZED", "VIEW"], NO_MATERIALIZED_VIEWS),
+];
 
 /// Whether `words` begin with `pattern`'s words (`text::first_words` gives them upper-cased, as a pattern is written).
 fn begins(words: &[String], pattern: &[&str]) -> bool {
@@ -2514,6 +2582,10 @@ mod tests {
             "BEGIN", "begin transaction;", "START TRANSACTION", "COMMIT", "END", "ROLLBACK", "ROLLBACK TO SAVEPOINT a", "SAVEPOINT a",
             "RELEASE a", "/* {\"app\": \"dbt\"} */ commit;", "DECLARE $x = 1", "declare $mode = 'full'",
             "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "CREATE TYPE mood AS ENUM ('sad', 'ok')", "DROP TYPE mood",
+            "CREATE USER ann WITH PASSWORD 'x'", "grant select on t to ann", "CREATE TASK k SCHEDULE '1 minute' AS SELECT 1",
+            "CREATE SHARE s", "BACKUP DATABASE db TO 'x'", "ATTACH 'x' AS y", "CREATE SECRET s (TYPE s3)", "CREATE SEQUENCE q",
+            "CREATE FUNCTION g(x INT) RETURNS INT AS $$ SELECT x $$", "CALL p()", "COPY t TO 'x.csv'", "USE crm", "CREATE SCHEMA s",
+            "COMMENT ON TABLE t IS 'x'", "CREATE MATERIALIZED VIEW mv AS SELECT 1",
         ];
         for sql in refused {
             let got = page.request("POST", "/sql", &[], sql.into()).await;
@@ -2526,6 +2598,8 @@ mod tests {
             ("DECLARE $x = 1", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"),
             ("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"),
             ("CREATE TYPE mood AS ENUM ('sad', 'ok')", "a page makes no types yet (CREATE TYPE): make the column text, or keep the type on a node"),
+            ("CREATE USER ann WITH PASSWORD 'x'", "a page has no users or grants (CREATE USER): a page is one person's, so sign in to a node for users and grants"),
+            ("COPY t TO 'x.csv'", "a page has no COPY: put a file with PUT /files/{name} and read it by name, and ask /sql?format=csv (or parquet) for a file of an answer"),
         ] {
             let got = page.request("POST", "/sql", &[], sql.into()).await;
             assert_eq!(std::str::from_utf8(&got.body).unwrap(), words, "{sql}");
@@ -2535,6 +2609,8 @@ mod tests {
             "CREATE TABLE merged AS SELECT 1 AS declared",
             "SELECT declared FROM merged",
             "CREATE TABLE types AS SELECT 1 AS id",
+            "CREATE TABLE grants AS SELECT 1 AS copy",
+            "SELECT copy FROM grants",
         ] {
             assert_eq!(page.request("POST", "/sql", &[], sql.into()).await.status, 200, "{sql}");
         }
@@ -2580,6 +2656,18 @@ mod tests {
         assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
         let body = std::str::from_utf8(&got.body).unwrap();
         assert!(body.contains("orders AT (VERSION => 1)"), "{body}");
+    }
+
+    /// The page's catalog is `page`, as `GET /objects` names it: a missing table's words say `page.public.…` (not
+    /// DataFusion's `datafusion`), and a three-part name in it reads the page's table.
+    #[tokio::test]
+    async fn a_pages_catalog_is_page() {
+        let page = page_with_tables().await;
+        let missing = page.request("POST", "/sql", &[], "SELECT * FROM nope".into()).await;
+        assert_eq!(missing.status, 404);
+        assert!(String::from_utf8_lossy(&missing.body).contains("'page.public.nope'"), "{}", String::from_utf8_lossy(&missing.body));
+        let whole = page.request("POST", "/sql?format=csv", &[], "SELECT count(*) AS n FROM page.public.orders".into()).await;
+        assert_eq!((whole.status, String::from_utf8_lossy(&whole.body).as_ref()), (200, "n\n3\n"));
     }
 
     #[tokio::test]

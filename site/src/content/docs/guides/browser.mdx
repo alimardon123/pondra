@@ -1,0 +1,163 @@
+---
+title: Pondra in a browser
+description: Run SQL inside a web page with no server, on files people drop, tables kept across reloads, a lake's tables over the web, and a node for the rest.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A page is Pondra's engine built for WebAssembly. It runs in a browser tab, or in Node, on one thread, with no
+server. It takes the requests a node takes and gives the answers a node gives: `POST /sql`, files under
+`/files/`, and `GET /objects`. SQL means the same on a page as on a node. What a page can't do, it refuses by name
+with the node's SQLSTATE.
+
+## Get the module
+
+The module is two files, `pondra_web.js` and `pondra_web_bg.wasm`. Each release carries them in
+`pondra-web.tar.gz`:
+
+```bash norun
+curl -LO https://github.com/alimardon123/pondra/releases/latest/download/pondra-web.tar.gz
+tar xzf pondra-web.tar.gz
+```
+
+Serve both files from your site, side by side. To build them from the source instead, run
+`bash tools/web_build.sh`, which writes them to `web/pkg/`. It needs Rust's `wasm32-unknown-unknown` target and
+`wasm-bindgen`'s command line.
+
+## A page
+
+```js norun
+import init, { Page } from './pondra_web.js';
+
+await init(); // (loads pondra_web_bg.wasm from beside the module)
+const page = new Page();
+
+async function sql(text, format = 'csv') {
+  const answer = await page.request('POST', `/sql?format=${format}`, {}, text);
+  const body = new TextDecoder().decode(answer.body);
+  if (answer.status !== 200) throw new Error(`${answer.headers['x-pondra-sqlstate']}: ${body}`);
+  return body;
+}
+
+await sql('CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10))');
+await sql("INSERT INTO t VALUES (1, 'tea'), (2, 'cake')");
+console.log(await sql('SELECT * FROM t ORDER BY id'));
+```
+
+`page.request(method, path, headers, body)` is one request, as to a node. `headers` is a plain object, and `body`
+is text, bytes (a `Uint8Array` or an `ArrayBuffer`) or nothing. The answer is `{status, headers, body}`, with
+`body` as a `Uint8Array`. `format=` is a node's: `json` (the default), `csv`, `ndjson` or `arrow`, among others
+([HTTP API](/pondra/reference/http/)). An error answer carries its SQLSTATE in `x-pondra-sqlstate` and its words
+in the body.
+
+Tables are made, written and dropped as on a node. `PRIMARY KEY`, `UNIQUE`, `CHECK` and `VARCHAR(n)` refuse
+the rows a node refuses, with the same codes (`23505`, `23514`, `22001`).
+
+## Files people give it
+
+A file put under `/files/` is read by its name, as on a node. It can be CSV, Parquet, JSON or Arrow:
+
+```js norun
+const input = document.querySelector('input[type=file]');
+input.onchange = async () => {
+  const file = input.files[0];
+  await page.request('PUT', `/files/${file.name}`, {}, await file.arrayBuffer());
+  console.log(await sql(`SELECT count(*) AS n FROM '${file.name}'`));
+};
+```
+
+`CREATE TABLE orders AS FROM 'orders.csv'` copies a file into a table of the page's own, which stays when the
+file is deleted (`DELETE /files/orders.csv`). `GET /files/{name}` gives a file back with its `etag`. A `PUT` to a
+name that has a file is refused (`409`) unless it sends `If-Match` with that `etag`, and then it replaces the file
+only if nobody changed it since (`412` otherwise). `GET /objects` lists the page's tables with their rows and
+bytes.
+
+## Keep tables across reloads
+
+`new Page()` holds its tables in memory, so they are gone when the tab closes. `Page.kept()` keeps them in the
+site's private file system in the browser (OPFS), so a reload finds them again:
+
+```js norun
+const page = await Page.kept('pondra'); // (the folder: 'pondra' when none is given)
+for (const { file, why } of page.unread()) console.warn(`left out ${file}: ${why}`);
+```
+
+- A folder belongs to one page at a time. Another tab, or another page in this tab, that asks for the same
+  folder is refused until `page.free()` is called or the tab closes or reloads. Give another page another folder.
+- A kept file the page couldn't read is left as it is, and `page.unread()` names it and says why. The page opens
+  with the tables it could read. A write to the left-out table is refused (`55000`) while its file is there.
+  Clearing the site's data in the browser removes it.
+- Where there is no OPFS (Node, or a browser without it), `Page.kept` rejects before it reads anything.
+
+## A lake's tables over the web
+
+A lake's [published Delta tables](/pondra/guides/other-engines/) are files that any web server can serve. A
+page reads them with `read_delta`, at their latest version or at any earlier one. It opens only the files that a
+filter's ranges need:
+
+```sql norun
+SELECT * FROM read_delta('https://data.example.com/lake/orders') WHERE id = 7;
+SELECT count(*) FROM read_delta('https://data.example.com/lake/orders', version => 3);
+```
+
+A single file reads by its URL, as in `FROM 'https://data.example.com/orders.parquet'`. The web server must allow
+the page's origin (CORS). A read from the end of a file also needs it to expose `Content-Range`
+(`Access-Control-Expose-Headers: Content-Range`), and the page names the header when it can't see it.
+
+## A page with a node
+
+Given a node, a page answers the tables it has and asks the node for the rest:
+
+```js norun
+const page = new Page({ node: 'https://pondra.example.com', token });
+await sql(`SELECT o.id, sum(s.amount) AS total
+           FROM orders o JOIN sales s ON s.id = o.id GROUP BY o.id`);
+```
+
+Here `orders` is the page's own table and `sales` is the node's. The page sends the rows of its tables with the
+query, and the node answers. It sends at most `web_send_mb` (64 MB), and refuses a bigger query with `54000`
+before sending anything. `CREATE TABLE copy AS SELECT * FROM sales` makes a page table from the node's rows.
+
+- The page refuses a write into the node's tables and a query that joins a file with them (`0A000`). Make a
+  table of the file first.
+- The node must name the page's origin in [`PONDRA_WEB_ORIGINS`](/pondra/reference/environment/).
+- Give the page the token of the person using it, never a shared one, since whoever runs the page can read it.
+
+## Memory and settings
+
+A page stops the query that grows it past its memory line with `53200`, rather than let the tab crash. The line
+is `memory_max_gb` if given. Otherwise it is three eighths of the device's memory when the browser says it
+(`navigator.deviceMemory`), 1 GB on a phone or tablet whose browser doesn't say it, and 3 GB anywhere else. A
+node's answer that is bigger than the room the page has left is refused the same way, before it is read.
+
+Every key of the options other than `node` and `token` is a setting, named as in
+[Environment](/pondra/reference/environment/) without `PONDRA_` and in lower case:
+
+```js norun
+const page = new Page({ memory_max_gb: 1, web_send_mb: 16 });
+```
+
+Settings belong to the module, not to one page. The first page given any fixes them, and a later page given
+other values is refused by name.
+
+## In Node
+
+The same module runs in Node, given the bytes of its `.wasm` file:
+
+```js norun
+import { readFile } from 'node:fs/promises';
+import init, { Page } from './pondra_web.js';
+
+await init({ module_or_path: await readFile('pondra_web_bg.wasm') });
+const page = new Page();
+```
+
+## What a page doesn't do yet
+
+<Aside>
+A page refuses these with `0A000`: views (`CREATE VIEW`), `ALTER TABLE`, transactions (`BEGIN`), `DECLARE`,
+`CREATE TYPE`, `MERGE` and `INSERT … ON CONFLICT`, identity columns, a table's past (`AT (VERSION => …)`), SQL
+functions and sequences. Users and grants, tasks, shares, secrets, backups, attached lakes and `COPY` are a node's,
+and a page refuses them the same way, saying where to do each. `DEFAULT` in `VALUES` and a row narrower than its
+table fail with DataFusion's words.
+</Aside>

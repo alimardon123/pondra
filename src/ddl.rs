@@ -77,9 +77,17 @@ pub fn database_name(name: &str) -> Result<()> {
 }
 
 /// This lake's own name in three-part names: its folder's (or prefix's) last part (`mylake` of
-/// `D:\data\mylake` too).
+/// `D:\data\mylake` too), and `memory` for a lake held in this process's memory, as DuckDB names its own.
 pub fn lake_name(lake: &Lake) -> String {
-    lake.url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("lake").to_lowercase()
+    name_of(&lake.url)
+}
+
+/// `lake_name` of a lake at `url`. A lake in memory is `memory://<id>`, whose id would show in every name and error.
+fn name_of(url: &str) -> String {
+    if crate::memory::in_memory(url) {
+        return "memory".into();
+    }
+    url.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or("lake").to_lowercase()
 }
 
 /// A table or view of a lake or one attached to it, as `pondra.tables`, the shell's `.tables` and
@@ -1523,6 +1531,15 @@ fn reads(lake: &Lake, sql: &str, t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lake's name is its folder's or prefix's last part, in lower case; a lake in memory is `memory`, not its id.
+    #[test]
+    fn a_lakes_name_is_its_folders_and_memory_for_one_in_memory() {
+        assert_eq!(name_of("/data/MyLake/"), "mylake");
+        assert_eq!(name_of("D:\\data\\mylake"), "mylake");
+        assert_eq!(name_of("s3://bucket/shop"), "shop");
+        assert_eq!(name_of("memory://2965062e0e8442ce87cf27d8a2c4f13e"), "memory");
+    }
 
     /// A failed `CREATE TABLE … AS SELECT` drops only the table its own job made: the leader checks `made_by` under the lake's
     /// lock, so another statement's table under the name stays, and the job's own table goes.
