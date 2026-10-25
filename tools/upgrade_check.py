@@ -19,6 +19,8 @@
       lake is on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py), where a
       follower's flush is always in flight.
 
+  upgrade_check.py lakes,format (any of lakes, format, drain, rolling, comma-separated; all of them by default)
+
 Prints the checks as JSON and exits 1 if one fails (a failing release's lakes and node logs are
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
 (deltalake, pyiceberg); without them those checks are skipped, and say so.
@@ -1050,7 +1052,7 @@ def run(name, results, f, *args):
 def main():
     global A
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("what", nargs="?", default="all", choices=["lakes", "format", "drain", "rolling", "all"])
+    ap.add_argument("what", nargs="?", default="all", help="any of lakes, format, drain, rolling (comma-separated), or all")
     ap.add_argument("--new", default=os.path.join(HERE, "..", "target", "release", "pondra"), help="this build's binary")
     ap.add_argument("--from", dest="first", default="0.22.0", help="the oldest release whose lake must open")
     ap.add_argument("--only", default="", help="these releases only (comma-separated); `rolling` upgrades the newest of them")
@@ -1060,22 +1062,25 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="what each check measured, passed or not")
     ap.add_argument("--s3", action="store_true", help="`drain`'s cluster on s3://$PONDRA_BUCKET (AWS_* point at R2, MinIO or tools/sim_r2.py)")
     A = ap.parse_args()
+    parts = {"lakes", "format", "drain", "rolling"} if A.what == "all" else set(A.what.split(","))
+    if unknown := parts - {"lakes", "format", "drain", "rolling"}:
+        ap.error(f"no such check: {', '.join(sorted(unknown))}")
     new_bin = os.path.abspath(A.new)
     work = A.work or tempfile.mkdtemp(prefix="pondra-upgrade-")
     os.makedirs(work, exist_ok=True)
     wanted = [v for v in A.only.split(",") if v]
-    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted] if A.what in ("lakes", "format", "rolling", "all") else []
+    found = [(v, url) for v, url in releases(A.first) if not wanted or v in wanted] if parts & {"lakes", "format", "rolling"} else []
     out, ok = {}, True
-    if A.what in ("lakes", "all"):
+    if "lakes" in parts:
         out["lakes"] = {}
         for v, url in found:
             ok &= run(v, out["lakes"], lake_check, v, binary(v, url, A.cache), new_bin, work, A.port)
         ok &= bool(found)
-    if A.what in ("format", "all"):
+    if "format" in parts:
         ok &= run("format", out, format_check, new_bin, work, A.port, (found[-1][0], binary(*found[-1], A.cache)) if found else None)
-    if A.what in ("drain", "all"):
+    if "drain" in parts:
         ok &= run("drain", out, drain_check, new_bin, work, A.port)
-    if A.what in ("rolling", "all"):
+    if "rolling" in parts:
         v, url = found[-1]
         out["rolling"] = {}
         for first in ("followers", "leader"):
