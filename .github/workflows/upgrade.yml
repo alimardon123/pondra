@@ -4,7 +4,9 @@
 # of the newest release is upgraded to this build a node at a time under load
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
 # branch databases on disk and in a bucket (tools/environments_check.py, ADR-047); a project in Git
-# deployed to them (tools/project_check.py); Git folders (tools/git_check.py, ADR-060 §8); backups (tools/backup_check.py, ADR-070). In two halves side by side: the releases' checks, and the rest.
+# deployed to them (tools/project_check.py); Git folders (tools/git_check.py, ADR-060 §8); backups (tools/backup_check.py, ADR-070).
+# In three parts side by side: the releases' checks, the bucket's (a leader on simulated R2, branches in a bucket),
+# and the rest.
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
 # the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
@@ -27,8 +29,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # (two halves side by side, about six minutes each on a runner)
-        part: [releases, "past, branches, a bucket"]
+        # (side by side: on 10-25 the releases took 8.8 minutes, the bucket 6.7 and the rest 6.0, which with the
+        # bucket's took 12.6 minutes, the train's longest job)
+        part: [releases, "past, branches", "a bucket"]
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
@@ -59,37 +62,37 @@ jobs:
           set -o pipefail   # (the check's exit status, not tee's)
           python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
       - name: A table's past (UNDROP, retention)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/history_check.py --new target/release/pondra --work "$RUNNER_TEMP/history" | tee history.json
       - name: Branch databases (CREATE DATABASE dev CLONE prod)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
       - name: Branches across servers (ATTACH … READ_ONLY, GRANT CLONE; two buckets behind gates)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/environments_check.py --across --new target/release/pondra --work "$RUNNER_TEMP/environments-across" | tee environments-across.json
       - name: A project in Git made true in a database (pondra plan, deploy, branch, diff)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/project_check.py --new target/release/pondra --work "$RUNNER_TEMP/project" | tee project.json
       - name: Git folders (git_checkout, commit, pull, pull request against a stand-in GitHub)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/git_check.py --new target/release/pondra --work "$RUNNER_TEMP/git" | tee git.json
       - name: Backups (BACKUP DATABASE, RESTORE DATABASE, pondra backup and restore)
-        if: matrix.part != 'releases'
+        if: matrix.part == 'past, branches'
         run: |
           set -o pipefail
           python3 tools/backup_check.py --new target/release/pondra --work "$RUNNER_TEMP/backup" | tee backup.json
       - name: A leader stopped on a bucket (simulated R2) hands over at once; branches in a bucket
-        if: matrix.part != 'releases'
+        if: matrix.part == 'a bucket'
         run: |
           set -o pipefail
           python3 tools/sim_r2.py --port 9000 > "$RUNNER_TEMP/sim_r2.log" 2>&1 &
