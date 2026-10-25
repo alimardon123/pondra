@@ -66,19 +66,35 @@ impl Table {
 
     /// Does the table enforce a UNIQUE constraint (`constraints::checked`)?
     pub fn checked(&self) -> bool { !self.unique.is_empty() }
+
+    /// Does any column have a DEFAULT? Only then does a loading door work out which rows left a column out.
+    pub fn fills(&self) -> bool { self.columns.iter().any(|c| c.default.is_some()) }
+
+    /// The columns a loading door's rows left out, for `shape`: none when no column has a DEFAULT (`fills`), else each column
+    /// with a DEFAULT that `given` doesn't name (by SQL's name).
+    pub fn left_out(&self, given: &[String]) -> LeftOut {
+        match self.fills() {
+            true => LeftOut::Columns(self.columns.iter().filter(|c| c.default.is_some() && !given.contains(&c.name)).map(|c| c.name.clone()).collect()),
+            false => LeftOut::None,
+        }
+    }
+
+    /// Do rows `shape` made for `a` meet `b`'s rules as they are? The same `Arc` does, and so does an equal `Table` built
+    /// apart. `Table` is `PartialEq`, not `Eq`, so the pointer test is explicit.
+    pub fn same(a: &Arc<Table>, b: &Arc<Table>) -> bool { Arc::ptr_eq(a, b) || **a == **b }
 }
 
 /// A write's rows as they come: by position (`INSERT INTO t VALUES …`), by name with the columns or rows that left a column
 /// out (`LeftOut`, a loading door's), or whole, in the table's columns already (an UPDATE's or MERGE's new versions).
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum Rows {
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Positional(RecordBatch),
     Named(RecordBatch, LeftOut),
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Whole(RecordBatch),
 }
 
 /// Which rows left a column out, so its DEFAULT fills them: none, every row of these columns, or the rows each mask says.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum LeftOut {
     None,
     Columns(Vec<String>),
@@ -86,21 +102,21 @@ pub enum LeftOut {
 }
 
 /// What the rows are for: a plain INSERT, a loading door's rows, or an UPDATE's or MERGE's new versions.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum How {
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Insert,
     Load,
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Change,
 }
 
 /// Rows `shape` made, and the table they were made for: only `rules` makes one.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
+#[derive(Clone)]
 pub struct Shaped {
     rows: RecordBatch,
     table: Arc<Table>,
 }
 
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 impl Shaped {
     /// The rows, as the table holds them.
     pub fn rows(&self) -> &RecordBatch { &self.rows }
@@ -115,7 +131,6 @@ impl Shaped {
 /// What a form gives the rules that only it has: the session a CHECK is planned in, and a DEFAULT's values.
 pub trait Host: Sync {
     /// The session a CHECK is planned in (a node's `defaults::BASE`).
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
     fn base(&self) -> &SessionContext;
 
     /// `n` values of a DEFAULT, `expr` as SQL writes it, each row its own (`uuid()`, `nextval('t_id_seq')`): the rules
@@ -126,7 +141,7 @@ pub trait Host: Sync {
 /// `rows` with each column's DEFAULT in the rows a write left the column out of: `left_out(column)` says which (None: none).
 /// A column with no DEFAULT is not asked about, since `left_out` may be costly. Each value is cast to the column's type.
 pub async fn fill<H: Host>(t: &Table, rows: RecordBatch, left_out: impl Fn(&str) -> Option<BooleanArray>, host: &H) -> Result<RecordBatch> {
-    if t.columns.iter().all(|c| c.default.is_none()) || rows.num_rows() == 0 {
+    if !t.fills() || rows.num_rows() == 0 {
         return Ok(rows);
     }
     let n = rows.num_rows();
@@ -199,7 +214,6 @@ pub fn checked(t: &Table, name: &str, rows: RecordBatch, sql_names: bool, base: 
 /// A write's rows, shaped for the table they go into, in the order every door runs them (§3 of the design, steps 1 to 8):
 /// fitted to the table's columns, DEFAULTs for the columns a row left out, held forms written and checked, and, for a plain
 /// INSERT into a keyed table, no key given twice. `name` is the table's, for the refusals' words.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub async fn shape<H: Host>(t: &Arc<Table>, name: &str, rows: Rows, how: How, host: &H) -> Result<Shaped> {
     let rows = match rows {
         Rows::Positional(batch) => {
@@ -326,6 +340,38 @@ mod tests {
         assert!(!table(&["id"], vec![(plain("id"), DataType::Int64)], &[]).checked());
         let unique = Table { unique: vec![("a_key".into(), vec!["a".into()])], ..table(&[], vec![(plain("a"), DataType::Int64)], &[]) };
         assert!(unique.checked());
+    }
+
+    #[test]
+    fn a_table_fills_only_when_a_column_has_a_default() {
+        assert!(keyed().fills());
+        assert!(!guarded().fills());
+    }
+
+    #[test]
+    fn left_out_names_the_defaults_a_write_leaves_out() {
+        assert!(matches!(guarded().left_out(&["id".to_string()]), LeftOut::None), "no DEFAULT: nothing to fill");
+        let t = keyed(); // (v's DEFAULT is 7)
+        assert!(matches!(t.left_out(&["id".to_string()]), LeftOut::Columns(c) if c == vec!["v".to_string()]), "left out: listed");
+        assert!(matches!(t.left_out(&["id".to_string(), "v".to_string()]), LeftOut::Columns(c) if c.is_empty()), "given: not listed");
+    }
+
+    #[test]
+    fn rows_shaped_for_a_table_meet_the_same_table_or_an_equal_one() {
+        let a = Arc::new(keyed());
+        assert!(Table::same(&a, &a.clone()), "the same Arc");
+        assert!(Table::same(&a, &Arc::new(keyed())), "an equal table, built apart");
+        let mut null = keyed();
+        null.columns.iter_mut().find(|c| c.name == "v").unwrap().not_null = true;
+        let mut check = keyed();
+        check.checks.push(("v_pos".into(), "v > 0".into()));
+        for changed in [null, check] {
+            assert!(!Table::same(&a, &Arc::new(changed)), "a NOT NULL or a CHECK added is a change");
+        }
+        let typed = Arc::new(typed_table());
+        let mut label = typed_table();
+        label.columns.iter_mut().find(|c| c.name == "e").unwrap().labels.as_mut().unwrap().1.push("ok".into());
+        assert!(!Table::same(&typed, &Arc::new(label)), "a label added is a change");
     }
 
     #[tokio::test]

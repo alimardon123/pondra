@@ -590,10 +590,10 @@ impl Backend {
         if other.is_some() {
             return refuse("COPY into an attached lake: INSERT INTO it instead");
         }
-        let meta = self.app.lake.cat.meta(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.logical();
+        let rules = self.app.lake.cat.meta(&crate::store::table_key(&table)).await.map_err(user_error)?.ok_or_else(|| user_error(anyhow::anyhow!("no table {table}")))?.rules().map_err(user_error)?;
         // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
-        crate::auth::check_changes(&table, !meta.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
-        let n = if c.columns.is_empty() { meta.columns.iter().filter(|(c, _)| c != "_deleted").count() } else { c.columns.len() };
+        crate::auth::check_changes(&table, !rules.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
+        let n = if c.columns.is_empty() { rules.width() } else { c.columns.len() };
         COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
     }
@@ -620,8 +620,8 @@ impl Backend {
         // (both formats read Postgres's UTF-8 only: a chunk that isn't is refused before any line is read)
         let text = crate::pg_bytea::checked_utf8(&chunk).map_err(|b| err(crate::codes::coded(b.code, b.message)))?;
         let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
-        let table = crate::answer::schema(&meta.logical_columns()).map_err(err)?; // (SQL's names: ADR-022)
         let rules = meta.rules().map_err(err)?;
+        let table = rules.schema.clone(); // (SQL's names: ADR-022)
         let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() });
@@ -644,15 +644,13 @@ impl Backend {
                 continue;
             }
             let b = crate::pg_copy::typed(cols, &schema).map_err(err)?;
-            // the table's columns in its order, those not given their DEFAULT, or null
-            let cols = table.fields().iter().map(|f| b.column_by_name(f.name()).cloned().unwrap_or_else(|| datafusion::arrow::array::new_null_array(f.data_type(), b.num_rows()))).collect();
-            let b = RecordBatch::try_new(table.clone(), cols).map_err(|e| err(e.into()))?;
             let b = crate::rules::typed::spelled(&rules, b, true).map_err(err)?; // (`'A0EE…'` in a uuid column as Postgres reads it)
-            let b = crate::defaults::fill(&self.app.lake, &meta, b.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await.map_err(err)?;
-            p.rows += b.num_rows() as u64;
+            let left_out = rules.left_out(&given); // (the columns not given take their DEFAULT, or are null)
+            let shaped = crate::rules::shape(&rules, &p.copy.table, crate::rules::Rows::Named(b, left_out), crate::rules::How::Load, &crate::defaults::Node(&self.app.lake)).await.map_err(err)?;
+            p.rows += shaped.rows().num_rows() as u64;
             p.seq += 1;
             let src = crate::log::Src { producer: format!("copy:{}", p.job), seq: p.seq, prev: None };
-            self.app.log().map_err(err)?.append(p.copy.table.clone(), src, b).await.map_err(err)?;
+            self.app.log().map_err(err)?.append_shaped(p.copy.table.clone(), src, shaped).await.map_err(err)?;
         }
         Ok(())
     }

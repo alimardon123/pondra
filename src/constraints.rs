@@ -353,14 +353,11 @@ fn lock_of(lake: &Arc<Lake>) -> Option<Arc<tokio::sync::Mutex<()>>> {
     found
 }
 
-/// A checked append a loading door queues, for a table with an enforced UNIQUE (`Log::queue` calls
-/// this in place of its own path, which such a table's rows never take). The future answers once the
-/// leader has committed the rows (`leader`), or refused them. The guard of `TURN` is taken when the
-/// future is first polled: a producer that awaits its batches in order (Flight, Kafka) sends them in
-/// order, one answered before the next goes.
-pub fn queue(lake: Arc<Lake>, meta: &Arc<TableMeta>, table: String, src: Src, batch: RecordBatch) -> Result<impl Future<Output = Result<Ack>> + use<>> {
-    let rules = meta.rules()?;
-    let batch = crate::rules::checked(&rules, &table, batch, true, crate::defaults::base())?; // (NOT NULL, refused here as the plain path refuses it, not after a round trip; jsonb in its own form)
+/// An append a loading door queues, for a table with an enforced UNIQUE (`Log::queued` calls this in place of its own
+/// path, which such a table's rows never take, once it has checked the rows). The future answers once the leader has
+/// committed the rows (`leader`), or refused them. The guard of `TURN` is taken when the future is first polled: a
+/// producer that awaits its batches in order (Flight, Kafka) sends them in order, one answered before the next goes.
+pub fn queue(lake: Arc<Lake>, table: String, src: Src, batch: RecordBatch) -> Result<impl Future<Output = Result<Ack>> + use<>> {
     crate::metrics::add(&crate::metrics::ROWS_IN, batch.num_rows() as u64);
     let to = lake.to.get().cloned().ok_or_else(|| anyhow::anyhow!("no leader for {table} yet"))?;
     Ok(async move {

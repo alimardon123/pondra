@@ -11,17 +11,8 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast;
 use serde_json::{json, Value};
 
-/// Refuse rows that leave a NOT NULL column empty. `rows` are under SQL's names; `meta` is as
-/// stored. A delete marker (`_deleted`) carries only its key, and passes.
-pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> {
-    if !ruled(meta) || rows.num_rows() == 0 {
-        return Ok(());
-    }
-    crate::rules::checks(&meta.to_rules()?, table, rows, true, &BASE)
-}
-
-/// What a door runs on rows it is about to keep: written as the table holds them (`rules::typed::as_held`), then checked as
-/// `check` does, with each column as the table holds it.
+/// What a write runs on rows it is about to keep: `rules::checked` over the table's rules (the held forms written, then the
+/// checks), with each column as the table holds it.
 pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
     if !ruled(meta) || rows.num_rows() == 0 {
         return Ok(rows);
