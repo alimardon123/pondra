@@ -34,7 +34,6 @@ mod front;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
 mod friendly;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the set functions' rewrite: a node's door calls it)
 mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
@@ -49,15 +48,12 @@ mod pg_json;
 mod pg_json_make;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_json_edit;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_json_sets;
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
 mod pg_text;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
 mod pg_oids;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the visitor that rewrites a statement's casts is a node's until the front runs it)
 mod pg_casts;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front calls it in every form from F4: designs/l2-front-asks.md)
 mod pg_trace;
 pub mod pg_bytea;
 mod optimize;

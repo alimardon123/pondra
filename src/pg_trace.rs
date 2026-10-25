@@ -66,6 +66,7 @@ pub enum Ty {
 
 impl Ty {
     /// The type a `sql_types` entry names, if the port names it (a `varchar(n)` isn't one).
+    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (a stored type's name: only a node keeps them)
     pub fn of(sql_type: &str) -> Option<Ty> {
         match sql_type {
             "uuid" => Some(Ty::Uuid),
@@ -92,8 +93,8 @@ pub(crate) type Cols = Vec<(String, Option<Ty>)>;
 /// view here, so its columns are unknown).
 pub(crate) type Known = HashMap<String, Option<Cols>>;
 
-/// What Postgres reads by a uuid's type, read so where SQL comes in, at every door (a node's rewrite calls it today, the
-/// front in every form from F4): a string compared with a uuid, or written into a uuid column (`VALUES`, `SET`), is a
+/// What Postgres reads by a uuid's type, read so where SQL comes in, at every door (the front calls it in every form:
+/// `pg_casts::rewrite`): a string compared with a uuid, or written into a uuid column (`VALUES`, `SET`), is a
 /// uuid (`id = 'A0EE…'` finds `a0ee…`, as the column holds it, and `SET id = 'A0EE…'` writes it so), and
 /// `pg_typeof(x)` of one is 'uuid' (the planner sees text). A string compared with a jsonb column is read as
 /// jsonb's text (`doc = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`, and `doc = '1e2'` finds 100), and one that
