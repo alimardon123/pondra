@@ -11,8 +11,9 @@ use crate::codes::coded;
 use anyhow::{anyhow, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray, UInt32Array};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
+use datafusion::arrow::compute::kernels::numeric::sub;
 use datafusion::arrow::compute::{cast, take};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
 use datafusion::common::ScalarValue;
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
@@ -20,6 +21,7 @@ use datafusion::logical_expr::{PartitionEvaluator, Signature, Volatility, Window
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::prelude::SessionContext;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,6 +38,9 @@ struct Spec {
     /// WITH UNMATCHED ROWS: a row in no match is given once more, as `pondra_matches`' one NULL item.
     #[serde(default)]
     unmatched: bool,
+    /// WITHIN: each row is within the interval of its match's first row, by the first ORDER BY key (the time argument).
+    #[serde(default)]
+    within: bool,
 }
 
 /// AFTER MATCH SKIP: where the search for the next match goes on. A symbol is named, as the pattern names it.
@@ -84,6 +89,7 @@ struct Plan {
     code: Vec<Inst>,
     skip: Skip,
     unmatched: bool,
+    within: bool,
 }
 
 /// The plan of a spec, refused by name when it is malformed or too big.
@@ -93,7 +99,7 @@ fn compile(text: &str) -> Result<Plan> {
     let mut c = Compiler { code: vec![] };
     c.emit(&pattern, false)?;
     c.push(Inst::Match)?;
-    Ok(Plan { syms, code: c.code, skip: spec.skip, unmatched: spec.unmatched })
+    Ok(Plan { syms, code: c.code, skip: spec.skip, unmatched: spec.unmatched, within: spec.within })
 }
 
 /// Writes a pattern's program: a sequence is its parts in order, and a choice is a Split that prefers its first branch.
@@ -271,56 +277,118 @@ impl Found {
 /// The most preferred match that starts at or after `from`: the Pike VM's leftmost answer. A row's threads run in
 /// priority order; a match cuts the threads after it, and a higher-priority thread that matches later replaces it.
 /// No new thread starts once a match is found.
-/// `stamp` and `gen` are the partition's, so a search costs its rows, not a clear of every state.
-fn search(plan: &Plan, cond: &[Vec<bool>], n: usize, from: usize, stamp: &mut [usize], last: &mut usize) -> Option<Found> {
+/// `stamp` and `gen` are the partition's, so a search costs its rows, not a clear of every state. With WITHIN a thread that
+/// would take a row too late dies (`within_ok`), and the threads of each start are kept apart (`Seen`).
+fn search(plan: &Plan, cond: &[Vec<bool>], w: Option<&Within>, n: usize, from: usize, stamp: &mut [usize], last: &mut usize) -> Result<Option<Found>> {
     let code = &plan.code;
     let mut best: Option<Found> = None;
     let mut now: Vec<Thread> = vec![];
+    let mut now_pairs = HashSet::new();
     let mut gen = *last + 1;
     let mut i = from;
     loop {
         // (a new thread starts at this row last in line, so it is the least preferred)
         if best.is_none() && i < n {
-            close(code, &mut now, stamp, gen, 0, i, None, i, n);
+            let mut seen = Seen::of(w, stamp, gen, &mut now_pairs);
+            close(code, &mut now, &mut seen, 0, i, None, i, n);
         }
         let mut next = vec![];
+        let mut next_pairs = HashSet::new();
         let gen_next = gen + 1;
-        for t in &now {
-            match code[t.pc] {
-                Inst::Match => {
-                    best = Some(Found::of(t, i));
-                    break;
-                }
-                Inst::Sym(k, excluded) => {
-                    if i < n && cond[k][i] {
-                        let step = Rc::new(Step { sym: k, excluded, prev: t.path.clone() });
-                        close(code, &mut next, stamp, gen_next, t.pc + 1, t.start, Some(step), i + 1, n);
+        {
+            let mut seen = Seen::of(w, stamp, gen_next, &mut next_pairs);
+            for t in &now {
+                match code[t.pc] {
+                    Inst::Match => {
+                        best = Some(Found::of(t, i));
+                        break;
                     }
+                    Inst::Sym(k, excluded) => {
+                        if i < n && cond[k][i] && within_ok(w, t.start, i) {
+                            let step = Rc::new(Step { sym: k, excluded, prev: t.path.clone() });
+                            close(code, &mut next, &mut seen, t.pc + 1, t.start, Some(step), i + 1, n);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+        }
+        if next.len() > MAX_THREADS {
+            return Err(coded(
+                "54000",
+                format!("MATCH_RECOGNIZE: the search holds more than {MAX_THREADS} partial matches at once: narrow WITHIN or the conditions"),
+            ));
         }
         if i == n || (best.is_some() && next.is_empty()) {
             break;
         }
         now = next;
+        now_pairs = next_pairs;
         gen = gen_next;
         i += 1;
     }
     *last = gen + 1;
-    best
+    Ok(best)
+}
+
+/// The most threads a search may hold at once: past it the search is refused (54000), as WITHIN keeps one per start.
+const MAX_THREADS: usize = 1_000_000;
+
+/// WITHIN's times of one partition, in ticks of the time's unit (a timestamp's count from the epoch), and each row's bound:
+/// its time less the interval, so a row can be in a match only when the match's first row is no earlier than the bound.
+/// None is NULL.
+struct Within {
+    time: Vec<Option<i64>>,
+    low: Vec<Option<i64>>,
+}
+
+/// Whether row `i` may be taken by a thread that started at `start`: its time is within WITHIN's interval of the start's
+/// time. A NULL time is never within.
+fn within_ok(w: Option<&Within>, start: usize, i: usize) -> bool {
+    match w {
+        None => true,
+        Some(w) => matches!((w.time[start], w.low[i]), (Some(t), Some(low)) if t >= low),
+    }
+}
+
+/// Which thread reaches a state first, in one generation of threads. Without WITHIN a state holds one thread (its stamp
+/// is the generation). With WITHIN two starts' threads at a state have different futures (their times differ), so a state
+/// holds one thread per start, and `Start` is the generation's set of (state, start).
+enum Seen<'a> {
+    Stamp(&'a mut [usize], usize),
+    Start(&'a mut HashSet<(usize, usize)>),
+}
+
+impl<'a> Seen<'a> {
+    fn of(w: Option<&Within>, stamp: &'a mut [usize], gen: usize, pairs: &'a mut HashSet<(usize, usize)>) -> Seen<'a> {
+        match w {
+            Some(_) => Seen::Start(pairs),
+            None => Seen::Stamp(stamp, gen),
+        }
+    }
+
+    /// Whether a thread that started at `start` is the first of this generation to reach `pc`.
+    fn first(&mut self, pc: usize, start: usize) -> bool {
+        match self {
+            Seen::Stamp(stamp, gen) => {
+                let fresh = stamp[pc] != *gen;
+                stamp[pc] = *gen;
+                fresh
+            }
+            Seen::Start(pairs) => pairs.insert((pc, start)),
+        }
+    }
 }
 
 /// Adds the threads a state reaches at a row (its epsilon closure) to `out`, in priority order (a Split's first target
-/// first). A state holds one thread per row: the first to reach it, which is the one preferred. `gen` marks the list.
+/// first). A state holds the first thread to reach it, which is the one preferred (see `Seen`).
 #[allow(clippy::too_many_arguments)]
-fn close(code: &[Inst], out: &mut Vec<Thread>, stamp: &mut [usize], gen: usize, pc: usize, start: usize, path: Path, at: usize, n: usize) {
+fn close(code: &[Inst], out: &mut Vec<Thread>, seen: &mut Seen<'_>, pc: usize, start: usize, path: Path, at: usize, n: usize) {
     let mut todo = vec![pc];
     while let Some(pc) = todo.pop() {
-        if stamp[pc] == gen {
+        if !seen.first(pc, start) {
             continue;
         }
-        stamp[pc] = gen;
         match code[pc] {
             Inst::Jmp(x) => todo.push(x),
             Inst::Split(x, y) => {
@@ -354,12 +422,12 @@ struct Mem {
 
 /// Every match of one partition of `n` rows, as each row's memberships (a row in none has an empty list). Matches go on
 /// from the skip rule's place; an empty match goes on one row later.
-fn partition(plan: &Plan, cond: &[Vec<bool>], n: usize) -> Result<Vec<Vec<Mem>>> {
+fn partition(plan: &Plan, cond: &[Vec<bool>], w: Option<&Within>, n: usize) -> Result<Vec<Vec<Mem>>> {
     let mut rows: Vec<Vec<Mem>> = vec![Vec::new(); n];
     let (mut from, mut m) = (0usize, 0i64);
     let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
     while from < n {
-        let Some(f) = search(plan, cond, n, from, &mut stamp, &mut gen) else { break };
+        let Some(f) = search(plan, cond, w, n, from, &mut stamp, &mut gen)? else { break };
         m += 1;
         if f.start == f.end {
             rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
@@ -454,6 +522,38 @@ fn spec_text(column: &ArrayRef) -> Result<String> {
     Ok(text.value(0).to_string())
 }
 
+/// WITHIN reads the first ORDER BY as a time: a date or a timestamp, else 42804.
+fn check_time_type(t: &DataType) -> Result<()> {
+    match t {
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _) => Ok(()),
+        other => Err(coded(
+            "42804",
+            format!("MATCH_RECOGNIZE: WITHIN reads the first ORDER BY as a time, and {other} isn't one: order by a date or a timestamp"),
+        )),
+    }
+}
+
+/// WITHIN's times and bounds for a partition (see `Within`), from its time column and its interval column, which holds the
+/// interval in each row. A timestamp keeps its own unit and zone, since a zone's days and months are its own (a DST change
+/// moves a difference by an hour otherwise); a date becomes a timestamp of microseconds. The subtraction is arrow's, so an
+/// interval of months stays exact.
+fn within_of(time: &ArrayRef, interval: &ArrayRef) -> Result<Within> {
+    check_time_type(time.data_type())?;
+    let time: ArrayRef = match time.data_type() {
+        DataType::Date32 | DataType::Date64 => cast(time, &DataType::Timestamp(TimeUnit::Microsecond, None))?,
+        _ => time.clone(),
+    };
+    let low = sub(&time.as_ref(), &interval.as_ref())?;
+    Ok(Within { time: ticks(&time)?, low: ticks(&low)? })
+}
+
+/// A column of whole numbers as its values (a timestamp's ticks, of its own unit); NULL stays None.
+fn ticks(column: &ArrayRef) -> Result<Vec<Option<i64>>> {
+    let ints = cast(column, &DataType::Int64)?;
+    let ints = ints.as_any().downcast_ref::<Int64Array>().context("MATCH_RECOGNIZE: WITHIN's times are whole numbers")?;
+    Ok(ints.iter().collect())
+}
+
 /// A window's error keeps its SQLSTATE (SKIP TO's 22000, a state limit's 54000): DataFusion would wrap it as XX000 otherwise.
 fn external(e: anyhow::Error) -> DataFusionError {
     match e.downcast::<crate::codes::Coded>() {
@@ -494,7 +594,16 @@ impl Evaluator {
         for k in 0..plan.syms.len() {
             cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
         }
-        answer(&partition(plan, &cond, n)?, &plan.syms, self.all, plan.unmatched)
+        // the time and the interval come after the symbols' conditions
+        let within = match plan.within {
+            true => {
+                let time = values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?;
+                let interval = values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?;
+                Some(within_of(time, interval)?)
+            }
+            false => None,
+        };
+        answer(&partition(plan, &cond, within.as_ref(), n)?, &plan.syms, self.all, plan.unmatched)
     }
 }
 
@@ -522,6 +631,19 @@ impl WindowUDFImpl for Matcher {
             Some(ScalarValue::Utf8(Some(text))) => Some(compile(text).map_err(external)?),
             _ => None,
         };
+        // (WITHIN's time and interval are checked here, at planning, when the spec is a literal; `run` checks the time too)
+        if let Some(p) = plan.as_ref().filter(|p| p.within) {
+            let fields = args.input_fields();
+            if let Some(time) = fields.get(p.syms.len() + 1) {
+                check_time_type(time.data_type()).map_err(external)?;
+            }
+            // a backstop for a spec written by hand: pattern.rs writes an interval literal, which is an interval type
+            if let Some(interval) = fields.get(p.syms.len() + 2) {
+                if !matches!(interval.data_type(), DataType::Interval(_)) {
+                    return Err(external(coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR")));
+                }
+            }
+        }
         Ok(Box::new(Evaluator { all: self.all, plan }))
     }
 
@@ -851,8 +973,22 @@ mod tests {
     /// Each row's memberships as text: `1a2` (match 1, symbol a, place 2), `1-` for an empty match's row.
     fn shown(spec: &str, rows: &[Vec<usize>]) -> Result<Vec<String>> {
         let plan = compile(spec)?;
-        let found = partition(&plan, &conds(rows, plan.syms.len()), rows.len())?;
-        Ok(found
+        let found = partition(&plan, &conds(rows, plan.syms.len()), None, rows.len())?;
+        Ok(texts(&plan, &found))
+    }
+
+    /// `shown` under WITHIN: `times` are the rows' times (None is NULL), and each row must be within `interval` of its
+    /// match's first row.
+    fn shown_within(pattern: &str, rows: &[Vec<usize>], times: &[Option<i64>], interval: i64) -> Vec<String> {
+        let plan = compile(&within_spec(pattern)).unwrap();
+        let low = times.iter().map(|t| t.map(|t| t - interval)).collect();
+        let w = Within { time: times.to_vec(), low };
+        let found = partition(&plan, &conds(rows, plan.syms.len()), Some(&w), rows.len()).unwrap();
+        texts(&plan, &found)
+    }
+
+    fn texts(plan: &Plan, found: &[Vec<Mem>]) -> Vec<String> {
+        found
             .iter()
             .map(|r| {
                 r.iter()
@@ -863,7 +999,11 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ")
             })
-            .collect())
+            .collect()
+    }
+
+    fn within_spec(pattern: &str) -> String {
+        format!(r#"{{"pattern":"{pattern}","skip":{},"within":true}}"#, PAST)
     }
 
     const PAST: &str = r#"{"to":"past_last"}"#;
@@ -1099,5 +1239,60 @@ mod tests {
     fn the_spec_reads_unmatched() {
         assert!(compile(r#"{"pattern":"a","skip":{"to":"past_last"},"unmatched":true}"#).unwrap().unmatched);
         assert!(!compile(&spec("a", PAST)).unwrap().unmatched);
+    }
+
+    #[test]
+    fn the_spec_reads_within() {
+        assert!(compile(&within_spec("a")).unwrap().within);
+        assert!(!compile(&spec("a", PAST)).unwrap().within);
+    }
+
+    #[test]
+    fn within_takes_the_shorter_match_when_the_longer_runs_out() {
+        // four rows, one time unit apart, within 2: the greedy a+ from row 0 can't take row 3, so it stops at row 2
+        let rows = vec![vec![0]; 4];
+        assert_eq!(shown_within("a+", &rows, &[Some(0), Some(1), Some(2), Some(3)], 2), ["1a1", "1a2", "1a3", "2a1"]);
+    }
+
+    #[test]
+    fn within_gives_the_match_to_a_later_start_when_the_earlier_runs_out() {
+        // from row 0, b at time 4 is 4 after a's time 0, more than 3: that thread dies, and the start at row 1 (time 2) wins
+        let rows = vec![vec![0], vec![0], vec![1]];
+        assert_eq!(shown_within("a+ b", &rows, &[Some(0), Some(2), Some(4)], 3), ["", "1a1", "1b2"]);
+    }
+
+    #[test]
+    fn within_never_takes_a_null_time() {
+        // the row at NULL can't start a match, so the match is the next row's
+        let rows = vec![vec![0], vec![0]];
+        assert_eq!(shown_within("a", &rows, &[None, Some(0)], 3), ["", "1a1"]);
+    }
+
+    #[test]
+    fn within_reads_a_date_or_a_timestamp_only() {
+        assert!(check_time_type(&DataType::Timestamp(TimeUnit::Nanosecond, None)).is_ok());
+        assert!(check_time_type(&DataType::Date32).is_ok());
+        let err = check_time_type(&DataType::Int32).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42804");
+    }
+
+    #[test]
+    fn within_of_reads_dates_and_zoned_timestamps_alike() {
+        use datafusion::arrow::array::{Date32Array, IntervalMonthDayNanoArray, TimestampMicrosecondArray};
+        use datafusion::arrow::datatypes::IntervalMonthDayNanoType;
+        // a date is its day's microseconds, and an interval of one day moves each time back by a day
+        let day = IntervalMonthDayNanoType::make_value(0, 1, 0);
+        let interval: ArrayRef = Arc::new(IntervalMonthDayNanoArray::from(vec![day, day]));
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![0, 1]));
+        let w = within_of(&dates, &interval).unwrap();
+        assert_eq!(w.time, [Some(0), Some(86_400_000_000)]);
+        assert_eq!(w.low, [Some(-86_400_000_000), Some(0)]);
+        // a timestamp keeps its zone: the same instants give the same ticks and bounds as they do in UTC
+        let micros = vec![3_600_000_000i64, 7_200_000_000];
+        let zoned: ArrayRef = Arc::new(TimestampMicrosecondArray::from(micros.clone()).with_timezone("+02:00"));
+        let utc: ArrayRef = Arc::new(TimestampMicrosecondArray::from(micros));
+        let (a, b) = (within_of(&zoned, &interval).unwrap(), within_of(&utc, &interval).unwrap());
+        assert_eq!(a.time, b.time);
+        assert_eq!(a.low, b.low);
     }
 }
