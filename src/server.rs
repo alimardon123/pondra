@@ -1119,7 +1119,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
         return Err(E(anyhow::anyhow!(crate::log::SEQ_FROM_1))); // (0 is "nothing yet": its batch would be taken for a retry)
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
-    let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let meta = app.lake.table_meta(name).await?;
     let rules = meta.rules()?;
     let schema = rules.schema.clone(); // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
@@ -1166,7 +1166,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
     ensure!(!app.cluster.reader, "read-only node");
-    if app.lake.cat.meta(&table_key(&name)).await?.is_none() {
+    if app.lake.table_meta_if(name).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
@@ -1260,7 +1260,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
 async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)>) -> Result<Response, E> {
     crate::auth::check_all(&name)?; // (a user's: the whole row)
     let lake = &app.lake;
-    let meta = lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
+    let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
@@ -1423,6 +1423,20 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
+/// The text as sent, when it is one statement that is no variable's change and no script: the first half of the test
+/// `sql_as` makes of a request for a plain query. `pondra sql` makes it of its argument too (cli.rs).
+pub(crate) fn single_statement(sql: &str) -> Option<String> {
+    let [one] = &crate::routines::split(sql)[..] else { return None };
+    (crate::vars::change(sql).is_none() && !crate::script::is(sql)).then(|| one.clone())
+}
+
+/// The second half, on the statement once its `$name`s and functions are expanded: none of a checkpoint, a procedure's
+/// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
+/// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
+pub(crate) fn plain_statement(one: &str) -> bool {
+    !crate::write::checkpoint(one) && !crate::routines::runs_procedure(one) && crate::write::parse(one).is_none() && !crate::routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
+}
+
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
     use crate::routines::{Outcome, Who};
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
@@ -1435,12 +1449,11 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
-    if let ([one], true, true, true, None, false) = (&crate::routines::split(&req.sql)[..], req.params.is_empty(), req.tables.is_empty(), req.views.is_empty(), crate::vars::change(&req.sql), crate::script::is(&req.sql)) {
-        let sent = one;
-        let one = crate::routines::expand(&app.lake, &crate::vars::bound(one)?).await?; // (`$name`: the session's variables)
-        if !crate::write::checkpoint(&one) && !crate::routines::runs_procedure(&one) && crate::write::parse(&one).is_none() && !crate::routines::several(&one) && crate::text::control(&one).is_none() && !crate::txn::open() && !crate::settings::is(&one) {
+    if let (Some(sent), true, true, true) = (single_statement(&req.sql), req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
+        let one = crate::routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
+        if plain_statement(&one) && !crate::txn::open() {
             crate::query::mark("request read and checked");
-            return Ok(crate::audit::statement(&app, sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
+            return Ok(crate::audit::statement(&app, &sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
         }
     }
     let tables = Arc::new(req.tables);
@@ -1512,7 +1525,7 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
-            OFFSET.is_match(text) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
         };
         let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
             || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)

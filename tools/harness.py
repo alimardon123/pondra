@@ -638,11 +638,40 @@ def loads():
         empty[0] == 200 and empty_body["rows"] == 0 and [l["rows"] for l in empty_body["loaded"]] == [0, 0]
         and empty_again[0] == 200 and [l["rows"] for l in empty_again_body["loaded"]] == [0, 0]
         and empty_loads == [{"n": 0}] and count("empties") == {"n": 0, "s": 0}
-        and big[0] == 400 and big[1] == "22003" and "integer out of range" in big[2]
+        and big[0] == 400 and big[1] == "22003" and 'value "99999999999" is out of range for type integer' in big[2]
         and abc[0] == 400 and abc[1] == "22P02" and 'invalid input syntax for type integer: "abc"' in abc[2]
         and literal[0] == 400 and literal[1] == "22003" and "integer out of range" in literal[2]
         and selected[0] == 400 and selected[1] == "22003"
         and cast[0] == 400 and cast[1] == "22003")
+
+    # Check 15: a CSV's text and integer columns load as the table's types, as Postgres's COPY reads each value: `007` stays
+    # `007`, a quoted value and empty fields are as they are, an integer's spaces and sign are its own, a header file missing
+    # a column loads with NULL there, and a value an integer won't take is refused with its words and loads nothing.
+    # read_csv's `types` names the columns it reads as text, as a struct only.
+    run("CREATE TABLE zips (zip TEXT, n INT)")
+    write("zip/with.csv", "zip,n\n007,1\n02134,2\n")
+    write("zip/quoted.csv", 'zip,n\n"007",\n,4\n')
+    write("zip/spaces.csv", "zip,n\n5, 3 \n6,+1\n")
+    write("zip/bare.csv", "007,1\n")
+    write("zip/missing.csv", "zip\n008\n")
+    write("zip/point.csv", "zip,n\n1,2.5\n")
+    write("zip/exp.csv", "zip,n\n1,1e3\n")
+    zip_loads = [run(f"COPY INTO zips FROM '{d}/zip/{f}' (FORMAT csv, HEADER {h})") for f, h in
+                 [("with.csv", "true"), ("quoted.csv", "true"), ("spaces.csv", "true"), ("bare.csv", "false"), ("missing.csv", "true")]]
+    point = answer(f"COPY INTO zips FROM '{d}/zip/point.csv' (FORMAT csv, HEADER true)")
+    exp = answer(f"COPY INTO zips FROM '{d}/zip/exp.csv' (FORMAT csv, HEADER true)")
+    zips = sorted(((r.get("zip"), r.get("n")) for r in run("SELECT zip, n FROM zips")), key=repr)  # (a NULL's key is left out)
+    zips_want = sorted([("007", 1), ("02134", 2), ("007", None), (None, 4), ("5", 3), ("6", 1), ("007", 1), ("008", None)], key=repr)
+    typed = run(f"SELECT zip FROM read_csv('{d}/zip/with.csv', header => true, types => {{'zip': 'VARCHAR'}}) ORDER BY zip")
+    nope = refused(f"SELECT * FROM read_csv('{d}/zip/with.csv', header => true, types => {{'nope': 'VARCHAR'}})")
+    as_list = refused(f"SELECT * FROM read_csv('{d}/zip/with.csv', types => ['VARCHAR'])")
+    checks["15. a CSV's text and integer columns load as the table's types: 007 stays 007, quoted and empty fields as they are, spaces and + in an integer are its own, a missing column is NULL, a value an integer won't take is refused with its words and loads nothing; read_csv's types names columns as text"] = (
+        [l["rows"] for l in zip_loads] == [2, 2, 2, 1, 1] and zips == zips_want
+        and point[0] == 400 and point[1] == "22P02" and 'invalid input syntax for type integer: "2.5"' in point[2] and "point.csv, line 2)" in point[2]
+        and exp[0] == 400 and exp[1] == "22P02" and 'invalid input syntax for type integer: "1e3"' in exp[2] and "exp.csv, line 2)" in exp[2]
+        and len(run("SELECT file FROM pondra.loads WHERE name = 'zips'")) == 5
+        and typed == [{"zip": "007"}, {"zip": "02134"}]
+        and "nope" in nope and "zip, n" in nope and "struct" in as_list)
 
     # Check 8: a node that keeps records for two seconds (PONDRA_LOAD_RETENTION_SECS, read once): past
     # it, a load's record goes, and its old file (last changed before the window) isn't loaded again
@@ -1918,6 +1947,113 @@ def insert_spread():
     return f"on three nodes every node writes its share ({got['n']:,} rows in {took} s), one commit, ids unique; {len(checks)} checks"
 
 
+def serverless_guest(port):
+    """`pondra sql` as a guest node (node.rs's Guest): what a statement reads or writes, and how the lake's leader
+    answers it. Each check is one assertion, named in the result; a lake on object storage has no term files to look at."""
+    lake = new_lake()
+    local_lake = not lake.startswith("s3://")
+    terms, left = os.path.join(lake, "cluster", "term"), os.path.join(lake, "cluster", "left")
+    folder = tempfile.mkdtemp(prefix="pondra-guest-")
+    csv, parquet = os.path.join(folder, "rows.csv"), os.path.join(folder, "out.parquet")
+    with open(csv, "w") as f:
+        f.write("a,b\n1,x\n2,y\n3,z\n")
+
+    def run(q, extra=None):
+        p = subprocess.run([BIN, "sql", "--dir", lake, q], capture_output=True, text=True, env={**os.environ, **(extra or {})}, timeout=300)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+    def ran(q):
+        rc, _, err = run(q)
+        if rc:
+            raise RuntimeError(f"{q}: {err[-800:]}")
+
+    def count():  # with nobody leading the lake, or with a node: the rows of t as `pondra sql` shows them
+        rc, out, err = run("SELECT count(*) AS n FROM t")
+        found = re.search(r"^\|\s*(\d+)\s*\|$", out, re.M)
+        return int(found.group(1)) if rc == 0 and found else None
+
+    def shown(out, n):
+        return re.search(r"^\|\s*%d\s*\|$" % n, out, re.M) is not None
+
+    def listing(d):
+        return set(os.listdir(d)) if os.path.isdir(d) else set()
+
+    def node_count(url_port):
+        return call(url_port, "POST", "/sql", b"SELECT count(*) AS n FROM t")[0]["n"]
+
+    def ready_at(url_port, cap=30):
+        deadline = time.time() + cap
+        while time.time() < deadline:
+            try:
+                call(url_port, "GET", "/ready", timeout=2)
+                return True
+            except Exception:
+                time.sleep(0.05)
+        return False
+
+    checks, times = {}, {}
+    ran("CREATE TABLE t (a INT, b VARCHAR)")  # nobody leads: the guest leads it for the moment, and lets go
+
+    # a. COPY INTO loads a CSV file's rows on a lake nobody leads
+    rc, _, err = run(f"COPY INTO t FROM '{csv}' (FORMAT csv, HEADER)")
+    checks["a COPY INTO loads a file's rows on a lake nobody leads"] = rc == 0 and count() == 3
+
+    # b. A SELECT and an export read: no term is claimed, and the export's file is written
+    before = listing(terms)
+    rc1, _, _ = run("SELECT count(*) AS n FROM t")
+    rc2, _, err2 = run(f"COPY (SELECT * FROM t) TO '{parquet}'")
+    checks["b a SELECT and a COPY … TO make no term on a lake nobody leads, and the export is written"] = \
+        (rc1 == 0 and rc2 == 0 and os.path.exists(parquet) and (not local_lake or listing(terms) == before))
+
+    # c. An INSERT on a lake nobody leads leaves its term given back, and a node started right after answers /ready in time
+    left_before = listing(left)
+    rc3, _, err3 = run("INSERT INTO t VALUES (4, 'w')")
+    left_new = listing(left) - left_before
+    t0 = time.time()
+    node = Node(lake, port).start()
+    checks["c an INSERT leaves its term in cluster/left, and a node started right after answers /ready within 5 s"] = \
+        rc3 == 0 and (not local_lake or bool(left_new)) and ready_at(port) and time.time() - t0 <= 5
+    times["ready_s"] = round(time.time() - t0, 2)
+
+    # d. With a node leading, the statement goes to it, and a text of two statements reads its own write
+    rc4, _, err4 = run("INSERT INTO t VALUES (5, 'd')")
+    n4 = node_count(port)
+    nodes = call(port, "GET", "/stats")["nodes"]
+    rc5, out5, err5 = run("INSERT INTO t VALUES (6, 'e'); SELECT count(*) AS n FROM t")
+    checks["d with a node leading, an INSERT goes to it, the node's /stats keep it alone, and one argument of two statements reads its own write"] = \
+        rc4 == 0 and n4 == 5 and len(nodes) == 1 and rc5 == 0 and shown(out5, 6)
+
+    # e. With PONDRA_NO_DIRECT, an INSERT goes through the inbox, and two statements are refused by name
+    no_direct = {"PONDRA_NO_DIRECT": "1"}
+    rc6, _, err6 = run("INSERT INTO t VALUES (7, 'f')", no_direct)
+    n6 = node_count(port)
+    rc7, _, err7 = run("INSERT INTO t VALUES (8, 'g'); INSERT INTO t VALUES (9, 'h')", no_direct)
+    checks["e with PONDRA_NO_DIRECT, an INSERT lands through the inbox, and two statements are refused with the reason"] = \
+        rc6 == 0 and n6 == 7 and rc7 == 1 and "several statements" in err7 and "doesn't answer from here" in err7
+    node.kill()
+
+    # f. On a lake nobody leads: a CALL of a procedure that writes, and two statements in one argument, both write and answer
+    ran("CREATE PROCEDURE ins() LANGUAGE sql AS $$ INSERT INTO t VALUES (10, 'p'); $$")
+    rc8, _, err8 = run("CALL ins()")
+    rc9, out9, err9 = run("INSERT INTO t VALUES (11, 'q'); SELECT count(*) AS n FROM t")
+    checks["f on a lake nobody leads, a CALL that writes and two statements in one argument both write and answer"] = \
+        rc8 == 0 and rc9 == 0 and shown(out9, 9) and count() == 9
+
+    # g. A bad statement prints Error: with the words a node's POST /sql gives it, and exits 1
+    node = Node(lake, port).start()
+    ready_at(port)
+    conn = http_client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request("POST", "/sql", b"SELECT * FROM no_such_table")
+    reply = conn.getresponse()
+    words = reply.read().decode().strip()
+    rc10, _, err10 = run("SELECT * FROM no_such_table")
+    checks["g a bad statement prints Error: with a node's words for it, and exits 1"] = \
+        reply.status != 200 and rc10 == 1 and err10 == f"Error: {words}"
+    node.kill()
+    shutil.rmtree(folder, ignore_errors=True)
+    return checks, times
+
+
 def serverless():
     """Writes from any machine with the binary, with and without a running node."""
     import pyarrow as pa, pyarrow.parquet as pq
@@ -1990,18 +2126,40 @@ def serverless():
     n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
     node2_leads = leads(node2)
     node2.kill()
+    guest_checks, guest_times = serverless_guest(A.port + 3)  # (`pondra sql` as a guest node: its own lakes, one assertion each)
     # 8000 rows, and the leader started here adds 1000 more: 9000.
     ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and other_machine_waits)
+          and after_kill_s < 10 and other_machine_waits and all(guest_checks.values()))
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
                                      "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
-                                     "rows": n, "ok": ok}}))
+                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
             f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s (this machine's writer "
             f"finds its lock free); another machine's writer waits for the mark (no new term in 5 s: {other_machine_waits}); "
             f"{n['n']} rows, no duplicates")
+
+
+def retries():
+    """A write whose answer is lost, and its client resends it three minutes on, with `retry_secs` 300: applied once.
+    The id says the client's last resend time (its first send plus 300 s), so the node keeps its mark until then.
+    Real time, three minutes: the retry window's floor is two minutes (twice a lease of at least 60 s), so the clock
+    can't be sped up here (`log::tests` runs the same resend with a clock of its own)."""
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    sql(A.port, "CREATE TABLE sent (n BIGINT)")
+    job = f"auto-until{int(time.time()) + 300}-py-retries-1"
+    first = call(A.port, "POST", f"/sql?job={job}", b"INSERT INTO sent VALUES (1)")
+    time.sleep(180)
+    again = call(A.port, "POST", f"/sql?job={job}", b"INSERT INTO sent VALUES (1)")
+    n = sql(A.port, "SELECT count(*) AS n FROM sent")[0]
+    node.kill()
+    ok = first == {"rows": 1} and again == {"duplicate": True} and n == {"n": 1}
+    print(f"retries: first={first} resent at 180 s={again} rows={n} -> {'OK' if ok else 'FAIL'}")
+    if not ok:
+        sys.exit(1)
+    return "a write resent 3 minutes on, with retry_secs 300, is applied once (its id carries the client's deadline)"
 
 
 def clients():
@@ -7332,7 +7490,8 @@ def hot():
     Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
     held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`).
     Last, a table read cold (a hot budget no file fits: PONDRA_HOT_GB=0.000001) sizes its GROUP BY by its
-    columns' distinct values (`hot::told`)."""
+    columns' distinct values (`hot::told`). Last, a lake in memory holds every file hot once its first query's loads
+    settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -7447,6 +7606,28 @@ def hot():
     finally:
         cold.kill()
         clean_up()
+    # A lake in memory holds every file hot once its first query's loads settle (`hot.rs`): its files are in memory
+    # already, so its cache takes the query memory's room, and a file loads on its first read. Under a query memory of
+    # 0.333 GB (a quarter of it, 89 MB, held five of nine files and left the rest in Parquet), its 10M rows (160 MB of the
+    # two columns a GROUP BY reads) are held whole once the first query's background loads are done; the first query
+    # itself reads Parquet, as before.
+    mem = Node(":memory:", A.port, env={"PONDRA_MEMORY_GB": "0.333"}).start()
+    try:
+        mq = lambda s: call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-session": "hot-memory-lake-01"})
+        mq("CREATE TABLE mh AS SELECT x AS id, x % 1000 AS k, CAST(x * 7919 % 100003 AS DOUBLE) / 100.0 AS v FROM range(10000000) AS g(x)")
+        group = "SELECT k, count(*) AS n, sum(v) AS s FROM mh GROUP BY k"
+        answer = mq(group + " -- first")  # (its loads of the cold files start in the background, and busy counts them)
+        deadline = time.time() + 20
+        while metrics_of(A.port).get("pondra_hot_loading_files", 0) and time.time() < deadline:
+            time.sleep(0.5)
+        nxt = "\n".join(r.get("plan", "") for r in mq("EXPLAIN ANALYZE " + group + " -- next"))  # (every plan's text: ANALYZE's is "Plan with Metrics")
+        seen["a lake in memory, the plan once its first query's loads settle"] = [l.strip()[:160] for l in nxt.splitlines() if "DataSourceExec" in l]
+        checks["a lake in memory holds every file hot once its first query's loads settle (no Parquet scan in the next plan, 10M rows held)"] = \
+            "file_groups" not in nxt and "partition_sizes=" in nxt and len(answer) == 1000 and all(r["n"] == 10000 for r in answer)
+        checks["a lake in memory's cache holds its files whole (the hot gauge: 160 MB of the two columns)"] = \
+            160_000_000 <= (metrics_of(A.port).get("pondra_hot_bytes", 0) or 0) <= 170_000_000
+    finally:
+        mem.kill()
     # Under a memory line, the decoded columns are let go before a query is stopped (`oom.rs`): see hot_under_line.
     line_checks, line_seen = hot_under_line()
     checks.update(line_checks)
@@ -18709,7 +18890,7 @@ def registry():
         notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
         and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
                    {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
-        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500, 500, 500, 500, 409, 409] \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [400, 500, 500, 500, 409, 409] \
         and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
         and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
         and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"
@@ -24232,19 +24413,19 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
-# 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
-# it, so CI runs the suite in parts side by side that end together. A section not listed
-# counts as 5 s (sso_flow and sso_pg came after that run: their 15 and 20 are guesses).
-SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "backpressure": 39,
-        "functions": 38, "server": 34, "doors": 33, "crash": 32, "kafkas": 31, "finals": 28, "pace": 27,
-        "found": 23, "clouds": 21, "kafka": 21, "load": 20, "live": 17, "refreshed": 15, "sso_flow": 15, "sso_pg": 20,
-        "users": 14, "workspace": 14, "reader": 13, "scale": 12, "sealed": 12, "answers_big": 11,
-        "cursors": 11, "find": 11, "history": 11, "objects": 11, "procedures": 11, "sessions": 11,
-        "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
-        "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
-        "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60, "jsonfns": 60}
+# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40200329643,
+# 2026-10-25: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
+# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by the table of
+# 10-13, that run's three parts took 654, 441 and 608 s; by this one, four take about 426 s each.)
+SECS = {"memory": 240, "scale": 122, "waits": 113, "hot": 94, "sso": 90, "stopped": 77, "guesses": 45, "doors": 40,
+        "functions": 38, "crash": 37, "server": 36, "served": 33, "backpressure": 31, "finals": 28, "pace": 27,
+        "kafka": 26, "kafkas": 24, "found": 23, "clouds": 21, "tails": 21, "load": 20, "live": 18, "objects": 18,
+        "refreshed": 15, "lateral": 14, "sso_flow": 14, "users": 14, "workspace": 13, "reader": 12, "history": 11,
+        "sealed": 11, "sessions": 11, "answers_big": 10, "cursors": 10, "files": 10, "flows": 10, "guarded": 10,
+        "procedures": 10, "reached": 10, "begin": 9, "clients": 9, "columns": 9, "fills": 9, "followers": 9,
+        "schemas": 9, "serverless": 9, "temps": 9, "guard": 8, "learn": 8, "alter": 7, "bykey": 7, "fence": 7,
+        "safety": 7, "sequences": 7, "windows": 7, "catalogs": 6, "clusters": 6, "dedup": 6, "find": 6,
+        "friendly": 6, "loads": 6, "memorylake": 6, "plans": 6, "unique_doors": 6}
 
 
 def all_tests():
@@ -24281,7 +24462,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -24294,7 +24475,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

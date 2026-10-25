@@ -8,7 +8,7 @@
 //! In Spark's dialect (`datafusion.sql_parser.dialect = 'spark'`, and `spark_sql('…')`, whose casts Pondra's
 //! SQL turns into `pondra_truncate`) the fraction is cut toward zero instead, as Spark and Polars cast:
 //! `CAST(2.7 AS INT)` is 2 and `CAST(-2.7 AS INT)` is -2 (`Rounds` picks it by the dialect).
-use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, PrimitiveArray};
+use datafusion::arrow::array::{Array, ArrayRef, ArrowNativeTypeOp, AsArray, PrimitiveArray, StringArray};
 use datafusion::arrow::compute::{cast, cast_with_options, CastOptions};
 use datafusion::arrow::datatypes::{ArrowNativeType, DataType, Decimal128Type, Decimal256Type, Decimal32Type, Decimal64Type, DecimalType, Float32Type, Float64Type};
 use datafusion::arrow::error::ArrowError;
@@ -75,6 +75,35 @@ pub fn into(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     cast_with_options(&c, t, &CastOptions { safe: false, ..Default::default() }).map_err(|e| refused(&c, t, e))
 }
 
+/// The refusal of a value that the CSV reader couldn't parse as its column's type, from the text of the error (Arrow's
+/// `Error while parsing value '<v>' as type '<T>' …`; a leader's answer comes as text): the words and SQLSTATE `into`
+/// gives that value, so `2.5` into an integer is 22P02 as Postgres has it. None for any other text, or when the cast
+/// takes the value.
+pub fn parse_refusal(text: &str) -> Option<DataFusionError> { refusal_of(text, None) }
+
+/// `parse_refusal` for a value read from a file: its words end with `place`, the file and the line a person counts it on
+/// (` (file, line 2)`), which the caller works out (`copy::line_of`: Arrow's own count of lines is not a file's line).
+pub fn parse_refusal_in(text: &str, place: &str) -> Option<DataFusionError> { refusal_of(text, Some(place)) }
+
+/// The column (from 0) and the text of the value a CSV reader refused in `text`: the file's cell the caller finds the line
+/// of (`copy::line_of`).
+pub fn refused_cell(text: &str) -> Option<(usize, String)> {
+    let c = PARSE.captures(text)?;
+    Some((c[3].parse().ok()?, c[1].to_string()))
+}
+
+static PARSE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)Error while parsing value '(.*?)' as type '([^']+)' for column (\d+) at line \d+").expect("a regex"));
+
+fn refusal_of(text: &str, place: Option<&str>) -> Option<DataFusionError> {
+    let c = PARSE.captures(text)?;
+    let t = c[2].parse::<DataType>().ok()?;
+    let value: ArrayRef = Arc::new(StringArray::from(vec![c[1].to_string()]));
+    let refusal = into(&value, &t).err()?;
+    let Some(place) = place else { return Some(refusal) };
+    let e = anyhow::Error::from(refusal);
+    Some(external(format!("{} ({place})", crate::codes::words(&e)), crate::codes::of(&e)))
+}
+
 /// A refusal with Postgres's words and SQLSTATE, as a DataFusion error (`codes::of` finds the code through the chain).
 fn external(words: impl Into<String>, code: &'static str) -> DataFusionError {
     DataFusionError::External(Box::new(Violation(words.into(), code)))
@@ -90,7 +119,11 @@ fn refused(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     if matches!(source, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) {
         text_refusal(c, t, e)
     } else if source.is_numeric() {
-        number_refusal(t, e)
+        if t.is_decimal() && has_nan(c) {
+            nan_refusal()
+        } else {
+            number_refusal(t, e)
+        }
     } else {
         e.into()
     }
@@ -108,6 +141,9 @@ fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     let values = texts.as_string::<i32>();
     let Some(i) = (0..values.len()).find(|&i| values.is_valid(i) && safe_cast.is_null(i)) else { return plain() };
     let text = values.value(i);
+    if t.is_decimal() && text.trim().eq_ignore_ascii_case("nan") {
+        return nan_refusal();
+    }
     let range = match t {
         DataType::Int16 if overflows::<i16>(text) => Some("smallint"),
         DataType::Int32 if overflows::<i32>(text) => Some("integer"),
@@ -123,6 +159,21 @@ fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     match pg_name(t) {
         Some(name) => external(format!("invalid input syntax for type {name}: \"{text}\""), "22P02"),
         None => plain(),
+    }
+}
+
+/// The refusal of NaN going into a decimal (`numeric(p, s)`): Postgres keeps NaN in numeric, a decimal column here holds
+/// numbers only (0A000, named, so it is not taken for a value that is too big: 22003).
+fn nan_refusal() -> DataFusionError {
+    external("NaN can't go into a decimal column (numeric(p, s)): Postgres keeps NaN in numeric, but a decimal here holds only numbers", "0A000")
+}
+
+/// Is there a NaN in a float column (a cast of it into a decimal is refused by name: `nan_refusal`).
+fn has_nan(c: &ArrayRef) -> bool {
+    match c.data_type() {
+        DataType::Float64 => c.as_primitive::<Float64Type>().iter().flatten().any(f64::is_nan),
+        DataType::Float32 => c.as_primitive::<Float32Type>().iter().flatten().any(f32::is_nan),
+        _ => false,
     }
 }
 
@@ -448,6 +499,13 @@ mod tests {
             let c: ArrayRef = Arc::new(StringArray::from(vec![Some(number)]));
             assert_eq!(refusal(&c, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()), "{number}: a number Rust reads");
         }
+        let nan: ArrayRef = Arc::new(StringArray::from(vec![Some("1.5"), Some(" nan ")]));
+        let (code, words) = refusal(&nan, &DataType::Decimal128(3, 1));
+        assert_eq!(code, "0A000", "NaN into a decimal is refused by name: Postgres keeps NaN in numeric");
+        assert!(words.contains("NaN"), "{words}");
+        let float_nan: ArrayRef = Arc::new(Float64Array::from(vec![1.5, f64::NAN]));
+        assert_eq!(refusal(&float_nan, &DataType::Decimal128(3, 1)).0, "0A000", "a float NaN too");
+        assert_eq!(refusal(&float_nan, &DataType::Int64).0, "22003", "a NaN into an integer is still out of range");
         let junk: ArrayRef = Arc::new(StringArray::from(vec![Some("12abc")]));
         assert_eq!(refusal(&junk, &DataType::Decimal128(3, 1)).0, "22P02", "text that Rust doesn't read as a number is 22P02");
         let word: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
@@ -475,6 +533,38 @@ mod tests {
         assert_eq!(refusal(&int, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()));
         assert_eq!(refusal(&int, &DataType::UInt8).0, "22003");
         assert!(refusal(&int, &DataType::UInt8).1.contains("Can't cast value 99999999999 to type UInt8"));
+    }
+
+    /// A value the CSV reader refuses as its column's type is refused as the cast refuses it, from the reader's text: Postgres's
+    /// words and SQLSTATE for an integer that won't parse or overflows; None for a value the cast takes, and for other text.
+    #[test]
+    fn a_value_the_csv_reader_refuses_is_refused_as_postgres_refuses_it() {
+        let reader = |v: &str, t: &str| format!("Arrow error: Parser error: Error while parsing value '{v}' as type '{t}' for column 1 at line 2. Row data: '[7,{v}]'");
+        let words = |text: &str| parse_refusal(text).map(|e| {
+            let e = anyhow::Error::from(e);
+            (crate::codes::of(&e), crate::codes::words(&e))
+        });
+        assert_eq!(words(&reader("2.5", "Int32")), Some(("22P02", "invalid input syntax for type integer: \"2.5\"".to_string())));
+        // (read from a file: the place it is given, as the caller writes the file and the line)
+        let located = |text: &str| parse_refusal_in(text, "s3://b/x.csv, line 3").map(|e| {
+            let e = anyhow::Error::from(e);
+            (crate::codes::of(&e), crate::codes::words(&e))
+        });
+        assert_eq!(located(&reader("2.5", "Int32")), Some(("22P02", "invalid input syntax for type integer: \"2.5\" (s3://b/x.csv, line 3)".to_string())));
+        assert_eq!(located(&reader("99999999999", "Int32")), Some(("22003", "value \"99999999999\" is out of range for type integer (s3://b/x.csv, line 3)".to_string())));
+        assert_eq!(words(&reader("1e3", "Int64")), Some(("22P02", "invalid input syntax for type bigint: \"1e3\"".to_string())));
+        assert_eq!(words(&reader("99999999999", "Int32")), Some(("22003", "value \"99999999999\" is out of range for type integer".to_string())));
+        assert_eq!(words(&reader("yes", "Boolean")), None, "a boolean the cast takes");
+        assert_eq!(words("Division by zero"), None);
+    }
+
+    /// The column and the text of the value a CSV reader refused, from its error: a value may span lines.
+    #[test]
+    fn the_cell_a_csv_reader_refused_is_its_column_and_text() {
+        let reader = |v: &str| format!("Arrow error: Parser error: Error while parsing value '{v}' as type 'Int32' for column 1 at line 9999. Row data: '[7,{v}]'");
+        assert_eq!(refused_cell(&reader("2.5")), Some((1, "2.5".to_string())));
+        assert_eq!(refused_cell(&reader("a\nb")), Some((1, "a\nb".to_string())));
+        assert_eq!(refused_cell("Division by zero"), None);
     }
 
     /// Spark's dialect cuts a cast's fraction, Pondra's SQL rounds it, in the same session type: `SET` names the

@@ -699,12 +699,15 @@ A URL is a path, a glob (`sales/*.csv`), a list (`['a.csv', 'b.csv']`) or an `s3
 | Function | Options |
 |---|---|
 | `read_parquet`, `read_json` | `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
-| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `comment`, `new_line`, `all_varchar`, `hive_partitioning`, `union_by_name`, `columns`, `hive_types` |
+| `read_csv` | `header` (default `true`: the first line names the columns), `delim` (or `sep`, `delimiter`), `quote`, `escape`, `comment`, `new_line`, `all_varchar`, `hive_partitioning`, `union_by_name`, `columns`, `types`, `hive_types` |
 | `read_delta` | `version` |
 | `read_iceberg` | `version`, `snapshot_from_id`, `snapshot_from_timestamp`, `allow_moved_paths` |
 
 - `columns => {'id': 'BIGINT', 'name': 'VARCHAR'}` names the columns and their types. A CSV's are matched by
   position, JSON's and Parquet's by name.
+- `types => {'zip': 'VARCHAR'}` (`read_csv`) reads the named columns as those types; the others are still inferred.
+  The names are the file's columns. It takes this struct form only, and not with `columns` or with
+  `all_varchar => true`.
 - `hive_types => {'day': 'DATE'}` names the keys of the `key=value` folders and their types. It turns on
   `hive_partitioning`.
 - `comment => '#'` (`read_csv`) skips the lines that start with it.

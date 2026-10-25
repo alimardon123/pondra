@@ -401,9 +401,9 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
     let meta = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| t.meta.clone()).with_context(|| format!("no temporary table {name}"))?;
     let query = match names {
         Some(n) => {
-            let all = crate::write::row_columns(meta.columns.iter().map(|(c, _)| c.clone()), n);
-            let names = if n.is_empty() { crate::write::implicit(&all, crate::write::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
-            crate::write::rows_for(name, &all, names, query, &|c: &str| crate::defaults::sql_of(&meta, c))? // (a column left out takes its DEFAULT)
+            let all = crate::rules::rows::row_columns(meta.columns.iter().map(|(c, _)| c.clone()), n);
+            let names = if n.is_empty() { crate::write::implicit(&all, crate::rules::rows::rows_width(query)) } else { n }; // (no names: `VALUES (1, DEFAULT)`, the columns its rows give)
+            crate::rules::rows::rows_for(name, &all, names, query, &|c: &str| crate::defaults::sql_of(&meta, c))? // (a column left out takes its DEFAULT)
         }
         None => query.to_string(),
     };

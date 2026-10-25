@@ -223,10 +223,10 @@ impl Merge {
         }
         if let Some(u) = &self.upsert {
             let (names, said): (Vec<String>, Said) = match u.columns.is_empty() {
-                true => (crate::write::implicit(&table, crate::write::rows_width(&u.query)).to_vec(), Said::Positional),
+                true => (crate::write::implicit(&table, crate::rules::rows::rows_width(&u.query)).to_vec(), Said::Positional),
                 false => (u.columns.clone(), Said::Named),
             };
-            let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::write::defaulted(&u.query, *i)).map(|(_, n)| n.clone()).collect();
+            let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::rules::rows::defaulted(&u.query, *i)).map(|(_, n)| n.clone()).collect();
             if let Some((assigned, _)) = &u.update {
                 match assigned.is_empty() {
                     // (the names its rows give, minus the conflict key: a DEFAULT is not given, so not set either)
@@ -352,7 +352,7 @@ impl Upsert {
     /// (DO NOTHING, when `repeats` found a key twice): the source keeps each conflict key's first row.
     fn merge(&self, meta: &TableMeta, m: &Merge, first_only: bool) -> Result<Merge> {
         // The columns the rows give: the query's aliases below, and the conflict's.
-        let width = crate::write::rows_width(&self.query);
+        let width = crate::rules::rows::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
             // (no list: the table's first columns, as many as the rows give, as an INSERT's: `write::implicit`)
             true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(),
@@ -361,14 +361,14 @@ impl Upsert {
         // The rows must be as wide as the columns they are written to: the source's alias list below would otherwise fail
         // with DataFusion's words (XX000), where Postgres says 42601.
         if let Some(w) = width.filter(|&w| w != given.len()) {
-            return Err(crate::write::width_refused(&m.target, given.len(), w));
+            return Err(crate::rules::rows::width_refused(&m.target, given.len(), w));
         }
         let on = self.on_columns(meta, &m.target)?;
         ensure!(on.iter().all(|c| given.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
-        // A DEFAULT in the rows' own VALUES is written as an INSERT writes it (`write::rows_for`): the source can't hold the word.
+        // A DEFAULT in the rows' own VALUES is written as an INSERT writes it (`rules::rows::rows_for`): the source can't hold the word.
         use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
         let query = match Parser::new(&GenericDialect {}).try_with_sql(&self.query).and_then(|mut p| p.parse_query()) {
-            Ok(parsed) if crate::write::says_default(&parsed) => crate::write::rows_for(&m.target, &given, &given, &self.query, &|c: &str| crate::defaults::sql_of(meta, c))?,
+            Ok(parsed) if crate::rules::rows::says_default(&parsed) => crate::rules::rows::rows_for(&m.target, &given, &given, &self.query, &|c: &str| crate::defaults::sql_of(meta, c))?,
             _ => self.query.clone(),
         };
         // Every column of the table is in the source and the insert: one the rows leave out takes its default (NULL with
@@ -610,7 +610,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
         Some(u) => {
             let plain = u.merge(meta, m, false)?;
             // (one row of VALUES, an ORM's upsert, can't repeat a key: no query of the source under the lake's lock)
-            built = if !crate::write::one_row(&u.query) && repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
+            built = if !crate::rules::rows::one_row(&u.query) && repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
                 // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
                 if u.update.is_some() {

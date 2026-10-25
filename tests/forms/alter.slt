@@ -1,0 +1,169 @@
+# ALTER TABLE and TRUNCATE: a column added is NULL in the rows there, a rename and a drop take the table's rules along
+# (its key, its UNIQUE and its CHECKs), and the refusals are a node's (designs/l2-page-ddl.md D2).
+statement ok
+CREATE TABLE at1 (id INT PRIMARY KEY, name VARCHAR(5), n INT CHECK (n > 0), u INT UNIQUE)
+
+statement ok
+INSERT INTO at1 VALUES (1, 'a', 1, 10), (2, 'b', 2, 20)
+
+statement ok
+ALTER TABLE at1 ADD COLUMN w INT
+
+query ITIII
+SELECT id, name, n, u, w FROM at1 ORDER BY id
+----
+1 a 1 10 NULL
+2 b 2 20 NULL
+
+statement ok
+ALTER TABLE at1 ADD COLUMN IF NOT EXISTS w INT
+
+statement error 42701
+ALTER TABLE at1 ADD COLUMN w INT
+
+statement error 0A000
+ALTER TABLE at1 ADD COLUMN d INT DEFAULT 7
+
+statement error 0A000
+ALTER TABLE at1 ADD COLUMN nn INT NOT NULL
+
+statement error 0A000
+ALTER TABLE at1 ADD COLUMN c INT CHECK (c > 0)
+
+statement ok
+ALTER TABLE at1 ADD COLUMN s VARCHAR(3)
+
+statement error 22001
+INSERT INTO at1 (id, name, n, u, s) VALUES (3, 'c', 3, 30, 'long')
+
+statement ok
+ALTER TABLE at1 RENAME COLUMN w TO w2
+
+query II
+SELECT id, w2 FROM at1 ORDER BY id
+----
+1 NULL
+2 NULL
+
+statement ok
+ALTER TABLE at1 RENAME COLUMN id TO key
+
+statement error 23505
+INSERT INTO at1 (key, name, n, u) VALUES (1, 'c', 3, 30)
+
+statement ok
+ALTER TABLE at1 RENAME COLUMN n TO m
+
+statement error 23514
+INSERT INTO at1 (key, name, m, u) VALUES (9, 'c', 0, 90)
+
+statement ok
+ALTER TABLE at1 RENAME COLUMN u TO v
+
+statement error 23505
+INSERT INTO at1 (key, name, m, v) VALUES (9, 'c', 9, 10)
+
+statement error 42701
+ALTER TABLE at1 RENAME COLUMN m TO name
+
+statement error 42703
+ALTER TABLE at1 RENAME COLUMN nope TO other
+
+statement ok
+ALTER TABLE at1 DROP COLUMN w2
+
+statement error 0A000
+ALTER TABLE at1 DROP COLUMN key
+
+statement ok
+ALTER TABLE at1 DROP COLUMN m
+
+statement ok
+INSERT INTO at1 (key, name, v) VALUES (5, 'e', 50)
+
+statement ok
+ALTER TABLE at1 DROP COLUMN v
+
+statement ok
+INSERT INTO at1 (key, name) VALUES (6, 'f')
+
+statement ok
+ALTER TABLE at1 DROP COLUMN IF EXISTS nope
+
+statement error 42703
+ALTER TABLE at1 DROP COLUMN nope
+
+statement ok
+ALTER TABLE at1 RENAME TO at2
+
+query IT
+SELECT key, name FROM at2 ORDER BY key
+----
+1 a
+2 b
+5 e
+6 f
+
+statement error 23505
+INSERT INTO at2 (key, name) VALUES (2, 'dup')
+
+statement error 42P01
+SELECT * FROM at1
+
+statement ok
+CREATE TABLE at3 (x INT)
+
+statement error 42P07
+ALTER TABLE at2 RENAME TO at3
+
+statement error 42P01
+ALTER TABLE nope ADD COLUMN x INT
+
+statement ok
+CREATE VIEW atv AS SELECT key FROM at2
+
+statement error 0A000
+ALTER TABLE at2 RENAME COLUMN name TO label
+
+statement error 2BP01
+ALTER TABLE at2 DROP COLUMN name
+
+statement ok
+ALTER TABLE at2 ADD COLUMN later INT
+
+statement ok
+ALTER VIEW atv RENAME TO atw
+
+query I
+SELECT count(*) FROM atw
+----
+4
+
+statement ok
+DROP VIEW atw
+
+statement ok
+TRUNCATE at2
+
+query I
+SELECT count(*) FROM at2
+----
+0
+
+statement ok
+INSERT INTO at2 (key, name) VALUES (1, 'a')
+
+statement ok
+TRUNCATE TABLE at2
+
+statement error 42P01
+TRUNCATE nope
+
+statement error 0A000
+TRUNCATE at2, at3
+
+statement ok
+DROP TABLE at2
+
+statement ok
+DROP TABLE at3

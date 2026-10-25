@@ -119,6 +119,7 @@ pub fn received(code: &str) -> Option<&'static str> {
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
     let has = |w: &str| t.contains(w);
+    let first_said = |w: &str| t.split_once(' ').is_some_and(|(_, rest)| rest.starts_with(w)); // (`v is a view…`: what a name is, said first)
     match () {
         _ if has("could not serialize") => "40001",                                             // serialization_failure
         _ if has("cannot insert a non-default value") || has("can only be updated to default") => "428C9", // generated_always
@@ -133,18 +134,23 @@ fn by_words(text: &str) -> &'static str {
         _ if has("wrong token") || has("password authentication failed") => "28P01",            // invalid_password
         _ if has("sql error: parsererror") || has("syntax error") || has("expected: ") && has("found: ") => "42601", // syntax_error
         _ if has("inconsistent data length across values list") => "42601", // (a VALUES whose rows differ in width: Postgres says syntax_error too)
-        _ if has("no field named") || has("column") && has("not found") || has("no column ") => "42703", // undefined_column
+        _ if has("no field named") || has("column") && has("not found") || has("no column ") || has("column \"") && has("\" of relation \"") && has("does not exist") => "42703", // undefined_column
+        _ if has("constraint \"") && has("\" of relation \"") && has("does not exist") => "42704", // undefined_object (Postgres's code for a constraint that isn't there)
         _ if has("invalid function") || has("function") && (has("not found") || has("does not exist")) || has("no function ") => "42883", // undefined_function
-        _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("relation") && has("does not exist") => "42P01", // undefined_table
+        _ if has("table '") && has("not found") || has("no table ") || has("no table or view") || has("no view ") || has("relation") && has("does not exist") => "42P01", // undefined_table
         _ if has("no schema ") || has("schema") && has("does not exist") => "3F000",            // invalid_schema_name
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
+        _ if has(" is read by ") => "2BP01",                                                     // dependent_objects_still_exist (DROP TABLE that a view or a task reads)
+        _ if first_said("is a view") || first_said("is a table") => "42809",                    // wrong_object_type (a view's name where a table's goes, or the other way)
+        _ if has("already has a column") => "42701",                                           // duplicate_column (ALTER TABLE … ADD or RENAME COLUMN)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
         _ if has("multiple primary keys") => "42P16",                                          // invalid_table_definition
         _ if has("divide by zero") || has("division by zero") => "22012",                       // division_by_zero
         _ if has("overflow") || has("out of range") => "22003",                                 // numeric_value_out_of_range
         _ if has("can't cast value") || has("too large to store in a decimal") || int_overflow_text(&t) => "22003", // (Arrow's words for a number that doesn't fit: a value cast to a narrower integer, a decimal's precision, digits that overflow an integer)
         _ if has("csv error") => "22P04", // bad_copy_file_format (a file read as CSV is malformed: Arrow's words, e.g. a line with more fields than the schema has)
+        _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
@@ -158,6 +164,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
+        _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
         _ => "XX000",                                                                          // internal_error
     }
@@ -171,6 +178,10 @@ fn int_overflow_text(t: &str) -> bool {
     let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && after.starts_with(" to value of int")
 }
+
+/// Whether lowercase `t` holds Arrow's words for NaN cast to a decimal (`cannot cast string 'nan' to value of decimal128(5, 2)
+/// type`): a decimal here holds numbers only, so it is refused as `casts::into` refuses it (0A000), wherever the cast is made.
+fn nan_into_decimal(t: &str) -> bool { t.contains("cannot cast string 'nan' to value of decimal") }
 
 /// The SQLSTATE of one of Postgres's condition names (a script's `EXCEPTION WHEN unique_violation`).
 pub fn named(name: &str) -> Option<&'static str> {
@@ -196,7 +207,7 @@ pub fn http(code: &str) -> u16 {
         "28P01" | "28000" => 401,                                         // invalid_authorization: sign in
         "42501" => 403,                                                   // insufficient_privilege
         "42P01" | "42703" | "42883" | "42704" | "3F000" | "3D000" => 404, // undefined table / column / function / type / schema / database
-        "42P07" | "23505" => 409,                                         // already exists, duplicate key
+        "42P07" | "42701" | "23505" => 409,                               // already exists (a table, a column), duplicate key
         "53300" => 429,                                                   // too many of a user's queries at once (a quota)
         "0A000" => 501,                                                   // feature_not_supported
         "54000" => 413,                                                   // program_limit_exceeded (a page's rows past PONDRA_WEB_SEND_MB: too big to send)
@@ -236,6 +247,17 @@ mod tests {
         assert_eq!(of("type \"mood\" does not exist"), "42704");
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
+        assert_eq!(of("t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"), "2BP01");
+        assert_eq!(of("no view nov"), "42P01");
+        assert_eq!(of("column \"d2\" of relation \"at2\" does not exist"), "42703");
+        assert_eq!(of("constraint \"c\" of relation \"t\" does not exist"), "42704");
+        assert_eq!(of("t already has a column w"), "42701");
+        assert_eq!(of("key is t's key column: it stays"), "0A000");
+        assert_eq!(of("a is t's last column (DROP TABLE t)"), "0A000");
+        assert_eq!(of("ALTER TABLE t ADD COLUMN d … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE t SET d = …)"), "0A000");
+        assert_eq!(of("v is a view: write to the tables it reads"), "42809");
+        assert_eq!(of("t is a table"), "42809");
+        assert_ne!(of("no topic t on this Pondra node: a topic is a table (CREATE TABLE t …)"), "42809"); // (said of a topic, not a name)
         assert_eq!(of("error sending request for url (http://10.0.0.2:8080/cluster/commit)"), "58030");
         assert_eq!(of("cannot insert a non-DEFAULT value into column \"id\" of t: it is an identity column defined as GENERATED ALWAYS"), "428C9");
         assert_eq!(of("nextval: reached maximum value of sequence \"s\" (3)"), "2200H");
@@ -250,6 +272,7 @@ mod tests {
         assert_eq!(of("Cast error: Cannot cast string 'abc' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '1.5' to value of Int32 type"), "22P02");
         assert_eq!(of("Cast error: Cannot cast string '4.4.5' to value of Decimal128(38, 10) type"), "22P02");
+        assert_eq!(of("Cast error: Cannot cast string 'NaN' to value of Decimal128(5, 2) type"), "0A000"); // (a page's INSERT, `CAST('NaN' AS NUMERIC)`)
         assert_eq!(of("Arrow error: Csv error: incorrect number of fields for line 1, expected 0 got more than 0"), "22P04"); // (a read_csv over a file of blank lines: a malformed file, not a 500)
         assert_eq!(super::of(&super::coded("40001", "could not serialize access due to concurrent update")), "40001");
         assert_eq!(super::of(&super::coded("3D000", "no database x (CREATE DATABASE x)")), "3D000"); // (USE of a database that isn't there)

@@ -51,7 +51,22 @@ is text, bytes (a `Uint8Array` or an `ArrayBuffer`) or nothing. The answer is `{
 in the body.
 
 Tables are made, written and dropped as on a node. `PRIMARY KEY`, `UNIQUE`, `CHECK` and `VARCHAR(n)` refuse
-the rows a node refuses, with the same codes (`23505`, `23514`, `22001`).
+the rows a node refuses, with the same codes (`23505`, `23514`, `22001`). A row narrower than its table, and a
+`DEFAULT` in `VALUES`, take the column's default; a row wider than its columns is refused (`42601`).
+
+A page keeps identity columns, `GENERATED … AS IDENTITY` and `SERIAL`, as a node does. Each table counts its own:
+an INSERT that leaves the column out, or says `DEFAULT`, takes the next number, and an `ALWAYS` column given a value
+is refused (`428C9`). A kept page keeps the count, and a table dropped and made again starts it over.
+
+Views are made and dropped as on a node. A view reads its tables as they are when it is read, and it can read
+another view. `DROP TABLE` refuses a table that a view reads (`2BP01`), and `DROP TABLE … CASCADE` drops those views
+too. A kept page keeps its views.
+
+`ALTER TABLE` adds, drops and renames columns, and renames the table (`RENAME TO`, and `ALTER VIEW … RENAME TO` for a
+view). A column added is NULL in the rows already there, so it takes its type alone: `NOT NULL`, a `DEFAULT`, an
+identity, a `CHECK` or `UNIQUE` on it is refused, as on a node. A rename takes the table's rules along (its key, its
+`UNIQUE` and its `CHECK`s read the column by its new name), and a dropped column takes its `UNIQUE` and `CHECK`s with
+it. A column of a table that a view reads isn't renamed or dropped until the view is. `TRUNCATE t` empties a table.
 
 ## Files people give it
 
@@ -70,7 +85,7 @@ input.onchange = async () => {
 file is deleted (`DELETE /files/orders.csv`). `GET /files/{name}` gives a file back with its `etag`. A `PUT` to a
 name that has a file is refused (`409`) unless it sends `If-Match` with that `etag`, and then it replaces the file
 only if nobody changed it since (`412` otherwise). `GET /objects` lists the page's tables with their rows and
-bytes.
+bytes, and its views.
 
 ## Keep tables across reloads
 
@@ -155,9 +170,9 @@ const page = new Page();
 ## What a page doesn't do yet
 
 <Aside>
-A page refuses these with `0A000`: views (`CREATE VIEW`), `ALTER TABLE`, transactions (`BEGIN`), `DECLARE`,
-`CREATE TYPE`, `MERGE` and `INSERT … ON CONFLICT`, identity columns, a table's past (`AT (VERSION => …)`), SQL
-functions and sequences. Users and grants, tasks, shares, secrets, backups, attached lakes and `COPY` are a node's,
-and a page refuses them the same way, saying where to do each. `DEFAULT` in `VALUES` and a row narrower than its
-table fail with DataFusion's words.
+A page refuses these with `0A000`: transactions (`BEGIN`), `DECLARE`, `CREATE TYPE`, `MERGE` and
+`INSERT … ON CONFLICT`, a table's past (`AT (VERSION => …)`), SQL functions and sequences, and the
+`ALTER TABLE` forms beyond the ones above (a column's type or default, constraints). Users and grants, tasks, shares,
+secrets, backups, attached lakes, materialized views and `COPY` are a node's, and a page refuses them the same way,
+saying where to do each.
 </Aside>

@@ -2,9 +2,11 @@
 //! (`TableMeta::rules`), and a page will from its own definitions. Names are SQL's, as rows reach the rules;
 //! only `Column::stored` keeps the name a file or the log holds a column under. Nothing here reads files,
 //! storage or the catalog, so the rules over it (`shape`) run the same in a browser as on a node.
+pub mod alter;
 pub mod create;
 pub mod fit;
 pub mod keys;
+pub mod rows;
 pub mod typed;
 
 use anyhow::{bail, Result};

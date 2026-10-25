@@ -123,6 +123,28 @@ pub fn given(t: &Table, table: &str, columns: &[String], said: Said) -> Result<(
     }
 }
 
+/// An INSERT into `table` of `query`'s rows, as the rules of its ALWAYS identity give it (428C9). `names` are the columns the
+/// statement names (empty when it names none). With no names and no DEFAULT in its VALUES, the rows give the table's first
+/// columns, in order (`Said::Positional`). Otherwise the columns named (or, naming none, the first the rows give) are given
+/// unless the rows say DEFAULT for them, and that is `Said::Named`: a node's `INSERT INTO t query` reads it so, too.
+pub fn inserted(t: &Table, table: &str, names: &[String], query: &str) -> Result<()> {
+    use super::fit::implicit;
+    use super::rows::{defaulted, rows_width, says_default};
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
+    let width = rows_width(query);
+    if names.is_empty() {
+        // (a query that says DEFAULT somewhere is read as the named one is, below; one that doesn't, as a positional one)
+        let Ok(parsed) = Parser::new(&GenericDialect {}).try_with_sql(query).and_then(|mut p| p.parse_query()) else { return Ok(()) };
+        if !says_default(&parsed) {
+            return given(t, table, implicit(&columns, width), Said::Positional);
+        }
+    }
+    let names: Vec<String> = if names.is_empty() { implicit(&columns, width).to_vec() } else { names.to_vec() };
+    let given_names: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
+    given(t, table, &given_names, Said::Named)
+}
+
 /// `UPDATE` setting `columns` (as SQL names them): refused if one is an ALWAYS identity (428C9).
 pub fn set(t: &Table, columns: &[String]) -> Result<()> {
     match t.columns.iter().find(|c| c.always && columns.contains(&c.name)) {
@@ -196,5 +218,31 @@ mod tests {
         let t = table(&["id", "v"], &["id"]);
         assert_eq!(set(&t, &["id".to_string()]).unwrap_err().to_string(), "column \"id\" can only be updated to DEFAULT: it is an identity column defined as GENERATED ALWAYS");
         set(&t, &["v".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn inserted_gives_an_always_identity_only_what_the_rows_say() {
+        let t = table(&["id", "v"], &["id"]);
+        let named = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<String>>();
+        // positional: the rows give the first columns, and a value for the identity is refused in the positional words
+        let positional = inserted(&t, "s.t", &[], "VALUES (5, 'x')").unwrap_err();
+        assert_eq!(crate::codes::of(&positional), "428C9");
+        assert!(positional.to_string().ends_with("(name the columns you give, or say DEFAULT)"), "{positional}");
+        let wide = inserted(&t, "s.t", &[], "SELECT 'c', 2").unwrap_err();
+        assert_eq!(crate::codes::of(&wide), "428C9", "a SELECT of two columns gives both, the identity first");
+        // a positional row that says DEFAULT is read as a named one: the identity is left out, and its words are the named ones
+        inserted(&t, "s.t", &[], "VALUES (DEFAULT, 'x')").unwrap();
+        let mixed = inserted(&t, "s.t", &[], "VALUES (DEFAULT, 'x'), (5, 'y')").unwrap_err();
+        assert_eq!(crate::codes::of(&mixed), "428C9");
+        assert!(mixed.to_string().ends_with("(leave it out, or say DEFAULT)"), "{mixed}");
+        // named: a value for the identity is refused; DEFAULT, or leaving it out, takes its number
+        let given = inserted(&t, "s.t", &named(&["id", "v"]), "VALUES (10, 'c')").unwrap_err();
+        assert_eq!(crate::codes::of(&given), "428C9");
+        assert!(given.to_string().ends_with("(leave it out, or say DEFAULT)"), "{given}");
+        inserted(&t, "s.t", &named(&["id", "v"]), "VALUES (DEFAULT, 'c')").unwrap();
+        inserted(&t, "s.t", &named(&["v"]), "VALUES ('c')").unwrap();
+        inserted(&t, "s.t", &named(&["v"]), "SELECT 'c'").unwrap();
+        // a query that doesn't parse is the planner's to answer, not this rule's
+        inserted(&t, "s.t", &[], "VALUES (").unwrap();
     }
 }

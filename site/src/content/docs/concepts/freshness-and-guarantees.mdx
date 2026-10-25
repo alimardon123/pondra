@@ -54,9 +54,14 @@ SELECT count(*) AS rows_written FROM events;
 
 The batch went in once. A SQL write is made exactly-once with a **job** id: send the same job again
 and it is applied once. A job id you name is remembered for 64 days (`PONDRA_LOAD_RETENTION_SECS`), so a
-load re-run days later is still applied once. A write sent without one gets an id that starts `auto-`,
-which is remembered for about two minutes (twice the lock lease, `PONDRA_LOCK_LEASE_SECS`, 60 s by
-default): a retry in that time is applied once, and after it the same id is a new write.
+load re-run days later is still applied once, unless its name starts `auto-`: those ids are the clients' own, and are
+remembered for about two minutes. The Python and JavaScript clients make their own ids for their
+writes, and each id says the last moment its client may send it again: its first send plus its `retry_secs`
+(60 s by default). The node remembers the id until then, plus two minutes (twice the lock lease,
+`PONDRA_LOCK_LEASE_SECS`, 60 s by default), and no more than a day. So a retry the client sends is applied
+once. A write sent without a job, such as a `pondra sql` run with no `PONDRA_JOB`, gets an id that starts
+`auto-`, which is remembered for about two minutes: a retry in that time is applied once, and after it the
+same id is a new write.
 
 <Tabs syncKey="lang">
   <TabItem label="Python">

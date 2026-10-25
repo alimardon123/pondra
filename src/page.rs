@@ -34,12 +34,15 @@ use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DfStatement;
-use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, Insert, ObjectName, ObjectNamePart, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
+use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnOption, ColumnOptionDef, CreateTable, CreateView, Ident, Insert, ObjectName, ObjectNamePart, ObjectType, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, OnceLock, PoisonError};
 use std::task::Poll;
+
+mod alter; // (ALTER TABLE, ALTER VIEW … RENAME TO and TRUNCATE: `alter_statement`, `truncated`)
+mod counters; // (an identity column's counter, and `nextval` over the counters: `Counter`, `Nextval`)
 
 const TEXT: &str = "text/plain; charset=utf-8";
 const JSON: &str = "application/json";
@@ -48,11 +51,15 @@ const FILES: &str = "/files/";
 const WORKING: &str = "mem:///files/";
 /// The folder a page's tables are kept in, beside `files/` in its store. SQL never reads it (`located`).
 const TABLES: &str = "tables";
-/// The notes an Arrow file of a kept table carries: the table's name, a column's default as SQL text, and the CREATE TABLE
-/// text its rules are made from (`CREATE_KEY`, when the table has rules).
+/// Where a kept page keeps its views, one file each (`view_at`).
+const VIEWS: &str = "views";
+/// The notes an Arrow file of a kept table carries: the table's name, a column's default as SQL text, the CREATE TABLE
+/// text its rules are made from (`CREATE_KEY`, when the table has rules), and the counters of its identity columns, as JSON
+/// (`COUNTERS_KEY`, when it has any).
 const TABLE_KEY: &str = "pondra.table";
 const DEFAULT_KEY: &str = "pondra.default";
 const CREATE_KEY: &str = "pondra.create";
+const COUNTERS_KEY: &str = "pondra.counters";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
@@ -152,15 +159,18 @@ pub struct Page {
     node: Option<Node>,
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
     unread: Vec<(String, String)>, // (the kept files `kept` couldn't read, each as its path and the words of why)
-    ruled: std::sync::Mutex<HashMap<String, Ruled>>, // (each page table's rules, by its name: `Ruled`, kept with the table's file)
+    ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>>, // (each page table's rules, by its name: `Ruled`, kept with the table's file; `nextval` reads the counters in them)
+    views: std::sync::Mutex<BTreeMap<String, String>>, // (each view's query, by its name: `view_statement`; a statement reads them through the front, `views_for`)
 }
 
-/// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), and that statement's text,
-/// which a kept page keeps in the table's file (`CREATE_KEY`) to make them again.
+/// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), that statement's text, which a kept
+/// page keeps in the table's file (`CREATE_KEY`) to make them again, and the counters of its identity columns (`counters`, by
+/// sequence name): a table's counters are kept with its rules, so a rename moves them and a drop takes them away.
 #[derive(Clone)]
 struct Ruled {
     create: String,
     table: Arc<crate::rules::Table>,
+    counters: counters::Counters,
 }
 
 /// A statement planned (`planned`): its session, its plan, the name of the page table it changes (`touched`), and `ruled`,
@@ -275,6 +285,12 @@ impl Page {
                 page.unread.push((object.location.to_string(), crate::codes::words(&e)));
             }
         }
+        let listed = page.files.list(Some(&Path::from(VIEWS))).try_collect::<Vec<_>>().await?;
+        for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".json")) {
+            if let Err(e) = page.view_back(&object.location).await {
+                page.unread.push((object.location.to_string(), crate::codes::words(&e)));
+            }
+        }
         Ok(page)
     }
 
@@ -315,7 +331,11 @@ impl Page {
         };
         let url = ObjectStoreUrl::parse("mem://").expect("a URL");
         ctx.register_object_store(url.as_ref(), files.clone());
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled: Default::default() }
+        // (`nextval` counts in the page's tables' counters, which are kept with their rules: the page's session copies it to each
+        // statement's, so a statement's `nextval` reaches the same counters)
+        let ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>> = Default::default();
+        ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(counters::Nextval::new(ruled.clone())));
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -347,6 +367,15 @@ impl Page {
     /// its own is planned; a write is run and kept (`write`) before the next one is planned.
     async fn sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let turn = self.keeping.lock().await;
+        if let Some(answer) = self.view_statement(text).await? {
+            return Ok(answer);
+        }
+        if let Some(answer) = self.alter_statement(text).await? {
+            return Ok(answer);
+        }
+        // (a TRUNCATE is its table's DELETE: the DELETE it becomes is planned and run as any DELETE is)
+        let deleted = self.truncated(text)?;
+        let text = deleted.as_deref().unwrap_or(text);
         let planned = match self.planned(text).await {
             Ok(planned) => planned,
             // (a node to ask: the node answers a statement the page can't plan, or can't expand over a node's table, and the page
@@ -387,7 +416,7 @@ impl Page {
     /// whole row of one, or its enum) is sent as written, and a page's own refusal, or a statement over its files, stands.
     /// Kept apart from sending, so the snapshot path (4k-5) branches here later.
     async fn outgoing(&self, text: &str, format: Option<&str>, missing: bool) -> anyhow::Result<Option<Outgoing>> {
-        let (expanded, raw) = match crate::front::expand(&PageHost(self), text, &HashMap::new()).await {
+        let (expanded, raw) = match crate::front::expand(&PageHost(self), text, &self.views_for(text, &[]).await?).await {
             Ok(_) if !missing => return Ok(None), // (the planner's or a rule's refusal over what the page has: the page's own answer)
             Ok(expanded) => (crate::asof::as_of(&expanded)?.into_owned(), false),
             // (a page's own refusal, and a statement over its files, keep the front's error: only the front makes a file's name the page's)
@@ -478,8 +507,12 @@ impl Page {
     /// `SELECT * FROM` the node's rows, parsed as the page's session parses SQL: the query a fill's write puts in place of
     /// its own.
     fn rows_query(&self) -> anyhow::Result<Box<Query>> {
-        let sql = format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS));
-        let DfStatement::Statement(s) = self.parsed(&sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
+        self.query_of_text(&format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS)))
+    }
+
+    /// `sql` parsed as a query, as the page's session parses SQL (`parsed`).
+    fn query_of_text(&self, sql: &str) -> anyhow::Result<Box<Query>> {
+        let DfStatement::Statement(s) = self.parsed(sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
         let SqlStatement::Query(query) = *s else { anyhow::bail!("{sql} is not a query") };
         Ok(query)
     }
@@ -558,9 +591,15 @@ impl Page {
     /// another statement. The name of the page table it changes, if any (`touched`), comes back with the plan: `sql`
     /// keeps that table once the plan has run.
     async fn planned(&self, text: &str) -> anyhow::Result<Planned> {
+        self.planned_as(text, &[]).await
+    }
+
+    /// `planned`, with the views in `outer` left out of those the statement reads: a view's own query, planned as it is
+    /// made, doesn't read the view (`view_plans`).
+    async fn planned_as(&self, text: &str, outer: &[String]) -> anyhow::Result<Planned> {
         let row = crate::extension::row(text).transpose()?; // (DuckDB's INSTALL and LOAD: a row naming what happened, `extension.rs`)
         let text = row.as_deref().unwrap_or(text);
-        let expanded = crate::front::expand(&PageHost(self), text, &HashMap::new()).await?;
+        let expanded = crate::front::expand(&PageHost(self), text, &self.views_for(text, outer).await?).await?;
         // (a page keeps no table's past, so `AT (…)` is refused by name: left alone, it would fail as an unknown table "at:…")
         if crate::past_names::mentioned(&expanded) {
             return Err(crate::codes::coded("0A000", format!("{}: a page keeps no table's past (a node reads a table as it was)", crate::past_names::spelled(&expanded))));
@@ -573,8 +612,12 @@ impl Page {
     /// the table `NODE_ROWS` for this statement alone (`Overlay::own`). A CREATE TABLE with columns is planned without its
     /// constraints (`plain_create`), and its rules are the core's, made over the columns the planner gave it (`ruled_made`).
     async fn planned_expanded(&self, expanded: &str, rows: Option<Arc<dyn TableProvider>>) -> anyhow::Result<Planned> {
+        let ordered = crate::rules::create::in_order(expanded); // (an identity's options in the order the parser takes them, as a node puts them)
+        let expanded = ordered.as_deref().unwrap_or(expanded);
         rules(expanded)?; // (a table rule a page can't keep is refused before anything is planned or read)
         self.key_set(expanded)?; // (an UPDATE of a key column of a ruled table, which a node refuses too)
+        let whole = self.whole_rows(expanded).await?; // (an INSERT into one of the page's tables, as whole rows: all that follows reads it)
+        let expanded = whole.as_deref().unwrap_or(expanded);
         let (ctx, overlay) = self.statement()?;
         if let Some(rows) = rows {
             overlay.own(NODE_ROWS.to_string(), rows);
@@ -582,13 +625,19 @@ impl Page {
         crate::explain::prepare(&ctx, expanded); // (an EXPLAIN's operators' expected rows, as a node's)
         self.given(&overlay, expanded).await?;
         let created = self.created(expanded);
+        // (each identity column's sequence and counter, named past the names the page's counters hold: the planned DEFAULT and
+        // the counter are made from the same names)
+        let identified = match &created {
+            Some(c) => self.identified(c)?,
+            None => vec![],
+        };
         let sql = match &created {
-            Some(c) => plain_create(c).to_string(),
+            Some(c) => plain_create(c, &identified)?.to_string(),
             None => expanded.to_string(),
         };
         let plan = crate::engine::planned(&ctx, &sql).await?;
         let ruled = match &created {
-            Some(c) => self.ruled_made(c, &plan)?,
+            Some(c) => self.ruled_made(c, &plan, identified)?,
             None => None,
         };
         may(&plan)?;
@@ -611,16 +660,68 @@ impl Page {
         }
     }
 
+    /// An INSERT into one of the page's own tables, written as an INSERT of whole rows, as a node writes it (`rules::rows::rows_for`):
+    /// each row gives every column the table has, in its order. The columns it names (or, naming none, the first its values give)
+    /// take its values, and a column it leaves out, or says DEFAULT for, takes the column's default, or NULL. A row of the wrong
+    /// width is refused with the node's words and code. None for any other statement, and for an INSERT into a table the page
+    /// doesn't have, so the planner's own answer stands.
+    async fn whole_rows(&self, expanded: &str) -> anyhow::Result<Option<String>> {
+        if !expanded.to_ascii_lowercase().contains("insert") {
+            return Ok(None);
+        }
+        let Ok(DfStatement::Statement(mut statement)) = self.parsed(expanded) else { return Ok(None) };
+        let SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), on: None, columns: names, .. }) = statement.as_mut() else { return Ok(None) };
+        let target = self.table_ref(name)?;
+        if self.home(&target)? != Home::Page {
+            return Ok(None);
+        }
+        let Some(table) = self.default_schema()?.1.table(target.table()).await? else { return Ok(None) };
+        let columns: Vec<String> = table.schema().fields().iter().map(|f| f.name().clone()).collect();
+        let named: Vec<String> = names.iter().map(crate::text::object).collect();
+        // (an ALWAYS identity is given no value by an INSERT, which a node refuses as 428C9: the statement's own columns are judged)
+        if let Some(ruled) = self.ruled_of(target.table()).filter(|r| r.table.columns.iter().any(|c| c.always)) {
+            crate::rules::keys::inserted(&ruled.table, &name.to_string(), &named, &query.to_string())?;
+        }
+        let named = match named.is_empty() {
+            true => crate::rules::fit::implicit(&columns, crate::rules::rows::rows_width(&query.to_string())).to_vec(),
+            false => named,
+        };
+        let default = |c: &str| table.get_column_default(c).and_then(|e| datafusion::sql::unparser::expr_to_sql(e).ok()).map(|e| e.to_string());
+        let source = query.to_string();
+        let text = crate::rules::rows::rows_for(&name.to_string(), &columns, &named, &source, &default)?; // (its refusals are the node's)
+        let quoted = |names: &[String]| names.iter().map(|c| ObjectName::from(vec![Ident::with_quote('"', c.as_str())])).collect();
+        if crate::rules::rows::plain_values(&source).is_none() {
+            // (DataFusion types every VALUES in an INSERT's query by the INSERT's columns, a subquery's too, so a query keeps the
+            // columns its rows give, and the planner fills the others with their defaults, as `rows_for` would)
+            *names = quoted(&named);
+            return Ok(Some(statement.to_string()));
+        }
+        *query = self.query_of_text(&text)?;
+        *names = quoted(&columns);
+        Ok(Some(statement.to_string()))
+    }
+
     /// The rules a CREATE TABLE `c` makes, over the table as `plan` plans it (`made_table`), with the statement's text kept
     /// for a kept page (`CREATE_KEY`). None when the table has nothing a write could break (`has_rules`): it costs nothing,
     /// and its kept file has no note.
-    fn ruled_made(&self, c: &CreateTable, plan: &LogicalPlan) -> anyhow::Result<Option<Ruled>> {
+    fn ruled_made(&self, c: &CreateTable, plan: &LogicalPlan, identified: Vec<counters::Identified>) -> anyhow::Result<Option<Ruled>> {
         let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(made)) = plan else { anyhow::bail!("{} is not planned as a table", c.name) };
         let table = self.made_table(c, made.input.schema().as_arrow())?;
         if !has_rules(&table) {
             return Ok(None);
         }
-        Ok(Some(Ruled { create: SqlStatement::CreateTable(c.clone()).to_string(), table: Arc::new(table) }))
+        let held = identified.into_iter().map(|i| (i.sequence, i.counter)).collect();
+        Ok(Some(Ruled { create: SqlStatement::CreateTable(c.clone()).to_string(), table: Arc::new(table), counters: Arc::new(std::sync::Mutex::new(held)) }))
+    }
+
+    /// The identity columns of a CREATE TABLE `c` (`counters::identified`), each with its sequence named past the names the page's
+    /// tables' counters hold: a table renamed away keeps its sequence, so a new one may find its name taken.
+    fn identified(&self, c: &CreateTable) -> anyhow::Result<Vec<counters::Identified>> {
+        let taken: BTreeSet<String> = {
+            let all = self.ruled.lock().unwrap_or_else(PoisonError::into_inner);
+            all.values().flat_map(|r| r.counters.lock().unwrap_or_else(PoisonError::into_inner).keys().cloned().collect::<Vec<_>>()).collect()
+        };
+        counters::identified(c, |name| taken.contains(name))
     }
 
     /// The rules a CREATE TABLE declares (`rules::Table::of_create`) over the columns `schema` gives it. Each CHECK is checked as
@@ -653,6 +754,8 @@ impl Page {
         let TableFactor::Table { name, .. } = &target.relation else { return Ok(()) };
         let table = self.table_ref(name)?.table().to_string();
         let Some(ruled) = self.ruled_of(&table) else { return Ok(()) };
+        // (an ALWAYS identity is set only to DEFAULT, as a node sets it: 428C9)
+        crate::rules::keys::set(&ruled.table, &set_columns(&assignments))?;
         for assignment in &assignments {
             let columns: Vec<&ObjectName> = match &assignment.target {
                 AssignmentTarget::ColumnName(n) => vec![n],
@@ -810,11 +913,15 @@ impl Page {
     /// keeps the table it leaves, or forgets a dropped one, over that same file, so the rows the file holds would be gone.
     /// Once the file is removed, the name is the page's again.
     async fn unwritable(&self, name: &str) -> anyhow::Result<()> {
-        let at = kept_at(name);
+        self.unread_there(name, &kept_at(name), "table").await
+    }
+
+    /// `unwritable` of the kept file at `at`, which holds the `what` (a table or a view) named `name`.
+    async fn unread_there(&self, name: &str, at: &Path, what: &str) -> anyhow::Result<()> {
         let Some((path, why)) = self.unread.iter().find(|(path, _)| path.as_str() == at.as_ref()) else { return Ok(()) };
-        match self.files.head(&at).await {
+        match self.files.head(at).await {
             Err(StoreError::NotFound { .. }) => Ok(()),
-            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the table can't be written until the file is removed"))),
+            _ => Err(crate::codes::coded("55000", format!("{name}: the page couldn't read its kept file {path} ({why}), so the file is left as it is and the {what} can't be written until the file is removed"))),
         }
     }
 
@@ -876,8 +983,8 @@ impl Page {
             return Ok(());
         }
         let batches = batches_of(&table).await.ok_or_else(|| anyhow::anyhow!("{name}: a page's table holds its rows in memory"))?;
-        let create = self.ruled_of(name).map(|ruled| ruled.create);
-        let file = table_file(name, table.as_ref(), &batches, create.as_deref())?;
+        // (the counters are kept with the rules, so the file holds each counter as this write left it)
+        let file = table_file(name, table.as_ref(), &batches, self.ruled_of(name).as_ref())?;
         self.files.put_opts(&kept_at(name), PutPayload::from(file), PutOptions { mode: PutMode::Overwrite, ..Default::default() }).await?;
         Ok(())
     }
@@ -911,7 +1018,7 @@ impl Page {
         let schema = table_schema(&kept);
         let defaults = self.column_defaults(&kept, &schema)?;
         let ruled = match kept.metadata().get(CREATE_KEY) {
-            Some(text) => Some(self.ruled_from(text, &schema)?),
+            Some(text) => Some(self.ruled_from(text, &schema, kept.metadata().get(COUNTERS_KEY).map(String::as_str))?),
             None => None,
         };
         let mut batches = vec![];
@@ -921,13 +1028,18 @@ impl Page {
         Ok((name, MemTable::try_new(schema, vec![batches])?.with_column_defaults(defaults), ruled))
     }
 
-    /// The rules a kept table's CREATE TABLE text makes (`made_table`), over the table's schema, with the text kept as it is.
-    /// A note whose text is not a CREATE TABLE, or fails to parse or to build, makes the table unread, as a bad file does
-    /// (`kept` lists it by its path and the words of why).
-    fn ruled_from(&self, text: &str, schema: &Schema) -> anyhow::Result<Ruled> {
+    /// The rules a kept table's CREATE TABLE text makes (`made_table`), over the table's schema, with the text kept as it is, and
+    /// its counters as its counters note has them (`COUNTERS_KEY`): a file with none starts each identity column at its start, as
+    /// the CREATE made it. A note whose text is not a CREATE TABLE, or fails to parse or to build, makes the table unread, as a bad
+    /// file does (`kept` lists it by its path and the words of why).
+    fn ruled_from(&self, text: &str, schema: &Schema, counted: Option<&str>) -> anyhow::Result<Ruled> {
         let DfStatement::Statement(s) = self.parsed(text)? else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
         let SqlStatement::CreateTable(c) = *s else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
-        Ok(Ruled { create: text.to_string(), table: Arc::new(self.made_table(&c, schema)?) })
+        let held: BTreeMap<String, counters::Counter> = match counted {
+            Some(json) => serde_json::from_str(json).with_context(|| format!("its {COUNTERS_KEY} note is not a table's counters"))?,
+            None => counters::starting(&c)?,
+        };
+        Ok(Ruled { create: text.to_string(), table: Arc::new(self.made_table(&c, schema)?), counters: Arc::new(std::sync::Mutex::new(held)) })
     }
 
     /// The column defaults a kept file's notes give (`pondra.default`), each read as SQL over the table's schema.
@@ -1007,8 +1119,12 @@ impl Page {
             Some(c) => crate::ext_names::declared(session(), c).await?,
             None => vec![],
         };
+        let types = match given.options.get("types") {
+            Some(t) => Some(crate::ext_names::declared(session(), t).await?.iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>()),
+            None => None,
+        };
         let undeclared = declared.is_none();
-        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, |u| {
+        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, types.as_deref(), |u| {
             undeclared.then(|| crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))
         })
         .await?;
@@ -1140,8 +1256,249 @@ impl Page {
             }
             objects.push(object);
         }
+        for name in self.views.lock().unwrap_or_else(PoisonError::into_inner).keys() {
+            objects.push(json!({"catalog": "page", "schema": "public", "name": name, "kind": "view"}));
+        }
         Ok(Answer::ok(JSON, serde_json::to_vec(&json!({"objects": objects, "files": WORKING}))?))
     }
+}
+
+/// A page's views. DataFusion's own view keeps a plan made once, over the tables as they were then, and a page registers
+/// a table again after each write (`written`), so a page keeps each view's query as text (`views`) and the front reads it
+/// into each statement that names the view (`views_for`), as a node's front reads a request's own views.
+impl Page {
+    /// The page's view statements, answered here before anything is planned: CREATE VIEW and DROP VIEW, and the
+    /// statements a view's name changes (a DROP TABLE of a table a view reads, a CREATE TABLE or INSERT naming a view), in
+    /// a node's words. None for every other statement, and for one that doesn't parse, which the planner answers.
+    async fn view_statement(&self, text: &str) -> anyhow::Result<Option<Answer>> {
+        if !text.to_ascii_lowercase().contains("view") && self.views_held().is_empty() {
+            return Ok(None);
+        }
+        let Some(statement) = self.statement_of(text) else { return Ok(None) };
+        match statement {
+            SqlStatement::CreateView(c) if !c.materialized => self.create_view(c).await.map(Some),
+            SqlStatement::Drop { object_type: ObjectType::View, if_exists, names, cascade, .. } => self.drop_views(&names, if_exists, cascade).await.map(Some),
+            SqlStatement::Drop { object_type: ObjectType::Table, if_exists, names, cascade, .. } => {
+                for name in &names {
+                    if !if_exists {
+                        self.not_a_view(name, "no table ", "")?;
+                    }
+                    self.read_by(name, cascade).await?;
+                }
+                Ok(None)
+            }
+            SqlStatement::CreateTable(c) => self.not_a_view(&c.name, "", " is a view").map(|_| None),
+            SqlStatement::Insert(Insert { table: TableObject::TableName(name), .. }) => self.not_a_view(&name, "", " is a view: write to the tables it reads").map(|_| None),
+            _ => Ok(None),
+        }
+    }
+
+    /// `text` as one SQL statement, as written or once DuckDB's forms are made SQL that parses (`friendly::text`), or None.
+    fn statement_of(&self, text: &str) -> Option<SqlStatement> {
+        let parsed = self.parsed(text).ok().or_else(|| self.parsed(&crate::friendly::text(text).ok()?).ok());
+        match parsed? {
+            DfStatement::Statement(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// CREATE VIEW: the view's query, planned now as a statement would read it (`view_plans`), so a view that can't be read
+    /// is refused when it is made, then held and kept. A name a table or a view has is refused in a node's words; with IF
+    /// NOT EXISTS, an existing view is a node's answer and nothing changes.
+    async fn create_view(&self, c: CreateView) -> anyhow::Result<Answer> {
+        let name = self.view_name(&c.name)?;
+        if self.default_schema()?.1.table_exist(&name) {
+            anyhow::bail!("{name} is a table");
+        }
+        let exists = self.views_held().contains_key(&name);
+        if exists && c.if_not_exists {
+            return answered(json!({"name": name, "exists": true}));
+        }
+        if exists && !c.or_replace {
+            anyhow::bail!("view {name} already exists (CREATE OR REPLACE VIEW)");
+        }
+        let query = match c.columns.is_empty() {
+            true => c.query.to_string(),
+            false => {
+                let columns = c.columns.iter().map(|column| column.name.to_string()).collect::<Vec<_>>().join(", ");
+                format!("SELECT * FROM ({}) AS {}({columns})", c.query, crate::ext_names::quoted(&name))
+            }
+        };
+        self.view_plans(&name, &query).await?;
+        self.unread_there(&name, &view_at(&name), "view").await?;
+        self.keep_view(&name, Some(&query)).await?;
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).insert(name.clone(), query);
+        answered(json!({"view": name}))
+    }
+
+    /// Plans the query of the view `name` as a statement would read it, without the view itself. A page with a node refuses
+    /// a view over the node's tables by name: a page's view reads the page's own tables and files.
+    async fn view_plans(&self, name: &str, query: &str) -> anyhow::Result<()> {
+        match self.planned_as(query, &[name.to_string()]).await {
+            Ok(_) => Ok(()),
+            Err(e) if self.node.is_some() && crate::codes::of(&e) == "42P01" => Err(crate::codes::coded("0A000", format!("{name}: a page's view reads the page's own tables and files, and this one names a table the page doesn't have: make a page table of the node's rows first (CREATE TABLE … AS SELECT …)"))),
+            Err(e) => Err(e.context("the view's query")),
+        }
+    }
+
+    /// DROP VIEW, of each view named: it goes, and so does its kept file. A name with no view is refused in a node's words,
+    /// or with IF EXISTS answered as not dropped. A view another reads may go, as on a node; the other then fails when read,
+    /// unless CASCADE drops it too.
+    async fn drop_views(&self, names: &[ObjectName], if_exists: bool, cascade: bool) -> anyhow::Result<Answer> {
+        let mut answer = json!({});
+        for name in names {
+            let name = self.view_name(name)?;
+            if !self.views_held().contains_key(&name) {
+                anyhow::ensure!(if_exists, "no view {name}");
+                answer = json!({"view": name, "dropped": false});
+                continue;
+            }
+            if cascade {
+                self.cascade(&name, 0).await?;
+            }
+            self.forget_view(&name).await?;
+            answer = json!({"view": name, "dropped": true});
+        }
+        answered(answer)
+    }
+
+    /// A view that goes: its kept file, then the view.
+    async fn forget_view(&self, name: &str) -> anyhow::Result<()> {
+        self.unread_there(name, &view_at(name), "view").await?;
+        self.keep_view(name, None).await?;
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).remove(name);
+        Ok(())
+    }
+
+    /// A DROP TABLE of `table` while views read it is refused in a node's words (`ddl::drop_table`); with CASCADE, those
+    /// views go first, as a node drops them.
+    async fn read_by(&self, table: &ObjectName, cascade: bool) -> anyhow::Result<()> {
+        let table = self.table_ref(table)?.table().to_string();
+        let readers = self.readers(&table)?;
+        if readers.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            let listed = readers.iter().map(|view| format!("view {view}")).collect::<Vec<_>>().join(", ");
+            anyhow::bail!("{table} is read by {listed}: DROP TABLE {table} CASCADE drops them too, or drop them first");
+        }
+        self.cascade(&table, 0).await
+    }
+
+    /// CASCADE: the views that read `name` go, each after the views that read it, as a node drops them
+    /// (`routines::views_reading`).
+    async fn cascade(&self, name: &str, depth: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(depth < 16, "{name}: views that read views that read it, 16 deep: drop them by hand");
+        for view in self.readers(name)? {
+            if self.views_held().contains_key(&view) {
+                Box::pin(self.cascade(&view, depth + 1)).await?;
+                self.forget_view(&view).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The views whose queries name the page table or view `table`, in name order.
+    fn readers(&self, table: &str) -> anyhow::Result<Vec<String>> {
+        let state = self.ctx.state();
+        let options = state.config().options();
+        let (catalog, schema) = (&options.catalog.default_catalog, &options.catalog.default_schema);
+        let mut readers = vec![];
+        for (view, query) in self.views_held() {
+            let Some(statement) = self.statement_of(&query) else { continue };
+            let named = state.resolve_table_references(&DfStatement::Statement(Box::new(statement)))?;
+            if named.iter().any(|n| n.table() == table && n.schema().is_none_or(|s| s == schema) && n.catalog().is_none_or(|c| c == catalog)) {
+                readers.push(view);
+            }
+        }
+        Ok(readers)
+    }
+
+    /// Refuses `name` when a view has it: a node's words, `before` and `after` the name.
+    fn not_a_view(&self, name: &ObjectName, before: &str, after: &str) -> anyhow::Result<()> {
+        let name = self.table_ref(name)?.table().to_string();
+        match self.views_held().contains_key(&name) {
+            true => anyhow::bail!("{before}{name}{after}"),
+            false => Ok(()),
+        }
+    }
+
+    /// A view's name as the planner reads it, in the page's one schema; a name in another schema or catalog is refused by
+    /// name.
+    fn view_name(&self, name: &ObjectName) -> anyhow::Result<String> {
+        let reference = self.table_ref(name)?;
+        let state = self.ctx.state();
+        let options = state.config().options();
+        let here = reference.schema().is_none_or(|s| s == options.catalog.default_schema) && reference.catalog().is_none_or(|c| c == options.catalog.default_catalog);
+        match here {
+            true => Ok(reference.table().to_string()),
+            false => Err(crate::codes::coded("0A000", format!("{reference}: a page has one schema, public, so its views are made there"))),
+        }
+    }
+
+    /// The page's views, each name with its query: a copy, so no lock is held past it.
+    fn views_held(&self) -> BTreeMap<String, String> {
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The views `text` names, each as the front reads it (its own views read first, so a view may read another), by
+    /// every name a statement may give it (`v`, `public.v`, `page.public.v`): what the front puts in a statement's place
+    /// of each. `outer` are the views being read already, left out, so a view that names itself, or one that reads it,
+    /// is a missing table rather than a loop.
+    async fn views_for(&self, text: &str, outer: &[String]) -> anyhow::Result<HashMap<String, String>> {
+        let mut views = HashMap::new();
+        for (name, query) in self.views_held() {
+            if outer.contains(&name) || !crate::text::mentions(text, &name) {
+                continue;
+            }
+            let inner = [outer, std::slice::from_ref(&name)].concat();
+            let read = Box::pin(self.views_for(&query, &inner)).await?;
+            let query = crate::front::expand(&PageHost(self), &query, &read).await?;
+            for key in [format!("page.public.{name}"), format!("public.{name}"), name] {
+                views.insert(key, query.clone());
+            }
+        }
+        Ok(views)
+    }
+
+    /// Keeps the view `name`'s query in a kept page's store (`view_at`), or with None forgets it. A page in memory keeps
+    /// nothing.
+    async fn keep_view(&self, name: &str, query: Option<&str>) -> anyhow::Result<()> {
+        if !self.keeps {
+            return Ok(());
+        }
+        let at = view_at(name);
+        match query {
+            Some(query) => {
+                let file = serde_json::to_vec(&json!({"name": name, "query": query}))?;
+                self.files.put_opts(&at, PutPayload::from(file), PutOptions { mode: PutMode::Overwrite, ..Default::default() }).await?;
+            }
+            None => match self.files.delete(&at).await {
+                Ok(()) | Err(StoreError::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            },
+        }
+        Ok(())
+    }
+
+    /// Reads the kept view at `at` back into the page. Nothing is planned: a view whose tables are gone fails when read.
+    async fn view_back(&self, at: &Path) -> anyhow::Result<()> {
+        let file = self.files.get(at).await?.bytes().await?;
+        let kept: serde_json::Value = serde_json::from_slice(&file).context("it is not a kept view")?;
+        let (Some(name), Some(query)) = (kept["name"].as_str(), kept["query"].as_str()) else { anyhow::bail!("it has no name and query, so it is not a kept view") };
+        self.views.lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string(), query.to_string());
+        Ok(())
+    }
+}
+
+/// An answer of one JSON object, as a node answers a statement that isn't a query.
+fn answered(object: serde_json::Value) -> anyhow::Result<Answer> {
+    Ok(Answer::ok(JSON, serde_json::to_vec(&object)?))
+}
+
+/// Where a kept page keeps the view `name`: its name and query, as JSON.
+fn view_at(name: &str) -> Path {
+    Path::from_iter([VIEWS, format!("{name}.json").as_str()])
 }
 
 /// Where a file a statement names is, as a page's store has it: a URL beginning `mem:///files/` as written, a web address
@@ -1262,9 +1619,9 @@ async fn put_back(table: &Arc<dyn TableProvider>, rows: Vec<Vec<RecordBatch>>) -
 }
 
 /// A page table as one Arrow IPC file: its batches over the file's schema (`kept_schema`), so `kept` reads the table
-/// back as it was, with its CREATE TABLE text (`create`) when it has rules.
-fn table_file(name: &str, table: &dyn TableProvider, batches: &[RecordBatch], create: Option<&str>) -> anyhow::Result<bytes::Bytes> {
-    let schema = kept_schema(name, table, create)?;
+/// back as it was, with its CREATE TABLE text and counters (`ruled`) when it has rules.
+fn table_file(name: &str, table: &dyn TableProvider, batches: &[RecordBatch], ruled: Option<&Ruled>) -> anyhow::Result<bytes::Bytes> {
+    let schema = kept_schema(name, table, ruled)?;
     let mut writer = FileWriter::try_new(Vec::new(), &schema)?;
     for batch in batches {
         writer.write(&over_schema(&schema, batch)?)?;
@@ -1273,9 +1630,9 @@ fn table_file(name: &str, table: &dyn TableProvider, batches: &[RecordBatch], cr
 }
 
 /// The schema a table is kept under: its own, with `pondra.table` (its name) in the schema's notes, `pondra.create` (its CREATE
-/// TABLE text, when it has rules) beside it, and `pondra.default` (the column's default, as SQL text) in the notes of each
-/// column that has one.
-fn kept_schema(name: &str, table: &dyn TableProvider, create: Option<&str>) -> anyhow::Result<SchemaRef> {
+/// TABLE text, when it has rules) and `pondra.counters` (its identity counters, when it has any) beside it, and `pondra.default`
+/// (the column's default, as SQL text) in the notes of each column that has one.
+fn kept_schema(name: &str, table: &dyn TableProvider, ruled: Option<&Ruled>) -> anyhow::Result<SchemaRef> {
     let mut fields = vec![];
     for field in table.schema().fields() {
         let mut notes = field.metadata().clone();
@@ -1286,8 +1643,12 @@ fn kept_schema(name: &str, table: &dyn TableProvider, create: Option<&str>) -> a
     }
     let mut notes = table.schema().metadata().clone();
     notes.insert(TABLE_KEY.to_string(), name.to_string());
-    if let Some(create) = create {
-        notes.insert(CREATE_KEY.to_string(), create.to_string());
+    if let Some(ruled) = ruled {
+        notes.insert(CREATE_KEY.to_string(), ruled.create.clone());
+        let counted = ruled.counters.lock().unwrap_or_else(PoisonError::into_inner);
+        if !counted.is_empty() {
+            notes.insert(COUNTERS_KEY.to_string(), serde_json::to_string(&*counted)?);
+        }
     }
     Ok(Arc::new(Schema::new_with_metadata(fields, notes)))
 }
@@ -1300,13 +1661,17 @@ fn table_schema(kept: &Schema) -> SchemaRef {
 
 /// The notes without the ones `kept_schema` adds, which a table's own schema does not have.
 fn without_notes(notes: &HashMap<String, String>) -> HashMap<String, String> {
-    notes.iter().filter(|(k, _)| ![TABLE_KEY, DEFAULT_KEY, CREATE_KEY].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+    notes.iter().filter(|(k, _)| ![TABLE_KEY, DEFAULT_KEY, CREATE_KEY, COUNTERS_KEY].contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
-/// Whether a table has any rule a write could break: an enforced key, a UNIQUE, a CHECK, or a held type or enum column. A
-/// table with none keeps no rules at all (`ruled_made`).
+/// Whether a table has any rule a write could break: an enforced key, a UNIQUE, a CHECK, or a held type or enum column, or an
+/// identity column (ALWAYS, or one whose DEFAULT counts), whose counter the table keeps. A table with none keeps no rules at all
+/// (`ruled_made`).
 fn has_rules(t: &crate::rules::Table) -> bool {
-    !t.key.is_empty() || !t.unique.is_empty() || !t.checks.is_empty() || t.columns.iter().any(|c| c.held.is_some() || c.labels.is_some())
+    !t.key.is_empty()
+        || !t.unique.is_empty()
+        || !t.checks.is_empty()
+        || t.columns.iter().any(|c| c.held.is_some() || c.labels.is_some() || c.always || c.default.as_deref().is_some_and(|d| d.starts_with("nextval(")))
 }
 
 /// The first value of `columns` that a row of `new` gives and a row of `held` gives too, as Postgres's DETAIL writes it
@@ -1401,8 +1766,10 @@ fn projected(schema: &SchemaRef, batches: &[RecordBatch], names: &[String]) -> a
 
 /// A CREATE TABLE with columns, as the planner is given it (`planned_expanded`): its table constraints left out, and each
 /// column's options kept only where DataFusion keeps them (`kept_option`), with NOT NULL added to each column of an enforced
-/// PRIMARY KEY that lacks it, as Postgres makes them. Its rules are the core's (`Ruled`), made over the columns it plans.
-fn plain_create(c: &CreateTable) -> CreateTable {
+/// PRIMARY KEY that lacks it, as Postgres makes them. An identity column is planned as the plain column it is: its integer type
+/// (a SERIAL's, `planned_type`), NOT NULL, and a DEFAULT that counts in its sequence (`identified`), which the planner keeps as
+/// any DEFAULT. Its rules are the core's (`Ruled`), made over the columns it plans.
+fn plain_create(c: &CreateTable, identified: &[counters::Identified]) -> anyhow::Result<CreateTable> {
     let mut plain = c.clone();
     plain.constraints.clear();
     let keyed: Vec<String> = c
@@ -1423,11 +1790,33 @@ fn plain_create(c: &CreateTable) -> CreateTable {
     for column in &mut plain.columns {
         let inline = column.options.iter().any(|o| matches!(&o.option, ColumnOption::PrimaryKey(p) if !crate::rules::create::informational(&p.characteristics)));
         column.options.retain(|o| kept_option(&o.option));
-        if (inline || keyed.contains(&crate::text::ident(&column.name))) && !column.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)) {
+        let name = crate::text::ident(&column.name);
+        let identity = identified.iter().find(|i| i.column == name);
+        if let Some(identity) = identity {
+            column.data_type = planned_type(&column.data_type)?;
+            let default = parsed_expr(&crate::rules::create::identity_default(&identity.sequence))?;
+            column.options.push(ColumnOptionDef { name: None, option: ColumnOption::Default(default) });
+        }
+        if (inline || keyed.contains(&name) || identity.is_some()) && !column.options.iter().any(|o| matches!(o.option, ColumnOption::NotNull)) {
             column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
         }
     }
-    plain
+    Ok(plain)
+}
+
+/// An SQL expression as the page's parser reads it (an identity column's DEFAULT, `nextval('…')`).
+fn parsed_expr(text: &str) -> anyhow::Result<datafusion::sql::sqlparser::ast::Expr> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    Ok(Parser::new(&GenericDialect {}).try_with_sql(text)?.parse_expr()?)
+}
+
+/// The type a column is planned with: a SERIAL's integer type (`serial_type` names it), and any other type as it is written.
+fn planned_type(t: &datafusion::sql::sqlparser::ast::DataType) -> anyhow::Result<datafusion::sql::sqlparser::ast::DataType> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    match crate::rules::create::serial_type(t) {
+        Some(name) => Ok(Parser::new(&GenericDialect {}).try_with_sql(name)?.parse_data_type()?),
+        None => Ok(t.clone()),
+    }
 }
 
 /// What a planned write does to its table, for its rules (`kept_rules`).
@@ -1718,9 +2107,10 @@ fn statement_rules(statement: &datafusion::sql::parser::Statement) -> anyhow::Re
 
 /// A CREATE TABLE's rules. A CREATE TABLE … AS keeps NOT NULL, DEFAULT and COMMENT only, so its constraints and other options
 /// are refused, each named as written. A CREATE TABLE with columns keeps PRIMARY KEY, UNIQUE, CHECK and REFERENCES (which
-/// `made_table` refuses, or keeps as a fact, as a node does), NOT NULL, DEFAULT and COMMENT, and a computed column (refused by
-/// `made_table`): an identity column and any other option or table constraint is refused by name. Nothing is planned for a
-/// refused table, so it is not made.
+/// `made_table` refuses, or keeps as a fact, as a node does), NOT NULL, DEFAULT, COMMENT and an identity column (its counter,
+/// `identified`), and a computed column (refused by `made_table`); any other option or table constraint is refused by name. A
+/// column that is an identity has no DEFAULT of its own (`identity_of` refuses both, as Postgres does). Nothing is planned for a refused table, so it
+/// is not made.
 fn table_rules(c: &CreateTable) -> anyhow::Result<()> {
     if c.query.is_some() {
         let refused = c.constraints.first().map(|k| k.to_string()).or_else(|| c.columns.iter().flat_map(|column| &column.options).find(|o| !kept_option(&o.option)).map(|o| o.option.to_string()));
@@ -1732,10 +2122,7 @@ fn table_rules(c: &CreateTable) -> anyhow::Result<()> {
     if let Some(k) = c.constraints.iter().find(|k| !kept_constraint(k)) {
         return Err(not_kept(&k.to_string()));
     }
-    if let Some(column) = c.columns.iter().find(|column| matches!(crate::rules::create::identity_of(column), Ok(Some(_)))) {
-        return Err(not_kept_identity(&identity_what(column)));
-    }
-    match c.columns.iter().flat_map(|column| &column.options).find(|o| !kept_column_option(&o.option)) {
+    match c.columns.iter().flat_map(|column| &column.options).find(|o| !kept_column_option(&o.option) && !identity_option(&o.option)) {
         Some(o) => Err(not_kept(&o.option.to_string())),
         None => Ok(()),
     }
@@ -1784,9 +2171,45 @@ fn kept_option(option: &ColumnOption) -> bool {
 }
 
 /// The column options of a CREATE TABLE with columns that a page keeps or leaves to `made_table`: `kept_option`, a key, UNIQUE,
-/// CHECK, REFERENCES, and a computed column (an identity column is refused before this, by `identity_what`).
+/// CHECK, REFERENCES, and a computed column (its refusal is `made_table`'s). An identity's options are `identity_option`'s.
 fn kept_column_option(option: &ColumnOption) -> bool {
     kept_option(option) || matches!(option, ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_) | ColumnOption::Check(_) | ColumnOption::ForeignKey(_) | ColumnOption::Generated { generation_expr: Some(_), .. })
+}
+
+/// The options an identity column says, which a page keeps as a counter does (`counters::identified`): GENERATED … AS IDENTITY,
+/// the IDENTITY property and AUTO_INCREMENT, as `rules::create::identity_of` reads them.
+fn identity_option(option: &ColumnOption) -> bool {
+    match option {
+        ColumnOption::Generated { generation_expr, .. } => generation_expr.is_none(),
+        ColumnOption::Identity(_) => true,
+        ColumnOption::DialectSpecific(t) => matches!(&t[..], [w] if ["AUTO_INCREMENT", "AUTOINCREMENT"].contains(&w.to_string().to_uppercase().as_str())),
+        _ => false,
+    }
+}
+
+/// The columns an UPDATE's assignments give a value other than DEFAULT, as SQL names them (a tuple's values pair with its names, as
+/// written): an ALWAYS identity may be set to DEFAULT only (`keys::set`).
+fn set_columns(assignments: &[datafusion::sql::sqlparser::ast::Assignment]) -> Vec<String> {
+    use datafusion::sql::sqlparser::ast::{AssignmentTarget, Expr as SqlExpr};
+    let mut set = vec![];
+    for assignment in assignments {
+        let names: Vec<&ObjectName> = match &assignment.target {
+            AssignmentTarget::ColumnName(n) => vec![n],
+            AssignmentTarget::Tuple(ns) => ns.iter().collect(),
+        };
+        let values: Vec<String> = match &assignment.value {
+            SqlExpr::Tuple(vs) if vs.len() == names.len() => vs.iter().map(|v| v.to_string()).collect(),
+            value => vec![value.to_string(); names.len()],
+        };
+        for (name, value) in names.into_iter().zip(values) {
+            if let Some(ObjectNamePart::Identifier(ident)) = name.0.last() {
+                if !crate::rules::rows::is_word(&value) {
+                    set.push(crate::text::ident(ident));
+                }
+            }
+        }
+    }
+    set
 }
 
 /// The table constraints a CREATE TABLE with columns keeps or leaves to `made_table`: a PRIMARY KEY, UNIQUE, CHECK and FOREIGN KEY.
@@ -1794,20 +2217,9 @@ fn kept_constraint(constraint: &TableConstraint) -> bool {
     matches!(constraint, TableConstraint::PrimaryKey(_) | TableConstraint::Unique(_) | TableConstraint::Check(_) | TableConstraint::ForeignKey(_))
 }
 
-/// What an identity column is called in the words that refuse it: its GENERATED or AUTO_INCREMENT option as written, or its type
-/// (a SERIAL column is an identity by its type).
-fn identity_what(column: &ColumnDef) -> String {
-    column.options.iter().find(|o| matches!(o.option, ColumnOption::Generated { .. } | ColumnOption::Identity(_) | ColumnOption::DialectSpecific(_))).map_or_else(|| column.data_type.to_string(), |o| o.option.to_string())
-}
-
 /// The refusal for a table rule a page can't keep: 0A000, with the words that name it and say what its tables keep.
 fn not_kept(what: &str) -> anyhow::Error {
-    crate::codes::coded("0A000", format!("a page doesn't keep {what} yet: its tables keep NOT NULL, DEFAULT, PRIMARY KEY, UNIQUE and CHECK, and no other rule; make the table without it, or keep it on a node"))
-}
-
-/// The refusal for an identity column (0A000): a page has no counters yet, so its tables keep no identity.
-fn not_kept_identity(what: &str) -> anyhow::Error {
-    crate::codes::coded("0A000", format!("a page doesn't keep {what} yet: a page has no counters yet, so its tables keep no identity; give the column a DEFAULT, or keep the table on a node"))
+    crate::codes::coded("0A000", format!("a page doesn't keep {what} yet: its tables keep NOT NULL, DEFAULT, identity, PRIMARY KEY, UNIQUE and CHECK, and no other rule; make the table without it, or keep it on a node"))
 }
 
 /// The refusal for a table rule a CREATE TABLE … AS can't keep (0A000): the table is made with its columns and the rule, and
@@ -2396,16 +2808,15 @@ mod tests {
 
     /// A page refuses by name the table rules it can't keep, before it plans anything (`rules`): each answers 0A000 with
     /// the words that name its clause, and makes no table, so SELECT finds none. A CREATE TABLE … AS keeps NOT NULL, DEFAULT
-    /// and COMMENT only, and a page has no counters for an identity. A REFERENCES and a computed column are refused by the
-    /// core's rules when the table is made (`made_table`), in the core's words. The upserts are refused in their own words.
+    /// and COMMENT only, so an identity is refused there too. A REFERENCES and a computed column are refused by the core's rules
+    /// when the table is made (`made_table`), in the core's words. The upserts are refused in their own words.
     #[tokio::test]
     async fn a_page_refuses_the_rules_it_cannot_keep() {
         let cases = [
             ("CREATE TABLE t (id INT PRIMARY KEY) AS SELECT 1 AS id", "a page doesn't keep PRIMARY KEY yet on a CREATE TABLE … AS: make the table with its columns and PRIMARY KEY, then INSERT … SELECT into it"),
             ("CREATE TABLE t (id INT UNIQUE) AS SELECT 1 AS id", "a page doesn't keep UNIQUE yet on a CREATE TABLE … AS"),
             ("CREATE TABLE t (id INT CHECK (id > 0)) AS SELECT 1 AS id", "a page doesn't keep CHECK (id > 0) yet on a CREATE TABLE … AS"),
-            ("CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY)", "a page doesn't keep GENERATED ALWAYS AS IDENTITY yet: a page has no counters yet"),
-            ("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT)", "a page doesn't keep AUTO_INCREMENT yet: a page has no counters yet"),
+            ("CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY) AS SELECT 1 AS id", "a page doesn't keep GENERATED ALWAYS AS IDENTITY yet on a CREATE TABLE … AS"),
             ("CREATE TABLE t (id INT, u TEXT COLLATE \"C\")", "a page doesn't keep COLLATE"),
             ("EXPLAIN CREATE TABLE t (id INT PRIMARY KEY)", "a page doesn't keep PRIMARY KEY yet on an EXPLAIN of a CREATE TABLE"),
             ("EXPLAIN CREATE TABLE t (id INT CHECK (id > 0))", "a page doesn't keep CHECK (id > 0) yet on an EXPLAIN of a CREATE TABLE"),
@@ -2632,6 +3043,127 @@ mod tests {
         assert_eq!(crate::codes::http("23502"), 400);
     }
 
+    /// A statement's answer as `POST /sql` gives it, with its SQLSTATE in the header (`ask`), and its CSV rows (`csv`).
+    async fn ask(page: &Page, sql: &str) -> Answer {
+        page.request("POST", "/sql", &[], sql.to_string().into()).await
+    }
+
+    /// A statement that must run (200): its words when it doesn't.
+    async fn ran(page: &Page, sql: &str) {
+        let got = ask(page, sql).await;
+        assert_eq!(got.status, 200, "{sql}: {}", body(&got));
+    }
+
+    async fn csv(page: &Page, sql: &str) -> String {
+        let got = page.request("POST", "/sql?format=csv", &[], sql.to_string().into()).await;
+        assert_eq!(got.status, 200, "{sql}: {}", body(&got));
+        body(&got)
+    }
+
+    /// A page counts its identity columns as a node does: each table counts its own. An INSERT that leaves the column out, or says
+    /// DEFAULT, takes the next number, whichever form it takes (VALUES, or a SELECT of several rows). An ALWAYS column given a value
+    /// is refused 428C9 in a named INSERT, a positional one and an UPDATE, and the table is as it was; a BY DEFAULT column takes a
+    /// value given without counting; SERIAL counts; and a count runs out (2200H) as a sequence does, and a table made after a rename
+    /// of one of the same name counts its own.
+    #[tokio::test]
+    async fn a_page_counts_its_identity_columns_as_a_node_does() {
+        let page = Page::open(&Options::default());
+        for text in [
+            "CREATE TABLE i (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)",
+            "CREATE TABLE b (id BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 10 INCREMENT BY 5), v TEXT)",
+            "CREATE TABLE s (id SERIAL, v TEXT)",
+            "CREATE TABLE m (id INT GENERATED ALWAYS AS IDENTITY (MAXVALUE 2), v TEXT)",
+        ] {
+            ran(&page, text).await;
+        }
+        ran(&page, "INSERT INTO i (v) VALUES ('a'), ('b')").await;
+        ran(&page, "INSERT INTO i (id, v) VALUES (DEFAULT, 'c')").await;
+        ran(&page, "INSERT INTO i (v) SELECT v FROM (VALUES ('d'), ('e')) AS x(v)").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM i ORDER BY id").await, "id,v\n1,a\n2,b\n3,c\n4,d\n5,e\n");
+        for sql in ["INSERT INTO i (id, v) VALUES (10, 'c')", "INSERT INTO i VALUES (5, 'x')", "UPDATE i SET id = 3", "INSERT INTO i (id, v) SELECT 9, 'y'"] {
+            let got = ask(&page, sql).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (400, Some("428C9")), "{sql}: {}", body(&got));
+        }
+        assert_eq!(csv(&page, "SELECT id, v FROM i ORDER BY id").await, "id,v\n1,a\n2,b\n3,c\n4,d\n5,e\n", "the refused writes left the table as it was");
+        ran(&page, "INSERT INTO b (v) VALUES ('x'), ('y')").await;
+        ran(&page, "INSERT INTO b (id, v) VALUES (7, 'z')").await;
+        ran(&page, "INSERT INTO b (v) VALUES ('w')").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM b ORDER BY id").await, "id,v\n7,z\n10,x\n15,y\n20,w\n", "BY DEFAULT counts from its start, and a value given does not count");
+        ran(&page, "INSERT INTO s (v) VALUES ('p'), ('q')").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM s ORDER BY id").await, "id,v\n1,p\n2,q\n", "SERIAL counts from 1");
+        // MAXVALUE 2: the third number is past the sequence's end, and the write is undone, so the count is not used
+        ran(&page, "INSERT INTO m (v) VALUES ('a'), ('b')").await;
+        for _ in 0..2 {
+            let got = ask(&page, "INSERT INTO m (v) VALUES ('c'), ('d')").await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (400, Some("2200H")), "{}", body(&got));
+        }
+        assert_eq!(csv(&page, "SELECT id, v FROM m ORDER BY id").await, "id,v\n1,a\n2,b\n");
+        let unknown = ask(&page, "SELECT nextval('nope')").await;
+        assert_eq!((unknown.status, unknown.header("x-pondra-sqlstate")), (404, Some("42P01")), "{}", body(&unknown));
+        // a rename moves the counter with the table, and a table made after it takes the name the renamed one's sequence holds
+        ran(&page, "ALTER TABLE i RENAME TO j").await;
+        ran(&page, "INSERT INTO j (v) VALUES ('f')").await;
+        ran(&page, "CREATE TABLE i (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)").await;
+        ran(&page, "INSERT INTO i (v) VALUES ('g')").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM j ORDER BY id").await, "id,v\n1,a\n2,b\n3,c\n4,d\n5,e\n6,f\n", "j went on from 5");
+        assert_eq!(csv(&page, "SELECT id, v FROM i").await, "id,v\n1,g\n", "a new i counts from 1");
+        // a DROP takes the count with its table: a table made again starts over
+        ran(&page, "DROP TABLE j").await;
+        ran(&page, "CREATE TABLE j (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)").await;
+        ran(&page, "INSERT INTO j (v) VALUES ('h')").await;
+        assert_eq!(csv(&page, "SELECT id, v FROM j").await, "id,v\n1,h\n");
+    }
+
+    /// A kept page keeps its identity counts: a table reopened over the same store counts on from where its last write left it,
+    /// SERIAL and BY DEFAULT alike, and a rename's table keeps its count in its new file.
+    #[tokio::test]
+    async fn a_kept_page_keeps_its_identity_counts() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        for text in [
+            "CREATE TABLE i (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)",
+            "CREATE TABLE s (id SERIAL, v TEXT)",
+            "CREATE TABLE b (id BIGINT GENERATED BY DEFAULT AS IDENTITY (START WITH 10 INCREMENT BY 5), v TEXT)",
+        ] {
+            ran(&a, text).await;
+        }
+        ran(&a, "INSERT INTO i (v) VALUES ('a'), ('b')").await;
+        ran(&a, "INSERT INTO s (v) VALUES ('p')").await;
+        ran(&a, "INSERT INTO b (v) VALUES ('x')").await;
+        ran(&a, "ALTER TABLE i RENAME TO k").await;
+        ran(&a, "INSERT INTO k (v) VALUES ('c')").await;
+        drop(a);
+        let b = Page::kept(&options).await.unwrap();
+        assert!(b.unread().is_empty(), "{:?}", b.unread());
+        ran(&b, "INSERT INTO k (v) VALUES ('d')").await;
+        ran(&b, "INSERT INTO s (v) VALUES ('q')").await;
+        ran(&b, "INSERT INTO b (v) VALUES ('y')").await;
+        assert_eq!(csv(&b, "SELECT id, v FROM k ORDER BY id").await, "id,v\n1,a\n2,b\n3,c\n4,d\n");
+        assert_eq!(csv(&b, "SELECT id, v FROM s ORDER BY id").await, "id,v\n1,p\n2,q\n");
+        assert_eq!(csv(&b, "SELECT id, v FROM b ORDER BY id").await, "id,v\n10,x\n15,y\n");
+        let refused = ask(&b, "INSERT INTO k (id, v) VALUES (9, 'z')").await;
+        assert_eq!(refused.header("x-pondra-sqlstate"), Some("428C9"), "{}", body(&refused));
+    }
+
+    /// A page fills a narrow row, and a DEFAULT in VALUES, as a node does: a row that names fewer columns, or says DEFAULT, takes
+    /// the column's default; a row wider than the columns it names is refused with 42601, and nothing is written.
+    #[tokio::test]
+    async fn a_page_fills_a_narrow_row_and_a_default_as_a_node_does() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (a INT, b INT DEFAULT 5)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t VALUES (1)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t (a, b) VALUES (2, DEFAULT)".into()).await.status, 200);
+        // (a query's rows too: a narrow one takes the defaults, and a VALUES inside it is its own width)
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t SELECT x FROM (VALUES (3)) AS v(x)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT a, b FROM t ORDER BY a".into()).await.body, "a,b\n1,5\n2,5\n3,5\n");
+        for sql in ["INSERT INTO t VALUES (1, 2, 3)", "INSERT INTO t (a) VALUES (1, 2)"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (400, Some("42601")), "{sql}: {:?}", got.body);
+        }
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT a, b FROM t ORDER BY a".into()).await.body, "a,b\n1,5\n2,5\n3,5\n");
+    }
+
     /// What a page refused before it kept rules stays refused, with the code it always gave.
     #[tokio::test]
     async fn what_a_page_refused_already_stays_refused() {
@@ -2640,8 +3172,6 @@ mod tests {
         for sql in [
             "INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING",
             "CREATE TEMP TABLE x (id INT)",
-            "CREATE TABLE s (id SERIAL)",
-            "ALTER TABLE t ADD COLUMN w INT",
         ] {
             let got = page.request("POST", "/sql", &[], sql.into()).await;
             assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")), "{sql}");
@@ -2656,6 +3186,74 @@ mod tests {
         assert_eq!((got.status, got.header("x-pondra-sqlstate")), (501, Some("0A000")));
         let body = std::str::from_utf8(&got.body).unwrap();
         assert!(body.contains("orders AT (VERSION => 1)"), "{body}");
+    }
+
+    /// The text of an answer's body.
+    fn body(answer: &Answer) -> String {
+        String::from_utf8_lossy(&answer.body).into_owned()
+    }
+
+    /// A page keeps views as a node does: a view reads its tables as they are now (after an INSERT, and after CREATE OR
+    /// REPLACE TABLE), a view reads another, CREATE OR REPLACE changes it, and the refusals are a node's words. DROP TABLE of
+    /// a table a view reads is refused unless CASCADE, which drops the views that read it, and the views that read those.
+    #[tokio::test]
+    async fn a_page_keeps_views_over_its_tables_as_they_are_now() {
+        let page = Page::open(&Options::default());
+        let sql = |text: &str| page.request("POST", "/sql?format=csv", &[], text.to_string().into());
+        assert_eq!(sql("CREATE TABLE t (a INT, b VARCHAR)").await.status, 200);
+        assert_eq!(sql("INSERT INTO t VALUES (1, 'x'), (2, 'y')").await.status, 200);
+        let made = sql("CREATE VIEW v AS SELECT a FROM t WHERE a > 1").await;
+        assert_eq!((made.status, body(&made).as_str()), (200, r#"{"view":"v"}"#));
+        assert_eq!(body(&sql("SELECT count(*) AS n FROM v").await), "n\n1\n");
+        assert_eq!(sql("INSERT INTO t VALUES (3, 'z')").await.status, 200);
+        assert_eq!(body(&sql("SELECT count(*) AS n FROM v").await), "n\n2\n", "the view reads the rows the INSERT added");
+        assert_eq!(sql("CREATE VIEW w (n) AS SELECT count(*) FROM v").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n2\n");
+        assert_eq!(body(&sql("SELECT n FROM page.public.w").await), "n\n2\n");
+        assert_eq!(sql("CREATE OR REPLACE TABLE t AS SELECT * FROM (VALUES (5, 'q'), (6, 'r'), (7, 's')) AS x(a, b)").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n3\n", "the view reads the table made again");
+        assert_eq!(sql("CREATE OR REPLACE VIEW v AS SELECT a FROM t WHERE a > 6").await.status, 200);
+        assert_eq!(body(&sql("SELECT n FROM w").await), "n\n1\n", "w reads v as it is now");
+        for (text, words) in [
+            ("CREATE VIEW v AS SELECT 1", "view v already exists (CREATE OR REPLACE VIEW)"),
+            ("CREATE VIEW t AS SELECT 1", "t is a table"),
+            ("CREATE TABLE v (a INT)", "v is a view"),
+            ("INSERT INTO v VALUES (1)", "v is a view: write to the tables it reads"),
+            ("DROP VIEW nov", "no view nov"),
+            ("DROP TABLE v", "no table v"),
+            ("DROP TABLE t", "t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"),
+        ] {
+            let got = sql(text).await;
+            assert_ne!(got.status, 200, "{text}");
+            assert_eq!(body(&got), words, "{text}");
+        }
+        assert!(body(&sql("CREATE VIEW bad AS SELECT * FROM nothere").await).starts_with("the view's query: "));
+        assert_eq!(body(&sql("CREATE VIEW IF NOT EXISTS v AS SELECT 2").await), r#"{"name":"v","exists":true}"#);
+        assert_eq!(body(&sql("DROP VIEW IF EXISTS nov").await), r#"{"view":"nov","dropped":false}"#);
+        let listed = page.request("GET", "/objects", &[], bytes::Bytes::new()).await;
+        assert_eq!(names_listed(&listed), ["t", "v", "w"]);
+        assert_eq!(sql("DROP VIEW w").await.status, 200);
+        assert_eq!(sql("CREATE VIEW w AS SELECT a FROM v").await.status, 200);
+        assert_eq!(sql("DROP TABLE t CASCADE").await.status, 200);
+        assert!(names_listed(&page.request("GET", "/objects", &[], bytes::Bytes::new()).await).is_empty(), "CASCADE dropped v, which read t, and w, which read v");
+        assert_eq!(sql("SELECT a FROM w").await.status, 404);
+    }
+
+    /// A kept page keeps its views, and a page opened on the same store reads them again.
+    #[tokio::test]
+    async fn a_kept_page_keeps_its_views() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let a = Page::kept(&options).await.unwrap();
+        for text in ["CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) AS x(id)", "CREATE VIEW big AS SELECT id FROM t WHERE id > 1", "CREATE VIEW gone AS SELECT 1 AS one"] {
+            assert_eq!(a.request("POST", "/sql", &[], text.into()).await.status, 200, "{text}");
+        }
+        assert_eq!(a.request("POST", "/sql", &[], "DROP VIEW gone".into()).await.status, 200);
+        drop(a);
+        let b = Page::kept(&options).await.unwrap();
+        assert!(b.unread().is_empty(), "{:?}", b.unread());
+        assert_eq!(body(&b.request("POST", "/sql?format=csv", &[], "SELECT id FROM big ORDER BY id".into()).await), "id\n2\n3\n");
+        assert_eq!(names_listed(&b.request("GET", "/objects", &[], bytes::Bytes::new()).await), ["t", "big"]);
     }
 
     /// The page's catalog is `page`, as `GET /objects` names it: a missing table's words say `page.public.…` (not

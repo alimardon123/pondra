@@ -1,0 +1,75 @@
+# Views: a view reads its tables as they are now, a view reads another, and the refusals are a node's
+# (designs/l2-page-ddl.md D1).
+statement ok
+CREATE TABLE vt (a INT, b TEXT)
+
+statement ok
+INSERT INTO vt VALUES (1, 'x'), (2, 'y')
+
+statement ok
+CREATE VIEW vv AS SELECT a FROM vt WHERE a > 1
+
+query I
+SELECT count(*) FROM vv
+----
+1
+
+statement ok
+INSERT INTO vt VALUES (3, 'z')
+
+query I
+SELECT count(*) FROM vv
+----
+2
+
+statement ok
+CREATE VIEW vw (n) AS SELECT count(*) FROM vv
+
+query I
+SELECT n FROM vw
+----
+2
+
+statement ok
+CREATE OR REPLACE VIEW vv AS SELECT a FROM vt WHERE a > 2
+
+query I
+SELECT n FROM vw
+----
+1
+
+statement error 42P07
+CREATE VIEW vv AS SELECT 1
+
+statement error 42809
+CREATE VIEW vt AS SELECT 1
+
+statement error 42809
+CREATE TABLE vv (a INT)
+
+statement error 42809
+INSERT INTO vv VALUES (1)
+
+statement error 42P01
+DROP VIEW nov
+
+statement ok
+DROP VIEW IF EXISTS nov
+
+statement error 2BP01
+DROP TABLE vt
+
+statement ok
+DROP VIEW vw
+
+statement ok
+CREATE VIEW vw AS SELECT a FROM vv
+
+statement ok
+DROP TABLE vt CASCADE
+
+statement error 42P01
+SELECT a FROM vw
+
+statement error 42P01
+SELECT a FROM vv
