@@ -2,8 +2,8 @@ name: release
 
 # A tag vX.Y.Z (or a run started by hand): publishes what the build workflow made and tested for
 # that very commit (build.yml: the five platforms' wheels, npm packages and installer archives,
-# each tried on its platform, and the suite run on the Linux binary) to a GitHub release with
-# install.sh, install.ps1 and SHA256SUMS, to PyPI and to npm. Nothing is built here, so a release takes a
+# each tried on its platform, and the suite run on the Linux binary; the page's module) to a GitHub
+# release with install.sh, install.ps1 and SHA256SUMS, to PyPI and to npm. Nothing is built here, so a release takes a
 # minute or two: tag a commit once its build is green. A merge to main that changed nothing in a
 # pull request's code isn't built again: its packages are the pull request's (tools/ci_build.sh). A build still running is waited for; one
 # that failed stops the release (re-run its failed jobs, then this). Main builds macOS Intel only on a
@@ -80,6 +80,22 @@ jobs:
             ls dist/pondra-$v-*.whl dist/pondra-$p-$v.tgz "$a" > /dev/null || exit 1
           done
           [ "$(ls dist/pondra-$v-*.whl | wc -l)" = 5 ] && ls dist/pondra-$v.tgz
+      - uses: actions/download-artifact@v7 # (the page's module, which build.yml's `web` job built and checked)
+        continue-on-error: true # (a run that didn't build it still publishes, below, without the page)
+        with:
+          run-id: ${{ steps.build.outputs.run }}
+          github-token: ${{ github.token }}
+          name: web-pkg
+          path: web-pkg
+      - name: The page's module as one archive, pondra-web.tar.gz (site guides/browser)
+        run: |
+          if [ -f web-pkg/pondra_web.js ] && [ -f web-pkg/pondra_web_bg.wasm ]; then
+            cp LICENSE-MIT LICENSE-APACHE web-pkg/
+            tar czf dist/pondra-web.tar.gz -C web-pkg pondra_web.js pondra_web_bg.wasm LICENSE-MIT LICENSE-APACHE
+            tar tzvf dist/pondra-web.tar.gz
+          else
+            echo "::warning::build run ${{ steps.build.outputs.run }} has no web-pkg, so this release has no pondra-web.tar.gz"
+          fi
       - name: Every file's SHA-256 (install.sh and install.ps1 check the archive they download against it)
         run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/setup-node@v5

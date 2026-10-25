@@ -66,7 +66,8 @@ The details are in [`docs/prototype-status.md`](https://github.com/alimardon123/
 | Linux, macOS | `curl -fsSL https://github.com/alimardon123/pondra/releases/latest/download/install.sh \| sh` | `pondra` |
 | Python | `pip install pondra` (add `pyarrow` for pandas, Polars and Arrow) | `pondra`, `python -m pondra`, or `import pondra` |
 | Node | `npm install -g pondra` | `pondra`, or `npx pondra` with no install |
+| A web page | `pondra-web.tar.gz` below: `pondra_web.js` and its `.wasm`, served from your site | `new Page()` ([Pondra in a browser](https://alimardon123.github.io/pondra/guides/browser/)) |
 
 The files below: the binary alone for each platform (`pondra-<platform>.tar.gz` / `.zip`, what the
-installers download), the Python wheels and the npm packages. What changed is in the commits
+installers download), the Python wheels, the npm packages and the page's module (`pondra-web.tar.gz`). What changed is in the commits
 below and in [`docs/prototype-status.md`](https://github.com/alimardon123/pondra/blob/main/docs/prototype-status.md).
