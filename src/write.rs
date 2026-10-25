@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
+pub(crate) use crate::rules::fit::{by_position, implicit};
+use crate::rules::fit::fit_with;
+#[cfg(test)] pub(crate) use crate::rules::fit::fit;
 
 // ---------------------------------------------------------------- tables
 
@@ -1103,7 +1106,7 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
     let columns = row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let names = if names.is_empty() { implicit(&columns, rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
-    crate::seq::check_given(&meta.logical(), table, &given)?;
+    crate::seq::check_given(&meta, table, &given)?;
     let default = |c: &str| crate::defaults::sql_of(&meta, c);
     if plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
@@ -1162,15 +1165,6 @@ fn is_wildcard(item: &ast::SelectItem) -> bool {
         _ => return false,
     };
     matches!(expr, ast::Expr::Function(f) if ["columns", "unnest"].iter().any(|n| f.name.to_string().eq_ignore_ascii_case(n)))
-}
-
-/// The columns an INSERT without a column list fills, as Postgres takes them: the first `width` of the table's (all of
-/// them when the width isn't known, or isn't smaller). The rest take their DEFAULTs (`fitted`).
-pub(crate) fn implicit(columns: &[String], width: Option<usize>) -> &[String] {
-    match width {
-        Some(n) if n < columns.len() => &columns[..n],
-        _ => columns,
-    }
 }
 
 /// The columns an INSERT's whole rows are built for (`rows_for`): the table's, its delete marker only when the column list
@@ -1302,58 +1296,6 @@ pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str)
     let batches = crate::engine::sql(ctx, &crate::sys::planned(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(None) };
     Ok(Some(concat_batches(&first.schema(), &batches)?))
-}
-
-/// A query's rows as the table's columns, in its order and types (`rows` fits them with `fitted`; the tests of `literals.rs`
-/// fit a literal's rows with this, where no table has defaults to fill).
-#[cfg(test)]
-pub fn fit(target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> { fit_with(target, all).map(|(batch, _)| batch) }
-
-/// The columns a row fills by position: the table's, but its delete marker (`_deleted`), which SQL has no column for. A
-/// row gives a marker only by name (a change's rows name it, and so does a column list naming it): by position a row one
-/// value too wide made a delete of an INSERT, which answered `INSERT 0 1` and wrote nothing.
-pub(crate) fn by_position(target: &datafusion::arrow::datatypes::Schema) -> impl Iterator<Item = &datafusion::arrow::datatypes::FieldRef> {
-    target.fields().iter().filter(|f| f.name() != "_deleted")
-}
-
-/// `fit`, and the names of the columns the rows left out at the end: NULL in the batch until `fitted` gives them their
-/// DEFAULTs. A batch's `_deleted` column is the table's marker, by name; its other columns fill the table's others in
-/// order (`by_position`).
-fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, Vec<String>)> {
-    // An UPDATE's rows end with the ids they keep (`sys.rs`): those go along, by name.
-    let kept: Vec<usize> = (0..all.num_columns()).filter(|&i| [crate::text::ROW_ID, crate::text::CREATED].contains(&all.schema().field(i).name().as_str())).collect();
-    // (the marker is taken only where the table has one: a table without one takes a `_deleted` column by position, as before)
-    let marker = target.fields().iter().any(|f| f.name() == "_deleted").then(|| (0..all.num_columns()).find(|&i| all.schema().field(i).name() == "_deleted")).flatten();
-    let values: Vec<usize> = (0..all.num_columns()).filter(|i| !kept.contains(i) && Some(*i) != marker).collect();
-    let (ids, given_cols) = (all.project(&kept)?, all.project(&values)?);
-    // The given columns fill the table's others in order, the first few (later ones, such as added columns, are null).
-    let mut given = given_cols.columns().iter();
-    let mut padded = vec![];
-    let columns = target.fields().iter().map(|f| {
-        if f.name() == "_deleted" {
-            // (a row without a marker gives NULL: a missing marker is never a default, so it isn't padded)
-            return match marker {
-                Some(i) => crate::query::strict(all.column(i), f.data_type()),
-                None => Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows())),
-            };
-        }
-        match given.len() > 0 {
-            true => crate::query::strict(given.next().expect("counted"), f.data_type()),
-            false => {
-                padded.push(f.name().clone()); // (left out by the row: its DEFAULT, if it has one, in `fitted`)
-                Ok(datafusion::arrow::array::new_null_array(f.data_type(), all.num_rows()))
-            }
-        }
-    }).collect::<Result<Vec<_>, _>>()?;
-    if given.len() > 0 {
-        // (one value too many for a table with a marker is most likely the marker, declared or not: say how it's written)
-        let hint = if given.len() == 1 && marker.is_none() && target.fields().iter().any(|f| f.name() == "_deleted") { "; its delete marker _deleted is written only by name: INSERT INTO t (…, _deleted)" } else { "" };
-        return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({} given, the table has {}){hint}", given_cols.num_columns(), by_position(target).count())));
-    }
-    let (mut fields, mut columns) = (target.fields().to_vec(), columns);
-    fields.extend(ids.schema().fields().iter().cloned());
-    columns.extend(ids.columns().iter().cloned());
-    Ok((RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), columns)?, padded))
 }
 
 /// `fit`, with the columns the rows leave out at the end given their DEFAULT, as a bulk INSERT's are (`write_rows`)
@@ -1948,7 +1890,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         _ => {}
     }
-    let stored = lake.cat.get::<TableMeta>(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
+    let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
     let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
@@ -1956,7 +1898,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(crate::constraints::key_checked);
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
@@ -1983,7 +1925,9 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     };
     let meta = meta.expect("a table");
     // (each jsonb in its own form, so `RETURNING` answers what is held; the log checks the rows, as every door's)
-    let batch = crate::types::as_held(&meta, rows_of(lake, lake, &meta, &sql, None, files).await?, true)?;
+    let rows = rows_of(lake, lake, &meta, &sql, None, files).await?;
+    let rules = stored.as_ref().expect("a table").rules()?;
+    let batch = crate::rules::typed::as_held(&rules, rows, true)?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -2024,13 +1968,13 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
         r => r?,
     };
     let lake = other.as_deref().unwrap_or(lake);
-    let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
+    let meta = lake.cat.meta(&table_key(&table)).await?;
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
-        crate::seq::check_set(&m.logical(), &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
+        crate::seq::check_set(m, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
-    let checked = meta.as_ref().is_some_and(crate::constraints::checked);
+    let checked = meta.as_ref().is_some_and(|m| crate::constraints::checked(m));
     let append = meta.is_some_and(|m| m.key.is_empty());
     Ok(match stmt {
         // (a plain INSERT into a keyed table is no change here: `on_node_listed` sends it to `txn::autocommit`, under its locks)
@@ -2548,53 +2492,8 @@ async fn lead(dir: &str, store: &Store, term: u64, req: Option<Option<Request>>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int32Array};
+    use datafusion::arrow::array::Float64Array;
     use datafusion::arrow::datatypes::{Field, Schema};
-
-    /// A table of `a`, `b`, `c` and a delete marker, as a keyed table has them.
-    fn target() -> SchemaRef {
-        let int = |n: &str| Field::new(n, DataType::Int32, true);
-        Arc::new(Schema::new(vec![int("a"), int("b"), int("c"), Field::new("_deleted", DataType::Boolean, true)]))
-    }
-
-    /// One row of the named columns: `_deleted` a Boolean, the others Int32.
-    fn row(names: &[&str]) -> RecordBatch {
-        let fields: Vec<Field> = names.iter().map(|n| Field::new(*n, if *n == "_deleted" { DataType::Boolean } else { DataType::Int32 }, true)).collect();
-        let columns: Vec<ArrayRef> = names.iter().map(|n| -> ArrayRef { if *n == "_deleted" { Arc::new(BooleanArray::from(vec![false])) } else { Arc::new(Int32Array::from(vec![1])) } }).collect();
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("a row")
-    }
-
-    #[test]
-    fn a_short_row_pads_what_it_leaves_out_but_not_a_delete_marker() {
-        let (out, padded) = fit_with(&target(), &row(&["a"])).expect("fits");
-        assert_eq!(padded, ["b", "c"]);
-        assert_eq!((out.column(0).null_count(), out.column(1).null_count(), out.column(3).null_count()), (0, 1, 1));
-    }
-
-    #[test]
-    fn a_full_row_pads_nothing() {
-        assert!(fit_with(&target(), &row(&["a", "b", "c"])).expect("fits").1.is_empty());
-        assert!(fit_with(&target(), &row(&["a", "b", "c", "_deleted"])).expect("fits").1.is_empty());
-    }
-
-    #[test]
-    fn a_row_wider_than_the_table_is_refused_as_42601() {
-        let err = fit(&target(), &row(&["a", "b", "c", "_deleted", "x"])).expect_err("too wide");
-        assert_eq!(crate::codes::of(&err), "42601");
-    }
-
-    #[test]
-    fn a_row_gives_a_delete_marker_only_by_name() {
-        // one value too many, none of them named `_deleted`: refused, not written as a delete
-        let err = fit(&target(), &row(&["a", "b", "c", "x"])).expect_err("one value too many");
-        assert_eq!(crate::codes::of(&err), "42601");
-        // named, the marker fits
-        assert!(fit_with(&target(), &row(&["a", "b", "c", "_deleted"])).expect("fits").1.is_empty());
-        // a row of a value and a marker: b and c are padded, the marker is the row's own
-        let (out, padded) = fit_with(&target(), &row(&["a", "_deleted"])).expect("fits");
-        assert_eq!(padded, ["b", "c"]);
-        assert_eq!((out.column(1).null_count(), out.column(2).null_count(), out.column(3).null_count()), (1, 1, 0));
-    }
 
     #[tokio::test]
     async fn a_list_naming_the_marker_casts_its_floats_as_plain_values_do() {

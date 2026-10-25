@@ -16,40 +16,17 @@
 //! in, a cast to it is a cast to text (a literal checked against its labels) and `enum_range`,
 //! `enum_first` and `enum_last` are its labels (`pg_casts::rewrite`).
 //!
-//! `UUID`, `JSON` and `JSONB` are held as text too, as Delta, Spark, Snowflake and BigQuery hold
-//! one: every reader and client reads a string, and a uuid compares, sorts and joins as one. Each
-//! table keeps which columns are uuids, json or jsonb (`TableMeta::sql_types`), and every door refuses
-//! a value that isn't a uuid written Postgres's one way, lower case with hyphens (`check`), so two
-//! spellings of one uuid never meet. A json value is refused (22P02) unless it parses as JSON; its
-//! text is kept as written. A `jsonb` value is written as jsonb writes it (`as_held`: keys sorted and
-//! once, Postgres's spacing), so `=`, `GROUP BY` and `DISTINCT` compare values as Postgres does.
-//! SQL reads the other spellings Postgres takes as it does, and writes them that way: a cast to
-//! `uuid` (`'A0EE…'::uuid`, `pondra_uuid`), a cast to `json` or `jsonb` (`pondra_json`, checked where
-//! SQL comes in), a string compared with a uuid or written into one (`pg_trace::rewrite`), and the
-//! Postgres port's `COPY` (`spelled`); the loading doors of Pondra's own (JSON, Arrow, Kafka) take the
-//! one way. The Postgres port sends a uuid, json or jsonb column as Postgres's own type
-//! (`pg_types.rs`). `gen_random_uuid()` and
-//! `uuidv4()` are DataFusion's `uuid()`; `uuidv7()` (Postgres 18's) starts with the time, so a key
-//! of them comes in order and files hold narrow ranges of it.
-//!
-//! `VARCHAR(n)` (`CHARACTER VARYING(n)`, `NVARCHAR(n)`) is text whose values are at most `n`
-//! characters, as Postgres, Snowflake and Spark hold one: kept as `varchar(n)` in `sql_types`, and
-//! every door refuses a longer value (`check`: 22001), but for trailing spaces, which Postgres
-//! takes and cuts (kept here). Its length only grows (`ALTER COLUMN … TYPE VARCHAR(m)`, m ≥ n, or
-//! to plain text); a column holding text gets none, since its rows were never checked against one.
-use crate::pg_json::json_refusal;
+//! `UUID`, `JSON`, `JSONB` and `VARCHAR(n)` are held as text too, as Delta, Spark, Snowflake and BigQuery hold one, and
+//! how each keeps and refuses its values is `rules::typed`'s.
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
-use datafusion::arrow::array::{Array, AsArray, RecordBatch};
-use datafusion::arrow::datatypes::DataType;
 use datafusion::sql::sqlparser::ast::{self, Statement};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
-use crate::text::is_uuid;
 use crate::pg_casts::quoted;
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
@@ -330,224 +307,9 @@ pub fn grows(had: Option<&str>, wanted: &str) -> bool {
     had == Some(wanted) || matches!((had.and_then(length), length(wanted)), (Some(k), Some(n)) if n >= k)
 }
 
-/// The most characters a `varchar(n)` column's values have.
-pub fn length(t: &str) -> Option<usize> {
-    t.strip_prefix("varchar(")?.strip_suffix(')')?.parse().ok()
-}
-
-/// A type a column keeps as text and checks (`TableMeta::sql_types`): `uuid`, `json`, `jsonb` or `varchar(n)`.
-pub fn held(t: &str) -> bool { matches!(t, "uuid" | "json" | "jsonb") || length(t).is_some() }
-
-/// `v` is longer than `n` characters, but for trailing spaces (Postgres takes those, and cuts them).
-fn too_long(v: &str, n: usize) -> bool {
-    v.len() > n && v.trim_end_matches(' ').chars().count() > n
-}
+pub use crate::rules::typed::{held, length};
 
 pub use crate::pg_casts::uuid_of;
 
-/// `b`'s uuid columns (`sql_types`, by `b`'s names) written the one way, from any spelling Postgres
-/// takes, as Postgres's `COPY` reads them; what isn't a uuid is refused (22P02). A column already
-/// written so is left as it is (nearly always: a pass over its values).
-pub fn spelled(b: RecordBatch, sql_types: &BTreeMap<String, String>) -> Result<RecordBatch> {
-    let mut cols = b.columns().to_vec();
-    for (i, f) in b.schema().fields().iter().enumerate() {
-        let Some(a) = cols[i].as_string_opt::<i32>().filter(|_| sql_types.get(f.name()).is_some_and(|t| t == "uuid")) else { continue };
-        if a.iter().flatten().all(is_uuid) {
-            continue;
-        }
-        let one_way: datafusion::arrow::array::StringArray = a.iter().map(|v| v.map(uuid_of).transpose()).collect::<Result<_>>()?;
-        cols[i] = std::sync::Arc::new(one_way);
-    }
-    Ok(RecordBatch::try_new(b.schema(), cols)?)
-}
-
-/// `rows` with each jsonb column's values (`TableMeta::sql_types`) written as jsonb writes them (`jsonb_text`: keys
-/// sorted and once, Postgres's spacing), so `=`, `GROUP BY` and `DISTINCT` compare values as Postgres's do; a json column
-/// keeps its text as written. What isn't JSON is refused as `check` refuses it (22P02). A column already written
-/// so is left as it is. `sql_names`: whether `rows` are under SQL's names or stored ones, as for `check`.
-pub fn as_held(meta: &TableMeta, rows: RecordBatch, sql_names: bool) -> Result<RecordBatch> {
-    if !meta.sql_types.values().any(|t| t == "jsonb") {
-        return Ok(rows);
-    }
-    let mut cols = rows.columns().to_vec();
-    let mut changed = false;
-    for (stored, _) in meta.sql_types.iter().filter(|(_, t)| t.as_str() == "jsonb") {
-        let name = if sql_names { meta.name_of(stored) } else { stored.as_str() };
-        let Some(i) = rows.schema().index_of(name).ok() else { continue };
-        let c = cols[i].clone();
-        if c.null_count() == c.len() {
-            continue;
-        }
-        let text = datafusion::arrow::compute::cast(&c, &DataType::Utf8)?;
-        let text = text.as_string::<i32>();
-        let (mut same, mut refused) = (true, None);
-        let written = crate::pg_json_make::per_row(text.len(), |r, out| {
-            if text.is_null(r) {
-                return Ok(false);
-            }
-            let v = text.value(r);
-            if let Err(e) = crate::pg_json_make::jsonb_into(out, v) {
-                refused = Some(jsonb_refused(name, v, e));
-                return Err(datafusion::error::DataFusionError::Internal("a refused jsonb value".into())); // (stops the batch: `refused` says why)
-            }
-            same &= out.as_str() == v;
-            Ok(true)
-        });
-        if let Some(e) = refused {
-            return Err(e);
-        }
-        if same {
-            continue;
-        }
-        cols[i] = datafusion::arrow::compute::cast(&written?, c.data_type())?;
-        changed = true;
-    }
-    match changed {
-        true => Ok(RecordBatch::try_new(rows.schema(), cols)?),
-        false => Ok(rows),
-    }
-}
-
-/// The refusal of a jsonb value `jsonb_into` couldn't write: `refusal`'s message and SQLSTATE, as `check` words them. Where
-/// `refusal` takes no value (it is JSON, but a number past what `numeric` holds is only jsonb's), the words are JSON's and
-/// the error's own SQLSTATE stays (a lone surrogate's escape is JSON, but not jsonb's).
-fn jsonb_refused(column: &str, v: &str, e: datafusion::error::DataFusionError) -> anyhow::Error {
-    let code = crate::codes::of(&anyhow::Error::from(e));
-    let (message, code) = refusal("jsonb", column, v).unwrap_or_else(|| (json_refusal(v), code));
-    anyhow::Error::new(crate::codes::Violation(message, code))
-}
-
-/// Why a uuid column refuses a value: not a uuid, or one written another way than the column holds.
-fn refused_uuid(column: &str, s: &str) -> String {
-    match uuid_of(s) {
-        Ok(u) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds a uuid one way, lower case with hyphens: write '{u}', or cast it, '{s}'::uuid)"),
-        Err(_) => format!("invalid input syntax for type uuid: \"{s}\" (column {column} holds uuids)"),
-    }
-}
-
-/// Why a value of a column held as `t` is refused, with its message and SQLSTATE; None when it is taken.
-/// The column's name is the one the message gives.
-fn refusal(t: &str, column: &str, v: &str) -> Option<(String, &'static str)> {
-    match t {
-        "uuid" if !is_uuid(v) => Some((refused_uuid(column, v), "22P02")),
-        // (the reader the functions use decides: 22P02 for text that isn't JSON, 54001 past its levels)
-        "json" | "jsonb" => crate::pg_json_make::refused(v).map(|code| match code {
-            "54001" => (format!("stack depth limit exceeded (column {column} holds {t}: a document nested past {} levels)", crate::pg_json_make::MAX_DEPTH), code),
-            _ => (format!("{} (column {column} holds {t})", json_refusal(v)), code),
-        }),
-        _ => match length(t) {
-            Some(n) if too_long(v, n) => Some((format!("value too long for type character varying({n}) (column {column}: a value of {} characters)", v.chars().count()), "22001")),
-            _ => None,
-        },
-    }
-}
-
-/// Every door's rows (`defaults::check`): a value its column's enum doesn't list, or that isn't a
-/// uuid written the one way, or JSON, is refused (Postgres's 22P02), and one longer than its VARCHAR(n)
-/// (22001), the writer's alone. `marker`: a keyed table's delete markers carry no values.
-pub fn check(meta: &TableMeta, rows: &RecordBatch, sql_names: bool, marker: &dyn Fn(usize) -> bool) -> Result<()> {
-    for (stored, e) in &meta.enums {
-        let Some(c) = rows.column_by_name(if sql_names { meta.name_of(stored) } else { stored }) else { continue };
-        if c.null_count() == c.len() {
-            continue;
-        }
-        let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
-        let text = text.as_string::<i32>();
-        let labels: std::collections::HashSet<&str> = e.labels.iter().map(String::as_str).collect();
-        if let Some(i) = (0..text.len()).find(|&i| text.is_valid(i) && !labels.contains(text.value(i)) && !marker(i)) {
-            let what = e.of.clone().unwrap_or_else(|| format!("column {}", meta.name_of(stored)));
-            let message = format!("invalid input value for enum {what}: \"{}\" (its labels: {})", text.value(i), quoted(&e.labels));
-            return Err(anyhow::Error::new(crate::codes::Violation(message, "22P02")));
-        }
-    }
-    for (stored, t) in &meta.sql_types {
-        let Some(c) = rows.column_by_name(if sql_names { meta.name_of(stored) } else { stored }) else { continue };
-        if !held(t) || c.null_count() == c.len() {
-            continue; // (a type a newer release keeps: its own nodes check it)
-        }
-        let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
-        let text = text.as_string::<i32>();
-        let column = meta.name_of(stored);
-        let first = (0..text.len()).filter(|&i| text.is_valid(i) && !marker(i)).find_map(|i| refusal(t, column, text.value(i)));
-        if let Some((message, code)) = first {
-            return Err(anyhow::Error::new(crate::codes::Violation(message, code)));
-        }
-    }
-    Ok(())
-}
-
 /// `CREATE TYPE name AS ENUM (…)`, as `SHOW CREATE TYPE` writes it.
 pub fn create_sql(name: &str, t: &Type) -> String { format!("CREATE TYPE {name} AS ENUM ({})", quoted(&t.labels)) }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use datafusion::arrow::array::{ArrayRef, StringArray, StringViewArray};
-    use datafusion::arrow::datatypes::{Field, Schema};
-    use std::sync::Arc;
-
-    /// A table with a jsonb column `j` and a json column `k`, as `TableMeta::sql_types` keeps them.
-    fn held_meta() -> TableMeta {
-        TableMeta {
-            columns: vec![("j".into(), "Utf8".into()), ("k".into(), "Utf8".into())],
-            sql_types: BTreeMap::from([("j".to_string(), "jsonb".to_string()), ("k".to_string(), "json".to_string())]),
-            ..Default::default()
-        }
-    }
-
-    /// Two text columns, `j` and `k` (None: NULL).
-    fn held_batch(j: Vec<Option<&str>>, k: Vec<Option<&str>>) -> RecordBatch {
-        let schema = Schema::new(vec![Field::new("j", DataType::Utf8, true), Field::new("k", DataType::Utf8, true)]);
-        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(j)) as ArrayRef, Arc::new(StringArray::from(k)) as ArrayRef];
-        RecordBatch::try_new(Arc::new(schema), cols).unwrap()
-    }
-
-    #[test]
-    fn as_held_writes_jsonb_as_postgres_does_and_leaves_json_as_written() {
-        let rows = held_batch(vec![Some(r#"{"b":2,"a":1}"#), Some("[1,  2]"), None, Some(r#"{"a": 1}"#)], vec![Some(r#"{"b":2}"#); 4]);
-        let k_before = rows.column_by_name("k").unwrap().clone();
-        let out = as_held(&held_meta(), rows, true).unwrap();
-        let j = out.column_by_name("j").unwrap().as_string::<i32>();
-        assert_eq!(j.iter().collect::<Vec<_>>(), vec![Some(r#"{"a": 1, "b": 2}"#), Some("[1, 2]"), None, Some(r#"{"a": 1}"#)]);
-        assert!(Arc::ptr_eq(&k_before, out.column_by_name("k").unwrap()), "a json column is not touched");
-    }
-
-    #[test]
-    fn as_held_returns_a_batch_already_in_jsonb_form_with_the_same_array() {
-        let rows = held_batch(vec![Some(r#"{"a": 1, "b": 2}"#), Some("[1, 2]"), None], vec![Some(r#"{"b":2}"#); 3]);
-        let before = rows.column_by_name("j").unwrap().clone();
-        let out = as_held(&held_meta(), rows, true).unwrap();
-        assert!(Arc::ptr_eq(&before, out.column_by_name("j").unwrap()));
-    }
-
-    #[test]
-    fn as_held_refuses_what_is_not_json_with_checks_words() {
-        let (meta, rows) = (held_meta(), held_batch(vec![Some(r#"{"a":"#)], vec![Some(r#"{"b":2}"#)]));
-        let e = as_held(&meta, rows.clone(), true).unwrap_err();
-        assert_eq!(crate::codes::of(&e), "22P02");
-        assert!(e.to_string().contains("(column j holds jsonb)"), "{e}");
-        let checked = check(&meta, &rows, true, &|_: usize| false).unwrap_err();
-        assert_eq!(e.to_string(), checked.to_string());
-    }
-
-    #[test]
-    fn as_held_keeps_a_utf8view_column_a_view() {
-        let schema = Schema::new(vec![Field::new("j", DataType::Utf8View, true)]);
-        let col = StringViewArray::from(vec![Some(r#"{"b":2,"a":1}"#)]);
-        let rows = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(col) as ArrayRef]).unwrap(); // (no `k`: a column the batch lacks is skipped)
-        let out = as_held(&held_meta(), rows, true).unwrap();
-        let j = out.column_by_name("j").unwrap();
-        assert_eq!(j.data_type(), &DataType::Utf8View);
-        assert_eq!(j.as_string_view().value(0), r#"{"a": 1, "b": 2}"#);
-    }
-
-    #[test]
-    fn a_json_column_takes_the_levels_the_functions_read() {
-        let nested = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
-        assert_eq!(refusal("jsonb", "c", &nested(200)), None);
-        assert_eq!(refusal("jsonb", "c", "[1,").map(|(_, code)| code), Some("22P02"));
-        let (message, code) = refusal("json", "c", &nested(crate::pg_json_make::MAX_DEPTH + 1)).unwrap();
-        assert_eq!(code, "54001");
-        assert!(message.contains(&crate::pg_json_make::MAX_DEPTH.to_string()), "{message}");
-    }
-}
