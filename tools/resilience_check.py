@@ -8,6 +8,9 @@ once the fault is gone (how long it took is in `info`).
   500 and 503, PUTs applied and their replies lost, requests slowed and held, the bucket down for
   longer than a leader's lease.
 - **cutoff**: the leader alone cut off from the bucket while the others reach it: another leads.
+- **catalog**: the leader's catalog compactor answered one 409 by the bucket, as R2 answered it
+  on 10-25 (the compactor stopped for good, the leader went on, and its catalog went 26 minutes
+  unflushed): the catalog is compacted and flushed again within a minute, by whichever node leads.
 - **restart**: on a bucket as slow as R2, the leader killed and started again 2 s later, as its
   service starts it (and as a container does, with a new temp folder): the next term is led, and
   no node opens the lake as leader only to be fenced by another.
@@ -26,7 +29,7 @@ once the fault is gone (how long it took is in `info`).
   Python client and psycopg.
 - **cli**: `pondra sql` killed mid-INSERT, on local disk and a bucket, with a node and without.
 
-  resilience_check.py [storage] [cutoff] [restart] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
+  resilience_check.py [storage] [cutoff] [catalog] [restart] [clients] [doors] [flight] [disk] [cache] [server] [cli] [--secs 20]
   resilience_check.py --real [storage cutoff]   # the same faults in front of a real bucket (R2, S3)
 
 Needs moto's server, psycopg, confluent-kafka and pyarrow (tools/requirements.txt), Node.js for the
@@ -366,6 +369,47 @@ def cutoff(a):
         t1 = time.time()
         c.end(a.secs / 2)
         info["the cut-off leader back: roles"] = c.timeline.since(t1)
+    finally:
+        c.close()
+
+
+def catalog(a):
+    """The leader's catalog compactor answered 409 by the bucket once (`faulty_s3.py`'s `conflict`),
+    on the file it reads each round. object_store reads a 409 as AlreadyExists and doesn't retry
+    it; on R2 on 10-25 the compactor stopped for good, the leader went on serving, its catalog's
+    L0 filled, its checkpoint waited on a flush that never came, and the next leader replayed 26
+    minutes of the catalog's WAL (11.5 minutes without writes: reviews/soak-day-4205277.md). The
+    catalog's upkeep failing stops the leader (invariant 303), so another leads at once."""
+    c = Bucketed(a)
+    try:
+        nodes, load = c.nodes, c.load
+        time.sleep(a.secs / 2)
+        lead = until(lambda: one_leader(nodes), 60)
+        i, t0, load.phase = nodes.index(lead), time.time(), "a 409 to the catalog compactor"
+        said, term = os.path.getsize(lead.log), stats(lead)["term"]
+        # (as on R2: a compaction's read of its input failed it, then the compactor's next read of its boundary)
+        c.proxies[i].set(conflict=["GET /catalog/compacted/", "GET /catalog/gc/compactions.boundary"])
+        until(lambda: c.proxies[i].counts.get("conflict") == 2, 60)
+        check("the leader's catalog compaction read an input and then its boundary, and both were answered 409", c.proxies[i].counts.get("conflict") == 2, c.proxies[i].counts)
+        # (a memtable's flush writes to catalog/compacted/ too, so a file there says nothing of the compactor:
+        # its failure stopping the leader does, invariant 303; the leader of the nodes still up, as it stopped)
+        again = until(lambda: (n := one_leader([nd for nd in nodes if nd.alive()])) and stats(n)["term"] > term, 60)
+        info["the 409: roles"] = c.timeline.since(t0)
+        info["the 409: the leader's log"] = [line[:300] for line in open(lead.log, errors="replace").read()[said:].splitlines() if "slatedb" in line or "catalog" in line][:8]
+        check("…the compactor's failure stops the leader: the next term is led within a minute", bool(again), c.timeline.since(t0))
+        took = load.stall(t0, time.time())
+        info["the 409: the longest wait for an ack (s)"] = took
+        check("…and writes went on: no ack waited 30 s", took < 30, took)
+        for nd in nodes:  # (a node that stopped is started again, as its service starts it)
+            if not nd.alive():
+                info.setdefault("started again, as a service would", []).append(nd.port)
+                nd.start()
+        time.sleep(a.secs / 2)
+        lead = until(lambda: one_leader(nodes), 60)
+        unflushed = lead and harness.metrics_of(lead.port).get("pondra_catalog_unflushed_seconds")
+        info["the leader's catalog unflushed for (s)"] = unflushed
+        check("…and the leader's catalog was flushed within the last 30 s", unflushed is not None and unflushed < 30, unflushed)
+        c.end(a.secs / 2)
     finally:
         c.close()
 
@@ -1135,7 +1179,7 @@ def cli(a):
                 harness.LAKES.remove(lake)
 
 
-PARTS = {"storage": storage, "cutoff": cutoff, "restart": restart, "clients": clients, "doors": doors, "flight": flight, "disk": disk, "cache": cache, "server": server, "cli": cli}
+PARTS = {"storage": storage, "cutoff": cutoff, "catalog": catalog, "restart": restart, "clients": clients, "doors": doors, "flight": flight, "disk": disk, "cache": cache, "server": server, "cli": cli}
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
