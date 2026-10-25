@@ -11,6 +11,13 @@ pub fn object(n: &ast::ObjectName) -> String {
     n.0.iter().map(part).collect::<Vec<_>>().join(".")
 }
 
+/// A name as SQL resolves it (`S` is `s`, `"S"` is `S`), as `nextval('…')`, `ALTER` and `DROP TYPE` give it.
+pub fn object_of(name: &str) -> String {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
+    parsed.map(|n| object(&n)).unwrap_or_else(|_| name.to_lowercase())
+}
+
 /// One part of a name: as written if quoted, else in lower case.
 pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
 

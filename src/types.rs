@@ -21,14 +21,16 @@
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, Statement};
+use datafusion::sql::sqlparser::ast;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 use crate::pg_casts::quoted;
 use crate::rules::create::{enum_labels, labelled};
+use crate::rules::types::{add_label, exists, in_use, label_skipping, missing, skipping};
+
+pub use crate::rules::types::Change;
 
 pub fn key(name: &str) -> String { format!("ty/{name}") }
 
@@ -57,59 +59,11 @@ impl Enum {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "snake_case")]
-pub enum Change {
-    Create { name: String, labels: Vec<String>, if_not_exists: bool },
-    Add { name: String, label: String, if_not_exists: bool, before: Option<String>, after: Option<String> },
-    Rename { name: String, to: String },
-    Drop { names: Vec<String>, if_exists: bool },
-}
-
 /// `CREATE TYPE … AS ENUM`, `ALTER TYPE`, `DROP TYPE`, or None for anything else.
 pub fn statement(sql: &str) -> Option<Stmt> {
-    static WORD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*(CREATE(\s+OR\s+REPLACE)?|ALTER|DROP)\s+TYPE\b").expect("a regex"));
-    static UNLESS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^(\s*CREATE\s+TYPE\s+)IF\s+NOT\s+EXISTS\s+").expect("a regex"));
-    static DROP: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*DROP\s+TYPE\s+(IF\s+EXISTS\s+)?(.+?)(\s+(CASCADE|RESTRICT))?\s*;?\s*$"#).expect("a regex"));
-    let first = crate::text::first_word(sql);
-    let c = WORD.captures(first)?;
-    let ddl = |c: Change| Some(Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]));
-    let invalid = |e: String| Some(Stmt::Invalid(e));
-    let word = c[1].to_uppercase();
-    if c.get(2).is_some() {
-        return invalid("CREATE OR REPLACE TYPE: a type's columns keep their labels (ALTER TYPE … ADD VALUE adds one)".into());
-    }
-    if word == "DROP" {
-        // (CASCADE and RESTRICT are the same here: a drop never takes a column with it, so a type a column
-        // uses is refused by name whichever is written, and one no column uses is dropped either way)
-        let d = DROP.captures(first)?;
-        let names = d[2].split(',').map(|n| crate::seq::object_of(n.trim())).collect();
-        return ddl(Change::Drop { names, if_exists: d.get(1).is_some() });
-    }
-    let unless = UNLESS.is_match(first);
-    let text = UNLESS.replace(first, "$1");
-    let parsed = Parser::parse_sql(&GenericDialect {}, &text).map(|mut s| s.pop());
-    Some(match parsed {
-        Ok(Some(Statement::CreateType { name, representation: Some(ast::UserDefinedTypeRepresentation::Enum { labels }) })) => {
-            return ddl(Change::Create { name: crate::text::object(&name), labels: labels.iter().map(|l| l.value.clone()).collect(), if_not_exists: unless })
-        }
-        Ok(Some(Statement::CreateType { .. })) | Err(_) if word.starts_with("CREATE") => Stmt::Invalid("CREATE TYPE [IF NOT EXISTS] name AS ENUM ('label', …): enums are the types kept (a composite, a range or another type's alias isn't)".into()),
-        Ok(Some(Statement::AlterType(a))) => {
-            let name = crate::text::object(&a.name);
-            match a.operation {
-                ast::AlterTypeOperation::Rename(r) => return ddl(Change::Rename { name, to: crate::text::ident(&r.new_name) }),
-                ast::AlterTypeOperation::AddValue(v) => {
-                    let (before, after) = match v.position {
-                        Some(ast::AlterTypeAddValuePosition::Before(n)) => (Some(n.value), None),
-                        Some(ast::AlterTypeAddValuePosition::After(n)) => (None, Some(n.value)),
-                        None => (None, None),
-                    };
-                    return ddl(Change::Add { name, label: v.value.value, if_not_exists: v.if_not_exists, before, after });
-                }
-                ast::AlterTypeOperation::RenameValue(_) => Stmt::Invalid("ALTER TYPE … RENAME VALUE: rows keep the text they were written with (files are never rewritten); add the new label, UPDATE the rows to it".into()),
-            }
-        }
-        _ => Stmt::Invalid("ALTER TYPE name ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'label'] | RENAME TO new_name".into()),
+    crate::rules::types::change(sql).map(|r| match r {
+        Ok(c) => Stmt::Ddl(vec![crate::ddl::Ddl::Type(c)]),
+        Err(why) => Stmt::Invalid(why),
     })
 }
 
@@ -119,26 +73,18 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         Change::Create { name, labels, if_not_exists } => {
             let name = crate::ddl::new_name(lake, &name).await?;
             if lake.cat.get::<Type>(&key(&name)).await?.is_some() {
-                ensure!(if_not_exists, "type \"{name}\" already exists");
-                return Ok(j!({"type": name, "exists": true, "notice": format!("type \"{name}\" already exists, skipping")}));
+                ensure!(if_not_exists, exists(&name));
+                return Ok(j!({"type": name, "exists": true, "notice": skipping(&name)}));
             }
             labelled(&labels)?;
             lake.cat.commit(vec![(key(&name), json(&Type { labels }))], &[]).await?;
             Ok(j!({"type": name}))
         }
         Change::Add { name, label, if_not_exists, before, after } => {
-            let (name, mut t) = find(lake, &name).await?.with_context(|| format!("type \"{name}\" does not exist"))?;
-            if t.labels.contains(&label) {
-                ensure!(if_not_exists, "enum label \"{label}\" already exists");
-                return Ok(j!({"type": name, "unchanged": true, "notice": format!("enum label \"{label}\" already exists, skipping")}));
+            let (name, mut t) = find(lake, &name).await?.with_context(|| missing(&name))?;
+            if !add_label(&mut t.labels, &label, before.as_deref(), after.as_deref(), if_not_exists)? {
+                return Ok(j!({"type": name, "unchanged": true, "notice": label_skipping(&label)}));
             }
-            let at = match (&before, &after) {
-                (Some(n), _) => t.labels.iter().position(|l| l == n).with_context(|| format!("\"{n}\" is not an existing enum label"))?,
-                (_, Some(n)) => t.labels.iter().position(|l| l == n).with_context(|| format!("\"{n}\" is not an existing enum label"))? + 1,
-                _ => t.labels.len(),
-            };
-            t.labels.insert(at, label.clone());
-            labelled(&t.labels)?;
             // (every table using it takes the label in the same commit: a write checks its own copy)
             let mut puts = vec![(key(&name), json(&t))];
             for (k, mut m) in users(lake, &name).await? {
@@ -149,9 +95,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             Ok(j!({"type": name, "added": label}))
         }
         Change::Rename { name, to } => {
-            let (name, t) = find(lake, &name).await?.with_context(|| format!("type \"{name}\" does not exist"))?;
+            let (name, t) = find(lake, &name).await?.with_context(|| missing(&name))?;
             let to = crate::ddl::new_name(lake, &crate::text::join(crate::text::split(&name).0, &to)).await?;
-            ensure!(lake.cat.get::<Type>(&key(&to)).await?.is_none(), "type \"{to}\" already exists");
+            ensure!(lake.cat.get::<Type>(&key(&to)).await?.is_none(), exists(&to));
             let mut puts = vec![(key(&to), json(&t))];
             for (k, mut m) in users(lake, &name).await? {
                 m.enums.values_mut().filter(|e| e.of.as_deref() == Some(name.as_str())).for_each(|e| e.of = Some(to.clone()));
@@ -164,7 +110,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
             let mut gone = vec![];
             for n in names {
                 let Some((n, _)) = find(lake, &n).await? else {
-                    ensure!(if_exists, "type \"{n}\" does not exist");
+                    ensure!(if_exists, missing(&n));
                     continue;
                 };
                 // Every column that uses the type, named as table.column (SQL's names), for the same message
@@ -177,8 +123,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
                         }
                     }
                 }
-                let (what, verb) = if using.len() == 1 { ("column", "uses") } else { ("columns", "use") };
-                ensure!(using.is_empty(), "cannot drop type {n} because {what} {verb} it: {}; drop or change them first", using.join(", "));
+                in_use(&n, &using)?;
                 gone.push(n);
             }
             lake.cat.commit(vec![], &gone.iter().map(|n| key(n)).collect::<Vec<_>>()).await?;

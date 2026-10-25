@@ -758,7 +758,7 @@ impl Page {
     /// a node checks it at CREATE (`defaults::definition`): planned over an empty table of those columns, so a CHECK that names
     /// no column, or isn't a condition, is refused now and not at each row.
     fn made_table(&self, c: &CreateTable, schema: &Schema) -> anyhow::Result<crate::rules::Table> {
-        let table = crate::rules::Table::of_create(c, &Arc::new(schema.clone()))?;
+        let table = crate::rules::Table::of_create(c, &Arc::new(schema.clone()), &|_| None)?;
         for (name, check) in &table.checks {
             crate::rules::fit::breaking(&self.ctx, &RecordBatch::new_empty(table.schema.clone()), check).with_context(|| format!("CONSTRAINT {name} CHECK ({check})")).map_err(crate::rules::create::definition)?;
         }
