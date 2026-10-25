@@ -2130,6 +2130,9 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         // (`try_join`, not `join`: the collector never ends, so `join` waited for it and never saw the compactor stop.
         // The first failure of either one ends the wait here, and it takes the failure path below)
         if let Err(e) = tokio::try_join!(c.run(), g.run()) {
+            // (a compactor fenced by a newer leader's is this node's step down, not a failure: it restarts and rejoins
+            // as a follower, as a fenced write does. Stopping there left a stale leader that woke gone: harness `fence`)
+            let e = fatal(e);
             if crate::library::on() {
                 return crate::library::failed(format!("the catalog's compactor or garbage collector failed: {e}"));
             }
