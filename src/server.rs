@@ -3,7 +3,6 @@
 use crate::cluster::Cluster;
 use crate::log::{decode_flush, Ack, Log, Sequencer, Src};
 use crate::query::{latest_sql, raw, session, tail};
-use crate::answer::schema;
 use crate::store::*;
 use crate::tasks::Task;
 use crate::tier::{expire, tier_table};
@@ -1121,7 +1120,8 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
     let meta = app.lake.cat.meta(&table_key(&name)).await?.ok_or_else(|| anyhow::anyhow!("no table {name}"))?;
-    let schema = schema(&meta.logical_columns())?; // (rows come under SQL's names; the log keeps stored ones: ADR-022)
+    let rules = meta.rules()?;
+    let schema = rules.schema.clone(); // (rows come under SQL's names; the log keeps stored ones: ADR-022)
     let arrow = headers.get("content-type").is_some_and(|v| v.as_bytes().starts_with(b"application/vnd.apache.arrow"));
     let read = || -> anyhow::Result<_> {
         Ok(if arrow {
@@ -1139,16 +1139,14 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
     // (rows that can't be read as the table's are the sender's: 22P02, never the node's 500)
     let (batches, given) = read().map_err(|e| crate::codes::coded("22P02", format!("the rows can't be read as {name}'s: {}", crate::ext::said(&e))))?;
     let batch = concat_batches(&schema, &batches)?;
-    let batch = match (crate::defaults::any(&meta), given) {
-        (false, _) => batch,
-        (true, Some(given)) => crate::defaults::fill(&app.lake, &meta, batch.clone(), |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(batch.num_rows()))).await?,
-        (true, None) => {
-            let absent = crate::defaults::absent_keys(&meta, &body)?; // (a JSON row without the key)
-            crate::defaults::fill(&app.lake, &meta, batch, |c| absent.get(c).cloned()).await?
-        }
+    let left_out = match given {
+        Some(given) => rules.left_out(&given),
+        None if rules.fills() => crate::rules::LeftOut::PerRow(crate::defaults::absent_keys(&meta, &body)?), // (a JSON row without the key)
+        None => crate::rules::LeftOut::None,
     };
-    crate::auth::check_load(&meta, name, &batch)?; // (a keyed table's rows replace their keys': UPDATE too; marked _deleted, DELETE: S11)
-    Ok(Json(log.append(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, batch).await?))
+    let rows = crate::rules::shape(&rules, name, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await?;
+    crate::auth::check_load(&meta, name, rows.rows())?; // (a keyed table's rows replace their keys': UPDATE too; marked _deleted, DELETE: S11)
+    Ok(Json(log.append_shaped(name.to_string(), Src { producer: p.producer, seq: p.seq, prev: p.prev }, rows).await?))
 }
 
 #[derive(Deserialize)]

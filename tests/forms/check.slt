@@ -12,3 +12,17 @@ query II
 SELECT id, qty FROM c
 ----
 1 5
+
+# NOT NULL is checked before CHECK, as Postgres checks it: a row breaking both is 23502 (form-parity, the core's order); and
+# two CHECKs that fail name the first by name, not the first defined (Postgres sorts a table's CHECKs by name).
+statement ok
+CREATE TABLE cn (a INT NOT NULL, b INT CHECK (b > 0))
+
+statement error 23502
+INSERT INTO cn VALUES (NULL, -1)
+
+statement ok
+CREATE TABLE cm (a INT CONSTRAINT zz CHECK (a > 0), b INT CONSTRAINT aa CHECK (b > 0))
+
+statement error 23514 violates check constraint "aa"
+INSERT INTO cm VALUES (-1, -1)

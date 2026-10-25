@@ -1006,7 +1006,6 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
         Stmt::Update(t, set, cond) => {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
-            crate::seq::check_set(meta, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?; // (SET c = DEFAULT is Postgres's for an ALWAYS identity too)
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
                 Some((_, e)) => format!("({})", crate::defaults::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
@@ -1030,8 +1029,6 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
     let columns = row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let names = if names.is_empty() { implicit(&columns, rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
-    let given: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
-    crate::seq::check_given(&meta, table, &given)?;
     let default = |c: &str| crate::defaults::sql_of(&meta, c);
     if plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
@@ -1099,7 +1096,7 @@ pub(crate) fn row_columns(columns: impl IntoIterator<Item = String>, names: &[St
 }
 
 /// Does every row of this `VALUES` say DEFAULT at position `i`?
-fn defaulted(query: &str, i: usize) -> bool {
+pub(crate) fn defaulted(query: &str, i: usize) -> bool {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
     let Ok(q) = Parser::new(&GenericDialect {}).try_with_sql(query).and_then(|mut p| p.parse_query()) else { return false };
     matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().all(|r| r.get(i).is_some_and(is_default)))
@@ -1666,11 +1663,9 @@ impl Drop for Undo {
 async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: an apply's only)
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
-        return Ok(out); // (the session's own tables and views: on this node, in memory)
+        return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
     }
-    if let Stmt::Insert(t, query) = &stmt {
-        crate::seq::check_every(&app.lake, t, rows_width(query)).await?; // (the columns it gives: an ALWAYS identity's refused among them, in a transaction too)
-    }
+    identity(&app.lake, &stmt).await?; // (every SQL write's identity, before the DDL and transaction splits: autocommit and transactions both meet it)
     // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
     // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
     if let Some(note) = Box::pin(crate::txn::ddl_at_once(app, &stmt)).await? {
@@ -1884,6 +1879,46 @@ async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &st
     }
 }
 
+/// The identity check every SQL write meets once, however it came (`on_node_listed`, `from_cli`, and the leader's
+/// `change::run`): an ALWAYS identity column is given no value by an INSERT (428C9), and set by no UPDATE or MERGE, unless
+/// the value is DEFAULT. What each form gives is what Postgres takes (`change::Merge::written` for a MERGE and the INSERT …
+/// ON CONFLICT and OR … forms, `defaulted` for the DEFAULTs in VALUES). A name no lake here holds is Ok: its own path answers.
+pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
+    use crate::rules::keys::{given, set, Said};
+    if !matches!(stmt, Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Merge(_)) {
+        return Ok(());
+    }
+    let table = stmt.table();
+    // (a name not in a lake here, say an outside catalog's table: its own path takes it)
+    let Ok((other, name)) = crate::ddl::resolve(lake, &table).await else { return Ok(()) };
+    let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(()) }; // (as parsed once a version: `rules` is the memo)
+    if !meta.identity.values().any(|i| i.always) {
+        return Ok(());
+    }
+    let t = meta.rules()?;
+    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
+    match stmt {
+        // (a positional `INSERT INTO t query`: the table's first columns the rows have, as `implicit` takes them)
+        Stmt::Insert(_, query) => given(&t, &table, implicit(&columns, rows_width(query)), Said::Positional),
+        // (`INSERT INTO t (names) query`: the columns named, or the table's first ones the rows have, as `whole_rows` takes them;
+        // a value that says DEFAULT is not given)
+        Stmt::InsertInto(_, names, query) => {
+            let names: Vec<String> = if names.is_empty() { implicit(&columns, rows_width(query)).to_vec() } else { names.clone() };
+            let given_names: Vec<String> = names.iter().enumerate().filter(|(i, _)| !defaulted(query, *i)).map(|(_, n)| n.clone()).collect();
+            given(&t, &table, &given_names, Said::Named)
+        }
+        Stmt::Update(_, assigned, _) => set(&t, &assigned.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>()),
+        Stmt::Merge(m) => {
+            let written = m.written(&t);
+            for (columns, said) in written.given {
+                given(&t, &table, &columns, said)?;
+            }
+            set(&t, &written.set)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The statement as the leader's to carry out (`change.rs`), if it is one: an UPDATE or DELETE of
 /// an append table, or a MERGE.
 pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
@@ -1894,9 +1929,6 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
     };
     let lake = other.as_deref().unwrap_or(lake);
     let meta = lake.cat.meta(&table_key(&table)).await?;
-    if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
-        crate::seq::check_set(m, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
-    }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
     let checked = meta.as_ref().is_some_and(|m| crate::constraints::checked(m));
@@ -2029,6 +2061,10 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
     let mut stmt = stmt;
     if let Ok(lake) = Lake::open(dir, false, false).await {
         stmt = crate::protect::door(&lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
+        if matches!(stmt, Stmt::Insert(..) | Stmt::InsertInto(..) | Stmt::Update(..) | Stmt::Merge(_)) {
+            crate::ddl::sync(&lake, "", false).await?; // (the lakes ATTACH made: a name in one resolves once they are here, as `one_from_cli` takes them)
+            identity(&lake, &stmt).await?; // (as a node's: every SQL write's identity, here before `whole_rows` rewrites an INSERT INTO t (names))
+        }
         if let Some((query, to, options)) = crate::ext::view_write(&lake, &stmt).await? {
             let out = crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
             return Ok(j!({"rows": out["copied"]}));
@@ -2038,7 +2074,6 @@ pub async fn from_cli(dir: &str, stmt: Stmt) -> Result<Value> {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&*Lake::open(dir, false, false).await?, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
             let lake = Lake::open(dir, false, false).await?;
-            crate::seq::check_every(&lake, &t, rows_width(&query)).await?;
             if !is_there(&lake, &t).await? {
                 return Err(no_table(&t));
             }

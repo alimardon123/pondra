@@ -66,19 +66,35 @@ impl Table {
 
     /// Does the table enforce a UNIQUE constraint (`constraints::checked`)?
     pub fn checked(&self) -> bool { !self.unique.is_empty() }
+
+    /// Does any column have a DEFAULT? Only then does a loading door work out which rows left a column out.
+    pub fn fills(&self) -> bool { self.columns.iter().any(|c| c.default.is_some()) }
+
+    /// The columns a loading door's rows left out, for `shape`: none when no column has a DEFAULT (`fills`), else each column
+    /// with a DEFAULT that `given` doesn't name (by SQL's name).
+    pub fn left_out(&self, given: &[String]) -> LeftOut {
+        match self.fills() {
+            true => LeftOut::Columns(self.columns.iter().filter(|c| c.default.is_some() && !given.contains(&c.name)).map(|c| c.name.clone()).collect()),
+            false => LeftOut::None,
+        }
+    }
+
+    /// Do rows `shape` made for `a` meet `b`'s rules as they are? The same `Arc` does, and so does an equal `Table` built
+    /// apart. `Table` is `PartialEq`, not `Eq`, so the pointer test is explicit.
+    pub fn same(a: &Arc<Table>, b: &Arc<Table>) -> bool { Arc::ptr_eq(a, b) || **a == **b }
 }
 
 /// A write's rows as they come: by position (`INSERT INTO t VALUES …`), by name with the columns or rows that left a column
 /// out (`LeftOut`, a loading door's), or whole, in the table's columns already (an UPDATE's or MERGE's new versions).
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum Rows {
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Positional(RecordBatch),
     Named(RecordBatch, LeftOut),
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Whole(RecordBatch),
 }
 
 /// Which rows left a column out, so its DEFAULT fills them: none, every row of these columns, or the rows each mask says.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum LeftOut {
     None,
     Columns(Vec<String>),
@@ -86,21 +102,21 @@ pub enum LeftOut {
 }
 
 /// What the rows are for: a plain INSERT, a loading door's rows, or an UPDATE's or MERGE's new versions.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub enum How {
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Insert,
     Load,
+    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's SQL paths build it from piece 8)
     Change,
 }
 
 /// Rows `shape` made, and the table they were made for: only `rules` makes one.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
+#[derive(Clone)]
 pub struct Shaped {
     rows: RecordBatch,
     table: Arc<Table>,
 }
 
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 impl Shaped {
     /// The rows, as the table holds them.
     pub fn rows(&self) -> &RecordBatch { &self.rows }
@@ -115,7 +131,6 @@ impl Shaped {
 /// What a form gives the rules that only it has: the session a CHECK is planned in, and a DEFAULT's values.
 pub trait Host: Sync {
     /// The session a CHECK is planned in (a node's `defaults::BASE`).
-    #[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
     fn base(&self) -> &SessionContext;
 
     /// `n` values of a DEFAULT, `expr` as SQL writes it, each row its own (`uuid()`, `nextval('t_id_seq')`): the rules
@@ -126,7 +141,7 @@ pub trait Host: Sync {
 /// `rows` with each column's DEFAULT in the rows a write left the column out of: `left_out(column)` says which (None: none).
 /// A column with no DEFAULT is not asked about, since `left_out` may be costly. Each value is cast to the column's type.
 pub async fn fill<H: Host>(t: &Table, rows: RecordBatch, left_out: impl Fn(&str) -> Option<BooleanArray>, host: &H) -> Result<RecordBatch> {
-    if t.columns.iter().all(|c| c.default.is_none()) || rows.num_rows() == 0 {
+    if !t.fills() || rows.num_rows() == 0 {
         return Ok(rows);
     }
     let n = rows.num_rows();
@@ -141,9 +156,10 @@ pub async fn fill<H: Host>(t: &Table, rows: RecordBatch, left_out: impl Fn(&str)
     Ok(RecordBatch::try_new(rows.schema(), columns)?)
 }
 
-/// The rules a write's rows meet once their shape is right, over the table as it is: an enum's labels and a held type's
-/// values (`typed::check`), each CHECK (`fit::breaking`, planned in `base`), and each NOT NULL column, in the order the
-/// columns are. `name` is the table's, for the words. `rows` are under SQL's names when `sql_names`, else under the stored
+/// The rules a write's rows meet once their shape is right, over the table as it is, in the order Postgres meets them: an
+/// enum's labels and a held type's values (`typed::check`), then each NOT NULL column (23502), then each CHECK (`fit::breaking`,
+/// planned in `base`, 23514) in the order of its name, as Postgres sorts a table's CHECKs (so a row breaking two names the
+/// first by name). `name` is the table's, for the words. `rows` are under SQL's names when `sql_names`, else under the stored
 /// ones. A row whose delete marker is set passes the CHECKs and the NOT NULLs.
 pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: &SessionContext) -> Result<()> {
     let ruled = !t.checks.is_empty() || t.columns.iter().any(|c| c.not_null || c.held.is_some() || c.labels.is_some());
@@ -153,7 +169,15 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
     let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
     typed::check(t, rows, sql_names, &marker)?;
+    for c in t.columns.iter().filter(|c| c.not_null) {
+        let Some(col) = rows.column_by_name(if sql_names { &c.name } else { &c.stored }).filter(|col| col.null_count() > 0) else { continue };
+        if (0..col.len()).any(|i| col.is_null(i) && !marker(i)) {
+            bail!("{name}.{} is NOT NULL, and a row gives it no value", c.name);
+        }
+    }
     if !t.checks.is_empty() {
+        let mut ordered: Vec<&(String, String)> = t.checks.iter().collect(); // (by name: Postgres's order, `strcmp` on the names)
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
         // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
         let named = match sql_names || !t.mapped {
             true => rows.clone(),
@@ -171,17 +195,11 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
             }
         };
         let all = fit::conform(&named, &t.schema)?;
-        for (check, condition) in &t.checks {
+        for (check, condition) in ordered {
             let bad = fit::breaking(base, &all, condition)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
                 return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{name}\" violates check constraint \"{check}\": CHECK ({condition})"), "23514")));
             }
-        }
-    }
-    for c in t.columns.iter().filter(|c| c.not_null) {
-        let Some(col) = rows.column_by_name(if sql_names { &c.name } else { &c.stored }).filter(|col| col.null_count() > 0) else { continue };
-        if (0..col.len()).any(|i| col.is_null(i) && !marker(i)) {
-            bail!("{name}.{} is NOT NULL, and a row gives it no value", c.name);
         }
     }
     Ok(())
@@ -199,7 +217,6 @@ pub fn checked(t: &Table, name: &str, rows: RecordBatch, sql_names: bool, base: 
 /// A write's rows, shaped for the table they go into, in the order every door runs them (§3 of the design, steps 1 to 8):
 /// fitted to the table's columns, DEFAULTs for the columns a row left out, held forms written and checked, and, for a plain
 /// INSERT into a keyed table, no key given twice. `name` is the table's, for the refusals' words.
-#[cfg_attr(feature = "server", allow(dead_code))] // (a node's paths call it from piece 6)
 pub async fn shape<H: Host>(t: &Arc<Table>, name: &str, rows: Rows, how: How, host: &H) -> Result<Shaped> {
     let rows = match rows {
         Rows::Positional(batch) => {
@@ -328,6 +345,38 @@ mod tests {
         assert!(unique.checked());
     }
 
+    #[test]
+    fn a_table_fills_only_when_a_column_has_a_default() {
+        assert!(keyed().fills());
+        assert!(!guarded().fills());
+    }
+
+    #[test]
+    fn left_out_names_the_defaults_a_write_leaves_out() {
+        assert!(matches!(guarded().left_out(&["id".to_string()]), LeftOut::None), "no DEFAULT: nothing to fill");
+        let t = keyed(); // (v's DEFAULT is 7)
+        assert!(matches!(t.left_out(&["id".to_string()]), LeftOut::Columns(c) if c == vec!["v".to_string()]), "left out: listed");
+        assert!(matches!(t.left_out(&["id".to_string(), "v".to_string()]), LeftOut::Columns(c) if c.is_empty()), "given: not listed");
+    }
+
+    #[test]
+    fn rows_shaped_for_a_table_meet_the_same_table_or_an_equal_one() {
+        let a = Arc::new(keyed());
+        assert!(Table::same(&a, &a.clone()), "the same Arc");
+        assert!(Table::same(&a, &Arc::new(keyed())), "an equal table, built apart");
+        let mut null = keyed();
+        null.columns.iter_mut().find(|c| c.name == "v").unwrap().not_null = true;
+        let mut check = keyed();
+        check.checks.push(("v_pos".into(), "v > 0".into()));
+        for changed in [null, check] {
+            assert!(!Table::same(&a, &Arc::new(changed)), "a NOT NULL or a CHECK added is a change");
+        }
+        let typed = Arc::new(typed_table());
+        let mut label = typed_table();
+        label.columns.iter_mut().find(|c| c.name == "e").unwrap().labels.as_mut().unwrap().1.push("ok".into());
+        assert!(!Table::same(&typed, &Arc::new(label)), "a label added is a change");
+    }
+
     #[tokio::test]
     async fn a_positional_row_one_value_too_wide_is_refused_as_42601() {
         let t = Arc::new(keyed());
@@ -399,6 +448,24 @@ mod tests {
         assert_eq!(crate::codes::of(&err), "23502");
         assert_eq!(crate::codes::words(&err), "s.t.m is NOT NULL, and a row gives it no value");
         shape(&t, "s.t", Rows::Whole(rows(Some(-1), None, true)), How::Change, &host()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_not_null_is_refused_before_a_check_a_row_breaks_both_as_postgres_refuses_it() {
+        let t = Arc::new(guarded());
+        let rows = batch(vec![("id", ints(&[Some(1)])), ("n", ints(&[Some(-1)])), ("m", ints(&[None])), ("_deleted", bools(&[false]))]);
+        let err = shape(&t, "s.t", Rows::Whole(rows), How::Change, &host()).await.err().expect("a CHECK and a NOT NULL");
+        assert_eq!(crate::codes::of(&err), "23502");
+        assert_eq!(crate::codes::words(&err), "s.t.m is NOT NULL, and a row gives it no value");
+    }
+
+    #[test]
+    fn two_failing_checks_name_the_first_by_name_not_the_first_defined() {
+        let t = table(&[], vec![(plain("a"), DataType::Int64), (plain("b"), DataType::Int64)], &[("zz", "a > 0"), ("aa", "b > 0")]);
+        let rows = batch(vec![("a", ints(&[Some(-1)])), ("b", ints(&[Some(-1)]))]);
+        let err = checks(&t, "s.t", &rows, true, &SessionContext::new()).err().expect("two CHECKs");
+        assert_eq!(crate::codes::of(&err), "23514");
+        assert_eq!(crate::codes::words(&err), "new row for relation \"s.t\" violates check constraint \"aa\": CHECK (b > 0)");
     }
 
     #[tokio::test]

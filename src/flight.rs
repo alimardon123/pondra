@@ -477,21 +477,25 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
     let (lake, again, table2) = (app.lake.clone(), log.clone(), table.clone());
     let who = crate::auth::current(); // (the caller, for its grants in the task below: a task keeps no task-local)
     type Queued = Pin<Box<dyn std::future::Future<Output = anyhow::Result<crate::log::Ack>> + Send>>;
-    let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, RecordBatch, crate::log::Src), Status>>(256);
+    let (acks_tx, mut acks_rx) = tokio::sync::mpsc::channel::<Result<(Queued, crate::rules::Shaped, crate::log::Src), Status>>(256);
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel(); // (acks are small; a client may read them only at the end)
     crate::panics::task(async move {
         let mut batches = std::pin::pin!(batches);
-        let meta: Option<TableMeta> = lake.cat.get(&table_key(&table)).await.ok().flatten();
-        let Some((meta, schema)) = meta.and_then(|m| Some((m.clone(), crate::answer::schema(&m.logical_columns()).ok()?))) else { // (SQL's names: ADR-022)
+        let meta = lake.cat.meta(&table_key(&table)).await.ok().flatten();
+        let Some((meta, rules)) = meta.and_then(|m| {
+            let rules = m.rules().ok()?;
+            Some((m, rules))
+        }) else {
+            // (SQL's names: ADR-022)
             let _ = acks_tx.send(Err(refused("42P01", format!("no table {table}")))).await;
             return;
         };
-        // (a column the batch leaves out: its DEFAULT)
-        let (m, sch, lk) = (&meta, &schema, &lake);
-        let conformed = |b: RecordBatch| async move {
+        // (the batch's rows, shaped for the table: a column it leaves out takes its DEFAULT)
+        let (m, r, lk, name) = (&meta, &rules, &lake, table.as_str());
+        let shaped = |b: RecordBatch| async move {
             let given: Vec<String> = b.schema().fields().iter().map(|f| f.name().clone()).collect();
-            let rows = crate::query::conform(&b, sch)?;
-            crate::defaults::fill(lk, m, rows, |c| (!given.iter().any(|g| g == c)).then(|| crate::defaults::all(b.num_rows()))).await
+            let left_out = r.left_out(&given);
+            crate::rules::shape(r, name, crate::rules::Rows::Named(b, left_out), crate::rules::How::Load, &crate::defaults::Node(lk)).await
         };
         // (a keyed table's rows replace their keys', and rows marked _deleted delete them: S11)
         let named = crate::auth::catalog_name(&table);
@@ -502,14 +506,14 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
         let mut i = 0;
         while let Some(b) = batches.next().await {
             let b = match b {
-                Ok(b) => conformed(b).await.map_err(status).and_then(|b| load(&b).map(|_| b)),
+                Ok(b) => shaped(b).await.map_err(status).and_then(|s| load(s.rows()).map(|_| s)),
                 Err(e) => Err(e),
             };
             let queued = match b {
-                Ok(b) => {
+                Ok(s) => {
                     let (seq, prev) = if producer.is_empty() { (0, None) } else { (first + i, (i > 0).then(|| first + i - 1)) };
                     let src = crate::log::Src { producer: producer.clone(), seq, prev };
-                    log.queue(table.clone(), src.clone(), b.clone()).await.map(|f| (Box::pin(f) as Queued, b, src)).map_err(status)
+                    log.queue_shaped(table.clone(), src.clone(), s.clone()).await.map(|f| (Box::pin(f) as Queued, s, src)).map_err(status)
                 }
                 Err(e) => Err(e),
             };
@@ -529,7 +533,7 @@ fn append(app: &App, table: String, producer: String, first: u64, batches: impl 
                     let ack = log.sent_again(ack.await, &table, &src, &batch).await.map_err(status);
                     ack.map(|a| {
                         let mut a = serde_json::to_value(a).unwrap_or_default();
-                        a["rows"] = batch.num_rows().into();
+                        a["rows"] = batch.rows().num_rows().into();
                         PutResult { app_metadata: a.to_string().into_bytes().into() }
                     })
                 }
@@ -748,7 +752,7 @@ impl FlightSqlService for Sql {
             _ => cmd.table.clone(),
         };
         let mut batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(req.into_inner().map_err(Into::into)).map_err(stream_status).peekable();
-        let mut exists = self.0.lake.cat.get::<TableMeta>(&table_key(&table)).await.map_err(status)?.is_some();
+        let mut exists = self.0.lake.cat.meta(&table_key(&table)).await.map_err(status)?.is_some();
         crate::auth::check_rows(&crate::auth::catalog_name(&table)).map_err(denied)?; // (the row doors' one check)
         // ADBC's modes: create (fail if there), append (fail if not), replace, create_append.
         use arrow_flight::sql::{TableExistsOption as IfThere, TableNotExistOption as IfNot};

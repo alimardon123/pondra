@@ -8,6 +8,7 @@
 //!   numbers every flush as a log segment and commits them all, with the producers' seqs, in ONE
 //!   catalog write. Producers are acked only after that.
 use crate::cluster::http;
+use crate::rules::Shaped;
 use crate::store::*;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -273,17 +274,22 @@ impl Log {
         self.queue(table, src, batch).await?.await
     }
 
+    /// `append`, for rows `shape` made (`queue_shaped`).
+    pub async fn append_shaped(&self, table: String, src: Src, rows: Shaped) -> Result<Ack> {
+        self.queue_shaped(table, src, rows).await?.await
+    }
+
     /// `ack`, or, when it says the batch was overtaken on its way to the leader by the one after it (a
     /// follower's flushes race: invariant 29), the batch sent again: its predecessor is committed by the time
     /// this answer is read, so it goes through at once. A conflict that stays is a real gap, tried again for
     /// at most 5 s with a pause that doubles from 10 ms, so it costs a dozen flushes (each over 64 KB writes
     /// a segment), never a hundred. The doors that pipeline (Kafka's, Flight's) read their answers in order.
-    pub async fn sent_again(&self, mut ack: Result<Ack>, table: &str, src: &Src, batch: &RecordBatch) -> Result<Ack> {
+    pub async fn sent_again(&self, mut ack: Result<Ack>, table: &str, src: &Src, rows: &Shaped) -> Result<Ack> {
         let (mut pause, until) = (Duration::ZERO, Instant::now() + Duration::from_secs(5));
         while matches!(&ack, Ok(a) if a.conflict) && Instant::now() < until {
             tokio::time::sleep(pause).await;
             pause = (pause * 2).clamp(Duration::from_millis(10), Duration::from_secs(1));
-            ack = self.append(table.to_string(), src.clone(), batch.clone()).await;
+            ack = self.append_shaped(table.to_string(), src.clone(), rows.clone()).await;
         }
         ack
     }
@@ -291,16 +297,34 @@ impl Log {
     /// Queue rows now and get their ack later: rows queued one after another commit in that
     /// order, so a client can have several batches in flight (the Kafka protocol does).
     pub async fn queue(&self, table: String, src: Src, batch: RecordBatch) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
+        self.queued(table, src, batch, None).await
+    }
+
+    /// `queue`, for rows `shape` made for the table as it is now: they are not checked again while the table's rules are
+    /// the same (a commit since makes a new entry, whose `Table` is equal when nothing a write checks has changed). They are
+    /// when the table changed between the door and this queue (R9).
+    pub async fn queue_shaped(&self, table: String, src: Src, rows: Shaped) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
+        let made_for = rows.table().clone();
+        self.queued(table, src, rows.into_rows(), Some(made_for)).await
+    }
+
+    /// The queue both doors use. `made_for` is the table the rows were shaped for, if they were: the rows are checked again
+    /// (held forms, then the rules) only when the table is not that one.
+    async fn queued(&self, table: String, src: Src, batch: RecordBatch, made_for: Option<Arc<crate::rules::Table>>) -> Result<impl std::future::Future<Output = Result<Ack>> + use<>> {
         if crate::backup::frozen(&self.lake) {
             return Err(crate::backup::refused(Some(&self.lake.url))); // (every door's rows: HTTP, Kafka, Flight, COPY)
         }
         let batch = match self.lake.cat.meta(&table_key(&table)).await? {
-            Some(m) if crate::constraints::checked(&m) => {
-                return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), &m, table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
-            }
             Some(m) => {
                 let rules = m.rules()?;
-                crate::rules::checked(&rules, &table, batch, true, crate::defaults::base())? // (NOT NULL, and jsonb in its own form, whichever door the rows came in by)
+                let batch = match made_for.is_some_and(|t| crate::rules::Table::same(&t, &rules)) {
+                    true => batch,
+                    false => crate::rules::checked(&rules, &table, batch, true, crate::defaults::base())?, // (NOT NULL, and jsonb in its own form, whichever door the rows came in by)
+                };
+                if crate::constraints::checked(&m) {
+                    return Ok(Either::Right(crate::constraints::queue(self.lake.clone(), table, src, batch)?)); // (an enforced UNIQUE: checked on the leader, `constraints.rs`)
+                }
+                batch
             }
             None => batch,
         };
