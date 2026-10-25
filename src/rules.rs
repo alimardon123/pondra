@@ -156,9 +156,10 @@ pub async fn fill<H: Host>(t: &Table, rows: RecordBatch, left_out: impl Fn(&str)
     Ok(RecordBatch::try_new(rows.schema(), columns)?)
 }
 
-/// The rules a write's rows meet once their shape is right, over the table as it is: an enum's labels and a held type's
-/// values (`typed::check`), each CHECK (`fit::breaking`, planned in `base`), and each NOT NULL column, in the order the
-/// columns are. `name` is the table's, for the words. `rows` are under SQL's names when `sql_names`, else under the stored
+/// The rules a write's rows meet once their shape is right, over the table as it is, in the order Postgres meets them: an
+/// enum's labels and a held type's values (`typed::check`), then each NOT NULL column (23502), then each CHECK (`fit::breaking`,
+/// planned in `base`, 23514) in the order of its name, as Postgres sorts a table's CHECKs (so a row breaking two names the
+/// first by name). `name` is the table's, for the words. `rows` are under SQL's names when `sql_names`, else under the stored
 /// ones. A row whose delete marker is set passes the CHECKs and the NOT NULLs.
 pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: &SessionContext) -> Result<()> {
     let ruled = !t.checks.is_empty() || t.columns.iter().any(|c| c.not_null || c.held.is_some() || c.labels.is_some());
@@ -168,7 +169,15 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
     let deleted = rows.column_by_name("_deleted").and_then(|d| d.as_boolean_opt().cloned());
     let marker = |i: usize| deleted.as_ref().is_some_and(|d| d.is_valid(i) && d.value(i));
     typed::check(t, rows, sql_names, &marker)?;
+    for c in t.columns.iter().filter(|c| c.not_null) {
+        let Some(col) = rows.column_by_name(if sql_names { &c.name } else { &c.stored }).filter(|col| col.null_count() > 0) else { continue };
+        if (0..col.len()).any(|i| col.is_null(i) && !marker(i)) {
+            bail!("{name}.{} is NOT NULL, and a row gives it no value", c.name);
+        }
+    }
     if !t.checks.is_empty() {
+        let mut ordered: Vec<&(String, String)> = t.checks.iter().collect(); // (by name: Postgres's order, `strcmp` on the names)
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
         // (under SQL's names, every column there: one a write leaves out is NULL, which passes)
         let named = match sql_names || !t.mapped {
             true => rows.clone(),
@@ -186,17 +195,11 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
             }
         };
         let all = fit::conform(&named, &t.schema)?;
-        for (check, condition) in &t.checks {
+        for (check, condition) in ordered {
             let bad = fit::breaking(base, &all, condition)?;
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
                 return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{name}\" violates check constraint \"{check}\": CHECK ({condition})"), "23514")));
             }
-        }
-    }
-    for c in t.columns.iter().filter(|c| c.not_null) {
-        let Some(col) = rows.column_by_name(if sql_names { &c.name } else { &c.stored }).filter(|col| col.null_count() > 0) else { continue };
-        if (0..col.len()).any(|i| col.is_null(i) && !marker(i)) {
-            bail!("{name}.{} is NOT NULL, and a row gives it no value", c.name);
         }
     }
     Ok(())
@@ -445,6 +448,24 @@ mod tests {
         assert_eq!(crate::codes::of(&err), "23502");
         assert_eq!(crate::codes::words(&err), "s.t.m is NOT NULL, and a row gives it no value");
         shape(&t, "s.t", Rows::Whole(rows(Some(-1), None, true)), How::Change, &host()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_not_null_is_refused_before_a_check_a_row_breaks_both_as_postgres_refuses_it() {
+        let t = Arc::new(guarded());
+        let rows = batch(vec![("id", ints(&[Some(1)])), ("n", ints(&[Some(-1)])), ("m", ints(&[None])), ("_deleted", bools(&[false]))]);
+        let err = shape(&t, "s.t", Rows::Whole(rows), How::Change, &host()).await.err().expect("a CHECK and a NOT NULL");
+        assert_eq!(crate::codes::of(&err), "23502");
+        assert_eq!(crate::codes::words(&err), "s.t.m is NOT NULL, and a row gives it no value");
+    }
+
+    #[test]
+    fn two_failing_checks_name_the_first_by_name_not_the_first_defined() {
+        let t = table(&[], vec![(plain("a"), DataType::Int64), (plain("b"), DataType::Int64)], &[("zz", "a > 0"), ("aa", "b > 0")]);
+        let rows = batch(vec![("a", ints(&[Some(-1)])), ("b", ints(&[Some(-1)]))]);
+        let err = checks(&t, "s.t", &rows, true, &SessionContext::new()).err().expect("two CHECKs");
+        assert_eq!(crate::codes::of(&err), "23514");
+        assert_eq!(crate::codes::words(&err), "new row for relation \"s.t\" violates check constraint \"aa\": CHECK (b > 0)");
     }
 
     #[tokio::test]

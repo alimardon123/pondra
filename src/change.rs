@@ -185,6 +185,64 @@ pub fn upsert_of(target: String, upsert: Upsert, sql: String) -> Merge {
     Merge { sql, target, alias, source: String::new(), on: String::new(), clauses: vec![], semi: false, upsert: Some(upsert) }
 }
 
+/// The columns a MERGE writes, for the identity check (`write::identity`): each INSERT's (`given`, with the rules' way of
+/// naming them: `Said::Named` for a list the statement names, `Said::Positional` for the table's first columns when it names
+/// none), and the columns each UPDATE sets (`set`).
+pub struct Written {
+    pub given: Vec<(Vec<String>, crate::rules::keys::Said)>,
+    pub set: Vec<String>,
+}
+
+impl Merge {
+    /// What this writes, for the table whose rules are `t`. It is read from `clauses` (a MERGE, or `UPDATE … FROM` and
+    /// `DELETE … USING` as the MERGE they are: `merge_from`) and from `upsert` (`INSERT … ON CONFLICT` and `INSERT OR …`:
+    /// `upsert_of`). A value that says DEFAULT is neither given nor set: its column takes its default. An upsert's columns
+    /// are its `columns` (none: the table's first, as many as its rows have), and its DO UPDATE SET is its `update`'s set;
+    /// INSERT OR REPLACE has an empty set, which `Upsert::merge` makes of every column its rows give but the conflict's: here
+    /// those the rows do not give DEFAULT, as a DEFAULT is the identity's own value, never one the writer chose (the replaced
+    /// row takes its default, as before).
+    pub fn written(&self, t: &crate::rules::Table) -> Written {
+        use crate::rules::keys::Said;
+        let is_default = |v: &str| crate::defaults::is_word(v);
+        let table: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
+        let mut given: Vec<(Vec<String>, Said)> = vec![];
+        let mut set: Vec<String> = vec![];
+        for c in &self.clauses {
+            match &c.action {
+                Action::Insert(columns, values) => {
+                    let (names, said): (Vec<String>, Said) = match columns.is_empty() {
+                        true => (crate::write::implicit(&table, Some(values.len())).to_vec(), Said::Positional),
+                        false => (columns.clone(), Said::Named),
+                    };
+                    let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !values.get(*i).is_some_and(|v| is_default(v))).map(|(_, n)| n.clone()).collect();
+                    given.push((kept, said));
+                }
+                Action::Update(assigned) => set.extend(assigned.iter().filter(|(_, e)| !is_default(e)).map(|(c, _)| c.clone())),
+                Action::Delete => {}
+            }
+        }
+        if let Some(u) = &self.upsert {
+            let (names, said): (Vec<String>, Said) = match u.columns.is_empty() {
+                true => (crate::write::implicit(&table, crate::write::rows_width(&u.query)).to_vec(), Said::Positional),
+                false => (u.columns.clone(), Said::Named),
+            };
+            let kept: Vec<String> = names.iter().enumerate().filter(|(i, _)| !crate::write::defaulted(&u.query, *i)).map(|(_, n)| n.clone()).collect();
+            if let Some((assigned, _)) = &u.update {
+                match assigned.is_empty() {
+                    // (the names its rows give, minus the conflict key: a DEFAULT is not given, so not set either)
+                    true => {
+                        let on: Vec<String> = if u.on.is_empty() { t.key.clone() } else { u.on.clone() };
+                        set.extend(kept.iter().filter(|c| !on.contains(c)).cloned());
+                    }
+                    false => set.extend(assigned.iter().filter(|(_, e)| !is_default(e)).map(|(c, _)| c.clone())),
+                }
+            }
+            given.push((kept, said));
+        }
+        Written { given, set }
+    }
+}
+
 impl Merge {
     /// The source column each key column is matched on, in the key's order: the ON is `t.k = s.c` (either way round)
     /// for every key column once, and nothing else. None for any other ON.
@@ -390,6 +448,12 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
         let name = lake.attached.read().unwrap().iter().find(|(_, o)| std::sync::Arc::ptr_eq(o, &other)).map(|(n, _)| n.clone());
         bail!("{} is in attached lake {}: UPDATE, DELETE and MERGE run on that lake's own node for now (pondra {}); INSERT works from here",
               stmt.table(), name.unwrap_or_else(|| crate::ddl::lake_name(&other)), other.url);
+    }
+    // (the leader's own path, for an UPDATE, DELETE or MERGE sent straight here: a node checked it as it got it. An INSERT is
+    // not checked again: a node rewrites an `INSERT INTO t (names)` to name every column (`whole_rows`), id among them, and
+    // checked the statement it was given before that; `write::identity`)
+    if !matches!(stmt, crate::write::Stmt::Insert(..)) {
+        crate::write::identity(lake, &stmt).await?;
     }
     let stored: TableMeta = lake.cat.get(&table_key(&table)).await?.with_context(|| format!("no table {table}"))?;
     let meta = stored.logical(); // (the change's SQL names columns as SQL knows them: ADR-022)

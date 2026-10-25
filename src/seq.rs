@@ -13,7 +13,6 @@
 //! table and gone with it (`DROP TABLE … PURGE`; a table kept to be undropped keeps it), and not
 //! an object of its own. `ALWAYS` refuses a value given for it, and an UPDATE of it.
 use crate::log::{Ack, Outcome};
-use crate::rules::keys::Said;
 use crate::store::{json, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{bail, ensure, Context};
@@ -339,35 +338,11 @@ pub async fn drop_owned(lake: &Lake, meta: &TableMeta) -> Result<()> {
     Ok(())
 }
 
-/// `INSERT` giving `columns` (as SQL names them): refused if one is an ALWAYS identity (428C9). `meta` as stored or `logical()`.
-pub fn check_given(meta: &TableMeta, table: &str, columns: &[String]) -> Result<()> {
-    if !meta.identity.values().any(|i| i.always) { return Ok(()) }
-    crate::rules::keys::given(&meta.to_rules()?, table, columns, Said::Named)
-}
-
-/// `UPDATE` setting `columns`: refused if one is an ALWAYS identity (428C9). `meta` as stored or `logical()`.
-pub fn check_set(meta: &TableMeta, columns: &[String]) -> Result<()> {
-    if !meta.identity.values().any(|i| i.always) { return Ok(()) }
-    crate::rules::keys::set(&meta.to_rules()?, columns)
-}
-
 /// Does `sql` call `nextval` or `setval`? (A materialized view can't: its fill and every write
 /// would number its rows again.)
 pub fn calls(sql: &str) -> bool {
     static WORDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(nextval|setval)\s*\(").expect("a regex"));
     WORDS.is_match(sql)
-}
-
-/// A positional `INSERT INTO t query` gives the columns its rows have (`width`: the rows' width, `write::rows_width`; None
-/// when the query doesn't fix it, which gives them all): refused when one of those is an ALWAYS identity.
-pub async fn check_every(lake: &Lake, table: &str, width: Option<usize>) -> Result<()> {
-    // (a name not in a lake here, say an outside catalog's table: the INSERT's own path takes it)
-    let Ok((other, name)) = crate::ddl::resolve(lake, table).await else { return Ok(()) };
-    let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&crate::store::table_key(&name)).await? else { return Ok(()) }; // (as parsed once a version: every positional INSERT asks)
-    let t = meta.rules()?;
-    let columns: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
-    let given = crate::write::implicit(&columns, width);
-    crate::rules::keys::given(&t, table, given, Said::Positional)
 }
 
 static NAMED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bnextval\s*\(\s*'((?:[^']|'')*)'\s*\)").expect("a regex"));

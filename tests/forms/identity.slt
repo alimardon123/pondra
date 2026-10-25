@@ -27,3 +27,189 @@ SELECT id, v FROM i ORDER BY id
 1 a
 2 b
 3 c
+
+# A PRIMARY KEY with an identity: each write that names the identity column with a value is refused (428C9) as an INSERT is,
+# in a statement and in a transaction: ON CONFLICT, INSERT OR IGNORE and REPLACE, MERGE, and UPDATE … FROM (audit H2). A value
+# that says DEFAULT, or no value, takes the identity's own number.
+statement ok
+CREATE TABLE p (id BIGINT GENERATED ALWAYS AS IDENTITY, k TEXT PRIMARY KEY, v TEXT)
+
+statement ok
+INSERT INTO p (k, v) VALUES ('a', 'x')
+
+statement error 428C9
+INSERT INTO p (id, k, v) VALUES (5, 'b', 'y') ON CONFLICT (k) DO NOTHING
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT INTO p (id, k, v) VALUES (5, 'b', 'y') ON CONFLICT (k) DO NOTHING
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+INSERT INTO p (k, v) VALUES ('a', 'y') ON CONFLICT (k) DO UPDATE SET id = 9
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT INTO p (k, v) VALUES ('a', 'y') ON CONFLICT (k) DO UPDATE SET id = 9
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+INSERT INTO p (k, v) VALUES ('a', 'y') ON CONFLICT (k) DO UPDATE SET id = EXCLUDED.id
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT INTO p (k, v) VALUES ('a', 'y') ON CONFLICT (k) DO UPDATE SET id = EXCLUDED.id
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+INSERT OR IGNORE INTO p (id, k, v) VALUES (5, 'b', 'y')
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT OR IGNORE INTO p (id, k, v) VALUES (5, 'b', 'y')
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+INSERT OR REPLACE INTO p (id, k, v) VALUES (5, 'a', 'y')
+
+statement ok
+BEGIN
+
+statement error 428C9
+INSERT OR REPLACE INTO p (id, k, v) VALUES (5, 'a', 'y')
+
+statement ok
+ROLLBACK
+
+# (DEFAULT is the identity's own value, not one the writer chose: OR REPLACE takes it, and the replaced row takes a new number
+# (Postgres refuses the ON CONFLICT … SET id = EXCLUDED.id form of this, 428C9; here the DEFAULT is not given, so it is not refused))
+statement ok
+INSERT OR REPLACE INTO p (id, k, v) VALUES (DEFAULT, 'a', 'y')
+
+statement error 428C9
+MERGE INTO p AS m USING (SELECT 'b' AS k, 'y' AS v) AS s ON m.k = s.k WHEN NOT MATCHED THEN INSERT (id, k, v) VALUES (5, s.k, s.v)
+
+statement ok
+BEGIN
+
+statement error 428C9
+MERGE INTO p AS m USING (SELECT 'b' AS k, 'y' AS v) AS s ON m.k = s.k WHEN NOT MATCHED THEN INSERT (id, k, v) VALUES (5, s.k, s.v)
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+MERGE INTO p AS m USING (SELECT 'a' AS k, 'y' AS v) AS s ON m.k = s.k WHEN MATCHED THEN UPDATE SET id = 9
+
+statement ok
+BEGIN
+
+statement error 428C9
+MERGE INTO p AS m USING (SELECT 'a' AS k, 'y' AS v) AS s ON m.k = s.k WHEN MATCHED THEN UPDATE SET id = 9
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+UPDATE p SET id = 9 FROM (SELECT 'a' AS k) AS s WHERE p.k = s.k
+
+statement ok
+BEGIN
+
+statement error 428C9
+UPDATE p SET id = 9 FROM (SELECT 'a' AS k) AS s WHERE p.k = s.k
+
+statement ok
+ROLLBACK
+
+statement error 428C9
+UPDATE p SET id = 9 WHERE k = 'a'
+
+statement error 428C9
+INSERT INTO p VALUES (5, 'b', 'y')
+
+statement ok
+INSERT INTO p (id, k, v) VALUES (DEFAULT, 'b', 'y') ON CONFLICT (k) DO NOTHING
+
+statement ok
+INSERT INTO p (k, v) VALUES ('c', 'z') ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v
+
+statement ok
+MERGE INTO p AS m USING (SELECT 'd' AS k, 'y' AS v) AS s ON m.k = s.k WHEN NOT MATCHED THEN INSERT (id, k, v) VALUES (DEFAULT, s.k, s.v)
+
+statement ok
+MERGE INTO p AS m USING (SELECT 'e' AS k, 'y' AS v) AS s ON m.k = s.k WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, s.v)
+
+statement ok
+INSERT OR IGNORE INTO p (k, v) VALUES ('f', 'z')
+
+statement ok
+INSERT OR REPLACE INTO p (k, v) VALUES ('g', 'z')
+
+statement ok
+INSERT OR IGNORE INTO p (id, k, v) VALUES (DEFAULT, 'h', 'z')
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO p (id, k, v) VALUES (DEFAULT, 'a', 'w') ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO p (k, v) VALUES ('a', 'w') ON CONFLICT (k) DO UPDATE SET id = DEFAULT
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+MERGE INTO p AS m USING (SELECT 'a' AS k, 'y' AS v) AS s ON m.k = s.k WHEN MATCHED THEN UPDATE SET id = DEFAULT, v = s.v
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+statement ok
+UPDATE p SET id = DEFAULT WHERE k = 'a'
+
+statement ok
+ROLLBACK
+
+# (a's row is the OR REPLACE's DEFAULT row, id 2: that statement takes two numbers (2 and 3), as the base build does, so b is 4)
+query IT
+SELECT id, k FROM p ORDER BY id
+----
+2 a
+4 b
+5 c
+6 d
+7 e
+8 f
+9 g
+10 h
