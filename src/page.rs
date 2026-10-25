@@ -34,7 +34,7 @@ use datafusion::logical_expr::{DdlStatement, Expr, LogicalPlan, TableSource};
 use datafusion::object_store::{memory::InMemory, path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DfStatement;
-use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateView, Insert, ObjectName, ObjectNamePart, ObjectType, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
+use datafusion::sql::sqlparser::ast::{AssignmentTarget, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, CreateView, Ident, Insert, ObjectName, ObjectNamePart, ObjectType, OnInsert, Query, SetExpr, SqliteOnConflict, Statement as SqlStatement, TableConstraint, TableFactor, TableObject, Update};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -498,8 +498,12 @@ impl Page {
     /// `SELECT * FROM` the node's rows, parsed as the page's session parses SQL: the query a fill's write puts in place of
     /// its own.
     fn rows_query(&self) -> anyhow::Result<Box<Query>> {
-        let sql = format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS));
-        let DfStatement::Statement(s) = self.parsed(&sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
+        self.query_of_text(&format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS)))
+    }
+
+    /// `sql` parsed as a query, as the page's session parses SQL (`parsed`).
+    fn query_of_text(&self, sql: &str) -> anyhow::Result<Box<Query>> {
+        let DfStatement::Statement(s) = self.parsed(sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
         let SqlStatement::Query(query) = *s else { anyhow::bail!("{sql} is not a query") };
         Ok(query)
     }
@@ -601,6 +605,8 @@ impl Page {
     async fn planned_expanded(&self, expanded: &str, rows: Option<Arc<dyn TableProvider>>) -> anyhow::Result<Planned> {
         rules(expanded)?; // (a table rule a page can't keep is refused before anything is planned or read)
         self.key_set(expanded)?; // (an UPDATE of a key column of a ruled table, which a node refuses too)
+        let whole = self.whole_rows(expanded).await?; // (an INSERT into one of the page's tables, as whole rows: all that follows reads it)
+        let expanded = whole.as_deref().unwrap_or(expanded);
         let (ctx, overlay) = self.statement()?;
         if let Some(rows) = rows {
             overlay.own(NODE_ROWS.to_string(), rows);
@@ -635,6 +641,35 @@ impl Page {
             },
             _ => None,
         }
+    }
+
+    /// An INSERT into one of the page's own tables, written as an INSERT of whole rows, as a node writes it (`rules::rows::rows_for`):
+    /// each row gives every column the table has, in its order. The columns it names (or, naming none, the first its values give)
+    /// take its values, and a column it leaves out, or says DEFAULT for, takes the column's default, or NULL. A row of the wrong
+    /// width is refused with the node's words and code. None for any other statement, and for an INSERT into a table the page
+    /// doesn't have, so the planner's own answer stands.
+    async fn whole_rows(&self, expanded: &str) -> anyhow::Result<Option<String>> {
+        if !expanded.to_ascii_lowercase().contains("insert") {
+            return Ok(None);
+        }
+        let Ok(DfStatement::Statement(mut statement)) = self.parsed(expanded) else { return Ok(None) };
+        let SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), on: None, columns: names, .. }) = statement.as_mut() else { return Ok(None) };
+        let target = self.table_ref(name)?;
+        if self.home(&target)? != Home::Page {
+            return Ok(None);
+        }
+        let Some(table) = self.default_schema()?.1.table(target.table()).await? else { return Ok(None) };
+        let columns: Vec<String> = table.schema().fields().iter().map(|f| f.name().clone()).collect();
+        let named: Vec<String> = names.iter().map(crate::text::object).collect();
+        let named = match named.is_empty() {
+            true => crate::rules::fit::implicit(&columns, crate::rules::rows::rows_width(&query.to_string())).to_vec(),
+            false => named,
+        };
+        let default = |c: &str| table.get_column_default(c).and_then(|e| datafusion::sql::unparser::expr_to_sql(e).ok()).map(|e| e.to_string());
+        let text = crate::rules::rows::rows_for(&name.to_string(), &columns, &named, &query.to_string(), &default)?;
+        *query = self.query_of_text(&text)?;
+        *names = columns.iter().map(|c| ObjectName::from(vec![Ident::with_quote('"', c.as_str())])).collect();
+        Ok(Some(statement.to_string()))
     }
 
     /// The rules a CREATE TABLE `c` makes, over the table as `plan` plans it (`made_table`), with the statement's text kept
@@ -2905,6 +2940,22 @@ mod tests {
             assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT * FROM t".into()).await.body, "id,v\n1,7\n", "{sql}");
         }
         assert_eq!(crate::codes::http("23502"), 400);
+    }
+
+    /// A page fills a narrow row, and a DEFAULT in VALUES, as a node does: a row that names fewer columns, or says DEFAULT, takes
+    /// the column's default; a row wider than the columns it names is refused with 42601, and nothing is written.
+    #[tokio::test]
+    async fn a_page_fills_a_narrow_row_and_a_default_as_a_node_does() {
+        let page = Page::open(&Options::default());
+        assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t (a INT, b INT DEFAULT 5)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t VALUES (1)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql", &[], "INSERT INTO t (a, b) VALUES (2, DEFAULT)".into()).await.status, 200);
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT a, b FROM t ORDER BY a".into()).await.body, "a,b\n1,5\n2,5\n");
+        for sql in ["INSERT INTO t VALUES (1, 2, 3)", "INSERT INTO t (a) VALUES (1, 2)"] {
+            let got = page.request("POST", "/sql", &[], sql.into()).await;
+            assert_eq!((got.status, got.header("x-pondra-sqlstate")), (400, Some("42601")), "{sql}: {:?}", got.body);
+        }
+        assert_eq!(page.request("POST", "/sql?format=csv", &[], "SELECT a, b FROM t ORDER BY a".into()).await.body, "a,b\n1,5\n2,5\n");
     }
 
     /// What a page refused before it kept rules stays refused, with the code it always gave.
