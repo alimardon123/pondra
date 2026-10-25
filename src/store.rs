@@ -1873,6 +1873,7 @@ pub struct Catalog {
     db: Db_,
     order: tokio::sync::Mutex<u64>, // leader: next commit id; held while writing, so ids follow write order
     flushed: AtomicU64,             // leader: `order` at the last memtable flush
+    flushed_at: Mutex<Instant>,     // leader: when the catalog last had nothing unflushed (`checkpoint`)
     writes: Option<mpsc::UnboundedSender<Write>>, // leader: writes waiting to commit, in order
     unstarted: Mutex<Option<mpsc::UnboundedReceiver<Write>>>, // (until `Lake::open` starts `commits`)
     committed: AtomicU64,           // leader: the last committed write (what reads see)
@@ -2126,8 +2127,9 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
         if local {
             crate::panics::task(unpin(store));
         }
-        let (a, b) = tokio::join!(c.run(), g.run());
-        if let Err(e) = a.and(b) {
+        // (`try_join`, not `join`: the collector never ends, so `join` waited for it and never saw the compactor stop.
+        // The first failure of either one ends the wait here, and it takes the failure path below)
+        if let Err(e) = tokio::try_join!(c.run(), g.run()) {
             if crate::library::on() {
                 return crate::library::failed(format!("the catalog's compactor or garbage collector failed: {e}"));
             }
@@ -2294,7 +2296,7 @@ impl Catalog {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(Parsed::new()), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
+        Catalog { db, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(Parsed::new()), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
     }
 
     /// What the catalog's block caches hold, in bytes.
@@ -2694,11 +2696,32 @@ impl Catalog {
     pub async fn checkpoint(&self) -> Result<()> {
         let Db_::Writer(db) = &self.db else { return Ok(()) };
         let next = *self.order.lock().await; // every commit before it is in the memtable
-        if self.flushed.load(Relaxed) != next {
-            db.flush_with_options(FlushOptions { flush_type: FlushType::MemTable }).await?;
+        let flushed = self.flushed.load(Relaxed);
+        if flushed != next {
+            let flush = db.flush_with_options(FlushOptions { flush_type: FlushType::MemTable });
+            tokio::pin!(flush);
+            // (a flush that takes 30 s is still waited for, not dropped: the line says why it is slow)
+            if tokio::time::timeout(Duration::from_secs(30), &mut flush).await.is_err() {
+                eprintln!("the catalog's checkpoint has waited 30 s: its level-0 files wait for compaction ({} commits not yet in the bucket's catalog)", next - flushed);
+                flush.await?;
+            }
             self.flushed.store(next, Relaxed);
         }
+        // (a catalog with nothing unflushed counts from here, so a commit after a quiet spell isn't seen as one that waited all of it)
+        *self.flushed_at.lock().unwrap() = Instant::now();
         Ok(())
+    }
+
+    /// Leader: how long, in seconds, the catalog has held commits that no flush has persisted (0 when it has none).
+    /// `/metrics` reads it. It reads `committed` and not `order`, which a commit holds while it writes: a stalled
+    /// bucket must not stall the scrape that says so. `order` is `committed` + 1 once no commit is in flight, so
+    /// commits are unflushed exactly when `committed` has reached `flushed`.
+    pub fn unflushed_seconds(&self) -> f64 {
+        // (a reader's `committed` and `flushed` are both 0: without this it would count from its open)
+        if !self.is_writer() || self.committed.load(Relaxed) < self.flushed.load(Relaxed) {
+            return 0.0;
+        }
+        self.flushed_at.lock().unwrap().elapsed().as_secs_f64()
     }
 
     /// Lets go of the catalog: its writer flushes what it holds and stops its background tasks, a
