@@ -24,7 +24,6 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
 pub(crate) use crate::rules::fit::{by_position, implicit};
-use crate::rules::fit::fit_with;
 pub(crate) use crate::rules::create::{definition, option_text};
 #[cfg(test)] pub(crate) use crate::rules::fit::fit;
 
@@ -1205,12 +1204,10 @@ pub async fn follows(lake: &Lake, table: &str) -> Result<bool> {
     Ok(views || lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?.into_iter().any(|(_, t)| t.source == table))
 }
 
-/// Run a row query here: its rows in the table's column order and types. `lake` is the table's own: the one a
-/// DEFAULT's `nextval` takes its values from.
-pub async fn rows(lake: &Lake, ctx: &SessionContext, meta: &TableMeta, sql: &str) -> Result<RecordBatch> {
-    let target = schema(&meta.columns)?;
-    let Some(all) = planned(ctx, &target, sql).await? else { return Ok(RecordBatch::new_empty(target)) };
-    fitted(lake, meta, &target, &all).await
+/// Run a row query here, its rows shaped once for `t`, the table `name` (`shaped`): in the table's column order and types,
+/// with `how` saying which rules they meet. `lake` is the table's own: the one a DEFAULT's `nextval` takes its values from.
+pub async fn rows(lake: &Lake, ctx: &SessionContext, t: &Arc<crate::rules::Table>, name: &str, sql: &str, how: crate::rules::How) -> Result<crate::rules::Shaped> {
+    shaped(lake, t, name, planned(ctx, &t.schema, sql).await?, how).await
 }
 
 /// A query's rows as planned in `ctx`, before they fit the table (`rows`); None when it gives none.
@@ -1229,17 +1226,6 @@ pub(crate) async fn planned(ctx: &SessionContext, target: &SchemaRef, sql: &str)
     let batches = crate::engine::sql(ctx, &crate::sys::planned(&crate::routines::rows_apart(sql))?).await?.collect().await?;
     let Some(first) = batches.first() else { return Ok(None) };
     Ok(Some(concat_batches(&first.schema(), &batches)?))
-}
-
-/// `fit`, with the columns the rows leave out at the end given their DEFAULT, as a bulk INSERT's are (`write_rows`)
-/// and as Postgres fills them: `INSERT INTO t VALUES (1)` is t's first column, the others their defaults.
-async fn fitted(lake: &Lake, meta: &TableMeta, target: &SchemaRef, all: &RecordBatch) -> Result<RecordBatch> {
-    let (batch, padded) = fit_with(target, all)?;
-    if padded.is_empty() || !crate::defaults::any(meta) {
-        return Ok(batch); // (a full-width INSERT, or a table with no defaults: nothing more to do)
-    }
-    let n = batch.num_rows();
-    crate::defaults::fill(lake, meta, batch, |c| padded.iter().any(|p| p == c).then(|| crate::defaults::all(n))).await
 }
 
 /// A query's rows (`all`; None: it gave none) shaped once for `t`, the table `name` (`rules::shape`): by position, the
@@ -2275,7 +2261,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
                 }
                 // (no row lock here, unlike a node's own plain INSERT (`txn::autocommit_as`): `pondra sql` and an attached
                 // lake's INSERT write without one, so two writers of one new key can both pass this check. A documented race.)
-                crate::constraints::key_check(target, table, s, None, rows.rows()).await?; // (the keys are new: checked here, where the rows are)
+                crate::constraints::key_check(target, table, s, None, rows.rows(), false).await?; // (the keys are new: checked here, where the rows are)
             }
             let (ack, _) = tokio::sync::oneshot::channel();
             let append = Append { table: table.into(), src: Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch: rows.into_rows(), ack };
@@ -2528,6 +2514,13 @@ mod tests {
         let none = of(&lake, &t, "SELECT 1 AS a, 1 AS b, NULL AS c WHERE false", How::Insert).await?; // (aliased: DataFusion names two 1s alike)
         assert_eq!(none.rows().num_rows(), 0);
         assert_eq!(none.rows().schema(), t.schema);
+        // (the same by a query's own session: `rows` shapes what `planned` gives, for the table as it is)
+        let ctx = SessionContext::new();
+        let shaped = rows(&lake, &ctx, &t, "t", "SELECT 1, 5, NULL", How::Insert).await?;
+        assert_eq!(shaped.rows().num_rows(), 1);
+        assert!(Arc::ptr_eq(shaped.table(), &t));
+        assert_eq!(text(shaped.rows(), "d"), "x");
+        assert_eq!(rows(&lake, &ctx, &t, "t", "SELECT 1, 5, NULL WHERE false", How::Insert).await?.rows().num_rows(), 0);
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())

@@ -104,9 +104,9 @@ pub enum LeftOut {
 }
 
 /// What the rows are for, which says whether `shape` looks for a key given twice among them (step 8): a plain INSERT (`Insert`:
-/// it looks, when the table's key is checked); rows whose writer looks for that itself, later (`Load`: a loading door's, and an
-/// INSERT whose key check comes after its row locks, R8, or after it asks whether its job is in); or an UPDATE's or MERGE's new
-/// versions (`Change`).
+/// it looks, when the table's key is checked); rows whose writer looks for that itself, later (`Load`: a loading door's, an
+/// INSERT whose key check comes after its row locks, R8, or after it asks whether its job is in, and a temporary table's INSERT,
+/// whose key is checked over all its rows, R6); or an UPDATE's or MERGE's new versions (`Change`).
 pub enum How {
     Insert,
     Load,

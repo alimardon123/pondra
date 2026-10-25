@@ -4,10 +4,13 @@ use super::Table;
 use anyhow::{bail, ensure, Result};
 use datafusion::arrow::array::RecordBatch;
 
+/// The name Postgres gives a primary key that isn't named: `{t}_pkey`, `t` the table's name without its schema.
+pub fn pkey(table: &str) -> String { format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)) }
+
 /// The key's name, and its columns in SQL's names (`key`), after checking that no two of `new`'s rows share a key: refused as a
 /// plain INSERT's are (23505 with `{table}_pkey` and Postgres's words).
 pub fn once(table: &str, key: &[String], new: &RecordBatch) -> Result<(String, Vec<String>)> {
-    let name = format!("{}_pkey", table.rsplit('.').next().unwrap_or(table)); // (Postgres's name for a primary key that isn't named)
+    let name = pkey(table); // (Postgres's name for a primary key that isn't named)
     if let Some(found) = twice(new, key, &[])? {
         return Err(violated(&name, key, found));
     }
@@ -166,6 +169,15 @@ mod tests {
             assert_eq!(by_hash, exactly(&values, &keys).expect("decided"), "{values:?} {keys:?}");
             assert_eq!(by_hash.as_deref(), want, "{values:?} {keys:?}");
         }
+    }
+
+    #[test]
+    fn a_primary_key_is_named_as_postgres_names_it() {
+        assert_eq!(pkey("s.t"), "t_pkey");
+        assert_eq!(pkey("t"), "t_pkey");
+        let key = vec!["id".to_string()];
+        let one = RecordBatch::try_from_iter([("id", ints(&[Some(1)]))]).unwrap();
+        assert_eq!(once("s.t", &key, &one).unwrap().0, "t_pkey");
     }
 
     #[test]

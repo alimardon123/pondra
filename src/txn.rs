@@ -1074,7 +1074,7 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
                 // rest are looked up in the table as it is now. COMMIT checks them again (`write_changes`).
                 let texts = key_texts(rows.rows(), &meta.key)?;
                 let kept = with_txn(|t| t.by_key.get(&name).map(|by| by.kept(&texts))).flatten().unwrap_or_else(|| vec![None; texts.len()]);
-                crate::constraints::key_check_over(lake, &name, &stored, rows.rows(), &kept).await?;
+                crate::constraints::key_check_over(lake, &name, &stored, rows.rows(), &kept, false).await?;
             }
             (vec![], vec![rows.into_rows()], at, keys)
         }
@@ -1186,7 +1186,7 @@ async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str
     if crate::write::sent(lake, job).await? {
         return Ok(j!({"duplicate": true}));
     }
-    crate::constraints::key_check(lake, &name, &stored, None, rows.rows()).await?; // (under the locks: the rows the other writer committed are here)
+    crate::constraints::key_check(lake, &name, &stored, None, rows.rows(), false).await?; // (under the locks: the rows the other writer committed are here)
     crate::returning::wrote(&[], std::slice::from_ref(rows.rows()));
     let n = rows.rows().num_rows();
     pause_for_tests().await;
@@ -1730,7 +1730,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             mine.extend(reads.keys.keys().filter(|k| is_on(k.as_slice())).cloned());
         }
         conflicts(lake, name, &meta, &reads, &mine).await?;
-        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
+        let (p, _) = crate::change::appends(lake, seq, name, &stored, old, new, &format!("txn:{}:{name}", c.job.as_ref().unwrap_or(&c.id)), true, false).await?; // (a plain INSERT's key is new at COMMIT too: `constraints.rs`)
         pending.extend(p);
     }
     if pending.is_empty() {
