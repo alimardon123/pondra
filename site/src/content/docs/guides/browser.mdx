@@ -62,6 +62,11 @@ Views are made and dropped as on a node. A view reads its tables as they are whe
 another view. `DROP TABLE` refuses a table that a view reads (`2BP01`), and `DROP TABLE … CASCADE` drops those views
 too. A kept page keeps its views.
 
+Enum types are made as on a node, `CREATE TYPE mood AS ENUM ('sad', 'ok')`, and so is a column's own
+`ENUM('a', 'b')`. A column of one holds text and refuses a value its labels don't list (`22P02`), and so does a cast
+(`'ok'::mood`). `ALTER TYPE … ADD VALUE` adds a label, `RENAME TO` renames the type, and `DROP TYPE` refuses a type a
+column uses (`2BP01`). A kept page keeps its types.
+
 `ALTER TABLE` adds, drops and renames columns, and renames the table (`RENAME TO`, and `ALTER VIEW … RENAME TO` for a
 view). A column added is NULL in the rows already there, so it takes its type alone: `NOT NULL`, a `DEFAULT`, an
 identity, a `CHECK` or `UNIQUE` on it is refused, as on a node. A rename takes the table's rules along (its key, its
@@ -176,7 +181,7 @@ const page = new Page();
 ## What a page doesn't do yet
 
 <Aside>
-A page refuses these with `0A000`: `DECLARE`, `CREATE TYPE`, `MERGE` and
+A page refuses these with `0A000`: `DECLARE`, `MERGE` and
 `INSERT … ON CONFLICT`, a table's past (`AT (VERSION => …)`), SQL functions and sequences, and the
 `ALTER TABLE` forms beyond the ones above (a column's type or default, constraints). Users and grants, tasks, shares,
 secrets, backups, attached lakes, materialized views and `COPY` are a node's, and a page refuses them the same way,

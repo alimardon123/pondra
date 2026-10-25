@@ -43,6 +43,7 @@ use std::task::Poll;
 
 mod alter; // (ALTER TABLE, ALTER VIEW … RENAME TO and TRUNCATE: `alter_statement`, `truncated`)
 mod counters; // (an identity column's counter, and `nextval` over the counters: `Counter`, `Nextval`)
+mod types; // (enum types: CREATE TYPE, ALTER TYPE, DROP TYPE)
 mod txn; // (BEGIN … COMMIT or ROLLBACK, and savepoints: `control`, `gate`, `at_once`)
 
 const TEXT: &str = "text/plain; charset=utf-8";
@@ -164,6 +165,7 @@ pub struct Page {
     views: std::sync::Mutex<BTreeMap<String, String>>, // (each view's query, by its name: `view_statement`; a statement reads them through the front, `views_for`)
     txn: std::sync::Mutex<Option<txn::Txn>>, // (the open transaction, if any: `page::txn`)
     notes: std::sync::Mutex<Vec<String>>, // (what the statement running now says beside its answer: `note`)
+    types: std::sync::Mutex<BTreeMap<String, Vec<String>>>, // (each enum type's labels, by its name: `page::types`)
 }
 
 /// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), that statement's text, which a kept
@@ -282,6 +284,7 @@ impl Page {
     /// that doesn't read is left out and listed by `unread`, so the page still opens with the tables it can read.
     pub async fn kept(options: &Options) -> anyhow::Result<Page> {
         let mut page = Page::open(options);
+        page.types_back().await?; // (first: a table's rules read its columns' types)
         let listed = page.files.list(Some(&Path::from(TABLES))).try_collect::<Vec<_>>().await?;
         for object in listed.iter().filter(|o| o.location.as_ref().ends_with(".arrow")) {
             if let Err(e) = page.restore(&object.location).await {
@@ -338,7 +341,7 @@ impl Page {
         // statement's, so a statement's `nextval` reaches the same counters)
         let ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>> = Default::default();
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(counters::Nextval::new(ruled.clone())));
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default(), txn: Default::default(), notes: Default::default() }
+        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default(), txn: Default::default(), notes: Default::default(), types: Default::default() }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -397,6 +400,9 @@ impl Page {
     /// `sql` of a statement that is not a transaction word.
     async fn statement_sql(&self, text: &str, format: Option<&str>) -> anyhow::Result<Answer> {
         let turn = self.keeping.lock().await;
+        if let Some(answer) = self.type_statement(text).await? {
+            return Ok(answer);
+        }
         if let Some(answer) = self.view_statement(text).await? {
             return Ok(answer);
         }
@@ -662,7 +668,7 @@ impl Page {
             None => vec![],
         };
         let sql = match &created {
-            Some(c) => plain_create(c, &identified)?.to_string(),
+            Some(c) => plain_create(c, &identified, &|n| self.type_labels(n).is_some())?.to_string(),
             None => expanded.to_string(),
         };
         let plan = crate::engine::planned(&ctx, &sql).await?;
@@ -758,7 +764,7 @@ impl Page {
     /// a node checks it at CREATE (`defaults::definition`): planned over an empty table of those columns, so a CHECK that names
     /// no column, or isn't a condition, is refused now and not at each row.
     fn made_table(&self, c: &CreateTable, schema: &Schema) -> anyhow::Result<crate::rules::Table> {
-        let table = crate::rules::Table::of_create(c, &Arc::new(schema.clone()), &|_| None)?;
+        let table = crate::rules::Table::of_create(c, &Arc::new(schema.clone()), &|n| self.type_labels(n))?;
         for (name, check) in &table.checks {
             crate::rules::fit::breaking(&self.ctx, &RecordBatch::new_empty(table.schema.clone()), check).with_context(|| format!("CONSTRAINT {name} CHECK ({check})")).map_err(crate::rules::create::definition)?;
         }
@@ -1826,7 +1832,7 @@ fn projected(schema: &SchemaRef, batches: &[RecordBatch], names: &[String]) -> a
 /// PRIMARY KEY that lacks it, as Postgres makes them. An identity column is planned as the plain column it is: its integer type
 /// (a SERIAL's, `planned_type`), NOT NULL, and a DEFAULT that counts in its sequence (`identified`), which the planner keeps as
 /// any DEFAULT. Its rules are the core's (`Ruled`), made over the columns it plans.
-fn plain_create(c: &CreateTable, identified: &[counters::Identified]) -> anyhow::Result<CreateTable> {
+fn plain_create(c: &CreateTable, identified: &[counters::Identified], typed: &dyn Fn(&str) -> bool) -> anyhow::Result<CreateTable> {
     let mut plain = c.clone();
     plain.constraints.clear();
     let keyed: Vec<String> = c
@@ -1849,6 +1855,9 @@ fn plain_create(c: &CreateTable, identified: &[counters::Identified]) -> anyhow:
         column.options.retain(|o| kept_option(&o.option));
         let name = crate::text::ident(&column.name);
         let identity = identified.iter().find(|i| i.column == name);
+        if enum_typed(&column.data_type, typed) {
+            column.data_type = datafusion::sql::sqlparser::ast::DataType::Varchar(None); // (its rows are text, as a node's: its labels are its rules')
+        }
         if let Some(identity) = identity {
             column.data_type = planned_type(&column.data_type)?;
             let default = parsed_expr(&crate::rules::create::identity_default(&identity.sequence))?;
@@ -1859,6 +1868,16 @@ fn plain_create(c: &CreateTable, identified: &[counters::Identified]) -> anyhow:
         }
     }
     Ok(plain)
+}
+
+/// Whether a column's type is an enum: `ENUM('a', 'b')` written in the column, or a type the page holds (`typed`).
+fn enum_typed(t: &datafusion::sql::sqlparser::ast::DataType, typed: &dyn Fn(&str) -> bool) -> bool {
+    use datafusion::sql::sqlparser::ast::DataType;
+    match t {
+        DataType::Enum(..) => true,
+        DataType::Custom(name, args) => args.is_empty() && typed(&crate::text::object(name)),
+        _ => false,
+    }
 }
 
 /// An SQL expression as the page's parser reads it (an identity column's DEFAULT, `nextval('…')`).
@@ -2286,7 +2305,7 @@ fn not_kept_as(what: &str) -> anyhow::Error {
 }
 
 /// The statements a page doesn't take yet, refused by name before anything is parsed (ADR-072: a form that can't do a thing
-/// says so, and says what to write instead). DECLARE, MERGE, the type statements and a node's own
+/// says so, and says what to write instead). DECLARE, MERGE and a node's own
 /// statements (users, tasks, shares, …) each name what to write in its place; DataFusion's own words for them name nothing
 /// of the kind. Words are whole and read past comments, so a table named `merged` or a string `'begin'` is not one of them.
 fn not_taken(sql: &str) -> anyhow::Result<()> {
@@ -2297,17 +2316,11 @@ fn not_taken(sql: &str) -> anyhow::Result<()> {
     if begins(&words, &["MERGE"]) {
         return Err(crate::codes::coded("0A000", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"));
     }
-    if let Some(pattern) = TYPE_STATEMENTS.into_iter().find(|pattern| begins(&words, pattern)) {
-        return Err(crate::codes::coded("0A000", format!("a page makes no types yet ({}): make the column text, or keep the type on a node", pattern.join(" "))));
-    }
     match NODE_STATEMENTS.into_iter().find(|(pattern, _)| begins(&words, pattern)) {
         Some((pattern, what)) => Err(crate::codes::coded("0A000", what.replace("{}", &pattern.join(" ")))),
         None => Ok(()),
     }
 }
-
-/// The words of the statements that make or drop a type, as `not_taken` reads them.
-const TYPE_STATEMENTS: [&[&str]; 4] = [&["CREATE", "TYPE"], &["CREATE", "OR", "REPLACE", "TYPE"], &["DROP", "TYPE"], &["ALTER", "TYPE"]];
 
 const NO_USERS: &str = "a page has no users or grants ({}): a page is one person's, so sign in to a node for users and grants";
 const NO_TASKS: &str = "a page runs no tasks ({}): tasks run on a node";
@@ -2526,9 +2539,8 @@ impl Host for PageHost<'_> {
         Some(Relation::Columns(table.schema().fields().iter().map(|f| (f.name().clone(), None)).collect()))
     }
 
-    // (a page makes no types, so no enum has labels here: an enum a page names is refused at its CREATE, by name)
-    async fn enum_labels(&self, _name: &str) -> Option<Vec<String>> {
-        None
+    async fn enum_labels(&self, name: &str) -> Option<Vec<String>> {
+        self.0.type_labels(name)
     }
 
     // (not an `async fn`: a loop back into the front goes through here, and this declared `Send` is where the
@@ -3045,7 +3057,7 @@ mod tests {
         assert_eq!(page.request("POST", "/sql", &[], "CREATE TABLE t AS SELECT 1 AS id".into()).await.status, 200);
         let refused = [
             "DECLARE $x = 1", "declare $mode = 'full'",
-            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "CREATE TYPE mood AS ENUM ('sad', 'ok')", "DROP TYPE mood",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
             "CREATE USER ann WITH PASSWORD 'x'", "grant select on t to ann", "CREATE TASK k SCHEDULE '1 minute' AS SELECT 1",
             "CREATE SHARE s", "BACKUP DATABASE db TO 'x'", "ATTACH 'x' AS y", "CREATE SECRET s (TYPE s3)", "CREATE SEQUENCE q",
             "CREATE FUNCTION g(x INT) RETURNS INT AS $$ SELECT x $$", "CALL p()", "COPY t TO 'x.csv'", "USE crm", "CREATE SCHEMA s",
@@ -3060,7 +3072,6 @@ mod tests {
         for (sql, words) in [
             ("DECLARE $x = 1", "a page has no variables yet (DECLARE): write the value into the statement, or declare it on a node"),
             ("MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE", "a page doesn't take MERGE yet: write its INSERT, UPDATE and DELETE into the page's table, or MERGE on a node"),
-            ("CREATE TYPE mood AS ENUM ('sad', 'ok')", "a page makes no types yet (CREATE TYPE): make the column text, or keep the type on a node"),
             ("CREATE USER ann WITH PASSWORD 'x'", "a page has no users or grants (CREATE USER): a page is one person's, so sign in to a node for users and grants"),
             ("COPY t TO 'x.csv'", "a page has no COPY: put a file with PUT /files/{name} and read it by name, and ask /sql?format=csv (or parquet) for a file of an answer"),
         ] {
@@ -3282,6 +3293,42 @@ mod tests {
         drop(a);
         let b = Page::kept(&options).await.unwrap();
         assert_eq!(csv(&b, "SELECT id, v FROM t ORDER BY id").await, "id,v\n1,kept\n");
+    }
+
+    /// A page keeps enum types as a node does: a cast to one and a column of one take its labels and refuse any other (22P02),
+    /// ADD VALUE gives the label to the columns of the type, RENAME TO renames it in them, and DROP TYPE is refused while a
+    /// column uses it. A kept page keeps its types and reads its tables' columns as of them.
+    #[tokio::test]
+    async fn a_page_keeps_enum_types_as_a_node_does() {
+        let store = Arc::new(InMemory::new());
+        let options = Options { store: Some(store.clone()), ..Default::default() };
+        let page = Page::kept(&options).await.unwrap();
+        ran(&page, "CREATE TYPE mood AS ENUM ('sad', 'ok')").await;
+        assert_eq!(code(&page, "CREATE TYPE mood AS ENUM ('x')").await, "42P07");
+        assert_eq!(ask(&page, "CREATE TYPE IF NOT EXISTS mood AS ENUM ('x')").await.header("x-pondra-notices"), Some(r#"["type \"mood\" already exists, skipping"]"#));
+        assert_eq!(csv(&page, "SELECT 'sad'::mood AS m, enum_first(NULL::mood) AS f, enum_last(NULL::mood) AS l").await, "m,f,l\nsad,sad,ok\n");
+        assert_eq!(code(&page, "SELECT 'glad'::mood").await, "22P02");
+        ran(&page, "CREATE TABLE t (id INT, m mood, e ENUM('a', 'b'))").await;
+        ran(&page, "INSERT INTO t VALUES (1, 'sad', 'a')").await;
+        assert_eq!(code(&page, "INSERT INTO t VALUES (2, 'glad', 'a')").await, "22P02");
+        assert_eq!(code(&page, "INSERT INTO t VALUES (2, 'ok', 'c')").await, "22P02");
+        ran(&page, "ALTER TYPE mood ADD VALUE 'glad' BEFORE 'ok'").await;
+        ran(&page, "INSERT INTO t VALUES (2, 'glad', 'b')").await;
+        assert_eq!(csv(&page, "SELECT array_to_string(enum_range(NULL::mood), ' ') AS r").await, "r\nsad glad ok\n");
+        ran(&page, "ALTER TYPE mood RENAME TO feeling").await;
+        assert_eq!(code(&page, "SELECT enum_first(NULL::mood)").await, "42704");
+        assert_eq!(csv(&page, "SELECT 'sad'::feeling AS m").await, "m\nsad\n");
+        assert_eq!(code(&page, "DROP TYPE feeling").await, "2BP01");
+        drop(page);
+        let b = Page::kept(&options).await.unwrap();
+        assert!(b.unread().is_empty(), "{:?}", b.unread());
+        assert_eq!(code(&b, "INSERT INTO t VALUES (3, 'cross', 'a')").await, "22P02");
+        ran(&b, "INSERT INTO t VALUES (3, 'glad', 'a')").await;
+        assert_eq!(csv(&b, "SELECT id, m, e FROM t ORDER BY id").await, "id,m,e\n1,sad,a\n2,glad,b\n3,glad,a\n");
+        ran(&b, "DROP TABLE t").await;
+        ran(&b, "DROP TYPE feeling").await;
+        assert_eq!(code(&b, "DROP TYPE feeling").await, "42704");
+        ran(&b, "DROP TYPE IF EXISTS feeling").await;
     }
 
     /// A page fills a narrow row, and a DEFAULT in VALUES, as a node does: a row that names fewer columns, or says DEFAULT, takes

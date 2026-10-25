@@ -1,4 +1,4 @@
-# Enum types: CREATE TYPE … AS ENUM, a value cast to it, and one it doesn't hold refused (22P02) (form-parity P4).
+# Enum types: CREATE TYPE … AS ENUM, a value cast to it, and one it doesn't hold refused (22P02); ADD VALUE, RENAME TO, and DROP TYPE refused while a column uses it (2BP01) (form-parity P4).
 statement ok
 CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
 
@@ -21,3 +21,42 @@ SELECT name, feel FROM m ORDER BY name
 ----
 a happy
 b sad
+
+statement error 22P02
+INSERT INTO m VALUES ('c', 'glad')
+
+statement ok
+ALTER TYPE mood ADD VALUE 'glad' AFTER 'ok'
+
+statement ok
+INSERT INTO m VALUES ('c', 'glad')
+
+query T
+SELECT enum_last(NULL::mood)
+----
+happy
+
+statement error 2BP01
+DROP TYPE mood
+
+statement ok
+ALTER TYPE mood RENAME TO feeling
+
+statement error 42704
+SELECT enum_first(NULL::mood)
+
+query T
+SELECT 'ok'::feeling
+----
+ok
+
+query T
+SELECT feel FROM m WHERE name = 'c'
+----
+glad
+
+statement ok
+DROP TABLE m
+
+statement ok
+DROP TYPE feeling
