@@ -13,7 +13,6 @@ import json
 import os
 import sys
 import threading
-import urllib.error
 import urllib.parse
 import uuid
 import warnings
@@ -187,7 +186,8 @@ class _Body(io.RawIOBase):
 
 def opener(db):
     """What `Pondra._call` sends a request through: `send(req)` answers it from the node in this
-    process, as urllib's `opener.open(req)` would; with `stream`, its body is read as the node writes it.
+    process, as urllib's `opener.open(req)` would (a refusal, 400 or more, is a `client._Refused`); with
+    `stream`, its body is read as the node writes it.
     (`timeout` is accepted and not used: there is no socket to time out; the call waits for the node's
     answer, and Ctrl-C stops it.)"""
 
@@ -205,8 +205,8 @@ def opener(db):
         body = _Body(lib, answer)  # (from here, closing it frees the answer: Ctrl-C included)
         try:
             status, head = body.head()
-            if status >= 400:  # (raised as urllib raises it: `_call` reads its code, sqlstate and body)
-                raise urllib.error.HTTPError(req.full_url, status, "", head, io.BytesIO(body.readall()))
+            if status >= 400:  # (raised as `_call` reads a refusal: its code, headers and body)
+                raise client._Refused(status, head, body.readall())
             if stream:
                 answered, body = Response(status, head, io.BufferedReader(body)), None
                 return answered
