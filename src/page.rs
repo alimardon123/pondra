@@ -714,8 +714,12 @@ impl Page {
             Some(c) => crate::ext_names::declared(session(), c).await?,
             None => vec![],
         };
+        let types = match given.options.get("types") {
+            Some(t) => Some(crate::ext_names::declared(session(), t).await?.iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>()),
+            None => None,
+        };
         let undeclared = declared.is_none();
-        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, |u| {
+        let (columns, data) = crate::ext_names::files_table(&state, &given, declared, &hive_types, types.as_deref(), |u| {
             undeclared.then(|| crate::codes::coded("42P01", format!("no file {} was given to this page (PUT /files/{{path}})", written(u))))
         })
         .await?;

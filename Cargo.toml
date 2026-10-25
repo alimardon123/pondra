@@ -61,6 +61,7 @@ http = { version = "1", optional = true } # (an AWS catalog's requests signed by
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
 datafusion-spark = "55.1" # Spark's functions DataFusion doesn't name itself (format_string, pmod, parse_url…): PySpark's vocabulary in SQL
 regex = "1" # (COPY FROM: its NULL string; already built for arrow-csv)
+csv-core = "0.1.13" # (the CSV reader Arrow reads with: a COPY INTO refusal's line is found by reading the file as it does)
 postgres-types = { version = "0.2", optional = true } # (DECIMAL as NUMERIC over the Postgres protocol; already built for pgwire)
 pgwire = { version = "0.41", default-features = false, features = ["server-api-aws-lc-rs", "pg-type-chrono"], optional = true } # the Postgres wire protocol (psql, drivers, BI tools); TLS as sslmode=require asks
 # Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out

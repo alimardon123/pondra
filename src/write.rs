@@ -1473,11 +1473,12 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
 /// `rows` with its first `given` columns cast to the table's types, batch by batch, by `query::strict`, the cast INSERT
 /// makes of a value: a value that won't go is the stream's error, with Postgres's words and SQLSTATE. The columns after
 /// them are already of their types (a DEFAULT, or NULL, cast in the plan). `schema` is the stream's: every column's type.
+/// A value a CSV reader refuses as its column's type (`read_csv`'s `types`) gets the same words (`casts::parse_refusal`).
 fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: SchemaRef, given: usize) -> datafusion::execution::SendableRecordBatchStream {
     use futures::StreamExt;
     let out = schema.clone();
     let cast = rows.map(move |b| -> datafusion::error::Result<RecordBatch> {
-        let mut columns = b?.columns().to_vec();
+        let mut columns = b.map_err(|e| crate::casts::parse_refusal(&e.to_string()).unwrap_or(e))?.columns().to_vec();
         for (column, field) in columns.iter_mut().zip(schema.fields()).take(given) {
             // (a refusal is the DataFusion error `casts::into` made, kept as it is: `codes::of` finds its code)
             *column = crate::query::strict(column, field.data_type()).map_err(|e| match e.downcast::<datafusion::error::DataFusionError>() {

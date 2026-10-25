@@ -28,10 +28,18 @@ tokio::task_local! {
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
-    /// The files each table of files in this statement reads, listed once for it (planning asks
-    /// several times; each node of a spread query has its coordinator's list). The next statement
-    /// lists again: a file changed under its name is read as it is now, never by an old size.
-    static LISTED: std::cell::RefCell<HashMap<String, TableMeta>>;
+    /// The statement's listing: the files each table of files in it reads, listed once for it (planning asks
+    /// several times; each node of a spread query has its coordinator's list), and the `types` each read names,
+    /// parsed once. The next statement lists again: a file changed under its name is read as it is now, never by an
+    /// old size.
+    static LISTED: std::cell::RefCell<Statement>;
+}
+
+/// A statement's listing (`LISTED`).
+#[derive(Default)]
+struct Statement {
+    tables: HashMap<String, TableMeta>,
+    types: HashMap<String, Vec<(String, datafusion::arrow::datatypes::DataType)>>,
 }
 
 /// Run a statement (or a node's share of one) as its caller: `owner` or not, listing each table
@@ -219,15 +227,18 @@ pub async fn meta(lake: &Lake, table: &str) -> Result<Option<TableMeta>> {
     }
     let spec = for_caller(lake, spec(table).context("not a table of files")?)?;
     check(lake, &spec).await?;
-    if let Ok(Some(m)) = LISTED.try_with(|l| l.borrow().get(table).cloned()) {
+    if let Ok(Some(m)) = LISTED.try_with(|l| l.borrow().tables.get(table).cloned()) {
         return Ok(Some(m));
     }
-    let m = resolve(lake, &spec).await?;
+    let m = match retyped_meta(&spec).await? {
+        Some(m) => m,
+        None => resolve(lake, &spec).await?,
+    };
     keep(table, &m);
     Ok(Some(m))
 }
 
-fn keep(table: &str, m: &TableMeta) { _ = LISTED.try_with(|l| l.borrow_mut().insert(table.to_string(), m.clone())); }
+fn keep(table: &str, m: &TableMeta) { _ = LISTED.try_with(|l| l.borrow_mut().tables.insert(table.to_string(), m.clone())); }
 
 /// The coordinator's list of the tables of files among `tables`, for its slices.
 pub async fn of(lake: &Lake, tables: &[String]) -> Result<Vec<(String, TableMeta)>> {
@@ -353,6 +364,34 @@ fn shown<'a>(lake: &Lake, u: &'a str) -> &'a str {
     u.strip_prefix(&format!("{}/", lake.url.trim_end_matches('/'))).unwrap_or(u)
 }
 
+/// The `types` a spec's read names (`read_csv`'s, kept as `"zip" VARCHAR, …`): each column and the type it is read as.
+/// A statement parses each text once (`declared` builds a session of its own for it): every file a statement reads
+/// with the same `types` gets the same answer, and the settings it reads them under don't change within the statement.
+async fn types_of(spec: &Spec) -> Result<Option<Vec<(String, datafusion::arrow::datatypes::DataType)>>> {
+    let Some(t) = spec.options.get("types") else { return Ok(None) };
+    if let Ok(Some(hit)) = LISTED.try_with(|l| l.borrow().types.get(t).cloned()) {
+        return Ok(Some(hit));
+    }
+    let types: Vec<(String, datafusion::arrow::datatypes::DataType)> = crate::write::declared(t).await?.iter().map(|f| (f.name().clone(), f.data_type().clone())).collect();
+    _ = LISTED.try_with(|l| l.borrow_mut().types.insert(t.clone(), types.clone()));
+    Ok(Some(types))
+}
+
+/// A typed read's metadata (`read_csv`'s `types`), from the plain spec's listing in this statement (`columns_of` plans
+/// the plain read first): the same files, and the schema `resolve` gives, with the same `retyped`. None (`resolve` does
+/// it) when the plain table isn't listed, or has no files, or its files are in folders (their keys are `resolve`'s).
+async fn retyped_meta(spec: &Spec) -> Result<Option<TableMeta>> {
+    let Some(types) = types_of(spec).await? else { return Ok(None) };
+    let plain = Spec { options: spec.options.iter().filter(|(k, _)| k.as_str() != "types").map(|(k, v)| (k.clone(), v.clone())).collect(), ..spec.clone() };
+    let Ok(Some(listed)) = LISTED.try_with(|l| l.borrow().tables.get(&crate::ext_names::name(&plain)).cloned()) else { return Ok(None) };
+    if listed.files.is_empty() || listed.files.iter().any(|f| !f.part.is_empty()) {
+        return Ok(None);
+    }
+    let Ok(schema) = crate::answer::schema(&listed.columns) else { return Ok(None) };
+    let schema = crate::ext_names::retyped(&schema, &types)?;
+    Ok(Some(TableMeta { columns: crate::ext_names::named(schema.fields()), files: listed.files, ext: Some(spec.clone()), ..Default::default() }))
+}
+
 /// The files, their schema, and (Parquet) each file's rows and column ranges from its footer.
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     match spec.format.as_str() {
@@ -389,7 +428,7 @@ async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
         register(lake, u).await?;
     }
     let undeclared = declared.is_none();
-    let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
+    let (columns, files) = crate::ext_names::files_table(&state, spec, declared, &hive_types, types_of(spec).await?.as_deref(), |u| undeclared.then(|| crate::codes::coded("42P01", format!("no file matches {}", shown(lake, u))))).await?; // (declared: none yet is an empty table)
     Ok(TableMeta { columns, files, ext: Some(spec.clone()), ..Default::default() })
 }
 
@@ -1608,5 +1647,31 @@ mod tests {
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    /// A typed read of a plain table listed in this statement takes its files and its columns retyped (as `resolve`
+    /// does); a table not listed, or with no files, is left to `resolve`; a name the files lack is refused as it is.
+    #[tokio::test]
+    async fn a_typed_read_of_a_listed_table_keeps_its_files_and_retypes_its_columns() {
+        let plain = Spec { urls: vec!["file:///d/".into()], format: "csv".into(), options: BTreeMap::new() };
+        let mut typed = plain.clone();
+        typed.options.insert("types".into(), "\"zip\" VARCHAR".into());
+        let file = || DataFile { path: "file:///d/a.csv".into(), bytes: 9, rows: 1, ..Default::default() };
+        let listed = TableMeta { columns: vec![("zip".into(), "Int64".into()), ("n".into(), "Int64".into())], files: vec![file()], ext: Some(plain.clone()), ..Default::default() };
+        assert!(retyped_meta(&typed).await.unwrap().is_none(), "not listed: resolve reads it");
+        LISTED.scope(Default::default(), async {
+            keep(&crate::ext_names::name(&plain), &listed);
+            let m = retyped_meta(&typed).await.unwrap().expect("listed");
+            assert_eq!(m.columns, vec![("zip".to_string(), "Utf8".to_string()), ("n".to_string(), "Int64".to_string())]);
+            assert_eq!(m.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["file:///d/a.csv"]);
+            assert_eq!(m.ext.expect("its spec").options["types"], "\"zip\" VARCHAR");
+            let mut nope = plain.clone();
+            nope.options.insert("types".into(), "\"nope\" VARCHAR".into());
+            let err = retyped_meta(&nope).await.err().expect("refused");
+            assert!(err.to_string().starts_with("types names nope, which the files don't have"), "{err}");
+            keep(&crate::ext_names::name(&plain), &TableMeta { files: vec![], ..listed.clone() });
+            assert!(retyped_meta(&typed).await.unwrap().is_none(), "no files: resolve reads it");
+        })
+        .await;
     }
 }

@@ -10,6 +10,7 @@ use crate::store::{json, producer_key, table_key, Lake, TableMeta, QUIET};
 use crate::write::Stmt;
 use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::prelude::DataFrame;
@@ -279,8 +280,10 @@ pub struct Entry {
 /// A CSV file is read as `read_csv` reads it: a line `\.` is data, as DuckDB and Postgres 18 read a file (the end
 /// marker is COPY FROM STDIN's); a blank line is no row (Postgres and DuckDB read one as a NULL in a one-column file);
 /// a file with no rows loads nothing. Such a file is listed in the answer with 0 rows, and nothing is recorded for it:
-/// each later run lists it again with 0 rows, FORCE changes nothing, and `pondra.loads` doesn't show it. A value that
-/// won't go into its column is refused with Postgres's words and SQLSTATE (`casts::into`).
+/// each later run lists it again with 0 rows, FORCE changes nothing, and `pondra.loads` doesn't show it. A CSV's text
+/// and integer columns are read as the table's types (`read_as`), as Postgres's COPY reads each value: `007` stays
+/// `007`, and `2.5` into an integer is refused, where the file's own inferred type would round it. A value that won't
+/// go into its column is refused with Postgres's words and SQLSTATE (`casts::into`, `casts::parse_refusal`).
 ///
 /// Invariant 337: a file is loaded into a table once a version (`copy::copy_into`, `adopt::file`):
 /// its load is a bulk INSERT whose job names the table's folder, the file and its version, so a
@@ -309,7 +312,9 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         expire(app, &known).await?; // (the leader keeps the records as far as the retention: the next statement finds them gone)
     }
     let run = force.then(|| uuid::Uuid::new_v4().to_string());
-    let cols: Vec<String> = meta.logical_columns().into_iter().map(|(c, _)| c).collect();
+    let logical = meta.logical_columns();
+    let cols: Vec<String> = logical.iter().map(|(c, _)| c.clone()).collect();
+    let table_types: BTreeMap<String, String> = logical.into_iter().collect();
     let (now, mut loaded) = (now_ms(), vec![]);
     for p in pieces {
         let done = known.get(&ld_key(&folder, &p.url)).is_some_and(|e| e.version == p.version);
@@ -317,14 +322,30 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         if !force && (done || old) {
             continue;
         }
-        let names = columns_of(lake, &p.query, positional, &cols, table, &p.url).await?;
+        let (given, names) = columns_of(lake, &p.query, positional, &cols, table, &p.url).await?;
         if names.is_empty() {
             // (a file with no rows: an empty one, or of blank lines, reads no columns; nothing is written or recorded for it)
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": 0}));
             continue;
         }
+        // A CSV's text and integer columns are read as the table's types, so the file is read again with them (none
+        // when all_varchar reads every column as text already).
+        let query = match &p.reader {
+            Some((format, reader)) if format == "csv" && !reader.get("all_varchar").is_some_and(|v| v != "false") => {
+                let types = typed_columns(&given, &names, &table_types);
+                if types.is_empty() {
+                    p.query
+                } else {
+                    crate::routines::expand(lake, &reader_query(format, &p.url, reader, &types)).await?
+                }
+            }
+            _ => p.query,
+        };
         let load = Load { folder: folder.clone(), file: p.url.clone(), version: p.version.clone(), run: run.clone() };
-        let out = crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, p.query), Some(job_of(&load)), owner()).await?;
+        let out = match crate::write::on_node_as(app, Stmt::InsertInto(table.to_string(), names, query.clone()), Some(job_of(&load)), owner()).await {
+            Ok(out) => out,
+            Err(e) => return Err(refused_at(lake, &query, &p.url, p.dialect, e).await),
+        };
         if let Some(rows) = out["rows"].as_u64() {
             loaded.push(serde_json::json!({"file": p.url, "version": p.version, "rows": rows}));
         }
@@ -338,18 +359,20 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
 }
 
 /// One file a load reads: its URL, its version (its e-tag, else size and time), when it last
-/// changed (ms), and the query that reads it, expanded.
+/// changed (ms), the query that reads it, expanded, and for a path its reader (format and options), to read it again.
 struct Piece {
     url: String,
     version: String,
     modified: u64,
     query: String,
+    reader: Option<(String, BTreeMap<String, String>)>,
+    dialect: Option<Dialect>, // (how the file's CSV reader splits it, when the cell scan can follow it)
 }
 
 /// The source's files, as `(what to show, headerless CSV?, the files)`. A path's reader is its
 /// FORMAT, else its extension's, with the options given; a query's is its file reference's own.
 async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) -> Result<(String, bool, Vec<Piece>)> {
-    let (shown, spec, query_of) = match from {
+    let (shown, spec, query_of, dialect) = match from {
         Source::Path(p) => {
             // (a relative path is the owner's folder's, made whole here; a client's is read as `objects` maps it: the lake's files)
             let p = if scheme(p).is_none() && owner() { crate::ddl::full(p)? } else { p.clone() };
@@ -358,8 +381,9 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
                 None => format_of(p.trim_end_matches('/')).context("COPY INTO: which FORMAT? (csv, parquet, json or arrow)")?,
             };
             reader.extend(options.iter().filter(|(k, _)| !matches!(k.as_str(), "format" | "force")).map(|(k, v)| (k.clone(), v.clone())));
+            let dialect = (format == "csv").then(|| dialect_of(&reader)).flatten();
             let query_of = (format.clone(), reader.clone());
-            (p.clone(), crate::ext_names::Spec { urls: vec![p], format, options: reader }, Some(query_of))
+            (p.clone(), crate::ext_names::Spec { urls: vec![p], format, options: reader }, Some(query_of), dialect)
         }
         Source::Query(q) => {
             ensure!(options.keys().all(|k| k == "force"), "COPY INTO (SELECT …): the reader's options go in the query: read_csv('…', header => true)");
@@ -367,7 +391,11 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
             let names = crate::ext_names::names(&expanded);
             ensure!(names.len() == 1, "COPY INTO (SELECT …) names {} files: one outside source (FROM 'path'), loaded file by file", names.len());
             let spec = crate::ext_names::spec(&names[0]).context("COPY INTO (SELECT …): its FROM is a file")?;
-            (spec.urls[0].clone(), spec, None)
+            // (only `SELECT * FROM 'file'` reads the file's columns as they are: any other query's column numbers are its own)
+            let lit = format!("'{}'", spec.urls[0].replace('\'', "''"));
+            let plain = q.trim().trim_end_matches(';').trim_end().eq_ignore_ascii_case(&format!("SELECT * FROM {lit}"));
+            let dialect = (spec.format == "csv" && plain).then(|| dialect_of(&spec.options)).flatten();
+            (spec.urls[0].clone(), spec, None, dialect)
         }
     };
     let positional = query_of.as_ref().is_some_and(|(f, r)| f == "csv" && r.get("header").is_some_and(|h| h == "false"));
@@ -376,7 +404,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
     let mut pieces = vec![];
     for (url, o) in listed {
         let query = match (&query_of, from) {
-            (Some((format, reader)), _) => reader_query(format, &url, reader),
+            (Some((format, reader)), _) => reader_query(format, &url, reader, &[]),
             (None, Source::Query(q)) => {
                 let lit = format!("'{}'", spec.urls[0].replace('\'', "''"));
                 ensure!(q.matches(&lit).count() == 1, "COPY INTO (SELECT …): the file reference {lit} must appear once, as written");
@@ -386,33 +414,389 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
         };
         let query = crate::routines::expand(lake, &query).await?;
         let version = o.e_tag.clone().unwrap_or_else(|| format!("{}-{}", o.size, o.last_modified.timestamp_millis()));
-        pieces.push(Piece { url, version, modified: o.last_modified.timestamp_millis().max(0) as u64, query });
+        pieces.push(Piece { url, version, modified: o.last_modified.timestamp_millis().max(0) as u64, query, reader: query_of.clone(), dialect });
     }
     Ok((shown, positional, pieces))
 }
 
-/// `SELECT * FROM read_csv('file', header => true)`: one file, read as a table's reader reads it.
-fn reader_query(format: &str, file: &str, reader: &BTreeMap<String, String>) -> String {
+/// `SELECT * FROM read_csv('file', header => true)`: one file, read as a table's reader reads it, with the columns `types`
+/// names (their file names and types) read as those types.
+fn reader_query(format: &str, file: &str, reader: &BTreeMap<String, String>, types: &[(String, String)]) -> String {
     let args: String = reader.iter().map(|(k, v)| {
         let v = if v == "true" || v == "false" || v.parse::<f64>().is_ok() { v.clone() } else { format!("'{}'", v.replace('\'', "''")) };
         format!(", {k} => {v}")
     }).collect();
-    format!("SELECT * FROM read_{format}('{}'{args})", file.replace('\'', "''"))
+    let types = match types.is_empty() {
+        true => String::new(),
+        false => format!(", types => {{{}}}", types.iter().map(|(c, t)| format!("'{}': '{t}'", c.replace('\'', "''"))).collect::<Vec<_>>().join(", ")),
+    };
+    format!("SELECT * FROM read_{format}('{}'{args}{types})", file.replace('\'', "''"))
 }
 
-/// The columns a file's query gives, as the table's names they load into: by name, or by position
-/// for a headerless CSV. Refused by name: a column the table lacks, with both ways out.
-async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String], table: &str, url: &str) -> Result<Vec<String>> {
+/// The type a CSV column is read as, when its table column is text or an integer: the table's type as SQL spells it, so
+/// each value is read as Postgres's COPY reads it (`007` stays `007`; `2.5` into an integer is refused). None when the
+/// file's own inferred type is that one already, or the table's column is another type, which is read and cast as before.
+fn read_as(table_type: &str, inferred: &DataType) -> Option<String> {
+    let (want, spelled) = match crate::answer::dtype(table_type).ok()? {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => (DataType::Utf8, "VARCHAR".to_string()), // (Arrow's CSV reader can't parse LargeUtf8)
+        t if t.is_integer() => (t, crate::objects::sql_type(table_type)),
+        _ => return None,
+    };
+    (*inferred != want).then_some(spelled)
+}
+
+/// The columns a CSV file is read again with (`reader_query`'s `types`), by the file's own names: each whose table column
+/// `read_as` says to read as another type.
+fn typed_columns(given: &[(String, DataType)], names: &[String], table_types: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    given.iter().zip(names).filter_map(|((file, inferred), table)| Some((file.clone(), read_as(table_types.get(table)?, inferred)?))).collect()
+}
+
+/// A CSV value the reader refused (`22P02`, `22003`) with the file and the line its cell starts on (`casts::parse_refusal_in`).
+/// The INSERT's error has Postgres's words only (its stream lost the reader's text), so the file is read again by `query`, as
+/// the INSERT reads it: each of its partitions (byte ranges, in file order) on its own task, a batch at a time (no batch is
+/// kept). The reader's own error names the column and the value. The first refusal in partition order is the file's first
+/// refusal; the later partitions are stopped there. The line is then the file's first cell of that column with that text
+/// (`line_of`), when the file's reader is one `dialect` describes. Without one, or when the bytes can't be read, the file
+/// alone: never a line that may be wrong. Any other error is kept as it is.
+async fn refused_at(lake: &Lake, query: &str, file: &str, dialect: Option<Dialect>, e: anyhow::Error) -> anyhow::Error {
+    if !matches!(crate::codes::of(&e), "22P02" | "22003") {
+        return e;
+    }
+    let read = async {
+        let ctx = crate::query::session(lake, query, "").await?;
+        {
+            // (each partition reads only its own byte range, as planned: with the sharing of files between partitions on, a
+            // partition takes whichever range is next, so a partition's order is not the file's)
+            let state = ctx.state_ref();
+            state.write().config_mut().options_mut().execution.enable_file_stream_work_stealing = false;
+        }
+        let df = crate::engine::sql(&ctx, query).await?;
+        let mut parts: Vec<_> = df
+            .execute_stream_partitioned()
+            .await?
+            .into_iter()
+            .map(|mut part| {
+                tokio::spawn(async move {
+                    while let Some(batch) = part.next().await {
+                        batch?; // (dropped as it is read: one batch at a time)
+                    }
+                    anyhow::Ok(())
+                })
+            })
+            .collect();
+        let mut first = anyhow::Ok(());
+        for part in parts.iter_mut() {
+            match part.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first = Err(e);
+                    break;
+                }
+                Err(joined) => {
+                    first = Err(joined.into());
+                    break;
+                }
+            }
+        }
+        for part in &parts {
+            part.abort(); // (the partitions after the first refusal are not needed)
+        }
+        first
+    };
+    let Err(r) = read.await else { return e };
+    let text = format!("{r:#}");
+    let Some((column, value)) = crate::casts::refused_cell(&text) else { return e };
+    let line = match dialect {
+        Some(dialect) => line_of(lake, file, dialect, column, &value).await,
+        None => None,
+    };
+    let place = match line {
+        Some(line) => format!("{file}, line {line}"),
+        None => file.to_string(),
+    };
+    match crate::casts::parse_refusal_in(&text, &place) {
+        Some(refusal) => anyhow::Error::from(refusal),
+        None => e,
+    }
+}
+
+/// The line the file's first cell of column `column` (from 0) with the text `value` starts on, found in the file's bytes as
+/// they stream from its store; the read stops there. The reader refuses the first such cell in file order (the same text
+/// is refused wherever it is), so this is the cell it refused. None for a file that starts with a compression's magic
+/// number (the reader doesn't read those), for bytes that can't be read, and for no such cell.
+async fn line_of(lake: &Lake, file: &str, dialect: Dialect, column: usize, value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return None; // (an empty value is read as null, never refused)
+    }
+    let (store, path) = crate::ext::store(lake, file).await.ok()?;
+    let mut chunks = object_store_df::ObjectStoreExt::get(&store, &path).await.ok()?.into_stream();
+    let mut cells = Cells::new(dialect, column, value);
+    let (mut head, mut checked) = (Vec::new(), false);
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.ok()?;
+        if checked {
+            if let Some(line) = cells.push(&chunk) {
+                return Some(line);
+            }
+            continue;
+        }
+        head.extend_from_slice(&chunk); // (the first bytes, until a compression's magic number can be told)
+        if head.len() < 6 {
+            continue;
+        }
+        checked = true;
+        if compressed(&head) {
+            return None;
+        }
+        if let Some(line) = cells.push(&head) {
+            return Some(line);
+        }
+    }
+    if !checked {
+        if compressed(&head) {
+            return None;
+        }
+        if let Some(line) = cells.push(&head) {
+            return Some(line);
+        }
+    }
+    cells.finish()
+}
+
+/// The magic numbers of the compressed formats DataFusion reads (gzip, bzip2, xz, zstd): a file that starts with one is not
+/// text. (bzip2's is `BZh` and a block size, a digit.)
+fn compressed(head: &[u8]) -> bool {
+    let magics: [&[u8]; 3] = [&[0x1f, 0x8b], &[0xfd, b'7', b'z', b'X', b'Z', 0x00], &[0x28, 0xb5, 0x2f, 0xfd]];
+    magics.iter().any(|m| head.starts_with(m)) || (head.len() >= 4 && head.starts_with(b"BZh") && head[3].is_ascii_digit())
+}
+
+/// How a CSV reader splits a file into records and fields: the characters csv-core reads them with, as Arrow's reader gives
+/// them (its delimiter, quote, escape, comment and terminator), and whether the first record is a header.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Dialect {
+    delim: u8,
+    quote: u8,
+    escape: Option<u8>,
+    comment: Option<u8>,
+    terminator: Option<u8>, // (None: CR, LF or CRLF, as the reader's default)
+    header: bool,
+}
+
+/// A comma-separated file with a header and the reader's default characters.
+#[cfg(test)]
+const COMMA: Dialect = Dialect { delim: b',', quote: b'"', escape: None, comment: None, terminator: None, header: true };
+
+/// The dialect of a CSV reader's options, as `ext_names::file_format` reads them: a comma unless `delim`, `sep` or `delimiter`
+/// gives one character, a header unless `header` is false, and the quote, escape, comment and `new_line` the reader is given.
+/// None for an option that isn't one character (or a `new_line` other than the reader's), and for a delimiter that is the quote.
+fn dialect_of(reader: &BTreeMap<String, String>) -> Option<Dialect> {
+    let o = |k: &str| reader.get(k).map(String::as_str);
+    // (a line break is never a delimiter, quote, escape or comment: the line count takes them as breaks)
+    let byte = |v: &str| (v.len() == 1 && !matches!(v, "\r" | "\n")).then(|| v.as_bytes()[0]);
+    let terminator = match o("new_line") {
+        None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => None,
+        Some("\r" | "\\r") => Some(b'\r'),
+        Some(_) => return None,
+    };
+    let delim = match o("delim").or(o("sep")).or(o("delimiter")) {
+        None => b',',
+        Some(d) => byte(d)?,
+    };
+    let quote = match o("quote") {
+        None => b'"',
+        Some(q) => byte(q)?,
+    };
+    let escape = match o("escape") {
+        None => None,
+        Some(e) => Some(byte(e)?),
+    };
+    let comment = match o("comment") {
+        None => None,
+        Some(c) => Some(byte(c)?),
+    };
+    (delim != quote).then_some(Dialect { delim, quote, escape, comment, terminator, header: o("header") != Some("false") })
+}
+
+/// Finds a CSV cell as the bytes arrive, in any split of them: the line its text starts on, for the first cell of column
+/// `column` (from 0) whose text is `value`, outside the header. csv-core reads the fields, as Arrow's reader does, and keeps
+/// its state from one piece to the next. What is left here is the line count: every CR, LF and CRLF is a line break, inside
+/// quotes too, as an editor counts them. Blank lines and comment lines are skipped before a record, as csv-core skips them,
+/// so a field's line is the line its first byte is on.
+struct Cells {
+    dialect: Dialect,
+    column: usize,
+    value: Vec<u8>,
+    reader: csv_core::Reader,
+    out: Vec<u8>,       // the field's unquoted text, as csv-core writes it, a piece at a time
+    line: u64,          // the line the next byte is on
+    cr: bool,           // the last byte counted was a CR, so a LF after it is the same break
+    record_start: bool, // no byte of the record yet but its blank and comment lines
+    comment: bool,      // in a comment line, to its LF
+    field: usize,       // the record's field the next field is
+    records: u64,       // the records ended so far (the header is the first)
+    fresh: bool,        // no byte of the field read yet
+    cell_line: u64,     // the line the field's first byte is on
+    fits: bool,         // the field's text so far is the start of `value`
+    len: usize,         // the field's text's length so far, one past `value`'s at most
+}
+
+impl Cells {
+    fn new(dialect: Dialect, column: usize, value: &str) -> Self {
+        let terminator = match dialect.terminator {
+            None => csv_core::Terminator::CRLF,
+            Some(t) => csv_core::Terminator::Any(t),
+        };
+        let reader = csv_core::ReaderBuilder::new()
+            .delimiter(dialect.delim)
+            .quote(dialect.quote)
+            .escape(dialect.escape)
+            .comment(dialect.comment)
+            .terminator(terminator)
+            .build();
+        Cells { dialect, column, value: value.as_bytes().to_vec(), reader, out: vec![0; 1024], line: 1, cr: false, record_start: true, comment: false, field: 0, records: 0, fresh: true, cell_line: 1, fits: true, len: 0 }
+    }
+
+    /// The cell's line, once these bytes show it.
+    fn push(&mut self, bytes: &[u8]) -> Option<u64> {
+        self.feed(bytes, false)
+    }
+
+    /// The cell's line at the end of the bytes, when the last field is the cell.
+    fn finish(&mut self) -> Option<u64> {
+        self.feed(&[], true)
+    }
+
+    /// Reads fields from `input` until the cell is found or the input is used up. An empty input at the end (`end`) is the
+    /// end of the file, which csv-core ends the last field at; any other empty input is no more bytes yet.
+    fn feed(&mut self, mut input: &[u8], end: bool) -> Option<u64> {
+        loop {
+            if self.record_start {
+                let n = self.skip(input);
+                input = &input[n..];
+                if self.record_start {
+                    return None; // (nothing of the record yet: the rest comes with more input)
+                }
+            }
+            if input.is_empty() && !end {
+                return None;
+            }
+            if self.fresh {
+                self.cell_line = self.line;
+            }
+            let mut out = std::mem::take(&mut self.out);
+            let (res, nin, nout) = self.reader.read_field(input, &mut out);
+            self.count(&input[..nin]);
+            if nin > 0 {
+                self.fresh = false;
+            }
+            input = &input[nin..];
+            if self.field == self.column && self.fits {
+                for &b in &out[..nout] {
+                    self.text(b); // (only the column's cell's text is compared: no other field's)
+                }
+            }
+            self.out = out;
+            match res {
+                csv_core::ReadFieldResult::OutputFull => {}
+                csv_core::ReadFieldResult::Field { record_end } => {
+                    let hit = self.end_field();
+                    if record_end {
+                        self.records += 1;
+                        self.field = 0;
+                        self.record_start = true;
+                    } else {
+                        self.field += 1;
+                    }
+                    self.fresh = true;
+                    if hit.is_some() {
+                        return hit;
+                    }
+                }
+                csv_core::ReadFieldResult::InputEmpty | csv_core::ReadFieldResult::End => return None,
+            }
+        }
+    }
+
+    /// Skips the blank lines and comment lines csv-core skips at a record's start, in `input`, and clears `record_start` at
+    /// the first byte of content. Returns how many bytes it used.
+    fn skip(&mut self, input: &[u8]) -> usize {
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            i += 1;
+            if self.comment {
+                self.count_byte(b);
+                self.comment = b != b'\n'; // (a comment runs to its LF, as csv-core has it)
+            } else if Some(b) == self.dialect.comment {
+                self.comment = true;
+            } else if self.is_term(b) {
+                self.count_byte(b); // (a blank line)
+            } else {
+                self.record_start = false;
+                return i - 1;
+            }
+        }
+        i
+    }
+
+    fn is_term(&self, b: u8) -> bool {
+        match self.dialect.terminator {
+            None => b == b'\r' || b == b'\n',
+            Some(t) => b == t,
+        }
+    }
+
+    fn count(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.count_byte(b);
+        }
+    }
+
+    fn count_byte(&mut self, b: u8) {
+        match b {
+            b'\r' => {
+                self.line += 1;
+                self.cr = true;
+            }
+            b'\n' => {
+                if !std::mem::take(&mut self.cr) {
+                    self.line += 1; // (a CRLF is one break: its CR counted it)
+                }
+            }
+            _ => self.cr = false,
+        }
+    }
+
+    /// The field's text ends: its line when it is the cell. The next field starts empty.
+    fn end_field(&mut self) -> Option<u64> {
+        let header = self.dialect.header && self.records == 0;
+        let hit = (self.field == self.column && !header && self.fits && self.len == self.value.len()).then_some(self.cell_line);
+        self.fits = true;
+        self.len = 0;
+        hit
+    }
+
+    fn text(&mut self, b: u8) {
+        self.fits &= self.value.get(self.len) == Some(&b);
+        self.len = (self.len + 1).min(self.value.len() + 1);
+    }
+}
+
+/// The columns a file's query gives, each with its inferred type, and the table's names they load into: by name, or by
+/// position for a headerless CSV. Refused by name: a column the table lacks, with both ways out.
+async fn columns_of(lake: &Lake, query: &str, positional: bool, cols: &[String], table: &str, url: &str) -> Result<(Vec<(String, DataType)>, Vec<String>)> {
     let df = crate::engine::sql(&crate::query::session(lake, query, "").await?, query).await?;
-    let given: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let given: Vec<(String, DataType)> = df.schema().fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect();
     if positional {
         ensure!(given.len() <= cols.len(), "{url} has {} columns, {table} has {}", given.len(), cols.len());
-        return Ok(cols[..given.len()].to_vec());
+        let names = cols[..given.len()].to_vec();
+        return Ok((given, names));
     }
-    if let Some(c) = given.iter().find(|c| !cols.contains(c)) {
+    if let Some((c, _)) = given.iter().find(|(c, _)| !cols.contains(c)) {
         bail!("{table} has no column {c} (in {url}): COPY INTO {table} FROM (SELECT … FROM '…') to choose the columns, or ALTER TABLE {table} ADD COLUMN {c} …");
     }
-    Ok(given)
+    let names: Vec<String> = given.iter().map(|(c, _)| c.clone()).collect();
+    Ok((given, names))
 }
 
 fn ld_key(folder: &str, file: &str) -> String {
@@ -508,4 +892,120 @@ pub async fn tables(lake: &Lake, text: &str) -> Result<Vec<(&'static str, Arc<dy
     ])?;
     let table: Arc<dyn datafusion::catalog::TableProvider> = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
     Ok(vec![("loads", table)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CSV column is read as the table's type when the table's is text or an integer and the file's inferred type
+    /// differs: VARCHAR for text, the integer's SQL type for an integer. Other table types are read as before.
+    #[test]
+    fn a_csv_column_is_read_as_its_text_or_integer_table_type() {
+        assert_eq!(read_as("Utf8", &DataType::Int64), Some("VARCHAR".to_string()));
+        assert_eq!(read_as("Utf8", &DataType::Utf8), None);
+        assert_eq!(read_as("Int32", &DataType::Int64), Some("INT".to_string()));
+        assert_eq!(read_as("Int64", &DataType::Int64), None, "the same type: the same query");
+        assert_eq!(read_as("UInt8", &DataType::Float64), Some("TINYINT UNSIGNED".to_string()));
+        assert_eq!(read_as("Decimal128(15, 2)", &DataType::Float64), None);
+        assert_eq!(read_as("Date32", &DataType::Utf8), None);
+    }
+
+    /// The reader's options as they were, and `read_csv`'s `types` as a struct after them when there are some.
+    #[test]
+    fn the_types_go_to_the_reader_as_a_struct() {
+        let reader = BTreeMap::from([("header".to_string(), "true".to_string())]);
+        assert_eq!(reader_query("csv", "/x/a.csv", &reader, &[]), "SELECT * FROM read_csv('/x/a.csv', header => true)");
+        assert_eq!(reader_query("csv", "/x/a.csv", &reader, &[("zip".to_string(), "VARCHAR".to_string())]), "SELECT * FROM read_csv('/x/a.csv', header => true, types => {'zip': 'VARCHAR'})");
+    }
+
+    /// The line a cell starts on, as the bytes arrive in pieces of `size` bytes.
+    fn cell_at(text: &[u8], size: usize, dialect: Dialect, column: usize, value: &str) -> Option<u64> {
+        let mut cells = Cells::new(dialect, column, value);
+        text.chunks(size).find_map(|c| cells.push(c)).or_else(|| cells.finish())
+    }
+
+    /// A cell is found on the line its text starts on, in any split of the bytes: blank lines, CRLF, a lone CR, no final line
+    /// break, a quoted line break, doubled quotes, text after a closing quote, a missing field, the header, the first match.
+    #[test]
+    fn a_cell_is_found_on_its_line_however_the_bytes_arrive() {
+        let comma = COMMA;
+        let cases: [(&[u8], usize, &str, Option<u64>); 12] = [
+            (b"zip,n\n007,1\n\n008,2.5\n", 1, "2.5", Some(4)),
+            (b"zip,n\r\n007,1\r\n\r\n008,2.5\r\n", 1, "2.5", Some(4)),
+            (b"zip,n\r007,2.5\r", 1, "2.5", Some(2)),
+            (b"zip,n\n007,2.5", 1, "2.5", Some(2)),
+            (b"zip,n\n\"a\nb\",1\n008,2.5\n", 1, "2.5", Some(4)),
+            (b"zip,n\n\"a\nb\",1\n008,2.5\n", 0, "a\nb", Some(2)),
+            (b"zip,n\n\"say \"\"008\"\"\",1\n", 0, "say \"008\"", Some(2)),
+            (b"zip,n\n\"x\"y,2.5\n", 0, "xy", Some(2)),
+            (b"zip,n\n008\n007,2.5\n", 1, "2.5", Some(3)),
+            (b"zip,n\n007,2.5\n008,2.5\n", 1, "2.5", Some(2)),
+            (b"2.5,n\n007,2.5\n", 0, "2.5", None),
+            (b"zip,n\n008,2.5\n", 1, "2.50", None),
+        ];
+        for (text, column, value, want) in cases {
+            for size in 1..=text.len() {
+                assert_eq!(cell_at(text, size, comma, column, value), want, "{:?} in pieces of {size}", String::from_utf8_lossy(text));
+            }
+        }
+    }
+
+    /// The dialect decides what a field is: a `;` file has one field a line under `,`; with no header the first record is a cell.
+    #[test]
+    fn the_dialect_decides_what_a_cell_is() {
+        let semi = Dialect { delim: b';', ..COMMA };
+        let comma = COMMA;
+        let headerless = Dialect { header: false, ..COMMA };
+        assert_eq!(cell_at(b"zip;n\n007;2.5\n", 3, semi, 1, "2.5"), Some(2));
+        assert_eq!(cell_at(b"zip;n\n007;2.5\n", 3, comma, 1, "2.5"), None, "one field a line under ','");
+        assert_eq!(cell_at(b"008,2.5\n", 2, headerless, 1, "2.5"), Some(1), "no header: the first record is a cell");
+        assert_eq!(cell_at(b"008,2.5\n", 2, comma, 1, "2.5"), None, "a header is no cell");
+    }
+
+    /// The line a cell starts on, with the options csv-core reads (a quote, an escape, a comment, a CR terminator) as Arrow reads them.
+    #[test]
+    fn the_options_csv_core_reads_give_the_same_cells() {
+        let cases: [(&[u8], Dialect, usize, &str, Option<u64>); 4] = [
+            (b"zip,n\n'a,b',2.5\n", Dialect { quote: b'\'', ..COMMA }, 0, "a,b", Some(2)),
+            (b"zip,n\n\"a\\\"b\",2.5\n", Dialect { escape: Some(b'\\'), ..COMMA }, 0, "a\"b", Some(2)),
+            (b"zip,n\n# 007, 2.5\n007,2.5\n", Dialect { comment: Some(b'#'), ..COMMA }, 1, "2.5", Some(3)),
+            (b"zip,n\r007,2.5\r", Dialect { terminator: Some(b'\r'), ..COMMA }, 1, "2.5", Some(2)),
+        ];
+        for (text, dialect, column, value, want) in cases {
+            for size in 1..=text.len() {
+                assert_eq!(cell_at(text, size, dialect, column, value), want, "{:?} in pieces of {size}", String::from_utf8_lossy(text));
+            }
+        }
+    }
+
+    /// A reader's options give its dialect, or none for an option that isn't a character or a delimiter that is the quote.
+    #[test]
+    fn a_readers_options_give_its_dialect_or_none() {
+        let opts = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        assert_eq!(dialect_of(&opts(&[])), Some(COMMA));
+        assert_eq!(dialect_of(&opts(&[("header", "false")])), Some(Dialect { header: false, ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("header", "true"), ("sep", ";")])), Some(Dialect { delim: b';', ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("delimiter", "\t")])), Some(Dialect { delim: b'\t', ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("delim", "ab")])), None, "one character");
+        assert_eq!(dialect_of(&opts(&[("delim", "\"")])), None, "a delimiter that is the quote");
+        assert_eq!(dialect_of(&opts(&[("quote", "\"")])), Some(COMMA));
+        assert_eq!(dialect_of(&opts(&[("quote", "'")])), Some(Dialect { quote: b'\'', ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("escape", "\\")])), Some(Dialect { escape: Some(b'\\'), ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("comment", "#")])), Some(Dialect { comment: Some(b'#'), ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("new_line", "\n")])), Some(COMMA));
+        assert_eq!(dialect_of(&opts(&[("new_line", "\r")])), Some(Dialect { terminator: Some(b'\r'), ..COMMA }));
+        assert_eq!(dialect_of(&opts(&[("new_line", "x")])), None, "a new_line the reader doesn't take");
+    }
+
+    /// The magic numbers the compressed formats start with, and what a text file starts with.
+    #[test]
+    fn a_compressed_file_is_told_by_its_magic_number() {
+        assert!(compressed(&[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00]), "gzip");
+        assert!(compressed(&[0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00]), "zstd");
+        assert!(compressed(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]), "xz");
+        assert!(compressed(b"BZh91AY&SY"), "bzip2");
+        assert!(!compressed(b"zip,n\n"), "a CSV");
+        assert!(!compressed(b"BZhost,n\n"), "a header that starts BZh");
+    }
 }

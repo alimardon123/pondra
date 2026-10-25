@@ -613,11 +613,40 @@ def loads():
         empty[0] == 200 and empty_body["rows"] == 0 and [l["rows"] for l in empty_body["loaded"]] == [0, 0]
         and empty_again[0] == 200 and [l["rows"] for l in empty_again_body["loaded"]] == [0, 0]
         and empty_loads == [{"n": 0}] and count("empties") == {"n": 0, "s": 0}
-        and big[0] == 400 and big[1] == "22003" and "integer out of range" in big[2]
+        and big[0] == 400 and big[1] == "22003" and 'value "99999999999" is out of range for type integer' in big[2]
         and abc[0] == 400 and abc[1] == "22P02" and 'invalid input syntax for type integer: "abc"' in abc[2]
         and literal[0] == 400 and literal[1] == "22003" and "integer out of range" in literal[2]
         and selected[0] == 400 and selected[1] == "22003"
         and cast[0] == 400 and cast[1] == "22003")
+
+    # Check 15: a CSV's text and integer columns load as the table's types, as Postgres's COPY reads each value: `007` stays
+    # `007`, a quoted value and empty fields are as they are, an integer's spaces and sign are its own, a header file missing
+    # a column loads with NULL there, and a value an integer won't take is refused with its words and loads nothing.
+    # read_csv's `types` names the columns it reads as text, as a struct only.
+    run("CREATE TABLE zips (zip TEXT, n INT)")
+    write("zip/with.csv", "zip,n\n007,1\n02134,2\n")
+    write("zip/quoted.csv", 'zip,n\n"007",\n,4\n')
+    write("zip/spaces.csv", "zip,n\n5, 3 \n6,+1\n")
+    write("zip/bare.csv", "007,1\n")
+    write("zip/missing.csv", "zip\n008\n")
+    write("zip/point.csv", "zip,n\n1,2.5\n")
+    write("zip/exp.csv", "zip,n\n1,1e3\n")
+    zip_loads = [run(f"COPY INTO zips FROM '{d}/zip/{f}' (FORMAT csv, HEADER {h})") for f, h in
+                 [("with.csv", "true"), ("quoted.csv", "true"), ("spaces.csv", "true"), ("bare.csv", "false"), ("missing.csv", "true")]]
+    point = answer(f"COPY INTO zips FROM '{d}/zip/point.csv' (FORMAT csv, HEADER true)")
+    exp = answer(f"COPY INTO zips FROM '{d}/zip/exp.csv' (FORMAT csv, HEADER true)")
+    zips = sorted(((r.get("zip"), r.get("n")) for r in run("SELECT zip, n FROM zips")), key=repr)  # (a NULL's key is left out)
+    zips_want = sorted([("007", 1), ("02134", 2), ("007", None), (None, 4), ("5", 3), ("6", 1), ("007", 1), ("008", None)], key=repr)
+    typed = run(f"SELECT zip FROM read_csv('{d}/zip/with.csv', header => true, types => {{'zip': 'VARCHAR'}}) ORDER BY zip")
+    nope = refused(f"SELECT * FROM read_csv('{d}/zip/with.csv', header => true, types => {{'nope': 'VARCHAR'}})")
+    as_list = refused(f"SELECT * FROM read_csv('{d}/zip/with.csv', types => ['VARCHAR'])")
+    checks["15. a CSV's text and integer columns load as the table's types: 007 stays 007, quoted and empty fields as they are, spaces and + in an integer are its own, a missing column is NULL, a value an integer won't take is refused with its words and loads nothing; read_csv's types names columns as text"] = (
+        [l["rows"] for l in zip_loads] == [2, 2, 2, 1, 1] and zips == zips_want
+        and point[0] == 400 and point[1] == "22P02" and 'invalid input syntax for type integer: "2.5"' in point[2] and "point.csv, line 2)" in point[2]
+        and exp[0] == 400 and exp[1] == "22P02" and 'invalid input syntax for type integer: "1e3"' in exp[2] and "exp.csv, line 2)" in exp[2]
+        and len(run("SELECT file FROM pondra.loads WHERE name = 'zips'")) == 5
+        and typed == [{"zip": "007"}, {"zip": "02134"}]
+        and "nope" in nope and "zip, n" in nope and "struct" in as_list)
 
     # Check 8: a node that keeps records for two seconds (PONDRA_LOAD_RETENTION_SECS, read once): past
     # it, a load's record goes, and its old file (last changed before the window) isn't loaded again
