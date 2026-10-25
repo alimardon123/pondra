@@ -57,6 +57,8 @@ mod pg_text;
 mod pg_oids;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the visitor that rewrites a statement's casts is a node's until the front runs it)
 mod pg_casts;
+#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front calls it in every form from F4: designs/l2-front-asks.md)
+mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
 mod held;

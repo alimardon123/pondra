@@ -7034,7 +7034,7 @@ def _temps_typed(checks, port):
     INSERT … SELECT and UPDATE with Postgres 16's SQLSTATE and words, and nothing is written; a good one reads back as
     Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
     rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
-    A Postgres connection's temporary table sends its uuid column as a uuid (`pg_types::of`). SHOW CREATE gives each
+    A Postgres connection's temporary table sends its uuid column as a uuid (a node's `Host::relation`, host.rs). SHOW CREATE gives each
     column's type. Its NOT NULL, DEFAULT and CHECK are kept and checked as a lake table's are (`temp::create`, `temp::apply`),
     and a write a DEFAULT leaves out takes it. Every expected answer is Postgres 16's, from a probe of these statements on /tmp/pg16-l3."""
     import psycopg
@@ -16971,7 +16971,7 @@ def jsons():
     answer jsonb as Postgres prints it, and nesting past 10,000 levels is refused 54001 (`pg_json_make.rs`'s MAX_DEPTH). A whole row (json_agg(t), to_json(t) and
     row_to_json(t) over a table, an alias, a CTE or a subquery) is made of its columns; json_agg's ORDER BY, FILTER, DISTINCT and OVER,
     the object forms, PostgREST's coalesce(json_agg(...), '[]') and a JSON column in a maker answer as Postgres 16 does, over HTTP, the
-    port and three nodes; a whole row that can't be made is refused by name (`pg_types.rs`, MAKERS).
+    port and three nodes; a whole row that can't be made is refused by name (`pg_trace.rs`, MAKERS).
     Measured, per 1,000,000 rows (the benchmark's lake: `t` as in jsonedits, and `m` = (id BIGINT, name VARCHAR) with
     'n' || id; the method as there; seconds per statement; in parentheses, the same run's build before parts A to D,
     which is also before main's merge):
@@ -18030,7 +18030,7 @@ def jsons():
 
 
 def _jsons_w2(check, url, q, info):
-    """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_types::one`
+    """Brief W2 (PR #131). The Postgres port types a statement's columns from the text its JSON operators read (`pg_trace::one`
     runs `pg_json::text` first), so `doc ? 'a'`, `?|`, `?&` and `@>` send doc as jsonb (3802) under Postgres's name for it; and
     COPY … TO STDOUT types its columns as RowDescription does, so a binary COPY sends a jsonb's version byte and a uuid's 16
     bytes. Every expected answer is Postgres 16's on the same rows (a scratch database, dropped after): the rows, the column

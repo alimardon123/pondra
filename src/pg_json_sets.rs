@@ -878,7 +878,7 @@ pub fn bare_aliases(stmt: &Statement) -> bool { ast::Visit::visit(stmt, &mut Fou
 /// Rewrites a statement's set-returning calls where SQL comes in (`types::rewrite`), and whether it changed any. What
 /// Postgres refuses, and what this engine doesn't take yet, is refused before anything changes. The names of changed
 /// SELECT items are kept as written (`names_kept`). `columns` are the lower-case names of the columns the statement's
-/// relations have (`pg_types::columns_named`): a bare value name (`bare_aliases`) is written `name.value` unless one of
+/// relations have (`pg_trace::columns_named`): a bare value name (`bare_aliases`) is written `name.value` unless one of
 /// them is that name. When they are unknown (None), no bare name is written.
 pub fn sets(stmt: &mut Statement, columns: Option<&HashSet<String>>) -> anyhow::Result<bool> {
     let mut scan = Scan::default();

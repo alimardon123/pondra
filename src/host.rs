@@ -1,10 +1,11 @@
 //! A node as the SQL front's host (`front.rs`): what the front asks, answered from the lake.
 
 use crate::ext_names::Attached;
-use crate::front::{Host, Own};
+use crate::front::{Host, Own, Relation};
 use crate::expander::Routine;
 use crate::measures::Definition;
-use crate::store::Lake;
+use crate::pg_trace::Ty;
+use crate::store::{Lake, TableMeta};
 use crate::ddl;
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::Statement;
@@ -35,6 +36,10 @@ impl Host for Lake {
     }
 
     async fn measure_views(&self, sql: &str) -> Result<Arc<HashMap<String, Arc<Definition>>>> { measure_views(self, sql).await }
+
+    async fn relation(&self, name: &str) -> Option<Relation<Self>> { relation(self, name).await }
+
+    async fn enum_labels(&self, name: &str) -> Option<Vec<String>> { crate::types::labels(self, name).await }
 
     // (The two below wrap free functions for the same reason as `own`: their passes ask queries.)
     fn types(&self, stmts: &mut [Statement]) -> impl Future<Output = Result<bool>> + Send { types_of(self, stmts) }
@@ -117,4 +122,38 @@ async fn measure_views(lake: &Lake, sql: &str) -> Result<Arc<HashMap<String, Arc
         }
     }
     Ok(Arc::new(out))
+}
+
+// What a name is to a node (`Host::relation`): the columns of a table, or a stored view's query. The front's traces read
+// them (`pg_trace`), so a node answers as it answered when the trace was the node's own.
+
+/// What `name` is to this node: a session's temporary table, a session's temporary view, or a table or stored view of
+/// this lake (or of the lake attached under its first part).
+async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
+    if let Some(cols) = crate::temp::columns_of(name) {
+        // (a session's temporary table shadows a lake table of its name, so its own columns and types come first)
+        return Some(Relation::Columns(cols.into_iter().map(|(c, t)| (c, t.as_deref().and_then(Ty::of))).collect()));
+    }
+    // (a session's temporary view: its query, traced as a stored view's is)
+    if let Some((_, sql)) = crate::temp::views(name).into_iter().find(|(n, _)| n == name) {
+        return Some(Relation::View { sql, lake: None });
+    }
+    let (other, local) = crate::ddl::resolve(lake, name).await.ok()?;
+    let lake = other.as_deref().unwrap_or(lake);
+    if let Ok(Some(m)) = lake.cat.meta(&crate::store::table_key(&local)).await {
+        if m.finish.is_some() {
+            // (a view that finishes its answers shows the columns it answers, SQL's names as `SELECT *` shows them, not its partial ones)
+            let l = m.described();
+            return Some(Relation::Columns(l.columns.iter().filter(|(c, _)| !l.marker(c)).map(|(c, _)| (c.clone(), l.sql_types.get(c).and_then(|t| Ty::of(t)))).collect()));
+        }
+        return Some(Relation::Columns(typed_columns(&m).map(|(c, t)| (c.to_string(), t)).collect()));
+    }
+    let view = lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(&local)).await.ok()??;
+    Some(Relation::View { sql: view.sql, lake: other })
+}
+
+/// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
+/// by. `sql_types` is keyed by the stored name.
+fn typed_columns(m: &TableMeta) -> impl Iterator<Item = (&str, Option<Ty>)> + '_ {
+    m.live().filter(|(_, n, _)| !m.marker(n)).map(|(s, n, _)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
 }

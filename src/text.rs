@@ -209,7 +209,7 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The functions that make JSON: the Postgres port traces their arguments (`pg_types`), so a JSON or
+/// The functions that make JSON: the Postgres port traces their arguments (`pg_trace`), so a JSON or
 /// whole-row argument is written as JSON.
 pub const JSON_MAKERS: &[&str] = &["to_json", "to_jsonb", "row_to_json", "json_build_object", "jsonb_build_object", "json_build_array",
     "jsonb_build_array", "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg"];
@@ -244,7 +244,7 @@ pub fn names_a_type(sql: &str) -> bool {
         return true;
     }
     // (a string compared with a column, `doc = '…'`, `'…' <> doc`, `doc IN ('…', …)`, `CASE doc WHEN '…'`, `doc IS DISTINCT FROM '…'`:
-    // a jsonb column reads it as jsonb's text (`pg_types::rewrite`) when it is a document, or JSON jsonb writes otherwise than
+    // a jsonb column reads it as jsonb's text (`pg_trace::rewrite`) when it is a document, or JSON jsonb writes otherwise than
     // as written: `doc = '1e2'` finds 100, `doc = ' 100 '` too. A canonical scalar (`'100'`, `'"x"'`, `'true'`) compares as it is
     // written, and a string that isn't JSON (`'x'`, `'alice'`) is not read at all, so a statement with only those is not parsed
     // for it. A document written into a column isn't read: `VALUES (1, '{…}')` stays unparsed)
