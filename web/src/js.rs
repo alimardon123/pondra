@@ -89,6 +89,44 @@ pub(crate) async fn body(response: &JsValue) -> Result<Vec<u8>, String> {
     Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
+/// A response's body read to the end, or None when it is more than `most` bytes: its `content-length` says so before
+/// anything is read, or a chunk takes it past as it is read (`body.getReader()`). Then no more is read, and the body is
+/// cancelled, so the rest is never fetched. The chunks are copied into the module's memory one at a time, so a body is
+/// never held twice in it; with no `most`, the whole body is read as `body` reads it.
+pub(crate) async fn body_within(response: &JsValue, most: Option<usize>) -> Result<Option<Vec<u8>>, String> {
+    let Some(most) = most else { return body(response).await.map(Some) };
+    let stream = get(response, "body")?;
+    let length = header(&get(response, "headers")?, "content-length")?.and_then(|length| length.parse::<usize>().ok());
+    if length.is_some_and(|length| length > most) {
+        if !stream.is_null() {
+            let _ = awaited(&stream, "cancel", &[]).await;
+        }
+        return Ok(None);
+    }
+    if stream.is_null() {
+        return Ok(Some(vec![])); // (a body of no bytes: a HEAD's, or a 204's)
+    }
+    let reader = call_method(&stream, "getReader")?;
+    let mut read = Vec::with_capacity(length.unwrap_or(0));
+    loop {
+        let chunk = awaited(&reader, "read", &[]).await.map_err(js_words)?;
+        if get(&chunk, "done")?.as_bool() == Some(true) {
+            return Ok(Some(read));
+        }
+        let value = get(&chunk, "value")?.dyn_into::<js_sys::Uint8Array>().map_err(js_words)?;
+        let (at, more) = (read.len(), value.length() as usize);
+        if at + more > most {
+            let _ = awaited(&reader, "cancel", &[]).await;
+            return Ok(None);
+        }
+        if at + more > read.capacity() {
+            read.reserve_exact((read.capacity() * 2).clamp(at + more, most) - at); // (doubled, as a Vec grows, but never past `most`)
+        }
+        read.resize(at + more, 0);
+        value.copy_to(&mut read[at..]);
+    }
+}
+
 /// A JavaScript failure's words: an Error's message, a thrown string, or none of those. (`JsString::from` on an object
 /// throws, so an object is never turned into a string that way.)
 pub(crate) fn js_words(e: JsValue) -> String {

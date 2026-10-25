@@ -281,6 +281,8 @@ async fn checkpoint(reach: &impl Reach, root: &str, files: &[String]) -> Result<
         _ => parquet_actions(reach, files.iter().map(|n| url(n)).collect()).await?,
     };
     let sidecars: Vec<String> = out.iter().filter_map(|a| a["sidecar"]["path"].as_str()).map(|p| if p.contains("://") { p.to_string() } else { url(&format!("_sidecars/{}", unescape(p))) }).collect();
+    let outside: Vec<&str> = sidecars.iter().map(String::as_str).filter(|s| s.strip_prefix(&format!("{root}/")).is_none_or(crate::lake_files::leaves)).collect();
+    reach.named(&outside).await?; // (one outside the table, by its whole URL or a `..`: the caller's to read, as the table is)
     if !sidecars.is_empty() {
         out.extend(parquet_actions(reach, sidecars).await?);
     }

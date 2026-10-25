@@ -355,7 +355,7 @@ def external():
             "gzip": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'gzip')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
             "temp": err("CREATE TEMPORARY EXTERNAL TABLE b4 STORED AS CSV LOCATION 'a.csv'"), "option": err("CREATE EXTERNAL TABLE b5 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.null_regex' 'x')"),
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
-            "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", b"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION 'dir/'"))}
+            "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", f"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION '{here}/dir/'".encode()))}  # (a path on the server's disk: a client's relative name is the lake's files, below)
     checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
         "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no file matches" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
@@ -381,16 +381,41 @@ def external():
     checks["the lake's own files read as a table by any reader, and nothing else of its folder; /objects and pondra.tables say each object's kind (a materialized view's too)"] = mine == [{"a": 1, "b": "x"}] \
         and all(("through a node it started itself" if not A.s3 else "no secret covers") in e for e in outside) and kinds.get("ev") == "files" and kinds.get("v") == "view" \
         and listed.get("ev") == "external table" and listed.get("v") == "view" and listed.get("mv_kinds") == "materialized view" and shown == ["mv_kinds"]
+    # An Iceberg table's metadata names its manifest list and manifests wherever it likes. One a client PUT into the lake's
+    # files is the lake's, but what it names outside them (the server's disk, the lake's own catalog) is refused to a
+    # non-owner by name before the node reads it with its own credentials, in the same words whether a file is there or not.
+    def iceberg_in_files(name, snapshot):
+        meta = {"format-version": 2, "table-uuid": str(uuid.uuid4()), "location": f"{area}{name}", "last-sequence-number": 1, "last-updated-ms": 0,
+                "last-column-id": 1, "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "a", "required": False, "type": "long"}]}],
+                "current-snapshot-id": 1, "snapshots": [{"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 0, "summary": {"operation": "append"}, **snapshot}]}
+        call(A.port, "PUT", f"/files/{name}/metadata/v1.metadata.json", json.dumps(meta).encode(), headers=hdr)
+    iceberg_in_files("ice_disk", {"manifest-list": "file:///etc/hostname"})
+    iceberg_in_files("ice_lake", {"manifest-list": f"{area}../catalog/x.avro"})
+    iceberg_in_files("ice_v1", {"manifests": ["file:///etc/hostname"]})
+    named_outside = [_raises_text(lambda n=n: anyone(f"SELECT * FROM read_iceberg('{area}{n}')")) for n in ("ice_disk", "ice_lake", "ice_v1")]
+    q(f"COPY (SELECT 1 AS a) TO '{here}/ice_ok/' (FORMAT iceberg)")  # (made beside the lake, then put in its files: read as moved)
+    for folder, _, names in os.walk(f"{here}/ice_ok"):
+        for n in names:
+            with open(os.path.join(folder, n), "rb") as f:
+                call(A.port, "PUT", f"/files/ice_ok/{os.path.relpath(os.path.join(folder, n), f'{here}/ice_ok')}", f.read(), headers=hdr)
+    checks["an Iceberg table in the lake's files: a non-owner is refused 42501 a manifest list or manifest it names outside them, before the node reads it, and reads one pondra wrote, moved there"] = \
+        all(e.startswith("403:") and ("through a node it started itself" if not A.s3 else "no secret covers") in e for e in named_outside) \
+        and anyone(f"SELECT * FROM read_iceberg('{area}ice_ok', allow_moved_paths => true)") == [{"a": 1}]
     # A client that isn't the program reads a relative name as a page does: the lake's own file of that name, as PUT wrote
     # it, with the program's rows. A name no file is at answers 404, its SQLSTATE in the x-pondra-sqlstate header (the body
     # is the words alone), and its words name the file as SQL wrote it.
     theirs = anyone("SELECT * FROM 'reports/q1.csv'")
+    anyone("CREATE EXTERNAL TABLE q1_ext (a BIGINT, b VARCHAR) STORED AS CSV LOCATION 'reports/q1.csv' OPTIONS ('format.has_header' 'true')")
+    their_table = anyone("SELECT * FROM q1_ext")
+    anyone("DROP TABLE q1_ext")
+    their_copy = _raises_text(lambda: anyone("COPY (SELECT 1 AS a) TO 'out.csv'"))
     conn = http.client.HTTPConnection("127.0.0.1", other.port, timeout=30)
     conn.request("POST", "/sql", b"SELECT * FROM 'nope.csv'")
     resp = conn.getresponse()
     nope_status, nope_code, nope_words = resp.status, resp.getheader("x-pondra-sqlstate"), resp.read().decode()
-    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows; a name no file is at: 404, 42P01"] = theirs == mine \
-        and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words
+    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too; a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
+        and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words \
+        and their_table == mine and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]

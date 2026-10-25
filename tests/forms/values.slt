@@ -1,0 +1,24 @@
+# A value its column can't hold is refused, in Postgres's codes: too long for a VARCHAR(n) (22001), not a number
+# (22P02), out of an INT's range (22003); a value that fits is taken.
+statement ok
+CREATE TABLE v (s VARCHAR(3), n INT)
+
+statement error 22001
+INSERT INTO v VALUES ('abcd', 1)
+
+statement error 22P02
+INSERT INTO v VALUES ('abc', 'x')
+
+statement error 22003
+INSERT INTO v VALUES ('abc', 3000000000)
+
+statement ok
+INSERT INTO v VALUES ('abc', 1)
+
+statement error 22001
+UPDATE v SET s = 'abcd'
+
+query TI
+SELECT s, n FROM v
+----
+abc 1

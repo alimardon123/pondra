@@ -72,6 +72,9 @@ A delete needs a key to name the row, so a Debezium delete for a table **without
 refused: the record fails with `INVALID_RECORD`, and the node logs why. Appending the `before` row
 instead would bring the deleted row back. Make the table with the source's `PRIMARY KEY`.
 
+To keep whole Postgres tables this way with Debezium Server, its settings and what it carries, see
+[Change data capture](/guides/change-data-capture/).
+
 ```sql
 CREATE TABLE users (id BIGINT PRIMARY KEY, name VARCHAR, score DOUBLE);
 ```

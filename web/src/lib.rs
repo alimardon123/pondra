@@ -199,15 +199,42 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
 
 /// A page's options: it reads the web through `fetch` (`fetch.rs`), asks `node` (`node.rs`) for the tables it doesn't
 /// have, keeps its files and tables in `store` (none is memory, as `new` has it; OPFS is `kept`'s), and watches the bytes
-/// its allocator holds (`heap::live`).
+/// its allocator holds (`heap::live`) against the line its device has (`device_line`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
     pondra::page::Options {
         web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
         store,
         node,
         memory: Some(Arc::new(heap::live)),
+        line: device_line(),
         ..Default::default()
     }
+}
+
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// The memory line a page has on this device (`page::Options::line`; `memory_max_gb` is taken over it), or None for the
+/// page's own 3 GiB. A phone's browser refuses to grow a module's memory well before 3 GiB, and the page would trap there
+/// instead of stopping the query that grew it (53200). A browser that says how much memory its device has
+/// (`navigator.deviceMemory`, in GiB, which Chrome rounds down to a power of two and gives as 8 at most) gives three
+/// eighths of it, so 8 keeps 3 GiB; one that doesn't say (Safari) on a device whose pointer is a finger (`(pointer:
+/// coarse)`: a phone or a tablet) gives 1 GiB. Elsewhere (a desktop's Firefox or Safari, Node) the page keeps its own.
+fn device_line() -> Option<usize> {
+    let global = JsValue::from(js_sys::global());
+    let said = js::get(&global, "navigator").and_then(|navigator| js::get(&navigator, "deviceMemory")).ok().and_then(|gib| gib.as_f64());
+    let gib = match said {
+        Some(gib) if gib > 0.0 => gib * 3.0 / 8.0,
+        _ if coarse_pointer(&global) => 1.0,
+        _ => return None,
+    };
+    Some((gib.min(3.0) * GIB) as usize)
+}
+
+/// Whether the device's main pointer is a finger (`matchMedia('(pointer: coarse)')`). A worker has no `matchMedia`: false.
+fn coarse_pointer(global: &JsValue) -> bool {
+    let Ok(match_media) = js::function(global, "matchMedia") else { return false };
+    let Ok(query) = match_media.call1(global, &"(pointer: coarse)".into()) else { return false };
+    js::get(&query, "matches").ok().and_then(|matches| matches.as_bool()) == Some(true)
 }
 
 /// Sets the panic hook once: a panic says why, not just "unreachable".

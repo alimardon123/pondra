@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
 pub(crate) use crate::rules::fit::{by_position, implicit};
 use crate::rules::fit::fit_with;
+pub(crate) use crate::rules::create::{definition, option_text};
 #[cfg(test)] pub(crate) use crate::rules::fit::fit;
 
 // ---------------------------------------------------------------- tables
@@ -86,15 +87,6 @@ pub(crate) fn made_by_job(spec: String, job: &str) -> Result<String> {
     Ok(spec.to_string())
 }
 
-/// A table's definition refused: invalid_table_definition (42P16) unless the error says its own
-/// code, never an internal error (XX000, which HTTP answers 500).
-pub(crate) fn definition(e: anyhow::Error) -> anyhow::Error {
-    match crate::codes::of(&e) {
-        "XX000" => crate::codes::coded("42P16", format!("{e:#}")),
-        _ => e,
-    }
-}
-
 /// Leader: create a table (sent again for an existing one, `publish` changes). The caller holds
 /// the lock that serialises table rewrites.
 pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> {
@@ -134,9 +126,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             crate::tier::check_partition(p, &columns)?;
         }
         ensure!(not_null.iter().chain(defaults.keys()).chain(identity.keys()).all(|c| columns.iter().any(|(n, _)| n == c)), "NOT NULL, DEFAULT and identity: columns of the table");
-        if let Some(c) = constraints.iter().flat_map(|k| &k.columns).find(|c| !columns.iter().any(|(n, _)| n == *c)) {
-            return Err(crate::codes::coded("42703", format!("column \"{c}\" named in a constraint does not exist")));
-        }
+        crate::rules::create::constraint_columns(&columns, &constraints)?;
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
@@ -147,16 +137,14 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             ensure!(!identity.contains_key(c), "{c} is an identity column: its values come from its sequence, not a DEFAULT");
             crate::seq::named_exist(lake, expr).await?; // (DEFAULT nextval('s'): s is there)
         }
-        if let Some((c, t)) = columns.iter().find(|(c, t)| identity.contains_key(c) && !["Int16", "Int32", "Int64"].contains(&t.as_str())) {
-            bail!("{c} is an identity column: it counts in smallint, integer or bigint, not {t}");
-        }
+        crate::rules::create::identity_types(&columns, &identity)?;
         crate::defaults::definition(&columns, &defaults, &checks).await?; // (a DEFAULT, a CHECK: as a temporary table's are)
         Ok((retention, columns, ttl))
     }
     .await
     .map_err(definition)?;
     // (a key's columns are NOT NULL too: a row with no key has nothing to be found by)
-    let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| not_null.contains(c) || key.contains(c) || identity.contains_key(*c)).cloned().collect();
+    let not_null: Vec<String> = columns.iter().map(|(c, _)| c).filter(|c| crate::rules::create::required(c.as_str(), &not_null, &key, &identity)).cloned().collect();
     let mut defaulted = publish.is_none(); // (a new table published as the node's --publish says)
     let mut meta = match lake.cat.get::<TableMeta>(&table_key(name)).await? {
         // (A new table reads the log from now on: a table of this name dropped earlier left rows
@@ -179,7 +167,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                 let t = &columns.iter().find(|(n, _)| n == c).expect("a column").1;
                 let as_type = match t.as_str() { "Int16" => "smallint", "Int32" => "integer", _ => "bigint" };
                 i.sequence = crate::seq::owned(lake, owner, c, [vec![crate::seq::Opt::As(as_type.into())], i.declared.clone()].concat()).await?;
-                defaults.insert(c.clone(), format!("nextval('{}')", i.sequence.replace('\'', "''")));
+                defaults.insert(c.clone(), crate::rules::create::identity_default(&i.sequence));
             }
             TableMeta { columns, key, merge, publish: publish.unwrap_or_else(default_publish), cluster: cluster.unwrap_or_default(), ttl, partition, order, not_null, defaults, checks, identity, constraints, enums, sql_types, folder, tiered: lake.visible(), made: Some((lake.visible(), crate::log::now_ms())), made_by, ids: true, properties: properties.unwrap_or_default(), retention_secs: retention, ..Default::default() }
         }
@@ -391,18 +379,6 @@ fn renamed(body: &mut ast::SetExpr, names: &[ast::Ident]) -> bool {
         ast::SetExpr::SetOperation { left, .. } => renamed(left, names),
         ast::SetExpr::Query(q) => renamed(&mut q.body, names),
         _ => false,
-    }
-}
-
-/// An option's value as text: a quoted string as it says (`'op = ''D'''` is `op = 'D'`), anything
-/// else as written.
-fn option_text(v: &ast::Expr) -> String {
-    match v {
-        ast::Expr::Value(ast::ValueWithSpan { value: ast::Value::SingleQuotedString(s) | ast::Value::DoubleQuotedString(s), .. }) => s.clone(),
-        // (a list: `publish = (delta, iceberg)`, `cluster_by = (a, b)`, as a string's commas)
-        ast::Expr::Tuple(t) => t.iter().map(option_text).collect::<Vec<_>>().join(", "),
-        ast::Expr::Nested(e) => option_text(e),
-        other => other.to_string().trim_matches('\'').to_string(),
     }
 }
 
@@ -932,64 +908,13 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         }
         (None, None) => declared().await?,
     };
-    let columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
-    let name = |e: &ast::Expr| e.to_string().trim_matches('"').to_string();
-    // (a PRIMARY KEY said NOT ENFORCED is a fact, not the key: `constraints.rs`)
-    let mut key: Vec<String> = c.constraints.iter().flat_map(|k| match k {
-        ast::TableConstraint::PrimaryKey(pk) if !crate::constraints::informational(&pk.characteristics) => pk.columns.iter().map(|i| name(&i.column.expr)).collect(),
-        _ => vec![],
-    }).collect();
-    key.extend(c.columns.iter().filter(|c| c.options.iter().any(|o| matches!(&o.option, ast::ColumnOption::PrimaryKey(pk) if !crate::constraints::informational(&pk.characteristics)))).map(|c| c.name.value.clone()));
-    let identity: BTreeMap<String, crate::seq::Identity> = c.columns.iter().filter_map(|c| crate::seq::identity_of(c).transpose().map(|i| i.map(|i| (c.name.value.clone(), i)))).collect::<Result<_>>().map_err(definition)?;
-    let not_null: Vec<String> = c.columns.iter().filter(|c| c.options.iter().any(|o| matches!(o.option, ast::ColumnOption::NotNull))).map(|c| c.name.value.clone()).collect();
-    let defaults: BTreeMap<String, String> = c.columns.iter().filter_map(|c| c.options.iter().find_map(|o| match &o.option {
-        ast::ColumnOption::Default(e) => Some((c.name.value.clone(), e.to_string())),
-        _ => None,
-    })).collect();
-    // CHECKs, named as Postgres names them when they aren't: `{table}_{column}_check`, `{table}_check`.
-    let table = object(&c.name).rsplit('.').next().unwrap_or_default().to_string();
-    let mut checks: Vec<(String, String)> = vec![];
-    let mut check = |name: Option<&ast::Ident>, base: String, expr: &ast::Expr| {
-        let name = name.map(ident).unwrap_or_else(|| (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}{}", i - 1) }).find(|n| !checks.iter().any(|(c, _)| c == n)).unwrap_or(base));
-        checks.push((name, expr.to_string()));
-    };
-    for col in &c.columns {
-        for o in &col.options {
-            if let ast::ColumnOption::Check(k) = &o.option {
-                check(k.name.as_ref().or(o.name.as_ref()), format!("{table}_{}_check", col.name.value), &k.expr);
-            }
-        }
-    }
-    for k in &c.constraints {
-        if let ast::TableConstraint::Check(k) = k {
-            check(k.name.as_ref(), format!("{table}_check"), &k.expr);
-        }
-    }
-    let mut opts: BTreeMap<String, String> = BTreeMap::new();
-    if let ast::CreateTableOptions::With(o) | ast::CreateTableOptions::Options(o) = &c.table_options {
-        for o in o {
-            if let ast::SqlOption::KeyValue { key, value } = o {
-                opts.insert(key.value.to_lowercase(), option_text(value));
-            }
-        }
-    }
-    // (`PARTITION BY`, `CLUSTER BY`, `SEQUENCE BY`, `TTL` and `MERGE sum` came in as these options: `layout.rs`)
-    if let o @ (ast::CreateTableOptions::Plain(_) | ast::CreateTableOptions::TableProperties(_)) = &c.table_options {
-        // (MySQL's `ENGINE=…` and the like: a feature of another engine, refused by name with its SQLSTATE)
-        return Err(crate::codes::coded("0A000", format!("CREATE TABLE {} … {o}: a table's options go in WITH (name = value, …)", c.name)));
-    }
-    const OPTIONS: [&str; 7] = ["publish", "cluster_by", "partition_by", "ttl", "order_by", "merge", "retention"];
-    if let Some(k) = opts.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
-        return Err(crate::codes::coded("22023", format!("CREATE TABLE … WITH ({k} = …): tables take {}", OPTIONS.join(", ")))); // (invalid_parameter_value, as Postgres refuses an option it doesn't know)
-    }
-    let list = |k: &str| opts.get(k).map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>());
-    let merge: BTreeMap<String, String> = list("merge").unwrap_or_default().iter().filter_map(|m| m.split_once(':')).map(|(c, f)| (c.into(), f.into())).collect();
-    let mut columns = columns;
-    if !key.is_empty() && merge.is_empty() && !columns.iter().any(|(c, _)| c == "_deleted") {
+    let mut columns: Vec<(String, String)> = fields.iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    // (what the statement declares, read from its AST alone: `rules/create.rs`, refused in the order a node always has)
+    let d = crate::rules::create::declared(c)?;
+    if d.keyed() && !columns.iter().any(|(c, _)| c == "_deleted") {
         columns.push(("_deleted".into(), "Boolean".into())); // (so DELETE works; writes leave it out)
     }
-    let constraints = crate::constraints::declared(c, &table).map_err(definition)?;
-    let spec = j!({"columns": columns, "key": key, "merge": merge, "publish": list("publish"), "cluster_by": list("cluster_by"), "ttl": opts.get("ttl"), "partition_by": opts.get("partition_by"), "order_by": opts.get("order_by"), "not_null": not_null, "defaults": defaults, "checks": checks, "retention": opts.get("retention"), "identity": identity, "constraints": constraints, "enums": enums, "sql_types": sql_types});
+    let spec = j!({"columns": columns, "key": d.key, "merge": d.merge, "publish": d.list("publish"), "cluster_by": d.list("cluster_by"), "ttl": d.options.get("ttl"), "partition_by": d.options.get("partition_by"), "order_by": d.options.get("order_by"), "not_null": d.not_null, "defaults": d.defaults, "checks": d.checks, "retention": d.options.get("retention"), "identity": d.identity, "constraints": d.constraints, "enums": enums, "sql_types": sql_types});
     Ok(spec.to_string())
 }
 

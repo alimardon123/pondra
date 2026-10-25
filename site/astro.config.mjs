@@ -39,7 +39,7 @@ export default defineConfig({
         { label: 'Docs', items: [
           { label: 'Get started', items: ['start/install', 'start/first-lake', 'start/features', 'start/tour', 'start/shell', 'start/console'] },
           { label: 'Data', collapsed: true, items: ['guides/tables', 'guides/load-data', 'guides/query', 'guides/measures', 'guides/change-rows', 'guides/past', 'guides/files-and-other-lakes'] },
-          { label: 'Streams', collapsed: true, items: ['guides/views', 'guides/windows', 'guides/stream-joins', 'guides/flows', 'guides/kafka'] },
+          { label: 'Streams', collapsed: true, items: ['guides/views', 'guides/windows', 'guides/stream-joins', 'guides/flows', 'guides/kafka', 'guides/change-data-capture'] },
           { label: 'Python and code', collapsed: true, items: ['guides/sql-and-python', 'guides/dataframes', 'guides/pyspark', 'guides/functions-and-procedures', 'guides/scripts', 'guides/workspace', 'guides/tasks', 'guides/notebooks'] },
           { label: 'Teams', collapsed: true, items: ['guides/environments', 'guides/projects', 'guides/git', 'guides/sharing', 'guides/security', 'guides/single-sign-on'] },
           { label: 'Connect', collapsed: true, items: ['guides/agents', 'guides/dbt-and-bi', 'guides/other-engines', 'guides/ai-and-files'] },
