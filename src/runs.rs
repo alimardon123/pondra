@@ -435,10 +435,16 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     } else if crate::routines::word(p, "after") {
         loop {
             task.after.push(crate::text::object(&p.parse_object_name(false)?));
+            // (`AFTER a FAILED`, `AFTER ANY FAILED`, `AFTER a ALWAYS`: a pipeline's steps, not a task's; `any` and `all` read as names)
+            if crate::routines::word(p, "failed") || crate::routines::word(p, "always") {
+                return Err(crate::codes::coded("0A000", crate::kept::AFTER_FAILED));
+            }
             if !p.consume_token(&Token::Comma) {
                 break;
             }
         }
+    } else if crate::routines::word(p, "on") && (crate::routines::word(p, "files") || crate::routines::word(p, "change")) {
+        return Err(crate::codes::coded("0A000", crate::kept::ON_FILES)); // (a pipeline's trigger, where a task's SCHEDULE or AFTER goes)
     } else {
         bail!("SCHEDULE '…' or AFTER task is missing");
     }
@@ -1076,6 +1082,25 @@ pub fn no_runs() -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_heads_are_refused_by_name() {
+        // (a task's head as `routines` reads it: CREATE TASK taken, then the name and what follows)
+        let head = |sql: &str| {
+            let mut p = Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(sql).unwrap();
+            let _ = p.parse_keywords(&[Keyword::CREATE, Keyword::TASK]);
+            task(&mut p, sql).map(|_| ()).map_err(|e| e.to_string())
+        };
+        assert!(head("CREATE TASK t AFTER a AS SELECT 1").is_ok());
+        assert!(head("CREATE TASK t SCHEDULE '1 hour' AS SELECT 1").is_ok());
+        assert_eq!(head("CREATE TASK t AFTER a FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        assert_eq!(head("CREATE TASK t AFTER a, b FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        assert_eq!(head("CREATE TASK t AFTER a ALWAYS AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        assert_eq!(head("CREATE TASK t AFTER ANY FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        assert_eq!(head("CREATE TASK t AFTER ALL ALWAYS AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        assert_eq!(head("CREATE TASK t ON FILES 'landing/' AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
+        assert_eq!(head("CREATE TASK t ON CHANGE OF sales.orders AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
+    }
 
     #[test]
     fn execute_task() {

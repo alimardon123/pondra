@@ -113,7 +113,8 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
     }
     Some(match what {
-        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        // (a refusal is said as it is, the pipeline's words; any other mistake gets the usage too)
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {

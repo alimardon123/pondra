@@ -163,6 +163,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
+        _ if has("come in 1.1") || has("comes in 1.1") || has("coming in 1.1") => "0A000", // feature_not_supported (a statement 1.1 brings, refused by name where it is read as text: `kept.rs`)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
         _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
