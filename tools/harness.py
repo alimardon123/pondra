@@ -24319,19 +24319,19 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
-# 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
-# it, so CI runs the suite in parts side by side that end together. A section not listed
-# counts as 5 s (sso_flow and sso_pg came after that run: their 15 and 20 are guesses).
-SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "backpressure": 39,
-        "functions": 38, "server": 34, "doors": 33, "crash": 32, "kafkas": 31, "finals": 28, "pace": 27,
-        "found": 23, "clouds": 21, "kafka": 21, "load": 20, "live": 17, "refreshed": 15, "sso_flow": 15, "sso_pg": 20,
-        "users": 14, "workspace": 14, "reader": 13, "scale": 12, "sealed": 12, "answers_big": 11,
-        "cursors": 11, "find": 11, "history": 11, "objects": 11, "procedures": 11, "sessions": 11,
-        "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
-        "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
-        "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60, "jsonfns": 60}
+# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40200329643,
+# 2026-10-25: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
+# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by the table of
+# 10-13, that run's three parts took 654, 441 and 608 s; by this one, four take about 426 s each.)
+SECS = {"memory": 240, "scale": 122, "waits": 113, "hot": 94, "sso": 90, "stopped": 77, "guesses": 45, "doors": 40,
+        "functions": 38, "crash": 37, "server": 36, "served": 33, "backpressure": 31, "finals": 28, "pace": 27,
+        "kafka": 26, "kafkas": 24, "found": 23, "clouds": 21, "tails": 21, "load": 20, "live": 18, "objects": 18,
+        "refreshed": 15, "lateral": 14, "sso_flow": 14, "users": 14, "workspace": 13, "reader": 12, "history": 11,
+        "sealed": 11, "sessions": 11, "answers_big": 10, "cursors": 10, "files": 10, "flows": 10, "guarded": 10,
+        "procedures": 10, "reached": 10, "begin": 9, "clients": 9, "columns": 9, "fills": 9, "followers": 9,
+        "schemas": 9, "serverless": 9, "temps": 9, "guard": 8, "learn": 8, "alter": 7, "bykey": 7, "fence": 7,
+        "safety": 7, "sequences": 7, "windows": 7, "catalogs": 6, "clusters": 6, "dedup": 6, "find": 6,
+        "friendly": 6, "loads": 6, "memorylake": 6, "plans": 6, "unique_doors": 6}
 
 
 def all_tests():
