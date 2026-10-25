@@ -336,7 +336,9 @@ class Pondra:
         format = format or ("arrow" if _has_arrow() else "json")
         changes = _changes(sql)
         if changes and not job:
-            job = f"auto-{self.producer}-{next(self._auto)}"  # (sent again after a node went, it is applied once; `auto-`: kept for the retry window only)
+            # (sent again after a node went, it is applied once. `auto-until<S>-`: S is the last moment this request may be sent again, its first send
+            # plus `retry_secs`, so the node keeps its mark until then, and then the retry window: store::kept_ms)
+            job = f"auto-until{int(time.time() + self.retry_secs)}-{self.producer}-{next(self._auto)}"
         again = bool(changes) or _is_query(sql) and not re.search(r"(?i)\bstart\s*\(", _code(sql))  # (pondra.start runs something)
         path = f"/sql?format={format}" + (f"&job={urllib.parse.quote(job)}" if job else "") + (f"&catalog={catalog}" if catalog else "")
         if not params and not sent and not views:

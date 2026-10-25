@@ -1,7 +1,6 @@
 //! The `pondra` command: its subcommands and options, and what each one starts.
 use crate::*;
 use clap::Parser;
-use datafusion::arrow::util::pretty::pretty_format_batches;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -609,10 +608,7 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Cmd::Lead { dir } => write::lead_only(&dir).await?,
-        Cmd::Backup { lake, to, retention_days } => {
-            let stmt = write::Stmt::Ddl(vec![ddl::Ddl::BackupDatabase { database: None, to, retention_days }]);
-            println!("{}", serde_json::to_string_pretty(&write::from_cli(&lake, stmt).await?)?);
-        }
+        Cmd::Backup { lake, to, retention_days } => sql_on_guest(&lake, &backup_sql(&to, retention_days), &[]).await?,
         Cmd::Restore { from, to, at } => {
             let at = at.as_deref().map(backup::instant).transpose()?;
             println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
@@ -628,32 +624,7 @@ async fn run() -> anyhow::Result<()> {
             }
             let _ = attached;
         }
-        Cmd::Sql { dir, query, attach: attached } => {
-            // `USE` sets a session's path, and this command has no session (`path.rs`).
-            anyhow::ensure!(!path::is_use(&query) && path::set_schema(&query).is_none(), "{}", settings::NO_SESSION);
-            // DuckDB's INSTALL and LOAD answer a row naming what happened, as a page answers them (`extension.rs`).
-            let query = match crate::extension::row(&query) { Some(row) => row?, None => query };
-            // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then
-            // a write or a query. A write to a folder with no lake yet makes one.
-            let lake = match write::parse(&query) {
-                Some(_) => write::made(&dir).await?,
-                None => store::Lake::open(&dir, false, false).await?,
-            };
-            for spec in &attached {
-                node::attach(&lake, spec, "", false).await?;
-            }
-            ddl::sync(&lake, "", false).await?;
-            let query = routines::expand(&lake, &query).await?;
-            match write::parse(&query) {
-                Some(stmt) => println!("{}", ext::scope(true, write::from_cli(&dir, stmt)).await?), // (its user's own machine: its files, its credentials)
-                None => {
-                    let planned = sys::planned(&query)?; // (as every door: ASOF JOIN, and `*` without the system columns a query names)
-                    let run = async { anyhow::Ok(query::session(&lake, &query, "").await?.enable_url_table().sql(&planned).await?.collect().await?) };
-                    let batches = ext::scope(true, auth::WHO.scope(auth::Principal::token(auth::Role::Admin), run)).await?; // (and its storage: attached lakes too)
-                    println!("{}", pretty_format_batches(&batches)?);
-                }
-            }
-        }
+        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&dir, &query, &attached).await?,
         Cmd::Token { dir, user, name } => {
             let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
             let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
@@ -674,8 +645,100 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `pondra sql`, and `pondra backup` (its one statement, `backup_sql`): one statement, asked of a guest node of the lake
+/// (`node::Options::guest`), which answers it as `POST /sql` does, and ends. A plain query or an export (`COPY … TO`) reads;
+/// anything else may write, and leads the lake for the moment if nobody does. The output is what the node gives: the
+/// notices its procedures printed, then the answer.
+async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
+    // `USE` sets a session's path, and this command has no session (`path.rs`).
+    anyhow::ensure!(!path::is_use(query) && path::set_schema(query).is_none(), "{}", settings::NO_SESSION);
+    // DuckDB's INSTALL and LOAD answer a row naming what happened, as a page answers them (`extension.rs`).
+    let query = match extension::row(query) { Some(row) => row?, None => query.to_string() };
+    let reads = server::single_statement(&query).is_some_and(|one| server::plain_statement(&one)) || matches!(write::parse(&query), Some(write::Stmt::CopyTo(..)));
+    let guest = if reads { node::Guest::Reads } else { node::Guest::Writes };
+    let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
+        Ok(node) => node,
+        // (its leader is alive and doesn't answer from here: the write goes through the bucket's inbox)
+        Err(e) if e.downcast_ref::<node::Unreached>().is_some() => return through_inbox(dir, &query, attached).await,
+        Err(e) => return Err(e),
+    };
+    // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
+    let job = url::form_urlencoded::byte_serialize(write::job().as_bytes()).collect::<String>();
+    let answer = async {
+        let res = node.ask("POST", &format!("/sql?format=table&job={job}"), query.into_bytes()).await?;
+        let (ok, heard, sqlstate) = (res.status().is_success(), shell::notices(res.headers()), res.headers().get("x-pondra-sqlstate").cloned());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+        anyhow::Ok((ok, heard, sqlstate, String::from_utf8_lossy(&body).into_owned()))
+    }
+    .await;
+    let finished = node.finish().await; // (before anything prints: a guest that led waits for what it wrote to be durable)
+    let (ok, heard, sqlstate, body) = answer?;
+    if !ok {
+        let err = write::refusal(sqlstate.as_ref(), body);
+        // (fenced out by a newer writer: run again with this job, so whoever records it records it once, as `write::deliver` does)
+        if write::fenced(&err) && write::tries() < 5 {
+            if let Err(e) = finished {
+                eprintln!("the guest didn't end cleanly before the run again: {e:#}");
+            }
+            cluster::restart_with("fenced while writing", &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())]);
+        }
+        return Err(err);
+    }
+    finished?;
+    print!("{heard}");
+    println!("{body}");
+    Ok(())
+}
+
+/// A write whose lake's leader is alive but doesn't answer from this machine's guest start (`node::Unreached`): it is
+/// sent as a one-off writer sends it (`write::through_bucket_statement`): over HTTP if this machine reaches the leader after
+/// all, else through the bucket's inbox, where the leader records it, or this process leads for a moment. The inbox carries
+/// one statement that writes, so a text of several, a CALL, a script or a setting is refused by name.
+async fn through_inbox(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
+    let refused = |why: &str| anyhow::anyhow!("{}, and {why}", node::Unreached);
+    if routines::split(query).len() > 1 {
+        return Err(refused("this text is several statements: the inbox takes one statement at a time, so send each one by itself"));
+    }
+    // As a node takes SQL: a write to a folder with no lake yet makes one, led for a moment as `pondra lead` leads it.
+    let lake = match (write::parse(query).is_some(), store::Lake::open(dir, false, false).await) {
+        (_, Ok(lake)) => lake,
+        (true, Err(_)) => {
+            write::lead_only(dir).await?;
+            store::Lake::open(dir, false, false).await?
+        }
+        (false, Err(e)) => return Err(e),
+    };
+    for spec in attached {
+        node::attach(&lake, spec, "", false).await?;
+    }
+    ddl::sync(&lake, "", false).await?;
+    // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then a write.
+    let query = routines::expand(&lake, query).await?;
+    let Some(stmt) = write::parse(&query) else {
+        return Err(refused("this statement isn't a write the inbox carries (a CALL, a script or a setting): it needs the leader"));
+    };
+    println!("{}", ext::scope(true, write::through_bucket_statement(&lake, stmt)).await?); // (its user's own machine: its files, its credentials)
+    Ok(())
+}
+
+/// The statement `pondra backup` runs on the lake: `BACKUP DATABASE TO 'to' [WITH (retention_days = n)]`, its place quoted
+/// the way SQL quotes a string (a `'` doubled), which `write::parse` reads back.
+fn backup_sql(to: &str, retention_days: Option<u64>) -> String {
+    let keep = retention_days.map(|d| format!(" WITH (retention_days = {d})")).unwrap_or_default();
+    format!("BACKUP DATABASE TO '{}'{keep}", to.replace('\'', "''"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_backup_names_its_place_as_sql_quotes_it() {
+        assert_eq!(super::backup_sql("backups/till", None), "BACKUP DATABASE TO 'backups/till'");
+        let sql = super::backup_sql("it's/here", Some(3));
+        assert_eq!(sql, "BACKUP DATABASE TO 'it''s/here' WITH (retention_days = 3)");
+        let Some(crate::write::Stmt::Ddl(ds)) = crate::write::parse(&sql) else { panic!("a backup statement: {sql}") };
+        assert!(matches!(&ds[..], [crate::ddl::Ddl::BackupDatabase { database: None, to, retention_days: Some(3) }] if to == "it's/here"), "{sql}");
+    }
+
     #[test]
     fn a_command_mistyped() {
         for (word, c) in [("serv", "serve"), ("sevre", "serve"), ("sorve", "serve"), ("aply", "apply"), ("stauts", "status")] {

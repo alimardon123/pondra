@@ -146,7 +146,7 @@ pondra sql --dir s3://my-bucket/lake "INSERT INTO events VALUES (10001, 'u1', 1.
 +-------+
 | 10000 |
 +-------+
-{"committed":true}
+{"rows":1}
 ```
 
 Opening a lake's catalog is about twenty sequential requests, so a serverless query has a floor. As

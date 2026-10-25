@@ -418,30 +418,30 @@ pub async fn folder_of(lake: &Lake, t: &str) -> Result<String> {
 pub fn seg_key(n: u64) -> String { format!("s/{n:020}") }
 pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 
-/// How long a producer's mark is kept after its last commit, from its name (0: kept for good, as every
-/// mark was before expiries). Three windows:
+/// How long a producer's mark is kept after its last commit, from its name and the time `now` (ms; 0: kept for
+/// good, as every mark was before expiries). Three windows:
 /// - the named window, `copy::retention_ms` (64 days): a job a client named (`POST /sql?job=`,
-///   `POST /insert/{t}?job=`, the Python client's `job=`, `PONDRA_JOB`). The docs promise that a job sent
-///   again is applied once, and a daily load may be re-run days later;
-/// - the retry window, `retry_ms`: an id nobody named (it starts `auto-`, `log::auto_job`), a transaction's
-///   COMMIT and a COPY's chunks, unless a client named the transaction's job;
+///   `POST /insert/{t}?job=`, the Python client's `job=`, `PONDRA_JOB`) whose name doesn't start `auto-`. The docs
+///   promise that a job sent again is applied once, and a daily load may be re-run days later;
+/// - the retry window (`job_kept`): an id that starts `auto-` (the clients' own: `auto-until<S>-` ids, which say
+///   their last resend time, `client_until`, and the others, `log::auto_job`'s and the older clients'), a
+///   transaction's COMMIT and a COPY's chunks, unless a client named the transaction's job;
 /// - 0 for the rest: views', tasks', Kafka's and `/append`'s producers, and the records of COPY INTO files
 ///   (`job:load:`) and of Iceberg snapshots (`job:iceberg:`), which their own code keeps or expires.
 ///
 /// The retry window was checked against the paths that send each kind again, not taken on trust:
-/// - an `auto-` id is resent only by its client's own retries (the Python client's `retry_secs`, 60 s,
-///   python/pondra/client.py:186), by a fenced `pondra sql` starting over with its job (write.rs ~2299,
-///   `PONDRA_JOB` is passed on), and by the inbox: a leader committed the request and died before it deleted
-///   it, and the next writer waits out `alive`'s 30 s (cluster.rs:554, inbox.rs);
+/// - an `auto-` id is resent only by its client's own retries (the clients' `retry_secs`, python/pondra/client.py,
+///   js/index.js), by a fenced `pondra sql` starting over with its job (write.rs ~2299, `PONDRA_JOB` is passed on),
+///   and by the inbox: a leader committed the request and died before it deleted it, and the next writer waits out
+///   `alive`'s 30 s (cluster.rs:554, inbox.rs);
 /// - a transaction's COMMIT (`txn:{id}:{table}`, a fresh id per transaction: txn.rs `start`) is sent once, by
 ///   the node that runs it (txn.rs `commit`: `write::post` to the leader, or `commit_here` on the leader), and
 ///   a failed send goes back to the client as an error with the transaction gone, so nothing sends it again;
 ///   a named transaction (`txn:job-{j}:`) is sent again by its client, so it takes the named window;
 /// - a COPY chunk (`copy:{job}`, pg.rs ~642) is appended once, and its error goes back to the client, which
 ///   can't resume a COPY: nothing sends a chunk again.
-/// So the retry window covers all of them with room. It is `2 × max(PONDRA_LOCK_LEASE_SECS, 60 s)`.
-pub fn kept_ms(producer: &str) -> u64 {
-    let named = |job: &str| if job.starts_with("auto-") { retry_ms() } else { crate::copy::retention_ms() };
+pub fn kept_ms(producer: &str, now: u64) -> u64 {
+    let named = |job: &str| job_kept(job, now);
     if let Some(job) = producer.strip_prefix("sql:") {
         return named(job);
     }
@@ -460,7 +460,35 @@ pub fn kept_ms(producer: &str) -> u64 {
     0
 }
 
-/// The retry window (`kept_ms`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
+/// The window of a job id, from its name (`kept_ms`):
+/// - `auto-until<S>-…` (a client's id, `S` its last resend time in unix seconds: its first send plus its `retry_secs`):
+///   the mark is kept until `S` plus the retry window, so a resend that is still allowed finds it. Measured from `now`
+///   (a commit): `max(retry_ms, S - now) + retry_ms`, and 24 hours at most, whatever `S` says;
+/// - any other `auto-…` id: the clients' own ids (`log::auto_job`, an older client's `auto-{producer}-{n}`, and the
+///   Python client's `producer=`, which is the user's own name, so an `auto-` name a user picks lands here too): the
+///   retry window, whatever follows the prefix;
+/// - any other job: a name a client chose, which is kept for the named window (`copy::retention_ms`).
+fn job_kept(job: &str, now: u64) -> u64 {
+    if let Some(until_s) = client_until(job) {
+        let left = until_s.saturating_mul(1000).saturating_sub(now);
+        return left.max(retry_ms()).saturating_add(retry_ms()).min(UNTIL_CAP_MS);
+    }
+    if job.starts_with("auto-") {
+        return retry_ms();
+    }
+    crate::copy::retention_ms()
+}
+
+/// The most a mark is kept for its client's deadline (`job_kept`): a day.
+const UNTIL_CAP_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// `S` of a job id `auto-until<S>-…` (digits, then a dash), if it is one: the last moment its client may send it again.
+pub fn client_until(job: &str) -> Option<u64> {
+    let (digits, _) = job.strip_prefix("auto-until")?.split_once('-')?;
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().unwrap_or(u64::MAX))
+}
+
+/// The retry window (`job_kept`): twice the lease (`locks::lease`, PONDRA_LOCK_LEASE_SECS, 60 s by
 /// default), and at least a minute, so 120 s by default. It has no setting of its own.
 pub fn retry_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1106,6 +1134,12 @@ pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionCo
     ctx
 }
 
+/// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
+pub const READER_POLL: Duration = Duration::from_millis(250);
+
+/// A guest that reads reads one snapshot, for one statement, and never polls: its life is far shorter than this.
+pub const READER_ONE_SNAPSHOT: Duration = Duration::from_secs(3600);
+
 impl Lake {
     /// `writer`: the leader. `streamed`: a follower, which also gets every commit streamed from
     /// the leader, so its own catalog view only needs the leader's checkpoints (no log replay).
@@ -1113,6 +1147,11 @@ impl Lake {
     pub const NO_LAKE: &'static str = "holds no lake yet";
 
     pub async fn open(url: &str, writer: bool, streamed: bool) -> Result<Arc<Lake>> {
+        Self::open_polled(url, writer, streamed, READER_POLL).await
+    }
+
+    /// `open`, a reader polling the bucket every `poll` (`READER_POLL`, or `READER_ONE_SNAPSHOT` for a guest's one statement).
+    pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
@@ -1142,7 +1181,7 @@ impl Lake {
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => Catalog::writer(store.clone(), cache, local).await?,
-                false => match Catalog::opened(store.clone(), streamed, cache).await {
+                false => match Catalog::opened(store.clone(), streamed, cache, poll).await {
                     Ok(cat) => cat,
                     // (no catalog at all: say so, rather than the database's own words for it)
                     Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -1190,7 +1229,8 @@ impl Lake {
                 lake.cat.send(Frame::Durable(id));
             }
         });
-        while let Some((handle, d, done)) = writes.recv().await {
+        while let Some((handle, d, done, sent)) = writes.recv().await {
+            let t = commit_stage("queued", sent);
             let Some(lake) = me.upgrade() else { return };
             let cat = &lake.cat;
             let need = cat.replicas.saturating_sub(1);
@@ -1216,6 +1256,7 @@ impl Lake {
                     _ = acked.changed() => {}
                 }
             }
+            let t = commit_stage("durable", t);
             if need == 0 {
                 cat.send(Frame::Change(d.clone()));
             }
@@ -1224,6 +1265,7 @@ impl Lake {
             cat.send(Frame::Committed(d.id));
             let _ = to_bucket.send((handle, d.id));
             let _ = done.send(());
+            commit_stage("applied", t);
         }
     }
 
@@ -1720,6 +1762,95 @@ fn same_bytes(a: &Bytes, b: &Bytes) -> bool {
     (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
 
+/// The keys the node holds, each with the commit that put it and its value (None: deleted, kept as a tombstone where the
+/// node doesn't hold the whole catalog). It counts the live producers' marks (`p/`) and expiries (`g/`, not the old marks'
+/// `g/~` pass) as they change, under the same lock, so a scrape reads two numbers instead of scanning the range
+/// (`Catalog::tallies`). Every change goes through the methods below, which keep the counts.
+#[derive(Default)]
+struct Overlay {
+    map: BTreeMap<String, (u64, Option<Bytes>)>,
+    marks: usize,
+    expiries: usize,
+}
+
+impl std::ops::Deref for Overlay {
+    type Target = BTreeMap<String, (u64, Option<Bytes>)>;
+    fn deref(&self) -> &Self::Target { &self.map }
+}
+
+impl Overlay {
+    /// Puts `k` as `v`, whatever was there.
+    fn set(&mut self, k: String, v: (u64, Option<Bytes>)) {
+        let (was, is) = (self.map.get(&k).is_some_and(|(_, old)| old.is_some()), v.1.is_some());
+        self.map.insert(k.clone(), v);
+        self.tally(&k, was, is);
+    }
+
+    /// Puts `k` as `v` if nothing is there.
+    fn insert_absent(&mut self, k: String, v: (u64, Option<Bytes>)) {
+        if !self.map.contains_key(&k) {
+            self.set(k, v);
+        }
+    }
+
+    fn remove(&mut self, k: &str) {
+        if let Some((_, v)) = self.map.remove(k) {
+            self.tally(k, v.is_some(), false);
+        }
+    }
+
+    /// Keeps the entries `keep` says to keep.
+    fn retain(&mut self, mut keep: impl FnMut(&str, &(u64, Option<Bytes>)) -> bool) {
+        let (mut marks, mut expiries) = (0, 0);
+        self.map.retain(|k, v| {
+            let kept = keep(k, v);
+            if !kept && v.1.is_some() {
+                match Self::family(k) {
+                    Some(true) => marks += 1,
+                    Some(false) => expiries += 1,
+                    None => {}
+                }
+            }
+            kept
+        });
+        self.marks -= marks;
+        self.expiries -= expiries;
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        (self.marks, self.expiries) = (0, 0);
+    }
+
+    /// Whether `k` is a producer's mark (`Some(true)`), an expiry (`Some(false)`), or neither.
+    fn family(k: &str) -> Option<bool> {
+        if k.starts_with("p/") {
+            Some(true)
+        } else if k.starts_with(crate::log::EXPIRY) && !k.starts_with("g/~") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// A key went from live (`was`) to live or deleted (`is`): counted if it is one of the two families.
+    fn tally(&mut self, k: &str, was: bool, is: bool) {
+        if was == is {
+            return;
+        }
+        let count = match Self::family(k) {
+            Some(true) => &mut self.marks,
+            Some(false) => &mut self.expiries,
+            None => return,
+        };
+        if is {
+            *count += 1;
+        } else {
+            *count -= 1;
+        }
+    }
+}
+
 /// The catalog is a SlateDB key-value store inside the lake.
 /// One process holds the writer (SlateDB fences out any other); any number can read.
 pub struct Catalog {
@@ -1741,7 +1872,7 @@ pub struct Catalog {
     // deleted), each with its commit number, are laid over our own view of the catalog, which is
     // a few seconds behind. A read uses them only if our view isn't ahead of the stream (else
     // they could be older than what the view has) and, after a gap, once the view passed `hold`.
-    overlay: Mutex<BTreeMap<String, (u64, Option<Bytes>)>>,
+    overlay: Mutex<Overlay>,
     view: (AtomicU64, AtomicU64), // our own view's "c" and the "n" it had at or before that "c"
     pruned: AtomicU64,            // streamed changes up to this commit were dropped (the view has them)
     pins: Mutex<BTreeMap<u64, usize>>, // scans in progress, by the view "c" they started from
@@ -1774,7 +1905,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>);
+type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
 
 enum Db_ {
     Writer(Db),
@@ -2104,15 +2235,18 @@ impl Catalog {
         let mut all = collect(db.scan(b"".to_vec()..b"d/".to_vec()).await.map_err(fatal)?).await?;
         all.extend(collect(db.scan(b"d0".to_vec()..vec![0xff]).await.map_err(fatal)?).await?);
         trace("the catalog in memory", t0);
-        cat.overlay.get_mut().unwrap().extend(all.into_iter().map(|(k, v)| (k, (c, Some(v)))));
+        let overlay = cat.overlay.get_mut().unwrap();
+        for (k, v) in all {
+            overlay.set(k, (c, Some(v)));
+        }
         cat.streamed.store(c, Relaxed);
         cat.loud.store(c, Relaxed);
         cat.mirror.store(true, Relaxed);
         Ok(cat)
     }
 
-    async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions) -> Result<Self> {
-        let opts = DbReaderOptions { manifest_poll_interval: Duration::from_millis(250), skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
+    async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
+        let opts = DbReaderOptions { manifest_poll_interval: poll, skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
         // FollowLatest writes nothing, so readers work with read-only bucket credentials.
         let (cache, held) = blocks();
         let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache);
@@ -2127,8 +2261,8 @@ impl Catalog {
     /// so a bucket that isn't there, or that refuses the credentials, left `pondra sql` waiting
     /// for ever. When opening takes a while, a listing (after the store's own retries) says
     /// whether there is a catalog to wait for.
-    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions) -> Result<Self> {
-        let open = Self::reader(store.clone(), streamed, cache);
+    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
+        let open = Self::reader(store.clone(), streamed, cache, poll);
         tokio::pin!(open);
         if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
             return cat;
@@ -2226,10 +2360,12 @@ impl Catalog {
         // (The leader reads inline data from its own store; everyone else keeps it until their
         // view has it. With the whole catalog here, a deleted key is simply gone.)
         let writer = self.is_writer();
-        o.extend(d.puts.iter().filter(|(k, _)| !(writer && k.starts_with("d/"))).map(|(k, v)| (k.clone(), (d.id, Some(v.clone())))));
+        for (k, v) in d.puts.iter().filter(|(k, _)| !(writer && k.starts_with("d/"))) {
+            o.set(k.clone(), (d.id, Some(v.clone())));
+        }
         match self.mirror.load(Relaxed) {
-            true => d.deletes.iter().for_each(|k| drop(o.remove(k))),
-            false => o.extend(d.deletes.iter().map(|k| (k.clone(), (d.id, None)))),
+            true => d.deletes.iter().for_each(|k| o.remove(k)),
+            false => d.deletes.iter().for_each(|k| o.set(k.clone(), (d.id, None))),
         }
         self.streamed.fetch_max(d.id, Relaxed);
         if !quiet(d) {
@@ -2286,10 +2422,10 @@ impl Catalog {
             if self.mirror.load(Relaxed) {
                 // The mirror answers every read but inline data without our view, so commits the
                 // view already has must still arrive through the stream: `pruned` stays put.
-                o.retain(|k, (id, _)| *id > upto || !k.starts_with("d/"));
+                o.retain(|k, v| v.0 > upto || !k.starts_with("d/"));
             } else {
                 self.pruned.fetch_max(upto, Relaxed);
-                o.retain(|_, (id, _)| *id > upto);
+                o.retain(|_, v| v.0 > upto);
             }
         }
         if self.follows && !self.mirror.load(Relaxed) && self.hold.load(Relaxed) <= c {
@@ -2320,11 +2456,11 @@ impl Catalog {
             return Ok(());
         }
         // Streamed changes newer than the snapshot win; everything older gives way to it.
-        o.retain(|k, (id, _)| *id > c || k.starts_with("d/"));
+        o.retain(|k, v| v.0 > c || k.starts_with("d/"));
         for (k, v) in all {
-            o.entry(k).or_insert((c, Some(v)));
+            o.insert_absent(k, (c, Some(v)));
         }
-        o.retain(|_, (_, v)| v.is_some()); // (deleted keys: absent from the whole catalog)
+        o.retain(|_, v| v.1.is_some()); // (deleted keys: absent from the whole catalog)
         self.pruned.fetch_max(c, Relaxed); // older streamed commits are in the snapshot
         self.streamed.fetch_max(c, Relaxed);
         self.loud.fetch_max(c, Relaxed);
@@ -2526,10 +2662,14 @@ impl Catalog {
         Ok(self.scan_raw(from, to).await?.into_iter().take(n).collect())
     }
 
-    /// How many keys in [from, to) the catalog holds, when it holds the whole catalog in memory (the
-    /// leader's, and a follower's once seeded); counted in place, nothing copied. `None` otherwise.
-    pub fn count(&self, from: &str, to: &str) -> Option<usize> {
-        self.mirror.load(Relaxed).then(|| self.overlay.lock().unwrap().range(from.to_string()..to.to_string()).filter(|(_, (_, v))| v.is_some()).count())
+    /// The producers' marks (`p/` keys) and the expiries (`g/` keys) the catalog holds, when it holds the whole catalog in
+    /// memory (the leader's, and a follower's once seeded); `None` otherwise. Counted as the overlay changes, so this is two
+    /// numbers, not a scan under the lock (`Overlay`).
+    pub fn tallies(&self) -> Option<(usize, usize)> {
+        self.mirror.load(Relaxed).then(|| {
+            let o = self.overlay.lock().unwrap();
+            (o.marks, o.expiries)
+        })
     }
 
     /// Leader: persist the catalog memtable if anything was committed since the last time. A
@@ -2579,6 +2719,7 @@ impl Catalog {
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
+        let t0 = Instant::now();
         let puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut batch = WriteBatch::new();
         for (k, v) in &puts {
@@ -2588,9 +2729,11 @@ impl Catalog {
             batch.delete(k);
         }
         let mut id = self.order.lock().await;
+        let t1 = commit_stage("order", t0);
         let c = ("c".to_string(), Bytes::from(json(&*id)));
         batch.put(&c.0, &c.1);
         let handle = db.write(batch).await.map_err(|e| self.fenced(e))?;
+        let t2 = commit_stage("slatedb write", t1);
         if self.flush_now {
             // (its WAL written now, not at the next tick of `flush_interval`: a commit waited about a
             // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
@@ -2603,12 +2746,54 @@ impl Catalog {
         }
         let (done, rx) = oneshot::channel();
         let puts = puts.into_iter().chain([c]).collect();
-        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done));
+        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done, t2));
         *id += 1;
         Ok(rx)
     }
 }
 
+
+/// `PONDRA_TRACE_COMMIT=1`: where a leader's commits spend their time. Each stage is the time since the one before it
+/// (`since`); once a minute one line on stderr gives each stage's p50 and p95 over that minute, and how late a 10 ms
+/// sleep woke (`lag`: the runtime's own wait, which every stage pays when the node's cores are busy). Returns now, the
+/// next stage's start.
+pub fn commit_stage(stage: &'static str, since: Instant) -> Instant {
+    type Stages = Mutex<(Instant, Vec<(&'static str, Vec<f64>)>)>;
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        let on = crate::env::is_set("PONDRA_TRACE_COMMIT");
+        if on {
+            crate::panics::spawn(async {
+                loop {
+                    let t = Instant::now();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    commit_stage("lag", t + Duration::from_millis(10));
+                }
+            });
+        }
+        on
+    });
+    crate::per_node!(static STAGES: Stages = Mutex::new((Instant::now(), vec![])); clear = |s| *s.lock().unwrap_or_else(|e| e.into_inner()) = (Instant::now(), vec![]));
+    let now = Instant::now();
+    if !*ON {
+        return now;
+    }
+    let mut s = STAGES.lock().unwrap();
+    let ms = now.saturating_duration_since(since).as_secs_f64() * 1e3;
+    match s.1.iter_mut().find(|(n, _)| *n == stage) {
+        Some((_, v)) => v.push(ms),
+        None => s.1.push((stage, vec![ms])),
+    }
+    if now - s.0 >= Duration::from_secs(60) {
+        let line: Vec<String> = s.1.iter_mut().map(|(n, v)| {
+            v.sort_by(f64::total_cmp);
+            let q = |p: f64| v[((v.len() - 1) as f64 * p) as usize];
+            format!("{n} {:.3}/{:.3} ({})", q(0.5), q(0.95), v.len())
+        }).collect();
+        eprintln!("commit stages p50/p95 ms (count): {}", line.join(", "));
+        *s = (now, vec![]);
+    }
+    now
+}
 
 impl Catalog {
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
@@ -2735,7 +2920,7 @@ mod tests {
         let first: Vec<String> = lake.cat.scan_first("g/", "g0", 3).await?.into_iter().map(|(k, _)| k).collect();
         assert_eq!(first, ["g/0", "g/1", "g/2"]);
         assert_eq!(lake.cat.scan_first("g/", "g0", 99).await?.len(), 5);
-        assert_eq!(lake.cat.count("g/", "g0"), Some(5));
+        assert_eq!(lake.cat.tallies().map(|t| t.1), Some(5), "five expiries; `h/x` is neither");
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
         Ok(())

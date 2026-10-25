@@ -3251,6 +3251,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "crc-fast",
+ "csv-core",
  "datafusion",
  "datafusion-functions-json",
  "datafusion-spark",

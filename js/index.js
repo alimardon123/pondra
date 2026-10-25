@@ -210,7 +210,9 @@ export class Pondra {
 
   async _statement(query, params) {
     const changes = isChange(query);
-    const path = changes ? `/sql?job=auto-${this.producer}-${++this.jobs}` : "/sql"; // (sent again after a node went, a change is applied once; `auto-`: kept for the retry window only)
+    // (sent again after a node went, a change is applied once. `auto-until<S>-`: S is the last moment this request may be sent again, its first send
+    // plus `retrySecs`, so the node keeps its mark until then, and then the retry window: store::kept_ms)
+    const path = changes ? `/sql?job=auto-until${Math.floor(Date.now() / 1000 + this.retrySecs)}-${this.producer}-${++this.jobs}` : "/sql";
     return (await this._post(path, query, params, changes)).json();
   }
 

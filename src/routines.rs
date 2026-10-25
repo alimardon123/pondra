@@ -1010,7 +1010,8 @@ pub fn call_of(sql: &str) -> Option<(String, Vec<FunctionArg>)> {
 /// without waiting, its arguments, and the answer's column (`run`).
 pub fn start_of(sql: &str) -> Option<(String, Vec<FunctionArg>, String)> {
     static START: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^start\s+(call\b.*)$").expect("a regex"));
-    if let Some(call) = START.captures(crate::text::first_word(sql)) {
+    let word = crate::text::first_word(sql);
+    if let Some(call) = (crate::text::head(sql) == "start").then(|| START.captures(word)).flatten() { // (the regex is for a statement that begins so)
         let (name, args) = call_of(call.get(1)?.as_str())?;
         return Some((name, args, "run".into()));
     }
@@ -1048,6 +1049,9 @@ pub fn do_of(sql: &str) -> Option<(String, String)> {
     static DO: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?is)^DO\s+(?:LANGUAGE\s+(\w+)\s+)?\$(\w*)\$(.*)\$(\w*)\$\s*(?:LANGUAGE\s+(\w+))?\s*;?\s*$").expect("a regex")
     });
+    if crate::text::head(sql) != "do" {
+        return None; // (the regex is for a statement that begins with `DO`)
+    }
     let c = DO.captures(crate::text::first_word(sql))?;
     let body = c[3].strip_prefix("\r\n").or_else(|| c[3].strip_prefix('\n')).unwrap_or(&c[3]); // (line 1 is the code's first line)
     (c[2] == c[4]).then(|| (c.get(1).or(c.get(5)).map_or("plpgsql", |m| m.as_str()).to_lowercase(), body.to_string()))

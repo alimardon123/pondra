@@ -55,7 +55,7 @@ A connection to a node takes these options:
 | `token` | none | sent as `Authorization: Bearer …`; the token's role decides what the connection may do |
 | `user`, `password` | none | sign in as a [user](/pondra/guides/security/#users-roles-and-grants) instead: its name and password (or one of its tokens) |
 | `onNotice` | `console.log` | called with each line a procedure printed. `null` keeps them quiet |
-| `retrySecs` | 60 | how long a call keeps trying while no node answers it (0: once) |
+| `retrySecs` | 60 | how long a call keeps trying while no node answers it (0: once); a write it sends again inside that time is applied once |
 | `ca` | none | a PEM file of the authority that signs an `https` node's certificate. This process trusts it from the first request, as `NODE_EXTRA_CA_CERTS` would. Node 22.19 or later has the call for it; older Nodes throw, naming the two ways round it |
 | `fetch` | the global `fetch` | a function used in place of it, for TLS of your own (Bun's, an undici `Agent`, Deno's client). It brings its own certificates, so `ca` doesn't apply to it |
 

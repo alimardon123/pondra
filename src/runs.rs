@@ -506,7 +506,7 @@ fn task_options(p: &mut Parser) -> Result<TaskOptions> {
 /// `EXECUTE TASK name [(day => value, …)]`: its name and the values' SQL, if `sql` is one.
 pub fn execute_of(sql: &str) -> Option<(String, Vec<(String, String)>)> {
     static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^\s*execute\s+task\b").expect("a regex"));
-    if !HEAD.is_match(crate::text::first_word(sql)) {
+    if crate::text::head(sql) != "execute" || !HEAD.is_match(crate::text::first_word(sql)) {
         return None;
     }
     let mut p = Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(crate::text::first_word(sql)).ok()?;

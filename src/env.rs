@@ -119,6 +119,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_TLS_CA", Node),
     ("PONDRA_TLS_CERT", Node),
     ("PONDRA_TLS_KEY", Node),
+    ("PONDRA_TRACE_COMMIT", Node),
     ("PONDRA_TRACE_PG", Node),
     ("PONDRA_TRACE_QUERY", Node),
     ("PONDRA_TRACE_RERUN", Node),
