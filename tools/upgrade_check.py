@@ -717,6 +717,7 @@ class Load:
         # (acked: each producer's last acknowledged batch so far, to go on from: a soak's next leg)
         self.stop_, self.acked, self.torn, self.reads = threading.Event(), collections.defaultdict(int, acked or {}), [], [0]
         self.waits = collections.deque(maxlen=500_000)  # (wait, sent at): the recent ones
+        self.sending = {}  # producer -> when its batch still waiting was first sent
         self.threads = [threading.Thread(target=self.write, args=(f"p{i}",), daemon=True) for i in range(producers)]
         self.threads += [threading.Thread(target=self.read, daemon=True) for _ in range(readers)]
 
@@ -729,7 +730,7 @@ class Load:
         while not self.stop_.is_set():
             seq += 1
             body = "".join(json.dumps({"producer": producer, "seq": seq, "i": i}) + "\n" for i in range(self.size))
-            t0 = time.time()
+            t0 = self.sending[producer] = time.time()
             while True:
                 try:
                     random.choice(self.nodes).call("POST", f"/append/{self.table}?producer={producer}&seq={seq}", body, timeout=20)
@@ -737,6 +738,7 @@ class Load:
                 except Exception:
                     time.sleep(0.1)
             self.waits.append((time.time() - t0, t0))
+            del self.sending[producer]
             self.acked[producer] = seq
             if self.rate:
                 time.sleep(max(0.0, t0 + 1 / self.rate - time.time()))
@@ -762,9 +764,16 @@ class Load:
         return {"batches acknowledged": sum(self.acked.values()), "lost or twice": wrong, "torn reads": self.torn[:5], "reads": self.reads[0]}
 
     def longest(self, since, until_=None):
-        """The longest a batch waited for its acknowledgement, of those sent from `since` on (s)."""
+        """The longest a batch waited for its acknowledgement, of those sent from `since` on (s). A batch still
+        waiting counts with its wait so far: a stall that outlasts the question is still a stall."""
+        now, sent = time.time(), list(self.sending.values())
         w = [d for d, t0 in list(self.waits) if t0 >= since and (until_ is None or t0 <= until_)]
+        w += [now - t0 for t0 in sent if t0 >= since and (until_ is None or t0 <= until_)]
         return round(max(w, default=0), 2)
+
+    def waiting(self, since, until_=None):
+        """Whether a batch sent from `since` on (to `until_`) still waits for its acknowledgement."""
+        return any(t0 >= since and (until_ is None or t0 <= until_) for t0 in list(self.sending.values()))
 
 
 def drain_check(new_bin, work, port):
