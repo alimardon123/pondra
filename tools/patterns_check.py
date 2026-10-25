@@ -605,6 +605,8 @@ TABLES = {
     "flink_ticker": ("symbol TEXT, rowtime TIMESTAMP, price INT, tax INT",
                       [{"symbol": "ACME", "rowtime": datetime(2011, 4, 1, 10) + timedelta(minutes=20 * k), "price": p, "tax": t}
                        for k, (p, t) in enumerate(zip([20, 17, 18, 11, 14, 9, 15, 14, 24, 1, 19], [1, 2, 1, 3, 2, 1, 1, 2, 2, 2, 1]))]),
+    # a column d and a symbol d (see the fixed example of that name)
+    "dclash": ("d INT, price INT", [{"d": d, "price": p} for d, p in zip(range(1, 9), [10, 9, 8, 12, 11, 13, 12, 5])]),
 }
 
 
@@ -665,6 +667,10 @@ def m_excl(m, rows):
 def m_flink(m, rows):  # dropTime: the C row's time; dropDiff: A's price less C's (A is the match's first row)
     c = pos_of(m, "c")[-1]
     return {"symbol": rows[0]["symbol"], "dropTime": rows[c]["rowtime"], "dropDiff": rows[m.start]["price"] - rows[c]["price"]}
+
+
+def m_clash(m, rows):  # FIRST(d) and LAST(d) are the column d; count(d.*) is the symbol d's rows
+    return {"s": rows[m.start]["d"], "e": rows[m.end - 1]["d"], "nd": len(pos_of(m, "d"))}
 
 
 def lo_(rows, i):  # price below the price two rows on (NEXT(price, 2)); no such row is NULL, so false
@@ -956,6 +962,14 @@ FIXED += [
                   "B AS B.price > A.price - 10, C AS C.price < A.price - 10", "PAST LAST ROW", tail=" ORDER BY dropTime",
                   within="INTERVAL '1' HOUR"),
          expect=[{"symbol": "ACME", "dropTime": datetime(2011, 4, 1, 13, 0), "dropDiff": 14}]),
+    # A column named d and a symbol named d: ORDER BY the column, DEFINE the symbol, which reads its own row (PREV is the
+    # row before). Prices on d 1-8: 10 9 8 12 11 13 12 5. d1 has no PREV, so it is no fall; d2 and d3 fall, d4 rises, d5
+    # falls, d6 rises, d7 and d8 fall: runs d2-3, d5 and d7-8. FIRST(d) and LAST(d) read the column, count(d.*) the symbol.
+    dict(name="a column d and a symbol d: ORDER BY d, DEFINE d AS d.price < PREV(d.price), the column and the symbol apart",
+         table="dclash", partition=None, order="d", pattern="d+", skip="PAST LAST ROW", define={"d": down_}, measures=m_clash,
+         query=mr("dclash", None, "d", "FIRST(d) AS s, LAST(d) AS e, count(d.*) AS nd", "d+", "d AS d.price < PREV(d.price)",
+                  "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 2, "e": 3, "nd": 2}, {"s": 5, "e": 5, "nd": 1}, {"s": 7, "e": 8, "nd": 2}]),
 ]
 
 # The ticker's ALL ROWS query (SHOW), for harness.py's doors and spreads.
@@ -983,12 +997,25 @@ def load_tables(port):
         sql_exec(port, f"INSERT INTO {name} VALUES {vals}")
 
 
+# The fixed examples whose DEFINE reads another symbol's rows (the match so far): the reference's answer, and the engine's
+# refusal (0A000) until the next PR makes DEFINE read the match so far. That PR flips these to the answer.
+NEXT_PR_REFUSED = ("Flink's WITHIN example: a drop of 10 in an hour, the bound inclusive (A B* C, DEFINE reads A), one row",)
+
+
 def fixed_checks(port, show=True):
     """Section 3 on the node: each example's query, run `runs` times, answers the column names written for it and
     its rows in the written order (NULLs as NULL, read from Arrow)."""
     load_tables(port)
     out = {}
     for ex in FIXED:
+        if ex["name"] in NEXT_PR_REFUSED:
+            r = post_sql(port, ex["query"])
+            ok = (not r["ok"]) and r["code"] == "0A000" and "reads the match so far" in r["msg"].lower()
+            out[ex["name"]] = ok
+            if show:
+                print(f"fixed: {'REFUSED until the next PR' if ok else 'FAIL'} {ex['name']}"
+                      + ("" if ok else f" (got ok={r['ok']} [{r['code']}] {r['msg'][:200]})"))
+            continue
         names = list(ex["expect"][0])
         want = [tuple(norm(d.get(n)) for n in names) for d in ex["expect"]]
         runs = [post_sql(port, ex["query"], arrow=True) for _ in range(ex.get("runs", 1))]
@@ -1086,22 +1113,22 @@ ROWS_PER = {"one": "ONE ROW PER MATCH", "show": "ALL ROWS PER MATCH SHOW EMPTY M
             "omit": "ALL ROWS PER MATCH OMIT EMPTY MATCHES", "unmatched": "ALL ROWS PER MATCH WITH UNMATCHED ROWS"}
 
 
-SEQ_COLS = ("p", "i", "ts", "d", "ca", "cb", "cc")  # seqs's columns in order: the other columns of ALL ROWS follow this order
+SEQ_COLS = ("p", "i", "ts", "dt", "ca", "cb", "cc")  # seqs's columns in order: the other columns of ALL ROWS follow this order
 SEQ_BASE = datetime(2026, 3, 2, 9, 0)  # ts is i in minutes from here, with a jitter (gen_data)
 WITHIN_MINUTES = (2, 3, 4, 6, 9, 12)  # the WITHIN intervals of the random queries, in minutes (i steps 3 a row)
-WITHIN_DAYS = (1, 2, 3)  # and in days, for a WITHIN by the date column d
-SEQ_DATE = date(2026, 3, 2)  # d is this day plus about half the position, in days (gen_data)
+WITHIN_DAYS = (1, 2, 3)  # and in days, for a WITHIN by the date column dt
+SEQ_DATE = date(2026, 3, 2)  # dt is this day plus about half the position, in days (gen_data)
 WITHIN_UNITS = {"MINUTE": lambda k: timedelta(minutes=k), "DAY": lambda k: timedelta(days=k)}
 
 
 def pick_within(rng):
-    """(order, within) of one query: ORDER BY i with no WITHIN, or WITHIN by ts in minutes, or by d in days (within is
+    """(order, within) of one query: ORDER BY i with no WITHIN, or WITHIN by ts in minutes, or by dt in days (within is
     (unit, amount))."""
     if rng.random() >= 0.2:
         return "i", None
     if rng.random() < 0.5:
         return "ts", ("MINUTE", rng.choice(WITHIN_MINUTES))
-    return "d", ("DAY", rng.choice(WITHIN_DAYS))
+    return "dt", ("DAY", rng.choice(WITHIN_DAYS))
 
 
 def random_spec(rng, mode):
@@ -1117,7 +1144,8 @@ def random_spec(rng, mode):
 
 
 def random_query(pattern, skip, mode, spec, order="i", within=None):
-    """The query over seqs, ORDER BY order; within (unit, amount) is WITHIN's, written after PATTERN."""
+    """The query over seqs, ORDER BY order; within (unit, amount) is WITHIN's, written after PATTERN. The DEFINEs read
+    their own rows only: a DEFINE that reads another symbol is refused by the engine until the next PR."""
     measures = ", ".join(measure_text(x) for x in spec)
     clause = "" if within is None else f" WITHIN INTERVAL '{within[1]}' {within[0]}"
     final = "ORDER BY p, mn" if mode == "one" else f"ORDER BY p, {order}, mn"
@@ -1191,7 +1219,7 @@ def gen_data(rng):
         rows = []
         for pos in range(rng.randint(0, 25)):
             row = {"p": p, "i": 3 * pos + 1, "ts": SEQ_BASE + timedelta(minutes=3 * pos + 1 + rng.randint(-4, 4)),
-                   "d": SEQ_DATE + timedelta(days=max(0, pos // 2 + rng.randint(-1, 1)))}
+                   "dt": SEQ_DATE + timedelta(days=max(0, pos // 2 + rng.randint(-1, 1)))}
             for s in "abc":
                 row["c" + s] = None if rng.random() < 0.08 else (rng.random() < pr[s])
             rows.append(row)
@@ -1224,10 +1252,10 @@ def reference_random(parts, tree, skip, mode, spec, order="i", within=None):
 def random_checks(port, seed=1, queries=600, show=5):
     rng = random.Random(seed)
     data = gen_data(rng)
-    parts = {"i": random_parts(data, "i"), "ts": random_parts(data, "ts"), "d": random_parts(data, "d")}  # (WITHIN orders by ts or d)
+    parts = {"i": random_parts(data, "i"), "ts": random_parts(data, "ts"), "dt": random_parts(data, "dt")}  # (WITHIN orders by ts or dt)
     sql_exec(port, "DROP TABLE IF EXISTS seqs")
-    sql_exec(port, "CREATE TABLE seqs (p INT, i INT, ts TIMESTAMP, d DATE, ca BOOLEAN, cb BOOLEAN, cc BOOLEAN)")
-    vals = [f"({p}, {r['i']}, {sql_value(r['ts'])}, {sql_value(r['d'])}, {sql_value(r['ca'])}, {sql_value(r['cb'])}, {sql_value(r['cc'])})"
+    sql_exec(port, "CREATE TABLE seqs (p INT, i INT, ts TIMESTAMP, dt DATE, ca BOOLEAN, cb BOOLEAN, cc BOOLEAN)")
+    vals = [f"({p}, {r['i']}, {sql_value(r['ts'])}, {sql_value(r['dt'])}, {sql_value(r['ca'])}, {sql_value(r['cb'])}, {sql_value(r['cc'])})"
             for p, rows in data for r in rows]
     if vals:
         sql_exec(port, "INSERT INTO seqs VALUES " + ", ".join(vals))
@@ -1273,13 +1301,13 @@ def random_checks(port, seed=1, queries=600, show=5):
     print(f"random: {agreed} of {done} queries agree with the reference ({both_errors} answered with 22000 by both); "
           f"{regenerated} patterns regenerated (the reference's search ran past its budget)")
     print("random, by rows per match: " + ", ".join(f"{m} {per_mode[m][1]} of {per_mode[m][0]}" for m in MODES))
-    print(f"random, WITHIN (by ts in minutes, or by d in days): {within_q[1]} of {within_q[0]} agree")
+    print(f"random, WITHIN (by ts in minutes, or by dt in days): {within_q[1]} of {within_q[0]} agree")
     print(f"random: {len(misses)} disagree; {parser_class} of them refused with 'Expected' (42601): each a parser bug to report")
     misses.sort(key=lambda x: x[0])  # the smallest first: the shortest pattern, then the fewest rows given
     for _, text, skip, mode, query, expect, r, data_ in misses[:show]:
         print(f"DISAGREE rows per match {mode}, pattern ({text})  skip {skip}\n  query: {query}")
         for p, rows in data_:
-            print(f"  data p={p}: " + json.dumps([{"i": r_["i"], "ts": f"{r_['ts']:%H:%M}", "d": str(r_["d"]), "a": r_["ca"], "b": r_["cb"], "c": r_["cc"]}
+            print(f"  data p={p}: " + json.dumps([{"i": r_["i"], "ts": f"{r_['ts']:%H:%M}", "dt": str(r_["dt"]), "a": r_["ca"], "b": r_["cb"], "c": r_["cc"]}
                                                  for r_ in rows]))
         print(f"  reference: {expect[0]} {expect[1] if expect[0] == 'rows' else ''} "
               f"{expect[2] if expect[0] == 'rows' else ''}"[:600])
