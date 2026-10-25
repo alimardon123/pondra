@@ -10,9 +10,11 @@ median of several, each a new text so no answer is remembered); 500 one-row INSE
 the load; and, with `--tpch`, its 8 tables loaded from Parquet and the 22 queries run once cold and once warm (the
 warm total is reported). With `--settle`, each engine waits that long after each load before its queries, so a
 lake's merges after a load don't count in them. Pondra finds its library through PONDRA_LIBRARY
-(target/release/libpondra_lib.so here by default).
+(target/release/libpondra_lib.so here by default). Before each run, each engine's library is dropped from the
+page cache (`startup_order.from_disk`), so idle memory is what a process that reads it from disk holds, not what a
+file just built or installed leaves resident.
 """
-import argparse, json, os, statistics, subprocess, sys, tempfile, time
+import argparse, importlib.util, json, os, statistics, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
@@ -25,6 +27,9 @@ ap.add_argument("--only", default="pondra,folder,duckdb")
 ap.add_argument("--settle", type=float, default=0, help="seconds to wait after each load before timing queries (lets background merges finish)")
 ap.add_argument("--child", default=None)
 A = ap.parse_args()
+
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from startup_order import from_disk  # noqa: E402 (found once tools/ is on the path)
 
 TABLES = ["customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier"]
 
@@ -110,6 +115,14 @@ def rss_mb():
     return next(int(l.split()[1]) for l in open("/proc/self/status") if l.startswith("VmRSS")) / 1024
 
 
+def library(engine, env):
+    """The engine's own library, read from disk before each of its runs."""
+    if engine != "duckdb":
+        return [env["PONDRA_LIBRARY"]]
+    spec = importlib.util.find_spec("_duckdb") # (DuckDB's extension module, found without importing it)
+    return [spec.origin] if spec else []
+
+
 def main():
     env = dict(os.environ)
     env.setdefault("PONDRA_LIBRARY", os.path.join(ROOT, "target", "release", "libpondra_lib.so"))
@@ -119,6 +132,7 @@ def main():
         runs = []
         for _ in range(A.runs):
             args = [sys.executable, __file__, "--child", engine, "--rows", str(A.rows), "--settle", str(A.settle)] + (["--tpch", A.tpch] if A.tpch else [])
+            from_disk(*library(engine, env))
             p = subprocess.run(args, env=env, capture_output=True, text=True)
             if p.returncode:
                 sys.exit(f"{engine} failed:\n{p.stderr[-3000:]}")

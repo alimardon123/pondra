@@ -18,7 +18,7 @@ c. "connect() while a node is open here: the same lake another connection to it 
    connection; local() and open() warn that they go at 1.0"
 d. "a misspelt setting is refused naming the nearest"
 e. "a setting changed on a later open is refused naming it"
-f. "50 opens and closes leave no threads or open files" (Linux)
+f. "50 opens and closes leave no threads or open files, and each close takes under 100 ms" (Linux)
 g. "a fork's child: its parent's connection refused by name, connect() there a node beside it; the parent still
    answers" (Linux and macOS)
 h. "the library asks for no static TLS, so any process loads it" (Linux)
@@ -275,7 +275,9 @@ def child_cycles():
         db.sql("CREATE TABLE IF NOT EXISTS t (id INT)")
         db.sql("INSERT INTO t VALUES (1)")
         n = db.sql("SELECT count(*) AS n FROM t").rows()[0]["n"]
+        t = time.perf_counter()
         db.close()
+        closes.append(time.perf_counter() - t)
         return n
 
     def switches():  # (every time a thread of this process was woken)
@@ -293,11 +295,13 @@ def child_cycles():
         time.sleep(2)  # (a node left running, or a task of its, wakes its threads while nothing is open)
         return len(os.listdir("/proc/self/task")), len(os.listdir("/proc/self/fd")), switches() - before
 
+    closes = []
     rows = [cycle()]
     first = census()
     rows += [cycle() for _ in range(49)]
     last = census()
-    return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows}
+    return {"threads": [first[0], last[0]], "files": [first[1], last[1]], "wakeups": [first[2], last[2]], "rows": rows,
+            "close_ms": round(statistics.median(closes) * 1000, 1)}
 
 
 def child_quiet():
@@ -508,6 +512,7 @@ def judge_cycles(f):
     (w0, w1) = f["wakeups"]
     yield w1 <= w0 + 20, f"nothing of the 50 runs once they are closed: {w0} then {w1} wakeups of the process's threads in 2 s idle (at most 20 more)"
     yield set(f["rows"]) == {1} and len(f["rows"]) == 50, "every cycle's lake answered its count (1)"
+    yield f["close_ms"] < 100, f"a close takes {f['close_ms']} ms, the median of the 50 (under 100: no wait for a client the HTTP door never had)"
 
 
 def judge_fork(f):

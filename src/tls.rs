@@ -392,7 +392,10 @@ impl axum::serve::Listener for Doors {
     type Addr = Peer;
     async fn accept(&mut self) -> (Conn, Peer) {
         match self.next().await {
-            Some(c) => c,
+            Some(c) => {
+                crate::drain::took();
+                c
+            }
             None => std::future::pending().await, // (the accept loop never ends)
         }
     }
