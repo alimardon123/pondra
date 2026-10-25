@@ -59,25 +59,6 @@ pub async fn definition(columns: &[(String, String)], defaults: &std::collection
     Ok(())
 }
 
-/// A bulk INSERT's rows (under their stored names), checked as they stream into files.
-pub fn checked(rows: datafusion::execution::SendableRecordBatchStream, meta: &Option<TableMeta>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
-    use futures::StreamExt;
-    let Some(meta) = meta.as_ref().filter(|m| ruled(m)) else { return rows };
-    let (schema, table) = (rows.schema(), table.to_string());
-    let t = match meta.to_rules() {
-        Ok(t) => t,
-        Err(e) => {
-            let one = futures::stream::once(async move { Err::<datafusion::arrow::array::RecordBatch, _>(datafusion::error::DataFusionError::External(e.into())) });
-            return Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, one));
-        }
-    };
-    let checked = rows.map(move |b| {
-        let b = b?;
-        crate::rules::checked(&t, &table, b, false, &BASE).map_err(|e| datafusion::error::DataFusionError::External(e.into()))
-    });
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, checked))
-}
-
 /// Does the table have defaults (under SQL's names)?
 pub fn any(meta: &TableMeta) -> bool { !meta.defaults.is_empty() }
 

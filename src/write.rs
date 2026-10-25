@@ -1242,17 +1242,29 @@ async fn fitted(lake: &Lake, meta: &TableMeta, target: &SchemaRef, all: &RecordB
     crate::defaults::fill(lake, meta, batch, |c| padded.iter().any(|p| p == c).then(|| crate::defaults::all(n))).await
 }
 
-/// An INSERT's rows into `meta`'s table, from `sql` (its rows' query). A `VALUES` of literals is built here as
-/// DataFusion would plan it, with no session (`literals.rs`); anything else is planned in a session of `lake` as
-/// of `upto` (`files`: this machine's files too), as `rows` plans it. `home` is the table's own lake (`rows`).
-pub async fn rows_of(lake: &Lake, home: &Lake, meta: &TableMeta, sql: &str, upto: Option<u64>, files: bool) -> Result<RecordBatch> {
-    let target = schema(&meta.columns)?;
-    if let Some(all) = crate::literals::literal_rows(sql, &target) {
-        return fitted(home, meta, &target, &all).await;
+/// A query's rows (`all`; None: it gave none) shaped once for `t`, the table `name` (`rules::shape`): by position, the
+/// columns left out at the end given their DEFAULT, held forms, the checks, and for `How::Insert` no key twice. `home` is the
+/// table's own lake: the one a DEFAULT's `nextval` takes its values from.
+async fn shaped(home: &Lake, t: &Arc<crate::rules::Table>, name: &str, all: Option<RecordBatch>, how: crate::rules::How) -> Result<crate::rules::Shaped> {
+    let rows = match all {
+        Some(all) => crate::rules::Rows::Positional(all),
+        None => crate::rules::Rows::Whole(RecordBatch::new_empty(t.schema.clone())), // (no rows: in the table's columns already)
+    };
+    crate::rules::shape(t, name, rows, how, &crate::defaults::Node(home)).await
+}
+
+/// An INSERT's rows into `t`'s table `name`, from `sql` (its rows' query), shaped once for `t` (`shaped`). A `VALUES` of
+/// literals is built here as DataFusion would plan it, with no session (`literals.rs`); anything else is planned in a session
+/// of `lake` as of `upto` (`files`: this machine's files too). `home` is the table's own lake: the one a DEFAULT's `nextval`
+/// takes its values from.
+#[allow(clippy::too_many_arguments)]
+pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, name: &str, sql: &str, upto: Option<u64>, files: bool, how: crate::rules::How) -> Result<crate::rules::Shaped> {
+    if let Some(all) = crate::literals::literal_rows(sql, &t.schema) {
+        return shaped(home, t, name, Some(all), how).await;
     }
     let ctx = crate::query::session_at(lake, sql, "", upto).await?;
     let ctx = if files { ctx.enable_url_table() } else { ctx };
-    rows(home, &ctx, meta, sql).await
+    shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await
 }
 
 /// An INSERT's `VALUES` with each value for a DOUBLE, REAL or DECIMAL column cast to that column's
@@ -1359,7 +1371,8 @@ pub fn in_order(ctx: &SessionContext) { ctx.state_ref().write().config_mut().opt
 pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: datafusion::prelude::DataFrame, stamp: Option<crate::log::Reserved>) -> Result<(Vec<(String, String)>, Vec<DataFile>)> {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::prelude::{cast as cast_to, Expr};
-    let meta = lake.cat.get::<TableMeta>(&table_key(table)).await?;
+    let meta = lake.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)
+    let rules = meta.as_ref().map(|m| m.rules()).transpose()?.filter(|t| t.ruled()); // (None: a new table, or one with no rule)
     // (a table's live columns, in order, written under their stored names: ADR-022)
     let target: Vec<(String, DataType)> = match &meta {
         Some(m) => m.live().map(|(s, _, t)| Ok((s.to_string(), crate::answer::dtype(t)?))).collect::<Result<_>>()?,
@@ -1394,7 +1407,7 @@ pub async fn write_rows(lake: &Lake, ctx: &SessionContext, table: &str, df: data
     let columns = target.iter().map(|(n, t)| (n.clone(), t.to_string())).collect();
     let partition = meta.as_ref().and_then(|m| m.partition.clone());
     let next = Arc::new(std::sync::atomic::AtomicU64::new(0)); // (the streams share one block of ids)
-    let streams = df.execute_stream_partitioned().await?.into_iter().map(|rows| cast_given(rows, schema.clone(), given_n)).map(|rows| crate::defaults::checked(rows, &meta, table)).map(|rows| match stamp {
+    let streams = df.execute_stream_partitioned().await?.into_iter().map(|rows| cast_given(rows, schema.clone(), given_n)).map(|rows| checked_stream(rows, rules.clone(), table)).map(|rows| match stamp {
         Some(reserved) => crate::sys::stamp_stream(rows, next.clone(), reserved),
         None => Ok(rows),
     });
@@ -1422,6 +1435,16 @@ fn cast_given(rows: datafusion::execution::SendableRecordBatchStream, schema: Sc
         Ok(RecordBatch::try_new(schema.clone(), columns)?)
     });
     Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(out, cast))
+}
+
+/// A bulk INSERT's rows (under their stored names), checked as they stream into files: `rules::checked` on each batch
+/// (held forms, then the checks), over `t` (None: nothing to check).
+fn checked_stream(rows: datafusion::execution::SendableRecordBatchStream, t: Option<Arc<crate::rules::Table>>, table: &str) -> datafusion::execution::SendableRecordBatchStream {
+    use futures::StreamExt;
+    let Some(t) = t else { return rows };
+    let (schema, table) = (rows.schema(), table.to_string());
+    let checked = rows.map(move |b| crate::rules::checked(&t, &table, b?, false, crate::defaults::base()).map_err(|e| datafusion::error::DataFusionError::External(e.into())));
+    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, checked))
 }
 
 /// Leader: record an INSERT's files in one commit through the log (`adopt::file`), creating the
@@ -1866,14 +1889,14 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         (None, _) => bail!("no table {table}"),
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),
     };
-    let meta = meta.expect("a table");
-    // (each jsonb in its own form, so `RETURNING` answers what is held; the log checks the rows, as every door's)
-    let rows = rows_of(lake, lake, &meta, &sql, None, files).await?;
+    // (shaped once, each jsonb in its own form, so `RETURNING` answers what is held; the log doesn't check the rows again
+    // while the table is the one they were shaped for)
     let rules = stored.as_ref().expect("a table").rules()?;
-    let batch = crate::rules::typed::as_held(&rules, rows, true)?;
-    crate::returning::wrote(&[], std::slice::from_ref(&batch));
-    let n = batch.num_rows();
-    let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
+    let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Insert } else { crate::rules::How::Change };
+    let rows = rows_of(lake, lake, &rules, &table, &sql, None, files, how).await?;
+    crate::returning::wrote(&[], std::slice::from_ref(rows.rows()));
+    let n = rows.rows().num_rows();
+    let ack = app.log()?.append_shaped(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, rows).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
 }
 
@@ -2236,24 +2259,26 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
         let (sql, sent) = crate::change::for_leader(query, target, &t, &t, &sql, files).await?; // (files here: this machine's)
         return Ok(Some(Request::Change(sql, job.into(), sent)));
     }
-    let stored = target.cat.get::<TableMeta>(&table_key(table)).await?;
+    let stored = target.cat.meta(&table_key(table)).await?; // (as parsed once a version: `rules` is the memo)
     let meta = stored.as_ref().map(|m| m.logical());
     let log = meta.as_ref().is_some_and(|m| through_log(m, stmt));
     match (meta, stmt) {
         (Some(m), _) if log => {
             let sql = rows_sql(&m, stmt)?;
-            let batch = rows_of(query, target, &m, &sql, None, files).await?; // (a DEFAULT's sequence is the attached lake's)
-            let batch = crate::defaults::fit(&m, table, batch)?; // (NOT NULL, and each jsonb in its own form: as a node's own log checks its rows)
+            let rules = stored.as_ref().expect("a table").rules()?;
+            // (an INSERT's keys are looked at below, after `sent`, as before: `Load`)
+            let how = if matches!(stmt, Stmt::Insert(..)) { crate::rules::How::Load } else { crate::rules::How::Change };
+            let rows = rows_of(query, target, &rules, table, &sql, None, files, how).await?; // (a DEFAULT's sequence is the attached lake's)
             if let Some(s) = stored.as_ref().filter(|s| matches!(stmt, Stmt::Insert(..)) && crate::constraints::key_checked(s)) {
                 if sent(target, job).await? {
                     return Ok(None); // (a retry: `deliver` answers it as a duplicate)
                 }
                 // (no row lock here, unlike a node's own plain INSERT (`txn::autocommit_as`): `pondra sql` and an attached
                 // lake's INSERT write without one, so two writers of one new key can both pass this check. A documented race.)
-                crate::constraints::key_check(target, table, s, None, &batch).await?; // (the keys are new: checked here, where the rows are)
+                crate::constraints::key_check(target, table, s, None, rows.rows()).await?; // (the keys are new: checked here, where the rows are)
             }
             let (ack, _) = tokio::sync::oneshot::channel();
-            let append = Append { table: table.into(), src: Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch, ack };
+            let append = Append { table: table.into(), src: Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch: rows.into_rows(), ack };
             Ok(Some(Request::Flush(encode_flush(&pack(target, &[append]).await?)?.into())))
         }
         (_, Stmt::Insert(_, sql)) => {
@@ -2458,5 +2483,53 @@ mod tests {
         assert_eq!(implicit(&names, Some(3)), ["a", "b", "c"]);
         assert_eq!(implicit(&names, Some(5)), ["a", "b", "c"]);
         assert_eq!(implicit(&names, None), ["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn rows_of_shapes_its_rows_once() -> Result<()> {
+        use crate::rules::How;
+        use datafusion::arrow::array::StringArray;
+        async fn of(lake: &Lake, t: &Arc<crate::rules::Table>, sql: &str, how: How) -> Result<crate::rules::Shaped> {
+            rows_of(lake, lake, t, "t", sql, None, false, how).await
+        }
+        fn text(b: &RecordBatch, column: &str) -> String {
+            b.column_by_name(column).and_then(|c| c.as_any().downcast_ref::<StringArray>().map(|s| s.value(0).to_string())).expect("a text value")
+        }
+        let dir = std::env::temp_dir().join(format!("pondra-shaped-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let meta = TableMeta {
+            columns: vec![("id".into(), "Int64".into()), ("n".into(), "Int32".into()), ("j".into(), "Utf8".into()), ("d".into(), "Utf8".into())],
+            key: vec!["id".into()],
+            not_null: vec!["id".into(), "n".into()],
+            checks: vec![("t_n_check".into(), "n >= 0".into())],
+            defaults: [("d".to_string(), "'x'".to_string())].into(),
+            sql_types: [("j".to_string(), "jsonb".to_string())].into(),
+            ids: true,
+            ..Default::default()
+        };
+        let t = Arc::new(meta.to_rules()?);
+        let one = of(&lake, &t, r#"VALUES (1, 5, '{"b":1,"a":2}')"#, How::Insert).await?;
+        assert_eq!(one.rows().num_rows(), 1);
+        assert!(Arc::ptr_eq(one.table(), &t));
+        assert_eq!(text(one.rows(), "d"), "x");
+        assert_eq!(text(one.rows(), "j"), r#"{"a": 2, "b": 1}"#);
+        let err = of(&lake, &t, "VALUES (1, NULL, NULL)", How::Insert).await.err().expect("a NULL in NOT NULL");
+        assert_eq!(crate::codes::of(&err), "23502");
+        assert!(crate::codes::words(&err).contains("t.n is NOT NULL"), "{}", crate::codes::words(&err));
+        let err = of(&lake, &t, "VALUES (1, -1, NULL)", How::Insert).await.err().expect("a CHECK");
+        assert_eq!(crate::codes::of(&err), "23514");
+        assert!(crate::codes::words(&err).contains(r#"violates check constraint "t_n_check""#), "{}", crate::codes::words(&err));
+        let twice = "VALUES (1, 1, NULL), (1, 2, NULL)";
+        let err = of(&lake, &t, twice, How::Insert).await.err().expect("a key twice");
+        assert_eq!(crate::codes::of(&err), "23505");
+        assert!(crate::codes::words(&err).contains(r#"duplicate key value violates unique constraint "t_pkey": Key (id)=(1) already exists"#), "{}", crate::codes::words(&err));
+        assert_eq!(of(&lake, &t, twice, How::Load).await?.rows().num_rows(), 2);
+        assert_eq!(of(&lake, &t, twice, How::Change).await?.rows().num_rows(), 2);
+        let none = of(&lake, &t, "SELECT 1 AS a, 1 AS b, NULL AS c WHERE false", How::Insert).await?; // (aliased: DataFusion names two 1s alike)
+        assert_eq!(none.rows().num_rows(), 0);
+        assert_eq!(none.rows().schema(), t.schema);
+        lake.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }
