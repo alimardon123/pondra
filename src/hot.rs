@@ -2,14 +2,23 @@
 //! from here when all it needs are here, and skips reading and decoding the Parquet file (TPC-H
 //! runs about 1.5x faster hot). Files never change, so nothing here goes stale.
 //!
-//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: a quarter of
-//! RAM; 0 turns it off), and only for a file a second scan came back to (a lake held in memory
-//! loads on the first, as it is there to be read again): data read once — a backfill, a consumer
-//! reading the log through, a one-off report — passes through without costing the CPU that
-//! decoding it would. A table whose columns are held keeps each file it writes as written (`put`),
-//! so its new files and a merge's are read from memory at once. When full, the cache makes room
-//! only by dropping columns nobody read for a minute: a working set bigger than memory is read
-//! from Parquet as before, instead of being churned through the cache.
+//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: a quarter of the
+//! query memory, an eighth of RAM; 0 turns it off), and only for a file a second scan came back to:
+//! data read once — a backfill, a consumer reading the log through, a one-off report — passes through
+//! without costing the CPU that decoding it would. A table whose columns are held keeps each file it
+//! writes as written (`put`), so its new files and a merge's are read from memory at once. When full,
+//! the cache makes room only by dropping columns nobody read for a minute: a working set bigger than
+//! memory is read from Parquet as before, instead of being churned through the cache. The loads a scan
+//! starts wait for its query: the files the scan's plan reads carry a gate (`gated`), and the loads start
+//! when the last copy of those files goes, with the query's plan, so no query pays for the loads it
+//! starts, and a concurrent scan of the same file starts no second load (`busy`).
+//!
+//! A lake held in memory (`memory://`) is different: its files are in memory already, so its cache
+//! may take the query memory's room, within the memory line (`room_for`), and it loads a file on its
+//! first read, not its second. Once the first query's loads have started and run, every file it holds
+//! is hot; the first query itself reads Parquet, as before. A quarter of the query memory held the first
+//! files a scan loaded and left the rest in Parquet for good (a 10M-row table of nine files kept five of
+//! them hot at 0.33 GB of query memory).
 //!
 //! A file with a lineage (another engine's, or written without a leader) gets its rows' system
 //! columns from it here, and an append table's file with rows deleted is held without them: both
@@ -30,7 +39,7 @@ use datafusion::datasource::file_format::options::ReadOptions;
 use datafusion::datasource::listing::{ListingTable, ListingTableConfig, ListingTableUrl};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::parquet::arrow::{arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder}, ProjectionMask};
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{project_schema, stats::Precision, ColumnStatistics, ScalarValue, Statistics};
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
@@ -49,6 +58,7 @@ const BATCH: usize = 8192;
 
 pub struct Hot {
     max: usize,
+    memory: bool, // a lake held in memory (`memory://`): see the module's doc
     state: Mutex<State>,
     slot: tokio::sync::Semaphore, // one file at a time: loading competes with queries for CPU
 }
@@ -60,6 +70,7 @@ struct State {
     used: usize,
     busy: HashSet<String>,           // files being loaded
     once: std::collections::VecDeque<String>, // files a scan read once (the next read loads them)
+    need: HashMap<String, usize>,    // a lake in memory's files that didn't fit: the bytes they decode to, so no try decodes them again
 }
 
 struct Col {
@@ -101,10 +112,15 @@ impl Held {
 }
 
 impl Hot {
-    pub fn new() -> Hot {
+    /// The cache of a lake: `memory` for a lake held in memory. Its budget is the query memory (`room_for` takes what
+    /// queries don't reserve, within the memory line), not a quarter of it: see the module's doc.
+    pub fn new(memory: bool) -> Hot {
         let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
-        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| crate::store::memory_limit() / 4); // (a quarter of the query memory: an eighth of RAM)
-        Hot { max, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
+        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match memory {
+            true => crate::store::memory_limit(),
+            false => crate::store::memory_limit() / 4, // (a quarter of the query memory: an eighth of RAM)
+        });
+        Hot { max, memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }
 
     pub fn on(&self) -> bool { self.max > 0 }
@@ -158,6 +174,7 @@ impl Hot {
             keep
         });
         s.rows.retain(|k, _| !gone.contains(base(k)));
+        s.need.retain(|k, _| !gone.contains(base(k)));
         s.used = s.used.saturating_sub(freed);
     }
 
@@ -184,25 +201,33 @@ impl Hot {
     }
 
     /// Decode `file`'s columns among `fields` that aren't here yet, in the background, if they
-    /// can fit (`deletes`: without its deleted rows).
-    fn load(self: &Arc<Self>, lake: Arc<Lake>, file: DataFile, fields: Vec<FieldRef>, deletes: bool) {
+    /// can fit (`deletes`: without its deleted rows). The decode waits for `gate` to open: the scan's
+    /// query is over then (`gated`). Returns whether a load was started.
+    fn load(self: &Arc<Self>, lake: Arc<Lake>, file: DataFile, fields: Vec<FieldRef>, deletes: bool, gate: LoadGate) -> bool {
         let guess = (file.bytes as usize).max(1 << 20) * 3; // decoded LZ4 Parquet: roughly 3x (checked after)
         // Queries come first: what they hold now is off the cache's budget, so a node under load
         // keeps its memory for them (both are bounded by `--memory-gb`).
         let room = self.room_for(&lake);
         let key = key(&file, deletes);
-        let memory = crate::memory::in_memory(&lake.url);
+        let memory = self.memory;
         let fields: Vec<FieldRef> = {
             let mut s = self.state.lock().unwrap();
             let missing: Vec<FieldRef> = fields.into_iter().filter(|f| !s.cols.contains_key(&(key.clone(), f.name().clone()))).collect();
-            if missing.is_empty() || s.busy.contains(&key) || !(memory || s.twice(&key)) || !s.room(guess, room) {
-                return;
+            // (a lake in memory guesses nothing: its file is decoded and fits or not, and a file that didn't fit
+            // waits for the room its decoded size needs, not a guess of it: `need`)
+            let need = match memory {
+                true => s.need.get(&key).copied().unwrap_or(0),
+                false => guess,
+            };
+            if missing.is_empty() || s.busy.contains(&key) || !(memory || s.twice(&key)) || !s.room(need, room) {
+                return false;
             }
             s.busy.insert(key.clone());
             missing
         };
         let hot = self.clone();
         crate::panics::spawn(async move {
+            let _ = gate.await; // (the scan's query is over: its plan was dropped)
             let _slot = hot.slot.acquire().await;
             let decoded = decode(&lake, &file, &fields, deletes).await;
             let mut s = hot.state.lock().unwrap();
@@ -212,8 +237,15 @@ impl Hot {
                 return; // (batches cut differently: can't be combined)
             }
             let sizes: Vec<usize> = arrays.iter().map(|a| size(a)).collect();
-            if !s.room(sizes.iter().sum(), room) {
+            let bytes: usize = sizes.iter().sum();
+            if !s.room(bytes, room) {
+                if memory {
+                    s.need.insert(key.clone(), bytes); // (the next scan waits for this much room before it decodes the file again)
+                }
                 return;
+            }
+            if memory {
+                s.need.remove(&key);
             }
             s.rows.insert(key.clone(), Arc::new(rows));
             for (((f, arrays), ranges), bytes) in fields.iter().zip(arrays).zip(ranges).zip(sizes) {
@@ -223,6 +255,7 @@ impl Hot {
             drop(s);
             crate::oom::wake(); // (the columns are in: the watch may need to give some back)
         });
+        true
     }
 
     /// The most the cache may hold now: its budget, less what queries hold; and past the node's trim line
@@ -570,22 +603,28 @@ impl TableProvider for HotFiles {
         }
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
         let (plain, special): (Vec<&DataFile>, Vec<&DataFile>) = cold.iter().copied().partition(|f| plain_file(f, deletes));
+        // The loads this scan starts wait on this sender: the files of its plan carry it (`gated`), so they start when the
+        // last copy of those files goes, with the query's plan. Here the scan lets go of its own copy.
+        let (go, gate) = tokio::sync::oneshot::channel::<()>();
+        let gate: LoadGate = futures::FutureExt::shared(gate);
+        let holder = Arc::new(Gate(go));
         if !plain.is_empty() {
             let urls = plain.iter().map(|f| ListingTableUrl::parse(self.lake.full(&f.path))).collect::<Result<Vec<_>, _>>()?;
             let options = ParquetReadOptions::default().to_listing_options(state.config(), state.default_table_options());
             let config = ListingTableConfig::new_with_multi_paths(urls).with_listing_options(options).with_schema(self.schema.clone());
             let table = ListingTable::try_new(config)?.with_cache(state.runtime_env().cache_manager.get_file_statistic_cache());
-            plans.push(told(table.scan(state, projection, filters, limit).await?, &self.known)?);
+            plans.push(gated(told(table.scan(state, projection, filters, limit).await?, &self.known)?, &holder)?);
         }
         if !special.is_empty() {
             let state = state.as_any().downcast_ref::<datafusion::execution::SessionState>().ok_or_else(|| datafusion::error::DataFusionError::Internal("a session without its state".into()))?;
             let ctx = datafusion::prelude::SessionContext::new_with_state(state.clone());
             let df = crate::query::files_once(&self.lake, &ctx, &special, &self.meta, &self.schema).await.map_err(|e| datafusion::error::DataFusionError::External(e.into()))?;
             let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-            plans.push(df.select_columns(&names)?.create_physical_plan().await?);
+            plans.push(gated(df.select_columns(&names)?.create_physical_plan().await?, &holder)?);
         }
+        drop(holder); // (its copies are in the plan's files: the loads wait for them; with no file to carry it, they start now)
         for f in cold {
-            self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes);
+            self.lake.hot.load(self.lake.clone(), f.clone(), schema.fields().to_vec(), deletes, gate.clone()); // (in the background: the next read has the file)
         }
         if !held.is_empty() {
             let source = HotSource::new(schema.clone(), held, state.config().target_partitions().max(1), self.known.clone());
@@ -593,12 +632,22 @@ impl TableProvider for HotFiles {
                 plans.push(DataSourceExec::from_data_source(source));
             }
         }
-        match plans.len() {
-            0 => Ok(Arc::new(EmptyExec::new(schema))),
-            _ => UnionExec::try_new(plans),
-        }
+        let plan: Arc<dyn ExecutionPlan> = match plans.len() {
+            0 => Arc::new(EmptyExec::new(schema)),
+            _ => UnionExec::try_new(plans)?,
+        };
+        Ok(plan)
     }
 }
+
+/// A scan's loads wait on this: a shared receiver, which opens (with `Ok`, or `Err` once the sender is gone) when the
+/// last copy of the sender goes, with the scan's files (`gated`).
+type LoadGate = futures::future::Shared<tokio::sync::oneshot::Receiver<()>>;
+
+/// The sender a scan's loads wait for. Each file of the scan's plan holds an `Arc` of it (`gated`), so it goes when the
+/// last of those files goes: with the query's plan, after its streams have ended, or when an EXPLAIN or a failed query
+/// drops the plan.
+struct Gate(#[allow(dead_code)] tokio::sync::oneshot::Sender<()>); // (held, never read: its drop is the signal)
 
 /// A file a scan reads as Parquet: no lineage, and no deleted rows to drop (`deletes`: the table's rows are read
 /// without them, as a keyed table's are not).
@@ -669,6 +718,29 @@ fn told(plan: Arc<dyn ExecutionPlan>, known: &HashMap<String, Known>) -> datafus
     }).collect();
     let built = FileScanConfigBuilder::from(config.clone()).with_file_groups(groups).with_statistics(fill(&config.statistics())).build();
     Ok(DataSourceExec::from_data_source(built))
+}
+
+/// A scan's plan with each file it reads holding the scan's gate (`Gate`), as a typed extension of the file: the loads the
+/// scan starts wait until the last copy of those files goes, with the query's plan. The files are the same files in the same
+/// groups, and no node is added, so the plan's shape and its EXPLAIN text are the same (an optimizer rule still sees the
+/// scan it saw). DataFusion copies a file with its extensions when it splits or repartitions the groups, so a copy in
+/// the optimized plan holds the gate too; a plan with no file reading Parquet holds none, and nothing waits for it.
+fn gated(plan: Arc<dyn ExecutionPlan>, gate: &Arc<Gate>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    let plan = plan.transform_up(|node| {
+        let Some(scan) = node.downcast_ref::<DataSourceExec>() else { return Ok(Transformed::no(node)) };
+        let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>() else { return Ok(Transformed::no(node)) };
+        let groups: Vec<FileGroup> = config.file_groups.iter().map(|g| {
+            let files = g.iter().map(|f| f.clone().with_extension(gate.clone())).collect::<Vec<_>>();
+            let group = FileGroup::new(files);
+            match g.file_statistics(None) {
+                Some(s) => group.with_statistics(Arc::new(s.clone())),
+                None => group,
+            }
+        }).collect();
+        let built = FileScanConfigBuilder::from(config.clone()).with_file_groups(groups).build();
+        Ok(Transformed::yes(DataSourceExec::from_data_source(built)))
+    })?;
+    Ok(plan.data)
 }
 
 /// The hot batches of a scan, as DataFusion's memory source reads them (the same partitions in the same order, and
@@ -1027,7 +1099,7 @@ mod tests {
 
     #[test]
     fn put_holds_a_file_in_the_readers_batches() {
-        let hot = Hot { max: 1 << 30, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
+        let hot = Hot { max: 1 << 30, memory: false, state: Default::default(), slot: tokio::sync::Semaphore::new(1) };
         // Three writes of different sizes: the file is still read in batches of 8,192 rows.
         let pieces = [(0i64, 5_000i64), (5_000, 20_000), (25_000, 3)];
         let ints: Vec<ArrayRef> = pieces.iter().map(|&(from, n)| Arc::new(Int64Array::from_iter_values(from..from + n)) as ArrayRef).collect();
@@ -1087,5 +1159,38 @@ mod tests {
 
         assert_eq!(source.partition_statistics(None).unwrap().num_rows, Precision::Exact(18));
         assert_eq!(source.partition_statistics(Some(1)).unwrap().num_rows, Precision::Exact(7));
+    }
+
+    #[test]
+    fn gated_holds_a_scans_loads_until_the_last_copy_of_its_plan_goes() {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use datafusion::physical_plan::displayable;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+        let groups = vec![
+            FileGroup::new(vec![datafusion::datasource::listing::PartitionedFile::new("a.parquet", 10), datafusion::datasource::listing::PartitionedFile::new("b.parquet", 10)]),
+            FileGroup::new(vec![datafusion::datasource::listing::PartitionedFile::new("c.parquet", 10)]),
+        ];
+        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(ParquetSource::new(schema))).with_file_groups(groups).build();
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+        let (go, mut wait) = tokio::sync::oneshot::channel::<()>();
+        let gate = Arc::new(Gate(go));
+        let tagged = gated(plan.clone(), &gate).unwrap();
+        drop(gate);
+
+        // Every file of every group holds the gate, and the plan reads as it did (no node added, the same files).
+        let scan = tagged.downcast_ref::<DataSourceExec>().expect("a file scan");
+        let config = scan.data_source().downcast_ref::<FileScanConfig>().expect("its config");
+        let files: Vec<bool> = config.file_groups.iter().flat_map(|g| g.iter().map(|f| f.extension::<Arc<Gate>>().is_some())).collect();
+        assert_eq!(files, [true, true, true]);
+        assert_eq!(displayable(tagged.as_ref()).indent(false).to_string(), displayable(plan.as_ref()).indent(false).to_string());
+
+        // The loads wait while either copy of the plan is held, and go once the last one is dropped.
+        assert!(matches!(wait.try_recv(), Err(TryRecvError::Empty)));
+        drop(plan);
+        assert!(matches!(wait.try_recv(), Err(TryRecvError::Empty)));
+        drop(tagged);
+        assert!(matches!(wait.try_recv(), Err(TryRecvError::Closed)));
     }
 }
