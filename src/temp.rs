@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_temporary_table_refuses_what_its_not_null_and_checks_refuse() {
-        // (its writes are checked as a lake table's are: `apply` runs `defaults::check` over each batch)
+        // (its writes are checked as a lake table's are: `apply` runs `defaults::fit`, which runs `rules::checked`, over each batch)
         let s = "unit-temp-checks";
         let meta = TableMeta {
             columns: vec![("a".into(), "Int32".into()), ("c".into(), "Int32".into())],

@@ -1,7 +1,7 @@
 //! Enum types (round 34): `CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')`, as Postgres and
 //! DuckDB make them, and MySQL's `ENUM('a', 'b')` written as a column's type. A column of one holds
 //! text in its files, so Delta and Iceberg readers and every client read it as a string, and every
-//! door that writes rows refuses a value its labels don't list (`check`, from `defaults::check`:
+//! door that writes rows refuses a value its labels don't list (`check`, from `rules::checks`:
 //! Postgres's 22P02, the writer's alone). Each table keeps the labels of its enum columns
 //! (`TableMeta::enums`), so a write's check reads nothing else; `ALTER TYPE … ADD VALUE` adds the
 //! label to every table using the type, in the type's own commit. A label is never renamed or

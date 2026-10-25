@@ -368,14 +368,19 @@ async fn produce(app: &App, who: &crate::auth::Principal, ver: i16, r: &mut Rd) 
     let mut topics: Vec<(String, Vec<(i32, BoxFuture<'static, Outcome>)>)> = vec![];
     for _ in 0..r.len()? {
         let name = r.str()?;
-        let meta: Option<TableMeta> = app.lake.cat.meta(&table_key(&name)).await?.map(|m| m.logical()); // (JSON fields by SQL's names: ADR-022)
+        let meta = app.lake.cat.meta(&table_key(&name)).await?; // (the stored entry: its JSON fields are SQL's names too, ADR-022)
+        let rules = meta.as_ref().map(|m| m.rules());
         let allowed = who.role >= Role::Write && crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_rows(&crate::auth::catalog_name(&name))).is_ok(); // (the row doors' one check)
         let mut parts = vec![];
         for _ in 0..r.len()? {
             let (index, records) = (r.i32()?, r.nbytes()?.unwrap_or_default());
-            let outcome = match (&meta, index) {
+            let outcome = match (&meta, &rules, index) {
                 _ if !allowed => ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(format!("this {} may not write {name}", if who.access.is_some() { "user" } else { "token" })))),
-                (Some(meta), 0) => queue(app, who, &name, meta, &records).await,
+                (Some(meta), Some(Ok(rules)), 0) => queue(app, who, &name, meta, rules, &records).await,
+                (Some(_), Some(Err(e)), 0) => {
+                    eprintln!("kafka: a record for {name} refused: {e:#}"); // (the table's rules don't make: its records are refused)
+                    ready((INVALID_RECORD, -1, Some(crate::ext::said(e))))
+                }
                 _ => ready((UNKNOWN_TOPIC, -1, None)),
             };
             parts.push((index, outcome));
@@ -415,7 +420,7 @@ fn ready(o: Outcome) -> BoxFuture<'static, Outcome> { async move { o }.boxed() }
 /// exactly-once: its (producer id, sequence) become a Pondra producer and seq, and `prev` makes
 /// a batch that overtook its predecessor go again once that one is in (OUT_OF_ORDER_SEQUENCE
 /// only if it never comes).
-async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, records: &[u8]) -> BoxFuture<'static, Outcome> {
+async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, records: &[u8]) -> BoxFuture<'static, Outcome> {
     let invalid = |e: anyhow::Error| {
         eprintln!("kafka: a record for {table} refused: {e:#}"); // (librdkafka shows only the code; this says why)
         ready((INVALID_RECORD, -1, Some(crate::ext::said(&e))))
@@ -429,22 +434,24 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
     };
     let mut acks = vec![];
     for b in batches {
-        let rows = match to_rows(meta, &b.recs) {
-            Ok((rows, lines)) if crate::defaults::any(meta) => {
-                // (a JSON row without a key takes its column's DEFAULT)
-                let filled = async { crate::defaults::fill(&app.lake, meta, rows, |c| crate::defaults::absent_keys(meta, &lines).ok()?.remove(c)).await };
-                match filled.await {
-                    Ok(rows) => rows,
-                    Err(e) => return invalid(e),
-                }
-            }
-            Ok((rows, _)) => rows,
+        let (batch, lines) = match to_rows(rules, &b.recs) {
+            Ok(r) => r,
             Err(e) => return invalid(e),
         };
-        if let Err(e) = crate::defaults::check(meta, table, &rows) {
-            return invalid(e); // (NOT NULL: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
-        }
-        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), &rows)) {
+        // (a JSON row without a key takes its column's DEFAULT)
+        let left_out = match rules.fills() {
+            true => match crate::defaults::absent_keys(meta, &lines) {
+                Ok(masks) => crate::rules::LeftOut::PerRow(masks),
+                Err(e) => return invalid(e),
+            },
+            false => crate::rules::LeftOut::None,
+        };
+        // (NOT NULL, a CHECK, a held form: said as a bad record, which a producer doesn't retry; a UNIQUE's duplicate is the leader's to find, and `failed` says it the same way)
+        let rows = match crate::rules::shape(rules, table, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await {
+            Ok(rows) => rows,
+            Err(e) => return invalid(e),
+        };
+        if let Err(e) = crate::auth::WHO.sync_scope(who.clone(), || crate::auth::check_load(meta, &crate::auth::catalog_name(table), rows.rows())) {
             return ready((TOPIC_AUTHORIZATION_FAILED, -1, Some(crate::ext::said(&e)))); // (a keyed topic's records replace their keys', a tombstone deletes: S11)
         }
         let src = match b.producer_id >= 0 && b.base_seq >= 0 {
@@ -458,7 +465,7 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
             }
             false => Src { producer: String::new(), seq: 0, prev: None }, // at-least-once, as in Kafka
         };
-        match log.queue(table.to_string(), src.clone(), rows.clone()).await {
+        match log.queue_shaped(table.to_string(), src.clone(), rows.clone()).await {
             Ok(ack) => acks.push((ack, src, rows)),
             Err(e) => return ready(failed(&e)),
         }
@@ -589,8 +596,8 @@ fn unsnappy(data: &[u8], most: u64) -> Result<Vec<u8>> {
 }
 
 /// Records as rows of the table: each value a JSON row (see the module comment).
-fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8>)> {
-    let schema = schema(&meta.columns)?;
+fn to_rows(t: &crate::rules::Table, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8>)> {
+    let schema = t.schema.clone();
     let raw = schema.index_of("_value").is_ok();
     // Tombstones and change events are rewritten one by one; plain JSON rows go straight through.
     let has = |v: &[u8], word: &[u8]| v.windows(word.len()).any(|w| w == word);
@@ -602,7 +609,7 @@ fn to_rows(meta: &TableMeta, recs: &[Rec]) -> Result<(RecordBatch, Vec<u8>)> {
         match (raw, slow) {
             (true, _) => {}
             (false, false) => lines.extend_from_slice(r.value.as_deref().unwrap_or_default()),
-            (false, true) => match row(meta, r.key.as_deref(), r.value.as_deref())? {
+            (false, true) => match row(t, r.key.as_deref(), r.value.as_deref())? {
                 Some(v) => serde_json::to_writer(&mut lines, &v)?,
                 None => continue,
             },
@@ -646,7 +653,7 @@ fn wrapped(v: &serde_json::Map<String, Value>) -> bool {
 
 /// A record as the JSON row to write, None to skip it. Debezium's `after` is the new row, a
 /// delete marks `before` deleted; a null value (a tombstone) deletes the key from a keyed table.
-fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Option<Value>> {
+fn row(t: &crate::rules::Table, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Option<Value>> {
     let unwrap = |mut v: Value| if v.as_object().is_some_and(wrapped) { v["payload"].take() } else { v };
     let deleted = |mut v: Value| {
         if let Some(o) = v.as_object_mut() {
@@ -658,7 +665,7 @@ fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Opt
         Some(v) => serde_json::from_slice(v)?,
         None => Value::Null,
     });
-    let keyed = !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
+    let keyed = !t.key.is_empty() && t.column("_deleted").is_some();
     if let Some(op) = v.get("op").and_then(Value::as_str).map(String::from).filter(|_| v.get("after").is_some() || v.get("before").is_some()) {
         v = match op.as_str() {
             "c" | "u" | "r" => v["after"].take(),
@@ -681,7 +688,7 @@ fn row(meta: &TableMeta, key: Option<&[u8]>, value: Option<&[u8]>) -> Result<Opt
     let k = unwrap(serde_json::from_slice(key).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(key).into())));
     Ok(Some(deleted(match k {
         Value::Object(_) => k,
-        k if meta.key.len() == 1 => Value::Object([(meta.key[0].clone(), k)].into_iter().collect()),
+        k if t.key.len() == 1 => Value::Object([(t.key[0].clone(), k)].into_iter().collect()),
         _ => bail!("a tombstone's key must name every key column"),
     })))
 }

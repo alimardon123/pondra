@@ -127,7 +127,7 @@ fn refusal(t: &str, column: &str, v: &str) -> Option<(String, &'static str)> {
     }
 }
 
-/// Every door's rows (`defaults::check`): a value its column's enum doesn't list, or that isn't a
+/// Every door's rows (`rules::checks`): a value its column's enum doesn't list, or that isn't a
 /// uuid written the one way, or JSON, is refused (Postgres's 22P02), and one longer than its VARCHAR(n)
 /// (22001), the writer's alone. `marker`: a keyed table's delete markers carry no values.
 pub fn check(t: &Table, rows: &RecordBatch, sql_names: bool, marker: &dyn Fn(usize) -> bool) -> Result<()> {
