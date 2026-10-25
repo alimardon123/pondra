@@ -7490,7 +7490,8 @@ def hot():
     Then rows tiered from the log, and eight small files held and merged: a hot table's new files are
     held as they are written, and a merge's file takes the replaced files' place (`Hot::put`, `Hot::forget`).
     Last, a table read cold (a hot budget no file fits: PONDRA_HOT_GB=0.000001) sizes its GROUP BY by its
-    columns' distinct values (`hot::told`)."""
+    columns' distinct values (`hot::told`). Last, a lake in memory holds every file hot once its first query's loads
+    settle, with a query memory too small for a quarter of it to hold the table (`hot::Hot::new`)."""
     import re
     lake = new_lake()
     node = Node(lake, A.port, env={"PONDRA_HOT_GB": "1"}).start()
@@ -7605,6 +7606,28 @@ def hot():
     finally:
         cold.kill()
         clean_up()
+    # A lake in memory holds every file hot once its first query's loads settle (`hot.rs`): its files are in memory
+    # already, so its cache takes the query memory's room, and a file loads on its first read. Under a query memory of
+    # 0.333 GB (a quarter of it, 89 MB, held five of nine files and left the rest in Parquet), its 10M rows (160 MB of the
+    # two columns a GROUP BY reads) are held whole once the first query's background loads are done; the first query
+    # itself reads Parquet, as before.
+    mem = Node(":memory:", A.port, env={"PONDRA_MEMORY_GB": "0.333"}).start()
+    try:
+        mq = lambda s: call(A.port, "POST", "/sql", s.encode(), headers={"x-pondra-session": "hot-memory-lake-01"})
+        mq("CREATE TABLE mh AS SELECT x AS id, x % 1000 AS k, CAST(x * 7919 % 100003 AS DOUBLE) / 100.0 AS v FROM range(10000000) AS g(x)")
+        group = "SELECT k, count(*) AS n, sum(v) AS s FROM mh GROUP BY k"
+        answer = mq(group + " -- first")  # (its loads of the cold files start in the background, and busy counts them)
+        deadline = time.time() + 20
+        while metrics_of(A.port).get("pondra_hot_loading_files", 0) and time.time() < deadline:
+            time.sleep(0.5)
+        nxt = "\n".join(r.get("plan", "") for r in mq("EXPLAIN ANALYZE " + group + " -- next"))  # (every plan's text: ANALYZE's is "Plan with Metrics")
+        seen["a lake in memory, the plan once its first query's loads settle"] = [l.strip()[:160] for l in nxt.splitlines() if "DataSourceExec" in l]
+        checks["a lake in memory holds every file hot once its first query's loads settle (no Parquet scan in the next plan, 10M rows held)"] = \
+            "file_groups" not in nxt and "partition_sizes=" in nxt and len(answer) == 1000 and all(r["n"] == 10000 for r in answer)
+        checks["a lake in memory's cache holds its files whole (the hot gauge: 160 MB of the two columns)"] = \
+            160_000_000 <= (metrics_of(A.port).get("pondra_hot_bytes", 0) or 0) <= 170_000_000
+    finally:
+        mem.kill()
     # Under a memory line, the decoded columns are let go before a query is stopped (`oom.rs`): see hot_under_line.
     line_checks, line_seen = hot_under_line()
     checks.update(line_checks)
@@ -22759,6 +22782,100 @@ def dialects():
     return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
 
 
+def patterns():
+    """MATCH_RECOGNIZE (ADR-073, phase 1): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random
+    queries (every pattern operator, every skip rule, empty matches, four partitions of 0-25 rows) against a reference
+    matcher of that file's own, the fixed examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets,
+    FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an
+    exclusion), and the refusals by name. Section 5, the doors: the ticker over the Postgres port equals HTTP; a
+    10,000-row table over 50 symbols answers the same from three nodes (?spread=1) as from one, and spreads; a stored
+    view and a materialized view equal the query, the view kept live through new rows. Without the matcher every
+    statement here is refused (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
+    import patterns_check as pc
+    import psycopg
+    checks, info = {}, {}
+    q = lambda s: sql(A.port, s)
+    lake = new_lake()
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    ok, info["random"] = pc.random_checks(A.port, seed=1, queries=600)
+    checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions) answer as the reference does, or 22000 where it does"] = ok
+    fixed = pc.fixed_checks(A.port)
+    info["fixed missed"] = [k for k, v in fixed.items() if not v]
+    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion: the answers written in patterns_check.py"] = all(fixed.values())
+    refused = pc.refusal_checks(A.port)
+    info["refusals missed"] = [k for k, v in refused.items() if not v]
+    checks["refusals by name: ALL ROWS PER MATCH, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states"] = all(refused.values())
+    # section 5: the ticker over the Postgres port, then three nodes on a lake of their own
+    ticker_q = pc.FIXED[0]["query"]
+    want = pc.post_sql(A.port, ticker_q)["value"]
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:
+        cur = c.execute(ticker_q)
+        cols = [d.name for d in cur.description]
+        over_pg = [dict(zip(cols, r)) for r in cur.fetchall()]
+    checks["the ticker's matches over the Postgres port equal HTTP's, and there are the three of the brief"] = over_pg == want and len(want) == 3
+    node.kill()
+    lake = new_lake()
+    nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]
+    pc.load_tables(A.port)
+    q("CREATE TABLE ticks (symbol TEXT, day INT, price INT)")
+    rng = random.Random(3)
+    vals = []
+    for k in range(50):
+        price = 100
+        for day in range(1, 201):
+            price = max(1, price + rng.randint(-3, 3))
+            vals.append(f"('s{k:02d}', {day}, {price})")
+    for i in range(0, len(vals), 1000):
+        q("INSERT INTO ticks VALUES " + ", ".join(vals[i:i + 1000]))
+    for p in range(A.port, A.port + 3):
+        until(lambda p=p: sql(p, "SELECT count(*) AS n FROM ticks"), [{"n": 10000}], 60)
+    spread_q = ("SELECT symbol, start_day, bottom_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+                "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+                "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+                "up AS up.price > PREV(up.price)) ORDER BY symbol, start_day")
+    t0 = time.time()
+    one = call(A.port, "POST", "/sql?spread=0", spread_q.encode(), timeout=120)
+    info["one node, ms"] = round((time.time() - t0) * 1000)
+    def spreads(port):  # a spread query is counted as spread, or as shuffled when it repartitions by the PARTITION BY
+        m = metrics_of(port)
+        return m["pondra_spread_queries_total"] + m["pondra_shuffled_queries_total"]
+    # the members register with the lake over a few seconds: warm up with a plain spread query until the counters move
+    warm_until = time.time() + 30
+    while time.time() < warm_until:
+        seen = spreads(A.port + 1)
+        call(A.port + 1, "POST", "/sql?spread=1", b"SELECT symbol, count(*) AS n FROM ticks GROUP BY symbol")
+        if spreads(A.port + 1) > seen:
+            break
+        time.sleep(1)
+    before = spreads(A.port + 1)
+    t0 = time.time()
+    three = call(A.port + 1, "POST", "/sql?spread=1", spread_q.encode(), timeout=120)
+    info["three nodes, ms"] = round((time.time() - t0) * 1000)
+    info["spread on node 2"] = spreads(A.port + 1) - before > 0
+    others = [call(p, "POST", "/sql?spread=1", spread_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
+    checks["the 10,000-row query over 50 symbols: each of three nodes with ?spread=1 == one node, and the query spread"] = \
+        bool(one) and three == one and all(o == one for o in others) and info["spread on node 2"]
+    # views: a stored view and a materialized view of the brief's query, the materialized one kept live
+    view_q = ticker_q.rsplit(" ORDER BY ", 1)[0]
+    q(f"CREATE VIEW ticker_v AS {view_q}")
+    q(f"CREATE MATERIALIZED VIEW ticker_mv AS {view_q}")
+    checks["a stored view of the query == the query"] = q("SELECT * FROM ticker_v ORDER BY start_day") == want
+    q("INSERT INTO ticker VALUES ('ACME',21,21),('ACME',22,23),('ACME',23,26),('ACME',24,12),('ACME',25,30)")
+    want_after = q(ticker_q)
+    got_mv = until(lambda: q("SELECT * FROM ticker_mv ORDER BY start_day"), want_after, 30)
+    checks["a materialized view == the query after five more rows (the match at day 18 and at day 23 come in)"] = \
+        got_mv == want_after and [(r["start_day"], r["bottom_day"], r["end_day"]) for r in want_after] == \
+        [(5, 6, 10), (10, 12, 13), (14, 16, 18), (18, 21, 23), (23, 24, 25)]
+    info["view after inserts"] = q("SELECT * FROM ticker_v ORDER BY start_day") == want_after
+    for n in nodes:
+        n.kill()
+    ok = all(checks.values())
+    print(json.dumps({"patterns": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"patterns: {len(pc.FIXED)} fixed examples, {len(pc.REFUSED)} refusals and 600 random queries agree with the reference; the doors agree: all {len(checks)} checks pass"
+
+
 def _delta_commits(lake, table):
     """A Delta table's JSON commits, as {version: [action, ...]}, each line of a commit as the log writes it."""
     import open_check
@@ -24378,24 +24495,24 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on CI's runner (main's build run 650,
-# 2026-10-13: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by
-# it, so CI runs the suite in parts side by side that end together. A section not listed
-# counts as 5 s (sso_flow and sso_pg came after that run: their 15 and 20 are guesses).
-SECS = {"memory": 240, "waits": 99, "sso": 89, "stopped": 87, "guesses": 45, "backpressure": 39,
-        "functions": 38, "server": 34, "doors": 33, "crash": 32, "kafkas": 31, "finals": 28, "pace": 27,
-        "found": 23, "clouds": 21, "kafka": 21, "load": 20, "live": 17, "refreshed": 15, "sso_flow": 15, "sso_pg": 20,
-        "users": 14, "workspace": 14, "reader": 13, "scale": 12, "sealed": 12, "answers_big": 11,
-        "cursors": 11, "find": 11, "history": 11, "objects": 11, "procedures": 11, "sessions": 11,
-        "files": 10, "followers": 10, "guarded": 10, "begin": 9, "bykey": 9, "clients": 9, "flows": 9,
-        "guard": 9, "hot": 9, "schemas": 9, "temps": 9, "catalogs": 8, "clusters": 8, "columns": 8,
-        "fills": 8, "serverless": 8, "alter": 7, "fence": 7, "loads": 7, "safety": 7, "sequences": 7,
-        "tiering": 7, "windows": 7, "dedup": 6, "unique_doors": 6, "memorylake": 60, "served": 60, "jsonfns": 60}
+# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40200329643,
+# 2026-10-25: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
+# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by the table of
+# 10-13, that run's three parts took 654, 441 and 608 s; by this one, four take about 426 s each.)
+SECS = {"memory": 240, "scale": 122, "waits": 113, "hot": 94, "sso": 90, "stopped": 77, "guesses": 45, "doors": 40,
+        "functions": 38, "crash": 37, "server": 36, "served": 33, "backpressure": 31, "finals": 28, "pace": 27,
+        "kafka": 26, "kafkas": 24, "found": 23, "clouds": 21, "tails": 21, "load": 20, "live": 18, "objects": 18,
+        "refreshed": 15, "lateral": 14, "sso_flow": 14, "users": 14, "workspace": 13, "reader": 12, "history": 11,
+        "sealed": 11, "sessions": 11, "answers_big": 10, "cursors": 10, "files": 10, "flows": 10, "guarded": 10,
+        "procedures": 10, "reached": 10, "begin": 9, "clients": 9, "columns": 9, "fills": 9, "followers": 9,
+        "schemas": 9, "serverless": 9, "temps": 9, "guard": 8, "learn": 8, "alter": 7, "bykey": 7, "fence": 7,
+        "safety": 7, "sequences": 7, "windows": 7, "catalogs": 6, "clusters": 6, "dedup": 6, "find": 6,
+        "friendly": 6, "loads": 6, "memorylake": 6, "plans": 6, "unique_doors": 6}
 
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -24427,7 +24544,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -24440,7 +24557,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

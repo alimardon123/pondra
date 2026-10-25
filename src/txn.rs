@@ -20,12 +20,14 @@ use crate::store::*;
 use crate::locks::{lock_wait, passes, Hold, Locks, Place, LOCK_MAX};
 use crate::settings::SERIALIZABLE;
 use crate::write::Stmt;
+pub use crate::rules::txn::Level;
+use crate::rules::txn::{aborted, begin_modes, plan, read_only, savepoint_name, write_word};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, UInt64Type};
 use datafusion::sql::sqlparser::ast::{
     Expr, GroupByExpr, Ident, LockClause, LockType, NonBlock, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor,
-    TransactionAccessMode, TransactionIsolationLevel, TransactionMode, Visit, Visitor,
+    TransactionMode, Visit, Visitor,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
@@ -133,22 +135,6 @@ impl ByKey {
             Some(row) => Some(Some(row)),
             None => self.gone.contains(key).then_some(None),
         })
-    }
-}
-
-/// READ COMMITTED or REPEATABLE READ (ADR-067 §1). READ UNCOMMITTED is READ COMMITTED, as in Postgres.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Level {
-    Committed,
-    Repeatable,
-}
-
-impl Level {
-    fn name(self) -> &'static str {
-        match self {
-            Level::Committed => "read committed",
-            Level::Repeatable => "repeatable read",
-        }
     }
 }
 
@@ -358,7 +344,7 @@ pub async fn command(app: &crate::server::App, word: &str, sql: &str) -> Result<
                 release_txn(&t);
                 Ok(("ROLLBACK", None))
             }
-            None => Ok(("ROLLBACK", Some("there is no transaction in progress".into()))),
+            None => Ok(("ROLLBACK", Some(crate::rules::txn::NONE_OPEN.into()))),
         },
         _ => commit(app, &s).await.map(|(tag, warning, _)| (tag, warning)),
     }
@@ -366,7 +352,7 @@ pub async fn command(app: &crate::server::App, word: &str, sql: &str) -> Result<
 
 /// Runs `f` on the session's open transaction (25P01 outside one), answering `tag`.
 fn on_open(s: &str, what: &str, tag: &'static str, f: impl FnOnce(&mut Txn) -> Result<()>) -> Result<(&'static str, Option<String>)> {
-    at(s, f).unwrap_or_else(|| Err(crate::codes::coded("25P01", format!("{what} can only be used in transaction blocks")))).map(|()| (tag, None))
+    at(s, f).unwrap_or_else(|| Err(crate::rules::txn::outside(what))).map(|()| (tag, None))
 }
 
 /// `SAVEPOINT name` (ADR-067 §9): a mark in the transaction's kept writes, which `ROLLBACK TO` returns to.
@@ -407,29 +393,13 @@ fn rollback_to(s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
 
 /// The newest savepoint of that name (3B001 when there is none). As in Postgres, that error fails the transaction.
 fn mark_of(t: &mut Txn, name: &str) -> Result<usize> {
-    t.marks.iter().rposition(|m| m.name == name).ok_or_else(|| {
-        let why = format!("savepoint \"{name}\" does not exist");
-        t.failed.get_or_insert_with(|| why.clone());
-        crate::codes::coded("3B001", why)
-    })
-}
-
-/// The name a savepoint statement gives: an unquoted one lower-cased, as Postgres folds it.
-fn savepoint_name(sql: &str) -> Result<String> {
-    let ident = match Parser::parse_sql(&GenericDialect {}, sql)?.pop() {
-        Some(Statement::Savepoint { name }) | Some(Statement::ReleaseSavepoint { name }) => name,
-        Some(Statement::Rollback { savepoint: Some(name), .. }) => name,
-        _ => return Err(crate::codes::coded("42601", "a savepoint statement needs a savepoint's name")),
-    };
-    Ok(match ident.quote_style {
-        Some(_) => ident.value,
-        None => ident.value.to_lowercase(),
-    })
-}
-
-/// The error for a statement in a failed transaction (25P02): until its end, only ROLLBACK (or COMMIT) goes on.
-fn aborted(why: &str) -> anyhow::Error {
-    crate::codes::coded("25P02", format!("current transaction is aborted, commands ignored until end of transaction block (it failed: {why})"))
+    match crate::rules::txn::mark_of(t.marks.iter().map(|m| m.name.as_str()), name) {
+        Ok(i) => Ok(i),
+        Err(why) => {
+            t.failed.get_or_insert_with(|| why.clone());
+            Err(crate::rules::txn::no_savepoint(&why))
+        }
+    }
 }
 
 /// How long a transaction may sit idle before the idle timeout ends it (`PONDRA_TXN_IDLE_SECS`, 600).
@@ -456,7 +426,7 @@ fn begin(app: &crate::server::App, s: &str, sql: &str) -> Result<(&'static str, 
     let level = level.map_or_else(default_level, Ok)?;
     let read_only = read_only.unwrap_or_else(default_read_only);
     if !start(app, s, level, read_only, None) {
-        return Ok(("BEGIN", Some("there is already a transaction in progress".into())));
+        return Ok(("BEGIN", Some(crate::rules::txn::ALREADY.into())));
     }
     Ok(("BEGIN", None))
 }
@@ -481,42 +451,6 @@ fn start(app: &crate::server::App, s: &str, level: Level, read_only: bool, job: 
         crate::panics::spawn(upkeep());
     }
     true
-}
-
-/// The modes of a `BEGIN` (or `START TRANSACTION`) statement, as sqlparser reads them.
-fn begin_modes(sql: &str) -> Result<Vec<TransactionMode>> {
-    Ok(match Parser::parse_sql(&GenericDialect {}, sql)?.pop() {
-        Some(Statement::StartTransaction { modes, .. }) => modes,
-        _ => vec![],
-    })
-}
-
-/// The level and access mode the modes name (None: not named). SERIALIZABLE, and the isolation levels that aren't built,
-/// are refused by name (0A000); a mode named twice is refused (42601).
-fn plan(modes: &[TransactionMode]) -> Result<(Option<Level>, Option<bool>)> {
-    let (mut level, mut read_only) = (None, None);
-    for m in modes {
-        match m {
-            TransactionMode::IsolationLevel(l) => {
-                if level.is_some() {
-                    return Err(crate::codes::coded("42601", "conflicting or redundant isolation levels"));
-                }
-                level = Some(match l {
-                    TransactionIsolationLevel::ReadUncommitted | TransactionIsolationLevel::ReadCommitted => Level::Committed,
-                    TransactionIsolationLevel::RepeatableRead => Level::Repeatable,
-                    TransactionIsolationLevel::Serializable => return Err(crate::codes::coded("0A000", SERIALIZABLE)),
-                    _ => return Err(crate::codes::coded("0A000", "that isolation level isn't built here: READ COMMITTED and REPEATABLE READ are")),
-                });
-            }
-            TransactionMode::AccessMode(a) => {
-                if read_only.is_some() {
-                    return Err(crate::codes::coded("42601", "conflicting or redundant access modes"));
-                }
-                read_only = Some(matches!(a, TransactionAccessMode::ReadOnly));
-            }
-        }
-    }
-    Ok((level, read_only))
 }
 
 /// `SET TRANSACTION` (the open transaction: before its first statement) and `SET SESSION CHARACTERISTICS AS TRANSACTION`
@@ -657,11 +591,6 @@ pub fn gate(lake: &Lake, sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// The error for a write in a read-only transaction (25006), as Postgres words it.
-fn read_only(word: &str) -> anyhow::Error {
-    crate::codes::coded("25006", format!("cannot execute {word} in a read-only transaction"))
-}
-
 /// The words Postgres names a statement by in its errors and notices (25006, the DDL notice), for a parsed statement.
 fn word_of(stmt: &Stmt) -> &'static str {
     use crate::ddl::Ddl;
@@ -682,26 +611,6 @@ fn word_of(stmt: &Stmt) -> &'static str {
         },
         Stmt::Invalid(_) => "DDL",
     }
-}
-
-/// The words Postgres names a write by in 25006: None for a statement that reads. (Its text, before the parse.)
-fn write_word(sql: &str) -> Option<String> {
-    let words: Vec<String> = crate::text::first_word(sql).trim_end_matches(';').split_whitespace().take(2).map(|w| w.to_uppercase()).collect();
-    let first = words.first()?.as_str();
-    match first {
-        "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE" | "GRANT" | "REVOKE" | "COMMENT" => Some(first.to_string()),
-        "CREATE" | "DROP" | "ALTER" => Some(words.join(" ")),
-        "COPY" => (!sql.to_uppercase().contains(" TO ")).then(|| "COPY FROM".to_string()),
-        "WITH" => with_write(sql), // (its words don't say what it does: its parse does)
-        _ => None,
-    }
-}
-
-/// The write a `WITH` statement makes (`WITH … INSERT`, `… UPDATE`, `… DELETE`, `… MERGE`), by its parse; None for one
-/// that only reads, or doesn't parse (the door reports that).
-fn with_write(sql: &str) -> Option<String> {
-    let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? else { return None };
-    crate::text::write_of(&q).map(str::to_string)
 }
 
 /// Statements that set or show something rather than run a query: they don't make a transaction one that has run.
@@ -795,9 +704,9 @@ fn at_once_notice(word: &str) -> Result<Option<String>> {
     }
     writable(word)?;
     if with_txn(|t| t.level) == Some(Level::Repeatable) {
-        return Err(crate::codes::coded("0A000", "DDL in a REPEATABLE READ transaction: its snapshot can't see what the DDL makes. Run it before BEGIN or after COMMIT, or use READ COMMITTED (the default)"));
+        return Err(crate::rules::txn::ddl_repeatable());
     }
-    Ok(Some(format!("{word} ran at once: DDL isn't part of a transaction here, and ROLLBACK won't undo it")))
+    Ok(Some(crate::rules::txn::ran_at_once(word)))
 }
 
 /// A temporary table's CREATE in this session's open transaction (`temp.rs`): it runs at once too, with the same checks and
@@ -819,7 +728,7 @@ pub async fn ddl_at_once(app: &crate::server::App, stmt: &Stmt) -> Result<Option
         }
     }
     if let Some(name) = with_txn(|t| names.iter().find(|n| t.tables.get(*n).is_some_and(pending)).cloned()).flatten() {
-        return Err(crate::codes::coded("0A000", format!("{name} has writes pending in this transaction: DDL on it would change the shape they were written against. COMMIT first, then run the DDL")));
+        return Err(crate::rules::txn::ddl_pending(&name));
     }
     Ok(Some(note))
 }
@@ -1614,7 +1523,7 @@ fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
 /// whatever the answer. A failed send lets go too, and the lease covers a send that never arrived.
 /// COMMIT: the tag and warning Postgres gives, and what the leader answered (`duplicate`: a job's commit sent again).
 async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Option<String>, Value)> {
-    let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some("there is no transaction in progress".into()), j!({}))) };
+    let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some(crate::rules::txn::NONE_OPEN.into()), j!({}))) };
     if t.failed.is_some() {
         release_txn(&t);
         return Ok(("ROLLBACK", None, j!({})));

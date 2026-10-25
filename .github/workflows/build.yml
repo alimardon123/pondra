@@ -215,7 +215,7 @@ jobs:
           fi
           binary=false
           if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
-          suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 4) | {part: "harness, \(.) of 3", shard: "\(.)/3"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
+          suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 5) | {part: "harness, \(.) of 4", shard: "\(.)/4"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
           printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
             "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
@@ -452,9 +452,9 @@ jobs:
       - if: needs.plan.outputs.event != 'pull_request'
         run: cargo build --release --workspace
 
-  # The suite, on linux-x64's very binary, in four parts side by side: the quick correctness suite
+  # The suite, on linux-x64's very binary, in five parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
-  # GCS and Azure, scale, Flight…) in three, each section dealt by its measured time
+  # GCS and Azure, scale, Flight…) in four, each section dealt by its measured time
   # (`harness.py all --shard`), and frames against Polars, the console in Chromium, every example
   # on the website, then a cluster losing its leader twice.
   suite:

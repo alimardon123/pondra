@@ -226,7 +226,7 @@ const THE_NODES: &[(&str, &str)] = &[
     ("temp_directory", "spill files go to the system's temporary folder (TMPDIR)"),
 ];
 
-pub const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: REPEATABLE READ is snapshot isolation, which allows write skew; ask for it with SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"; // (`txn.rs` says it too)
+pub use crate::rules::txn::SERIALIZABLE; // (one definition: rules::txn)
 
 /// Is this value of a setting one `ONE_WAY` refuses? (Its SQLSTATE and why.) `DateStyle` takes any
 /// order of days and months, but only ISO's output.

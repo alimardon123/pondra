@@ -111,12 +111,36 @@ pub fn evaluate(base: &SessionContext, rows: &RecordBatch, expr: &str) -> Result
 }
 
 /// `expr` over `rows`, whose columns `schema` names: qualified names among them (`t.v` and `excluded.v` for an upsert's
-/// old and proposed row, one batch of both), so the same name may be in it twice. None if it doesn't plan over them
-/// (an unqualified name the schema holds twice is ambiguous, and SQL works it out instead).
+/// old and proposed row, one batch of both), so the same name may be in it twice. It is analyzed as a query's expression
+/// is (`analyzed`), unless the analyzer's rules can't change it (`optimize::analyzed_alone`), so it answers what SQL answers:
+/// a cast of a fraction to an integer rounds (invariant 293). None if it doesn't plan over them (an unqualified name the
+/// schema holds twice is ambiguous, and SQL works it out instead).
 pub fn evaluate_in(base: &SessionContext, rows: &RecordBatch, schema: &datafusion::common::DFSchema, expr: &str) -> Result<Option<ArrayRef>> {
-    let Ok(e) = base.parse_sql_expr(expr, schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
+    let Ok(e) = base.parse_sql_expr(expr, schema) else { return Ok(None) };
+    let Ok(e) = (match crate::optimize::analyzed_alone(&e, schema) {
+        true => Ok(e),
+        false => analyzed(base, e, schema),
+    }) else {
+        return Ok(None);
+    };
     let Ok(phys) = base.create_physical_expr(e, schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
+}
+
+/// `e` as the analyzer leaves it in a query over `schema`: DataFusion's rules and Pondra's (`optimize::analyzer_rules`),
+/// which planning an expression alone (`create_physical_expr`) doesn't run.
+fn analyzed(base: &SessionContext, e: datafusion::logical_expr::Expr, schema: &datafusion::common::DFSchema) -> datafusion::common::Result<datafusion::logical_expr::Expr> {
+    use datafusion::logical_expr::{EmptyRelation, LogicalPlan, Projection};
+    use datafusion::optimizer::analyzer::Analyzer;
+    static ANALYZER: std::sync::LazyLock<Analyzer> = std::sync::LazyLock::new(|| Analyzer::with_rules(crate::optimize::analyzer_rules()));
+    let input = Arc::new(LogicalPlan::EmptyRelation(EmptyRelation { produce_one_row: false, schema: Arc::new(schema.clone()) }));
+    let plan = LogicalPlan::Projection(Projection::try_new(vec![e], input)?);
+    let state = base.state_ref();
+    let plan = ANALYZER.execute_and_check(plan, state.read().config_options(), |_, _| {})?;
+    match plan {
+        LogicalPlan::Projection(mut p) if p.expr.len() == 1 => Ok(p.expr.remove(0).unalias()),
+        _ => datafusion::common::internal_err!("an expression's projection analyzed into another plan"),
+    }
 }
 
 /// Which of `rows` break `check`, a condition over their columns by name: those it is false for

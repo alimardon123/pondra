@@ -116,9 +116,6 @@ pub fn sql_of(meta: &TableMeta, column: &str) -> Option<String> {
     Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
 }
 
-/// Is this text the word DEFAULT (any case, spaces aside)? A quoted `"default"` is a column's name.
-pub fn is_word(text: &str) -> bool { text.trim().eq_ignore_ascii_case("default") }
-
 /// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
 /// reads it in an UPDATE's SET, a MERGE's INSERT and an upsert; anything else is the value as written.
 pub fn value(meta: &TableMeta, column: &str, text: &str) -> String {
@@ -129,6 +126,7 @@ pub fn value(meta: &TableMeta, column: &str, text: &str) -> String {
 }
 
 pub use crate::rules::alter::is_null; // (`DEFAULT NULL` is no default: the core reads it for every form)
+pub use crate::rules::rows::is_word;
 
 /// `ALTER TABLE t ALTER COLUMN c SET DEFAULT e | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
 /// (leader, under the lake's lock), with Postgres's meanings: a default is worked out for the rows
