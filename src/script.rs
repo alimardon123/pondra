@@ -82,16 +82,25 @@ fn tokens(text: &str) -> Vec<Tok> {
 
 /// What a piece of a script (the text between two `;`s) does to how deep in blocks it is: one more
 /// for each block it opens, one less for each `END`. A block's word opens one only where a statement
-/// starts (the piece's start, after `THEN`, `ELSE`, `DO`, `LOOP`, `REPEAT`, `BEGIN`, `ASYNC`, a label,
-/// or a task's `AS`), so
+/// starts (the piece's start, after `THEN`, `ELSE`, `DO`, `LOOP`, `REPEAT`, `BEGIN`, `ASYNC`,
+/// `PARALLEL`, a label, or a task's or pipeline's first `AS` outside parentheses), so
 /// `DROP TABLE IF EXISTS` opens nothing; `CASE` always does, as an expression's ends with `END` too;
-/// `BEGIN;` and `BEGIN TRANSACTION` are a transaction's.
+/// `BEGIN;` and `BEGIN TRANSACTION` are a transaction's. A pipeline's `STEP a AS …` starts a statement
+/// after its `AS` (outside parentheses: `WHEN cast(x AS int)` is an expression's), so its block is one statement.
 pub fn depth(piece: &str) -> i32 {
     let t = tokens(piece);
     let word = |i: usize| t.get(i).filter(|x| x.k == K::Word).map(|x| piece[x.at..x.end].to_ascii_lowercase());
-    let task = word(0).as_deref() == Some("create") && [1, 3].iter().any(|&i| matches!(word(i).as_deref(), Some("task" | "procedure"))); // (`CREATE TASK … AS BEGIN …`, a procedure's too)
-    let mut d = 0;
+    let task = word(0).as_deref() == Some("create") && [1, 3].iter().any(|&i| matches!(word(i).as_deref(), Some("task" | "procedure" | "pipeline"))); // (`CREATE TASK … AS BEGIN …`, a procedure's and a pipeline's too)
+    let (mut d, mut parens) = (0, 0);
+    let mut step = false; // a STEP where a statement starts, its AS not yet seen
+    let mut step_block: Option<usize> = None; // the word after a STEP's AS: where a statement starts
+    let mut task_block: Option<usize> = None; // the word after a task's first AS outside parentheses: where its statement starts
     for i in 0..t.len() {
+        match t[i].k {
+            K::Open => parens += 1,
+            K::Close => parens -= 1,
+            _ => {}
+        }
         let Some(w) = word(i) else { continue };
         let before = i.checked_sub(1).and_then(word);
         if w == "end" {
@@ -101,7 +110,16 @@ pub fn depth(piece: &str) -> i32 {
         if before.as_deref() == Some("end") {
             continue; // (END IF)
         }
-        let starts = i == 0 || matches!(before.as_deref(), Some("then" | "else" | "do" | "loop" | "repeat" | "begin" | "async")) || labelled(&t, i) || task && before.as_deref() == Some("as");
+        let starts = i == 0 || matches!(before.as_deref(), Some("then" | "else" | "do" | "loop" | "repeat" | "begin" | "async" | "parallel")) || labelled(&t, i) || task_block == Some(i) || step_block == Some(i);
+        if w == "step" && starts {
+            step = true;
+        } else if w == "as" && step && parens == 0 {
+            step = false;
+            step_block = Some(i + 1);
+        }
+        if task && w == "as" && parens == 0 && task_block.is_none() {
+            task_block = Some(i + 1); // (only the first: a column's `AS parallel` in the body starts nothing)
+        }
         d += match w.as_str() {
             "case" => 1,
             "begin" => (starts && opens(piece, &t, i)) as i32,
@@ -109,6 +127,7 @@ pub fn depth(piece: &str) -> i32 {
             "repeat" => (starts && t.get(i + 1).is_none_or(|x| x.k != K::Open)) as i32,
             "while" | "loop" => starts as i32,
             "for" => (starts && matches!(word(i + 2).as_deref(), Some("in" | "as"))) as i32,
+            "parallel" => starts as i32, // (`PARALLEL … END PARALLEL`; `FOR … PARALLEL n DO` follows a `)`, not a statement's start)
             _ => 0,
         };
     }
@@ -1389,12 +1408,55 @@ mod tests {
 
     fn split(s: &str) -> Vec<String> { crate::routines::split(s).into_iter().map(|x| x.trim().to_string()).collect() }
 
+    /// §2.2's whole example of a pipeline (design/etl-and-bi-tools.md), as written there.
+    const PIPELINE_SECTION_2_2: &str = r#"
+CREATE PIPELINE sales.orders (day DATE DEFAULT current_date - 1)
+  SCHEDULE 'daily at 02:00 UTC'
+  WITH (retries = 2, run_as = etl)
+AS BEGIN
+  PARALLEL                                                  -- side by side; the block waits for both
+    STEP land_orders AS
+      COPY INTO raw.orders FROM 's3://shop/drop/orders/' (FORMAT csv, HEADER true);
+    STEP land_customers AS                                  -- another database, through a connection
+      INSERT INTO raw.customers SELECT * FROM shop.public.customers WHERE updated >= $day;
+  END PARALLEL;
+
+  STEP enrich AS CALL run('etl/enrich.py', day => $day);    -- a code file, its parameters bound
+
+  STEP score WITH (packages = ['scikit-learn==1.7']) AS     -- or the code itself, inline
+    DO LANGUAGE python $$
+      df = db.sql("SELECT * FROM sales.orders_enriched WHERE day = $day").to_pandas()
+      db.append("sales.scores", df.assign(score=df.amount.rank(pct=True)))
+    $$;
+
+  STEP daily AS                                             -- sales.daily is keyed by (day, region)
+    INSERT OR REPLACE INTO sales.daily
+    SELECT day, region, sum(amount) AS revenue FROM sales.orders_enriched
+    WHERE day = $day GROUP BY ALL;
+
+  FOR r IN (SELECT DISTINCT region FROM sales.daily WHERE day = $day) PARALLEL 4 DO
+    STEP export AS                                          -- one pass per region, four at once
+      COPY (SELECT * FROM sales.daily WHERE region = $r.region AND day = $day)
+      TO 's3://exports/' || $r.region || '/' || $day || '.parquet' (FORMAT parquet);
+  END FOR;
+
+  STEP report WHEN $daily.rows > 0 AS                       -- another pipeline, as a child run
+    EXECUTE PIPELINE sales.monthly_report (day => $day) WAIT;
+
+  STEP alert AFTER ANY FAILED AS
+    CALL pondra.notify('team', 'orders failed at ' || $run.failed || ': ' || $run.error);
+  STEP tidy AFTER ALL ALWAYS AS DELETE FROM raw.orders WHERE day < $day - 30;
+END;
+"#;
+
     #[test]
     fn blocks_are_one_statement() {
         assert_eq!(split("SELECT 1; IF $n = 0 THEN PRINT 'a'; ELSE PRINT 'b'; END IF; SELECT 2").len(), 3);
         assert_eq!(split("BEGIN; INSERT INTO t VALUES (1); COMMIT;").len(), 3); // (a transaction)
         assert_eq!(split("BEGIN TRANSACTION; SELECT 1; COMMIT").len(), 3);
         assert_eq!(split("BEGIN SELECT 1; IF a THEN IF b THEN SELECT 2; END IF; END IF; END; SELECT 3").len(), 2);
+        assert_eq!(split("CREATE PIPELINE p AS BEGIN PARALLEL STEP a AS BEGIN SELECT 1; SELECT 2; END; STEP b AS SELECT 3; END PARALLEL; END; SELECT 4").len(), 2);
+        assert_eq!(split("CREATE TASK t SCHEDULE '1 hour' AS SELECT 1 AS parallel; SELECT 2").len(), 2);
         assert_eq!(split("DROP TABLE IF EXISTS t; SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t").len(), 2);
         assert_eq!(split("SELECT CASE WHEN a THEN if(b, 1, 2) ELSE repeat('x', 2) END; IF a THEN IF (b) THEN SELECT 1; END IF; END IF").len(), 2);
         assert_eq!(split("outer: WHILE true DO LEAVE outer; END WHILE outer; SELECT x::int FROM t").len(), 2);
@@ -1402,6 +1464,15 @@ mod tests {
         assert_eq!(split("FOR r IN (SELECT 1 AS a) PARALLEL 4 DO SELECT 1; END FOR; ASYNC BEGIN SELECT 1; SELECT 2; END; AWAIT ALL").len(), 3);
         assert_eq!(split("CREATE TASK t AFTER a AS BEGIN INSERT INTO x VALUES (1); RETURN 2; END; EXECUTE TASK a (day => 1)").len(), 2);
         assert_eq!(split("CREATE OR REPLACE TASK t SCHEDULE '1 hour' AS SELECT 1; SELECT 2").len(), 2); // (AS with no block)
+        // pipelines (1.1): a block after AS, a STEP's block, PARALLEL's, and a STEP's AS inside an expression
+        assert_eq!(split("CREATE PIPELINE p AS BEGIN STEP a AS SELECT 1; STEP b AS BEGIN SELECT 2; SELECT 3; END; END; SELECT 4").len(), 2);
+        assert_eq!(split(&format!("{}; SELECT 1", PIPELINE_SECTION_2_2)).len(), 2);
+        assert_eq!(split("CREATE OR REPLACE PIPELINE p AS BEGIN PARALLEL STEP a AS SELECT 1; STEP b AS SELECT 2; END PARALLEL; FOR r IN (SELECT 1 AS x) PARALLEL 4 DO STEP e AS SELECT $r.x; END FOR; STEP t AFTER ALL ALWAYS AS SELECT 5; END; SELECT 6").len(), 2);
+        assert_eq!(split("STEP a AS BEGIN SELECT 1; SELECT 2; END; SELECT 3").len(), 2);
+        assert_eq!(split("PARALLEL SELECT 1; SELECT 2; END PARALLEL; SELECT 3").len(), 2);
+        assert_eq!(split("STEP a WHEN cast($n AS int) > 0 AS BEGIN SELECT 1; SELECT 2; END; SELECT 3").len(), 2);
+        assert_eq!(split("SELECT 1 AS parallel; SELECT 2").len(), 2);
+        assert_eq!(split("SELECT step FROM t; SELECT 2").len(), 2);
         assert!(parse("CREATE TASK t AFTER a AS BEGIN SELECT 1; SELECT 2; END").is_ok_and(|s| s.len() == 1));
         assert_eq!(inside("-- a day's load\nBEGIN DECLARE PARAMETER $d DATE; SELECT $d; END;"), Some(" DECLARE PARAMETER $d DATE; SELECT $d; "));
         assert_eq!(inside("BEGIN; SELECT 1; END"), None); // (a transaction)
