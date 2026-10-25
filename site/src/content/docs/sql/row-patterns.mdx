@@ -254,9 +254,10 @@ among the rows given.
 ## WITHIN
 
 `WITHIN INTERVAL` goes after `PATTERN`. It limits how long a match may run: every row of a match must be at most the
-interval after the match's first row. The time is the first `ORDER BY` key, which must be a date or a timestamp, in
-ascending order. A row past the interval ends that way of matching, and the search goes on with the others: a shorter
-repetition, or a later start, is tried in the standard's order.
+interval after the match's first row. The bound is inclusive: a row exactly the interval after the first row is
+still in the match. The time is the first `ORDER BY` key, which must be a date or a timestamp, in ascending order.
+With a date, the interval counts days: `WITHIN INTERVAL '2' DAY`. A row past the interval ends that way of matching,
+and the search goes on with the others: a shorter repetition, or a later start, is tried in the standard's order.
 
 ```sql
 CREATE TABLE ticker_ts (symbol TEXT, day INT, ts TIMESTAMP, price INT);
@@ -294,7 +295,6 @@ ACME    14         16          18
 Without the limit, the match from day 5 runs to day 10. With it, the match stops at day 9, the last day within four hours
 of day 5: day 10 is five hours on. The match from day 14 reaches day 18, exactly four hours on, and the limit includes it.
 
-- The limit includes its end: a row exactly the interval after the first row is in the match.
 - A row with no time (`NULL`) is in no match with `WITHIN`.
 - The query is refused without an `ORDER BY` (`42601`: `WITHIN reads the first ORDER BY: add one, a date or a timestamp`),
   with a descending `ORDER BY` (`0A000`: `WITHIN reads the first ORDER BY ascending`), and with a key that isn't a time,
