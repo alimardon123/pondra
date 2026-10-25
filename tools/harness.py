@@ -18867,7 +18867,7 @@ def registry():
         notice[0] == 200 and "nothing is built" in notice[1] and again == (200, 'relation "visits_page_idx" already exists, skipping') \
         and pg == [{"indexname": "visits_lower", "indexdef": "CREATE INDEX visits_lower ON public.visits USING brin (lower(path)) WHERE (path IS NOT NULL)"},
                    {"indexname": "visits_page_idx", "indexdef": "CREATE INDEX visits_page_idx ON public.visits (path)"}] \
-        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [500, 500, 500, 500, 409, 409] \
+        and renamed == ["clicks_lower_page", "orders_region_at_idx", "visits_lower", "visits_path"] and [r[0] for r in refused_ix] == [400, 500, 500, 500, 409, 409] \
         and "hnsw" in refused_ix[2][1] and "a view" in refused_ix[0][1] and "an index has the name" in refused_ix[4][1] \
         and after_column == ["clicks_lower_page", "orders_region_at_idx"] and after_table == after_column \
         and show("index", "sales.orders_region_at_idx") == "CREATE INDEX orders_region_at_idx ON sales.orders_2025 (region, at DESC);"

@@ -486,10 +486,6 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
     }
-    // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS.
-    static VIEW_RENAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?is)^\s*ALTER\s+(MATERIALIZED\s+)?VIEW\s+(IF\s+EXISTS\s+)?([\w."-]+)\s+RENAME\s+TO\s+([\w."-]+)\s*;?\s*$"#).expect("a regex")
-    });
     // DataFusion's CREATE EXTERNAL TABLE (a stored view of files: `ext::external`), in its own words.
     static EXTERNAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?is)^\s*CREATE\s+(\w+\s+){0,3}EXTERNAL\s+TABLE\b").expect("a regex")
@@ -541,8 +537,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
     }
     let name = |s: &str| s.split('.').map(|p| if p.starts_with('"') { p.trim_matches('"').to_string() } else { p.to_lowercase() }).collect::<Vec<_>>().join(".");
-    if let Some(c) = (head == "alter").then(|| VIEW_RENAME.captures(first_word(sql))).flatten() {
-        return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&c[3]), to: name(&c[4]) }]));
+    // `ALTER VIEW v RENAME TO w` (dbt's): the parser takes only ALTER VIEW … AS (`rules::alter::view_rename`).
+    if let Some((from, to)) = (head == "alter").then(|| crate::rules::alter::view_rename(first_word(sql))).flatten() {
+        return Some(Stmt::Ddl(vec![Ddl::RenameTable { name: name(&from), to: name(&to) }]));
     }
     // `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following, and stay as a table of that name.
     static DETACH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"(?is)^\s*ALTER\s+MATERIALIZED\s+VIEW\s+([\w."-]+)\s+DETACH\s*;?\s*$"#).expect("a regex"));
@@ -716,10 +713,11 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             Stmt::Update(relation(&u.table.relation)?, set.collect(), where_(&u.selection))
         }
         Statement::AlterTable(a) => match &a.operations[..] {
-            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::defaults::fills_existing(c) || !matches!(crate::seq::identity_of(c), Ok(None)) => {
-                Stmt::Invalid(format!("ALTER TABLE {} ADD COLUMN {} … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE {} SET {} = …)", a.name, c.name, a.name, c.name))
-            }
-            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
+            [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::rules::alter::fills_existing(c) => Stmt::Invalid(crate::rules::alter::owes_rows(&a.name.to_string(), &c.name.to_string())),
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => match crate::rules::alter::beside_type(c) {
+                Some(what) => Stmt::Invalid(crate::rules::alter::not_alone(&a.name.to_string(), &c.name.to_string(), &what)), // (a CHECK or a key: not dropped unsaid)
+                None => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
+            },
             // (renames, drops and types: the catalog's names change, the files never do: ADR-022)
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
             [ast::AlterTableOperation::DropColumn { column_names, if_exists, .. }] => Stmt::Ddl(column_names.iter().map(|c| Ddl::AlterColumn { table: object(&a.name), column: ident(c), change: Change::Drop { if_exists: *if_exists } }).collect()),
@@ -944,7 +942,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     match stmt {
         Stmt::AddColumn(_, column, sql_type, if_not_exists) => {
             if m.columns.iter().any(|(c, _)| c == column) {
-                ensure!(*if_not_exists, "{table} already has a column {column}");
+                ensure!(*if_not_exists, crate::rules::alter::has_column(&table, column));
                 return Ok(None);
             }
             let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)

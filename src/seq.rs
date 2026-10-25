@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // (the statement-side parts of an identity column and its options: `rules/create.rs`, which the page reads too)
-pub use crate::rules::create::{identity_of, options_sql, serial_type, shape, Identity, Opt, Shape};
+pub use crate::rules::create::{options_sql, serial_type, shape, Identity, Opt, Shape};
 
 type Result<T> = anyhow::Result<T>;
 

@@ -1333,21 +1333,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
         return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
     }
-    // Postgres's codes for a column a view uses: a drop is 2BP01, a type change or a rename 0A000.
-    let code = match change {
-        Change::Drop { .. } => "2BP01",
-        _ => "0A000",
-    };
+    // (Postgres's codes for a column a view uses: `rules::alter::used_by`)
     let readers = readers(lake, &name).await?;
     if !readers.is_empty() {
-        let words = match readers.as_slice() {
-            [one] => format!("{name} is used by {one}, which names its columns: drop it first"),
-            _ => format!("{name} is used by {}, which name its columns: drop them first", readers.join(", ")),
-        };
-        return Err(crate::codes::coded(code, words));
+        return Err(crate::rules::alter::used_by(&name, &readers, matches!(change, Change::Drop { .. })));
     }
     let Some(stored) = m.stored(column).map(str::to_string) else {
-        ensure!(matches!(change, Change::Drop { if_exists: true }), "{name} has no column {column}");
+        ensure!(matches!(change, Change::Drop { if_exists: true }), crate::rules::alter::no_column(&name, column));
         return Ok(j!({"table": name, "unchanged": true}));
     };
     let partition = m.partition.as_deref().map(|p| p.split_once('(').map_or(p, |(_, c)| c.trim_end_matches(')')));
@@ -1355,11 +1347,14 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         Change::Rename(to) => {
             ensure!(!to.is_empty(), "a column needs a name");
             ensure!(!system(&to), "{to} is a system column's name");
-            ensure!(m.stored(&to).is_none(), "{name} already has a column {to}");
+            ensure!(m.stored(&to).is_none(), crate::rules::alter::has_column(&name, &to));
             match to == stored {
                 true => m.names.remove(&stored),
                 false => m.names.insert(stored.clone(), to.clone()),
             };
+            for (_, condition) in &mut m.checks {
+                *condition = crate::rules::alter::check_renamed(condition, column, &to); // (its checks are in SQL's names: they follow it)
+            }
             j!({"renamed": column, "to": to})
         }
         Change::Drop { .. } => {
@@ -1370,12 +1365,13 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
                 _ if m.order.as_ref() == Some(&stored) => "order_by",
                 _ => "",
             };
-            ensure!(role.is_empty(), "{column} is {name}'s {role} column: it stays");
-            ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), "{column} is {name}'s last column (DROP TABLE {name})");
+            ensure!(role.is_empty(), crate::rules::alter::stays(&name, column, role));
+            ensure!(m.live().count() > 1 + usize::from(m.stored("_deleted").is_some()), crate::rules::alter::last_column(&name, column));
             m.cluster.retain(|c| *c != stored);
             m.merge.remove(&stored);
             m.names.remove(&stored);
             crate::constraints::without_column(&mut m, &stored); // (its UNIQUE and the facts naming it go with it, as in Postgres)
+            m.checks.retain(|(_, condition)| !crate::rules::alter::check_reads(condition, column)); // (and its checks)
             m.dropped.push(stored.clone());
             j!({"dropped": column})
         }

@@ -8,7 +8,6 @@ use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast;
 use serde_json::{json, Value};
 
 /// What a write runs on rows it is about to keep: `rules::checked` over the table's rules (the held forms written, then the
@@ -163,24 +162,7 @@ pub fn value(meta: &TableMeta, column: &str, text: &str) -> String {
     }
 }
 
-/// Is a DEFAULT the NULL literal (`DEFAULT NULL`, `NULL::text`, `CAST(NULL AS text)`)? Postgres keeps
-/// no default for it: a column added with one is NULL in the rows there, as one with none is.
-pub fn is_null(e: &ast::Expr) -> bool {
-    match e {
-        ast::Expr::Value(v) => matches!(v.value, ast::Value::Null),
-        ast::Expr::Nested(e) | ast::Expr::Cast { expr: e, .. } => is_null(e),
-        _ => false,
-    }
-}
-
-/// Does an ADD COLUMN owe the rows already there a value: NOT NULL, or a DEFAULT that isn't NULL?
-pub fn fills_existing(c: &ast::ColumnDef) -> bool {
-    c.options.iter().any(|o| match &o.option {
-        ast::ColumnOption::NotNull => true,
-        ast::ColumnOption::Default(e) => !is_null(e),
-        _ => false,
-    })
-}
+pub use crate::rules::alter::is_null; // (`DEFAULT NULL` is no default: the core reads it for every form)
 
 /// `ALTER TABLE t ALTER COLUMN c SET DEFAULT e | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
 /// (leader, under the lake's lock), with Postgres's meanings: a default is worked out for the rows
@@ -247,7 +229,7 @@ async fn count_nulls(lake: &Lake, table: &str, column: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
 
     fn expr(sql: &str) -> ast::Expr { Parser::new(&GenericDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap() }
 
@@ -267,11 +249,11 @@ mod tests {
         for e in ["'z'", "0", "NULL + 1", "now()"] {
             assert!(!is_null(&expr(e)), "{e}");
         }
-        assert!(!fills_existing(&column("c varchar(200) DEFAULT NULL")));
-        assert!(!fills_existing(&column("c INT DEFAULT CAST(NULL AS INT)")));
-        assert!(fills_existing(&column("c INT DEFAULT 0")));
-        assert!(fills_existing(&column("c INT NOT NULL")));
-        assert!(fills_existing(&column("c INT NOT NULL DEFAULT NULL")));
+        assert!(!crate::rules::alter::fills_existing(&column("c varchar(200) DEFAULT NULL")));
+        assert!(!crate::rules::alter::fills_existing(&column("c INT DEFAULT CAST(NULL AS INT)")));
+        assert!(crate::rules::alter::fills_existing(&column("c INT DEFAULT 0")));
+        assert!(crate::rules::alter::fills_existing(&column("c INT NOT NULL")));
+        assert!(crate::rules::alter::fills_existing(&column("c INT NOT NULL DEFAULT NULL")));
     }
 
     #[test]
