@@ -90,7 +90,11 @@ fn refused(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     if matches!(source, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) {
         text_refusal(c, t, e)
     } else if source.is_numeric() {
-        number_refusal(t, e)
+        if t.is_decimal() && has_nan(c) {
+            nan_refusal()
+        } else {
+            number_refusal(t, e)
+        }
     } else {
         e.into()
     }
@@ -108,6 +112,9 @@ fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     let values = texts.as_string::<i32>();
     let Some(i) = (0..values.len()).find(|&i| values.is_valid(i) && safe_cast.is_null(i)) else { return plain() };
     let text = values.value(i);
+    if t.is_decimal() && text.trim().eq_ignore_ascii_case("nan") {
+        return nan_refusal();
+    }
     let range = match t {
         DataType::Int16 if overflows::<i16>(text) => Some("smallint"),
         DataType::Int32 if overflows::<i32>(text) => Some("integer"),
@@ -123,6 +130,21 @@ fn text_refusal(c: &ArrayRef, t: &DataType, e: ArrowError) -> DataFusionError {
     match pg_name(t) {
         Some(name) => external(format!("invalid input syntax for type {name}: \"{text}\""), "22P02"),
         None => plain(),
+    }
+}
+
+/// The refusal of NaN going into a decimal (`numeric(p, s)`): Postgres keeps NaN in numeric, a decimal column here holds
+/// numbers only (0A000, named, so it is not taken for a value that is too big: 22003).
+fn nan_refusal() -> DataFusionError {
+    external("NaN can't go into a decimal column (numeric(p, s)): Postgres keeps NaN in numeric, but a decimal here holds only numbers", "0A000")
+}
+
+/// Is there a NaN in a float column (a cast of it into a decimal is refused by name: `nan_refusal`).
+fn has_nan(c: &ArrayRef) -> bool {
+    match c.data_type() {
+        DataType::Float64 => c.as_primitive::<Float64Type>().iter().flatten().any(f64::is_nan),
+        DataType::Float32 => c.as_primitive::<Float32Type>().iter().flatten().any(f32::is_nan),
+        _ => false,
     }
 }
 
@@ -448,6 +470,13 @@ mod tests {
             let c: ArrayRef = Arc::new(StringArray::from(vec![Some(number)]));
             assert_eq!(refusal(&c, &DataType::Decimal128(3, 1)), ("22003", "numeric field overflow".to_string()), "{number}: a number Rust reads");
         }
+        let nan: ArrayRef = Arc::new(StringArray::from(vec![Some("1.5"), Some(" nan ")]));
+        let (code, words) = refusal(&nan, &DataType::Decimal128(3, 1));
+        assert_eq!(code, "0A000", "NaN into a decimal is refused by name: Postgres keeps NaN in numeric");
+        assert!(words.contains("NaN"), "{words}");
+        let float_nan: ArrayRef = Arc::new(Float64Array::from(vec![1.5, f64::NAN]));
+        assert_eq!(refusal(&float_nan, &DataType::Decimal128(3, 1)).0, "0A000", "a float NaN too");
+        assert_eq!(refusal(&float_nan, &DataType::Int64).0, "22003", "a NaN into an integer is still out of range");
         let junk: ArrayRef = Arc::new(StringArray::from(vec![Some("12abc")]));
         assert_eq!(refusal(&junk, &DataType::Decimal128(3, 1)).0, "22P02", "text that Rust doesn't read as a number is 22P02");
         let word: ArrayRef = Arc::new(StringArray::from(vec![Some("abc")]));
