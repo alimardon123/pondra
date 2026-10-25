@@ -5,7 +5,7 @@
 `pondra` is `pondra.connect()` (a lake held in memory), `folder` is `pondra.connect(<a new folder>)`, `duckdb` is
 `duckdb.connect()`. Each engine runs in a process of its own, `--runs` times; a time is the median. What is
 measured, in that process: importing and opening up to the first answer of `SELECT 1`, and the process's memory
-then (idle); a table of `--rows` rows made from a series; a grouped aggregate and a key's row over it (warm: the
+then (idle); a table of `--rows` rows made from a series; a grouped aggregate (of a DOUBLE, then of a DECIMAL) and a key's row over it (warm: the
 median of several, each a new text so no answer is remembered); 500 one-row INSERTs; the process's memory after
 the load; and, with `--tpch`, its 8 tables loaded from Parquet and the 22 queries run once cold and once warm (the
 warm total is reported). With `--settle`, each engine waits that long after each load before its queries, so a
@@ -43,7 +43,6 @@ def child(engine):
         con = duckdb.connect()
         q = lambda s: con.execute(s).to_arrow_table()
         do = lambda s: con.execute(s)
-        series = f"SELECT x AS id, x % 1000 AS k, (x * 7919 % 100003) / 100.0 AS v FROM range({A.rows}) AS g(x)"
     else:
         import pondra
         out["import"] = time.perf_counter() - t0
@@ -51,8 +50,11 @@ def child(engine):
         con = pondra.connect(folder)
         q = lambda s: con.sql(s).to_arrow()
         do = lambda s: con.sql(s)
-        series = f"SELECT x AS id, x % 1000 AS k, (x * 7919 % 100003) / 100.0 AS v FROM range({A.rows}) AS g(x)"
     out["open"] = time.perf_counter() - t0 - out["import"]
+    # (v is DOUBLE in both engines and d DECIMAL(18, 2) in both: `/ 100.0` alone is numeric in pondra, as in Postgres, and
+    # DOUBLE in DuckDB, so each would sum a different type)
+    series = (f"SELECT x AS id, x % 1000 AS k, CAST(x * 7919 % 100003 AS DOUBLE) / 100.0 AS v, "
+              f"CAST((x * 7919 % 100003) / 100.0 AS DECIMAL(18, 2)) AS d FROM range({A.rows}) AS g(x)")
     q("SELECT 1")
     out["first answer"] = time.perf_counter() - t0
     out["memory idle (MB)"] = rss_mb()
@@ -63,6 +65,7 @@ def child(engine):
     assert q("SELECT count(*) AS n FROM t").column(0)[0].as_py() == A.rows
     timed = lambda make, n: statistics.median(_timed(q, make, n))
     out["aggregate (warm)"] = timed(lambda i: f"SELECT k, count(*) AS n, sum(v) AS s FROM t GROUP BY k -- {i}", 5)
+    out["aggregate of a DECIMAL (warm)"] = timed(lambda i: f"SELECT k, count(*) AS n, sum(d) AS s FROM t GROUP BY k -- {i}", 5)
     out["a key's row (warm)"] = timed(lambda i: f"SELECT * FROM t WHERE id = {i * 7919 % A.rows}", 50)
     do("CREATE TABLE s (a INT, b VARCHAR)")
     t = time.perf_counter()
