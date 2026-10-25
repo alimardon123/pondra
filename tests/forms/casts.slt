@@ -1,0 +1,38 @@
+# Postgres's casts and type functions at every form: uuid, arrays, pg_typeof, a lateral series, an enum's refusal
+# (form-parity §2: the front runs these passes on every form, `pg_casts::rewrite`).
+query T
+SELECT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::uuid::text
+----
+a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+
+statement error 22P02
+SELECT CAST('nope' AS UUID)
+
+query T
+SELECT pg_typeof(gen_random_uuid())
+----
+uuid
+
+query T
+SELECT pg_typeof(1)
+----
+bigint
+
+query T
+SELECT '{a,b}'::text[]
+----
+[a, b]
+
+statement ok
+CREATE TABLE s (id INT, qty INT)
+
+statement ok
+INSERT INTO s VALUES (1, 2), (2, 3)
+
+query I
+SELECT count(*) FROM s, generate_series(1, s.qty) g
+----
+5
+
+statement error 42704
+SELECT enum_range(NULL::mood)

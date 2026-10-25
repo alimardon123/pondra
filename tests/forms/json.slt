@@ -26,3 +26,25 @@ query T
 SELECT pg_typeof('{}'::jsonb)
 ----
 jsonb
+
+query T
+SELECT '{"b": 1, "a": 2}'::jsonb::text
+----
+{"a": 2, "b": 1}
+
+query TT
+SELECT key, value FROM json_each_text('{"a": "x", "b": "y"}') ORDER BY key
+----
+a x
+b y
+
+statement ok
+CREATE TABLE o (id INT, name TEXT)
+
+statement ok
+INSERT INTO o VALUES (1, 'a')
+
+query T
+SELECT to_json(o)::text FROM o
+----
+{"id":1,"name":"a"}
