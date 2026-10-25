@@ -34,6 +34,8 @@ mod front;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
 mod friendly;
+mod matcher;
+mod pattern;
 mod lateral;
 #[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;

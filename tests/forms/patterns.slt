@@ -1,0 +1,47 @@
+# MATCH_RECOGNIZE answers alike on every form (ADR-073): Oracle's ticker (ACME's 20 days), with and without
+# PARTITION BY, an empty match, and a refusal. Every query has an ORDER BY; the expected rows are tools/patterns_check.py's
+# (its FIXED examples: the ticker's matches worked out by hand there).
+statement ok
+CREATE TABLE ticker (symbol TEXT, day INT, price INT)
+
+statement ok
+INSERT INTO ticker VALUES ('ACME',1,12),('ACME',2,17),('ACME',3,19),('ACME',4,21),('ACME',5,25),('ACME',6,12),('ACME',7,15),('ACME',8,20),('ACME',9,24),('ACME',10,25),('ACME',11,19),('ACME',12,15),('ACME',13,25),('ACME',14,25),('ACME',15,14),('ACME',16,12),('ACME',17,14),('ACME',18,24),('ACME',19,23),('ACME',20,22)
+
+query TIII
+SELECT symbol, start_day, bottom_day, end_day FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+----
+ACME 5 6 10
+ACME 10 12 13
+ACME 14 16 18
+
+query TIII
+SELECT symbol, start_day, bottom_day, end_day FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+----
+ACME 5 6 10
+ACME 11 12 13
+ACME 14 16 18
+
+query III
+SELECT start_day, bottom_day, end_day FROM ticker MATCH_RECOGNIZE (ORDER BY day MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+----
+5 6 10
+10 12 13
+14 16 18
+
+statement ok
+CREATE TABLE flags (day INT, flag BOOLEAN)
+
+statement ok
+INSERT INTO flags VALUES (1, FALSE), (2, TRUE), (3, TRUE), (4, FALSE), (5, TRUE)
+
+# a* matches empty at days 1 and 4 (shown: ONE ROW PER MATCH shows empty matches), and takes days 2-3 and day 5.
+query IIII
+SELECT mn, s, e, n FROM flags MATCH_RECOGNIZE (ORDER BY day MEASURES MATCH_NUMBER() AS mn, FIRST(day) AS s, LAST(day) AS e, count(*) AS n ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (a*) DEFINE a AS flag) ORDER BY mn
+----
+1 NULL NULL 0
+2 2 3 2
+3 NULL NULL 0
+4 5 5 1
+
+statement error 0A000 ALL ROWS PER MATCH
+SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day ALL ROWS PER MATCH PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day

@@ -80,6 +80,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past_names::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
+    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;
     let all = host.routines().await?;
@@ -90,7 +91,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let as_written = || Ok(crate::expander::named_apart(sql).unwrap_or_else(|| sql.to_string()));
     let measure_views = host.measure_views(sql).await?;
     let measured = crate::measures::wanted(sql, &measure_views); // (a view with measures read, or a measure named)
-    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::text::names_a_type(sql) {
+    if !expands && !measured && !crate::friendly::wanted(sql) && !crate::pattern::wanted(sql) && !crate::text::names_a_type(sql) {
         return as_written();
     }
     // DuckDB's `FROM t WHERE …` (FROM first, with clauses after it): `SELECT * FROM t WHERE …`.
@@ -116,10 +117,11 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
             }
         }
     }
+    let patterned = crate::pattern::wanted(sql) && crate::pattern::rewrite(host, &mut stmts).await?; // (MATCH_RECOGNIZE as SQL around one window)
     let typed = crate::pg_casts::rewrite(host, &mut stmts).await?; // (JSON's set functions, uuid and json casts, pg_typeof, a lateral generate_series, array literals, an enum's casts as text)
     // DuckDB's and Snowflake's forms (`friendly.rs`): a text sent on as it was when none is in it
     let friendly = crate::friendly::rewrite(host, &mut stmts).await?;
-    if !expands && !friendly && !typed {
+    if !expands && !friendly && !typed && !patterned {
         return as_written();
     }
     Ok(crate::text::text(&stmts))
