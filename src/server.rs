@@ -187,7 +187,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
-        .merge(crate::iceberg::rest())
+        .merge(crate::iceberg_rest::rest())
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
         .layer(axum::extract::DefaultBodyLimit::max(1 << 30)) // batches up to 1 GiB
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -940,7 +940,7 @@ impl App {
         crate::write::record(&self.lake, f, seq).await
     }
 
-    /// Another engine's append (`iceberg::update`), recorded by the leader under the lake's lock.
+    /// Another engine's append (`iceberg_rest::update`), recorded by the leader under the lake's lock.
     pub async fn record_iceberg(&self, c: Vec<crate::iceberg::Commit>) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(c)).await };
         let _guard = self.lock.lock().await;

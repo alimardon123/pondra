@@ -121,6 +121,7 @@ mod rules;
 #[cfg(feature = "lake")] mod layout;
 #[cfg(feature = "lake")] mod learned;
 #[cfg(feature = "lake")] mod iceberg;
+#[cfg(feature = "doors")] mod iceberg_rest;
 #[cfg(feature = "lake")] mod inbox;
 #[cfg(feature = "doors")] mod kafka;
 #[cfg(feature = "doors")] mod kafka_client;
