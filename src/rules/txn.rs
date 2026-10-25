@@ -138,3 +138,43 @@ fn with_write(sql: &str) -> Option<String> {
     let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, sql).ok()?.pop()? else { return None };
     crate::text::write_of(&q).map(str::to_string)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_begin_takes_its_modes_and_refuses_what_is_not_built() -> Result<()> {
+        let serializable = plan(&begin_modes("BEGIN ISOLATION LEVEL SERIALIZABLE")?).unwrap_err();
+        assert_eq!(crate::codes::of(&serializable), "0A000");
+        let twice = plan(&begin_modes("BEGIN ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL REPEATABLE READ")?).unwrap_err();
+        assert_eq!(crate::codes::of(&twice), "42601");
+        assert_eq!(plan(&begin_modes("BEGIN READ ONLY")?)?, (None, Some(true)));
+        assert_eq!(plan(&begin_modes("START TRANSACTION ISOLATION LEVEL REPEATABLE READ")?)?, (Some(Level::Repeatable), None));
+        Ok(())
+    }
+
+    #[test]
+    fn a_savepoint_is_named_as_postgres_folds_its_name() -> Result<()> {
+        assert_eq!(savepoint_name("SAVEPOINT Abc")?, "abc");
+        assert_eq!(savepoint_name("RELEASE SAVEPOINT \"Abc\"")?, "Abc");
+        assert_eq!(savepoint_name("ROLLBACK TO SAVEPOINT s")?, "s");
+        Ok(())
+    }
+
+    #[test]
+    fn the_newest_savepoint_of_a_name_is_the_one_found() {
+        assert_eq!(mark_of(["a", "b", "a"].into_iter(), "a"), Ok(2));
+        assert_eq!(mark_of(["a"].into_iter(), "z"), Err("savepoint \"z\" does not exist".to_string()));
+    }
+
+    #[test]
+    fn a_write_is_named_by_its_word_and_a_read_is_not() {
+        assert_eq!(write_word("insert into t values (1)").as_deref(), Some("INSERT"));
+        assert_eq!(write_word("create table t (a int)").as_deref(), Some("CREATE TABLE"));
+        assert_eq!(write_word("SELECT 1"), None);
+        assert_eq!(write_word("WITH x AS (SELECT 1) SELECT * FROM x"), None);
+        assert_eq!(write_word("COPY t TO 'x.csv'"), None);
+        assert_eq!(write_word("COPY t FROM 'x.csv'").as_deref(), Some("COPY FROM"));
+    }
+}
