@@ -257,3 +257,82 @@ query II
 SELECT k, n FROM pc WHERE k = 1
 ----
 1 5
+
+# A subquery in the VALUES of a planned upsert is worked out as an INSERT works it out: one row of it, then two with distinct keys.
+statement count 2
+INSERT INTO pc VALUES (1, (SELECT n FROM pc WHERE k = 2) + 10, 0), (4, 7, 0) ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+query II
+SELECT k, n FROM pc WHERE k IN (1, 4) ORDER BY k
+----
+1 14
+4 7
+
+# A planned upsert (two rows of VALUES, or a query) meets the table's NOT NULL, CHECK and widths as its proposed rows, before
+# the conflict is looked for, as a one-row upsert does: each statement, both ways, answered as Postgres 16 does. The bad row
+# is the one a hit names, so the answer is the same on a hit and on a miss.
+statement ok
+CREATE TABLE pn (k INT PRIMARY KEY, n INT NOT NULL CHECK (n >= 0), d DOUBLE PRECISION, v VARCHAR(3))
+
+statement ok
+INSERT INTO pn VALUES (1, 3, 0.5, 'a')
+
+# 1.5 is an INT's 2 in excluded, on either path: 2 * 2.
+statement count 1
+INSERT INTO pn VALUES (1, 1.5, 0, 'b') ON CONFLICT (k) DO UPDATE SET n = excluded.n * 2
+
+statement count 2
+INSERT INTO pn VALUES (1, 1.5, 0, 'b'), (2, 7, 0, 'c') ON CONFLICT (k) DO UPDATE SET n = excluded.n * 2
+
+query IIT
+SELECT k, n, v FROM pn ORDER BY k
+----
+1 4 a
+2 7 c
+
+statement error 23502
+INSERT INTO pn VALUES (1, NULL, 0, 'x') ON CONFLICT (k) DO NOTHING
+
+statement error 23502
+INSERT INTO pn VALUES (1, NULL, 0, 'x') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+statement error 23502
+INSERT INTO pn VALUES (1, NULL, 0, 'x'), (2, 5, 0, 'y') ON CONFLICT (k) DO NOTHING
+
+statement error 23502
+INSERT INTO pn VALUES (2, 5, 0, 'y'), (1, NULL, 0, 'x') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+statement error 23514
+INSERT INTO pn VALUES (1, -1, 0, 'x') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+statement error 23514
+INSERT INTO pn VALUES (2, 1, 0, 'x'), (1, -1, 0, 'y') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+statement error 22001
+INSERT INTO pn VALUES (1, 1, 0, 'toolong') ON CONFLICT (k) DO NOTHING
+
+statement error 22001
+INSERT INTO pn VALUES (2, 1, 0, 'y'), (1, 1, 0, 'toolong') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+# A key given twice: DO NOTHING keeps its first row, as Postgres inserts the first and finds the second conflicting; DO UPDATE refuses.
+statement count 1
+INSERT INTO pn VALUES (5, 1, 0, 'p'), (5, 2, 0, 'q') ON CONFLICT (k) DO NOTHING
+
+query IIT
+SELECT k, n, v FROM pn WHERE k = 5
+----
+5 1 p
+
+statement error 21000
+INSERT INTO pn VALUES (6, 1, 0, 'p'), (6, 2, 0, 'q') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+# INSERT … SELECT … ON CONFLICT: the query's 1.5 is 2 in the INT column, and excluded holds it so.
+statement count 2
+INSERT INTO pn SELECT k, n, d, v FROM (VALUES (1, 1.5, 0, 'x'), (2, 7, 0, 'y')) AS s (k, n, d, v) ON CONFLICT (k) DO UPDATE SET n = excluded.n * 2
+
+query IIT
+SELECT k, n, v FROM pn ORDER BY k
+----
+1 4 a
+2 14 c
+5 1 p

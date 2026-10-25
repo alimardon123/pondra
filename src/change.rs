@@ -318,11 +318,6 @@ impl Merge {
         if self.alias().eq_ignore_ascii_case("excluded") {
             return None; // (`txn::joined` names the old row by the alias: a name the proposed row's `excluded` can't share)
         }
-        // (an INSERT OR REPLACE whose row says DEFAULT stays with the planned MERGE, which works that DEFAULT out twice: the
-        // identity numbers it hands out are the ones today's build gives, and `forms/identity.slt` holds them)
-        if matches!(&u.update, Some((set, None)) if set.is_empty()) && crate::write::says_default_text(&u.query) {
-            return None;
-        }
         let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns.iter().any(|(n, _)| n == c);
         let distinct = |cs: &[String]| cs.iter().enumerate().all(|(i, c)| !cs[..i].contains(c));
         if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
@@ -412,73 +407,40 @@ fn same_key_type(key: &DataType, source: &DataType) -> bool {
 }
 
 impl Upsert {
-    /// The columns a conflict is on: the statement's own, else the table's key. `merge` and `repeats` both take them from here.
+    /// The columns a conflict is on: the statement's own, else the table's key. `given` and `merge` both take them from here.
     fn on_columns(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
         let on = if self.on.is_empty() { meta.key.clone() } else { self.on.clone() };
         ensure!(!on.is_empty(), "INSERT … ON CONFLICT: name the columns a conflict is on (ON CONFLICT (id) …), or give {target} a PRIMARY KEY");
         Ok(on)
     }
 
-    /// The MERGE this is, for a table of these columns: a row whose `on` columns match one of the
-    /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted. `first_only`
-    /// (DO NOTHING, when `repeats` found a key twice): the source keeps each conflict key's first row.
-    fn merge(&self, meta: &TableMeta, m: &Merge, first_only: bool) -> Result<Merge> {
-        // The columns the rows give: the query's aliases below, and the conflict's.
+    /// The columns the rows give: the statement's own, else the table's first columns, as many as the rows give (`write::implicit`).
+    /// The rows must be as wide as those (42601, in Postgres's words, not DataFusion's), and must give the conflict's columns.
+    fn given(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
         let width = crate::write::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
-            // (no list: the table's first columns, as many as the rows give, as an INSERT's: `write::implicit`)
             true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(),
             false => self.columns.clone(),
         };
-        // The rows must be as wide as the columns they are written to: the source's alias list below would otherwise fail
-        // with DataFusion's words (XX000), where Postgres says 42601.
         if let Some(w) = width.filter(|&w| w != given.len()) {
-            return Err(crate::write::width_refused(&m.target, given.len(), w));
+            return Err(crate::write::width_refused(target, given.len(), w));
         }
-        let on = self.on_columns(meta, &m.target)?;
+        let on = self.on_columns(meta, target)?;
         ensure!(on.iter().all(|c| given.contains(c)), "INSERT … ON CONFLICT ({}): the rows must give those columns", on.join(", "));
-        // A DEFAULT in the rows' own VALUES is written as an INSERT writes it (`write::rows_for`): the source can't hold the word.
-        use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-        let query = match Parser::new(&GenericDialect {}).try_with_sql(&self.query).and_then(|mut p| p.parse_query()) {
-            Ok(parsed) if crate::write::says_default(&parsed) => crate::write::rows_for(&m.target, &given, &given, &self.query, &|c: &str| crate::defaults::sql_of(meta, c))?,
-            _ => self.query.clone(),
-        };
-        // Every column of the table is in the source and the insert: one the rows leave out takes its default (NULL with
-        // none), and `excluded` holds it too, as Postgres's does. `_deleted` only when the rows give it.
+        Ok(given)
+    }
+
+    /// The MERGE this is, for a table of these columns, whose rows `given` names: a row whose `on` columns match one of the
+    /// table's updates it (DO UPDATE) or is skipped (DO NOTHING); the others are inserted. The rows are the proposed ones
+    /// `merge` shaped once for the table, as a plain INSERT's are, and `excluded` holds them as an INSERT writes them.
+    fn merge(&self, meta: &TableMeta, m: &Merge, given: &[String]) -> Result<Merge> {
+        let on = self.on_columns(meta, &m.target)?;
+        // Every column of the table is in `excluded` and the insert: one the rows leave out holds its default (NULL with none),
+        // as the rows were shaped. `_deleted` only when the rows give it.
         let columns: Vec<String> = meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted" || given.contains(c)).collect();
-        let (a, x, u) = (q(&m.alias), "excluded", "__u");
-        // The conflict columns are cast to the table's types before a conflict is checked, as Postgres casts an INSERT's
-        // values first: `excluded` holds the cast keys, so a DECIMAL 7003.5 for a BIGINT key is the key 7003 and conflicts
-        // with it. (The other columns are cast as they are written; a list's type has no spelling `arrow_cast` reads back.)
-        let typed = |c: &String, expr: String| match meta.columns.iter().find(|(n, _)| n == c).map(|(_, t)| crate::answer::dtype(t)) {
-            Some(Ok(t)) if !matches!(t, DataType::List(_)) => format!("arrow_cast({expr}, '{t}')"),
-            _ => expr,
-        };
-        let value = |c: &String| match on.contains(c) {
-            true => typed(c, format!("{u}.{}", q(c))),
-            false => format!("{u}.{}", q(c)),
-        };
-        // (a column the rows leave out is its default, cast to its type as the conflict columns are: a DECIMAL's DEFAULT 0
-        // would be an Int64 in `excluded` otherwise)
-        let cast: Vec<String> = columns.iter().map(|c| match given.contains(c) {
-            true => format!("{} AS {}", value(c), q(c)),
-            false => match crate::defaults::sql_of(meta, c) {
-                Some(d) => format!("{} AS {}", typed(c, d), q(c)),
-                None => format!("NULL AS {}", q(c)), // (cast as it is written, as before: not every type has a spelling `arrow_cast` reads)
-            },
-        }).collect();
+        let (a, x) = (q(&m.alias), "excluded");
         let names: Vec<String> = columns.iter().map(|c| q(c)).collect();
-        let given_names: Vec<String> = given.iter().map(|c| q(c)).collect();
-        let source = if first_only {
-            // A window can't sit in a WHERE: the rows are numbered in their order, each conflict key's first is kept, and so
-            // is every row NULL in a conflict column (NULLs never conflict). Built only when a key repeats (`repeats`).
-            let keys: Vec<String> = on.iter().map(|c| value(c)).collect();
-            let null: Vec<String> = on.iter().map(|c| format!("{} IS NULL", q(c))).collect();
-            format!("(SELECT {} FROM (SELECT {}, row_number() OVER (PARTITION BY {} ORDER BY {u}.__p) AS __r FROM (SELECT *, row_number() OVER () AS __p FROM ({}) AS __v ({})) AS {u}) AS __f WHERE __r = 1 OR {}) AS {x}",
-                names.join(", "), cast.join(", "), keys.join(", "), query, given_names.join(", "), null.join(" OR "))
-        } else {
-            format!("(SELECT {} FROM ({}) AS {u} ({})) AS {x}", cast.join(", "), query, given_names.join(", "))
-        };
+        let source = format!("(SELECT {} FROM {PROPOSED_TABLE}) AS {x}", names.join(", "));
         let on_sql = on.iter().map(|c| format!("{a}.{} = {x}.{}", q(c), q(c))).collect::<Vec<_>>().join(" AND ");
         let insert = Clause { kind: Kind::NotMatched, when: None, action: Action::Insert(columns.clone(), columns.iter().map(|c| format!("{x}.{}", q(c))).collect()) };
         let mut clauses = vec![];
@@ -499,16 +461,52 @@ impl Upsert {
 
 fn q(c: &str) -> String { format!("\"{}\"", c.replace('"', "\"\"")) }
 
+/// The name an upsert's proposed rows have in the sessions its MERGE's clauses plan in (`session`): `excluded` reads them.
+const PROPOSED_TABLE: &str = "__proposed";
+
 tokio::task_local! {
     /// The change's SQL may read files on this machine (`MERGE … USING 'new.csv'` from the shell's
     /// own node: `server::owner`).
     pub static FILES: bool;
 }
 
-/// A session for the change's queries, as of `upto`.
+tokio::task_local! {
+    /// The proposed rows of the upsert whose MERGE is planned here (`merge`): each session its clauses make holds them as
+    /// `__proposed`.
+    static PROPOSED: Arc<RecordBatch>;
+}
+
+/// A session for the change's queries, as of `upto`. Under a MERGE's clauses (`PROPOSED`), it holds the proposed rows as
+/// `__proposed`, registered as `query::SENT`'s tables are.
 async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelude::SessionContext> {
     let ctx = crate::query::session_at(lake, sql, "", Some(upto)).await?;
-    Ok(if FILES.try_with(|f| *f).unwrap_or(false) { ctx.enable_url_table() } else { ctx })
+    let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { ctx.enable_url_table() } else { ctx };
+    if let Ok(rows) = PROPOSED.try_with(|r| r.clone()) {
+        ctx.deregister_table(PROPOSED_TABLE)?;
+        ctx.register_table(PROPOSED_TABLE, Arc::new(datafusion::datasource::MemTable::try_new(rows.schema(), vec![vec![(*rows).clone()]])?))?;
+    }
+    Ok(ctx)
+}
+
+/// The rows an INSERT … ON CONFLICT proposes for `name`, worked out as a plain INSERT's rows are (`write::whole_rows_of`, then
+/// `write::rows_of` with `How::Load`: shaped for the table's rules as of `at`). Both paths of an upsert take them from here:
+/// `txn::upsert_point` for a one-row upsert, before its locks, and `merge`. `meta` is the table as SQL names it, `rules` its
+/// rules, `given` the columns the rows give (`Upsert::given`).
+pub(crate) async fn proposed_rows(lake: &Lake, name: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, given: &[String], query: &str, at: u64) -> Result<RecordBatch> {
+    let sql = crate::write::whole_rows_of(lake, name, meta, given, query).await?;
+    let files = FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `session`)
+    Ok(crate::write::rows_of(lake, lake, rules, name, &sql, Some(at), files, crate::rules::How::Load).await?.into_rows())
+}
+
+/// `rows` keeping each conflict key's first row, in the rows' order, and every row NULL in a conflict column (NULLs never
+/// conflict): what DO NOTHING keeps of rows that give a key twice (`merge`).
+fn first_of_each(rows: &RecordBatch, on: &[String]) -> Result<RecordBatch> {
+    use datafusion::arrow::row::{RowConverter, SortField};
+    let columns = on.iter().map(|c| rows.column_by_name(c).cloned().with_context(|| format!("no column {c}"))).collect::<Result<Vec<_>>>()?;
+    let keys = RowConverter::new(columns.iter().map(|c| SortField::new(c.data_type().clone())).collect())?.convert_columns(&columns)?;
+    let mut seen = std::collections::HashSet::new();
+    let keep: BooleanArray = (0..rows.num_rows()).map(|i| Some(columns.iter().any(|c| c.is_null(i)) || seen.insert(keys.row(i)))).collect();
+    Ok(datafusion::arrow::compute::filter_record_batch(rows, &keep)?)
 }
 
 /// Leader: carry out an UPDATE or DELETE of an append table, or a MERGE into any table (`sql`),
@@ -675,42 +673,36 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
 }
 
-/// Does a source hold two rows of one conflict key? A row NULL in a conflict column conflicts with none, so it isn't counted.
-async fn repeats(lake: &Lake, source: &str, on: &[String], upto: u64) -> Result<bool> {
-    let keys: Vec<String> = on.iter().map(|c| q(c)).collect();
-    let not_null: Vec<String> = on.iter().map(|c| format!("{} IS NOT NULL", q(c))).collect();
-    let sql = format!("SELECT 1 FROM {source} WHERE {} GROUP BY {} HAVING count(*) > 1 LIMIT 1", not_null.join(" AND "), keys.join(", "));
-    let ctx = session(lake, &sql, upto).await?;
-    Ok(ctx.sql(&sql).await?.count().await? > 0)
-}
-
 async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let what = if m.upsert.is_some() { "INSERT … ON CONFLICT" } else { "MERGE" };
     // (read from the statement before `m` is rebound to the MERGE it becomes below, whose `upsert` is None)
     let upsert = m.upsert.is_some();
     let merge_stmt = m.sql.trim_start().get(..5).is_some_and(|w| w.eq_ignore_ascii_case("MERGE")); // (an UPDATE … FROM keeps its message)
     let built;
+    let mut proposed = None;
     let m = match &m.upsert {
         Some(u) => {
-            let plain = u.merge(meta, m, false)?;
-            // (one row of VALUES, an ORM's upsert, can't repeat a key: no query of the source under the lake's lock)
-            built = if !crate::write::one_row(&u.query) && repeats(lake, &plain.source, &u.on_columns(meta, &m.target)?, upto).await? {
+            let given = u.given(meta, &m.target)?; // (its width and conflict columns are checked before its rows are worked out)
+            let on = u.on_columns(meta, &m.target)?;
+            let mut rows = proposed_rows(lake, table, meta, &Arc::new(meta.to_rules()?), &given, &u.query, upto).await?;
+            // (one row of VALUES, an ORM's upsert, can't repeat a key: its rows aren't looked at for one)
+            if !crate::write::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
                 // one's DO UPDATE WHERE failed on the existing key, and so is this refusal too.
                 if u.update.is_some() {
                     return Err(crate::codes::coded("21000", "ON CONFLICT DO UPDATE command cannot affect row a second time: ensure that no rows proposed for insertion within the same command have duplicate constrained values"));
                 }
-                u.merge(meta, m, true)?
-            } else {
-                plain
-            };
+                rows = first_of_each(&rows, &on)?;
+            }
+            built = u.merge(meta, m, &given)?;
+            proposed = Some(rows);
             &built
         }
         None => m,
     };
     let (t, a, s, on) = (format!("{} AS {}", crate::write::sql_name(table), q(&m.alias)), q(&m.alias), &m.source, &m.on);
     // Each target row takes at most one source row (else which one's values?). A DELETE … USING deletes a row once
-    // however many match it, as Postgres does. An upsert's keys are unique by now (`repeats`).
+    // however many match it, as Postgres does. An upsert's keys are unique by now (`first_of_each`, or refused above).
     if !m.semi && !upsert {
         let twice = format!("SELECT {a}.{} FROM {t} JOIN {s} ON {on} GROUP BY 1 HAVING count(*) > 1 LIMIT 1", q(ROW_ID));
         let ctx = session(lake, &twice, upto).await?;
@@ -721,45 +713,51 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
             bail!("{what}: a row of {table} matches more than one source row");
         }
     }
-    let (mut old, mut new) = (vec![], vec![]);
-    for (i, c) in m.clauses.iter().enumerate() {
-        // A row takes the first clause of its kind whose condition holds.
-        let earlier: Vec<String> = m.clauses[..i].iter().filter(|e| e.kind == c.kind).map(|e| format!(" AND NOT coalesce(({}), false)", e.when.as_deref().unwrap_or("true"))).collect();
-        let when = format!("coalesce(({}), false){}", c.when.as_deref().unwrap_or("true"), earlier.concat());
-        let rest = match c.kind {
-            Kind::Matched if m.semi => format!("FROM {t} WHERE EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
-            Kind::Matched => format!("FROM {t} JOIN {s} ON {on} WHERE {when}"),
-            Kind::NotMatched => format!("FROM {s} WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {on}) AND {when}"),
-            Kind::NotMatchedBySource => format!("FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
-        };
-        let (o, n) = match (&c.action, c.kind) {
-            (Action::Insert(..), Kind::Matched | Kind::NotMatchedBySource) => bail!("MERGE: INSERT goes with WHEN NOT MATCHED"),
-            (Action::Update(_) | Action::Delete, Kind::NotMatched) => bail!("MERGE: WHEN NOT MATCHED takes an INSERT"),
-            (Action::Update(set), _) => {
-                if let Some((c, _)) = set.iter().find(|(c, _)| meta.key.contains(c)) {
-                    return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
+    let clauses = async {
+        let (mut old, mut new) = (vec![], vec![]);
+        for (i, c) in m.clauses.iter().enumerate() {
+            // A row takes the first clause of its kind whose condition holds.
+            let earlier: Vec<String> = m.clauses[..i].iter().filter(|e| e.kind == c.kind).map(|e| format!(" AND NOT coalesce(({}), false)", e.when.as_deref().unwrap_or("true"))).collect();
+            let when = format!("coalesce(({}), false){}", c.when.as_deref().unwrap_or("true"), earlier.concat());
+            let rest = match c.kind {
+                Kind::Matched if m.semi => format!("FROM {t} WHERE EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
+                Kind::Matched => format!("FROM {t} JOIN {s} ON {on} WHERE {when}"),
+                Kind::NotMatched => format!("FROM {s} WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {on}) AND {when}"),
+                Kind::NotMatchedBySource => format!("FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
+            };
+            let (o, n) = match (&c.action, c.kind) {
+                (Action::Insert(..), Kind::Matched | Kind::NotMatchedBySource) => bail!("MERGE: INSERT goes with WHEN NOT MATCHED"),
+                (Action::Update(_) | Action::Delete, Kind::NotMatched) => bail!("MERGE: WHEN NOT MATCHED takes an INSERT"),
+                (Action::Update(set), _) => {
+                    if let Some((c, _)) = set.iter().find(|(c, _)| meta.key.contains(c)) {
+                        return Err(crate::codes::coded("0A000", format!("{what}: UPDATE of {table}'s key column {c} isn't taken here: delete the row, then insert it with its new key")));
+                    }
+                    ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
+                    select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
                 }
-                ensure!(set.iter().all(|(c, _)| meta.columns.iter().any(|(n, _)| n == c) && !crate::text::NAMES.contains(&c.as_str())), "{}: UPDATE sets the table's own columns", what);
-                select_as(lake, meta, Some(set), None, &rest, upto, &a).await?
-            }
-            (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
-            (Action::Insert(columns, values), _) => {
-                // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
-                let given = if columns.is_empty() { crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() };
-                if given.len() != values.len() {
-                    let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
-                    return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));
+                (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
+                (Action::Insert(columns, values), _) => {
+                    // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
+                    let given = if columns.is_empty() { crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() };
+                    if given.len() != values.len() {
+                        let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
+                        return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));
+                    }
+                    ensure!(given.iter().all(|c| meta.columns.iter().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
+                    // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
+                    let values: Vec<String> = meta.columns.iter().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
+                    select_as(lake, meta, None, Some(&values), &rest, upto, &a).await?
                 }
-                ensure!(given.iter().all(|c| meta.columns.iter().any(|(n, _)| n == c)), "MERGE: INSERT names the table's own columns");
-                // (a column the clause leaves out takes its default, as `select_as` gives it: NULL with none)
-                let values: Vec<String> = meta.columns.iter().map(|(c, _)| given.iter().position(|g| g == c).map_or("DEFAULT".into(), |i| values[i].clone())).collect();
-                select_as(lake, meta, None, Some(&values), &rest, upto, &a).await?
-            }
-        };
-        old.extend(o);
-        new.extend(n);
+            };
+            old.extend(o);
+            new.extend(n);
+        }
+        Ok::<_, anyhow::Error>((old, new))
+    };
+    match proposed {
+        Some(rows) => PROPOSED.scope(Arc::new(rows), clauses).await,
+        None => clauses.await,
     }
-    Ok((old, new))
 }
 
 /// The change as one commit: new versions and new rows into the table; the old versions into

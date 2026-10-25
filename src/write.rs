@@ -1113,13 +1113,6 @@ pub(crate) fn row_columns(columns: impl IntoIterator<Item = String>, names: &[St
     columns.into_iter().filter(|c| c != "_deleted" || names.contains(c)).collect()
 }
 
-/// Does this query's `VALUES` say DEFAULT somewhere (`says_default`), read from its text? False if it doesn't parse.
-pub(crate) fn says_default_text(query: &str) -> bool {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let Ok(q) = Parser::new(&GenericDialect {}).try_with_sql(query).and_then(|mut p| p.parse_query()) else { return false };
-    says_default(&q)
-}
-
 /// Does every row of this `VALUES` say DEFAULT at position `i`?
 pub(crate) fn defaulted(query: &str, i: usize) -> bool {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
