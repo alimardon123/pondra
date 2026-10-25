@@ -192,10 +192,15 @@ const PARQUET_WRITING: [&str; 19] = ["max_row_group_size", "data_page_row_count_
 const PARQUET_TUNING: [&str; 8] = ["pushdown_filters", "reorder_filters", "enable_page_index", "pruning", "skip_metadata", "metadata_size_hint", "bloom_filter_on_read", "schema_force_view_types"];
 
 /// A LOCATION as a read takes it: a URL as written; a path on this machine made whole, and a
-/// folder there ending in `/` (its files).
+/// folder there ending in `/` (its files). A client over the network has no folder on the server,
+/// so its relative name stays as written and is read where it reads every relative name, in the
+/// lake's files (`for_caller`), as a view over `'x.csv'` is; one that leaves them is refused here.
 fn located(l: &str) -> Result<String> {
     if scheme(l).is_some() {
         return Ok(l.to_string());
+    }
+    if let Some(relative) = crate::lake_files::relative("", l).filter(|_| !owner()) {
+        return relative.map(|_| l.to_string());
     }
     let whole = crate::ddl::full(l)?;
     Ok(match l.ends_with('/') || std::path::Path::new(&whole).is_dir() {
@@ -1590,6 +1595,19 @@ mod tests {
     fn one_int(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
         let column = batches[0].column(0);
         column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("an integer").value(0)
+    }
+
+    /// A client's relative LOCATION is the lake's files, as its relative names are: kept as written for `for_caller` to
+    /// read there, and refused when it leaves them. The program that started the node has its folder made whole.
+    #[tokio::test]
+    async fn a_clients_relative_location_is_the_lakes_files() {
+        let made = |owner: bool, l: &'static str| scope(owner, async move { located(l) });
+        assert_eq!(made(false, "reports/q1.csv").await.unwrap(), "reports/q1.csv");
+        assert_eq!(made(false, "./ev/").await.unwrap(), "./ev/");
+        assert_eq!(crate::codes::of(&made(false, "../x.csv").await.unwrap_err()), "0A000");
+        assert_eq!(made(false, "s3://b/x.csv").await.unwrap(), "s3://b/x.csv");
+        assert!(made(true, "reports/q1.csv").await.unwrap().ends_with("/reports/q1.csv"));
+        assert!(std::path::Path::new(&made(true, "reports/q1.csv").await.unwrap()).is_absolute());
     }
 
     /// A client over the network reads a relative name as a page reads it: a file of the lake's own, as `PUT /files/…`

@@ -48,6 +48,9 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
     if let Some(l) = lakes.iter().find(|l| full.trim_end_matches('/') == l.as_str() || full.starts_with(&format!("{l}/"))) {
         bail!("COPY … TO {to}: that's inside the lake at {l}, whose files are its own (write beside it, or INSERT into a table)");
     }
+    if !owner() && crate::lake_files::relative("", to).is_some() {
+        bail!(crate::codes::coded("42501", format!("COPY … TO {to}: a client's relative name is a file of the lake's own (PUT /files/…), which COPY doesn't write: write to a bucket (s3://, gs://, az://), or PUT the file")));
+    }
     let remote = scheme(to).is_some_and(|s| s != "file");
     match remote {
         false => ensure!(owner(), crate::codes::coded("42501", format!("COPY … TO {to}: a path on the server's own disk, which a client writes only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): write it there, or to a bucket (s3://, gs://, az://)"))),
