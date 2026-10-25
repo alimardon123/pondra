@@ -1025,9 +1025,15 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
 pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str) -> Result<String> {
     let (other, name) = crate::ddl::resolve(lake, table).await?;
     let meta: TableMeta = other.as_deref().unwrap_or(lake).cat.get(&table_key(&name)).await?.with_context(|| format!("no table {table}"))?;
+    whole_rows_of(lake, table, &meta, names, query).await
+}
+
+/// `whole_rows` for a table whose stored meta the caller holds (`meta`, as `lake` stores it, under the name `table` the
+/// statement gives): a one-row upsert's proposed row is worked out here once, before its locks (`txn::upsert_point`).
+pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str) -> Result<String> {
     let columns = crate::rules::rows::row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let names = if names.is_empty() { implicit(&columns, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
-    let default = |c: &str| crate::defaults::sql_of(&meta, c);
+    let default = |c: &str| crate::defaults::sql_of(meta, c);
     if crate::rules::rows::plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
@@ -1699,12 +1705,13 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
-    // the job, so a retry of it is a duplicate. (MERGE and UNIQUE tables never get here: `changes` sends them to the leader.)
+    // the job, so a retry of it is a duplicate. A MERGE gets here only when `changes` took it as a one-row upsert of one
+    // key (`point_upsert`, which asked the same question): the other MERGEs and the UNIQUE tables never do.
     // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
     let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
-    if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..))) || key_insert {
+    if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
     let sql = match (&meta, &stmt) {
@@ -1806,7 +1813,8 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
 }
 
 /// The statement as the leader's to carry out (`change.rs`), if it is one: an UPDATE or DELETE of
-/// an append table, or a MERGE.
+/// an append table, or a MERGE. None for a MERGE that is a one-row upsert of one key this database holds, which the node
+/// works out from the key's row (`txn::autocommit`, as `point_upsert` says).
 pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let (Stmt::Update(..) | Stmt::Delete(..) | Stmt::Merge(_) | Stmt::Insert(..)) = stmt else { return Ok(None) };
     let (other, table) = match crate::ddl::resolve(lake, &stmt.table()).await {
@@ -1815,6 +1823,11 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
     };
     let lake = other.as_deref().unwrap_or(lake);
     let meta = lake.cat.meta(&table_key(&table)).await?;
+    if let (Stmt::Merge(m), None, Some(stored)) = (stmt, &other, &meta) {
+        if m.point_upsert(&table, stored).is_some() {
+            return Ok(None);
+        }
+    }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
     let checked = meta.as_ref().is_some_and(|m| crate::constraints::checked(m));

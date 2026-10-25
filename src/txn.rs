@@ -8,8 +8,9 @@
 //! `LOCK_MAX` rows locks none. An enforced-UNIQUE table locks nothing: its COMMIT's check refuses a row changed since it was
 //! read (40001). A MERGE and an INSERT … ON CONFLICT lock their rows as an UPDATE does. `COMMIT` sends the writes to the leader
 //! in one request (`commit_here`), which checks them under the lake's lock and writes them as one flush (§6). Outside a
-//! transaction, a keyed table's UPDATE or DELETE, and a plain INSERT into a table whose key is checked, is a transaction of its
-//! own (`autocommit`, §7), appended through the log under the job's producer.
+//! transaction, a keyed table's UPDATE or DELETE, a plain INSERT into a table whose key is checked, and a one-row upsert of
+//! one key (`change::Merge::point_upsert`) is a transaction of its own (`autocommit`, §7), appended through the log under the
+//! job's producer.
 //!
 //! A failed statement fails the transaction: until `ROLLBACK` (or `COMMIT`), every statement is refused with 25P02. DDL
 //! runs at once (`ddl_at_once`); savepoints are `Mark`s; a READ ONLY transaction refuses its writes (25006). An idle
@@ -21,7 +22,7 @@ use crate::settings::SERIALIZABLE;
 use crate::write::Stmt;
 pub use crate::rules::txn::Level;
 use crate::rules::txn::{aborted, begin_modes, plan, read_only, savepoint_name, write_word};
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, UInt64Type};
 use datafusion::sql::sqlparser::ast::{
@@ -768,15 +769,21 @@ fn conflict(table: &str) -> anyhow::Error {
     crate::codes::coded("40001", format!("could not serialize access due to concurrent update of {table}: try the transaction again"))
 }
 
+/// The rows of an INSERT as the table takes them, worked out as of commit `at` by `query` (`write::rows_of`) and checked by the
+/// table's rules (NOT NULL, CHECK, the types). `meta` is the table as SQL names it, `stored` as it is kept.
+async fn checked_rows(lake: &Lake, name: &str, meta: &TableMeta, stored: &Arc<TableMeta>, query: &str, at: u64, files: bool) -> Result<RecordBatch> {
+    let rows = crate::write::rows_of(lake, lake, meta, query, Some(at), files).await?;
+    let rules = stored.rules()?;
+    crate::rules::checked(&rules, name, rows, true, crate::defaults::base())
+}
+
 /// An INSERT's rows, worked out as of a read point and, under READ COMMITTED, with the keys they write locked (ADR-067 §3).
 /// The query may have read a key another transaction changed while the lock waited (a counter's `n + 1`, an upsert's
 /// `ON CONFLICT`): then the rows are worked out again as of the commit the locks were granted at (`passes`).
 async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapshot: u64, files: bool) -> Result<(RecordBatch, u64, Option<Keys>)> {
     let lake = &l.app.lake;
     passes(l, snapshot, |at| async move {
-        let rows = crate::write::rows_of(lake, lake, l.meta, query, Some(at), files).await?;
-        let rules = stored.rules()?;
-        let rows = crate::rules::checked(&rules, l.name, rows, true, crate::defaults::base())?;
+        let rows = checked_rows(lake, l.name, l.meta, stored, query, at, files).await?;
         // (over `LOCK_MAX` rows nothing is locked, `passes`, so their keys' text would be made for nothing)
         let keys = if rows.num_rows() > LOCK_MAX { vec![] } else { write_keys(l.meta, &[], std::slice::from_ref(&rows))? };
         Ok((rows, keys))
@@ -811,12 +818,62 @@ async fn changing(l: &Locks<'_>, stmt: &Stmt, snapshot: u64) -> Result<Changed> 
 async fn point(l: &Locks<'_>, key: &[String], set_to: &[(String, String)], snapshot: u64) -> Result<Option<Changed>> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let (row, at, keys) = passes(l, snapshot, |at| async move {
-        let row = change_one(lake, name, meta, key, Some(at), set_to).await?;
+        let row = change_one(lake, name, meta, key, Some(at), set_to, None).await?;
         let keys = if row.is_some() { vec![key.to_vec()] } else { vec![] };
         Ok((row, keys))
     })
     .await?;
     Ok(row.map(|(old, new)| (old, new, at, keys)))
+}
+
+/// A one-row upsert of one key (`change::Merge::point_upsert`), worked out from the key's row as `point` works out an UPDATE
+/// (ADR-036 §6), and not by planning. Its proposed row is worked out once, before any lock, as an INSERT's is, and checked
+/// the same way: NOT NULL and CHECK fail it on a hit too, as Postgres checks them first. The row it inserts is that proposed
+/// row as `current` reads a row (`inserted_row`), worked out once as well. Then, each pass, the key's row as of the read
+/// point, under the key's lock: a DO NOTHING keeps it, a DO UPDATE changes it by its SET (`upsert_row`), and a key no row
+/// holds takes the inserted row. None: SQL works the upsert out (`change`'s planned MERGE).
+async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, m: &crate::change::Merge, p: &crate::change::PointUpsert, snapshot: u64) -> Result<Option<Changed>> {
+    let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
+    let Some(query) = m.upsert_query() else { return Ok(None) };
+    let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `change::session`)
+    let sql = crate::write::whole_rows_of(lake, name, stored, &p.given, query).await?;
+    let proposed = checked_rows(lake, name, meta, stored, &sql, snapshot, files).await?;
+    let inserted = inserted_row(meta, &proposed)?;
+    let Ok(mut keys) = keys_of(&proposed, &meta.key) else { return Ok(None) };
+    let Some(key) = keys.pop() else { return Ok(None) };
+    let (key, proposed, inserted) = (&key, &proposed, &inserted);
+    let (done, at, keys) = passes(l, snapshot, |at| async move {
+        let found = upsert_row(l, key, proposed, inserted, at, m.alias(), p).await?;
+        let keys = if found.is_some() { vec![key.clone()] } else { vec![] };
+        Ok((found, keys))
+    })
+    .await?;
+    Ok(done.map(|(old, new)| (old, new, at, keys)))
+}
+
+/// One pass of `upsert_point` as of commit `at`, under the key's lock: `(old, new)` as `change_one` gives them, with a key no
+/// row holds inserting `inserted`. `proposed` is what SET's `excluded` names. None: SQL works the SET out (`change_one`).
+async fn upsert_row(l: &Locks<'_>, key: &[String], proposed: &RecordBatch, inserted: &RecordBatch, at: u64, alias: &str, p: &crate::change::PointUpsert) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
+    let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
+    let Some(set) = &p.update else {
+        return Ok(Some(match current(lake, name, meta, key, Some(at)).await? {
+            Current::Row(_) => (vec![], vec![]), // (DO NOTHING keeps the row)
+            Current::Gone => (vec![], vec![inserted.clone()]),
+            Current::Changed => return Err(conflict(name)),
+        }));
+    };
+    match change_one(lake, name, meta, key, Some(at), set, Some((alias, proposed))).await? {
+        None => Ok(None),
+        Some((old, _)) if old.is_empty() => Ok(Some((vec![], vec![inserted.clone()]))), // (no row: the inserted one)
+        Some(found) => Ok(Some(found)),
+    }
+}
+
+/// The row an upsert inserts: the proposed row as `current` reads a row (`row_schema`), but without `_version`, as `change_one`'s
+/// new versions are: the table's columns, and `_row_id` and `_created_at` null for a new row.
+fn inserted_row(meta: &TableMeta, proposed: &RecordBatch) -> Result<RecordBatch> {
+    let fields: Vec<_> = row_schema(meta)?.fields().iter().filter(|f| f.name() != crate::text::VERSION).cloned().collect();
+    crate::query::conform(proposed, &Arc::new(Schema::new(fields)))
 }
 
 /// The rows an UPDATE, DELETE or MERGE changes, with the commit they were read at and the keys they lock: one key's by the
@@ -826,6 +883,10 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
     let hit = match stmt {
         Stmt::Update(_, set, Some(cond)) => match point_key(&l.app.lake, l.name, stored, set, cond).await? {
             Some(key) => point(l, &key, set, snapshot).await?,
+            None => None,
+        },
+        Stmt::Merge(m) => match m.point_upsert(l.name, stored) {
+            Some(p) => upsert_point(l, stored, m, &p, snapshot).await?,
             None => None,
         },
         _ => None,
@@ -940,7 +1001,8 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
 /// through the log. Its locks are held while the append is in flight, and go with its answer (`Hold`), or with their lease when no
 /// answer came; the table is registered as appending meanwhile, so a writer closing it (`locks::close`) waits for the append. It
 /// takes no lake lock and no session state. The producer is the job's (`sql:{job}`), so a retried one is a duplicate. MERGE and
-/// tables with an enforced UNIQUE don't come here (`write::on_node_listed`).
+/// a MERGE comes here only as a one-row upsert of one key (`change::Merge::point_upsert`), and tables with an enforced UNIQUE
+/// don't (`write::changes`, `write::run_listed`).
 pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
@@ -959,17 +1021,40 @@ async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: 
     let name = stmt.table();
     let stored = stored_table(lake, &name).await?;
     let meta = stored.logical();
-    refuse_change(lake, &name, &meta, stmt).await?;
-    crate::views::can_follow(lake, &name, false).await?;
-    if let Some(v) = crate::views::filling(lake, &name).await? {
-        return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {name}'s rows")));
+    // (a one-row upsert of one key is checked as an INSERT's job is, and as `change::run` checks a MERGE: its view refused by
+    // that name, and what follows the table asked once its rows are known, `change::run`'s order)
+    let upsert = matches!(stmt, Stmt::Merge(_));
+    if upsert {
+        if crate::write::sent(lake, job).await? {
+            return Ok(j!({"duplicate": true}));
+        }
+        ensure!(lake.cat.get::<crate::views::View>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a view's: change the table it follows");
+    } else {
+        refuse_change(lake, &name, &meta, stmt).await?;
+        crate::views::can_follow(lake, &name, false).await?;
+        if let Some(v) = crate::views::filling(lake, &name).await? {
+            return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {name}'s rows")));
+        }
     }
     let l = Locks { app, name: &name, meta: &meta, owner: owner.to_string(), txn: false, locking: true, committed: true, wait: lock_wait(), taken };
     let (old, new, _, _) = change(&l, &stored, stmt, lake.visible()).await?;
+    if upsert {
+        if old.iter().any(|b| b.num_rows() > 0) {
+            crate::views::can_follow(lake, &name, false).await?;
+            if let Some(v) = crate::views::filling(lake, &name).await? {
+                bail!("materialized view {v} is still being filled from {name}'s rows: change them once it is (in a moment)");
+            }
+        }
+        // (the lock's grant brought the job's own append in, if it landed while this waited: as `insert_as` checks it)
+        if crate::write::sent(lake, job).await? {
+            return Ok(j!({"duplicate": true}));
+        }
+    }
     crate::returning::wrote(&old, &new);
     let out = tally(&old, &new);
     let Some(batch) = crate::change::upserts(&stored, &old, &new)? else {
-        return Ok(j!({"rows": 0, "updated": 0, "deleted": 0, "inserted": 0})); // (no row matched)
+        // (no row matched: a MERGE's answer is `change::run`'s, which has no counts; an UPDATE or DELETE's has them)
+        return Ok(if upsert { j!({"rows": 0}) } else { j!({"rows": 0, "updated": 0, "deleted": 0, "inserted": 0}) });
     };
     pause_for_tests().await;
     let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
@@ -1672,15 +1757,20 @@ enum Current {
     Changed,
 }
 
-/// A row has the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version` (null: the transaction's own). `key` is
-/// the key's text as `key_text` gives it.
-async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>) -> Result<Current> {
+/// The schema of a row as `current` reads it: the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version`.
+fn row_schema(meta: &TableMeta) -> Result<datafusion::arrow::datatypes::SchemaRef> {
     use datafusion::arrow::datatypes::{Field, TimeUnit};
     let mut fields: Vec<Arc<Field>> = crate::answer::schema(&meta.columns)?.fields().to_vec();
     fields.push(Arc::new(Field::new(crate::text::ROW_ID, DataType::Int64, true)));
     fields.push(Arc::new(Field::new(crate::text::CREATED, DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true)));
     fields.push(Arc::new(Field::new(crate::text::VERSION, DataType::Int64, true)));
-    let target = Arc::new(Schema::new(fields));
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// A row has the table's columns (SQL's names), then `_row_id`, `_created_at` and `_version` (null: the transaction's own). `key` is
+/// the key's text as `key_text` gives it.
+async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>) -> Result<Current> {
+    let target = row_schema(meta)?;
     if snapshot.is_some() {
         let own = with_txn(|t| match (t.by_key.get_mut(table), t.tables.get(table)) {
             (Some(by), Some(c)) => by.own(&key.join(KEY_SEP), &c.new),
@@ -1702,19 +1792,25 @@ async fn current(lake: &Lake, table: &str, meta: &TableMeta, key: &[String], sna
     Ok(Current::Row(crate::query::conform(&r, &target)?))
 }
 
+/// A table a point change works one key's row out for (`point_key`, `change::Merge::point_upsert`): keyed, with no merge, no
+/// order, no renamed or dropped column (`mapped`), and a plain name (no dot, no quotes).
+pub(crate) fn point_table(name: &str, stored: &TableMeta) -> bool {
+    !stored.key.is_empty() && stored.merge.is_empty() && stored.order.is_none() && !stored.mapped() && !name.contains('.') && !name.contains('"')
+}
+
 /// `UPDATE t SET … WHERE <key> = <value> [AND …]` of a keyed table, worked out from its one row without planning: its old and
 /// new versions, as `change::rows_of` gives them. In a transaction (`snapshot`) the row is its own version or the snapshot's;
 /// one changed since refuses it at once (40001: its COMMIT would be). None: not such an UPDATE (SQL works it out).
 pub async fn point_change(lake: &Lake, name: &str, stored: &TableMeta, snapshot: Option<u64>, set_to: &[(String, String)], cond: &str) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
     let Some(key) = point_key(lake, name, stored, set_to, cond).await? else { return Ok(None) };
-    change_one(lake, name, &stored.logical(), &key, snapshot, set_to).await
+    change_one(lake, name, &stored.logical(), &key, snapshot, set_to, None).await
 }
 
 /// The key an UPDATE's `WHERE` names (`<key> = <value> [AND …]`) on a keyed table, as text (`key_text`). None: the UPDATE isn't
 /// one key's, sets a key or a column SQL must work out, or names a key the text can't say (a JSON key: the general path).
 async fn point_key(lake: &Lake, name: &str, stored: &TableMeta, set_to: &[(String, String)], cond: &str) -> Result<Option<Vec<String>>> {
     let meta = stored.logical();
-    if meta.key.is_empty() || !meta.merge.is_empty() || meta.order.is_some() || stored.mapped() || name.contains('.') || name.contains('"')
+    if !point_table(name, stored)
         || set_to.iter().any(|(c, _)| meta.key.contains(c) || c == "_deleted" || crate::text::NAMES.contains(&c.as_str()) || !meta.columns.iter().any(|(n, _)| n == c))
     {
         return Ok(None);
@@ -1740,23 +1836,45 @@ fn key_text(meta: &TableMeta, key: &[String]) -> Result<Vec<String>> {
 }
 
 /// The row of `key` as the read point gives it, with its new version by `set_to`: its old and new versions (none: the row is
-/// gone). None: SQL works the UPDATE out (a value only SQL can evaluate).
-async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>, set_to: &[(String, String)]) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
+/// gone). `excluded`: an upsert's proposed row and the name the target goes by, so that `set_to` reads the old row as
+/// `alias.c` and the proposed one as `excluded.c` (`evaluate_in`). None: SQL works the UPDATE out (a value only SQL can
+/// evaluate, or an unqualified column both rows have).
+async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], snapshot: Option<u64>, set_to: &[(String, String)], excluded: Option<(&str, &RecordBatch)>) -> Result<Option<(Vec<RecordBatch>, Vec<RecordBatch>)>> {
     let row = match current(lake, name, meta, key, snapshot).await? {
         Current::Row(r) => r,
         Current::Gone => return Ok(Some((vec![], vec![]))),
         Current::Changed => return Err(conflict(name)),
     };
+    let both = match excluded {
+        Some((alias, proposed)) => Some(joined(alias, &row, proposed)?),
+        None => None,
+    };
     let mut new = row.clone();
     for (c, e) in set_to {
         // (a value that won't evaluate here goes the planned way, which says what is wrong: `evaluate` errs on an
         // unsimplified `now()`, which a default may be)
-        let Some(v) = crate::defaults::evaluate(&row, &crate::defaults::value(meta, c, e)).ok().flatten() else { return Ok(None) };
+        let expr = crate::defaults::value(meta, c, e);
+        let value = match &both {
+            Some((rows, schema)) => crate::rules::fit::evaluate_in(crate::defaults::base(), rows, schema, &expr).ok().flatten(),
+            None => crate::defaults::evaluate(&row, &expr).ok().flatten(),
+        };
+        let Some(v) = value else { return Ok(None) };
         let t = new.schema().field_with_name(c)?.data_type().clone();
         new = set(&new, c, crate::query::strict(&v, &t)?)?;
     }
     let keep: Vec<usize> = (0..new.num_columns()).filter(|&i| new.schema().field(i).name() != crate::text::VERSION).collect();
     Ok(Some((vec![row], vec![new.project(&keep)?])))
+}
+
+/// The old row and the proposed one as one batch, and the schema that names each one's columns: the old row's by `alias`, the
+/// proposed one's by `excluded`, which is how `evaluate_in` reads a SET's `t.v` and `excluded.v`.
+fn joined(alias: &str, row: &RecordBatch, proposed: &RecordBatch) -> Result<(RecordBatch, datafusion::common::DFSchema)> {
+    use datafusion::common::DFSchema;
+    let mut schema = DFSchema::try_from_qualified_schema(alias, row.schema().as_ref())?;
+    schema.merge(&DFSchema::try_from_qualified_schema("excluded", proposed.schema().as_ref())?);
+    let fields: Vec<_> = row.schema().fields().iter().chain(proposed.schema().fields()).cloned().collect();
+    let columns: Vec<ArrayRef> = row.columns().iter().chain(proposed.columns()).cloned().collect();
+    Ok((RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?, schema))
 }
 
 /// In a transaction, a key lookup (`serve::Point`) answered from the transaction's own version of the row or the snapshot's,

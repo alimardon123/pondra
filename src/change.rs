@@ -289,6 +289,78 @@ impl Merge {
     }
 }
 
+/// A one-row `INSERT … ON CONFLICT` of one key, which `txn` works out from the key's row (`Merge::point_upsert`): the columns
+/// its row gives, as written or implied (`write::implicit`), and the SET pairs as written (`update`; None: DO NOTHING).
+pub struct PointUpsert {
+    pub given: Vec<String>,
+    pub update: Option<Vec<(String, String)>>,
+}
+
+impl Merge {
+    /// The name the target is given in the statement, which its SET and its rows call its columns by (`t.v`).
+    pub fn alias(&self) -> &str { &self.alias }
+
+    /// The rows an `INSERT … ON CONFLICT` (or `INSERT OR …`) gives, as written; None for a MERGE.
+    pub fn upsert_query(&self) -> Option<&str> { self.upsert.as_ref().map(|u| u.query.as_str()) }
+
+    /// Is this a one-row upsert of one key that `txn` works out from the key's row (ADR-036 §6), and with what: the columns
+    /// its row gives (`given`) and its SET (`update`). `name` is the table as its lake names it (`ddl::resolve`), `stored` its
+    /// stored meta; the statement's database being this one is the caller's to say. None: the planned MERGE answers it, as
+    /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a row past it is hidden from reads, and not
+    /// from the key's lookup), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
+    /// point read gives up for those too); a conflict target that is the key; one row of values that read no table
+    /// (`rules::rows::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
+    /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
+    /// `_deleted` or a system name. INSERT OR REPLACE's empty SET is every given column but the key's, as its rows give
+    /// them; a SET that is empty then is DO NOTHING.
+    pub fn point_upsert(&self, name: &str, stored: &TableMeta) -> Option<PointUpsert> {
+        let u = self.upsert.as_ref()?;
+        if self.alias().eq_ignore_ascii_case("excluded") {
+            return None; // (`txn::joined` names the old row by the alias: a name the proposed row's `excluded` can't share)
+        }
+        // (an INSERT OR REPLACE whose row says DEFAULT stays with the planned MERGE, which works that DEFAULT out twice: the
+        // identity numbers it hands out are the ones today's build gives, and `forms/identity.slt` holds them)
+        if matches!(&u.update, Some((set, None)) if set.is_empty()) && crate::rules::rows::says_default_text(&u.query) {
+            return None;
+        }
+        let plain = |c: &str| c != "_deleted" && !crate::text::NAMES.contains(&c) && stored.columns.iter().any(|(n, _)| n == c);
+        let distinct = |cs: &[String]| cs.iter().enumerate().all(|(i, c)| !cs[..i].contains(c));
+        if !crate::txn::point_table(name, stored) || stored.ttl.is_some() || !stored.ids || crate::constraints::checked(stored) || crate::auth::limited().is_some() {
+            return None;
+        }
+        if !crate::rules::rows::constant_row(&u.query) || !self.on_key(stored) {
+            return None;
+        }
+        let width = crate::rules::rows::rows_width(&u.query);
+        let given: Vec<String> = match u.columns.is_empty() {
+            true => {
+                let columns: Vec<String> = stored.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+                crate::write::implicit(&columns, width).to_vec()
+            }
+            false => u.columns.clone(),
+        };
+        if width != Some(given.len()) || !given.iter().all(|c| plain(c.as_str())) || !distinct(&given) || !stored.key.iter().all(|k| given.contains(k)) {
+            return None;
+        }
+        let update = match &u.update {
+            None => None,
+            Some((_, Some(_))) => return None, // (a DO UPDATE … WHERE: the planned MERGE's)
+            Some((set, None)) if set.is_empty() => {
+                let pairs: Vec<(String, String)> = given.iter().filter(|c| !stored.key.contains(c)).map(|c| (c.clone(), format!("excluded.{}", q(c)))).collect();
+                (!pairs.is_empty()).then_some(pairs)
+            }
+            Some((set, None)) => {
+                let names: Vec<String> = set.iter().map(|(c, _)| c.clone()).collect();
+                if !set.iter().all(|(c, _)| plain(c.as_str()) && !stored.key.contains(c)) || !distinct(&names) {
+                    return None;
+                }
+                Some(set.clone())
+            }
+        };
+        Some(PointUpsert { given, update })
+    }
+}
+
 /// A SQL expression read back from its text (a MERGE's ON and its insert values are kept as text).
 fn expr(text: &str) -> Option<ast::Expr> {
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
