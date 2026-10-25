@@ -309,7 +309,7 @@ impl Merge {
     /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a row past it is hidden from reads, and not
     /// from the key's lookup), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
     /// point read gives up for those too); a conflict target that is the key; one row of values that read no table
-    /// (`write::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
+    /// (`rules::rows::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
     /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
     /// `_deleted` or a system name. INSERT OR REPLACE's empty SET is every given column but the key's, as its rows give
     /// them; a SET that is empty then is DO NOTHING.
@@ -331,7 +331,7 @@ impl Merge {
         if !crate::rules::rows::constant_row(&u.query) || !self.on_key(stored) {
             return None;
         }
-        let width = crate::write::rows_width(&u.query);
+        let width = crate::rules::rows::rows_width(&u.query);
         let given: Vec<String> = match u.columns.is_empty() {
             true => {
                 let columns: Vec<String> = stored.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
