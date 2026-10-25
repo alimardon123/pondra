@@ -1,0 +1,56 @@
+---
+title: What stays stable
+description: What every 1.x release keeps working as 1.0 does, what may change in any release, and how something is deprecated before it goes.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+From 1.0, Pondra's releases are numbered as semantic versioning says. A 1.x release adds and fixes,
+but it doesn't break what this page lists as stable: a lake, a query, a script or a program that
+works with 1.0 works with every 1.x. Something stable that has to go is deprecated first, keeps
+working through every 1.x release, and goes only in 2.0.
+
+## Stable through 1.x
+
+| What | What every 1.x keeps |
+|---|---|
+| Lakes | Every 1.x opens every lake an earlier release wrote, back to 0.22: each release's tests open a lake made by each of them and check every answer. A lake moves to a newer format only when something written there needs it, and only once every node knows that format, so the release before still opens a lake that used nothing new ([formats](/pondra/guides/upgrades/#which-releases-can-open-a-lake)). A backup restores with the release that made it or any later one. |
+| Upgrades | A cluster goes from one release to the next a node at a time, serving and taking writes the whole time ([how](/pondra/guides/upgrades/#upgrade-a-cluster-one-node-at-a-time)). Across several releases, take them one at a time, or stop every node and start them all on the new one. |
+| SQL | The statements, functions, options and system tables on the [SQL](/pondra/sql/) pages: their names, arguments and columns, and each error's SQLSTATE. A query answers the same rows in every 1.x, unless its answer was a bug. A system table may gain columns. |
+| HTTP | Every route on the [HTTP page](/pondra/reference/http/): its method, path, parameters, body, status codes and the fields of its answer. An answer may gain fields, so read the ones you need and pass over the rest. |
+| Clients | The functions and methods of the [Python](/pondra/reference/python/) (and its [frames](/pondra/reference/frames/)) and [JavaScript](/pondra/reference/javascript/) packages, with their arguments. A method may gain arguments, with defaults that keep what it did. A client of one 1.x release works with nodes of that release and later ones. |
+| Command line | Every command and flag on the [command line](/pondra/reference/cli/) page, and what each [environment variable](/pondra/reference/environment/) means. |
+| Other doors | What Pondra supports of the Postgres wire protocol, Arrow Flight and Flight SQL, the Kafka protocol, Iceberg REST and MCP, as their pages say. The Delta and Iceberg tables Pondra publishes keep to those formats' specifications. |
+| Monitoring | `GET /healthz`, `GET /ready`, and the `GET /metrics` series and `GET /stats` fields that [Observability](/pondra/guides/observability/) names. |
+
+## What may change in any release
+
+- How fast a query runs, how much memory it takes, and the plan `EXPLAIN` shows.
+- The wording of messages, warnings and log lines. Match an error by its SQLSTATE or its HTTP
+  status, not by its text.
+- Defaults that tune speed or memory, such as cache sizes and how queries spread across nodes.
+- The `/cluster/…` paths that nodes call each other on.
+- A lake's files and catalog as they lie in the folder or bucket. Read and write a lake through
+  Pondra, or read the Delta and Iceberg tables it publishes; never edit its files by hand.
+- What the console and the shell show, and where.
+- Whatever a security fix has to change, even where something relied on the hole. That release's
+  notes say so under **Before you upgrade**.
+
+<Aside type="caution" title="Before 1.0">
+Releases before 1.0 could change anything, and their notes said what changed. 1.0 removes what they
+deprecated: in Python `pondra.local()` and `pondra.open()`, and in JavaScript `local()`, which
+`connect()` replaces. The 1.0 release notes list each one.
+</Aside>
+
+## How something is deprecated
+
+1. A release's notes say it is deprecated and what to use instead, and its row in the reference says
+   so too.
+2. It keeps working through every 1.x release. The Python client raises a `DeprecationWarning` when
+   it is used, and the JavaScript client emits one as a process warning, once per process.
+3. It goes only in a major release, 2.0, whose upgrade guide says what to change.
+
+## Which releases get fixes
+
+Fixes, security fixes among them, ship in the newest 1.x release. Every 1.x release upgrades in
+place from the one before, so keeping current is how you get them.
