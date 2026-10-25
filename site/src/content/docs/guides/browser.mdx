@@ -155,9 +155,9 @@ const page = new Page();
 ## What a page doesn't do yet
 
 <Aside>
-A page refuses these with `0A000`: views and SQL functions (`CREATE VIEW`, `CREATE FUNCTION`), `ALTER TABLE`,
-transactions (`BEGIN`), `DECLARE`, `CREATE TYPE`, `MERGE` and `INSERT … ON CONFLICT`, identity columns, and a
-table's past (`AT (VERSION => …)`). `DEFAULT` in `VALUES` and a
-row narrower than its table fail with DataFusion's words. Users, streams, tasks and Python are a node's, not a
-page's.
+A page refuses these with `0A000`: views (`CREATE VIEW`), `ALTER TABLE`, transactions (`BEGIN`), `DECLARE`,
+`CREATE TYPE`, `MERGE` and `INSERT … ON CONFLICT`, identity columns, a table's past (`AT (VERSION => …)`), SQL
+functions and sequences. Users and grants, tasks, shares, secrets, backups, attached lakes and `COPY` are a node's,
+and a page refuses them the same way, saying where to do each. `DEFAULT` in `VALUES` and a row narrower than its
+table fail with DataFusion's words.
 </Aside>
