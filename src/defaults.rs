@@ -20,7 +20,7 @@ pub fn check(meta: &TableMeta, table: &str, rows: &RecordBatch) -> Result<()> {
     crate::rules::checks(&meta.to_rules()?, table, rows, true, &BASE)
 }
 
-/// What a door runs on rows it is about to keep: written as the table holds them (`types::as_held`), then checked as
+/// What a door runs on rows it is about to keep: written as the table holds them (`rules::typed::as_held`), then checked as
 /// `check` does, with each column as the table holds it.
 pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
     if !ruled(meta) || rows.num_rows() == 0 {
@@ -38,6 +38,9 @@ fn ruled(meta: &TableMeta) -> bool { !meta.not_null.is_empty() || !meta.checks.i
 /// `values` and `validate` take a copy (`copy`), so what they register is theirs alone.
 static BASE: std::sync::LazyLock<SessionContext> =
     std::sync::LazyLock::new(|| crate::store::functions(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
+
+/// The session a node plans a CHECK in (`BASE`), for the write rules' callers (`rules::checked`).
+pub fn base() -> &'static SessionContext { &BASE }
 
 /// A session with BASE's functions, for what registers functions of its own (`nextval`): what holds the lake must never
 /// go into BASE, which every check shares (invariants 199, 301).

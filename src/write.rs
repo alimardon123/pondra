@@ -1890,7 +1890,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
         }
         _ => {}
     }
-    let stored = lake.cat.get::<TableMeta>(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
+    let stored = lake.cat.meta(&table_key(&table)).await?; // (a plain INSERT's routing reads it as stored)
     let meta = stored.as_ref().map(|m| m.logical()); // (rows under SQL's names: the log keeps them stored, `log::pack`)
     // A keyed table's UPDATE or DELETE outside a transaction is a transaction of its own (ADR-067 §7): it locks the keys
     // it changes, so a change worked out from a snapshot can't overwrite a commit that landed meanwhile. Its producer is
@@ -1898,7 +1898,7 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     // A plain INSERT into a table whose key is checked (`constraints::key_checked`) is one too: its key must be new, and its
     // locks make two nodes' INSERTs of one new key wait for each other (`txn::autocommit_as`).
     let keyed = meta.as_ref().is_some_and(|m| !m.key.is_empty());
-    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(crate::constraints::key_checked);
+    let key_insert = matches!(stmt, Stmt::Insert(..)) && stored.as_ref().is_some_and(|m| crate::constraints::key_checked(m));
     if (keyed && matches!(stmt, Stmt::Update(..) | Stmt::Delete(..))) || key_insert {
         return Box::pin(crate::change::FILES.scope(files, crate::txn::autocommit(app, &stmt, &job))).await;
     }
@@ -1925,7 +1925,9 @@ async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, f
     };
     let meta = meta.expect("a table");
     // (each jsonb in its own form, so `RETURNING` answers what is held; the log checks the rows, as every door's)
-    let batch = crate::types::as_held(&meta, rows_of(lake, lake, &meta, &sql, None, files).await?, true)?;
+    let rows = rows_of(lake, lake, &meta, &sql, None, files).await?;
+    let rules = stored.as_ref().expect("a table").rules()?;
+    let batch = crate::rules::typed::as_held(&rules, rows, true)?;
     crate::returning::wrote(&[], std::slice::from_ref(&batch));
     let n = batch.num_rows();
     let ack = app.log()?.append(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, batch).await?;
@@ -1966,13 +1968,13 @@ pub(crate) async fn changes(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> 
         r => r?,
     };
     let lake = other.as_deref().unwrap_or(lake);
-    let meta = lake.cat.get::<TableMeta>(&table_key(&table)).await?;
+    let meta = lake.cat.meta(&table_key(&table)).await?;
     if let (Stmt::Update(_, set, _), Some(m)) = (stmt, &meta) {
         crate::seq::check_set(m, &set.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>())?;
     }
     // (a table with an enforced UNIQUE: every write is checked on the leader, `constraints.rs`; a
     // keyed table's plain INSERT too, since its key must be new)
-    let checked = meta.as_ref().is_some_and(crate::constraints::checked);
+    let checked = meta.as_ref().is_some_and(|m| crate::constraints::checked(m));
     let append = meta.is_some_and(|m| m.key.is_empty());
     Ok(match stmt {
         // (a plain INSERT into a keyed table is no change here: `on_node_listed` sends it to `txn::autocommit`, under its locks)

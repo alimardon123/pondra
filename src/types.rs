@@ -21,7 +21,6 @@
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};
-use datafusion::arrow::array::RecordBatch;
 use datafusion::sql::sqlparser::ast::{self, Statement, VisitMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
@@ -308,14 +307,6 @@ pub fn grows(had: Option<&str>, wanted: &str) -> bool {
 pub use crate::rules::typed::{held, length};
 
 pub use crate::pg_casts::uuid_of;
-
-/// `rules::typed::as_held` over the entry's rules (`to_rules`), for an entry with a column held as jsonb.
-pub fn as_held(meta: &TableMeta, rows: RecordBatch, sql_names: bool) -> Result<RecordBatch> {
-    if !meta.sql_types.values().any(|t| t == "jsonb") {
-        return Ok(rows);
-    }
-    crate::rules::typed::as_held(&meta.to_rules()?, rows, sql_names)
-}
 
 /// Where SQL comes in: a cast to an enum type is a cast to text (a literal one of its labels, or
 /// refused as Postgres refuses it), and `enum_range(NULL::t)`, `enum_first`, `enum_last` its
