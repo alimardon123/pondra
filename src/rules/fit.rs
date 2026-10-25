@@ -107,8 +107,15 @@ pub fn fit_with(target: &SchemaRef, all: &RecordBatch) -> Result<(RecordBatch, V
 pub fn evaluate(base: &SessionContext, rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> {
     use datafusion::common::DFSchema;
     let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
-    let Ok(e) = base.parse_sql_expr(expr, &schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
-    let Ok(phys) = base.create_physical_expr(e, &schema) else { return Ok(None) };
+    evaluate_in(base, rows, &schema, expr)
+}
+
+/// `expr` over `rows`, whose columns `schema` names: qualified names among them (`t.v` and `excluded.v` for an upsert's
+/// old and proposed row, one batch of both), so the same name may be in it twice. None if it doesn't plan over them
+/// (an unqualified name the schema holds twice is ambiguous, and SQL works it out instead).
+pub fn evaluate_in(base: &SessionContext, rows: &RecordBatch, schema: &datafusion::common::DFSchema, expr: &str) -> Result<Option<ArrayRef>> {
+    let Ok(e) = base.parse_sql_expr(expr, schema).and_then(crate::optimize::whole_literals) else { return Ok(None) };
+    let Ok(phys) = base.create_physical_expr(e, schema) else { return Ok(None) };
     Ok(Some(phys.evaluate(rows)?.into_array(rows.num_rows())?))
 }
 

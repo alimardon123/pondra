@@ -1,0 +1,231 @@
+# A one-row upsert of one key, INSERT … ON CONFLICT (k) with one VALUES row, is worked out from the key's row as an UPDATE
+# is: a hit and a miss, DO UPDATE and DO NOTHING, the column list and none, DEFAULT in the VALUES, a SET over the old row
+# (`pu.v`) and the proposed one (`excluded.v`), NOT NULL and CHECK on the proposed row before the conflict is looked for,
+# RETURNING, BEGIN … COMMIT and ROLLBACK, and a key of two columns. Each answer is Postgres 16's (form-parity).
+statement ok
+CREATE TABLE pu (k BIGINT PRIMARY KEY, v TEXT NOT NULL CHECK (v <> 'bad'), n INT DEFAULT 7)
+
+statement ok
+INSERT INTO pu VALUES (1, 'a', 1), (2, 'b', 2)
+
+statement count 1
+INSERT INTO pu VALUES (1, 'x', 10) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = excluded.n
+
+statement count 1
+INSERT INTO pu VALUES (3, 'c', 3) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = excluded.n
+
+statement count 0
+INSERT INTO pu VALUES (1, 'nope', 99) ON CONFLICT (k) DO NOTHING
+
+statement count 1
+INSERT INTO pu VALUES (4, 'd', 4) ON CONFLICT DO NOTHING
+
+query ITI
+SELECT k, v, n FROM pu ORDER BY k
+----
+1 x 10
+2 b 2
+3 c 3
+4 d 4
+
+# The column list leaves n out: a new row takes its DEFAULT, a hit's n is the old one.
+statement count 1
+INSERT INTO pu (k, v) VALUES (5, 'e') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (5, 'e2') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement count 1
+INSERT INTO pu VALUES (5, 'e3', DEFAULT) ON CONFLICT (k) DO UPDATE SET n = excluded.n + 1
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 5
+----
+5 e2 8
+
+# SET over the old row and the proposed one: t.v || excluded.v, t.n + 1, and excluded.n of a column the row leaves out (its DEFAULT).
+statement count 1
+INSERT INTO pu (k, v) VALUES (2, 'Z') ON CONFLICT (k) DO UPDATE SET v = pu.v || excluded.v
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (2, 'q') ON CONFLICT (k) DO UPDATE SET n = pu.n + 1
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (1, 'w') ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+query ITI
+SELECT k, v, n FROM pu WHERE k IN (1, 2) ORDER BY k
+----
+1 x 7
+2 bZ 3
+
+# A value in the VALUES is cast as an INSERT casts it: 2.5 rounds to 3.
+statement count 1
+INSERT INTO pu (k, v, n) VALUES (6, 'r', CAST(2.5 AS INT)) ON CONFLICT (k) DO NOTHING
+
+query I
+SELECT n FROM pu WHERE k = 6
+----
+3
+
+# NOT NULL and CHECK are the proposed row's, checked before the conflict is looked for: a hit refuses too, as a miss does.
+statement error 23502
+INSERT INTO pu (k, v) VALUES (1, NULL) ON CONFLICT (k) DO NOTHING
+
+statement error 23502
+INSERT INTO pu (k, v) VALUES (9, NULL) ON CONFLICT (k) DO UPDATE SET n = excluded.n
+
+statement error 23514
+INSERT INTO pu VALUES (1, 'bad', 1) ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement error 23514
+INSERT INTO pu VALUES (9, 'bad', 1) ON CONFLICT (k) DO NOTHING
+
+# A SET that DataFusion can't plan over the two rows goes the planned way: an unqualified column both rows have is
+# ambiguous (Postgres: 42702; Pondra's code, as it always gave it: XX000), and now() in a SET (the planned way too) gives its text.
+statement error XX000 Ambiguous
+INSERT INTO pu (k, v) VALUES (1, 'u') ON CONFLICT (k) DO UPDATE SET n = n + 1
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (2, 'f') ON CONFLICT (k) DO UPDATE SET v = now()::text
+
+query B
+SELECT v LIKE '20%' FROM pu WHERE k = 2
+----
+true
+
+# RETURNING answers the row a hit writes, a miss's, and nothing for a DO NOTHING that finds one.
+query IT
+INSERT INTO pu (k, v) VALUES (2, 'ret') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v
+----
+2 ret
+
+query IT
+INSERT INTO pu (k, v) VALUES (30, 'new') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v
+----
+30 new
+
+query IT
+INSERT INTO pu (k, v) VALUES (30, 'again') ON CONFLICT (k) DO NOTHING RETURNING k, v
+----
+
+# In a transaction: rolled back, and kept on COMMIT.
+statement ok
+BEGIN
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (3, 'tx') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+query IT
+SELECT k, v FROM pu WHERE k = 3
+----
+3 tx
+
+statement ok
+ROLLBACK
+
+query IT
+SELECT k, v FROM pu WHERE k = 3
+----
+3 c
+
+statement ok
+BEGIN
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (3, 'kept') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (40, 'new') ON CONFLICT (k) DO NOTHING
+
+statement ok
+COMMIT
+
+query IT
+SELECT k, v FROM pu WHERE k IN (3, 40) ORDER BY k
+----
+3 kept
+40 new
+
+# A key of two columns: a hit updates it, a miss inserts, DO NOTHING keeps what is there.
+statement ok
+CREATE TABLE pk2 (a INT, b TEXT, c INT, PRIMARY KEY (a, b))
+
+statement ok
+INSERT INTO pk2 VALUES (1, 'x', 1)
+
+statement count 1
+INSERT INTO pk2 (a, b, c) VALUES (1, 'x', 5) ON CONFLICT (a, b) DO UPDATE SET c = pk2.c + excluded.c
+
+statement count 1
+INSERT INTO pk2 (a, b, c) VALUES (1, 'y', 6) ON CONFLICT (a, b) DO UPDATE SET c = excluded.c
+
+statement count 0
+INSERT INTO pk2 (a, b, c) VALUES (1, 'y', 9) ON CONFLICT (a, b) DO NOTHING
+
+query ITI
+SELECT a, b, c FROM pk2 ORDER BY a, b
+----
+1 x 6
+1 y 6
+
+# DuckDB's OR forms (Postgres has none): OR IGNORE is DO NOTHING, OR REPLACE sets every column the row gives but the key.
+# OR IGNORE's NOT NULL on a hit is refused, as ON CONFLICT's is (the answer the planned MERGE gave was 0 rows).
+statement count 0
+INSERT OR IGNORE INTO pu VALUES (1, 'ign', 1)
+
+statement count 1
+INSERT OR REPLACE INTO pu VALUES (1, 'rep', 42)
+
+statement error 23502
+INSERT OR IGNORE INTO pu (k, v) VALUES (1, NULL)
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 1
+----
+1 rep 42
+
+# In one transaction, a new key is inserted by an upsert, and a second upsert of that key updates the row the first one
+# inserted (its own version, read as the transaction's): kept by COMMIT, and dropped by ROLLBACK.
+statement ok
+BEGIN
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (50, 'first') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (50, 'second') ON CONFLICT (k) DO UPDATE SET n = pu.n + 1, v = excluded.v
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 50
+----
+50 second 8
+
+statement ok
+COMMIT
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 50
+----
+50 second 8
+
+statement ok
+BEGIN
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (51, 'first') ON CONFLICT (k) DO UPDATE SET v = excluded.v
+
+statement count 1
+INSERT INTO pu (k, v) VALUES (51, 'second') ON CONFLICT (k) DO UPDATE SET n = pu.n + 1, v = excluded.v
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 51
+----
+51 second 8
+
+statement ok
+ROLLBACK
+
+query ITI
+SELECT k, v, n FROM pu WHERE k = 51
+----

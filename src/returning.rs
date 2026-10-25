@@ -6,10 +6,11 @@
 //! The rows are the ones the write worked out, kept as it wrote them (`wrote`), never read back after it: other writes may
 //! have changed the table by then. Each path that works its rows out on this node keeps them: an INSERT through the log
 //! (`write::run_listed`), a keyed table's write on its own (`txn::autocommit`) and a statement in a transaction
-//! (`txn::statement`). A change the leader would work out (an append table's UPDATE or DELETE, a MERGE or ON CONFLICT, a
-//! table with a UNIQUE: `write::changes`) runs as a transaction of its own instead (`txn::alone`), so its rows are worked
-//! out here, where they can be returned, and still land in one commit. A job sent again writes nothing, and its first
-//! answer's rows aren't kept, so it is refused by name (55000) rather than answered with no rows.
+//! (`txn::statement`). A change the leader would work out (an append table's UPDATE or DELETE, a MERGE or ON CONFLICT that
+//! isn't a one-row upsert of one key, a table with a UNIQUE: `write::changes`) runs as a transaction of its own instead
+//! (`txn::alone`), so its rows are worked out here, where they can be returned, and still land in one commit. A job sent
+//! again writes nothing, and its first answer's rows aren't kept, so it is refused by name (55000) rather than answered
+//! with no rows.
 
 use crate::auth::Role;
 use crate::server::App;
@@ -182,7 +183,7 @@ fn parsed(r: &Returning) -> Result<Stmt> {
 }
 
 /// The write, run where its rows are worked out on this node: as it always runs, or, for a change the leader would work out
-/// (`write::changes`), as a transaction of its own (`txn::alone`).
+/// (`write::changes`; a one-row upsert of one key is not one), as a transaction of its own (`txn::alone`).
 async fn write(app: &App, r: &Returning, table: &str, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     let leaders = match &stmt {
         Stmt::InsertInto(t, ..) => crate::write::changes(&app.lake, &Stmt::Insert(t.clone(), String::new())).await?, // (its columns don't decide it)
