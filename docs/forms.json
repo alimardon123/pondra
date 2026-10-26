@@ -5,7 +5,8 @@
   "cluster": "three nodes on one lake, each query spread over them",
   "inprocess": "a node in the caller's process, through the library (Python's and JavaScript's connect(path))",
   "memory": "a node in the caller's process on a lake in memory (connect() with no path, DuckDB's :memory:)",
-  "page": "the browser's form (web/pkg's Page), one thread and no lake"
+  "page": "the browser's form (web/pkg's Page), one thread and no lake",
+  "page-lake": "the browser's form on the core's lake (web/pkg-lake's lake(), designs/page-lake-p2.md): until P3, only /sql runs on the lake"
  },
  "refusals": [
   {"form": "page", "file": "identity.slt", "sqlstate": "0A000", "says": "a page doesn't take INSERT … ON CONFLICT yet", "why": "P1: a page keeps identity columns with counters of its own (page/counters.rs) and transactions (page/txn.rs), so the file passes up to its first ON CONFLICT, which a page refuses as keys.slt's does", "owner": "L2"},

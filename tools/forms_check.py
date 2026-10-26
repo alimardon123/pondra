@@ -2,8 +2,8 @@
 """One set of SQL cases on every form (ADR-072 §6, reviews/form-parity.md): each form answers as a node does, or
 refuses by the name docs/forms.json gives it.
 
-  forms_check.py [--form server,cluster,inprocess,memory,page] [--only keys,defaults] [--bin PATH] [--lib PATH]
-                 [--pkg web/pkg] [--out PATH]
+  forms_check.py [--form server,cluster,inprocess,memory,page,page-lake] [--only keys,defaults] [--bin PATH] [--lib PATH]
+                 [--pkg web/pkg] [--pkg-lake web/pkg-lake] [--out PATH]
 
 The cases are tests/forms/*.slt, sqllogictest records as slt_check.py reads and prints them, one behaviour a file,
 each file on a lake (or a page) of its own:
@@ -19,6 +19,7 @@ Every form is reached through the one request contract, request(method, path, he
 - inprocess and memory: a node in this process through the library's pondra_request (python/pondra/inprocess.py),
   on a folder and on `:memory:`;
 - page: web/pkg's Page in Node behind a port (page_serve.mjs), over HTTP as a node.
+- page-lake: web/pkg-lake's page on the core's lake (`lake()`), behind a port as `page` is.
 
 docs/forms.json's `refusals` are the only differences a form may have. On that form, the file's first record that
 doesn't pass must be refused with the listed SQLSTATE and words, and the rest of the file isn't run. Each names its
@@ -36,7 +37,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import harness, slt_check
 
-FORMS = ("server", "cluster", "inprocess", "memory", "page")
+FORMS = ("server", "cluster", "inprocess", "memory", "page", "page-lake")
 SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 # DataFusion's own words for what it lacks: a refusal in them isn't yet one the form names (ADR-072 §6)
 DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|Schema error|Error during planning|Inconsistent data length|Placeholder")
@@ -113,15 +114,17 @@ class InProcess:
 
 
 class Page(Nodes):
-    """page: web/pkg's Page in Node behind a port (page_serve.mjs), made afresh (`POST /reset`) for each file."""
+    """page and page-lake: web/pkg's Page in Node behind a port (page_serve.mjs), made afresh (`POST /reset`) for each
+    file; `lake` opens it on the core's lake instead (page_serve.mjs --lake, with web/pkg-lake)."""
 
-    def __init__(self, pkg):
+    def __init__(self, pkg, lake=False):
         super().__init__(1, None)
-        self.pkg, self.child = pkg, None
+        self.pkg, self.lake, self.child = pkg, lake, None
 
     def open(self):
         if self.child is None:
-            self.child = subprocess.Popen(["node", os.path.join(HERE, "page_serve.mjs"), "--pkg", self.pkg], stdout=subprocess.PIPE, text=True)
+            cmd = ["node", os.path.join(HERE, "page_serve.mjs"), "--pkg", self.pkg] + (["--lake"] if self.lake else [])
+            self.child = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
             self.port = int(json.loads(self.child.stdout.readline())["url"].rsplit(":", 1)[1])
         status, _, said = self.request("POST", "/reset", {}, b"")
         if status != 204:
@@ -216,12 +219,12 @@ def split(table):
 
 def form_of(name):
     return {"server": lambda: Nodes(1, A.port), "cluster": lambda: Nodes(3, A.port), "inprocess": lambda: InProcess(False),
-            "memory": lambda: InProcess(True), "page": lambda: Page(A.pkg)}[name]()
+            "memory": lambda: InProcess(True), "page": lambda: Page(A.pkg), "page-lake": lambda: Page(A.pkg_lake, True)}[name]()
 
 
 def main():
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
-    A.bin, A.lib, A.pkg = (os.path.abspath(p) for p in (A.bin, A.lib, A.pkg))  # (inprocess and memory leave this folder)
+    A.bin, A.lib, A.pkg, A.pkg_lake = (os.path.abspath(p) for p in (A.bin, A.lib, A.pkg, A.pkg_lake))  # (inprocess and memory leave this folder)
     harness.BIN = A.bin
     os.environ["PONDRA_LIBRARY"] = A.lib
     os.environ.setdefault("PONDRA_BIN", A.bin)  # (the library's launcher, as inprocess_check.py gives it)
@@ -265,11 +268,12 @@ def main():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--form", default=",".join(FORMS))
+    ap.add_argument("--form", default=",".join(FORMS), help="forms, comma-separated, by name: " + ", ".join(FORMS))
     ap.add_argument("--only", default="", help="files by name, without .slt: keys,defaults")
     ap.add_argument("--bin", default=os.environ.get("PONDRA_BIN", os.path.join(REPO, "target/release/pondra")))
     ap.add_argument("--lib", default=os.environ.get("PONDRA_LIBRARY", os.path.join(REPO, "target/release/libpondra_lib.so")))
     ap.add_argument("--pkg", default=os.path.join(REPO, "web/pkg"))
+    ap.add_argument("--pkg-lake", default=os.path.join(REPO, "web/pkg-lake"))
     ap.add_argument("--port", type=int, default=8950)
     ap.add_argument("--out")
     A = ap.parse_args()
