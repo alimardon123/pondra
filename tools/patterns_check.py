@@ -1598,11 +1598,12 @@ REFUSED = [
     # as i * i with the row i; the engine refuses from row 257 (256 rows answer). c is never true, so no match ends the search.
     ("the 100,000 cap on partial matches, in a DEFINE that reads the match", mr("cap600", None, "day", "count(*) AS n", "(a | b)+ c",
                                                                                "a AS count(a.*) >= 0, b AS count(b.*) >= 0, c AS count(c.*) < 0",
-                                                                               "PAST LAST ROW"), "54000", "partial matches at once: make the conditions narrower"),
-    # A glue function the engine lacks: the message starts with the symbol it is in (42883 is undefined_function).
-    ("a glue function the engine lacks, in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+",
-                                                         "a AS no_such_glue_fn(a.price) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
-     "42883", "MATCH_RECOGNIZE: DEFINE a: "),
+                                                                               "PAST LAST ROW"), "54000", "more than 100,000 partial matches at once: make the conditions narrower"),
+    # A glue function the engine lacks, in a DEFINE that reads another symbol (so it is glue, planned with the match, and not
+    # row-only): the message starts with the symbol it is in, DEFINE b (42883 is undefined_function).
+    ("a glue function the engine lacks, in a DEFINE that reads another symbol", mr("tq", None, "day", "FIRST(day) AS s", "a+ b",
+                                                         "b AS no_such_glue_fn(a.price) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
+     "42883", "MATCH_RECOGNIZE: DEFINE b: "),
 ]
 
 
