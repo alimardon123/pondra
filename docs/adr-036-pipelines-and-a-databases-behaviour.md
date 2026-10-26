@@ -50,7 +50,7 @@ pipelines each lag the stage before.
 - **Dropped from its end:** dropping a view another follows is refused, naming the followers.
 - **The sequencer's check** (`log::commit`) now also owes a view's rows to the views that follow it:
   a flush packed without a downstream view (made meanwhile) is packed again.
-- `pondra.pipelines` lists each materialized view: what it follows, its kind (rows, aggregate,
+- `pondra.flows` lists each materialized view: what it follows, its kind (rows, aggregate,
   window, sessions, stream join), what else it reads, its expectations, its definition.
 
 ### 2. Expectations (built)

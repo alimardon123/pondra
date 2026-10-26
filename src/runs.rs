@@ -15,7 +15,10 @@
 //!   same run of their graph (the first task's tick, which its tick is too), claimed and marked done
 //!   as a scheduled one is. `WHEN` false is a run `skipped`, which counts as done; `RETURN`'s value
 //!   is the run's result (`pondra.result('load')`); `EXECUTE TASK nightly (day => …)` claims a tick
-//!   now, its values every task's in the graph; a suspended task takes no tick of its own.
+//!   now, and its run is the whole graph, suspended tasks too. A run's values are worked out once,
+//!   when its tick is claimed: what `EXECUTE TASK` gave, and the first task's `DECLARE PARAMETER`
+//!   defaults for the rest, so every task in the run sees the same `$day`. A suspended task takes
+//!   no tick of its own, and in a scheduled run neither does what follows it.
 //! - **`pondra.routines`, `pondra.tasks`**: the catalog's functions, procedures and tasks, as
 //!   tables (`SHOW FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS` read them).
 use crate::auth::Role;
@@ -366,7 +369,8 @@ pub struct Task {
     pub when: Option<String>,
     #[serde(default, skip_serializing_if = "TaskOptions::plain")]
     pub with: TaskOptions,
-    /// `ALTER TASK … SUSPEND`: no tick of its own until `RESUME` (`EXECUTE TASK` still runs it).
+    /// `ALTER TASK … SUSPEND`: no tick of its own until `RESUME`, and a scheduled run doesn't run what
+    /// follows it (`EXECUTE TASK` runs it, and its whole graph).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspended: bool,
 }
@@ -406,9 +410,13 @@ struct Tick {
     /// `RETURN`'s value, as SQL (`pondra.result`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<String>,
-    /// `EXECUTE TASK … (day => …)`'s values, the graph's.
+    /// The run's values, worked out once when the tick is claimed: what `EXECUTE TASK … (day => …)`
+    /// gave, then the first task's `DECLARE PARAMETER` defaults. Every task in the run gets them.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     params: HashMap<String, serde_json::Value>,
+    /// Claimed by `EXECUTE TASK`: the tasks after it run in its run, suspended ones too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    asked: bool,
 }
 
 impl Tick {
@@ -535,9 +543,40 @@ pub fn execute_of(sql: &str) -> Option<(String, Vec<(String, String)>)> {
     matches!(p.peek_token().token, Token::EOF).then_some((name, args))
 }
 
+/// A run's values, worked out once, as its tick is claimed: `given` (what `EXECUTE TASK` gave), then
+/// each `DECLARE PARAMETER` of the task in the order it declares them, so a later default may use an
+/// earlier one (a given value is cast to its type first). A parameter with no default and no value
+/// is left to the task's own DECLARE, which says it is required. One that fails stops there, and it
+/// and the rest are left out: the task's own DECLARE works them out when it runs, and its error is the
+/// run's.
+async fn values(app: &App, task: &Task, given: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
+    let mut out = given.clone();
+    let parameters: Vec<_> = crate::vars::parameters(&task.sql).into_iter().filter(|p| p.declared).collect();
+    let worked_out = crate::vars::own(given.clone(), async {
+        for p in parameters {
+            if p.default.is_none() && !given.contains_key(&p.name) {
+                continue;
+            }
+            let name = p.name.clone();
+            let change = crate::vars::Change::Declare { name: name.clone(), ty: p.ty, default: p.default, parameter: true };
+            if crate::vars::apply(app, change).await.is_err() {
+                break;
+            }
+            let Some(var) = crate::vars::get(&name) else { break };
+            if !given.contains_key(&name) {
+                out.insert(name, serde_json::json!({"sql": var.sql}));
+            }
+        }
+    });
+    crate::temp::SESSION.scope(None, worked_out).await; // (the run has no session: a caller's search path, settings and temp tables don't count)
+    out
+}
+
 /// `EXECUTE TASK name (…)`: its values worked out once, here, as the caller, then the leader
 /// claims a tick for it now (`Ddl::ExecuteTask`).
 pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: Who) -> Result<Outcome> {
+    let asked = |params: HashMap<String, serde_json::Value>| crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::ExecuteTask { name: name.clone(), params }]);
+    app.auth.allows(who.role, &asked(HashMap::new()))?; // (before its values: a caller who may not run it runs none of their queries)
     let mut params = HashMap::new();
     if !args.is_empty() {
         let select = args.iter().map(|(k, v)| format!("({v}) AS \"{k}\"")).collect::<Vec<_>>().join(", ");
@@ -545,9 +584,14 @@ pub async fn execute(app: &App, name: String, args: Vec<(String, String)>, who: 
         let row = datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?;
         params = crate::routines::values_of(&row)?;
     }
-    let stmt = crate::write::Stmt::Ddl(vec![crate::ddl::Ddl::ExecuteTask { name, params }]);
-    app.auth.allows(who.role, &stmt)?;
-    Ok(Outcome::Done(crate::write::on_node_as(app, stmt, None, who.files).await?))
+    let task = match crate::ddl::local(&app.lake, &name) {
+        Some(local) => app.lake.cat.get::<Task>(&task_key(&local)).await?,
+        None => None,
+    };
+    if let Some(task) = task {
+        params = values(app, &task, params).await;
+    }
+    Ok(Outcome::Done(crate::write::on_node_as(app, asked(params), None, who.files).await?))
 }
 
 /// Leader: claim a tick now for `EXECUTE TASK` (the scheduler runs it, and what follows it).
@@ -559,7 +603,7 @@ pub async fn execute_task(lake: &Lake, name: &str, params: HashMap<String, serde
         bail!("task {name} is running (run task-{name}-{}): EXECUTE TASK once it ends", t.at);
     }
     let at = now_ms().max(last.map_or(0, |t| t.at + 1));
-    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, ..Default::default() }))], &[]).await?;
+    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, asked: true, ..Default::default() }))], &[]).await?;
     WAKE.notify_one();
     Ok(serde_json::json!({"task": name, "run": format!("task-{name}-{at}")}))
 }
@@ -680,7 +724,7 @@ pub fn schedule(app: App) {
                 if running.lock().unwrap().contains(name) {
                     continue; // (a tick still running: the next waits for it)
                 }
-                let tick = match due(&app.lake, name, task).await {
+                let tick = match due(&app, name, task).await {
                     Ok(Some(t)) => t,
                     Ok(None) => continue,
                     Err(e) => {
@@ -777,7 +821,7 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     };
     let error = out.as_ref().err().map(|e| format!("{e:#}"));
     let _ = tokio::time::timeout(Duration::from_secs(60), run.ended(app, status, error, heard)).await; // (in the log before the tick is done)
-    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params });
+    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params, asked: tick.asked });
     if let Err(e) = app.lake.cat.commit(vec![(tick_key(name), done)], &[]).await {
         eprintln!("task {name}: tick {} ran, and couldn't be marked done ({e:#}): a new leader runs it again, with the same job", tick.at);
     }
@@ -805,20 +849,23 @@ async fn results(lake: &Lake, sql: &str, at: u64) -> String {
 /// The tick to run now, claimed (committed before it runs), if one is due: one claimed and not
 /// finished (a leader died in it, or `EXECUTE TASK` claimed it); for a scheduled task, the latest
 /// that has come since the last; for one that follows others, the latest run of their graph that
-/// every one of them ended well in, and it hasn't run in.
-async fn due(lake: &Lake, name: &str, task: &Task) -> Result<Option<Tick>> {
+/// every one of them ended well in, and it hasn't run in. A suspended task runs only in a run that
+/// `EXECUTE TASK` asked for.
+async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
+    let lake = &app.lake;
     let last = lake.cat.get::<Tick>(&tick_key(name)).await?;
     if let Some(t) = last.as_ref().filter(|t| !t.done) {
         return Ok(Some(t.clone())); // (again, with its job: what it wrote lands once)
     }
-    if task.suspended {
-        return Ok(None);
-    }
     let tick = match task.after.is_empty() {
         true => {
+            if task.suspended {
+                return Ok(None);
+            }
             let after = last.as_ref().map_or(task.created_ms, |t| t.at.max(task.created_ms));
             let Some(at) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
-            Tick { at, ..Default::default() }
+            let params = tokio::time::timeout(Duration::from_secs(30), values(app, task, HashMap::new())).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
+            Tick { at, params, ..Default::default() }
         }
         false => {
             let mut before: Option<Tick> = None;
@@ -830,7 +877,10 @@ async fn due(lake: &Lake, name: &str, task: &Task) -> Result<Option<Tick>> {
                 }
             }
             let Some(b) = before.filter(|b| b.at > task.created_ms && last.as_ref().is_none_or(|l| l.at < b.at)) else { return Ok(None) };
-            Tick { at: b.at, params: b.params, ..Default::default() }
+            if task.suspended && !b.asked {
+                return Ok(None);
+            }
+            Tick { at: b.at, params: b.params, asked: b.asked, ..Default::default() }
         }
     };
     lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
@@ -1117,6 +1167,10 @@ mod tests {
         assert_eq!((o.retries, o.retry_delay, o.timeout, o.on_failure.as_deref()), (2, Some(60), Some(90), Some("notify")));
         assert!(opts("(tries = 2)").unwrap_err().to_string().contains("retries, retry_delay"));
         assert!(opts("(timeout = 'cron 0 2 * * *')").unwrap_err().to_string().contains("how long"));
+        // (the options a branch or a pipeline would need, kept free: refused until they are built)
+        for k in ["run_as = admin", "overlap = skip", "every = '1 hour'", "late_after = '1 hour'", "on_late = notify", "packages = 'pandas'"] {
+            assert!(opts(&format!("({k})")).unwrap_err().to_string().contains("retries, retry_delay"), "{k}");
+        }
     }
 
     #[test]
@@ -1133,5 +1187,8 @@ mod tests {
         let leap = every("cron 0 0 29 2 *").unwrap(); // (from 2097: 2100 is no leap year, so 2104)
         assert_eq!(next_after(&leap, 4_013_000_000_000), 4_233_686_400_000);
         assert_eq!(latest(&never, 0, 4_000_000_000_000), None);
+        // (the schedule text refuses what it doesn't know: room for event triggers, kept free)
+        assert!(every("on files drop/").is_err());
+        assert!(every("on change raw.orders").is_err());
     }
 }

@@ -20643,8 +20643,9 @@ def tasks():
     graph, with `EXECUTE TASK`'s values (`$day`) and the results before them (`pondra.result`), sent
     from a follower; WHEN false skips a task and what follows it still runs; retries with the same
     job (what a try wrote lands once), refused while a run is under way; a timeout, on_failure and
-    nothing after a failure; ALTER TASK SUSPEND and RESUME; refusals (a loop, two schedules, a
-    missing task, DROP of a followed one, a schedule too long to count or that never comes); a graph through a leader failover, each write once."""
+    nothing after a failure; ALTER TASK SUSPEND and RESUME; a run's values worked out once at its claim (a scheduled
+    run's, and a retry's); EXECUTE TASK runs a suspended follower too, a scheduled run doesn't; refusals (a loop, two
+    schedules, a missing task, DROP of a followed one, a schedule too long to count or that never comes); a graph through a leader failover, each write once."""
     lake = new_lake()
     py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")
     nodes = [Node(lake, A.port + i, python=sys.executable, env={"PYTHONPATH": py}).start() for i in range(3)]
@@ -20764,6 +20765,62 @@ console.log("done"); await db.close();"""
     checks["from the clients: Python's db.task, @db.task and execute_task(…).wait(); JavaScript's task, executeTask and wait"] = (
         got["clients"]["python"] == '"ok"' and got["clients"]["js"] == "done"
         and got["clients"]["rows"] == [{"who": "js", "day": "2026-09-03"}, {"who": "js after", "day": "2026-09-03"}, {"who": "python"}, {"who": "sql", "day": "2026-09-02"}])
+    # F1: a run's values are worked out once, when its tick is claimed. Two followers of a first task that holds
+    # 1.5 s: one doesn't declare $t, the other declares it with the same default. Each gets the first task's $t,
+    # and runs a second or more after it.
+    q("CREATE TABLE f1 (task VARCHAR, t DOUBLE, seen DOUBLE)")
+    q("CREATE TASK f1first SCHEDULE '5 seconds' AS BEGIN DECLARE PARAMETER $t DOUBLE = date_part('epoch', now()); "
+      "INSERT INTO f1 VALUES ('first', $t, date_part('epoch', now())); WHILE date_part('epoch', now()) < $t + 1.5 DO $i = 1; END WHILE; END")
+    q("CREATE TASK tn AFTER f1first AS INSERT INTO f1 VALUES ('tn', $t, date_part('epoch', now()))")
+    q("CREATE TASK td AFTER f1first AS BEGIN DECLARE PARAMETER $t DOUBLE = date_part('epoch', now()); "
+      "INSERT INTO f1 VALUES ('td', $t, date_part('epoch', now())); END")
+    until(lambda: q("SELECT count(*) AS n FROM f1 WHERE task IN ('tn', 'td')")[0]["n"] >= 2, True, 30)
+    until(lambda: status("tn"), "ok", 30)
+    until(lambda: status("td"), "ok", 30)
+    q("ALTER TASK f1first SUSPEND")
+    f1_rows = q("SELECT task, t, seen FROM f1 ORDER BY task")
+    firsts = [r["t"] for r in f1_rows if r["task"] == "first"]
+    followers = [r for r in f1_rows if r["task"] in ("tn", "td")]
+    got["values"] = f1_rows
+    checks["a scheduled run's values are worked out once, at its claim: a follower with no $t of its own, and one that declares it, get the first task's, and run a second or more later"] = (
+        {r["task"] for r in followers} == {"tn", "td"} and status("tn") == "ok" and status("td") == "ok"
+        and all(r["t"] in firsts and r["seen"] - r["t"] >= 1.0 for r in followers))
+    # F1: a retry, and EXECUTE TASK with no values: the follower's $t is the first task's, in every try.
+    q("CREATE TASK rfirst SCHEDULE '1 hour' AS BEGIN DECLARE PARAMETER $t DOUBLE = date_part('epoch', now()); PRINT $t; END")
+    ready = time.time() + 2.5
+    q(f"CREATE TASK rnext AFTER rfirst WITH (retries = 3, retry_delay = '1 second') AS BEGIN DECLARE PARAMETER $t DOUBLE = date_part('epoch', now()); "
+      f"PRINT $t; IF date_part('epoch', now()) < {ready} THEN RAISE 'not yet'; END IF; END")
+    q("EXECUTE TASK rfirst")
+    until(lambda: status("rnext"), "ok", 30)
+    notes = {r["routine"]: r.get("notices") or "" for r in q("SELECT routine, notices FROM pondra.runs WHERE routine IN ('rfirst', 'rnext')")}
+    def printed(text):
+        return [float(l.strip()) for l in text.splitlines() if re.fullmatch(r"[-+]?\d+(\.\d+)?([eE][-+]?\d+)?", l.strip())]
+    first_said, tries_said = printed(notes.get("rfirst", "")), printed(notes.get("rnext", ""))
+    got["retry values"] = {"first": first_said, "tries": tries_said, "notices": notes}
+    checks["a retry, and EXECUTE TASK with no values: every try of the follower sees the first task's $t, as it was claimed"] = (
+        status("rnext") == "ok" and len(first_said) == 1 and len(tries_said) >= 2 and "try 1 failed" in notes.get("rnext", "")
+        and all(v == first_said[0] for v in tries_said))
+    # F2: EXECUTE TASK runs the whole graph, a suspended follower too (as on a branch).
+    q("CREATE TASK sroot SCHEDULE '1 hour' AS SELECT 1")
+    q("CREATE TASK snext AFTER sroot AS INSERT INTO glog VALUES ('snext', 0, NULL)")
+    q("ALTER TASK snext SUSPEND")
+    q("EXECUTE TASK sroot")
+    until(lambda: status("snext"), "ok", 30)
+    # A scheduled run doesn't run a suspended follower. s1 is made suspended and s2 after it, suspended, and s1 is
+    # resumed last: no tick of s1 comes before s2 is suspended.
+    q("CREATE TABLE sbeat (task VARCHAR)")
+    q("CREATE TASK s1 SCHEDULE '1 second' AS INSERT INTO sbeat VALUES ('s1')")
+    q("ALTER TASK s1 SUSPEND")
+    q("CREATE TASK s2 AFTER s1 AS INSERT INTO sbeat VALUES ('s2')")
+    q("ALTER TASK s2 SUSPEND")
+    q("ALTER TASK s1 RESUME")
+    until(lambda: q("SELECT count(*) AS n FROM sbeat WHERE task = 's1'")[0]["n"] >= 3, True, 30)
+    got["suspended follower"] = {"snext": q("SELECT count(*) AS n FROM glog WHERE task = 'snext'")[0]["n"],
+                                 "s2 runs": q("SELECT count(*) AS n FROM sbeat WHERE task = 's2'")[0]["n"], "s2 status": status("s2")}
+    q("ALTER TASK s1 SUSPEND")
+    checks["EXECUTE TASK runs its whole graph, a suspended follower too (once); a scheduled run doesn't run a suspended follower"] = (
+        status("snext") == "ok" and got["suspended follower"]["snext"] == 1 and got["suspended follower"]["s2 runs"] == 0
+        and got["suspended follower"]["s2 status"] is None)
     # Refusals.
     got["refused"] = refused = {
         "itself": err("CREATE TASK me AFTER me AS SELECT 1"),
