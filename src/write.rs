@@ -2269,7 +2269,7 @@ fn summary(flush: bool, v: Value) -> Result<Value> {
 
 /// Was this writer fenced out of the catalog by a newer one? (`pondra sql`'s guest asks it of an answer's words too.)
 pub(crate) fn fenced(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<slatedb::Error>().is_some_and(|e| matches!(e.kind(), slatedb::ErrorKind::Closed(_))) || format!("{e:#}").contains("newer DB client")
+    e.downcast_ref::<crate::kv::Error>().is_some_and(|e| e.closed()) || format!("{e:#}").contains("newer DB client")
 }
 
 /// How many times this command has already started over (it runs itself again, keeping its job).
