@@ -5,7 +5,9 @@
 //! `count(DISTINCT …)`, `string_agg`, `array_agg`, …), windows that all partition by columns the
 //! view selects (each key's rows come from that key's source rows alone: the latest bid of each
 //! bidder, the top ten of each auction), over one table or tables joined on those columns (each
-//! auction's winning bid), or one asked to be (`refresh = 'by key'`). After commits the leader
+//! auction's winning bid), or one asked to be (`refresh = 'by key'`). Windows and `GROUP BY`s may be
+//! stacked over one table (a `MATCH_RECOGNIZE`'s stack, with projections, filters and unnests between)
+//! when every node keeps a key's rows apart. After commits the leader
 //! finds the keys that the new, changed and deleted rows of what it reads touch, works out those
 //! keys again as of then, and puts their rows in place of the view's old ones, which go to
 //! `{view}$deleted` as a change's do (ADR-020).
@@ -26,8 +28,8 @@ use crate::views::View;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{ArrayRef, RecordBatch, UInt32Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, ScalarValue, TableReference};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, Transformed};
+use datafusion::common::{Column, DFSchema, ScalarValue, TableReference};
 use datafusion::logical_expr::{Aggregate, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Volatility};
 use datafusion::prelude::{cast, ident, lit, DataFrame, SessionContext};
 use serde::{Deserialize, Serialize};
@@ -81,32 +83,32 @@ pub fn producer(view: &str) -> String { format!("rerun:{view}") }
 /// The table the touched groups' keys are read from, as `__k0`, `__k1`, ….
 const TOUCHED: &str = "__touched";
 
-/// What a view needs to be kept by key: a `GROUP BY` of one table of this lake read alone (no other
-/// table, no subquery), every `GROUP BY` expression one of its columns, only `HAVING` above it, and
-/// nothing that answers otherwise as time passes. Its key columns, or why not (a clause that reads
+/// What a view needs to be kept by key: a stack of windows and `GROUP BY`s over one table of this lake
+/// read alone (the module doc's rule: each node keeps a key's rows apart, and nothing in it answers
+/// otherwise as time passes). Its key columns by the view's names, or why not (a clause that reads
 /// after "can't be kept by key: ").
 pub fn keys(plan: &LogicalPlan) -> Result<Vec<String>> {
-    if let Some(w) = window(plan) {
-        return window_keys(plan, w);
+    if joined_windows(plan).is_some() {
+        return window_keys(plan);
     }
-    let across = "ORDER BY, LIMIT, DISTINCT or a window over its groups looks across groups";
-    ensure!(matches!(plan, LogicalPlan::Projection(_)), across);
-    let agg = aggregate(plan).context(across)?;
-    ensure!(!agg.group_expr.is_empty() && !agg.group_expr.iter().any(|e| matches!(e, Expr::GroupingSet(_))), "it has no GROUP BY, or GROUPING SETS, ROLLUP or CUBE");
-    ensure!(crate::views::alone(&agg.input, false), "it reads more than one table, or a subquery");
-    let keys = selected(plan, agg).context("a GROUP BY expression isn't selected, so a row doesn't say which group it is")?;
+    let top = peeled(plan);
+    let k = keyed(plan)?;
+    let names = k.by.iter().map(|key| {
+        (0..top.schema().fields().len()).find(|&j| to_base(top, &column_at(top.schema(), j)).as_ref() == Some(key)).map(|j| top.schema().field(j).name().clone())
+    });
+    let why = if k.grouped { "a GROUP BY expression isn't selected, so a row doesn't say which group it is" } else { "a column its windows partition by isn't selected as it is, so a row doesn't say which window it is in" };
+    let names = names.collect::<Option<Vec<_>>>().context(why)?;
     if let Some(f) = changing(plan) {
         bail!("{f}() answers otherwise as time passes");
     }
-    Ok(keys)
+    Ok(names)
 }
 
-/// What a view of windows needs to be kept by key: one table of this lake read alone under them,
-/// or tables joined on them (`joined`), columns every window partitions by (each window's
-/// partition then lies within one key's rows), each selected as it is (so a row says which key it
-/// is), and nothing that answers otherwise as time passes. Those columns, by the view's names, in
-/// the first window's order.
-fn window_keys(plan: &LogicalPlan, w: &LogicalPlan) -> Result<Vec<String>> {
+/// What a view of windows over tables joined on their keys needs to be kept by key (`joined`): each
+/// table read alone under them, and each column the windows partition by selected as it is (so a row
+/// says which key it is). Those columns, by the view's names, in the first window's order.
+fn window_keys(plan: &LogicalPlan) -> Result<Vec<String>> {
+    let w = window(plan).context("a window over all its rows, or windows that share no PARTITION BY column, look across every row")?;
     let (by, input) = partitioned(w).context("a window over all its rows, or windows that share no PARTITION BY column, look across every row")?;
     let mut scans = 0;
     plan.apply_with_subqueries(|n| {
@@ -114,10 +116,11 @@ fn window_keys(plan: &LogicalPlan, w: &LogicalPlan) -> Result<Vec<String>> {
         Ok(TreeNodeRecursion::Continue)
     })?;
     let tables = joined(input, &by).map_or(1, |t| t.len());
-    ensure!(scans == tables && (tables > 1 || crate::views::alone(input, false)), "its windows read a GROUP BY, a subquery, a keyed table or an outer join, or tables not joined on every column they partition by");
+    ensure!(scans == tables, "its windows read a GROUP BY, a subquery, a keyed table or an outer join, or tables not joined on every column they partition by");
+    let top = peeled(plan);
     let names = by.iter().map(|c| {
         let i = input.schema().index_of_column(c).ok()?; // (a window keeps its input's columns first, at their places)
-        (0..plan.schema().fields().len()).find(|&j| traced(plan, j) == Some(i)).map(|j| plan.schema().field(j).name().clone())
+        (0..top.schema().fields().len()).find(|&j| traced(top, j) == Some(i)).map(|j| top.schema().field(j).name().clone())
     });
     let names = names.collect::<Option<Vec<_>>>().context("a column its windows partition by isn't selected as it is, so a row doesn't say which window it is in")?;
     if let Some(f) = changing(plan) {
@@ -126,8 +129,30 @@ fn window_keys(plan: &LogicalPlan, w: &LogicalPlan) -> Result<Vec<String>> {
     Ok(names)
 }
 
+/// The tables of a view of windows over tables joined on their keys (`joined`), when it is one: its
+/// own path (`window_keys`, `restrict_joined`, the joins `touched` reads).
+fn joined_windows(plan: &LogicalPlan) -> Option<Vec<(LogicalPlan, Vec<Column>)>> {
+    window(plan).and_then(partitioned).and_then(|(by, input)| joined(input, &by))
+}
+
+/// The plan under a top ORDER BY with no LIMIT: rows are a set, so the order doesn't change what a
+/// key's rows are.
+fn peeled(plan: &LogicalPlan) -> &LogicalPlan {
+    match plan {
+        LogicalPlan::Sort(s) if s.fetch.is_none() => peeled(&s.input),
+        _ => plan,
+    }
+}
+
+/// Whether an expression reads rows other than its own node's: a subquery, or an outer reference
+/// into one. A node with such an expression isn't key-local.
+fn reads_other_rows(e: &Expr) -> bool {
+    e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_) | Expr::OuterReferenceColumn(_, _)))).unwrap_or(true)
+}
+
 /// The view's windows, under its projections, filters and aliases.
 fn window(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    let plan = peeled(plan);
     match plan {
         LogicalPlan::Window(_) => Some(plan),
         LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => window(plan.inputs()[0]),
@@ -161,7 +186,7 @@ fn partitioned(plan: &LogicalPlan) -> Option<(Vec<Column>, &LogicalPlan)> {
 /// other way (one table, an outer join, a projection, a subquery, a keyed table's query).
 fn joined(input: &LogicalPlan, by: &[Column]) -> Option<Vec<(LogicalPlan, Vec<Column>)>> {
     fn equal(e: &Expr, pairs: &mut Vec<(Column, Column)>) -> Option<()> {
-        if e.exists(|e| Ok(matches!(e, Expr::ScalarSubquery(_) | Expr::Exists(_) | Expr::InSubquery(_)))).unwrap_or(true) {
+        if reads_other_rows(e) {
             return None;
         }
         for c in datafusion::logical_expr::utils::split_conjunction(e) {
@@ -257,14 +282,135 @@ fn traced(plan: &LogicalPlan, i: usize) -> Option<usize> {
     }
 }
 
-/// What a view kept by key works out a key at a time: its `GROUP BY` over the rows it groups, or
-/// the columns its windows partition by over the rows under them.
-fn grouping(plan: &LogicalPlan) -> Option<(Vec<Expr>, &LogicalPlan)> {
+/// The stack a view kept by key works out a key at a time over: its key nodes (windows and `GROUP BY`s,
+/// top down), the table's scan under them (`base`), and the keys `by`: each key node's keys over the
+/// table that every key node has too, in the lowest node's order. `grouped`: a `GROUP BY` is a node.
+struct Keyed {
+    base: LogicalPlan,
+    by: Vec<Expr>,
+    grouped: bool,
+}
+
+/// The keys of `plan`'s stack (its top past an ORDER BY with no LIMIT), over one table: `Keyed`, or why
+/// it isn't key-local.
+fn keyed(plan: &LogicalPlan) -> Result<Keyed> {
+    let top = peeled(plan);
+    let mut nodes = vec![];
+    let base = stacked(top, &mut nodes)?.clone();
+    ensure!(!nodes.is_empty(), "ORDER BY, LIMIT, DISTINCT or a window over its groups looks across groups");
+    let grouped = nodes.iter().any(|n| matches!(n, LogicalPlan::Aggregate(_)));
+    let lists: Vec<Vec<Expr>> = nodes.iter().map(|n| node_keys(n)).collect();
+    let (lowest, above) = lists.split_last().context("a key node")?;
+    let mut by: Vec<Expr> = vec![];
+    for k in lowest {
+        if !by.contains(k) && above.iter().all(|l| l.contains(k)) {
+            by.push(k.clone());
+        }
+    }
+    let why = if grouped { "its GROUP BYs and windows share no column of the table, so a key's rows don't come from its own rows alone" } else { "a window over all its rows, or windows that share no PARTITION BY column, look across every row" };
+    ensure!(!by.is_empty(), "{why}");
+    Ok(Keyed { base, by, grouped })
+}
+
+/// A stack from its top down to its table, which it returns: each node key-local (a projection, filter,
+/// alias, unnest, window or GROUP BY, with no expression that reads other rows), with the key nodes
+/// pushed to `nodes`, top down. A LIMIT, a DISTINCT or a join looks across keys.
+fn stacked<'a>(plan: &'a LogicalPlan, nodes: &mut Vec<&'a LogicalPlan>) -> Result<&'a LogicalPlan> {
+    ensure!(!plan.expressions().iter().any(reads_other_rows), "a subquery or an outer reference reads other rows than a key's");
     match plan {
-        LogicalPlan::Aggregate(a) => Some((a.group_expr.clone(), &a.input)),
-        LogicalPlan::Window(_) => partitioned(plan).map(|(by, input)| (by.into_iter().map(Expr::Column).collect(), input)),
-        LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => grouping(plan.inputs()[0]),
+        LogicalPlan::TableScan(_) => Ok(plan),
+        LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) | LogicalPlan::Unnest(_) => stacked(plan.inputs()[0], nodes),
+        LogicalPlan::Window(w) => {
+            nodes.push(plan);
+            stacked(&w.input, nodes)
+        }
+        LogicalPlan::Aggregate(a) => {
+            ensure!(!a.group_expr.is_empty() && !a.group_expr.iter().any(|e| matches!(e, Expr::GroupingSet(_))), "it has no GROUP BY, or GROUPING SETS, ROLLUP or CUBE");
+            nodes.push(plan);
+            stacked(&a.input, nodes)
+        }
+        LogicalPlan::Limit(_) => bail!("a LIMIT looks across every key"),
+        LogicalPlan::Sort(s) if s.fetch.is_some() => bail!("a LIMIT looks across every key"),
+        LogicalPlan::Sort(_) => bail!("an ORDER BY under the view's top looks across its rows"),
+        LogicalPlan::Distinct(_) => bail!("DISTINCT looks across its rows"),
+        LogicalPlan::Join(_) => bail!("it reads more than one table"),
+        _ => bail!("it reads its rows another way than a key's own"),
+    }
+}
+
+/// The keys one key node has over the table: a window's partition columns that every one of its
+/// functions partitions by, or a `GROUP BY`'s expressions. Those that trace to the table only.
+fn node_keys(n: &LogicalPlan) -> Vec<Expr> {
+    match n {
+        LogicalPlan::Window(w) => {
+            let mut shared: Option<Vec<Column>> = None;
+            for e in &w.window_expr {
+                let cols: Vec<Column> = match e.clone().unalias_nested().data {
+                    Expr::WindowFunction(f) => f.params.partition_by.iter().filter_map(|p| match p {
+                        Expr::Column(c) => Some(c.clone()),
+                        _ => None,
+                    }).collect(),
+                    _ => vec![],
+                };
+                shared = Some(match shared {
+                    None => cols,
+                    Some(s) => s.into_iter().filter(|c| cols.contains(c)).collect(),
+                });
+            }
+            shared.unwrap_or_default().into_iter().filter_map(|c| to_base(&w.input, &Expr::Column(c))).collect()
+        }
+        LogicalPlan::Aggregate(a) => a.group_expr.iter().filter_map(|g| to_base(&a.input, &g.clone().unalias_nested().data)).collect(),
+        _ => vec![],
+    }
+}
+
+/// `e`, an expression over `p`'s output, as one over the table's columns: through the nodes under `p`.
+/// None where a column isn't carried unchanged from the table (a window's or GROUP BY's result, an
+/// unnested column, a join's column).
+fn to_base(p: &LogicalPlan, e: &Expr) -> Option<Expr> {
+    match p {
+        LogicalPlan::TableScan(_) => Some(e.clone()),
+        LogicalPlan::Filter(f) => to_base(&f.input, e),
+        LogicalPlan::Projection(pr) => subst(e, p.schema(), &|j: usize| to_base(&pr.input, &pr.expr.get(j)?.clone().unalias_nested().data)),
+        LogicalPlan::SubqueryAlias(s) => subst(e, p.schema(), &|j: usize| to_base(&s.input, &column_at(s.input.schema(), j))),
+        LogicalPlan::Window(w) => subst(e, p.schema(), &|j: usize| if j < w.input.schema().fields().len() { to_base(&w.input, &column_at(w.input.schema(), j)) } else { None }),
+        LogicalPlan::Aggregate(a) => subst(e, p.schema(), &|j: usize| to_base(&a.input, &a.group_expr.get(j)?.clone().unalias_nested().data)),
+        LogicalPlan::Unnest(u) => subst(e, p.schema(), &|j: usize| {
+            let d = *u.dependency_indices.get(j)?;
+            let unnested = u.list_type_columns.iter().any(|(i, _)| *i == d) || u.struct_type_columns.contains(&d) || u.exec_columns.iter().any(|c| u.input.schema().index_of_column(c).ok() == Some(d));
+            if unnested { None } else { to_base(&u.input, &column_at(u.input.schema(), d)) }
+        }),
         _ => None,
+    }
+}
+
+/// `e` with each column of `schema` replaced by what `f` gives its place; None if one has nothing.
+fn subst(e: &Expr, schema: &DFSchema, f: &dyn Fn(usize) -> Option<Expr>) -> Option<Expr> {
+    let mut whole = true;
+    let out = e.clone().transform_up(|x| {
+        if let Expr::Column(c) = &x {
+            match schema.index_of_column(c).ok().and_then(|j| f(j)) {
+                Some(r) => return Ok(Transformed::yes(r)),
+                None => whole = false,
+            }
+        }
+        Ok(Transformed::no(x))
+    });
+    let out = out.ok()?;
+    whole.then_some(out.data)
+}
+
+/// Column `j` of `schema`, as an expression.
+fn column_at(schema: &DFSchema, j: usize) -> Expr {
+    let (q, f) = schema.qualified_field(j);
+    Expr::Column(Column::new(q.cloned(), f.name()))
+}
+
+/// `plan` with its table's scan replaced by `f` of it, the nodes over it as they are.
+fn cut_scan(plan: &LogicalPlan, f: &dyn Fn(&LogicalPlan) -> Result<LogicalPlan>) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::TableScan(_) => f(plan),
+        _ => Ok(plan.with_new_exprs(plan.expressions(), vec![cut_scan(plan.inputs()[0], f)?])?),
     }
 }
 
@@ -435,7 +581,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
 /// The tables of this lake a view kept by key joins under its windows (on their keys), its source
 /// among them, each one whose changes it can follow by key; or why not. None when it joins none.
 pub async fn joins(lake: &Lake, plan: &LogicalPlan, sql: &str, source: &str) -> Result<Vec<String>> {
-    let Some(tables) = window(plan).and_then(partitioned).and_then(|(by, input)| joined(input, &by)) else { return Ok(vec![]) };
+    let Some(tables) = joined_windows(plan) else { return Ok(vec![]) };
     let (here, elsewhere) = reads(lake, sql, source).await?;
     let mut joins: Vec<String> = vec![];
     for (t, _) in &tables {
@@ -823,9 +969,10 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     ctx.deregister_table(table_ref(&v.source))?;
     ctx.register_table(table_ref(&v.source), changed(lake, &v.source, done, now).await?.into_view())?;
     let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
-    let (by, input) = grouping(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
-    let keys: Vec<Expr> = by.iter().enumerate().map(|(i, g)| g.clone().unalias().alias(format!("__k{i}"))).collect();
-    let p = LogicalPlanBuilder::from(input.clone()).project(keys)?.distinct()?.build()?;
+    // (the keys of the changed rows themselves, with no filter of the view's: a superset of the touched keys)
+    let k = keyed(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
+    let keys: Vec<Expr> = k.by.iter().enumerate().map(|(i, g)| g.clone().alias(format!("__k{i}"))).collect();
+    let p = LogicalPlanBuilder::from(k.base).project(keys)?.distinct()?.build()?;
     Ok(ctx.execute_logical_plan(p).await?.collect().await?)
 }
 
@@ -894,17 +1041,27 @@ async fn worked_out(lake: &Lake, v: &View, now: u64, touched: Option<&Touched>) 
     Ok(ctx.execute_logical_plan(plan).await?.collect().await?)
 }
 
-/// `plan` with its `GROUP BY` or its windows reading only the touched keys' rows: a semi join on
-/// its keys (`IS NOT DISTINCT FROM`: a NULL key is a group too). A window sees every row of each
-/// partition it keeps, so each comes out as it would over every row.
+/// `plan` with its table's scan read at the touched keys' rows only: a semi join on the keys
+/// (`IS NOT DISTINCT FROM`: a NULL key is a group too), directly over the scan under every node. Each
+/// node then sees a touched key's rows whole, so each comes out as it would over every row.
 fn restrict(plan: &LogicalPlan, touched: &Touched) -> Result<LogicalPlan> {
+    let plan = peeled(plan); // (rows are a set: the order is left out)
+    if joined_windows(plan).is_some() {
+        return restrict_joined(plan, touched);
+    }
+    let k = keyed(plan).context("a view kept by key is a GROUP BY or windows within keys")?;
+    cut_scan(plan, &|scan: &LogicalPlan| semi(scan, &k.by, touched))
+}
+
+/// `restrict` for windows over tables joined on their keys: each table under the join cut to the
+/// touched keys (`within`).
+fn restrict_joined(plan: &LogicalPlan, touched: &Touched) -> Result<LogicalPlan> {
     Ok(match plan {
-        LogicalPlan::Aggregate(a) => LogicalPlan::Aggregate(Aggregate::try_new(Arc::new(semi(&a.input, &a.group_expr, touched)?), a.group_expr.clone(), a.aggr_expr.clone())?),
         LogicalPlan::Window(_) => {
-            let (by, _) = grouping(plan).context("windows kept by key share a PARTITION BY column")?;
-            within(plan, &by, touched)?
+            let (by, _) = partitioned(plan).context("windows kept by key share a PARTITION BY column")?;
+            within(plan, &by.into_iter().map(Expr::Column).collect::<Vec<_>>(), touched)?
         }
-        LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => plan.with_new_exprs(plan.expressions(), vec![restrict(plan.inputs()[0], touched)?])?,
+        LogicalPlan::Projection(_) | LogicalPlan::Filter(_) | LogicalPlan::SubqueryAlias(_) => plan.with_new_exprs(plan.expressions(), vec![restrict_joined(plan.inputs()[0], touched)?])?,
         _ => bail!("a view kept by key is a GROUP BY or windows within keys"),
     })
 }
@@ -1116,5 +1273,84 @@ mod tests {
         assert_eq!(text(&gone), ["2,b,20,200,1", "3,c,30,300,1", "5,p,50,500,1", "NULL,n,60,600,1"]);
         assert_eq!(names(&put), ["k", "v", ROW_ID, CREATED]);
         assert_eq!(text(&put), ["4,d,NULL,NULL", "2,x,NULL,NULL", "5,r,NULL,NULL", "5,r,NULL,NULL", "NULL,m,NULL,NULL"]);
+    }
+
+    /// `sql`'s plan as a view's query is planned (a MATCH_RECOGNIZE rewritten first), over `ticker` (symbol,
+    /// day, price) and `other` (symbol), both empty, with the pattern functions registered.
+    async fn planned(sql: &str) -> Result<LogicalPlan> {
+        let ctx = SessionContext::new();
+        crate::matcher::register(&ctx);
+        let ticker = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Utf8, true), Field::new("day", DataType::Int64, true), Field::new("price", DataType::Int64, true)]));
+        let other = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Utf8, true)]));
+        for (name, schema) in [("ticker", ticker), ("other", other)] {
+            let table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![RecordBatch::new_empty(schema)]])?;
+            ctx.register_table(name, Arc::new(table))?;
+        }
+        Ok(ctx.sql(&crate::pattern::rewritten(sql)?).await?.into_unoptimized_plan())
+    }
+
+    #[tokio::test]
+    async fn keys_of_a_match_recognize_are_its_partition() {
+        for rows in ["ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW", "ONE ROW PER MATCH AFTER MATCH SKIP TO NEXT ROW", "ALL ROWS PER MATCH AFTER MATCH SKIP PAST LAST ROW", "ALL ROWS PER MATCH AFTER MATCH SKIP TO NEXT ROW"] {
+            let sql = format!("SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day {rows} PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m");
+            assert_eq!(keys(&planned(&sql).await.unwrap()).unwrap(), ["symbol"], "{rows}");
+        }
+    }
+
+    #[tokio::test]
+    async fn keys_of_nested_windows_are_their_partition() {
+        let plan = planned("SELECT symbol, day, rank() OVER (PARTITION BY symbol ORDER BY day) AS r FROM (SELECT *, sum(price) OVER (PARTITION BY symbol) AS total FROM ticker) AS s").await.unwrap();
+        assert_eq!(keys(&plan).unwrap(), ["symbol"]);
+    }
+
+    #[tokio::test]
+    async fn keys_of_windows_with_a_projection_between_are_their_partition() {
+        let plan = planned("SELECT symbol, day, r, sum(price) OVER (PARTITION BY symbol) AS total FROM (SELECT symbol, day, price, rank() OVER (PARTITION BY symbol ORDER BY day) AS r FROM ticker) AS w").await.unwrap();
+        assert_eq!(keys(&plan).unwrap(), ["symbol"]);
+    }
+
+    #[tokio::test]
+    async fn keys_of_a_group_by_are_its_groups_as_before() {
+        let plan = planned("SELECT symbol, count(*) AS n FROM ticker GROUP BY symbol").await.unwrap();
+        assert_eq!(keys(&plan).unwrap(), ["symbol"]);
+        let plan = planned("SELECT day % 2 AS parity, symbol, count(*) AS n FROM ticker GROUP BY symbol, day % 2").await.unwrap();
+        assert_eq!(keys(&plan).unwrap(), ["symbol", "parity"]);
+        let plan = planned("SELECT symbol, count(*) AS n FROM ticker GROUP BY symbol, day").await.unwrap();
+        assert!(keys(&plan).unwrap_err().to_string().contains("isn't selected"));
+    }
+
+    #[tokio::test]
+    async fn a_window_over_a_group_by_that_doesnt_hold_its_key_is_refused() {
+        let plan = planned("SELECT symbol, n, rank() OVER (PARTITION BY day ORDER BY n) AS r FROM (SELECT symbol, max(day) AS day, count(*) AS n FROM ticker GROUP BY symbol) AS g").await.unwrap();
+        let err = keys(&plan).expect_err("a refusal");
+        assert!(err.to_string().contains("share no column of the table"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_subquery_in_a_filter_is_refused() {
+        for sql in [
+            "SELECT symbol, count(*) AS n FROM ticker WHERE symbol IN (SELECT symbol FROM other) GROUP BY symbol",
+            "SELECT symbol, day, rank() OVER (PARTITION BY symbol ORDER BY day) AS r FROM ticker WHERE symbol IN (SELECT symbol FROM other)",
+        ] {
+            let err = keys(&planned(sql).await.unwrap()).expect_err(sql);
+            assert!(err.to_string().contains("subquery"), "{sql}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_limit_is_refused() {
+        for sql in [
+            "SELECT symbol, count(*) AS n FROM ticker GROUP BY symbol LIMIT 5",
+            "SELECT symbol, day, rank() OVER (PARTITION BY symbol ORDER BY day) AS r FROM (SELECT * FROM ticker LIMIT 10) AS l",
+        ] {
+            let err = keys(&planned(sql).await.unwrap()).expect_err(sql);
+            assert!(err.to_string().contains("a LIMIT looks across every key"), "{sql}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_top_order_by_is_not_a_limit() {
+        let plan = planned("SELECT symbol, count(*) AS n FROM ticker GROUP BY symbol ORDER BY symbol").await.unwrap();
+        assert_eq!(keys(&plan).unwrap(), ["symbol"]);
     }
 }
