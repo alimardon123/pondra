@@ -530,42 +530,11 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
-/// The nodes' key in hand before this node calls its leader for a caller (`write::on_node_as`): a
-/// follower that just started may sign a user in, its catalog holding the users, a moment before the
-/// loop that reads the key (`cli.rs`) has it, and a call sent without it is refused as unsigned (CI's
-/// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
-/// key sealed by a master key this node doesn't have: waiting won't help that one.
-pub async fn signed(lake: &crate::store::Lake) {
-    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key().is_some() {
-        return;
-    }
-    for _ in 0..40 {
-        match crate::users::node_key(lake).await {
-            Ok(k) => return set_node_key(k),
-            Err(e) if format!("{e:#}").contains("master key") => return,
-            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
 /// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
 pub fn http_bare() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
 }
-
-// The lake's key for its nodes (`users::node_key`), once this node knows it: what it calls the others
-// with when no token is set. The node's, not the process's environment: the next node in a process
-// serves another lake, whose nodes are never sent this one's key, and no child process inherits it.
-crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
-
-/// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
-pub fn node_key() -> Option<String> {
-    crate::env::get("PONDRA_NODE_KEY").or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
-}
-
-/// This node learned the lake's key for its nodes (`node.rs`).
-pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
 /// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
@@ -575,7 +544,7 @@ pub fn http() -> reqwest::Client {
     crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
     // (a variable set empty is no token, as `env::get` takes it: compose passes an unset one on empty,
     // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
-    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(node_key);
+    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(crate::dial::node_key);
     let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
@@ -593,6 +562,55 @@ pub fn http() -> reqwest::Client {
     };
     *client = Some((token, made.clone()));
     made
+}
+
+/// The node's dial: HTTP between nodes, with this process's token (`http()`).
+pub struct Http;
+
+impl crate::dial::Dial for Http {
+    fn url(&self, to: &str) -> String {
+        if to.contains("://") { to.to_string() } else { crate::tls::url(to) }
+    }
+
+    fn call<'a>(&'a self, to: &'a str, c: crate::dial::Call) -> futures::future::BoxFuture<'a, anyhow::Result<crate::dial::Reply>> {
+        Box::pin(send_call(crate::dial::Dial::url(self, to), c))
+    }
+
+    fn unreached(&self, e: &anyhow::Error) -> bool {
+        e.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout())
+    }
+}
+
+/// One call over `http()`: the request as the node's own calls have always sent it, and the answer as a `Reply`.
+async fn send_call(url: String, c: crate::dial::Call) -> anyhow::Result<crate::dial::Reply> {
+    use crate::dial::{Reply, Verb};
+    let verb = match c.verb {
+        Verb::Get => reqwest::Method::GET,
+        Verb::Post => reqwest::Method::POST,
+        Verb::Delete => reqwest::Method::DELETE,
+    };
+    let mut req = http().request(verb, format!("{url}{}", c.path));
+    if c.json {
+        req = req.header("content-type", "application/json");
+    }
+    if let Some(body) = c.body {
+        req = req.body(body);
+    }
+    if let Some(d) = c.timeout {
+        req = req.timeout(d);
+    }
+    if let Some(k) = c.bearer {
+        req = req.bearer_auth(k);
+    }
+    if let Some(user) = c.user {
+        req = req.header(crate::auth::AS_USER, user);
+    }
+    let res = req.send().await?;
+    let status = res.status().as_u16();
+    let sqlstate = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let failed = res.error_for_status_ref().err().map(anyhow::Error::from);
+    let body = futures::TryStreamExt::map_err(res.bytes_stream(), anyhow::Error::from);
+    Ok(Reply::new(status, sqlstate, failed, futures::StreamExt::boxed(body)))
 }
 
 /// Is this node coming back to its own term `t` after its own restart (an exec, Windows' new process,

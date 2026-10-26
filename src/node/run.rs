@@ -314,9 +314,9 @@ impl Node {
         if let (true, Some(own)) = (leader, &replica) {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
-            if cluster::node_key().is_none() {
+            if crate::dial::node_key().is_none() {
                 if let Some(k) = users::node_key_made(&lake).await {
-                    cluster::set_node_key(k);
+                    crate::dial::set_node_key(k);
                 }
             }
             replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
@@ -413,7 +413,7 @@ impl Node {
                 for _ in 0..600 {
                     match users::node_key(&l).await {
                         Ok(k) => {
-                            cluster::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                            crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
                             return;
                         }
                         Err(e) if !said && format!("{e:#}").contains("master key") => {
@@ -548,7 +548,7 @@ impl Node {
             }
             if streamed {
                 if !lives {
-                    cluster::signed(&lake).await; // (a guest's calls to its leader are signed with the nodes' key, which it waits for, 10 s at most)
+                    crate::dial::signed(&lake).await; // (a guest's calls to its leader are signed with the nodes' key, which it waits for, 10 s at most)
                 }
                 cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
             }

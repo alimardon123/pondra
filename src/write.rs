@@ -1669,7 +1669,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let target = other.clone().unwrap_or_else(|| lake.arc());
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
         let Some(o) = other else {
-            crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
+            crate::dial::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
             return post_as(&app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
         let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false).await?;
@@ -2008,12 +2008,12 @@ pub(crate) async fn through_bucket_statement(lake: &Arc<Lake>, stmt: Stmt) -> Re
 
 /// One request of a statement, sent as `through_bucket_statement` describes: to the lake it writes (an attached lake's leader,
 /// if the name is one), under this process's job, so a retry of it is answered as a duplicate. The node key set is the target
-/// lake's (each lake has its own), before its leader is called (`cluster::signed`: a key set already is kept).
+/// lake's (each lake has its own), before its leader is called (`dial::signed`: a key set already is kept).
 async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
     let job = job().to_string();
-    crate::cluster::signed(&target).await;
+    crate::dial::signed(&target).await;
     match prepare(lake, &target, &table, &stmt, &job, true).await? {
         Some(req) => deliver(&target.url, Some(req), &job, true).await,
         None => Ok(j!({"duplicate": true})), // (a retry: the write it asks is recorded already)
