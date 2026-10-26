@@ -18,6 +18,7 @@
 //!   has no file to look at: it rings the inbox's bell, which a claimer answers with a mark within
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`). A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
+use crate::members::Members;
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
@@ -31,7 +32,6 @@ use std::time::{Duration, Instant};
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
 const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
-pub const CUT_OFF_SAYS: &str = "this node leads but can't reach the bucket: another node will lead in a moment, ask it";
 
 pub struct Cluster {
     pub addr: String, // a node is known by its address
@@ -41,7 +41,6 @@ pub struct Cluster {
     view: Mutex<Vec<String>>,                // follower: live nodes, as told by the leader
     last_ok: Mutex<Instant>,                 // follower: last heartbeat the leader answered
     heard: std::sync::atomic::AtomicBool,    // follower: the leader has answered us at least once
-    pub shard_runs: std::sync::atomic::AtomicU64, // task shards this node has run (for /stats)
     cut_off: std::sync::atomic::AtomicBool,       // leader: it can't reach the bucket (`keep_alive`)
     others: std::sync::atomic::AtomicBool,        // leader cut off: another node was there meanwhile
     may_lead: bool, // false: our store is another node's (pondra://), which leads: we never claim a term (`served.rs`)
@@ -165,25 +164,6 @@ impl Cluster {
         }
     }
 
-    pub fn is_leader(&self) -> bool { !self.reader && self.leader.addr == self.addr }
-
-    /// Live members, sorted: shard `s` of a task runs on `nodes[s % nodes.len()]`.
-    pub fn nodes(&self) -> Vec<String> {
-        if !self.is_leader() {
-            return if self.leader_ok() { self.view.lock().unwrap().clone() } else { vec![] }; // cut off: run no shards
-        }
-        let beats = self.beats.lock().unwrap();
-        let mut nodes: Vec<String> = beats.iter().filter(|(_, (t, ..))| t.elapsed() < LEASE).map(|(a, _)| a.clone()).collect();
-        nodes.push(self.addr.clone());
-        nodes.sort();
-        nodes
-    }
-
-    pub fn runs_shard(&self, shard: u32) -> bool {
-        let nodes = self.nodes();
-        nodes.iter().position(|n| *n == self.addr).is_some_and(|p| shard as usize % nodes.len() == p)
-    }
-
     /// Leader side of a heartbeat: our term and the live members, or nothing while this leader
     /// can't reach the bucket (the follower takes over: `follow`). (`said`: the follower's release
     /// and format, `format::said`; the answer keeps its shape, which every release reads.)
@@ -203,25 +183,11 @@ impl Cluster {
         out
     }
 
-    /// Leader: the newest format every live follower knows (None: no followers).
-    pub fn least_known(&self) -> Option<u32> { self.beats.lock().unwrap().values().filter(|(t, ..)| t.elapsed() < LEASE).map(|(_, _, f)| *f).min() }
-
     /// Has this node heard from the leader within the lease? Peers ask before taking over.
     pub fn leader_ok(&self) -> bool { self.is_leader() || self.last_ok.lock().unwrap().elapsed() < LEASE }
 
     /// What peers asking `/cluster/leader` get: our leader's term, and whether we still hear it.
     pub fn leader_status(&self) -> (u64, bool) { (self.leader.n, self.leader_ok() && !self.unreached()) }
-
-    /// Leader: has it gone `CUT_OFF` without reaching the bucket, with another node there to take
-    /// over, now or at any time since? It turns requests away then. (One that took over beats to
-    /// its own term, so after a lease this one would look alone, and held every write sent to it
-    /// until its client gave up.) A leader alone all along serves what it can, as it always did:
-    /// nobody else can lead, and its writes wait for the bucket.
-    pub fn cut_off(&self) -> bool {
-        // (a holder never steps aside: it is the store's only copy, and nobody else could lead; a store it
-        // can't reach is for the holder to fix, while its followers wait)
-        !self.serves_store && self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1)
-    }
 
     fn unreached(&self) -> bool { self.cut_off.load(std::sync::atomic::Ordering::Relaxed) }
 
@@ -394,6 +360,44 @@ impl Cluster {
     }
 }
 
+impl Members for Cluster {
+    fn me(&self) -> &str { &self.addr }
+    fn leader(&self) -> &Term { &self.leader }
+    fn reader(&self) -> bool { self.reader }
+
+    /// Live members, sorted: shard `s` of a task runs on `nodes[s % nodes.len()]`.
+    fn nodes(&self) -> Vec<String> {
+        if !self.is_leader() {
+            return if self.leader_ok() { self.view.lock().unwrap().clone() } else { vec![] }; // cut off: run no shards
+        }
+        let beats = self.beats.lock().unwrap();
+        let mut nodes: Vec<String> = beats.iter().filter(|(_, (t, ..))| t.elapsed() < LEASE).map(|(a, _)| a.clone()).collect();
+        nodes.push(self.addr.clone());
+        nodes.sort();
+        nodes
+    }
+
+    /// Leader: has it gone `CUT_OFF` without reaching the bucket, with another node there to take
+    /// over, now or at any time since? It turns requests away then. (One that took over beats to
+    /// its own term, so after a lease this one would look alone, and held every write sent to it
+    /// until its client gave up.) A leader alone all along serves what it can, as it always did:
+    /// nobody else can lead, and its writes wait for the bucket.
+    fn cut_off(&self) -> bool {
+        // (a holder never steps aside: it is the store's only copy, and nobody else could lead; a store it
+        // can't reach is for the holder to fix, while its followers wait)
+        !self.serves_store && self.unreached() && (self.others.load(std::sync::atomic::Ordering::Relaxed) || self.nodes().len() > 1)
+    }
+
+    /// Leader: the newest format every live follower knows (None: no followers).
+    fn least_known(&self) -> Option<u32> { self.beats.lock().unwrap().values().filter(|(t, ..)| t.elapsed() < LEASE).map(|(_, _, f)| *f).min() }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
+/// The node's own cluster, when `app` is a node's: a door that needs what only a node has (beats, releases, the
+/// leader's status) asks here, and answers 404 when there is none.
+pub fn of(app: &crate::app::App) -> Option<&Cluster> { app.members.as_any().downcast_ref::<Cluster>() }
+
 /// Does term `t`'s leader answer from here, as its leader?
 async fn answers(t: &Term) -> bool {
     let r = http().get(crate::tls::url(&format!("{}/cluster/leader", t.addr))).timeout(Duration::from_secs(2)).send().await;
@@ -409,8 +413,8 @@ fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bo
     // (a node that never leads gets no startup grace: a holder that changed under its name shows at
     // its first answer, not 30 s later, so the restart check in `follow` can fire)
     let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
-    let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0) })
+    let (beats, heard) = (Default::default(), Default::default());
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0) })
 }
 
 /// A node that just started under a leader, reading the commit stream (its view reads no WAL):
@@ -526,42 +530,11 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
-/// The nodes' key in hand before this node calls its leader for a caller (`write::on_node_as`): a
-/// follower that just started may sign a user in, its catalog holding the users, a moment before the
-/// loop that reads the key (`cli.rs`) has it, and a call sent without it is refused as unsigned (CI's
-/// `harness.py guarded`, "a change a follower forwards…"). It waits 10 s at most, and not at all for a
-/// key sealed by a master key this node doesn't have: waiting won't help that one.
-pub async fn signed(lake: &crate::store::Lake) {
-    if crate::env::is_set("PONDRA_TOKEN") || crate::env::is_set("PONDRA_ADMIN_TOKEN") || node_key().is_some() {
-        return;
-    }
-    for _ in 0..40 {
-        match crate::users::node_key(lake).await {
-            Ok(k) => return set_node_key(k),
-            Err(e) if format!("{e:#}").contains("master key") => return,
-            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
 /// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
 pub fn http_bare() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
 }
-
-// The lake's key for its nodes (`users::node_key`), once this node knows it: what it calls the others
-// with when no token is set. The node's, not the process's environment: the next node in a process
-// serves another lake, whose nodes are never sent this one's key, and no child process inherits it.
-crate::per_node!(static NODE_KEY: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None));
-
-/// The key this node calls the others with: `PONDRA_NODE_KEY` as set, else the lake's own, once known.
-pub fn node_key() -> Option<String> {
-    crate::env::get("PONDRA_NODE_KEY").or_else(|| NODE_KEY.read().unwrap_or_else(|e| e.into_inner()).clone())
-}
-
-/// This node learned the lake's key for its nodes (`node.rs`).
-pub fn set_node_key(k: String) { *NODE_KEY.write().unwrap_or_else(|e| e.into_inner()) = Some(k); }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
 /// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
@@ -571,7 +544,7 @@ pub fn http() -> reqwest::Client {
     crate::per_node!(static MINE: std::sync::Mutex<Option<(Option<String>, reqwest::Client)>> = std::sync::Mutex::new(None));
     // (a variable set empty is no token, as `env::get` takes it: compose passes an unset one on empty,
     // and "Bearer " sent in place of the nodes' key left a follower unable to reach its leader)
-    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(node_key);
+    let token = crate::env::get("PONDRA_TOKEN").or_else(|| crate::env::get("PONDRA_ADMIN_TOKEN")).or_else(crate::dial::node_key);
     let mut client = MINE.lock().unwrap();
     if let Some((t, c)) = client.as_ref().filter(|(t, _)| *t == token) {
         let _ = t;
@@ -589,6 +562,55 @@ pub fn http() -> reqwest::Client {
     };
     *client = Some((token, made.clone()));
     made
+}
+
+/// The node's dial: HTTP between nodes, with this process's token (`http()`).
+pub struct Http;
+
+impl crate::dial::Dial for Http {
+    fn url(&self, to: &str) -> String {
+        if to.contains("://") { to.to_string() } else { crate::tls::url(to) }
+    }
+
+    fn call<'a>(&'a self, to: &'a str, c: crate::dial::Call) -> futures::future::BoxFuture<'a, anyhow::Result<crate::dial::Reply>> {
+        Box::pin(send_call(crate::dial::Dial::url(self, to), c))
+    }
+
+    fn unreached(&self, e: &anyhow::Error) -> bool {
+        e.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout())
+    }
+}
+
+/// One call over `http()`: the request as the node's own calls have always sent it, and the answer as a `Reply`.
+async fn send_call(url: String, c: crate::dial::Call) -> anyhow::Result<crate::dial::Reply> {
+    use crate::dial::{Reply, Verb};
+    let verb = match c.verb {
+        Verb::Get => reqwest::Method::GET,
+        Verb::Post => reqwest::Method::POST,
+        Verb::Delete => reqwest::Method::DELETE,
+    };
+    let mut req = http().request(verb, format!("{url}{}", c.path));
+    if c.json {
+        req = req.header("content-type", "application/json");
+    }
+    if let Some(body) = c.body {
+        req = req.body(body);
+    }
+    if let Some(d) = c.timeout {
+        req = req.timeout(d);
+    }
+    if let Some(k) = c.bearer {
+        req = req.bearer_auth(k);
+    }
+    if let Some(user) = c.user {
+        req = req.header(crate::auth::AS_USER, user);
+    }
+    let res = req.send().await?;
+    let status = res.status().as_u16();
+    let sqlstate = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let failed = res.error_for_status_ref().err().map(anyhow::Error::from);
+    let body = futures::TryStreamExt::map_err(res.bytes_stream(), anyhow::Error::from);
+    Ok(Reply::new(status, sqlstate, failed, futures::StreamExt::boxed(body)))
 }
 
 /// Is this node coming back to its own term `t` after its own restart (an exec, Windows' new process,
@@ -627,15 +649,5 @@ fn relock(t: &Term) {
             });
         }
         Err(_) => {} // the mark still covers it
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cut_off_is_cannot_connect_now() {
-        assert_eq!(crate::codes::of(&anyhow::anyhow!("{}", CUT_OFF_SAYS)), "57P03");
     }
 }

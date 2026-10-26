@@ -1,6 +1,6 @@
 //! Feeds (ADR-026): a materialized view over another Kafka cluster's topic
 //! (`CREATE MATERIALIZED VIEW orders_in AS SELECT … FROM k.orders`) is kept up to date as records
-//! arrive. Each partition of the topic is a shard, run on one live node (`Cluster::runs_shard`):
+//! arrive. Each partition of the topic is a shard, run on one live node (`Members::runs_shard`):
 //! it fetches the records after the offset its view has, runs the view's query over them (it
 //! may join the lake's tables), and appends the rows with the offset it read up to as its
 //! producer's seq (`feed:{view}:{partition}`), the offset it started from as `prev`. The rows and
@@ -80,7 +80,7 @@ pub fn start(app: App) {
                     }
                 };
                 for p in parts {
-                    if app.cluster.runs_shard(p as u32) {
+                    if app.members.runs_shard(p as u32) {
                         wanted.insert((view.clone(), p));
                     }
                 }

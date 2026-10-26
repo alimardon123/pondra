@@ -10,8 +10,8 @@
 //!
 //! Distributed state: `shards` splits a task by the hash of `shard_by`; shard `s` runs on the
 //! `s % n`-th live node and only ever touches its own keys, so shards never conflict.
-use crate::cluster::Cluster;
 use crate::log::{Log, Src};
+use crate::members::Members;
 use crate::query::{over, session, tail};
 use crate::answer::schema;
 use crate::store::*;
@@ -47,14 +47,18 @@ pub fn producers(name: &str, task: &Task) -> Vec<String> {
     }
 }
 
+crate::per_node!(
+    /// The task shards this node has run, for `/stats`.
+    pub(crate) static SHARD_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
+
 /// Run this node's shards of every task over whatever arrived since each shard's last run.
-pub async fn run_all(lake: &Lake, cluster: &Cluster, log: &Log) -> Result<()> {
+pub async fn run_all(lake: &Lake, members: &dyn Members, log: &Log) -> Result<()> {
     let hwm = lake.visible(); // not the watch: what this node's reads actually include
     let mut runs = vec![];
     for (key, task) in lake.cat.scan::<Task>("k/", "k0").await? {
         for (s, producer) in producers(&key[2..], &task).into_iter().enumerate() {
             let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-            if hwm <= done || !cluster.runs_shard(s as u32) {
+            if hwm <= done || !members.runs_shard(s as u32) {
                 continue;
             }
             let rows = tail(lake, &task.source, done, Some(hwm), false).await?;
@@ -62,7 +66,7 @@ pub async fn run_all(lake: &Lake, cluster: &Cluster, log: &Log) -> Result<()> {
                 continue; // nothing new for this task: no run, no commit
             }
             let batch = crate::query::cast_as(&run(lake, &task, s as u32, rows).await?, &target_schema(lake, &task).await?)?;
-            cluster.shard_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SHARD_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let src = Src { producer, seq: hwm, prev: Some(done) }; // output + progress, if progress is still `done`
             runs.push(log.append(task.target.clone(), src, batch));
         }

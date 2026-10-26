@@ -2,6 +2,7 @@
 //! and the requests its router answers. Declared by `node.rs` under feature `doors`, as the doors' own code is.
 use crate::*;
 use super::{say, set_guest, Guest};
+use crate::members::Members;
 use std::{future::Future, sync::{Arc, OnceLock}, time::Duration};
 
 /// What a node is started with: `pondra serve`'s options for one lake, worked out (cli.rs).
@@ -313,9 +314,9 @@ impl Node {
         if let (true, Some(own)) = (leader, &replica) {
             // (the members are asked with the nodes' key: one that just restarted holds an
             // unsigned call until it has caught up, and it catches up from this leader)
-            if cluster::node_key().is_none() {
+            if crate::dial::node_key().is_none() {
                 if let Some(k) = users::node_key_made(&lake).await {
-                    cluster::set_node_key(k);
+                    crate::dial::set_node_key(k);
                 }
             }
             replica::recover(&lake, &addr, cluster.leader.n, Some(own)).await?;
@@ -335,7 +336,7 @@ impl Node {
         let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to)));
         tr("the sequencer");
         python::init(python);
-        let app = app::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+        let app = app::App { lake: lake.clone(), members: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
         crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
         learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
         // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
@@ -358,7 +359,7 @@ impl Node {
             }
         }
         if leader && lives {
-            let (l, c, tokens) = (app.lake.clone(), app.cluster.clone(), app.auth.on()); // (beside serving, not before it: C5)
+            let (l, c, tokens) = (app.lake.clone(), app.members.clone(), app.auth.on()); // (beside serving, not before it: C5)
             panics::spawn(async move {
                 let made = users::kept(&l).await == "none";
                 match users::make_keys(&l).await {
@@ -394,7 +395,7 @@ impl Node {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             });
-            let (l, c) = (app.lake.clone(), app.cluster.clone());
+            let (l, c) = (app.lake.clone(), app.members.clone());
             panics::spawn(async move {
                 // (a branch's pins in bases on other servers, renewed while it is used here: `branch::lapse`)
                 while c.is_leader() {
@@ -412,7 +413,7 @@ impl Node {
                 for _ in 0..600 {
                     match users::node_key(&l).await {
                         Ok(k) => {
-                            cluster::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                            crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
                             return;
                         }
                         Err(e) if !said && format!("{e:#}").contains("master key") => {
@@ -547,7 +548,7 @@ impl Node {
             }
             if streamed {
                 if !lives {
-                    cluster::signed(&lake).await; // (a guest's calls to its leader are signed with the nodes' key, which it waits for, 10 s at most)
+                    crate::dial::signed(&lake).await; // (a guest's calls to its leader are signed with the nodes' key, which it waits for, 10 s at most)
                 }
                 cluster::catch_up(lake.clone(), store.clone(), cluster.leader.clone()); // (answers wait until this node holds what the leader had; a view that replays the WAL has it)
             }

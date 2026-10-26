@@ -674,7 +674,7 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     let finished = node.finish().await; // (before anything prints: a guest that led waits for what it wrote to be durable)
     let (ok, heard, sqlstate, body) = answer?;
     if !ok {
-        let err = write::refusal(sqlstate.as_ref(), body);
+        let err = write::refusal(sqlstate.as_ref().and_then(|v| v.to_str().ok()), body);
         // (fenced out by a newer writer: run again with this job, so whoever records it records it once, as `write::deliver` does)
         if write::fenced(&err) && write::tries() < 5 {
             if let Err(e) = finished {

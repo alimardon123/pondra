@@ -7,7 +7,6 @@
 //! * The sequencer (the leader): skips retried batches (each producer's last seq: exactly-once),
 //!   numbers every flush as a log segment and commits them all, with the producers' seqs, in ONE
 //!   catalog write. Producers are acked only after that.
-use crate::cluster::http;
 use crate::rules::Shaped;
 use crate::store::*;
 use anyhow::{anyhow, Result};
@@ -212,7 +211,7 @@ impl To {
     async fn outcome(&self, f: Flush) -> Result<Outcome> {
         Ok(match self {
             To::Local(seq) => seq.submit(f).await?,
-            To::Leader(addr) => http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send().await?.error_for_status()?.json().await?,
+            To::Leader(addr) => crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?)).await?.checked()?.json().await?,
         })
     }
 }
@@ -367,14 +366,14 @@ async fn send(lake: &Lake, to: &To, mut pending: Vec<Append>, mut turn: Option<o
                     anyhow::Ok(outcome)
                 }
                 To::Leader(addr) => {
-                    let request = http().post(crate::tls::url(&format!("{addr}/cluster/commit"))).body(encode_flush(&f)?).send();
+                    let request = crate::dial::call(addr, crate::dial::Call::post("/cluster/commit", encode_flush(&f)?));
                     drop(done.take()); // (sent in order; over HTTP they may still arrive out of order, rarely)
                     unanswered = true;
                     let response = request.await?;
                     // (a 4xx is the leader's refusal, made before its sequencer took the flush; a 5xx, or a body lost on the
                     // way, may come after it did, so the rows may still commit: lost, as a dropped reply is here)
-                    unanswered = !response.status().is_client_error();
-                    let outcome = response.error_for_status()?.json().await?;
+                    unanswered = !(400..500).contains(&response.status);
+                    let outcome = response.checked()?.json().await?;
                     unanswered = false;
                     Ok(outcome)
                 }

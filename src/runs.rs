@@ -102,7 +102,7 @@ impl Run {
     /// A call whose arguments are said as they are: a DO block's `{"language": …, "code": …}`.
     pub fn begin(app: &App, routine: &str, role: Role, job: Option<&str>, args: String, id: Option<String>) -> Run {
         let caller = CALLER.try_with(|c| c.clone()).unwrap_or_else(|_| format!("{role:?}").to_lowercase());
-        let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.cluster.addr.clone(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
+        let line = Line { id: id.unwrap_or_else(new_id), routine: routine.into(), caller, node: app.members.me().to_string(), job: job.map(String::from), args: cut(args), started: now_ms(), ended: None, status: "running", notices: None, error: None };
         log(app, line.clone(), None);
         Run(Some((app.clone(), line)))
     }
@@ -270,7 +270,7 @@ pub fn mark_stopped(app: App) {
         if crate::backup::frozen(&app.lake) {
             return; // (a backup runs nothing, and writes no run log: ADR-070)
         }
-        if let Err(e) = stopped(&app, since, Some(&app.cluster.addr)).await {
+        if let Err(e) = stopped(&app, since, Some(app.members.me())).await {
             eprintln!("runs whose node stopped: {e:#}");
         }
         // (`left`: nodes gone, and since when; each is asked about once it's been gone a minute, and
@@ -278,11 +278,11 @@ pub fn mark_stopped(app: App) {
         let (mut led, mut seen, mut left) = (false, HashSet::new(), HashMap::<String, u64>::new());
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            if !app.cluster.is_leader() {
+            if !app.members.is_leader() {
                 (led, seen, left) = (false, HashSet::new(), HashMap::new());
                 continue;
             }
-            let live: HashSet<String> = app.cluster.nodes().into_iter().collect();
+            let live: HashSet<String> = app.members.nodes().into_iter().collect();
             for n in seen.difference(&live) {
                 left.entry(n.clone()).or_insert_with(now_ms);
             }
@@ -320,7 +320,7 @@ async fn stopped(app: &App, since: u64, whose: Option<&str>) -> Result<HashSet<S
     if app.log.is_none() {
         return Ok(newer); // (a read-only node writes nothing)
     }
-    let live = app.cluster.nodes();
+    let live = app.members.nodes();
     let only = whose.map(|n| format!(" AND node = '{}'", n.replace('\'', "''"))).unwrap_or_default();
     let batches = app.query(&format!("SELECT id, routine, caller, node, job, args, started FROM pondra.runs WHERE status = 'running'{only}"), None).await?;
     for b in &batches {
@@ -330,7 +330,7 @@ async fn stopped(app: &App, since: u64, whose: Option<&str>) -> Result<HashSet<S
         let started = b.column(6).as_primitive::<TimestampMicrosecondType>();
         for r in 0..b.num_rows() {
             let (at, by) = ((started.value(r) / 1000) as u64, node.value(r));
-            let gone = match by == app.cluster.addr {
+            let gone = match by == app.members.me() {
                 true => at < since, // (this address's, from before this node started)
                 false if live.iter().any(|n| n == by) => false,
                 false => {

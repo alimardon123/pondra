@@ -231,7 +231,12 @@ async fn backup(lake: &Lake, lock: &tokio::sync::Mutex<()>, database: Option<&st
 /// lake's next leader to fence.
 async fn take_here(to: &str, t: Take) -> Result<Value> {
     let store = crate::store::open_store(to)?.1;
-    let term = one_off_term(&store, to).await?;
+    // (a term none holds, or that another one-off writer holds: waited for; a node serving the backup refuses)
+    let term = crate::terms::claim_one_off(&store, |t| {
+        ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
+        Ok(())
+    })
+    .await?;
     let marks = Marks(crate::panics::task({
         let (store, n) = (store.clone(), term.n);
         async move {
@@ -274,24 +279,6 @@ impl Drop for Marks {
 async fn take_led(lake: &Lake, t: Take, term: u64) -> Result<Value> {
     crate::replica::recover(lake, "", term, None).await?;
     take(lake, t).await
-}
-
-/// The term a one-off writer claims for the backup at `to` (`write::deliver`'s loop): one that is none's, or
-/// that another one-off writer holds, which is waited for. A node serving the backup can't be asked here.
-async fn one_off_term(store: &Store, to: &str) -> Result<crate::terms::Term> {
-    loop {
-        match crate::terms::latest(store).await? {
-            Some(t) if crate::terms::alive(store, &t).await => {
-                ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            t => {
-                if let Some(term) = crate::terms::claim(store, t.map_or(1, |t| t.n + 1), "").await? {
-                    return Ok(term);
-                }
-            }
-        }
-    }
 }
 
 /// `RESTORE DATABASE name FROM 'url' [AT (TIMESTAMP => …)]` and `pondra restore`: a new lake at
