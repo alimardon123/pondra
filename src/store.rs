@@ -1163,6 +1163,9 @@ impl ObjectStore for ReadOnly {
 pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     let ctx = crate::engine::session(config, rt);
     crate::ai::register(&ctx); // ai_complete, ai_embed, cosine_similarity, …
+    // (the matcher again: its DEFINE glue is planned against the session as `register` sees it, which `engine::session`
+    // took before these functions existed, so a DEFINE could not call cosine_similarity)
+    crate::matcher::register(&ctx);
     crate::panics::test_function(&ctx); // pondra_panic(), for the tests only
     ctx
 }

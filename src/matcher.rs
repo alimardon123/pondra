@@ -22,7 +22,9 @@ use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
 use datafusion::logical_expr::simplify::SimplifyContext;
 use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
-use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, PartitionEvaluator, Projection, Signature, Volatility, WindowUDF, WindowUDFImpl};
+use datafusion::logical_expr::expr::WindowFunction;
+use datafusion::logical_expr::function::WindowFunctionSimplification;
+use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, PartitionEvaluator, Projection, Signature, Volatility, WindowFunctionDefinition, WindowUDF, WindowUDFImpl};
 use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_expr::PhysicalExpr;
@@ -33,11 +35,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::atomic::{self, AtomicBool};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// The most partial matches a search holds at once when a DEFINE reads the match so far (the ADR's number): past it the
 /// query is refused (54000). A test may use a smaller cap, through `Part`.
 const STATE_CAP: usize = 100_000;
+
+/// The most entries each of the planner's caches holds (the plans, and the glue by spec and types). A full cache is emptied
+/// before an insert, so a node that sees more specs than this starts again rather than grow.
+const CACHE_CAP: usize = 1_024;
 
 /// The spec `pattern.rs` writes: the pattern's text (`read` reads it and names its symbols), the skip rule, and the
 /// DEFINEs that read the match so far, with the columns their glue reads (`rows`: the row-only parts; `values`: the values
@@ -475,7 +482,8 @@ struct Planned {
 }
 
 /// One partition as the search reads it: each symbol's row-only conditions, WITHIN's times, the glue's row-only columns and
-/// value columns, the planned glue (when a DEFINE reads the match), and the cap on the partial matches a search holds.
+/// value columns, the planned glue (when a DEFINE reads the match), the cap on the partial matches a search holds, and the
+/// statement's stop flag when one is bound (`Matcher::stop`).
 struct Part<'a> {
     cond: &'a [Vec<bool>],
     within: Option<&'a Within>,
@@ -484,6 +492,7 @@ struct Part<'a> {
     values: &'a [ArrayRef],
     planned: Option<&'a Planned>,
     cap: usize,
+    stop: Option<&'a AtomicBool>,
 }
 
 /// A thread that took row `i`, waiting for its glue (`check`: the glue's index and its place in that glue's batch) when it
@@ -617,6 +626,9 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
     let mut gen = *last + 1;
     let mut i = from;
     loop {
+        if is_stopped(part) {
+            return Err(stopped());
+        }
         // (a new thread starts at this row last in line, so it is the least preferred)
         if best.is_none() && i < n {
             let mut seen = Seen::of(w, stated, stamp, gen, &mut now_reached);
@@ -719,6 +731,12 @@ fn cap_error(stated: bool, within: bool, cap: usize) -> anyhow::Error {
     coded("54000", msg)
 }
 
+/// Whether the statement a search runs for has been stopped (a timeout or a cancel set its flag). Read once per row.
+fn is_stopped(part: &Part) -> bool { part.stop.is_some_and(|s| s.load(atomic::Ordering::Relaxed)) }
+
+/// The refusal of a search its statement stopped: 57014, as a statement's own stop says it.
+fn stopped() -> anyhow::Error { coded("57014", "canceling statement: its MATCH_RECOGNIZE search was stopped") }
+
 /// The glue's answer for each thread of its batch at row `i` (NULL is false): the row-only columns of row `i`, broadcast, and
 /// each slot's value in each thread's state, as the glue's columns.
 fn check(part: &Part, plan: &Plan, glued: &Glued, types: &[Typed], states: &[&State], i: usize, m: i64) -> Result<Vec<bool>> {
@@ -747,6 +765,9 @@ fn partition(plan: &Plan, part: &Part) -> Result<Vec<Vec<Mem>>> {
     let (mut from, mut m) = (0usize, 0i64);
     let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
     while from < n {
+        if is_stopped(part) {
+            return Err(stopped());
+        }
         // (MATCH_NUMBER is the matches so far, plus one: the one this search finds)
         let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1)? else { break };
         m += 1;
@@ -1067,9 +1088,11 @@ struct Evaluator {
     planner: Arc<Planner>,
     /// The spec's text, and its plan, once read.
     text: String,
-    plan: Option<Plan>,
+    plan: Option<Arc<Plan>>,
     /// The spec's glue, planned against the input types, when a DEFINE reads the match.
     planned: Option<Arc<Planned>>,
+    /// The statement's stop flag, when one is bound.
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl PartitionEvaluator for Evaluator {
@@ -1091,7 +1114,7 @@ impl Evaluator {
         }
         if self.plan.is_none() {
             let text = spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?;
-            self.plan = Some(compile(&text)?);
+            self.plan = Some(self.planner.plan(&text)?);
             self.text = text;
         }
         let plan = self.plan.as_ref().context("MATCH_RECOGNIZE: no plan")?;
@@ -1126,15 +1149,19 @@ impl Evaluator {
             values: columns,
             planned: self.planned.as_deref(),
             cap: STATE_CAP,
+            stop: self.stop.as_deref(),
         };
         answer(&partition(plan, &part)?, &plan.syms, self.all, plan.unmatched)
     }
 }
 
-/// Plans the glue of specs against the engine's functions. `base` is the session's snapshot that `register` takes. A plan is
-/// kept per spec text and input types, so the partitions of one query plan once.
+/// Plans the glue of specs against the engine's functions, and keeps each spec's plan. `base` is the session's snapshot that
+/// `register` takes. The plan is kept per spec text, and the glue per spec text and input types, so the partitions of one
+/// query compile and plan once. No lock is held while a spec compiles or plans: two threads may each do the work, and the
+/// one that lands first is kept (`remember`).
 struct Planner {
     base: Arc<SessionState>,
+    plans: Mutex<HashMap<String, Arc<Plan>>>,
     cache: Mutex<HashMap<(String, Vec<DataType>), Arc<Planned>>>,
 }
 
@@ -1145,6 +1172,19 @@ impl std::fmt::Debug for Planner {
 }
 
 impl Planner {
+    fn new(base: Arc<SessionState>) -> Planner {
+        Planner { base, plans: Mutex::new(HashMap::new()), cache: Mutex::new(HashMap::new()) }
+    }
+
+    /// The plan of a spec, compiled once: from the cache when it is there.
+    fn plan(&self, text: &str) -> Result<Arc<Plan>> {
+        if let Some(p) = lock(&self.plans).get(text) {
+            return Ok(p.clone());
+        }
+        let p = Arc::new(compile(text)?);
+        Ok(remember(&self.plans, text.to_string(), p))
+    }
+
     /// The spec's glue planned for these input types (see `plan_glue`), from the cache when it is there.
     fn planned(&self, text: &str, plan: &Plan, types: &[DataType]) -> Result<Arc<Planned>> {
         let key = (text.to_string(), types.to_vec());
@@ -1152,9 +1192,18 @@ impl Planner {
             return Ok(p.clone());
         }
         let p = Arc::new(plan_glue(&self.base, plan, types)?);
-        lock(&self.cache).insert(key, p.clone());
-        Ok(p)
+        Ok(remember(&self.cache, key, p))
     }
+}
+
+/// Puts `value` under `key` in a cache of at most `CACHE_CAP` entries: a full cache is emptied first. Returns the value the
+/// cache keeps, which is the one already there when another thread put one in first.
+fn remember<K: Eq + Hash, V: Clone>(cache: &Mutex<HashMap<K, V>>, key: K, value: V) -> V {
+    let mut map = lock(cache);
+    if map.len() >= CACHE_CAP && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.entry(key).or_insert(value).clone()
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1272,12 +1321,14 @@ fn aggregate_types(base: &SessionState, name: &str, value: &DataType) -> Result<
 }
 
 /// The two window functions: `pondra_match` (a row's first membership) and `pondra_matches` (all of them, for matches
-/// that may share rows). The planner is the session's snapshot; it is not part of a function's identity.
+/// that may share rows). The planner is the session's snapshot, and `stop` the statement's flag once bound (see `simplify`);
+/// neither is part of a function's identity, so the bound and unbound functions are equal.
 #[derive(Debug)]
 struct Matcher {
     all: bool,
     signature: Signature,
     planner: Arc<Planner>,
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl PartialEq for Matcher {
@@ -1305,16 +1356,32 @@ impl WindowUDFImpl for Matcher {
 
     fn signature(&self) -> &Signature { &self.signature }
 
+    /// Binds the statement's stop flag. The optimizer plans a statement in the statement's own task, where `audit::stop` is
+    /// its flag, so the function a statement plans carries it into its search. The bound function has nothing to simplify,
+    /// so the optimizer reaches its fixpoint. Outside a statement nothing changes.
+    fn simplify(&self) -> Option<WindowFunctionSimplification> {
+        if self.stop.is_some() {
+            return None;
+        }
+        let stop = crate::audit::stop()?;
+        let (all, signature, planner) = (self.all, self.signature.clone(), self.planner.clone());
+        Some(Box::new(move |mut wf: WindowFunction, _: &SimplifyContext| -> DfResult<Expr> {
+            let bound = Matcher { all, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
+            wf.fun = WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(bound)));
+            Ok(Expr::WindowFunction(Box::new(wf)))
+        }))
+    }
+
     fn partition_evaluator(&self, args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
         let types: Vec<DataType> = args.input_fields().iter().map(|f| f.data_type().clone()).collect();
-        // (the spec is a literal, as `pattern.rs` writes it: compiled and planned here; another form is read at the first row)
+        // (the spec is a literal, as `pattern.rs` writes it: planned here, from the planner's cache; another form is read at the first row)
         let literal = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
             Some(ScalarValue::Utf8(Some(text))) => Some(text.clone()),
             _ => None,
         };
-        let mut evaluator = Evaluator { all: self.all, planner: self.planner.clone(), text: String::new(), plan: None, planned: None };
+        let mut evaluator = Evaluator { all: self.all, planner: self.planner.clone(), text: String::new(), plan: None, planned: None, stop: self.stop.clone() };
         if let Some(text) = literal {
-            let plan = compile(&text).map_err(external)?;
+            let plan = self.planner.plan(&text).map_err(external)?;
             // (WITHIN's time and interval are checked here, at planning; `run` checks the time too)
             if plan.within {
                 let fields = args.input_fields();
@@ -1347,12 +1414,14 @@ impl WindowUDFImpl for Matcher {
 }
 
 /// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`). A DEFINE's glue is planned
-/// against the session as it stands here, so it sees the functions registered before this call and no later one.
+/// against the session as it stands here, so it sees the functions registered before this call and no later one. The
+/// per-session functions (`files`, `nextval`, `secrets()`) are registered after it, so a DEFINE doesn't see them. The node's
+/// `functions` registers this again after its AI functions, so a DEFINE sees those too.
 pub fn register(ctx: &SessionContext) {
-    let planner = Arc::new(Planner { base: Arc::new(ctx.state()), cache: Mutex::new(HashMap::new()) });
+    let planner = Arc::new(Planner::new(Arc::new(ctx.state())));
     for all in [false, true] {
         let signature = Signature::variadic_any(Volatility::Immutable);
-        ctx.register_udwf(WindowUDF::from(Matcher { all, signature, planner: planner.clone() }));
+        ctx.register_udwf(WindowUDF::from(Matcher { all, signature, planner: planner.clone(), stop: None }));
     }
     ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
 }
@@ -1658,6 +1727,7 @@ impl<'a> Pat<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     /// The rows' conditions: `rows[r]` lists the symbols row r meets.
     fn conds(rows: &[Vec<usize>], syms: usize) -> Vec<Vec<bool>> {
@@ -1668,7 +1738,7 @@ mod tests {
     fn shown(spec: &str, rows: &[Vec<usize>]) -> Result<Vec<String>> {
         let plan = compile(spec)?;
         let cond = conds(rows, plan.syms.len());
-        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP };
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
         Ok(texts(&plan, &partition(&plan, &part)?))
     }
 
@@ -1679,7 +1749,7 @@ mod tests {
         let low = times.iter().map(|t| t.map(|t| t - interval)).collect();
         let w = Within { time: times.to_vec(), low };
         let cond = conds(rows, plan.syms.len());
-        let part = Part { cond: &cond, within: Some(&w), n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP };
+        let part = Part { cond: &cond, within: Some(&w), n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
         texts(&plan, &partition(&plan, &part).unwrap())
     }
 
@@ -1704,6 +1774,8 @@ mod tests {
     }
 
     const PAST: &str = r#"{"to":"past_last"}"#;
+
+    const NEXT: &str = r#"{"to":"next_row"}"#;
 
     fn spec(pattern: &str, skip: &str) -> String {
         format!(r#"{{"pattern":"{pattern}","skip":{skip}}}"#)
@@ -2001,7 +2073,12 @@ mod tests {
     /// as the engine's front writes it (`pattern::rewritten`), and the query runs in a session.
     async fn rows_of(sql: &str) -> Result<Vec<String>> {
         let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
-        let batches = ctx.sql(&crate::pattern::rewritten(sql)?).await?.collect().await?;
+        rows_in(&ctx, &crate::pattern::rewritten(sql)?).await
+    }
+
+    /// The rows of a rewritten query (`pattern::rewritten`) that runs in `ctx`, as `rows_of` gives them.
+    async fn rows_in(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
+        let batches = ctx.sql(sql).await?.collect().await?;
         let mut out = vec![];
         for b in &batches {
             for r in 0..b.num_rows() {
@@ -2174,5 +2251,147 @@ mod tests {
         assert_eq!(plan.defines[0].slots, [0, 1]);
         assert_eq!(plan.slots[0].var(), Some(1));
         assert_eq!(plan.slots[1].value(), Some(0));
+    }
+
+    /// A planner over a session with nothing registered but DataFusion's own functions.
+    fn planner() -> Planner { Planner::new(Arc::new(SessionContext::new().state())) }
+
+    #[test]
+    fn a_search_stops_when_its_statement_flag_is_set() {
+        // a flag set before the search runs stops it at its first row, with 57014; unset, the same search answers
+        let text = spec("a", PAST);
+        let values: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text.as_str()])), Arc::new(BooleanArray::from(vec![true; 3]))];
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut stopped = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop.clone()) };
+        let Err(err) = stopped.run(&values, 3) else { panic!("a stopped search answered") };
+        assert_eq!(crate::codes::of(&err), "57014");
+        assert!(err.to_string().contains("its MATCH_RECOGNIZE search was stopped"), "{err}");
+        stop.store(false, atomic::Ordering::Relaxed);
+        let mut free = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop) };
+        assert!(free.run(&values, 3).is_ok());
+    }
+
+    #[test]
+    fn a_search_stopped_from_another_thread_ends_at_its_next_row() {
+        // (a b* c) with c true on the last row only: the search from each row reads to the partition's end, so the partition
+        // takes about n² / 2 rows. (With c never true there is one linear search, which ends by itself.) The flag set 20 ms
+        // in, from another thread, ends the search at its next row.
+        let n = 4_000;
+        let plan = compile(&spec("a b* c", NEXT)).unwrap();
+        let cond = vec![vec![true; n], vec![true; n], (0..n).map(|i| i + 1 == n).collect::<Vec<bool>>()];
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                let at = Instant::now();
+                stop.store(true, atomic::Ordering::Relaxed);
+                at
+            })
+        };
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: Some(&*stop) };
+        let Err(err) = partition(&plan, &part) else { panic!("a stopped search answered") };
+        let returned = Instant::now();
+        let set_at = setter.join().unwrap();
+        assert_eq!(crate::codes::of(&err), "57014");
+        let latency = returned.duration_since(set_at);
+        // the same search with no flag bound, which runs to its end
+        let free = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let start = Instant::now();
+        let answered = partition(&plan, &free).is_ok();
+        let full = start.elapsed();
+        assert!(answered);
+        assert!(latency < full / 2, "a stopped search ({latency:?}) should end well before the whole one ({full:?})");
+    }
+
+    #[tokio::test]
+    async fn simplify_binds_the_statements_flag_once() {
+        let m = Matcher { all: false, signature: Signature::variadic_any(Volatility::Immutable), planner: Arc::new(planner()), stop: None };
+        assert!(m.simplify().is_none(), "nothing is bound outside a statement");
+        let flag = Arc::new(AtomicBool::new(false));
+        crate::audit::stoppable(flag.clone(), async {
+            let simplify = m.simplify().expect("a statement binds its flag");
+            let unbound = Matcher { all: false, signature: m.signature.clone(), planner: m.planner.clone(), stop: None };
+            let call = WindowFunction::new(WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(unbound))), vec![]);
+            let Expr::WindowFunction(out) = simplify(call, &SimplifyContext::builder().build()).expect("simplified") else {
+                panic!("a window function")
+            };
+            let WindowFunctionDefinition::WindowUDF(bound) = &out.fun else { panic!("a window UDF") };
+            assert!(bound.simplify().is_none(), "the bound function has nothing left to simplify");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_query_whose_flag_is_set_stops_its_search() -> Result<()> {
+        // the flag is bound when the query plans, so the search stops on the flag its statement set, and answers unset
+        let sql = crate::pattern::rewritten(
+            "WITH t(day) AS (VALUES (1), (2), (3)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day MEASURES CLASSIFIER() AS sym \
+             ALL ROWS PER MATCH PATTERN (a+) DEFINE a AS day > 0) ORDER BY day",
+        )?;
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let set = Arc::new(AtomicBool::new(true));
+        let stopped = crate::audit::stoppable(set, async {
+            let df = ctx.sql(&sql).await?;
+            df.collect().await
+        })
+        .await;
+        let Err(err) = stopped else { panic!("a stopped query answered") };
+        assert!(err.to_string().contains("canceling statement: its MATCH_RECOGNIZE search was stopped"), "{err}");
+        let free = crate::audit::stoppable(Arc::new(AtomicBool::new(false)), async {
+            let df = ctx.sql(&sql).await?;
+            df.collect().await
+        })
+        .await?;
+        assert_eq!(free.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn a_spec_is_compiled_once_for_all_its_partitions() {
+        let planner = planner();
+        let text = spec("a b", PAST);
+        let first = planner.plan(&text).unwrap();
+        assert!(Arc::ptr_eq(&first, &planner.plan(&text).unwrap()));
+    }
+
+    #[test]
+    fn the_planner_caches_stay_under_their_cap_and_answer_the_same() {
+        let planner = planner();
+        let text = spec("a b", PAST);
+        let rows = vec![vec![0], vec![0, 1], vec![1]];
+        let before = shown(&text, &rows).unwrap();
+        // (CACHE_CAP + 1 spellings of one spec: the same plan, under a key of its own each)
+        for i in 0..=CACHE_CAP {
+            planner.plan(&format!("{}{}", text, " ".repeat(i))).unwrap();
+        }
+        assert!(lock(&planner.plans).len() <= CACHE_CAP);
+        // (the same for the glue: a DEFINE of row-only columns, spelled CACHE_CAP + 1 ways)
+        let glue = |i: usize| format!(r#"{{"pattern":"a","skip":{},"defines":[{{"symbol":0,"glue":"__mr_r0 > 0{}","slots":[]}}],"rows":1}}"#, PAST, " ".repeat(i));
+        let types = [DataType::Utf8, DataType::Boolean, DataType::Int64];
+        for i in 0..=CACHE_CAP {
+            let t = glue(i);
+            let plan = planner.plan(&t).unwrap();
+            planner.planned(&t, &plan, &types).unwrap();
+        }
+        assert!(lock(&planner.cache).len() <= CACHE_CAP);
+        assert!(lock(&planner.plans).len() <= CACHE_CAP);
+        let plan = planner.plan(&text).unwrap();
+        let cond = conds(&rows, plan.syms.len());
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        assert_eq!(texts(&plan, &partition(&plan, &part).unwrap()), before);
+    }
+
+    #[tokio::test]
+    async fn a_define_sees_the_ai_functions_the_node_registers() -> Result<()> {
+        // `store::functions` registers the matcher again after the AI functions, so the glue plans cosine_similarity
+        let ctx = crate::store::functions(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let sql = crate::pattern::rewritten(
+            "WITH t(day, emb) AS (VALUES (1, [1.0, 0.0]), (2, [0.9, 0.1])) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a b) DEFINE b AS cosine_similarity(b.emb, FIRST(a.emb)) > 0.9) \
+             ORDER BY day",
+        )?;
+        assert_eq!(rows_in(&ctx, &sql).await?, ["1|a", "2|b"]);
+        Ok(())
     }
 }
