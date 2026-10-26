@@ -3512,6 +3512,24 @@ def schemas():
     q("CREATE SCHEMA dbo", 2)
     checks["a schema must exist before its tables; CREATE SCHEMA on a follower"] = "CREATE SCHEMA dbo" in (before or "") and q("CREATE SCHEMA IF NOT EXISTS dbo", 1)["unchanged"] \
         and err("CREATE SCHEMA dbo") is not None and err("DROP SCHEMA public") is not None
+    # pondra is the system's schema: no schema of a user's takes its name, in any case (42939), and its tables still answer
+    # (status, the SQLSTATE in its header, the message as text: the node's own words, not a repr)
+    def answer(s):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse(); body = r.read().decode(errors="replace")
+        return r.status, r.getheader("x-pondra-sqlstate"), body
+    pondra_refused = [answer(s) for s in ("CREATE SCHEMA pondra", "CREATE SCHEMA IF NOT EXISTS Pondra", 'CREATE SCHEMA "PONDRA"')]
+    checks["CREATE SCHEMA pondra, in any case, is refused 42939 (pondra is the system's schema); pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_refused) and isinstance(q("SELECT * FROM pondra.tasks"), list)
+    # a write into a pondra table says the system's words (read-only, 25006 as a backup's write), and no CREATE SCHEMA hint that CREATE SCHEMA pondra refuses
+    st, code, body = answer("INSERT INTO pondra.runs (id) VALUES (1)")
+    checks["a write into pondra.runs: refused 25006, in the system's words (read-only), with no CREATE SCHEMA hint"] = \
+        st != 200 and code == "25006" and "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only" in body and "CREATE SCHEMA" not in body
+    # nor a database: ATTACH … AS pondra, CREATE DATABASE pondra (a branch's too) would hide the same tables, and are refused before anything is made
+    pondra_dbs = [answer(s) for s in ("ATTACH '/tmp/pondra-harness-never-made' AS pondra", "CREATE DATABASE Pondra", "CREATE DATABASE pondra CLONE lake")]
+    checks["ATTACH … AS pondra and CREATE DATABASE pondra (CLONE too) are refused 42939; pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_dbs) and isinstance(q("SELECT * FROM pondra.tasks"), list)
     q("CREATE TABLE t (k BIGINT, v DOUBLE)", 1)
     q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 2)
     q("INSERT INTO t VALUES (1, 1.0), (2, 2.0)", 1)
@@ -19152,14 +19170,15 @@ def find():
     checks["every word in one field"] = any(r.get("object") == "orders" and r["name"] == "amount" for r in both) \
         and not any(r["is"] == "object" and r["name"] == "revenue" for r in both)
 
-    # concepts, under other products' names; a kind leaves them out
+    # concepts, under other products' names; a kind leaves them out ('pipeline' is the task graph: a 1.0 task is a pipeline of one step)
     fk = q("SELECT * FROM pondra.find('foreign key')")
     pipe = q("SELECT * FROM pondra.find('pipeline')")
     fk_link = q("SELECT * FROM pondra.find('foreign key', kind => 'link')")
     info["concepts"] = [fk, pipe, fk_link]
-    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the flow pattern; a kind leaves them out"] = \
+    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the task graph pattern (not the flow); a kind leaves them out"] = \
         any(r["is"] == "part" and r["kind"] == "link" and r.get("matched") == "also" and r.get("object") is None for r in fk) \
-        and any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) and not any(r.get("object") is None for r in fk_link)
+        and any(r["is"] == "pattern" and r["kind"] == "task graph" for r in pipe) and not any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) \
+        and not any(r.get("object") is None for r in fk_link)
 
     # an attached lake's objects
     prod = q("SELECT * FROM pondra.find('products')")
@@ -20845,6 +20864,12 @@ def variables():
     checks["pondra.variables lists them (name, value, type, declared), never a remembered answer; SET is still a setting"] = \
         got["listed"] == [{"name": "day", "value": "2026-09-29", "type": "Date32", "declared": "DATE"}] \
         and got["listed again"] == [{"name": "day", "value": "2026-09-30", "type": "Date32", "declared": "DATE"}]
+    # A struct variable's field is `$s.a` (1.1 reads a pipeline's `$daily.rows` so); a field of a value that is no struct is
+    # refused by DataFusion's words, so the form is kept free for 1.1 and means nothing else in the meantime (R5).
+    got["field"] = q("DECLARE $s = named_struct('a', 1); SELECT $s.a AS v", {})
+    got["field of a date"] = _raises_text(lambda: q("DECLARE $d = DATE '2026-09-30'; SELECT $d.from AS v", {}))
+    checks["$s.a reads a struct variable's field; a field of a DATE is refused (not a struct): the form stays free for 1.1"] = \
+        got["field"] == [{"v": 1}] and "is not Struct" in got["field of a date"]
     # A file's parameters, and runs.
     daily = ("-- The day to load\nDECLARE PARAMETER $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE PARAMETER $min DOUBLE DEFAULT 0;\n"
              "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
