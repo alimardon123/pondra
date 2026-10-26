@@ -21,6 +21,6 @@
   "more than one node: a page is one": {"modules": ["cluster", "drain", "guard", "locks", "replica", "skew", "spill", "spmd"]},
   "processes beside the node (Python's workers, Flight functions, model endpoints): a page starts none": {"modules": ["ai", "pyfn", "python", "udf"]},
   "the program and its machine: commands, a service, a node's life in a process": {"modules": ["apply", "ci", "cli", "jemalloc", "library", "node", "panics", "project", "service", "shell", "status"]},
-  "rules written against the server that belong in the core (reviews/form-parity.md §2 to §4): until each moves, a page refuses what it can't keep by name, listed in refusals": {"modules": ["change", "constraints", "cursors", "defaults", "facts", "frugal", "host", "json_rows", "literals", "oom", "path", "returning", "routines", "script", "seq", "settings", "temp", "txn", "types", "vars", "write"]}
+  "rules written against the server that belong in the core (reviews/form-parity.md §2 to §4): until each moves, a page refuses what it can't keep by name, listed in refusals": {"modules": ["change", "constraints", "cursors", "defaults", "facts", "frugal", "host", "json_rows", "literals", "oom", "path", "returning", "routines", "script", "seq", "settings", "statement", "temp", "txn", "types", "vars", "write"]}
  }
 }

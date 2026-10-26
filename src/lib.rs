@@ -189,6 +189,7 @@ mod rules;
 #[cfg(feature = "doors")] mod service;
 #[cfg(feature = "lake")] mod spill;
 #[cfg(feature = "lake")] mod spmd;
+#[cfg(feature = "doors")] mod statement;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;

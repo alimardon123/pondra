@@ -171,8 +171,11 @@ fn rebinding(host: &str, from: Option<std::net::SocketAddr>, own: &str) -> Optio
     None
 }
 
-/// This machine's name, as the OS says it.
+/// This machine's name, as the OS says it (a page has none: its host is the browser's).
+#[cfg(not(target_arch = "wasm32"))]
 static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(sysinfo::System::host_name);
+#[cfg(target_arch = "wasm32")]
+static MACHINE: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| None);
 
 /// May the request being served add rows to `table` (as the catalog names it) through a door that
 /// takes rows, not SQL (`/append`, `/insert`, Flight's DoPut and ingest, Kafka's produce)? Its INSERT

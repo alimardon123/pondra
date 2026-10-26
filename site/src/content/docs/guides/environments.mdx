@@ -186,7 +186,8 @@ pondra branch -d orders-by-channel       # its database, and its Git branch once
   Each project's CI is in [Continuous integration](/pondra/guides/projects/#continuous-integration).
 - **A branch's tasks wait to be resumed.** A task made in a branch or in test starts suspended, as the
   tasks it was cloned with do, so nothing in a branch reaches the outside on a schedule. `ALTER TASK name
-  RESUME` starts it, and `EXECUTE TASK name` runs it once.
+  RESUME` starts it. `EXECUTE TASK name` runs its graph once, the suspended tasks after it too:
+  `EXECUTE TASK nightly` runs nightly's graph once.
 - **A branch reads prod's files gently.** Its reads of prod's objects get a quarter of a node's requests
   at prod's bucket, and halve when the bucket asks to slow down (`pondra_bucket_turns` in `/metrics`), so
   prod's own nodes keep most of it.

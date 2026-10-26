@@ -64,6 +64,7 @@ impl Conn {
         Ok(Conn { io: Mutex::new((Self::stream(addr, s).await?, 0, false)), addr: addr.to_string(), settings: s.clone() })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     async fn stream(addr: &str, s: &Settings) -> Result<Box<dyn Stream>> {
         let tcp = tokio::time::timeout(std::time::Duration::from_secs(10), tokio::net::TcpStream::connect(addr)).await.with_context(|| format!("reaching {addr}"))??;
         tcp.set_nodelay(true)?;
@@ -82,6 +83,11 @@ impl Conn {
             login(&mut io, mech, user, pass).await.with_context(|| format!("logging in to {addr} as {user}"))?;
         }
         Ok(io.0)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn stream(_: &str, _: &Settings) -> Result<Box<dyn Stream>> {
+        Err(crate::codes::coded("0A000", "a page reaches no Kafka cluster: a browser opens no sockets"))
     }
 
     /// One request, its answer (after the correlation id).

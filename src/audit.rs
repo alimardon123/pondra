@@ -176,6 +176,7 @@ impl Refusal for pgwire::error::PgWireError {
     fn refusal(code: &str, message: String) -> Self { pgwire::error::PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new("ERROR".into(), code.into(), message))) }
 }
 
+#[cfg(feature = "doors")]
 impl Refusal for tonic::Status {
     fn refusal(_: &str, message: String) -> Self { tonic::Status::resource_exhausted(message) }
 }

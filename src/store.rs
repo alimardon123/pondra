@@ -17,7 +17,9 @@ use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::ClientConfigKey;
-use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+#[cfg(not(target_arch = "wasm32"))]
+use object_store::local::LocalFileSystem;
+use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use crate::kv::{self, slate, Kv, Written};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -774,6 +776,13 @@ pub fn ram() -> Option<usize> {
     *RAM.get_or_init(read_ram)
 }
 
+// (a page's memory is its line, which `page.rs` takes from its device: none is the machine's)
+#[cfg(target_arch = "wasm32")]
+fn read_ram() -> Option<usize> {
+    None
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn read_ram() -> Option<usize> {
     let proc = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines().find_map(|l| l.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok()));
     proc.map(|kb| (kb << 10).min(cgroup_memory().unwrap_or(usize::MAX))).or_else(|| {
@@ -784,6 +793,7 @@ fn read_ram() -> Option<usize> {
 
 /// The least memory limit of this process's cgroups and their parents (v2 `memory.max`, v1
 /// `memory.limit_in_bytes`; "max" or none: no limit). In a container the cgroup is its root.
+#[cfg(not(target_arch = "wasm32"))]
 fn cgroup_memory() -> Option<usize> {
     let groups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
     let limits = groups.lines().filter_map(|line| {
@@ -800,6 +810,7 @@ fn cgroup_memory() -> Option<usize> {
 }
 
 /// This process's resident memory, if the OS says.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn resident() -> Option<usize> {
     let proc = std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<usize>().ok());
     proc.map(|pages| pages * page_size()).or_else(|| {
@@ -810,9 +821,16 @@ pub fn resident() -> Option<usize> {
     })
 }
 
+/// A page's resident memory is not asked of an OS: it has none, and its memory is its line (`page.rs`).
+#[cfg(target_arch = "wasm32")]
+pub fn resident() -> Option<usize> {
+    None
+}
+
 /// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds
 /// (where a count of pages read as 4 KB pages was 16 times too little). Asked each time: glibc answers
 /// from memory, and a static would be a node's state for nothing.
+#[cfg(not(target_arch = "wasm32"))]
 fn page_size() -> usize {
     #[cfg(unix)]
     {
@@ -930,15 +948,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
         return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
     }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
-        std::fs::create_dir_all(url)?;
-        let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
-        // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
-        // overwrites, and a folder that refuses them never deletes those files. The soak of one local lake
-        // for 5 hours grew its catalog from 206 to 13,373 objects, and commits' p95 from 0.4 to 5.2 ms. The
-        // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
-        // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
-        // and a writer fenced by a newer one restarts (`fatal`).)
-        return Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None));
+        return folder(url);
     };
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
@@ -962,6 +972,26 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     // (the bucket's client, which scans and the SSD tier's misses go through, is counted apart:
     // each request goes through one of the two)
     Ok((url.trim_end_matches('/').to_string(), Arc::new(Counted(store)), Some((root, Arc::new(Counted(whole)) as Store))))
+}
+
+/// A folder's store, made if it isn't there.
+#[cfg(not(target_arch = "wasm32"))]
+fn folder(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    std::fs::create_dir_all(url)?;
+    let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
+    // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
+    // overwrites, and a folder that refuses them never deletes those files. The soak of one local lake
+    // for 5 hours grew its catalog from 206 to 13,373 objects, and commits' p95 from 0.4 to 5.2 ms. The
+    // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
+    // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
+    // and a writer fenced by a newer one restarts (`fatal`).)
+    Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None))
+}
+
+/// A page has no folders: its lake is in memory or in a bucket.
+#[cfg(target_arch = "wasm32")]
+fn folder(_: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    Err(crate::codes::coded("0A000", "a page opens no folder: its lake is in memory or in a bucket"))
 }
 
 // Lakes held in this process's memory (`memory://`, DuckDB's `:memory:`) live in `memory.rs`, which
@@ -1048,17 +1078,21 @@ impl object_store::MultipartUpload for CountedParts {
 /// manifest and compactions passes failed and deleted nothing. So an `Update` here is a head and an
 /// overwrite with the e-tag checked between them (a folder's version is its e-tag alone: `version` is
 /// None there); every other call is the folder's own.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub(crate) struct Local(pub(crate) LocalFileSystem);
 
 /// One process's conditional updates of a folder take turns here, so a check and the overwrite after it
 /// never interleave. (Not `Lake::replace`'s `ONE`, which is held across its own put.)
+#[cfg(not(target_arch = "wasm32"))]
 static UPDATES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Display for Local {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl ObjectStore for Local {
     async fn put_opts(&self, at: &Path, body: object_store::PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
@@ -2803,6 +2837,7 @@ mod tests {
 
     /// A catalog its own node's stop closed answers an error, never a restart (invariant 300):
     /// taken for a fence, the write below would exec this test again.
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closed_by_its_own_stop_is_no_fence() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
@@ -2821,6 +2856,7 @@ mod tests {
     /// e-tag a put or a head gave goes through, and the next with the e-tag that one gave too; an old e-tag, a
     /// missing object and two updates racing on one e-tag are refused as S3 refuses them; an update with an
     /// attribute is refused by name and changes nothing; creates and overwrites are as they were.
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_folder_takes_conditional_overwrites() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-local-{}", uuid::Uuid::new_v4()));
@@ -2865,6 +2901,7 @@ mod tests {
 
     /// A table entry is parsed once for its bytes: the same bytes (in the same buffer or another) give the
     /// same parse, changed bytes a new one, and what is kept stays under its count and byte bounds.
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_table_entry_is_parsed_once_per_version() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
@@ -2901,6 +2938,7 @@ mod tests {
 
     /// `recent_inline` answers a `d/` key that one of the last 64 commits wrote, and no other key: the
     /// frames are sent by hand, as the commit loop would send them, so no commit has to wait for it.
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recent_inline_answers_the_last_64_commits() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));

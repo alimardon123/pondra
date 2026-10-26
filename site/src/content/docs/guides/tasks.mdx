@@ -80,8 +80,11 @@ of the graph that declares `$day`, so `load_counts` above loads 2026-09-29, not 
 - **`pondra.result('t')`** is what task `t` answered in this run of the graph: its `RETURN`, or the
   first value of its last query. It is NULL when `t` gave nothing.
 - **`EXECUTE TASK name (…)`** starts a graph now, from its first task, with values for the `$name`s its
-  tasks declare. A scheduled run gives none, so each task takes its own default from
-  `DECLARE PARAMETER`. It is refused while that task's last run is still going.
+  tasks declare. It runs the whole graph, suspended tasks too. A run's values are worked out once, as it
+  starts, from what `EXECUTE TASK` gave and the first task's `DECLARE PARAMETER` defaults, so every task in
+  the run sees the same `$day`, through retries and a failover, even when the run crosses midnight. A later
+  task's own `DECLARE PARAMETER` of a name the first task doesn't declare still takes its own default. It
+  is refused while that task's last run is still going.
 - **Retries.** `retries = n` runs a failed task again with the same job, so what a try wrote lands
   once. `retry_delay` waits between tries (10 seconds by default), and `timeout` fails a try that runs
   longer.
@@ -93,8 +96,8 @@ of the graph that declares `$day`, so `load_counts` above loads 2026-09-29, not 
 ## Pause and resume
 
 `ALTER TASK name SUSPEND` stops a task, and `ALTER TASK name RESUME` starts it again. A suspended task
-has no ticks of its own. In a graph, neither it nor the tasks after it run. `EXECUTE TASK` still runs
-it.
+has no ticks of its own. In a graph's scheduled runs, neither it nor the tasks after it run. A run that
+`EXECUTE TASK` starts runs the whole graph, suspended tasks too.
 
 ```sql
 ALTER TASK count_orders SUSPEND;
