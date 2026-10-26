@@ -65,7 +65,17 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
     ensure!(status.is_success(), "{}.{}.{} at {endpoint}: {status} {}", o("share"), o("schema"), o("table"), serde_json::from_str::<Value>(&text).ok().and_then(|e| e["message"].as_str().map(str::to_string)).unwrap_or(text));
     let lines: Vec<Value> = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<_, _>>()?;
     ensure!(lines.len() >= 2, "{at}: an answer without its protocol and metadata");
-    let link = |u: &str| format!("share://files/{}", base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, u));
+    // (a link on the provider's own host is reached as the provider is, its admin having named it; any other only on the
+    // public internet, every address and redirect checked as it is reached: `public::web`)
+    let host = url::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(str::to_string));
+    let link = |u: &str| -> anyhow::Result<String> {
+        let at = url::Url::parse(u).with_context(|| format!("{endpoint}: a link that isn't a URL"))?;
+        let own = at.host_str().is_some_and(|h| Some(h) == host.as_deref());
+        if !own {
+            crate::public::check(&at).with_context(|| format!("{endpoint} links to {}", at.host_str().unwrap_or_default()))?;
+        }
+        Ok(format!("share://{}/{}", if own { "files" } else { "public" }, base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, u)))
+    };
     let (protocol, metadata) = match delta {
         true => (lines[0]["protocol"]["deltaProtocol"].clone(), lines[1]["metaData"]["deltaMetadata"].clone()),
         false => (j!({"minReaderVersion": 1, "minWriterVersion": 1}), lines[1]["metaData"].clone()),
@@ -76,20 +86,23 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
             true => f["deltaSingleAction"]["add"].clone(),
             false => j!({"path": f["url"], "partitionValues": f["partitionValues"], "size": f["size"], "stats": f["stats"]}),
         };
-        add["path"] = j!(link(add["path"].as_str().unwrap_or_default()));
+        add["path"] = j!(link(add["path"].as_str().unwrap_or_default())?);
         if add["deletionVector"]["storageType"] == "p" {
-            add["deletionVector"]["pathOrInlineDv"] = j!(link(add["deletionVector"]["pathOrInlineDv"].as_str().unwrap_or_default())); // (a vector of its own: a link too)
+            add["deletionVector"]["pathOrInlineDv"] = j!(link(add["deletionVector"]["pathOrInlineDv"].as_str().unwrap_or_default())?); // (a vector of its own: a link too)
         }
-        add
-    }).collect();
-    lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links));
+        Ok(add)
+    }).collect::<anyhow::Result<_>>()?;
+    lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links { public: false }));
+    lake.rt.register_object_store(&url::Url::parse("share://public")?, Arc::new(Links { public: true }));
     crate::read_delta::table(endpoint, &protocol, &metadata, adds.iter()).map(crate::ext::table_meta)
 }
 
-/// The files a provider links to (`share://files/<link, base64url>`): read with a GET of the link
-/// and the range asked, as a bucket would answer it. Links end, so nothing of them is kept.
+/// The files a provider links to (`share://files/<link, base64url>`, or `share://public/…` for a link off its own host):
+/// read with a GET of the link and the range asked, as a bucket would answer it. Links end, so nothing of them is kept.
 #[derive(Debug)]
-struct Links;
+struct Links {
+    public: bool, // (reached only on the public internet: `public::web`)
+}
 
 impl std::fmt::Display for Links {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("a share's links") }
@@ -123,7 +136,8 @@ impl object_store_df::ObjectStore for Links {
             (Some(r), _) => ours(r),
             (None, _) => object_store::GetRange::Offset(0),
         };
-        let r = crate::fetch::send(crate::ext::web().get(&url).header("range", byte_range::header(&want))).await.map_err(links_error)?;
+        let web = if self.public { crate::public::web() } else { crate::ext::web() };
+        let r = crate::fetch::send(web.get(&url).header("range", byte_range::header(&want))).await.map_err(links_error)?;
         match r.status().as_u16() {
             200 | 206 => {}
             404 => return Err(object_store_df::Error::NotFound { path: location.to_string(), source: "the provider has no such file now".into() }),

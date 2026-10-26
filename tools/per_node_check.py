@@ -84,6 +84,7 @@ PROCESS = {
     "pg_json_edit.rs:FUNCTIONS": "the JSON edits' definitions, made once: nothing of a lake",
     "pg_json_sets.rs:SETS": "the JSON set functions' names and columns, built into the binary",
     "pyfn.rs:SEEN": "SQL type names worked out by a session with nothing of a lake",
+    "public.rs:CLIENT": "a client with no token, for links someone other than the admin named (a share's): only its keep-alive sockets",
     "python.rs:BUSY": LOCK,
     "python.rs:CHOSEN": "the Python chosen in the console: the machine's, kept in python.txt beside the console's settings",
     "python.rs:EXE": SETTING + " (--python)",
