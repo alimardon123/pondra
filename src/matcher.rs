@@ -41,6 +41,10 @@ struct Spec {
     /// WITHIN: each row is within the interval of its match's first row, by the first ORDER BY key (the time argument).
     #[serde(default)]
     within: bool,
+    /// The DEFINEs that read the match so far (`pattern.rs` writes them; the matcher takes them in its next piece, so a
+    /// spec that has any is refused here until then).
+    #[serde(default)]
+    defines: Vec<serde_json::Value>,
 }
 
 /// AFTER MATCH SKIP: where the search for the next match goes on. A symbol is named, as the pattern names it.
@@ -95,6 +99,9 @@ struct Plan {
 /// The plan of a spec, refused by name when it is malformed or too big.
 fn compile(text: &str) -> Result<Plan> {
     let spec: Spec = serde_json::from_str(text).map_err(|e| anyhow!("MATCH_RECOGNIZE: the pattern's spec doesn't read: {e}"))?;
+    if !spec.defines.is_empty() {
+        return Err(coded("0A000", "MATCH_RECOGNIZE: a DEFINE that reads the match so far isn't run yet"));
+    }
     let (pattern, syms) = read(&spec.pattern)?;
     let mut c = Compiler { code: vec![] };
     c.emit(&pattern, false)?;
