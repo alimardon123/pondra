@@ -902,8 +902,6 @@ impl Page {
     /// just its new rows (the partitions past their length before); one that rewrites the table checks the whole table (no key
     /// or UNIQUE value twice, projected to those columns), as an UPDATE does, and its key is checked too. After an UPDATE the whole table is checked the same way, except for the
     /// key, which an UPDATE can't set (`key_set`). The rows that were there met the rules before, so a refusal is the write's.
-    /// The rows a write adds (all of them, for an UPDATE or a rewrite) are first put in their held form (`typed::as_held`, as a
-    /// node keeps them), so the table keeps that form and the checks see it.
     /// Known difference: a CHECK that isn't the same each time (`now()`, `random()`) is checked on an UPDATE over rows the UPDATE
     /// didn't touch.
     async fn holds(&self, name: &str, before: &Before, change: Change) -> anyhow::Result<()> {
@@ -918,33 +916,20 @@ impl Page {
         let (_, page) = self.default_schema()?;
         let Some(table) = page.table(name).await? else { return Ok(()) };
         let schema = table.schema();
-        let mut parts = partitions_of(&table).await.ok_or_else(|| anyhow::anyhow!("{name}: a page's table holds its rows in memory"))?;
-        // (MemSink appends each partition's rows, so the new ones are each partition's past the length it had)
-        let added = |i: usize, part: &[RecordBatch]| match before {
-            Some((_, held)) if appends => held.get(i).map_or(0, |h| h.len()).min(part.len()),
-            _ => 0,
-        };
-        // (the rows the write added go through `as_held` first, as a node writes them: a batch already in form comes back as it
-        // was, so only the partitions with a batch that changed are put back into the table, in held form)
-        let mut changed = vec![false; parts.len()];
-        for (i, part) in parts.iter_mut().enumerate() {
-            for j in added(i, part)..part.len() {
-                let form = crate::rules::typed::as_held(t, part[j].clone(), true)?;
-                let same = form.columns().iter().zip(part[j].columns()).all(|(a, b)| Arc::ptr_eq(a, b));
-                if !same {
-                    part[j] = form;
-                    changed[i] = true;
-                }
-            }
-        }
-        if changed.iter().any(|c| *c) {
-            let memory = inner(&table).downcast_ref::<MemTable>().ok_or_else(|| anyhow::anyhow!("{name}: a page's table holds its rows in memory"))?;
-            for (i, partition) in memory.batches.iter().enumerate().filter(|(i, _)| changed[*i]) {
-                *partition.write().await = parts[i].clone();
-            }
-        }
+        let parts = partitions_of(&table).await.ok_or_else(|| anyhow::anyhow!("{name}: a page's table holds its rows in memory"))?;
         let all: Vec<RecordBatch> = parts.iter().flatten().cloned().collect();
-        let fresh: Vec<RecordBatch> = parts.iter().enumerate().flat_map(|(i, part)| part[added(i, part)..].to_vec()).collect();
+        let fresh: Vec<RecordBatch> = match before {
+            // (MemSink appends each partition's rows, so the new ones are each partition's past the length it had)
+            Some((_, held)) if appends => parts
+                .iter()
+                .enumerate()
+                .flat_map(|(i, part)| {
+                    let was = held.get(i).map_or(0, |h| h.len()).min(part.len());
+                    part[was..].to_vec()
+                })
+                .collect(),
+            _ => all.clone(),
+        };
         let fresh = datafusion::arrow::compute::concat_batches(&schema, &fresh)?;
         if fresh.num_rows() == 0 {
             return Ok(());
@@ -2201,6 +2186,11 @@ fn table_rules(c: &CreateTable) -> anyhow::Result<()> {
             Some(what) => Err(not_kept_as(&what)),
             None => Ok(()),
         };
+    }
+    // (a node keeps a jsonb value in Postgres's form, `typed::as_held`: a page's tables take JSON columns with the core's write path)
+    if let Some(column) = c.columns.iter().find(|column| matches!(column.data_type, datafusion::sql::sqlparser::ast::DataType::JSON | datafusion::sql::sqlparser::ast::DataType::JSONB)) {
+        let kind = column.data_type.to_string().to_lowercase();
+        return Err(crate::codes::coded("0A000", format!("a page doesn't keep {kind} columns yet ({}): keep the value as TEXT and cast it where it is read (::{kind}), or make the table on a node", column.name)));
     }
     if let Some(k) = c.constraints.iter().find(|k| !kept_constraint(k)) {
         return Err(not_kept(&k.to_string()));
