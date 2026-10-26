@@ -2095,7 +2095,7 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => crate::cluster::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
+                    Err(e) if fenced(&e) && tries() < 5 => crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
                     r => r,
                 };
             }

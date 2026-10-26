@@ -275,7 +275,7 @@ fn stops_on_a_panic(at: &At, dir: &Path) {
     again.close();
 }
 
-/// 3. A lake nobody leads is made by the pondra program (`inbox::lead_once`), which a host's process
+/// 3. A lake nobody leads is made by the pondra program (`node::lead_once`), which a host's process
 /// doesn't have: ATTACH of a fresh folder says so by name. The node stays open for check 4.
 fn attach_needs_the_program(at: &At, dir: &Path) -> Opened {
     // (nothing in this process may name the program: PONDRA_LAUNCHER is what a host gives it)

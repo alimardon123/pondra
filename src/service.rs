@@ -491,7 +491,7 @@ mod os {
     }
 
     /// The node as a child of this process: started, started again whenever it ends on its own
-    /// (a node that must rejoin its cluster ends to be started again: `cluster::restart`), and
+    /// (a node that must rejoin its cluster ends to be started again: `node::restart`), and
     /// stopped by closing its standard input, as a node started by another program is.
     fn supervise(file: &Path) -> Result<()> {
         let name = file.file_stem().unwrap_or_default().to_string_lossy().into_owned();

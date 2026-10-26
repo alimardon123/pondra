@@ -666,7 +666,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    `query::register_views` again). A `ViewTable` keeps the table it was planned over; planned
    over whole tables, a spread query over a view counted every row once per node
    (`harness.py schemas`: "queries over views spread" fails without it).
-52. **A follower that finds no catalog starts over** (`cli.rs`: `cluster::restart`). A new lake's
+52. **A follower that finds no catalog starts over** (`cli.rs`: `node::restart`). A new lake's
    leader may not have made it yet, or may have died first; the restart waits for the one or
    takes over from the other when its mark is stale. Exiting instead lost a node of the R2
    cluster bench (`cluster.py race`: "a leader that never made the catalog").
@@ -720,7 +720,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`server::query`: `owner` in the key, run with its rights), and a statement that reads files
    never is: once expanded it names them (`"ext:…"`), or a view it reads does. `harness.py
    external`: "the owner's answers are remembered, but not one that reads a file here…".
-62. **A node never leads another lake in its own process** (`inbox::lead_once`): a write to an
+62. **A node never leads another lake in its own process** (`node::lead_once`): a write to an
    attached lake nobody leads, `CREATE DATABASE` and `ATTACH` of a new folder go through a `pondra
    lead` of their own (hidden), which leads for a moment, once, and ends. That lake's catalog writer would
    otherwise stay open in the node, and its next leader would fence it. (No test catches the
@@ -1521,7 +1521,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 206. **A service's node stops the way a node stops** (`service.rs`): systemd and launchd send
    SIGTERM; on Windows the supervisor closes the child's standard input (invariant 46), and a
    node that must restart to rejoin exits 75 for the supervisor to start it again
-   (`cluster::restart` under `PONDRA_SUPERVISED`), never a process the service manager doesn't
+   (`node::restart` under `PONDRA_SUPERVISED`), never a process the service manager doesn't
    know. `deploy_check.py service` on all three (deploy.yml): "killed, its manager starts it again,
    with its rows", "installed again with other options: stopped, started on its new port, with its
    rows".
@@ -2309,14 +2309,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    environment, and an empty value is no value. Nothing sets the environment (`set_var`): beside a
    library's host it is a data race, so a Pondra process it starts gets what it was given as its
    environment (`env::given()`), and `pondra sql`'s job and tries go to its next run through
-   `cluster::restart_with`. The first `give` fixes the settings; a later one may repeat a setting,
+   `node::restart_with`. The first `give` fixes the settings; a later one may repeat a setting,
    never change one, and each it would change is named, as is a name that isn't a setting (with the
    nearest one). `tools/per_node_check.py` fails a `PONDRA_*` name read past `env.rs` (by its text,
    or through a constant that names it), a name its `NAMES` doesn't list, a listed name nothing
    reads, and any `set_var`. `cargo test --lib env::`.
 303. **A node in a library never takes its host's process down** (`library.rs`, ADR-061 §5): what the
-   program does by exec, abort or exit, a library does to the node alone. `cluster::restart_with`
-   halts the node and starts it again in place (`library::restart`: its lock file says
+   program does by exec, abort or exit, a library does to the node alone. `node::restart_with`
+   halts the node and starts it again in place (`node::restart`: its lock file says
    `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
    a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
    node with the reason (`node::failed`), and every request is then 57P03 with it until it is
@@ -2327,7 +2327,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    and its write lands once; `PONDRA_CRASH` in a vital loop is 57P03, then the lake opens again with
    its rows. `tools/per_node_check.py` fails a process mutex read with `.unwrap()`.
 
-304. **What a node starts, it starts with the launcher** (`library::exe()`): `pondra lead` and the
+304. **What a node starts, it starts with the launcher** (`node::exe()`): `pondra lead` and the
    Python workers' search use the `pondra` program the packages carry (`PONDRA_LAUNCHER`, an
    option of `open`), never `current_exe()`, which in a library is the host (Python, Node). A
    library without one refuses by name what needs it.
