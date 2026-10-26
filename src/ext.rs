@@ -27,7 +27,7 @@ tokio::task_local! {
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
-    /// The lake a statement was sent to, its URL and a slash (`sent`): a client's relative LOCATION is stored as a file of its own,
+    /// The lake a statement was sent to, its URL and a slash (`rooted`): a client's relative LOCATION is stored as a file of its own,
     /// written whole, so every door reads the same file (`own_file`), the shell and `connect()` too.
     static ROOT: String;
     /// The statement's listing: the files each table of files in it reads, listed once for it (planning asks
@@ -50,9 +50,10 @@ pub async fn scope<F: std::future::Future>(owner: bool, f: F) -> F::Output {
     OWNER.scope(owner, listing(f)).await
 }
 
-/// `scope`, for a statement sent to the lake at `url` (`ROOT`).
-pub async fn sent<F: std::future::Future>(url: String, owner: bool, f: F) -> F::Output {
-    ROOT.scope(format!("{}/", url.trim_end_matches('/')), scope(owner, f)).await
+/// Run `f`, a statement sent to the lake at `url` (`ROOT`, `statement::run`).
+pub async fn rooted<F: std::future::Future>(url: &str, f: F) -> F::Output {
+    let root = format!("{}/", url.trim_end_matches('/'));
+    ROOT.scope(root, f).await
 }
 
 /// Run `f` listing each table of files once (within a statement already doing so: as it is).
@@ -1653,7 +1654,7 @@ mod tests {
     /// refused when it leaves them. The program that started the node has its folder made whole.
     #[tokio::test]
     async fn a_clients_relative_location_is_the_lakes_files() {
-        let made = |owner: bool, l: &'static str| sent("s3://b/lake".into(), owner, async move { located(l) });
+        let made = |owner: bool, l: &'static str| rooted("s3://b/lake", scope(owner, async move { located(l) }));
         assert_eq!(made(false, "reports/q1.csv").await.unwrap(), "s3://b/lake/files/reports/q1.csv");
         assert_eq!(made(false, "./ev/").await.unwrap(), "s3://b/lake/files/ev/");
         assert_eq!(scope(false, async { located("reports/q1.csv") }).await.unwrap(), "reports/q1.csv");
