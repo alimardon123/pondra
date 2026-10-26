@@ -268,20 +268,20 @@ pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net:
 const KNOCKS: u32 = 60;
 const ADDRESSES: usize = 10_000; // (the addresses held at once: when full, those whose minute ended go, or all)
 
-crate::per_node!(static KNOCKED: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (i64, u32)>> = std::sync::Mutex::new(std::collections::HashMap::new()));
+crate::per_node!(static KNOCKED: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u64, u32)>> = std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Is a refusal from `ip` at `now_ms` written: Some(false) yes, Some(true) yes and it is the last this minute,
 /// None no. (No address: a door that can't tell, counted under 0.0.0.0.)
-fn knocked(ip: Option<std::net::IpAddr>, now_ms: i64) -> Option<bool> {
+fn knocked(ip: Option<std::net::IpAddr>, now_ms: u64) -> Option<bool> {
     let mut all = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if all.len() >= ADDRESSES {
-        all.retain(|_, (since, _)| now_ms - *since < 60_000);
+        all.retain(|_, (since, _)| now_ms.saturating_sub(*since) < 60_000);
         if all.len() >= ADDRESSES {
             all.clear();
         }
     }
     let (since, n) = all.entry(ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))).or_insert((now_ms, 0));
-    if now_ms - *since >= 60_000 {
+    if now_ms.saturating_sub(*since) >= 60_000 {
         (*since, *n) = (now_ms, 0);
     }
     *n += 1;

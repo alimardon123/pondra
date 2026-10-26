@@ -299,6 +299,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     }
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
+    let here = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().is_some_and(|c| c.0.local); // (from this machine: `users::nodes_key`)
     if let Some(axum::extract::ConnectInfo(peer)) = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>() {
         if !peer.allowed() {
             return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
@@ -308,6 +309,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         }
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !peer.may_be_node() {
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
+        }
+        if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !app.auth.admin_set() && !crate::users::nodes_key(false, crate::ext::shared_master(), peer.local) {
+            return (StatusCode::UNAUTHORIZED, "the lake's keys are in the clear in its bucket, so the nodes' key is taken only from this machine: to run nodes on other machines, give every node --admin-token (or PONDRA_SECRET_KEY)").into_response();
         }
     }
     if header.as_deref().is_some_and(|h| h.starts_with("Bearer pb_")) {
@@ -348,7 +352,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         }
     }
     let signed = match &header {
-        Some(h) => crate::users::who(&app.lake, &app.auth, Some(h)).await,
+        Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), here).await,
         None => None,
     };
     let who = match signed {
