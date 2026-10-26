@@ -1,6 +1,6 @@
 # ADR-073: Row patterns (`MATCH_RECOGNIZE`)
 
-**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, #231; ALL ROWS PER MATCH and its options, #234); phase 2 building (`WITHIN`, 2026-10-25) · **Builds on:**
+**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, #231; ALL ROWS PER MATCH and its options, #234); phase 2 built (`WITHIN`, #240; conditions that read the match so far, 2026-10-26) · **Builds on:**
 ADR-017 (watermarks), ADR-052 (`EMIT FINAL`), ADR-056 and ADR-059 (views that run their query
 again, by key), ADR-072 (one engine in every form) · **Lane:** the coordinator's call (L6 owns the
 SQL front; L1 owns `rerun.rs`, `views.rs`, `store.rs`)
@@ -83,15 +83,24 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
 
 3. **A condition that reads the match so far is worked out inside the matcher.** `B AS B.price <
    A.price`, `LAST(down.price, 1)`, `avg(A.price) < 15` depend on which rows the match gave to which
-   symbol, so they can't be columns. The rewrite passes the columns they read to `pondra_match`,
-   and the matcher evaluates them per thread with Arrow's kernels on single values (the same
-   comparisons, arithmetic and casts DataFusion uses), from what each thread keeps: each symbol's
-   first and last row, its count, and each aggregate's running value. Threads at one state no
-   longer merge then (their pasts differ); past 100,000 live threads a pattern is refused by name
-   as too ambiguous (54000). Taken: column references, `PREV`, `NEXT`, `FIRST`, `LAST` (with
-   offsets), `count`, `sum`, `avg`, `min`, `max`, comparisons, arithmetic, `AND`, `OR`, `NOT`,
-   `IS [NOT] NULL`, `CASE`, casts. Anything else in such a condition is refused by name (0A000),
-   naming it.
+   symbol, so they can't be columns. The rewrite splits such a `DEFINE` at its top-level `AND`s: the
+   conjuncts that read only the row stay the symbol's column, as before. In the others, each part that
+   reads only the row (columns, `PREV`/`NEXT` of them, `CLASSIFIER()` as the symbol's name, any
+   function over those) becomes a column too, planned with the statement. What is left, the glue,
+   names those columns and one slot per navigation (`FIRST`, `LAST`, another symbol's column,
+   `PREV`/`NEXT` of them), aggregate (`count`, `sum`, `avg`, `min`, `max`) or `MATCH_NUMBER()`.
+   The matcher plans each glue once, as SQL over those names, against a snapshot of the engine's
+   session (its functions, analyzer rules and simplifier), so it is DataFusion's own expression.
+   Each thread keeps its slots' state: a navigation's row numbers, a count, a sum as MEASURES sums
+   it (wrapping integers, exact decimals, fsum's two-part DOUBLE), an average, a min or max. A row
+   is taken in three steps: every thread at a symbol takes it and checks the row-only conjuncts; each
+   glue runs once over all those threads; the passing threads go on in their order of preference.
+   Threads at one state merge only when their slots are equal too (and their starts, under
+   `WITHIN`). Past 100,000 live threads the search is refused (54000): the worst case is quadratic
+   in a match's length, and the cap bounds it. Still refused by name (0A000), each saying what to
+   write: an aggregate's own `FILTER`, `ORDER BY` or `DISTINCT`, aggregates other than the five, `avg`
+   of a decimal, `CLASSIFIER()` inside a navigation or an aggregate, a navigation of a navigation
+   deeper than `PREV`/`NEXT` of `FIRST`/`LAST`, a subquery.
 
 4. **Rows tied on the `ORDER BY` are taken in `_row_id` order** when the input is a lake table
    (the rewrite adds it as the last key), so every run and every node finds the same matches, and a
