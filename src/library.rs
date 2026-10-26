@@ -4,8 +4,9 @@
 //! supervisor, a thread of its own: a restart halts the node and starts it again in place, and a
 //! failure stops it and says why to every request after, until it is opened again.
 //!
-//! The places that exec, abort or exit ask [`on`] first and call [`restart`] or [`failed`] instead
-//! (`cluster::restart_with`, `panics::spawn`, `format::watch`, the catalog's compactor). Helpers the
+//! The places that exec, abort or exit ask [`hosted`](crate::node::hosted) first and call [`restart`] or
+//! [`failed`](crate::node::failed) instead (`cluster::restart_with`, `panics::spawn`, `format::watch`, the catalog's
+//! compactor). The node's host state is kept in `node.rs`, beside the rest of the node. Helpers the
 //! node starts (`pondra lead`, Python looked for beside it) are the program the packages give
 //! ([`exe`]), never the host's own executable.
 //!
@@ -13,31 +14,19 @@
 //! `capi/`, for Python's `pondra.open`, and its Node-API module for JavaScript's: `designs/l2-step4-open.md`),
 //! answers that stream included. The loopback door the node opens is for what lives outside the host's
 //! process: the console in a browser, Python's workers calling back, other processes on the lake.
-use crate::node::{Node, Options};
+use crate::node::{Event, Node, Options};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use futures::FutureExt;
 use tokio::sync::mpsc;
 
-/// Whether this process runs its node as a library: set by the first [`Opened::open`], never by the
-/// program. What the process is, so it outlives each node.
-static LIBRARY: AtomicBool = AtomicBool::new(false);
-
-/// Where a node's restarts and failures are sent: the supervisor of the node open now, if any. One
-/// node is open at a time in a process.
-static SUPERVISOR: Mutex<Option<mpsc::UnboundedSender<Event>>> = Mutex::new(None);
-
-/// Is this process a library's (`Opened::open`), not the program's?
-pub fn on() -> bool { LIBRARY.load(SeqCst) }
-
 /// The program a node starts helpers with (`pondra lead`, Python workers looked for beside it): this
 /// executable in the program; in a library, the one the packages ship beside it (`PONDRA_LAUNCHER`,
 /// which `pondra.open` gives), since the host's executable is Python or Node.
 pub fn exe() -> anyhow::Result<PathBuf> {
-    match on() {
+    match crate::node::hosted() {
         false => Ok(std::env::current_exe()?),
         true => crate::env::get("PONDRA_LAUNCHER").map(PathBuf::from).ok_or_else(|| {
             anyhow::anyhow!("this needs the pondra program, and the library was opened without it: give PONDRA_LAUNCHER, the path of the pondra binary (pondra.open gives the one its package ships)")
@@ -56,34 +45,12 @@ impl std::fmt::Display for Restarting {
     }
 }
 
-enum Event {
-    /// Halt the node and start it again (`cluster::restart_with`).
-    Restart(String),
-    /// Stop the node and say why until it is opened again.
-    Failed(String),
-    /// `Opened::close`.
-    Close,
-}
-
-fn send(e: Event) {
-    if let Some(s) = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
-        let _ = s.send(e);
-    }
-}
-
 /// In a library, a node that must start again (`cluster::restart_with` calls this after its lock
 /// files say "restarting"): the supervisor is told, and the task that asked unwinds, past the panic
 /// hook (a host's error reporting sees no panic for a takeover).
 pub fn restart(why: &str) -> ! {
-    send(Event::Restart(why.to_string()));
+    crate::node::send(Event::Restart(why.to_string()));
     std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
-}
-
-/// In a library, the node stops with this reason (a vital loop's panic, the compactor, a lake that
-/// moved past this build), and every request is answered with it until the node is opened again.
-pub fn failed(why: String) {
-    eprintln!("stopping: {why}");
-    send(Event::Failed(why));
 }
 
 /// What the node open in this process is doing now.
@@ -182,12 +149,7 @@ impl Opened {
         options.dir = crate::memory::place(&options.dir); // (`:memory:`: a new lake in this process's memory)
         let memory = crate::memory::in_memory(&options.dir).then(|| options.dir.clone());
         let (events, rx) = mpsc::unbounded_channel();
-        {
-            let mut s = SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner);
-            anyhow::ensure!(s.is_none(), "a node is open in this process already: close it first (one at a time)");
-            *s = Some(events.clone());
-        }
-        LIBRARY.store(true, SeqCst);
+        crate::node::host(events.clone())?;
         let state = Arc::new(Mutex::new(State::Starting));
         let router = Arc::new(Mutex::new(None));
         let (first, started) = std::sync::mpsc::channel();
@@ -196,7 +158,7 @@ impl Opened {
         let thread = match thread {
             Ok(t) => t,
             Err(e) => {
-                SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take();
+                crate::node::unhost();
                 return Err(e.into());
             }
         };
@@ -218,7 +180,7 @@ impl Opened {
         let thread = self.thread.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some(t) = thread {
             let _ = t.join();
-            SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).take();
+            crate::node::unhost();
         }
         if let Some(lake) = &self.memory {
             crate::memory::forget_memory(lake);
@@ -250,7 +212,7 @@ impl Opened {
             None => vec![],
         };
         // (one at a time, said before any setting is given: a refused open changes nothing)
-        anyhow::ensure!(SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_none(), "a node is open in this process already: close it first (one at a time)");
+        anyhow::ensure!(!crate::node::hosting(), "a node is open in this process already: close it first (one at a time)");
         crate::env::give(o.into_iter().map(|(k, v)| (if k == "launcher" { "PONDRA_LAUNCHER".into() } else { k }, text(v))))?;
         crate::tls::init()?; // (a certificate that can't be read: said now)
         let mut options = Options::local(&lake, &addr);
