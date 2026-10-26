@@ -17,7 +17,7 @@ esbuild's pattern: `pondra` holds the JavaScript client and depends, optionally,
 `pondra-<platform>` packages that each hold the launcher and the library side by side, so npm installs
 only the one that fits. No build tools beyond Python and npm.
 """
-import argparse, base64, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, zipfile
+import argparse, base64, concurrent.futures, hashlib, json, os, shutil, subprocess, sys, tarfile, tempfile, zipfile
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 # platform -> (wheel tags, npm os, npm cpu)
@@ -157,7 +157,11 @@ if __name__ == "__main__":
         missing = [p for p in (A.lib, A.launcher) if not os.path.isfile(p)]
         if missing:
             sys.exit(f"no {' or '.join(missing)}: the wheel and npm carry the library and its launcher (cargo build --workspace builds them)")
-    made = [wheel(A.lib, A.launcher, A.platform, A.out), npm_platform(A.lib, A.launcher, A.platform, A.out), archive(A.bin, A.platform, A.out)] if A.bin else []
-    made += [npm_main(A.out)] if A.npm_main else []
+    makes = [lambda: wheel(A.lib, A.launcher, A.platform, A.out), lambda: npm_platform(A.lib, A.launcher, A.platform, A.out), lambda: archive(A.bin, A.platform, A.out)] if A.bin else []
+    makes += [lambda: npm_main(A.out)] if A.npm_main else []
+    # (side by side: zlib lets go of the GIL as it compresses, and npm pack is a process of its own. One after
+    # another they took 57 s of linux-x64's run, 10-26, before the suite could start)
+    with concurrent.futures.ThreadPoolExecutor(max(len(makes), 1)) as pool:
+        made = list(pool.map(lambda make: make(), makes))
     print("\n".join(made))
     sys.exit(0 if made else 1)

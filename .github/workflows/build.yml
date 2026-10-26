@@ -354,7 +354,10 @@ jobs:
           PONDRA_STARTUP_LAYOUT: ${{ needs.plan.outputs.event != 'pull_request' && matrix.platform == 'linux-x64' && '1' || '' }}
         run: |
           if [ "${{ needs.plan.outputs.profile }}" = release ]; then
-            cargo build --release --workspace # (for this runner's glibc: a pull request's packages are tried here, never published)
+            # (without setup-python's PKG_CONFIG_PATH, as the host job that saves this cache builds: aws-lc-sys's build
+            # script watches it, so with it set every run rebuilt aws-lc-sys and the 12 crates over it, 2.3 of the
+            # build's 13.8 minutes, before the crate itself could start: run 40287278434)
+            env -u PKG_CONFIG_PATH cargo build --release --workspace # (for this runner's glibc: a pull request's packages are tried here, never published)
           elif [ -n "${{ matrix.zig }}" ]; then
             pip install -r tools/zig-requirements.txt
             # (zig's linker says, on every build, that it ignores the -Wl,-O1 rustc passes it: not a warning of ours)
