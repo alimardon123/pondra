@@ -22830,10 +22830,10 @@ def patterns():
     checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions, WITHIN on one in five, by timestamps or by dates) answer as the reference does, or 22000 where it does"] = ok
     fixed = pc.fixed_checks(A.port)
     info["fixed missed"] = [k for k, v in fixed.items() if not v]
-    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW), WITHIN on the ticker's timestamps (one match cut short, one later start that wins), Flink's WITHIN example (a drop of 10 in an hour; its DEFINE reads the match so far, so the engine refuses it, 0A000, until the next PR), a column and a symbol both named d: the answers written in patterns_check.py, names and rows"] = all(fixed.values())
+    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW), WITHIN on the ticker's timestamps (one match cut short, one later start that wins), Flink's WITHIN example (a drop of 10 in an hour), a column and a symbol both named d, and the DEFINEs that read the match so far: the three-phase counterexample, a variable with no rows (IS NOT NULL, COALESCE), DOUBLE, DECIMAL and INT sums, Oracle's 22-7 (its published days 1-3 and the fourth day the rule gives), Oracle's fragment with no match, Trino's V-shape: the answers written in patterns_check.py, names and rows"] = all(fixed.values())
     refused = pc.refusal_checks(A.port)
     info["refusals missed"] = [k for k, v in refused.items() if not v]
-    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states, WITHIN without an ORDER BY, descending or on an INT, a measure named like a column of the table, WITHIN with a number or a subquery"] = all(refused.values())
+    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states, WITHIN without an ORDER BY, descending or on an INT, a measure named like a column of the table, WITHIN with a number or a subquery, and what a DEFINE still can't read: an aggregate's FILTER, DISTINCT or ORDER BY, another aggregate, avg of a DECIMAL, CLASSIFIER() in a navigation, a navigation of a navigation, a subquery, the 100,000 cap, a glue function the engine lacks"] = all(refused.values())
     # section 5: the ticker over the Postgres port, then three nodes on a lake of their own
     ticker_q = pc.FIXED[0]["query"]
     want = pc.post_sql(A.port, ticker_q)["value"]
@@ -22842,6 +22842,14 @@ def patterns():
         cols = [d.name for d in cur.description]
         over_pg = [dict(zip(cols, r)) for r in cur.fetchall()]
     checks["the ticker's matches over the Postgres port equal HTTP's, and there are the three of the brief"] = over_pg == want and len(want) == 3
+    # a DEFINE that reads the match so far (Flink's example, one row) over the Postgres port: the same answer as HTTP's
+    flink_q = next(ex["query"] for ex in pc.FIXED if ex["name"].startswith("Flink's"))
+    http_flink = pc.post_sql(A.port, flink_q, arrow=True)
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:
+        cur = c.execute(flink_q)
+        pg_flink = ([d.name for d in cur.description], [tuple(r) for r in cur.fetchall()])
+    checks["a DEFINE that reads the match so far (Flink's example) over the Postgres port equals HTTP's, one row"] = \
+        bool(http_flink["ok"]) and pg_flink == http_flink["value"] and len(pg_flink[1]) == 1
     # ALL ROWS PER MATCH over the Postgres port: the same column names and rows as HTTP's (the rows of the brief's 15)
     answered = pc.post_sql(A.port, pc.ALL_ROWS_Q, arrow=True)
     all_names, all_rows = answered["value"] if answered["ok"] else (None, None)
@@ -22857,12 +22865,13 @@ def patterns():
     pc.load_tables(A.port)
     q("CREATE TABLE ticks (symbol TEXT, day INT, price INT)")
     rng = random.Random(3)
-    vals = []
+    vals, tick_rows = [], []
     for k in range(50):
         price = 100
         for day in range(1, 201):
             price = max(1, price + rng.randint(-3, 3))
             vals.append(f"('s{k:02d}', {day}, {price})")
+            tick_rows.append((f"s{k:02d}", day, price))
     for i in range(0, len(vals), 1000):
         q("INSERT INTO ticks VALUES " + ", ".join(vals[i:i + 1000]))
     for p in range(A.port, A.port + 3):
@@ -22906,6 +22915,48 @@ def patterns():
     info["ALL ROWS rows over 50 symbols"] = len(one_all) if isinstance(one_all, list) else None
     checks["the ALL ROWS query over the same 10,000 rows: each of three nodes with ?spread=1 == one node, and it spread"] = \
         bool(one_all) and three_all == one_all and all(o == one_all for o in others_all) and spread_all
+    # a DEFINE that reads the match so far (up counts its own rows), over the same 10,000 rows: each of three nodes with
+    # ?spread=1 == one node, and both == the reference's answer, computed here from the rows
+    read_q = ("SELECT symbol, start_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+              "MEASURES strt.day AS start_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+              "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+              "up AS up.price > PREV(up.price) AND count(up.*) < 6) ORDER BY symbol, start_day")
+    want_read = []
+    for part in pc.partitions_of([{"symbol": s, "day": d, "price": p} for s, d, p in tick_rows], "symbol", "day"):
+        truth = pc.truth_of_text(part, {"down": "price < PREV(price)", "up": "price > PREV(price) AND count(up.*) < 6"})
+        for m in pc.find_matches(truth, pc.parse_pattern("strt down+ up+"), pc.parse_skip("TO LAST up")):
+            want_read.append({"symbol": part[0]["symbol"], "start_day": part[m.start]["day"],
+                              "end_day": part[pc.pos_of(m, "up")[-1]]["day"]})
+    want_read.sort(key=lambda r: (r["symbol"], r["start_day"]))
+    one_read = call(A.port, "POST", "/sql?spread=0", read_q.encode(), timeout=120)
+    before = spreads(A.port + 1)
+    three_read = call(A.port + 1, "POST", "/sql?spread=1", read_q.encode(), timeout=120)
+    spread_read = spreads(A.port + 1) - before > 0
+    others_read = [call(p, "POST", "/sql?spread=1", read_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
+    info["DEFINE reading the match, matches over 50 symbols"] = len(want_read)
+    checks["a DEFINE that reads the match so far, over the same 10,000 rows: one node == the reference, each of three nodes with ?spread=1 == one node, and it spread"] = \
+        bool(want_read) and one_read == want_read and three_read == one_read and all(o == one_read for o in others_read) and spread_read
+    # 10,000 partitions of two rows: a DEFINE that counts its own rows (a+ takes one row of a partition, then the next one),
+    # so two matches a partition, the second starting at the second row: the count and the sum of the first rows
+    pt_rows = [{"k": k, "d": d, "price": 100 + (k * 7 + d) % 13} for k in range(1, 10001) for d in (1, 2)]
+    q("CREATE TABLE pt (k INT, d INT, price INT)")
+    pvals = [f"({r['k']}, {r['d']}, {r['price']})" for r in pt_rows]
+    for i in range(0, len(pvals), 1000):
+        q("INSERT INTO pt VALUES " + ", ".join(pvals[i:i + 1000]))
+    for p in range(A.port, A.port + 3):
+        until(lambda p=p: sql(p, "SELECT count(*) AS n FROM pt"), [{"n": 20000}], 60)
+    pt_q = ("SELECT count(*) AS n, sum(s) AS total FROM pt MATCH_RECOGNIZE (PARTITION BY k ORDER BY d MEASURES FIRST(d) AS s "
+            "ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (a+) DEFINE a AS count(a.*) <= 1)")
+    pt_n = pt_total = 0
+    for part in pc.partitions_of(pt_rows, "k", "d"):
+        for m in pc.find_matches(pc.truth_of_text(part, {"a": "count(a.*) <= 1"}), pc.parse_pattern("a+"), pc.parse_skip("PAST LAST ROW")):
+            pt_n += 1
+            pt_total += part[m.start]["d"]
+    want_pt = [{"n": pt_n, "total": pt_total}]
+    one_pt = call(A.port, "POST", "/sql?spread=0", pt_q.encode(), timeout=120)
+    three_pt = call(A.port + 1, "POST", "/sql?spread=1", pt_q.encode(), timeout=120)
+    checks["10,000 partitions of two rows, a DEFINE that counts its own rows: one node and three (?spread=1) answer the reference's matches and their total"] = \
+        one_pt == want_pt and three_pt == want_pt
     # views: a stored view and a materialized view of the brief's query, the materialized one kept live
     view_q = ticker_q.rsplit(" ORDER BY ", 1)[0]
     q(f"CREATE VIEW ticker_v AS {view_q}")
