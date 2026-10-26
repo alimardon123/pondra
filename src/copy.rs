@@ -5,7 +5,7 @@
 use crate::ext::{covering, list, owner, register, uncovered};
 use crate::ext_names::{format_of, scheme, NULL_FOLDER};
 use crate::log::{forget_producers, now_ms};
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, producer_key, table_key, Lake, TableMeta, QUIET};
 use crate::write::Stmt;
 use std::sync::Arc;

@@ -11,7 +11,7 @@
 //!
 //! A statement's quoted values are written as `'***'` when it makes a user, a token or a secret.
 //! Rows reach the log a moment later, in batches, from a writer on each node: nothing waits for it.
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};

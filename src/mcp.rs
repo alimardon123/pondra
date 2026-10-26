@@ -7,7 +7,7 @@
 //! back share one session, so a `write` of `BEGIN` is a transaction the next calls are in, until
 //! `COMMIT`, `ROLLBACK`, or `DELETE /mcp` with the id (`txn.rs`, `temp.rs`).
 use crate::auth::Role;
-use crate::server::App;
+use crate::app::App;
 use crate::store::{Lake, TableMeta};
 use crate::views::View;
 use anyhow::Result;

@@ -82,6 +82,7 @@ mod rules;
 // Feature `server`, on by default; every module the node is made of is one of these.
 #[cfg(feature = "doors")] pub mod cli;
 #[cfg(feature = "lake")] mod adopt;
+#[cfg(feature = "lake")] mod app;
 #[cfg(feature = "lake")] mod audit;
 #[cfg(feature = "lake")] mod ai;
 #[cfg(feature = "lake")] mod avro;
@@ -189,7 +190,7 @@ mod rules;
 #[cfg(feature = "doors")] mod service;
 #[cfg(feature = "lake")] mod spill;
 #[cfg(feature = "lake")] mod spmd;
-#[cfg(feature = "doors")] mod statement;
+#[cfg(feature = "lake")] mod statement;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;

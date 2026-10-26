@@ -755,7 +755,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    than here doesn't decide alone (`guard::spread_runs`: the other nodes saw the query cold), so
    the model decides until a second agrees; one slow first run kept the cluster bench's q1 on one
    node for good (`harness.py guard`: "one spread run slower than here doesn't decide alone").
-   Every run here is timed (`server::query_listed`), however quick: kept only past 20 ms, a query
+   Every run here is timed (`app::App::query_listed`), however quick: kept only past 20 ms, a query
    learned spread was never known to be faster here, and the third node of `harness.py guard`
    spread it now and then. Only the bytes it read, for this node's rate, wait for a run of 20 ms.
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
@@ -1888,7 +1888,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    columns to the table's types). Written as it was, a table with an `INTERVAL` column never left
    the log, and its `DROP TABLE` failed (the 0.33.0 gates). `harness.py tiering`: "INTERVAL columns
    tiered, merged and changed, read back exactly".
-258. **One table's tiering round failing stops no other table's** (`server::each`, in `tier_all`):
+258. **One table's tiering round failing stops no other table's** (`app::each`, in `app::App::tier_all`):
    each table's fold, purge and maintenance is its own, and the round names every table that failed
    once the rest are done. With one round for all, a table with an `INTERVAL` column stopped every
    table of the lake from leaving the log. (No test makes a table's round fail now that 257 holds;
@@ -2168,7 +2168,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
    whole (442 MB against 715 when written). A door's own query sends its answer from its plan
    (invariant 421).
-289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
+289. **A node runs at most `PONDRA_QUERIES` queries at once** (`app::TURNS`: four a core, 16 at
    least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
    refused (53300: a client asks again, or another node). A query run inside one this task runs (a
    procedure's, a script's, a probe of DuckDB's spellings) uses its caller's turn (`TURN`), never

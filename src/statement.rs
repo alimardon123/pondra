@@ -5,7 +5,7 @@
 
 use crate::audit;
 use crate::routines::{self, Outcome, Request, Who};
-use crate::server::{App, Kept};
+use crate::app::{App, Kept};
 use crate::temp;
 use anyhow::Result;
 use bytes::Bytes;

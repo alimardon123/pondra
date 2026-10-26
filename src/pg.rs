@@ -11,7 +11,7 @@
 //! the provider says `POSTGRES 'oauth'`, through OAUTHBEARER, which psql 18 fetches itself (ADR-074).
 //! Each statement runs as whoever signed in (`auth::WHO`).
 use crate::pg_types::Ty;
-use crate::server::App;
+use crate::app::App;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
@@ -659,7 +659,7 @@ impl Backend {
     /// lookup until the next commit, however many connections ask. Never in a transaction (its own
     /// writes and snapshot). Kept as Arrow, so each connection sends it in its own formats.
     async fn answer(&self, sql: &str) -> anyhow::Result<Vec<RecordBatch>> {
-        use crate::server::Kept;
+        use crate::app::Kept;
         let version = match crate::txn::open() {
             true => None,
             false => self.app.remembers(sql).await,

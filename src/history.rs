@@ -20,7 +20,7 @@
 //! second. At most `PONDRA_HISTORY_RATE` (500) rows a second are written a node: past that, the
 //! fast statements that went well are counted in one row, not written one by one. A slow or failed
 //! statement is always written. `PONDRA_HISTORY=off` keeps none.
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, ListBuilder, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray};

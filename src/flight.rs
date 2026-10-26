@@ -20,7 +20,7 @@
 //! - **Tokens:** `authorization: Bearer <token>`, or a handshake with basic auth whose password is
 //!   the token (what ADBC and pyarrow's `authenticate_basic_token` send).
 use crate::auth::Role;
-use crate::server::App;
+use crate::app::App;
 use crate::store::{table_key, TableMeta};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;

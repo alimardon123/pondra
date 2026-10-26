@@ -8,7 +8,7 @@
 //! that only it can redeem (`/sso/token`, with a verifier of its own). Nothing is kept on a node: the
 //! flow rides in a cookie signed with the lake's key, so any node of the lake finishes a flow another
 //! started.
-use crate::server::App;
+use crate::app::App;
 use crate::sso::Claimed;
 use crate::tls::Peer;
 use anyhow::{bail, ensure, Context, Result};
