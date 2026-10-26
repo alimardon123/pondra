@@ -438,7 +438,7 @@ async fn drain(plan: &Arc<dyn ExecutionPlan>, ctx: Arc<datafusion::execution::Ta
 
 /// `f`, a part of the query on `node`, its time in the statement's trace (`history::span`).
 async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Future<Output = T>) -> T {
-    let began = std::time::Instant::now();
+    let began = datafusion::common::instant::Instant::now();
     let out = f.await;
     crate::history::span(what, node, began);
     out

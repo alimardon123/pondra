@@ -446,7 +446,7 @@ fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)]) -> Result<(Vec<Record
 
 /// A record batch (v2, uncompressed) of an idempotent producer.
 fn encode((producer, epoch, seq): (i64, i16, i32), recs: &[(Option<Vec<u8>>, Option<Vec<u8>>)]) -> Vec<u8> {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    let ts = crate::log::now_ms() as i64;
     let mut body = vec![];
     for (i, (key, value)) in recs.iter().enumerate() {
         let mut rec = vec![0u8];

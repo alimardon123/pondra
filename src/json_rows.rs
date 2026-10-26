@@ -394,7 +394,7 @@ mod tests {
     fn best_of_five<R>(mut read: impl FnMut() -> R) -> std::time::Duration {
         (0..5)
             .map(|_| {
-                let start = std::time::Instant::now();
+                let start = datafusion::common::instant::Instant::now();
                 std::hint::black_box(read());
                 start.elapsed()
             })

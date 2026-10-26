@@ -819,7 +819,7 @@ pub async fn lent(lake: &Lake, urls: &[String]) -> Result<Vec<(String, Secret)>>
 /// The bearer token for a REST catalog, from the secret covering it: its TOKEN, or one its
 /// CLIENT_ID and CLIENT_SECRET get (OAuth's client credentials), kept until it expires.
 pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
-    crate::per_node!(static TOKENS: Mutex<Option<HashMap<String, (String, std::time::Instant)>>> = Mutex::new(None));
+    crate::per_node!(static TOKENS: Mutex<Option<HashMap<String, (String, datafusion::common::instant::Instant)>>> = Mutex::new(None));
     let Some((name, secret)) = covering(&list(lake).await?, url).filter(|(_, s)| s.kind == "iceberg") else { return Ok(None) };
     let p = open(&name, &secret)?;
     if let Some(t) = p.get("token") {
@@ -828,7 +828,7 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     let (Some(id), Some(pass)) = (p.get("client_id"), p.get("client_secret")) else { return Ok(None) };
     let key = format!("{name}:{}", secret.sealed);
     if let Some((t, until)) = TOKENS.lock().unwrap().get_or_insert_default().get(&key) {
-        if std::time::Instant::now() < *until {
+        if datafusion::common::instant::Instant::now() < *until {
             return Ok(Some(t.clone()));
         }
     }
@@ -841,7 +841,7 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));
     let t = body["access_token"].as_str().context("a token answer without access_token")?.to_string();
     let life = body["expires_in"].as_u64().unwrap_or(3600).saturating_sub(60);
-    TOKENS.lock().unwrap().get_or_insert_default().insert(key, (t.clone(), std::time::Instant::now() + std::time::Duration::from_secs(life)));
+    TOKENS.lock().unwrap().get_or_insert_default().insert(key, (t.clone(), datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(life)));
     Ok(Some(t))
 }
 

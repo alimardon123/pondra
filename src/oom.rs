@@ -17,7 +17,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 /// What a stopped request answers (SQLSTATE 53200: `codes::by_words` reads "out of memory").
 pub const OOM: &str = "out of memory: the node was nearly out of memory and stopped this query, the one that grew it (PONDRA_MEMORY_MAX_GB); a write in it may or may not have been applied";

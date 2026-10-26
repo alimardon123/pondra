@@ -1169,14 +1169,14 @@ tokio::task_local! {
 /// `PONDRA_TRACE_QUERY=1`: where one HTTP `/sql` statement's time goes, one line on stderr at its end. A stage is the
 /// time since the mark before it, so the stages add up to the statement's time up to its last mark.
 struct StatementTrace {
-    start: std::time::Instant,
-    last: std::time::Instant,
+    start: datafusion::common::instant::Instant,
+    last: datafusion::common::instant::Instant,
     stages: Vec<(&'static str, f64)>, // (name, ms)
 }
 
 impl StatementTrace {
     fn mark(&mut self, stage: &'static str) {
-        let now = std::time::Instant::now();
+        let now = datafusion::common::instant::Instant::now();
         self.stages.push((stage, (now - self.last).as_secs_f64() * 1000.0));
         self.last = now;
     }
@@ -1199,7 +1199,7 @@ pub async fn traced<T>(work: impl std::future::Future<Output = T>) -> T {
     if !tracing() {
         return work.await;
     }
-    let now = std::time::Instant::now();
+    let now = datafusion::common::instant::Instant::now();
     let trace = std::cell::RefCell::new(Some(StatementTrace { start: now, last: now, stages: vec![] }));
     TRACE.scope(trace, async {
         let out = work.await;

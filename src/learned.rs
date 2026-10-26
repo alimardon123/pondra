@@ -241,7 +241,7 @@ struct Known {
     name: String, // (the lake's own name: `lake.s.t` is its `s.t`)
     facts: HashMap<(String, String), (i64, f64)>,
     newest: i64, // (the newest history row read, µs)
-    read: Option<std::time::Instant>,
+    read: Option<datafusion::common::instant::Instant>,
     reading: bool,
 }
 
@@ -301,7 +301,7 @@ pub fn note(facts: &[Fact]) {
     if facts.is_empty() || !on() {
         return;
     }
-    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64);
+    let at = crate::log::now_us() as i64;
     let mut k = known_mut();
     for f in facts {
         keep(&mut k, at, f);
@@ -443,7 +443,7 @@ fn refresh() {
     impl Drop for Done {
         fn drop(&mut self) {
             let mut k = known_mut();
-            (k.reading, k.read) = (false, Some(std::time::Instant::now()));
+            (k.reading, k.read) = (false, Some(datafusion::common::instant::Instant::now()));
         }
     }
     let done = Done;

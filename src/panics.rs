@@ -10,7 +10,7 @@
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::time::Instant;
+use datafusion::common::instant::Instant;
 
 /// Run a request: `Err` (the panic's message) if it panicked.
 pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
@@ -108,7 +108,7 @@ pub(crate) fn note(resident: usize) {
 
 /// Stops the request the watch chose (`oom::pick`), if one qualifies: it is aborted, so its future is
 /// dropped and answers [`crate::oom::OOM`]. True if one was stopped.
-pub(crate) fn stop_one(now: std::time::Instant, margin: usize) -> bool {
+pub(crate) fn stop_one(now: Instant, margin: usize) -> bool {
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(id) = crate::oom::pick(&running, now, crate::oom::seen(), margin) else { return false };
     let Some(r) = running.get_mut(&id) else { return false };

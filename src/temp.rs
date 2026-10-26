@@ -25,7 +25,8 @@ use datafusion::sql::sqlparser::ast;
 use serde_json::{json as j, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 tokio::task_local! {
     /// The session a request belongs to, if any.

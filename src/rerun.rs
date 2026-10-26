@@ -35,7 +35,8 @@ use datafusion::prelude::{cast, ident, lit, DataFrame, SessionContext};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 /// How a view that runs its query again is kept.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
