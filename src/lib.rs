@@ -96,6 +96,7 @@ mod rules;
 #[cfg(feature = "lake")] mod catalogs;
 #[cfg(feature = "lake")] mod change;
 #[cfg(feature = "lake")] mod copy;
+#[cfg(feature = "lake")] pub mod crypto;
 #[cfg(feature = "lake")] mod cursors;
 #[cfg(feature = "lake")] mod guard;
 #[cfg(feature = "lake")] mod hilbert;

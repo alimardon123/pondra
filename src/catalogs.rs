@@ -146,8 +146,8 @@ impl Rest {
         let u = url::Url::parse(&location).with_context(|| format!("{url}: its location {location}"))?;
         ensure!(matches!(u.scheme(), "s3" | "s3a"), "{url}: {} vends credentials for {location}, which Pondra takes only for s3:// yet: CREATE SECRET … with SCOPE '{location}'", options["table"]);
         let bucket = format!("s3://{}", u.host_str().context("no bucket in the table's location")?);
-        let id = crate::text::hex(&aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, format!("{url}\n{}\n{}\n{location}", options["namespace"], options["table"]).as_bytes()).as_ref()[..12]);
-        let made = crate::text::hex(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, serde_json::to_vec(&params)?.as_slice()).as_ref());
+        let id = crate::text::hex(&crate::crypto::sha256(format!("{url}\n{}\n{}\n{location}", options["namespace"], options["table"]).as_bytes())[..12]);
+        let made = crate::text::hex(&crate::crypto::sha256(serde_json::to_vec(&params)?.as_slice()));
         let root = format!("delegated://{id}");
         let store = stored(&root, &made, || Ok(Arc::new(crate::cache::CachedStore::files(crate::ext::build(&url::Url::parse(&bucket)?, Some(&params), crate::ext::For::Files)?))))?;
         lake.rt.register_object_store(&url::Url::parse(&root)?, store.clone());

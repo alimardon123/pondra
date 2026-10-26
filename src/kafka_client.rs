@@ -129,7 +129,7 @@ async fn login(io: &mut (Box<dyn Stream>, i32, bool), mech: &str, user: &str, pa
                 authenticate(io, format!("\0{user}\0{pass}").as_bytes()).await?;
             }
             _ => {
-                let (alg, len) = if mech == "SCRAM-SHA-512" { (aws_lc_rs::hmac::HMAC_SHA512, 64) } else { (aws_lc_rs::hmac::HMAC_SHA256, 32) };
+                let len = if mech == "SCRAM-SHA-512" { 64 } else { 32 };
                 let nonce = uuid::Uuid::new_v4().simple().to_string();
                 let first_bare = format!("n={},r={nonce}", user.replace('=', "=3D").replace(',', "=2C"));
                 let server_first = String::from_utf8(authenticate(io, format!("n,,{first_bare}").as_bytes()).await?)?;
@@ -139,15 +139,16 @@ async fn login(io: &mut (Box<dyn Stream>, i32, bool), mech: &str, user: &str, pa
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD;
                 let mut salted = vec![0u8; len];
-                let pbkdf = if len == 64 { aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA512 } else { aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256 };
-                aws_lc_rs::pbkdf2::derive(pbkdf, std::num::NonZeroU32::new(iterations).context("SCRAM: 0 iterations")?, &b64.decode(salt)?, pass.as_bytes(), &mut salted);
-                let key = aws_lc_rs::hmac::Key::new(alg, &salted);
-                let client_key = aws_lc_rs::hmac::sign(&key, b"Client Key");
-                let stored = aws_lc_rs::digest::digest(if len == 64 { &aws_lc_rs::digest::SHA512 } else { &aws_lc_rs::digest::SHA256 }, client_key.as_ref());
+                let iterations = std::num::NonZeroU32::new(iterations).context("SCRAM: 0 iterations")?;
+                let salt = b64.decode(salt)?;
+                if len == 64 { crate::crypto::pbkdf2_sha512(iterations, &salt, pass.as_bytes(), &mut salted) } else { crate::crypto::pbkdf2_sha256(iterations, &salt, pass.as_bytes(), &mut salted) }
+                let hmac = |key: &[u8], data: &[u8]| -> Vec<u8> { if len == 64 { crate::crypto::hmac_sha512(key, data).to_vec() } else { crate::crypto::hmac_sha256(key, data).to_vec() } };
+                let client_key = hmac(&salted, b"Client Key");
+                let stored = if len == 64 { crate::crypto::sha512(&client_key).to_vec() } else { crate::crypto::sha256(&client_key).to_vec() };
                 let without_proof = format!("c=biws,r={r}");
                 let auth = format!("{first_bare},{server_first},{without_proof}");
-                let signature = aws_lc_rs::hmac::sign(&aws_lc_rs::hmac::Key::new(alg, stored.as_ref()), auth.as_bytes());
-                let proof: Vec<u8> = client_key.as_ref().iter().zip(signature.as_ref()).map(|(a, b)| a ^ b).collect();
+                let signature = hmac(&stored, auth.as_bytes());
+                let proof: Vec<u8> = client_key.iter().zip(&signature).map(|(a, b)| a ^ b).collect();
                 authenticate(io, format!("{without_proof},p={}", b64.encode(proof)).as_bytes()).await?;
             }
         }

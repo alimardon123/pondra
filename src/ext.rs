@@ -11,7 +11,6 @@
 //! append table's files (with no log).
 use crate::store::{json, DataFile, Lake, TableMeta};
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::sql::sqlparser::ast::Value;
@@ -1297,15 +1296,16 @@ fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
 /// `plain` sealed with a new data key: (the sealed values, the data key wrapped by the master key).
 fn seal_new(plain: &[u8]) -> Result<(String, String)> {
     let mut key = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut key).map_err(|_| anyhow!("no randomness"))?;
+    crate::crypto::random(&mut key)?;
     Ok((seal_with(&key, plain)?, wrap_key(&key)?))
 }
 
 fn seal_with(key: &[u8], plain: &[u8]) -> Result<String> {
     let mut nonce = [0u8; 12];
-    aws_lc_rs::rand::fill(&mut nonce).map_err(|_| anyhow!("no randomness"))?;
+    crate::crypto::random(&mut nonce)?;
+    let key: &[u8; 32] = key.try_into().map_err(|_| anyhow!("key"))?;
     let mut data = plain.to_vec();
-    LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| anyhow!("key"))?).seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut data).map_err(|_| anyhow!("sealing failed"))?;
+    crate::crypto::seal(key, nonce, &mut data)?;
     Ok(B64.encode([nonce.as_slice(), &data].concat()))
 }
 
@@ -1314,8 +1314,8 @@ fn open_with(key: &[u8], sealed: &str) -> Option<Vec<u8>> {
     (sealed.len() > 12).then_some(())?;
     let (nonce, data) = sealed.split_at(12);
     let mut data = data.to_vec();
-    let key = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).ok()?);
-    key.open_in_place(Nonce::try_assume_unique_for_key(nonce).ok()?, Aad::empty(), &mut data).ok().map(|p| p.to_vec())
+    let key: &[u8; 32] = key.try_into().ok()?;
+    crate::crypto::open(key, nonce.try_into().ok()?, &mut data).ok().map(|p| p.to_vec())
 }
 
 crate::per_node!(
@@ -1458,13 +1458,13 @@ fn admin_key(token: &str) -> [u8; 32] {
     }
     let mut key = [0u8; 32];
     let rounds = std::num::NonZeroU32::new(100_000).expect("non-zero");
-    aws_lc_rs::pbkdf2::derive(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, rounds, b"pondra: the master key from the admin token", token.as_bytes(), &mut key);
+    crate::crypto::pbkdf2_sha256(rounds, b"pondra: the master key from the admin token", token.as_bytes(), &mut key);
     KEYS.lock().unwrap().insert(token.to_string(), key);
     key
 }
 
 /// A key's SHA-256: the 32 bytes AES-256 takes.
-fn sha256_of(key: &str) -> [u8; 32] { aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key.as_bytes()).as_ref().try_into().expect("32 bytes") }
+fn sha256_of(key: &str) -> [u8; 32] { crate::crypto::sha256(key.as_bytes()) }
 
 /// This machine's key if an older release made one (`machine_key`'s file): never made here.
 fn machine_key_if_made() -> Option<String> {
@@ -1484,7 +1484,7 @@ fn machine_key() -> Result<String> {
     }
     std::fs::create_dir_all(path.parent().expect("a folder"))?;
     let mut bytes = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut bytes).map_err(|_| anyhow!("no randomness"))?;
+    crate::crypto::random(&mut bytes)?;
     let key: String = crate::text::hex(&bytes);
     match link_key(&key, &path) {
         Ok(()) => Ok(key),
@@ -1508,7 +1508,7 @@ fn checked_key(path: &std::path::Path, text: &str) -> Result<String> {
 /// leaves at most a stray file beside the key, never half a key.
 fn link_key(key: &str, path: &std::path::Path) -> std::io::Result<()> {
     let mut salt = [0u8; 8];
-    aws_lc_rs::rand::fill(&mut salt).map_err(|_| std::io::Error::other("no randomness"))?;
+    crate::crypto::random(&mut salt).map_err(|_| std::io::Error::other("no randomness"))?;
     let tmp = path.with_file_name(format!("secret.key.{}.{}", std::process::id(), crate::text::hex(&salt)));
     let mut f = std::fs::OpenOptions::new();
     f.write(true).create_new(true);

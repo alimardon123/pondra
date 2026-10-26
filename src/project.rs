@@ -640,9 +640,9 @@ async fn browser_token(http: &reqwest::Client, api: &str, provider: Option<&str>
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let back = format!("http://127.0.0.1:{}/", listener.local_addr()?.port());
     let mut secret = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut secret).map_err(|_| anyhow::anyhow!("no randomness"))?;
+    crate::crypto::random(&mut secret)?;
     let verifier = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, secret);
-    let challenge = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, verifier.as_bytes()));
+    let challenge = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, crate::crypto::sha256(verifier.as_bytes()));
     let mut start = reqwest::Url::parse(&format!("{api}/sso/{name}/start"))?;
     start.query_pairs_mut().append_pair("to", &back).append_pair("challenge", &challenge);
     eprintln!("signing in through {name} in your browser: {start}\n(once you are signed in there, the page asks you to continue to this command line)");

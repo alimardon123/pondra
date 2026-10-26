@@ -331,7 +331,7 @@ pub async fn sealed_into(store: &crate::store::Store, dir: &str, files: &[DataFi
     async fn put(store: &crate::store::Store, dir: &str, value: &impl Serialize, written: &mut Vec<String>) -> Result<String> {
         use object_store::ObjectStore;
         let body = serde_json::to_vec(value)?;
-        let name = crate::text::hex(&aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &body).as_ref()[..16]);
+        let name = crate::text::hex(&crate::crypto::sha256(&body)[..16]);
         let path = format!("{dir}/{name}.json.zst");
         let opts = object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
         match store.put_opts(&object_store::path::Path::from(path.as_str()), zstd::encode_all(&body[..], 3)?.into(), opts).await {

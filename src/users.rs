@@ -12,7 +12,6 @@
 use crate::auth::{Principal, Role};
 use crate::store::{json, Lake};
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use aws_lc_rs::{digest, hmac};
 use base64::{engine::general_purpose::STANDARD as B64, engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
@@ -689,19 +688,19 @@ async fn resolved(lake: &Lake, on: On) -> Result<On> {
 
 // ---------------------------------------------------------------- passwords, tokens, sessions
 
-pub fn sha256(s: &str) -> String { crate::text::hex(digest::digest(&digest::SHA256, s.as_bytes()).as_ref()) }
+pub fn sha256(s: &str) -> String { crate::text::hex(&crate::crypto::sha256(s.as_bytes())) }
 
 /// A new token for `user`, as `CREATE TOKEN` makes it: `pt_<user>_<32 random bytes>` (base64url) and
 /// its SHA-256 (hex), the only part kept. The randomness can't fail on a machine that runs this.
 pub fn new_token(user: &str) -> (String, String) {
     let mut secret = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut secret).expect("randomness");
+    crate::crypto::random(&mut secret).expect("randomness");
     let token = format!("pt_{}_{}", B64U.encode(user), B64U.encode(secret));
     let hash = sha256(&token);
     (token, hash)
 }
 
-fn hmac256(key: &[u8], data: &[u8]) -> Vec<u8> { hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data).as_ref().to_vec() }
+fn hmac256(key: &[u8], data: &[u8]) -> Vec<u8> { crate::crypto::hmac_sha256(key, data).to_vec() }
 
 /// SCRAM's iterations (RFC 7677's 4,096 at least; Postgres's default is 4,096): a login costs this
 /// many HMACs, about 10 ms; a password checked is remembered a minute (`VERIFIED`).
@@ -710,7 +709,7 @@ const ITERATIONS: u32 = 10_000;
 impl Verifier {
     pub fn of(password: &str) -> Verifier {
         let mut salt = [0u8; 16];
-        aws_lc_rs::rand::fill(&mut salt).expect("randomness");
+        crate::crypto::random(&mut salt).expect("randomness");
         Verifier::with(password, &salt, ITERATIONS)
     }
     pub fn with(password: &str, salt: &[u8], iterations: u32) -> Verifier {
@@ -719,7 +718,7 @@ impl Verifier {
         Verifier {
             salt: B64.encode(salt),
             iterations,
-            stored_key: B64.encode(digest::digest(&digest::SHA256, &client_key)),
+            stored_key: B64.encode(crate::crypto::sha256(&client_key)),
             server_key: B64.encode(hmac256(&salted, b"Server Key")),
         }
     }
@@ -727,14 +726,14 @@ impl Verifier {
     pub fn matches(&self, password: &str) -> bool {
         let Ok(salt) = B64.decode(&self.salt) else { return false };
         let other = Verifier::with(password, &salt, self.iterations);
-        aws_lc_rs::constant_time::verify_slices_are_equal(other.stored_key.as_bytes(), self.stored_key.as_bytes()).is_ok()
+        crate::crypto::same(other.stored_key.as_bytes(), self.stored_key.as_bytes())
     }
 }
 
 /// SCRAM's Hi(): PBKDF2-HMAC-SHA-256 of the password (SASLprep'd as ASCII-printable is: as given).
 fn salted(password: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
     let mut out = vec![0u8; 32];
-    aws_lc_rs::pbkdf2::derive(aws_lc_rs::pbkdf2::PBKDF2_HMAC_SHA256, std::num::NonZeroU32::new(iterations.max(1)).expect("non-zero"), salt, password.as_bytes(), &mut out);
+    crate::crypto::pbkdf2_sha256(std::num::NonZeroU32::new(iterations.max(1)).expect("non-zero"), salt, password.as_bytes(), &mut out);
     out
 }
 
@@ -753,7 +752,7 @@ impl Scram {
         let bare = client_first.strip_prefix("n,,").or_else(|| client_first.strip_prefix("y,,")).context("SCRAM without channel binding (n,,)")?;
         let cnonce = bare.split(',').find_map(|p| p.strip_prefix("r=")).context("the client's nonce")?;
         let mut more = [0u8; 18];
-        aws_lc_rs::rand::fill(&mut more).map_err(|_| anyhow!("no randomness"))?;
+        crate::crypto::random(&mut more)?;
         let nonce = format!("{cnonce}{}", B64.encode(more));
         let server_first = format!("r={nonce},s={},i={}", verifier.salt, verifier.iterations);
         Ok((Scram { verifier, nonce, first_bare: bare.to_string(), server_first: server_first.clone() }, server_first))
@@ -769,8 +768,8 @@ impl Scram {
         let proof = B64.decode(proof)?;
         ensure!(proof.len() == signature.len(), "a proof of the wrong length");
         let client_key: Vec<u8> = proof.iter().zip(&signature).map(|(a, b)| a ^ b).collect();
-        let check = digest::digest(&digest::SHA256, &client_key);
-        ensure!(aws_lc_rs::constant_time::verify_slices_are_equal(check.as_ref(), &stored).is_ok(), "password authentication failed");
+        let check = crate::crypto::sha256(&client_key);
+        ensure!(crate::crypto::same(&check, &stored), "password authentication failed");
         Ok(format!("v={}", B64.encode(hmac256(&B64.decode(&self.verifier.server_key)?, auth.as_bytes()))))
     }
 }
@@ -833,8 +832,8 @@ async fn keys(lake: &Lake) -> Result<Keys> {
         None => {
             let mut a = [0u8; 32];
             let mut b = [0u8; 32];
-            aws_lc_rs::rand::fill(&mut a).map_err(|_| anyhow!("no randomness"))?;
-            aws_lc_rs::rand::fill(&mut b).map_err(|_| anyhow!("no randomness"))?;
+            crate::crypto::random(&mut a)?;
+            crate::crypto::random(&mut b)?;
             let k = Keys { session: B64.encode(a), node: format!("pn_{}", B64U.encode(b)) };
             ensure!(lake.cat.is_writer(), "the lake's keys aren't made yet: its leader makes them when it starts");
             // (sealed from the first write when no release older than format 3 can read the lake; otherwise
@@ -988,7 +987,7 @@ async fn signed_session(lake: &Lake, mut payload: Value) -> Result<(String, u64)
 /// `labelled` for anything else.
 async fn verified(lake: &Lake, data: &[u8], payload: &str, sig: &str) -> Option<Value> {
     let key = B64.decode(keys(lake).await.ok()?.session).ok()?;
-    hmac::verify(&hmac::Key::new(hmac::HMAC_SHA256, &key), data, &B64U.decode(sig).ok()?).ok()?;
+    crate::crypto::verify_hmac_sha256(&key, data, &B64U.decode(sig).ok()?).then_some(())?;
     serde_json::from_slice(&B64U.decode(payload).ok()?).ok()
 }
 
@@ -1048,7 +1047,7 @@ async fn token_user(lake: &Lake, token: &str) -> Option<String> {
     let u = lake.cat.get::<User>(&user_key(&user)).await.ok()??;
     let hash = sha256(token);
     let now = crate::log::now_ms();
-    (u.login && u.tokens.iter().any(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.hash.as_bytes(), hash.as_bytes()).is_ok() && t.expires_ms.is_none_or(|x| x > now))).then_some(user)
+    (u.login && u.tokens.iter().any(|t| crate::crypto::same(t.hash.as_bytes(), hash.as_bytes()) && t.expires_ms.is_none_or(|x| x > now))).then_some(user)
 }
 
 // ---------------------------------------------------------------- who is asking, and what they may do
@@ -1346,7 +1345,7 @@ pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) ->
             return claimed(lake, &c.ok()?).await.ok(); // (an identity provider's: ADR-074)
         }
         // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
-        if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.node.as_bytes(), token.as_bytes()).is_ok()) {
+        if token.starts_with("pn_") && !auth.admin_set() && keys(lake).await.is_ok_and(|k| crate::crypto::same(k.node.as_bytes(), token.as_bytes())) {
             return Some(Principal::token(Role::Admin));
         }
         if token.starts_with("ps_") {
@@ -1368,7 +1367,7 @@ pub fn is_token(user: &str, password: &str) -> bool { BUILT_IN.contains(&user) |
 pub async fn sign_in(lake: &Lake, auth: &crate::auth::Auth, user: &str, password: &str) -> Option<Principal> {
     if BUILT_IN.contains(&user) {
         let role = auth.token_role(password);
-        return (role > Role::None && auth.token_for(user).is_some_and(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.as_bytes(), password.as_bytes()).is_ok())).then(|| Principal::token(role));
+        return (role > Role::None && auth.token_for(user).is_some_and(|t| crate::crypto::same(t.as_bytes(), password.as_bytes()))).then(|| Principal::token(role));
     }
     if let Some(c) = crate::sso::check(lake, password).await {
         // (an identity provider's token as the password: it signs in only the user it names)
@@ -1437,8 +1436,8 @@ mod tests {
         let auth = format!("n=user,r=rOprNGfwEbeRWgbNEkqO,{first},{without}");
         let salted = salted("pencil", &B64.decode(&v.salt).unwrap(), 4096);
         let client_key = hmac256(&salted, b"Client Key");
-        let stored = digest::digest(&digest::SHA256, &client_key);
-        let sig = hmac256(stored.as_ref(), auth.as_bytes());
+        let stored = crate::crypto::sha256(&client_key);
+        let sig = hmac256(&stored, auth.as_bytes());
         let proof: Vec<u8> = client_key.iter().zip(&sig).map(|(a, b)| a ^ b).collect();
         let last = s.last(&format!("{without},p={}", B64.encode(proof))).unwrap();
         assert_eq!(last, format!("v={}", B64.encode(hmac256(&hmac256(&salted, b"Server Key"), auth.as_bytes()))));

@@ -22,7 +22,7 @@ node and every child process would read it, and beside a library's host it is a 
 
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
-lists that nothing reads.
+lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
 
 Only the standard library; it reads the source, not a build.
 """
@@ -284,6 +284,9 @@ def settings():
                     read.add(name)
                     if name not in names and f not in NOT_READ:
                         bad.append(f"src/{rel}:{n}: {name} isn't in env.rs's NAMES: add it there with who it is for (or the file to NOT_READ in tools/per_node_check.py with why)")
+    own = sources[os.path.join(SRC, "env.rs")]  # (a rule env.rs keeps itself, the same in every form, reads its setting too)
+    start = own.index("pub const NAMES")
+    read |= set(NAME.findall(own[:start] + own[own.index("];", start):]))
     return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
 
 

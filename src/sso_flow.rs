@@ -267,12 +267,12 @@ async fn client_secret(app: &App, name: &str) -> Result<String> {
 
 fn random() -> String {
     let mut b = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut b).expect("randomness");
+    crate::crypto::random(&mut b).expect("randomness");
     B64U.encode(b)
 }
 
 /// PKCE's S256: the base64url SHA-256 of a verifier.
-fn s256(verifier: &str) -> String { B64U.encode(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, verifier.as_bytes())) }
+fn s256(verifier: &str) -> String { B64U.encode(crate::crypto::sha256(verifier.as_bytes())) }
 
 fn encode(s: &str) -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() }
 

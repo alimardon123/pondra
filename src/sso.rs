@@ -8,7 +8,6 @@
 use crate::store::{json, Lake};
 use crate::users::{Words, W};
 use anyhow::{bail, ensure, Context, Result};
-use aws_lc_rs::signature;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
@@ -608,21 +607,16 @@ fn jwks(v: &Value) -> Vec<Jwk> {
 }
 
 fn verify(key: &Jwk, alg: &str, signed: &[u8], sig: &[u8]) -> Result<()> {
-    use signature::{UnparsedPublicKey, VerificationAlgorithm};
-    let ec = |a: &'static dyn VerificationAlgorithm, point: &[u8]| UnparsedPublicKey::new(a, point).verify(signed, sig).is_ok();
     let ok = match (key, alg) {
-        (Jwk::Rsa { n, e, .. }, _) => {
-            let params = match alg {
-                "RS256" => &signature::RSA_PKCS1_2048_8192_SHA256,
-                "RS384" => &signature::RSA_PKCS1_2048_8192_SHA384,
-                "RS512" => &signature::RSA_PKCS1_2048_8192_SHA512,
-                "PS256" => &signature::RSA_PSS_2048_8192_SHA256,
-                _ => bail!("{alg} isn't an RSA key's"),
-            };
-            signature::RsaPublicKeyComponents { n: n.as_slice(), e: e.as_slice() }.verify(params, signed, sig).is_ok()
-        }
-        (Jwk::Ec { point, .. }, "ES256") => ec(&signature::ECDSA_P256_SHA256_FIXED, point),
-        (Jwk::Ec { point, .. }, "ES384") => ec(&signature::ECDSA_P384_SHA384_FIXED, point),
+        (Jwk::Rsa { n, e, .. }, _) => match alg {
+            "RS256" => crate::crypto::verify_rs256(n, e, signed, sig),
+            "RS384" => crate::crypto::verify_rs384(n, e, signed, sig),
+            "RS512" => crate::crypto::verify_rs512(n, e, signed, sig),
+            "PS256" => crate::crypto::verify_ps256(n, e, signed, sig),
+            _ => bail!("{alg} isn't an RSA key's"),
+        },
+        (Jwk::Ec { point, .. }, "ES256") => crate::crypto::verify_es256(point, signed, sig),
+        (Jwk::Ec { point, .. }, "ES384") => crate::crypto::verify_es384(point, signed, sig),
         _ => false,
     };
     ensure!(ok, "its signature isn't its issuer's");

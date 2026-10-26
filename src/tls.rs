@@ -143,7 +143,7 @@ impl Peer {
         let said = |name: &str| headers.get(name)?.to_str().ok()?.split(',').next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let named = said(ORIGIN).and_then(|v| v.split_once(' ').map(|(k, o)| (k.to_string(), o.to_string())));
         if let (Some((given, origin)), Some(key)) = (named, server_key().filter(|_| self.local)) {
-            if aws_lc_rs::constant_time::verify_slices_are_equal(given.as_bytes(), key.as_bytes()).is_ok() {
+            if crate::crypto::same(given.as_bytes(), key.as_bytes()) {
                 return Some(origin);
             }
         }
@@ -215,7 +215,7 @@ fn forwarded(headers: &axum::http::HeaderMap, from: std::net::IpAddr, proxies: &
 /// The address a `CLIENT` header names, when it carries `key` (`<key> <address>`).
 fn named(headers: &axum::http::HeaderMap, key: Option<&str>) -> Option<std::net::IpAddr> {
     let (given, addr) = headers.get(CLIENT)?.to_str().ok()?.split_once(' ')?;
-    aws_lc_rs::constant_time::verify_slices_are_equal(given.as_bytes(), key?.as_bytes()).ok()?;
+    crate::crypto::same(given.as_bytes(), key?.as_bytes()).then_some(())?;
     addr.parse().ok()
 }
 
