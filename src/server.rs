@@ -1023,22 +1023,6 @@ async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>
     })
 }
 
-/// Run a query (across the cluster if it's worth it) and format the result.
-async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
-    // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
-    let _armed = (crate::answer::streams(p.format.as_deref()) && !crate::explain::asked(query)).then(|| crate::query::arm(p.format.as_deref()));
-    let batches = match files {
-        true => app.query_as(&crate::sys::planned(query)?, Some("0"), true).await?, // (a file here: this node only)
-        false => app.query(query, p.spread.as_deref()).await?,
-    };
-    if crate::query::handed().is_some() {
-        return Ok(Rendered::Sent); // (its answer went to the door in pieces as its plan made them)
-    }
-    let rendered = answer(&batches, p);
-    crate::query::mark("answer rendered");
-    rendered
-}
-
 /// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at
 /// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`), or
 /// `Sent`: its answer went to the door in pieces as its plan made them (`query::collect_or_send`), and the

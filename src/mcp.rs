@@ -255,23 +255,34 @@ async fn list(app: &App) -> Result<Value> {
     Ok(json!({"tables": tables}))
 }
 
-/// A query's rows as JSON. Never a write (the write tool's, and BEGIN, COMMIT and ROLLBACK too).
-/// In a session it runs as POST /sql runs a statement sent with its session: in a transaction it
-/// reads the transaction's snapshot and its own writes, and `$name`s are the session's variables.
+/// A query's rows as JSON. Never a write (the write tool's, and BEGIN, COMMIT and ROLLBACK too). Run as every door runs a
+/// statement (`statement::run`): in a session it reads the transaction's snapshot and its own writes, and `$name`s are
+/// the session's variables; several statements run as a script.
 async fn query(app: &App, role: Role, sql: &str) -> Result<Value> {
-    if is_write(sql) {
+    if crate::statement::is_write(sql) {
         return Err(crate::codes::coded("25006", "this changes data or a transaction: use the write tool")); // (a read-only tool: Postgres's read_only_sql_transaction)
     }
-    if crate::temp::current().is_some() {
-        return Ok(match run(app, role, sql, None).await? {
-            crate::routines::Outcome::Rows(batches) => json!({"rows": rows(&batches)?, "total_rows": total(&batches)}),
-            crate::routines::Outcome::Done(v) => v,
-        });
+    let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
+    let how = crate::statement::How { job: None, spread: None, after: None, stale: None };
+    let who = crate::routines::Who { role, files: false, depth: 0 };
+    match crate::statement::run(app, req, how, who, &McpWire).await? {
+        crate::statement::Answer::Own(v) | crate::statement::Answer::Done(v) => Ok(v),
+        crate::statement::Answer::Rows(batches) => rows_json(&batches),
+        _ => anyhow::bail!("an answer no tool asks for"), // (MCP keeps no answer and streams none)
     }
-    let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
-    let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
-    Ok(json!({"rows": rows(&batches)?, "total_rows": total(&batches)}))
 }
+
+/// MCP's wire: a query's rows as JSON, kept nowhere (`kept_as` None: no results cache for a tool's answer).
+struct McpWire;
+
+impl crate::statement::Wire for McpWire {
+    type Own = Value;
+    fn kept_as(&self) -> Option<std::borrow::Cow<'_, str>> { None }
+    fn encode(&self, rows: Vec<RecordBatch>) -> Result<(Option<Bytes>, Value)> { Ok((None, rows_json(&rows)?)) }
+}
+
+/// A query's answer as a tool's JSON: its first rows, and the total.
+fn rows_json(batches: &[RecordBatch]) -> Result<Value> { Ok(json!({"rows": rows(batches)?, "total_rows": total(batches)})) }
 
 /// The write tool's SQL, run as POST /sql runs it (`run`): one statement or several, a
 /// transaction's BEGIN … COMMIT in its session, and `job`, so a retry is applied once.
@@ -322,11 +333,6 @@ fn answer(out: Result<crate::routines::Outcome>, heard: Vec<String>) -> Result<V
         v["notices"] = json!(heard);
     }
     Ok(v)
-}
-
-/// Changes data or a transaction (INSERT, CALL, BEGIN…): not for the query tool.
-fn is_write(sql: &str) -> bool {
-    crate::write::parse(sql).is_some() || crate::routines::runs_procedure(sql) || crate::text::control(sql).is_some()
 }
 
 fn total(batches: &[RecordBatch]) -> usize { batches.iter().map(RecordBatch::num_rows).sum() }

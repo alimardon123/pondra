@@ -51,6 +51,8 @@ impl Default for Results {
 
 impl Results {
     const MAX: usize = 64 << 20;
+    /// The biggest answer kept, by every door that keeps one: big results aren't what dashboards repeat.
+    pub(crate) const BIGGEST: usize = 1 << 20;
 
     fn flight(&self, key: &str) -> Arc<Flight> {
         let mut f = self.1.lock().unwrap();
@@ -75,8 +77,8 @@ impl Results {
     }
 
     fn put(&self, key: String, version: u64, body: bytes::Bytes) {
-        if body.len() > 1 << 20 {
-            return; // big results aren't what dashboards repeat
+        if body.len() > Self::BIGGEST {
+            return;
         }
         let mut c = self.0.lock().unwrap();
         c.1 += body.len();
