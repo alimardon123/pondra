@@ -47,9 +47,9 @@ impl Alone {
         // (a live term refuses at once: nothing here waits for another leader to finish)
         let term = terms::claim_one_off(store, |t| {
             if t.addr.is_empty() {
-                bail!("{store} is being written by a one-off writer (a backup, or another form alone): wait for it to finish, or lead another lake")
+                bail!("this lake is being written by a one-off writer (a backup, or another form alone): wait for it to finish, or lead another lake")
             }
-            bail!("{store} is led by the node at {}, which this process can't lead beside: stop that node, or lead another lake", t.addr)
+            bail!("this lake is led by the node at {}, which this process can't lead beside: stop that node, or lead another lake", t.addr)
         })
         .await?;
         let marks = terms::mark_every(store.clone(), term.n);
