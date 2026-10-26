@@ -4,7 +4,6 @@
 //! to record the result: one small commit, the leader's job (`Request`, `handle`). A machine that
 //! isn't a node reaches the leader over HTTP, through the bucket when it can't (`inbox.rs`), or
 //! leads for a moment itself when nobody does.
-use crate::cluster::http;
 use crate::terms::{alive, claim, latest, release};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::session;
@@ -1481,8 +1480,7 @@ pub async fn seen_here(app: &crate::app::App) {
     if app.seq.is_some() || app.members.reader() {
         return;
     }
-    let url = crate::tls::url(&format!("{}/cluster/visible", app.members.leader().addr));
-    let asked = async { http().get(url).timeout(std::time::Duration::from_secs(2)).send().await?.json::<u64>().await };
+    let asked = async { crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/visible").timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
     let Ok(upto) = asked.await else { return };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while app.lake.visible() < upto && std::time::Instant::now() < deadline {
@@ -2076,7 +2074,7 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
                     Some(Ok(v)) => return summary(matches!(r, Request::Flush(_)), v),
-                    Some(Err(e)) if !unreachable(&e) => return Err(e),
+                    Some(Err(e)) if !crate::dial::unreached(&e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
                 if let Some(v) = crate::inbox::send(&store, r, None, Some(&t)).await? {
@@ -2205,15 +2203,16 @@ async fn across(dir: &str, r: &crate::store::Reach, req: Option<Request>) -> Res
         None => {
             let store = open_store(dir)?.1;
             match latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::tls::url(&t.addr),
+                Some(t) if !t.addr.is_empty() && alive(&store, &t).await => crate::dial::url(&t.addr),
                 _ => bail!("nobody leads {dir}"),
             }
         }
     };
     let (path, body) = req.http()?;
-    let res = http().post(format!("{at}{path}")).header("content-type", "application/json").bearer_auth(token).body(body).send().await
+    let call = crate::dial::Call::post(path, body).as_json().bearer(token);
+    let res = crate::dial::call(&at, call).await
         .with_context(|| format!("{dir}'s leader doesn't answer at {at}: a branch is pinned while its base's server is up"))?;
-    if !res.status().is_success() {
+    if !res.ok() {
         bail!("{dir}'s leader at {at}: {}", res.text().await?);
     }
     Ok(res.json().await?)
@@ -2225,23 +2224,21 @@ pub async fn post(addr: &str, r: &Request) -> Result<Value> { post_as(addr, r, N
 /// (`auth::AS_USER`). Never to another lake's: it has users of its own.
 async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value> {
     let (path, body) = r.http()?;
-    let call = http().post(crate::tls::url(&format!("{addr}{path}"))).header("content-type", "application/json").body(body);
-    let call = match BEARER.try_with(|k| k.clone()) {
-        Ok(k) => call.bearer_auth(k), // (a branch's key, sent as this request's own Authorization)
-        Err(_) => call,
-    };
-    let call = match user {
-        Some(user) => call.header(crate::auth::AS_USER, user),
-        None => call,
-    };
-    let res = call.send().await?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+    let mut call = crate::dial::Call::post(path, body).as_json();
+    if let Ok(k) = BEARER.try_with(|k| k.clone()) {
+        call = call.bearer(k); // (a branch's key, sent as this request's own Authorization)
+    }
+    if let Some(user) = user {
+        call = call.as_user(user);
+    }
+    let res = crate::dial::call(addr, call).await?;
+    if res.status == 401 {
         bail!("the leader at {addr} asks for a sign-in: set PONDRA_TOKEN to one of the lake's tokens ({})", res.text().await?);
     }
-    if !res.status().is_success() {
+    if !res.ok() {
         // (the leader's refusal keeps its SQLSTATE: a follower's client tells it apart as the leader's would)
-        let sqlstate = res.headers().get("x-pondra-sqlstate").cloned();
-        return Err(refusal(sqlstate.as_ref(), format!("the leader at {addr}: {}", res.text().await?)));
+        let sqlstate = res.sqlstate.clone();
+        return Err(refusal(sqlstate.as_deref(), format!("the leader at {addr}: {}", res.text().await?)));
     }
     Ok(res.json().await?)
 }
@@ -2249,16 +2246,11 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
 /// The error a node's answer that isn't a success is, as a client takes it: the answer's words, with the SQLSTATE its
 /// `x-pondra-sqlstate` header names (none: the words alone). Shared by a follower's forwarded write (`post_as`) and a
 /// guest's answer (cli.rs), so both give the same error.
-pub(crate) fn refusal(sqlstate: Option<&http::HeaderValue>, said: String) -> anyhow::Error {
-    match sqlstate.and_then(|v| v.to_str().ok()).and_then(crate::codes::received) {
+pub(crate) fn refusal(sqlstate: Option<&str>, said: String) -> anyhow::Error {
+    match sqlstate.and_then(crate::codes::received) {
         Some(code) => crate::codes::coded(code, said),
         None => anyhow::anyhow!("{said}"),
     }
-}
-
-/// A failure to reach the leader at all (not an answer from it).
-fn unreachable(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect() || e.is_timeout())
 }
 
 /// What the user sees: the leader's answer, or for a log flush, whether it went in.

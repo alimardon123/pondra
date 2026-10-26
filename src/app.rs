@@ -285,8 +285,8 @@ impl App {
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else {
-            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/cluster/files", self.members.leader().addr))).json(&f).send().await?;
-            anyhow::ensure!(r.status().is_success(), "leader: {}", r.text().await?);
+            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::json("/cluster/files", &f)?).await?;
+            anyhow::ensure!(r.ok(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
         };
         let _guard = self.lock.lock().await;
@@ -380,8 +380,8 @@ impl App {
     /// work: a follower asks it).
     pub async fn checkpoint(&self) -> anyhow::Result<Value> {
         if self.seq.is_none() {
-            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/sql", self.members.leader().addr))).body("CHECKPOINT").send().await?;
-            anyhow::ensure!(r.status().is_success(), "the leader: {}", r.text().await?);
+            let r = crate::dial::call(&self.members.leader().addr, crate::dial::Call::post("/sql", "CHECKPOINT")).await?;
+            anyhow::ensure!(r.ok(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
         let rows = self.tier_all(0).await?;

@@ -436,11 +436,11 @@ const ANSWERS: [&str; 6] = ["23505", "23514", "23502", "22P02", "42P01", "40001"
 /// with the SQLSTATE its `x-pondra-sqlstate` header carries (`server::E` writes it), so a client on
 /// this node sees exactly what a client on the leader sees.
 async fn send(addr: &str, table: &str, src: &Src, batch: &RecordBatch) -> Result<Ack> {
-    let res = crate::cluster::http().post(crate::tls::url(&format!("{addr}/cluster/checked"))).body(encode(table, src, batch)?).send().await?;
-    if res.status().is_success() {
+    let res = crate::dial::call(addr, crate::dial::Call::post("/cluster/checked", encode(table, src, batch)?)).await?;
+    if res.ok() {
         return Ok(res.json().await?);
     }
-    let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(|c| ANSWERS.into_iter().find(|a| *a == c));
+    let code = res.sqlstate.as_deref().and_then(|c| ANSWERS.into_iter().find(|a| *a == c));
     let text = res.text().await?;
     Err(match code {
         Some(code) => crate::codes::coded(code, text),

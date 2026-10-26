@@ -579,9 +579,9 @@ async fn post_within(addr: &str, req: &Req, limit: Duration) -> Result<Option<u6
 }
 
 async fn send(addr: &str, r: &Req) -> Result<u64> {
-    let res = crate::cluster::http().post(crate::tls::url(&format!("{addr}/cluster/lock"))).json(r).send().await?;
-    if !res.status().is_success() {
-        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(|c| ANSWERS.iter().find(|a| **a == c).copied());
+    let res = crate::dial::call(addr, crate::dial::Call::json("/cluster/lock", r)?).await?;
+    if !res.ok() {
+        let code = res.sqlstate.as_deref().and_then(|c| ANSWERS.iter().find(|a| **a == c).copied());
         let text = res.text().await?;
         return Err(match code {
             Some(code) => coded(code, text),
