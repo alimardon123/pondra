@@ -22,11 +22,8 @@ use crate::text::{ident, object, ROW_ID};
 use anyhow::{bail, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::common::{DataFusionError, SchemaError};
-use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::Volatility;
-use datafusion::prelude::{SessionConfig, SessionContext};
-use std::sync::Arc;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use serde_json::json;
@@ -415,15 +412,14 @@ pub struct Open {
 }
 
 /// The query of an EMIT FINAL view (the text after `AS`, without EMIT FINAL), in open mode. `lake` is each lake table's
-/// columns by its name, as `rewrite` takes them. What open mode can't take is refused here, each with what to write.
-pub fn open(sql: &str, lake: &HashMap<String, Vec<String>>) -> Result<Open> {
-    // the session's functions (`engine::session`, as the runs make it), for what a later run would answer differently
-    let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+/// columns by its name, as `rewrite` takes them, and `functions` the session's, the lake's own among them, which say what
+/// a later run would answer differently. What open mode can't take is refused here, each with what to write.
+pub fn open(sql: &str, lake: &HashMap<String, Vec<String>>, functions: &dyn FunctionRegistry) -> Result<Open> {
     let mut query = crate::expander::parse_query(&text(sql))?;
     let (clause, plain) = {
         let s = around(&query)?;
-        projected(s, &ctx)?;
-        if let Some(f) = s.selection.as_ref().and_then(|w| rerun_in(w, &ctx)) {
+        projected(s, functions)?;
+        if let Some(f) = s.selection.as_ref().and_then(|w| rerun_in(w, functions)) {
             return Err(rerun_refusal(&f, "WHERE"));
         }
         let plain = matches!(s.projection.as_slice(), [SelectItem::Wildcard(_)]) && s.selection.is_none();
@@ -471,12 +467,12 @@ pub fn open(sql: &str, lake: &HashMap<String, Vec<String>>) -> Result<Open> {
         return Err(open_refusal("can't take WITH UNMATCHED ROWS: an unmatched row has no match to be decided by: make it a plain view"));
     }
     for d in symbols {
-        if let Some(f) = rerun_in(&d.definition, &ctx) {
+        if let Some(f) = rerun_in(&d.definition, functions) {
             return Err(rerun_refusal(&f, "DEFINE"));
         }
     }
     for m in measures {
-        if let Some(f) = rerun_in(&m.expr, &ctx) {
+        if let Some(f) = rerun_in(&m.expr, functions) {
             return Err(rerun_refusal(&f, "measure"));
         }
     }
@@ -582,7 +578,7 @@ fn rerun_refusal(f: &str, place: &str) -> anyhow::Error {
 }
 
 /// What open mode refuses in a projection or a WHERE: a window, or an aggregate, which would add up the matches of a run.
-fn projected(s: &Select, ctx: &SessionContext) -> Result<()> {
+fn projected(s: &Select, ctx: &dyn FunctionRegistry) -> Result<()> {
     let items = s.projection.iter().filter_map(|i| match i {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
         _ => None,
@@ -611,7 +607,7 @@ fn projected(s: &Select, ctx: &SessionContext) -> Result<()> {
 
 /// The first function of `e` that a later run could answer differently: DataFusion's Volatile functions, and its Stable
 /// ones (now() and the current date and time, which each run reads at its own time). The session's registry tells them.
-fn rerun_in(e: &Expr, ctx: &SessionContext) -> Option<String> {
+fn rerun_in(e: &Expr, ctx: &dyn FunctionRegistry) -> Option<String> {
     let mut found = None;
     let _ = visit_expressions(e, |x| {
         if let Expr::Function(f) = x {
@@ -1826,6 +1822,11 @@ mod tests {
     use super::*;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
+    /// The engine's own functions, as a session has them (open mode asks them what a later run answers differently).
+    fn engine_functions() -> datafusion::prelude::SessionContext {
+        crate::engine::session(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()))
+    }
+
     #[test]
     fn wanted_by_the_word() {
         assert!(wanted("SELECT * FROM t match_recognize (PATTERN (a))"));
@@ -2173,7 +2174,7 @@ mod tests {
         let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day \
                    MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up \
                    PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price))";
-        let o = open(sql, &lake_of("ticker", &["symbol", "day", "price"])).expect("an open view");
+        let o = open(sql, &lake_of("ticker", &["symbol", "day", "price"]), &engine_functions()).expect("an open view");
         assert!(o.inner.starts_with("SELECT * FROM (SELECT "), "{}", o.inner);
         assert!(o.inner.ends_with(") AS __mr_open"), "{}", o.inner);
         assert!(o.inner.contains("pondra_open("), "{}", o.inner);
@@ -2192,7 +2193,7 @@ mod tests {
         let sql = "SELECT symbol, bottom FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts \
                    MEASURES LAST(down.price) AS bottom ONE ROW PER MATCH PATTERN (strt down+ up+) \
                    DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m WHERE bottom < 10";
-        let o = open(sql, &lake_of("ticks", &["symbol", "ts", "price"])).expect("an open view");
+        let o = open(sql, &lake_of("ticks", &["symbol", "ts", "price"]), &engine_functions()).expect("an open view");
         let outer = o.outer.expect("a view that reads the matches");
         assert_eq!(outer, "SELECT symbol, bottom FROM __matches AS m WHERE bottom < 10");
         crate::expander::parse_query(&o.inner).expect("the inner text parses");
@@ -2238,11 +2239,11 @@ mod tests {
         ];
         for (sql, words) in cases {
             let sql = if sql.starts_with("SELECT") { sql } else { format!("SELECT * FROM ticks {sql} AS m") };
-            let err = open(&sql, &lake).expect_err("a refusal");
+            let err = open(&sql, &lake, &engine_functions()).expect_err("a refusal");
             assert_eq!(crate::codes::of(&err), "0A000", "{sql}: {err}");
             assert!(err.to_string().contains(words), "{sql}: {err}");
         }
-        let err = open(&format!("SELECT * FROM ticks {CLAUSE} AS m"), &HashMap::new()).expect_err("a refusal");
+        let err = open(&format!("SELECT * FROM ticks {CLAUSE} AS m"), &HashMap::new(), &engine_functions()).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "0A000");
         assert_eq!(
             err.to_string(),
