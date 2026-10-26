@@ -397,10 +397,10 @@ pub async fn leader(lake: Arc<Lake>, seq: Arc<Sequencer>, table: String, src: Sr
 /// The leader's part of a checked append, under the lock. A batch its producer already committed is a
 /// duplicate (the sequencer's own test: `log::commit`), answered before any check; a `prev` that
 /// doesn't match is a conflict, as the sequencer answers it. Otherwise the rows are checked against
-/// the table (`change::appends` runs `defaults::fit` and `constraints::check`) and committed as one flush whose
+/// the table (`change::appends` runs `rules::checked` and `constraints::check`) and committed as one flush whose
 /// table append carries the producer's seq, so the sequencer's progress moves with the rows.
 async fn append(lake: &Lake, seq: &Sequencer, table: &str, src: Src, batch: RecordBatch) -> Result<Ack> {
-    let meta: TableMeta = lake.cat.get(&crate::store::table_key(table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?;
+    let meta = lake.cat.meta(&crate::store::table_key(table)).await?.ok_or_else(|| anyhow::anyhow!("no table {table}"))?;
     if !src.producer.is_empty() {
         let last = lake.cat.get::<u64>(&crate::store::producer_key(&src.producer)).await?.unwrap_or(0);
         if src.seq <= last {

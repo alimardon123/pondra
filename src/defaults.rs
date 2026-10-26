@@ -10,18 +10,6 @@ use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, Record
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
-/// What a write runs on rows it is about to keep: `rules::checked` over the table's rules (the held forms written, then the
-/// checks), with each column as the table holds it.
-pub fn fit(meta: &TableMeta, table: &str, rows: RecordBatch) -> Result<RecordBatch> {
-    if !ruled(meta) || rows.num_rows() == 0 {
-        return Ok(rows);
-    }
-    crate::rules::checked(&meta.to_rules()?, table, rows, true, &BASE)
-}
-
-/// Does the table have a rule a write's rows meet: NOT NULL, a CHECK, an enum or a held type?
-fn ruled(meta: &TableMeta) -> bool { !meta.not_null.is_empty() || !meta.checks.is_empty() || !meta.enums.is_empty() || !meta.sql_types.is_empty() }
-
 /// The session CHECKs, DEFAULTs and expectations are planned in: every function a query's session has but the lake's
 /// (`store::functions`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
 /// that doesn't is refused at CREATE, as Postgres refuses it. Built once: `evaluate` and `breaking` run it as it is;

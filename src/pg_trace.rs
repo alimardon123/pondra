@@ -100,7 +100,7 @@ pub(crate) type Known = HashMap<String, Option<Cols>>;
 /// jsonb's text (`doc = '{ "b" : 1, "a" : 2 }'` finds `{"a": 2, "b": 1}`, and `doc = '1e2'` finds 100), and one that
 /// isn't JSON is refused 22P02. Only for a statement with such a string, a `pg_typeof`, a JSON maker or a `||`: a string
 /// compared by equality (`=`, `<>`, `IS [NOT] DISTINCT FROM`, `IN`, a CASE's WHEN) counts as one. A string written into a
-/// column is held as its column says (`defaults::fit`). Whether it changed anything.
+/// column is held as its column says (`rules::shape`). Whether it changed anything.
 pub async fn rewrite<H: Host>(host: &H, stmt: &mut Statement) -> anyhow::Result<bool> {
     let asks = |e: &Expr| matches!(e, Expr::Function(f) if object(&f.name) == "pg_typeof");
     let spelled = |e: &Expr| string(e).is_some_and(|s| !crate::text::is_uuid(s) && crate::pg_casts::uuid_of(s).is_ok());
