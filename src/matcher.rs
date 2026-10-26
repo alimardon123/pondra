@@ -2406,8 +2406,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_define_sees_the_ai_functions_the_node_registers() -> Result<()> {
-        // `store::functions` registers the matcher again after the AI functions, so the glue plans cosine_similarity
+        // The matcher registered after the AI functions, as `query::session_at` does, so the glue plans cosine_similarity
         let ctx = crate::store::functions(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        crate::matcher::register(&ctx);
         let sql = crate::pattern::rewritten(
             "WITH t(day, emb) AS (VALUES (1, [1.0, 0.0]), (2, [0.9, 0.1])) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
              MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a b) DEFINE b AS cosine_similarity(b.emb, FIRST(a.emb)) > 0.9) \
