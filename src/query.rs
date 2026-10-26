@@ -937,11 +937,13 @@ impl Pieces {
 
 /// An answer handed to its door: its first piece's bytes, the rest as they are written, and whether its last
 /// was written (a channel that closes before it is an answer cut short: the body must fail then, never end as
-/// if whole).
+/// if whole). `stop`: the statement's stop flag, for a plan's pieces (`send_rest`), which the body sets when the
+/// client goes before the end (`audit::guarded`); None when the rows were already collected.
 pub struct Handed {
     pub first: Vec<u8>,
     pub rest: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     pub ended: Arc<std::sync::atomic::AtomicBool>,
+    pub stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Lets the query a request runs send its answer in pieces, until it is dropped (`arm`).
@@ -1051,7 +1053,8 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
     let Some(hand) = take_hand() else { bail!("an answer in pieces has no door") };
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if hand.send(Handed { first, rest: rx, ended: ended.clone() }).is_err() {
+    let stop = crate::audit::stop(); // (this runs inside the statement: its flag is here, and the door's body outlives this)
+    if hand.send(Handed { first, rest: rx, ended: ended.clone(), stop }).is_err() {
         return Err(gone());
     }
     set_sent(Some(0));
@@ -1081,7 +1084,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
         // (no rows: the answer is its end, and nothing is left to write)
         let first = enc.step(None)?;
         ended.store(true, std::sync::atomic::Ordering::Release);
-        return Ok(Handed { first, rest: rx, ended });
+        return Ok(Handed { first, rest: rx, ended, stop: None });
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
@@ -1098,7 +1101,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
             }
         }
     });
-    Ok(Handed { first, rest: rx, ended })
+    Ok(Handed { first, rest: rx, ended, stop: None }) // (the rows are collected: no search runs after this)
 }
 
 /// Writes each piece to the body (`step_to`), and returns the rows written.
