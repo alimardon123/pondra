@@ -177,7 +177,7 @@ pub fn table_factor(lake: &str, t: &mut ast::TableFactor) -> Result<bool> {
 pub fn mentioned(sql: &str) -> bool { sql.contains("\"at:") }
 
 /// The `t AT (… => …)` that each table as it was in this (expanded) SQL stands for, as written: its
-/// moment is worked out as the query runs, so `server::query` looks there for one that moves.
+/// moment is worked out as the query runs, so `statement::query` looks there for one that moves.
 pub fn spelled(sql: &str) -> String {
     names(sql).iter().filter_map(|n| Spec::of(n).ok()).map(|s| format!("{} AT ({} => {})", s.table, s.at.to_uppercase(), s.expr)).collect::<Vec<_>>().join(" ")
 }

@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use crate::statement::{Answer, How, Wire};
+use std::borrow::Cow;
 
 #[derive(Clone)]
 pub struct App {
@@ -1423,86 +1425,22 @@ async fn apply(State(app): State<App>, uri: axum::http::Uri, role: axum::Extensi
     Ok(Json(crate::apply::ask(&app, verb, ask, who).await?))
 }
 
-/// The text as sent, when it is one statement that is no variable's change and no script: the first half of the test
-/// `sql_as` makes of a request for a plain query. `pondra sql` makes it of its argument too (cli.rs).
-pub(crate) fn single_statement(sql: &str) -> Option<String> {
-    let [one] = &crate::routines::split(sql)[..] else { return None };
-    (crate::vars::change(sql).is_none() && !crate::script::is(sql)).then(|| one.clone())
-}
-
-/// The second half, on the statement once its `$name`s and functions are expanded: none of a checkpoint, a procedure's
-/// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
-/// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
-pub(crate) fn plain_statement(one: &str) -> bool {
-    !crate::write::checkpoint(one) && !crate::routines::runs_procedure(one) && crate::write::parse(one).is_none() && !crate::routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
-}
-
 async fn sql_as(app: App, p: SqlParams, role: axum::Extension<crate::auth::Role>, headers: axum::http::HeaderMap, body: Bytes) -> Result<Response, E> {
-    use crate::routines::{Outcome, Who};
+    use crate::routines::Who;
     let kind = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
     let req = crate::routines::Request::read(kind, &body)?;
     // (a Python procedure's own calls, through the token lent to it; anyone else's is a first call)
     let lent = crate::auth::lent(headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "))).is_some();
     let depth = headers.get("x-pondra-depth").filter(|_| lent).and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(0);
     let who = Who { role: role.0, files: owner(&app.auth, &headers), depth };
-    if let Some(seg) = p.after {
-        let mut hwm = app.lake.hwm.subscribe();
-        let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
-    }
-    if let (Some(sent), true, true, true) = (single_statement(&req.sql), req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
-        let one = crate::routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
-        if plain_statement(&one) && !crate::txn::open() {
-            crate::query::mark("request read and checked");
-            return Ok(crate::audit::statement(&app, &sent, query(&app, &p, &one, who.files)).await?); // (the audit log and history keep it as it was sent)
-        }
-    }
-    let tables = Arc::new(req.tables);
-    // A script sent without a session is one of its own while it runs: its SET, PREPARE, BEGIN
-    // and temporary tables last to its end.
-    let own = (crate::temp::current().is_none() && crate::routines::split(&req.sql).len() > 1).then(crate::temp::of_script);
-    let run = crate::query::SENT.scope(tables, crate::routines::script(&app, &req.sql, &req.params, &req.views, who, p.job.clone()));
-    let out = match &own {
-        Some(s) => crate::temp::SESSION.scope(Some(s.clone()), run).await,
-        None => run.await,
-    };
-    own.inspect(|s| _ = crate::temp::end(s));
-    match out? {
-        Outcome::Rows(batches) => Ok(answer(&batches, &p)?.respond(p.format.as_deref())),
-        Outcome::Done(v) => Ok(Json(v).into_response()),
-    }
-}
-
-/// One query: a key lookup without planning, a remembered answer, or run (once for everyone who
-/// asks at the same moment).
-async fn query(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Response> {
-    let format = p.format.as_deref().unwrap_or("json");
-    let respond = |body: bytes::Bytes| ([("content-type", crate::answer::content_type(p.format.as_deref()))], body).into_response();
-    let limited = crate::auth::limited().is_some(); // (a user granted some tables: planned as it may read them, never answered from what another read, nor kept: its grants may change)
-    if format == "json" && !crate::temp::mentioned(query) && !limited {
-        if let Some(body) = crate::serve::point_sql(&app.lake, query).await? {
-            return Ok(respond(body.into())); // a key lookup: no planning
-        }
-    }
-    // The program that started the node (`files`) has its answers remembered apart, run with its
-    // rights: a file here it reads is named in the statement as expanded, or in a view it reads, and
-    // so never remembered.
-    let Some(version) = app.remembers(query).await else {
-        crate::query::mark("answer kept?");
-        return Ok(run_sql(app, p, query, files).await?.respond(p.format.as_deref()));
-    };
-    let key = format!("{format}{}|{}|{}|{query}", p.rows.map(|n| format!(":{n}")).unwrap_or_default(), p.spread.as_deref().unwrap_or(""), if files { "owner" } else { "" });
-    let stale = p.stale_ms.filter(|_| p.after.is_none()).map(Duration::from_millis); // (read-your-writes wins)
-    let run = || async {
-        let rendered = run_sql(app, p, query, files).await?;
-        let keep = match &rendered {
-            Rendered::Whole(body) => Some(body.clone()),
-            Rendered::Pieces(_) | Rendered::Sent => None, // (a big answer: sent to its own caller only)
-        };
-        Ok((keep, rendered))
-    };
-    Ok(match app.remembered(key, query, version, stale, run).await? {
-        Kept::Bytes(body) => respond(body),
-        Kept::Own(rendered) => rendered.respond(p.format.as_deref()),
+    let how = How { job: p.job.as_deref(), spread: p.spread.as_deref(), after: p.after, stale: p.stale_ms.map(Duration::from_millis) };
+    let format = p.format.as_deref();
+    Ok(match crate::statement::run(&app, req, how, who, &HttpWire(&p)).await? {
+        Answer::Kept(body) => Rendered::Whole(body).respond(format),
+        Answer::Own(r) => r.respond(format),
+        Answer::Rows(batches) => answer(&batches, &p)?.respond(format),
+        Answer::Done(v) => Json(v).into_response(),
+        Answer::Sent => Rendered::Sent.respond(format),
     })
 }
 
@@ -1588,22 +1526,6 @@ impl App {
     }
 }
 
-/// Run a query (across the cluster if it's worth it) and format the result.
-async fn run_sql(app: &App, p: &SqlParams, query: &str, files: bool) -> anyhow::Result<Rendered> {
-    // (an answer in a format that streams may be sent to the door from its plan: `query::collect_or_send`)
-    let _armed = (crate::answer::streams(p.format.as_deref()) && !crate::explain::asked(query)).then(|| crate::query::arm(p.format.as_deref()));
-    let batches = match files {
-        true => app.query_as(&crate::sys::planned(query)?, Some("0"), true).await?, // (a file here: this node only)
-        false => app.query(query, p.spread.as_deref()).await?,
-    };
-    if crate::query::handed().is_some() {
-        return Ok(Rendered::Sent); // (its answer went to the door in pieces as its plan made them)
-    }
-    let rendered = answer(&batches, p);
-    crate::query::mark("answer rendered");
-    rendered
-}
-
 /// An answer as the HTTP door sends it: rendered whole (what `Results` keeps and the others asking at
 /// the same moment share), or as a body in pieces, for an answer too big to render as one (`stream`), or
 /// `Sent`: its answer went to the door in pieces as its plan made them (`query::collect_or_send`), and the
@@ -1622,6 +1544,36 @@ impl Rendered {
             Rendered::Sent => return StatusCode::NO_CONTENT.into_response(),
         };
         ([("content-type", crate::answer::content_type(format))], body).into_response()
+    }
+}
+
+/// HTTP's encoding of an answer, for `statement::run`: JSON (or the format `?format=` names), with the console's typed
+/// first page of `?rows=` rows.
+struct HttpWire<'a>(&'a SqlParams);
+
+impl Wire for HttpWire<'_> {
+    type Own = Rendered;
+    fn kept_as(&self) -> Option<Cow<'_, str>> {
+        // (the key starts with the format, JSON when none is given, then a typed first page's rows)
+        let format = self.0.format.as_deref().unwrap_or("json");
+        Some(match self.0.rows {
+            None => Cow::Borrowed(format),
+            Some(n) => Cow::Owned(format!("{format}:{n}")),
+        })
+    }
+    fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Rendered)> {
+        let r = answer(&rows, self.0)?;
+        let keep = match &r {
+            Rendered::Whole(b) => Some(b.clone()),
+            Rendered::Pieces(_) | Rendered::Sent => None, // (a big answer: sent to its own caller only)
+        };
+        Ok((keep, r))
+    }
+    fn takes_point_json(&self) -> bool {
+        self.0.format.as_deref().unwrap_or("json") == "json"
+    }
+    fn pieces(&self, query: &str) -> Option<Option<&str>> {
+        (crate::answer::streams(self.0.format.as_deref()) && !crate::explain::asked(query)).then_some(self.0.format.as_deref())
     }
 }
 
