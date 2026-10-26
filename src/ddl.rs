@@ -640,8 +640,8 @@ pub fn full(dir: &str) -> Result<String> {
 /// Delete a lake no process leads (`DROP DATABASE`): its folder, or every object under its prefix.
 pub async fn delete_lake(dir: &str) -> Result<()> {
     let store = crate::store::open_store(dir)?.1;
-    if let Some(t) = crate::cluster::latest(&store).await? {
-        ensure!(!crate::cluster::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
+    if let Some(t) = crate::terms::latest(&store).await? {
+        ensure!(!crate::terms::alive(&store, &t).await, "another process leads the lake at {dir} ({}): stop it first", if t.addr.is_empty() { "a pondra sql" } else { &t.addr });
     }
     match dir.contains("://") {
         false => std::fs::remove_dir_all(dir).with_context(|| format!("deleting {dir}"))?,
@@ -700,7 +700,7 @@ pub fn beside(url: &str, name: &str) -> String {
 /// Attach lake `dir` as `name` here. A node (`follow`) keeps it fresh from its catalog, until it
 /// is detached; `stream` also follows its leader's commit stream (`--attach`: for good).
 pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, stream: bool) -> Result<()> {
-    let leader = crate::cluster::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
+    let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
     let live = match (&leader, stream) {
         (Some(a), true) => crate::cluster::http().get(crate::tls::url(&format!("{a}/cluster/leader"))).timeout(std::time::Duration::from_secs(2)).send().await.is_ok(),
         _ => false,

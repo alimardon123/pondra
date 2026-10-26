@@ -616,8 +616,8 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
             let store = store::open_store(&dir)?.1;
-            match cluster::latest(&store).await? {
-                Some(t) if !t.addr.is_empty() && cluster::alive(&store, &t).await => {
+            match terms::latest(&store).await? {
+                Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
                     println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
                 _ => println!("{}", serde_json::json!({"checkpoint": false, "why": "no node runs this lake: the next one to start tiers its log"})),

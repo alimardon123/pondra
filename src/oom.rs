@@ -47,7 +47,7 @@ crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); 
 /// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
 /// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
 pub fn line() -> Option<usize> {
-    if crate::library::on() {
+    if crate::node::hosted() {
         return None;
     }
     crate::env::memory_line(crate::store::ram().map(|ram| (ram as f64 * 0.85) as usize))

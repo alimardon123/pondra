@@ -12,7 +12,7 @@
 //!
 //! A claimer's mark and the inbox's bell (`urgent`) take turns of their own, a few: a node whose
 //! turns are all out on a scan still marks its term within a second or two of a ring, so a writer
-//! elsewhere never takes it for gone (`cluster::deaf`).
+//! elsewhere never takes it for gone (`terms::deaf`).
 use object_store::client::{ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -154,7 +154,7 @@ pub fn turns() -> Vec<(String, String, usize, usize)> {
 fn gate(root: &str) -> Arc<Gate> { GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone() }
 
 /// The turns of the store at `root` that say who is alive: a claimer's mark (`cluster/alive/…`) and the inbox's bell,
-/// rung and listened to (`cluster::listen`), at most two requests a second a lake. Four, whatever the store asks.
+/// rung and listened to (`terms::listen`), at most two requests a second a lake. Four, whatever the store asks.
 fn urgent_gate(root: &str) -> Arc<Gate> { URGENT.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(4))).clone() }
 
 /// Is this request one that says who is alive (`urgent_gate`)? Its path is the key's, under the bucket's name or not.

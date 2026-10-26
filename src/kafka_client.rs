@@ -145,6 +145,9 @@ async fn login(io: &mut (Box<dyn Stream>, i32, bool), mech: &str, user: &str, pa
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD;
                 let mut salted = vec![0u8; len];
+                // (fewer than RFC 7677's 4,096 makes the proof below cheap to guess the password from for whoever answers
+                // in the broker's place; a count past a million holds this node for nothing)
+                ensure!((4_096..=1_000_000).contains(&iterations), "SCRAM: the broker asks for {iterations} iterations (4,096 to 1,000,000 are taken)");
                 let iterations = std::num::NonZeroU32::new(iterations).context("SCRAM: 0 iterations")?;
                 let salt = b64.decode(salt)?;
                 if len == 64 { crate::crypto::pbkdf2_sha512(iterations, &salt, pass.as_bytes(), &mut salted) } else { crate::crypto::pbkdf2_sha256(iterations, &salt, pass.as_bytes(), &mut salted) }
@@ -155,7 +158,11 @@ async fn login(io: &mut (Box<dyn Stream>, i32, bool), mech: &str, user: &str, pa
                 let auth = format!("{first_bare},{server_first},{without_proof}");
                 let signature = hmac(&stored, auth.as_bytes());
                 let proof: Vec<u8> = client_key.iter().zip(&signature).map(|(a, b)| a ^ b).collect();
-                authenticate(io, format!("{without_proof},p={}", b64.encode(proof)).as_bytes()).await?;
+                let server_final = String::from_utf8(authenticate(io, format!("{without_proof},p={}", b64.encode(proof)).as_bytes()).await?)?;
+                // (the broker proves it holds the password's keys too: one that doesn't, answering in its place, is refused)
+                let server_key = hmac(&salted, b"Server Key");
+                let said = server_final.split(',').find_map(|p| p.strip_prefix("v=")).with_context(|| format!("SCRAM: the broker's last answer has no signature: {server_final}"))?;
+                ensure!(crate::crypto::same(&b64.decode(said)?, &hmac(&server_key, auth.as_bytes())), "SCRAM: the broker's signature is wrong: it isn't the broker that holds this user's password");
             }
         }
         Ok(())

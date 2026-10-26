@@ -401,21 +401,34 @@ def external():
     checks["an Iceberg table in the lake's files: a non-owner is refused 42501 a manifest list or manifest it names outside them, before the node reads it, and reads one pondra wrote, moved there"] = \
         all(e.startswith("403:") and ("through a node it started itself" if not A.s3 else "no secret covers") in e for e in named_outside) \
         and anyone(f"SELECT * FROM read_iceberg('{area}ice_ok', allow_moved_paths => true)") == [{"a": 1}]
+    # Its location too: an INSERT a non-owner sends writes no file where its metadata points outside what the caller may
+    # write (here the lake's own folder beside its files), refused 42501 by name before any file is written.
+    esc = {"format-version": 2, "table-uuid": str(uuid.uuid4()), "location": f"{area[:-len('files/')]}escaped/t", "last-sequence-number": 0, "last-updated-ms": 0,
+           "last-column-id": 1, "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "a", "required": False, "type": "long"}]}],
+           "current-snapshot-id": -1, "snapshots": [], "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}]}
+    call(A.port, "PUT", "/files/wh_esc/s/t/metadata/v1.metadata.json", json.dumps(esc).encode(), headers=hdr)
+    call(A.port, "PUT", "/files/wh_esc/s/t/metadata/version-hint.text", b"1", headers=hdr)
+    anyone(f"ATTACH '{area}wh_esc' AS esc (TYPE iceberg)")
+    escaped = _raises_text(lambda: anyone("INSERT INTO esc.s.t VALUES (1)"))
+    anyone("DETACH esc")
+    checks["an Iceberg table in the lake's files whose location is outside them: a non-owner's INSERT is refused 42501 by name, before a file is written"] = \
+        escaped.startswith("403:") and ("through a node it started itself" if not A.s3 else "no secret covers") in escaped
     # A client that isn't the program reads a relative name as a page does: the lake's own file of that name, as PUT wrote
     # it, with the program's rows. A name no file is at answers 404, its SQLSTATE in the x-pondra-sqlstate header (the body
     # is the words alone), and its words name the file as SQL wrote it.
     theirs = anyone("SELECT * FROM 'reports/q1.csv'")
     anyone("CREATE EXTERNAL TABLE q1_ext (a BIGINT, b VARCHAR) STORED AS CSV LOCATION 'reports/q1.csv' OPTIONS ('format.has_header' 'true')")
     their_table = anyone("SELECT * FROM q1_ext")
+    owners_table = q("SELECT * FROM q1_ext")  # (stored whole: the program that started the node reads the same file, not one in its folder)
     anyone("DROP TABLE q1_ext")
     their_copy = _raises_text(lambda: anyone("COPY (SELECT 1 AS a) TO 'out.csv'"))
     conn = http.client.HTTPConnection("127.0.0.1", other.port, timeout=30)
     conn.request("POST", "/sql", b"SELECT * FROM 'nope.csv'")
     resp = conn.getresponse()
     nope_status, nope_code, nope_words = resp.status, resp.getheader("x-pondra-sqlstate"), resp.read().decode()
-    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too; a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
+    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too (the same file for the node's own program); a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
         and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words \
-        and their_table == mine and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
+        and their_table == mine == owners_table and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]
@@ -10272,12 +10285,33 @@ def guarded():
         and said["fay: Kafka tombstone"] == ["None"] and said["fay: Iceberg DELETE"] == "ok" \
         and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
         and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
+    # (the REST catalog's listing shows a user only the tables it may read, as SQL's listings do: S27)
+    lister = lambda u: load_catalog(f"ls_{u}", type="rest", uri=f"http://127.0.0.1:{P}", token=ask(P, f"CREATE TOKEN ls_{u} FOR USER {u}", auth=boss)["token"])
+    listed = {u: sorted(".".join(t) for t in lister(u).list_tables("default")) for u in ("boss", "bob")}
+    info["iceberg listing"] = listed
+    checks["the Iceberg REST catalog lists a user only the tables it may read (S27)"] = "default.ice" in listed["boss"] and "default.ice" not in listed["bob"]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
-    c = Node(lake2, P + 2, write_token="w", admin_token="adm").start()
+    c = Node(lake2, P + 2, write_token="w", admin_token="adm", read_token="rd").start()
     ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
+    ask(P + 2, "CREATE USER chief PASSWORD 'chief-password-1' SUPERUSER", auth="Bearer adm")
     w = "Bearer w"
+    # (x-pondra-as, a forwarded change's user, only narrows: a read or write token acting as a superuser keeps its own role)
+    chief = {"x-pondra-as": "chief"}
+    acting = {
+        "a read token as a superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer rd", headers=chief),
+        "…making a superuser": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth="Bearer rd", headers=chief),
+        "a write token as a superuser, making one": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth=w, headers=chief),
+        "…its writes still made": ask(P + 2, "INSERT INTO t VALUES (2)", auth=w, headers=chief),
+        "the admin token as the superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
+    }
+    info["acting as"] = acting
+    checks["a token acting as a user (x-pondra-as) keeps its own role: a read or write token never makes a superuser"] = \
+        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" \
+        and "ERROR" in str(acting["…making a superuser"]) and "ERROR" in str(acting["a write token as a superuser, making one"]) \
+        and not str(acting["…its writes still made"]).startswith("ERROR") \
+        and isinstance(acting["the admin token as the superuser"], dict) and acting["the admin token as the superuser"].get("superuser") is True
     said = {
         "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
         "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),
@@ -24847,19 +24881,20 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40200329643,
-# 2026-10-25: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
-# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by the table of
-# 10-13, that run's three parts took 654, 441 and 608 s; by this one, four take about 426 s each.)
-SECS = {"memory": 240, "scale": 122, "waits": 113, "hot": 94, "sso": 90, "stopped": 77, "guesses": 45, "doors": 40,
-        "functions": 38, "crash": 37, "server": 36, "served": 33, "backpressure": 31, "finals": 28, "pace": 27,
-        "kafka": 26, "kafkas": 24, "found": 23, "clouds": 21, "tails": 21, "load": 20, "live": 18, "objects": 18,
-        "refreshed": 15, "lateral": 14, "sso_flow": 14, "users": 14, "workspace": 13, "reader": 12, "history": 11,
-        "sealed": 11, "sessions": 11, "answers_big": 10, "cursors": 10, "files": 10, "flows": 10, "guarded": 10,
-        "procedures": 10, "reached": 10, "begin": 9, "clients": 9, "columns": 9, "fills": 9, "followers": 9,
-        "schemas": 9, "serverless": 9, "temps": 9, "guard": 8, "learn": 8, "alter": 7, "bykey": 7, "fence": 7,
-        "safety": 7, "sequences": 7, "windows": 7, "catalogs": 6, "clusters": 6, "dedup": 6, "find": 6,
-        "friendly": 6, "loads": 6, "memorylake": 6, "plans": 6, "unique_doors": 6}
+# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40287278434,
+# 2026-10-26: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
+# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by 10-25's table,
+# that run's five parts took 352 to 485 s, doors, patterns and serverless having grown since; by this one, about
+# 426 s each.)
+SECS = {"memory": 240, "doors": 205, "patterns": 169, "serverless": 142, "scale": 104, "waits": 91, "sso": 90,
+        "hot": 87, "stopped": 77, "guesses": 45, "backpressure": 37, "functions": 36, "server": 35, "served": 33,
+        "crash": 30, "kafka": 29, "finals": 28, "kafkas": 27, "pace": 25, "found": 23, "clouds": 23, "tails": 20,
+        "load": 20, "live": 17, "refreshed": 15, "objects": 15, "workspace": 14, "users": 14, "sso_flow": 14,
+        "reader": 14, "procedures": 12, "cursors": 12, "clients": 12, "sessions": 11, "sealed": 11, "lateral": 11,
+        "history": 11, "guarded": 10, "followers": 10, "flows": 10, "files": 10, "columns": 10, "answers_big": 10,
+        "alter": 10, "temps": 9, "catalogs": 9, "begin": 9, "schemas": 8, "outside": 8, "find": 8, "fills": 8,
+        "windows": 7, "tiering": 7, "safety": 7, "guard": 7, "fence": 7, "bykey": 7, "sequences": 6, "plans": 6,
+        "memorylake": 6, "loads": 6, "friendly": 6, "dedup": 6, "clusters": 6}
 
 
 def all_tests():

@@ -53,8 +53,13 @@ pub enum Answer<O> {
     Sent,
 }
 
-/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
+/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it. The lake it was
+/// sent to is in scope while it runs (`ext::rooted`), so every door stores a client's relative LOCATION as the same file.
 pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    crate::ext::rooted(&app.lake.url, one_statement(app, req, how, who, wire)).await
+}
+
+async fn one_statement<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;

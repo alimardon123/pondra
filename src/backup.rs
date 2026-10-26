@@ -237,7 +237,7 @@ async fn take_here(to: &str, t: Take) -> Result<Value> {
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let _ = crate::cluster::mark_alive(&store, n).await;
+                let _ = crate::terms::mark_alive(&store, n).await;
             }
         }
     }));
@@ -253,7 +253,7 @@ async fn take_here(to: &str, t: Take) -> Result<Value> {
         Err(e) => Ok(Err(e)),
     };
     drop(marks); // (its mark stops before the term is let go, so no mark lands after it)
-    crate::cluster::release(&store, term.n).await;
+    crate::terms::release(&store, term.n).await;
     match out {
         Ok(run) => run,
         Err(panic) => std::panic::resume_unwind(panic),
@@ -278,15 +278,15 @@ async fn take_led(lake: &Lake, t: Take, term: u64) -> Result<Value> {
 
 /// The term a one-off writer claims for the backup at `to` (`write::deliver`'s loop): one that is none's, or
 /// that another one-off writer holds, which is waited for. A node serving the backup can't be asked here.
-async fn one_off_term(store: &Store, to: &str) -> Result<crate::cluster::Term> {
+async fn one_off_term(store: &Store, to: &str) -> Result<crate::terms::Term> {
     loop {
-        match crate::cluster::latest(store).await? {
-            Some(t) if crate::cluster::alive(store, &t).await => {
+        match crate::terms::latest(store).await? {
+            Some(t) if crate::terms::alive(store, &t).await => {
                 ensure!(t.addr.is_empty(), "{to} is served by a node, which can't read a lake in this process's memory: back up somewhere else, or stop that node");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
             t => {
-                if let Some(term) = crate::cluster::claim(store, t.map_or(1, |t| t.n + 1), "").await? {
+                if let Some(term) = crate::terms::claim(store, t.map_or(1, |t| t.n + 1), "").await? {
                     return Ok(term);
                 }
             }

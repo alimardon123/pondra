@@ -1,9 +1,9 @@
 //! The bucket inbox: how a machine that can reach the bucket but not the leader — another
 //! network, another company — still writes, exactly-once and with the same capabilities. It
 //! leaves its request in `inbox/<id>.<kind>` and touches `inbox/bell`. The leader looks at the
-//! bell every second (one HEAD, a cheap request class on S3 and R2: `cluster::listen`), marks its
+//! bell every second (one HEAD, a cheap request class on S3 and R2: `terms::listen`), marks its
 //! term alive when it rang, records every request and leaves the answer in `inbox/<id>.out`. A
-//! leader that doesn't mark itself in a few seconds is gone, and the writer leads (`cluster::deaf`).
+//! leader that doesn't mark itself in a few seconds is gone, and the writer leads (`terms::deaf`).
 //! Answers nobody collected are deleted after an hour.
 use crate::log::Sequencer;
 use crate::store::{Lake, Store};
@@ -28,13 +28,13 @@ pub async fn ring(store: &Store, id: &str) {
 /// caller then leads itself; the request is withdrawn, and a retry of it would be a duplicate).
 /// `wake`: nobody leads the lake at that place, so once the request is in, a process of its own
 /// leads it for a moment and answers it (`lead_once`). `holder`: the term whose leader is to answer,
-/// which is gone if it doesn't mark itself when the bell rings (`cluster::Ear`).
-pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option<&crate::cluster::Term>) -> Result<Option<Value>> {
+/// which is gone if it doesn't mark itself when the bell rings (`terms::Ear`).
+pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option<&crate::terms::Term>) -> Result<Option<Value>> {
     let (kind, body) = r.inbox()?;
     let id = uuid::Uuid::new_v4();
     let (req, out) = (Path::from(format!("inbox/{id}.{kind}")), Path::from(format!("inbox/{id}.out")));
     store.put(&req, body.into()).await?;
-    let mut ear = crate::cluster::Ear::ring(store, holder, &id.to_string()).await;
+    let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string()).await;
     let woke = wake.map(|dir| {
         let dir = dir.to_string();
         crate::panics::spawn(async move { lead_once(&dir).await })
@@ -69,7 +69,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option
                 None => {}
             }
         }
-        if tick % 10 == 0 && !matches!(&crate::cluster::latest(store).await?, Some(t) if crate::cluster::alive(store, t).await) {
+        if tick % 10 == 0 && !matches!(&crate::terms::latest(store).await?, Some(t) if crate::terms::alive(store, t).await) {
             let _ = store.delete(&req).await;
             return Ok(None);
         }
@@ -103,7 +103,7 @@ async fn lead_in_process(_: &str) -> Result<()> {
 }
 
 /// Leader: answer the inbox whenever the bell rings (the leader hears it as it marks its term:
-/// `rings`, `cluster::listen`), every 30 s anyway, and once at start: requests may have waited
+/// `rings`, `terms::listen`), every 30 s anyway, and once at start: requests may have waited
 /// for a leader.
 pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>, mut rings: tokio::sync::watch::Receiver<u64>) {
     crate::panics::spawn(async move {
