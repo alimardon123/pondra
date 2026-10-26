@@ -696,6 +696,9 @@ pub(crate) fn spill_room() {
         return;
     }
     LOOKED.store(now, Relaxed);
+    if live_spillers().is_empty() {
+        return; // (no spill disk made yet, so nothing to size and no disk to look at: a page never makes one)
+    }
     set_room(spill_gb());
 }
 
@@ -765,9 +768,15 @@ impl std::fmt::Debug for Lake {
 /// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
+
+/// A page's lake holds what the page's own pool does (`env::page_query_memory`): its memory is its line, not a machine's
+/// (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
+#[cfg(target_arch = "wasm32")]
+pub fn memory_limit() -> usize { crate::env::page_query_memory(None) }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
 /// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the

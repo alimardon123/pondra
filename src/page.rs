@@ -65,10 +65,6 @@ const COUNTERS_KEY: &str = "pondra.counters";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
-/// A page's memory line when `PONDRA_MEMORY_MAX_GB` isn't set: 3 GiB, a quarter below the 4 GiB a wasm32 memory ends at. The
-/// live bytes are what the program asked for, so that quarter is the room for the allocator's own footprint and for a last
-/// step that grows within one poll.
-const LINE: usize = 3 << 30;
 /// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
 const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
@@ -89,7 +85,7 @@ pub struct Options {
     /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
     pub memory: Option<Memory>,
     /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
-    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `LINE`.
+    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
 }
 
@@ -1755,16 +1751,14 @@ fn stopped() -> anyhow::Error {
     crate::codes::coded("53200", PAGE_OOM)
 }
 
-/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else 3 GiB (`LINE`).
+/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else
+/// `env::PAGE_LINE`.
 fn memory_line(device: Option<usize>) -> Option<usize> {
-    crate::env::memory_line(Some(device.unwrap_or(LINE)))
+    crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
 }
 
-/// The most query memory a page's pool holds (`env::query_memory`): its share is two thirds of the line (of the default line
-/// when the watch is off, so the pool is never empty).
-fn query_memory(device: Option<usize>) -> usize {
-    crate::env::query_memory(|| memory_line(device).unwrap_or(LINE) / 3 * 2)
-}
+/// The most query memory a page's pool holds: `env::page_query_memory`, as a page's lake holds it.
+fn query_memory(device: Option<usize>) -> usize { crate::env::page_query_memory(device) }
 
 /// A table's batches, partition by partition, as its memory table holds them (`inner`); None for another provider's table.
 async fn partitions_of(table: &Arc<dyn TableProvider>) -> Option<Vec<Vec<RecordBatch>>> {

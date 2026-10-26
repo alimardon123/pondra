@@ -248,6 +248,18 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
     gib("PONDRA_MEMORY_GB").unwrap_or_else(own)
 }
 
+/// A page's memory line when `PONDRA_MEMORY_MAX_GB` isn't set and its device doesn't say: 3 GiB, a quarter below the 4 GiB a
+/// wasm32 memory ends at. The live bytes are what the program asked for, so that quarter is the room for the allocator's own
+/// footprint and for a last step that grows within one poll.
+pub const PAGE_LINE: usize = 3 << 30;
+
+/// The most query memory a page holds (`query_memory`): two thirds of its line (`memory_line` of its device's, else
+/// `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). The page's own pool takes it with its
+/// device's line, and a page's lake (`store::memory_limit`) with none.
+pub fn page_query_memory(device: Option<usize>) -> usize {
+    query_memory(|| memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2)
+}
+
 /// A setting in seconds (fractions too), else `default`: one that is negative or not a number is the
 /// default too.
 pub fn secs(name: &str, default: f64) -> Duration {
