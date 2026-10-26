@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(of("External error: The used disk space during the spilling process has exceeded the allowable limit of 10.00 MB. Raise PONDRA_SPILL_GB to let it spill more."), "53100");
         assert_eq!(of("Resources exhausted: Memory Exhausted while Sorting (DiskManager is disabled)"), "53200"); // (PONDRA_SPILL_GB=0: nothing spills)
         // a lake in memory past its spill cap, or the room its disk keeps (memory::full: the same way out for both)
-        assert_eq!(of("Generic memory error: a lake in memory may spill 2 MB to disk and holds 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
+        assert_eq!(of("Generic memory error: this process's spills may take 2 MB of disk and hold 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
         assert_eq!(of("Generic memory error: the disk a lake in memory spills to has 3 MB free, and a lake keeps 256 MB: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
         // a page's browser storage over its quota, and a write the page then undid for it: disk_full, which HTTP answers 503
         let full = of("Generic opfs error: this site's browser storage is full: Failed to execute 'write' on 'FileSystemWritableFileStream'");
