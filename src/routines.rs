@@ -20,7 +20,7 @@
 //!   `pondra run` sends, a procedure's body (`split`, `prepare`, then `one` each in turn).
 use crate::auth::Role;
 use crate::ddl::Ddl;
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, Lake};
 use crate::write::Stmt;
 use crate::text::{ident, object};

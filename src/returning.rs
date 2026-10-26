@@ -13,7 +13,7 @@
 //! with no rows.
 
 use crate::auth::Role;
-use crate::server::App;
+use crate::app::App;
 use crate::write::Stmt;
 use anyhow::{bail, Result};
 use datafusion::arrow::compute::concat_batches;

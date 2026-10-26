@@ -602,7 +602,7 @@ pub type Place = (String, Option<String>, String);
 /// all. `committed`: READ COMMITTED, where a moved row is read again rather than refused. `wait`: `lock_timeout` (None: as
 /// long as it takes). `taken`: the owner has asked for locks, so their release is due when its statement ends.
 pub struct Locks<'a> {
-    pub app: &'a crate::server::App,
+    pub app: &'a crate::app::App,
     pub name: &'a str,
     pub meta: &'a TableMeta,
     pub owner: String,
@@ -668,7 +668,7 @@ where
 /// Takes `keys` for `owner`, here or at its leader (ADR-067 §4), and returns the commit they were granted at, which this
 /// node has committed up to when it returns. A write waits as `wait` says. With `flight`, the owner then registers as
 /// appending to that table, in the same request.
-pub async fn take_on(app: &crate::server::App, owner: &str, resources: &[String], wait: Option<Duration>, flight: Option<&str>) -> Result<u64> {
+pub async fn take_on(app: &crate::app::App, owner: &str, resources: &[String], wait: Option<Duration>, flight: Option<&str>) -> Result<u64> {
     if app.seq.is_some() {
         take(&app.lake.url, owner, resources, wait, flight).await?;
         return Ok(app.lake.visible());

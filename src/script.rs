@@ -14,7 +14,7 @@
 //! - **Splitting** (`depth`, `joined`): a block is one statement to every door's splitter, the
 //!   console's too (`sqlfile.js` `blocks`), by the same words.
 use crate::routines::{Outcome, Who};
-use crate::server::App;
+use crate::app::App;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use futures::future::BoxFuture;

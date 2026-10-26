@@ -11,7 +11,7 @@ use crate::ext;
 use crate::files::{APPLIES, VERSIONS};
 use crate::lake_files::under_files;
 use crate::routines::{Outcome, Who};
-use crate::server::App;
+use crate::app::App;
 use crate::store::{Changed, Lake};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};

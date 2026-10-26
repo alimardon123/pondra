@@ -916,7 +916,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
 }
 
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
-pub async fn define(app: &crate::server::App, name: &str, spec: &str) -> Result<Value> {
+pub async fn define(app: &crate::app::App, name: &str, spec: &str) -> Result<Value> {
     let out: Value = match app.seq {
         None => post(&app.cluster.leader.addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
         Some(_) => {
@@ -1356,12 +1356,12 @@ pub async fn stamp(lake: &Lake, table: &str, to: Option<&crate::log::To>) -> Res
 // ---------------------------------------------------------------- on a node
 
 /// `POST /sql` with a write statement: this node does the work; the leader records it.
-pub async fn on_node(app: &crate::server::App, stmt: Stmt, job: Option<String>) -> Result<Value> { on_node_as(app, stmt, job, false).await }
+pub async fn on_node(app: &crate::app::App, stmt: Stmt, job: Option<String>) -> Result<Value> { on_node_as(app, stmt, job, false).await }
 
 /// `on_node`; `files`: its SQL may read files on this machine (`FROM 'jan.csv'`: the shell's own
 /// node, `server::owner`).
 #[inline(never)] // (its work on the heap, made here: `App::query_as`)
-pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
+pub fn on_node_as(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
     Box::pin(async move {
         app.lake.caught_up().await?; // (a node that just started: not against an older catalog than its leader's)
         let out = crate::ext::listing(on_node_listed(app, stmt, job, files)).await?; // (files outside the lake: listed once a statement)
@@ -1372,7 +1372,7 @@ pub fn on_node_as(app: &crate::server::App, stmt: Stmt, job: Option<String>, fil
 
 /// SQL's CREATE TABLE of a table that's there, as Postgres has it: refused (42P07), left as it is with IF NOT EXISTS. With
 /// OR REPLACE it is replaced by `create_as`: the old table stays until the new one takes its place.
-async fn existing(app: &crate::server::App, c: &ast::CreateTable) -> Result<Option<Value>> {
+async fn existing(app: &crate::app::App, c: &ast::CreateTable) -> Result<Option<Value>> {
     let mut found = there(&app.lake, c).await;
     if !matches!(found, Ok(None)) {
         seen_here(app).await; // (a table just made or dropped through another node: this one holds it once it holds what its leader had)
@@ -1444,7 +1444,7 @@ where
 
 /// `create_as` on a node: each of its statements runs here, as the caller (`on_node_as`). A request stopped before its steps
 /// answer drops the table it made (`Undo`: the memory watch stops a request by dropping its future, `oom.rs`).
-async fn create_on_node(app: &crate::server::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Value> {
+async fn create_on_node(app: &crate::app::App, c: &ast::CreateTable, job: &str, files: bool) -> Result<Value> {
     let (app_run, job_run) = (app.clone(), job.to_string());
     let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
         let (app, job) = (app_run.clone(), job_run.clone());
@@ -1476,7 +1476,7 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
 /// node sees it (a script's INSERT, then its SELECT), as on the leader. The follower waits until
 /// its view holds everything the leader had committed once the write was done (5 s at most: a
 /// view that far behind catches up by itself).
-pub async fn seen_here(app: &crate::server::App) {
+pub async fn seen_here(app: &crate::app::App) {
     if app.seq.is_some() || app.cluster.reader {
         return;
     }
@@ -1542,7 +1542,7 @@ fn raced(if_not_exists: bool, name: &str, out: Result<Value>) -> Result<Value> {
 
 /// The table a `CREATE TABLE … AS SELECT` made, dropped if its request ends before the INSERT answers: the
 /// memory watch stops a request by dropping its future (`oom.rs`), so the code after the INSERT never runs.
-struct Undo(Option<(crate::server::App, String, String)>); // (app, table, job)
+struct Undo(Option<(crate::app::App, String, String)>); // (app, table, job)
 
 impl Drop for Undo {
     fn drop(&mut self) {
@@ -1557,7 +1557,7 @@ impl Drop for Undo {
     }
 }
 
-async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     let stmt = crate::protect::door(&app.lake, stmt).await?; // (a project's objects in a protected database: an apply's only)
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
@@ -1580,7 +1580,7 @@ async fn on_node_listed(app: &crate::server::App, stmt: Stmt, job: Option<String
 
 /// A statement once the session's own tables and its transaction have had their turn (`on_node_listed`): written here
 /// or by the leader.
-async fn run_listed(app: &crate::server::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
+async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
     }
@@ -1769,7 +1769,7 @@ fn attached_as(stmt: &Stmt) -> String { stmt.table().split('.').next().unwrap_or
 /// over them as they are; None: from here (`here`: a query that reads this machine's files, or a
 /// table not made yet). A spread that fails leaves what it wrote to the orphan sweep (no entry
 /// names those files), and this node writes it all.
-async fn everywhere(app: &crate::server::App, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>, to: &crate::log::To, here: bool) -> Result<Option<Option<Files>>> {
+async fn everywhere(app: &crate::app::App, table: &str, query: &str, job: &str, stamp: Option<crate::log::Reserved>, to: &crate::log::To, here: bool) -> Result<Option<Option<Files>>> {
     let query = crate::sys::planned(query)?;
     if here || app.here_only(&query).await {
         return Ok(crate::spmd::refused("it reads what only this node has"));

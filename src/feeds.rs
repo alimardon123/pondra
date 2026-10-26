@@ -7,7 +7,7 @@
 //! the offset commit together, so every record lands once, whichever node runs the shard or
 //! restarts; a run that lost the race is refused and starts again from what was committed.
 //! No feed, no work: the loop looks at the catalog only when it changes.
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, producer_key, table_key, Lake, TableMeta};
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};

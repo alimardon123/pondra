@@ -23,7 +23,7 @@
 //!   without casts a value given to its default's type. A variable holds one value (a number, a
 //!   string, a date, …), worked out once, as its caller, when it is set.
 use crate::routines::Outcome;
-use crate::server::App;
+use crate::app::App;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, RecordBatch};
 use serde_json::{json as j, Value};

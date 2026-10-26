@@ -11,7 +11,7 @@
 use crate::byte_range;
 use crate::read_delta::Log;
 use crate::reset::Once;
-use crate::server::App;
+use crate::app::App;
 use crate::shares::{Share, Shared};
 use crate::sharing_client::endpoint;
 use axum::extract::{FromRequestParts, Path, Query, State};

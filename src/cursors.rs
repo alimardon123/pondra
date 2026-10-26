@@ -17,7 +17,7 @@
 //! refused (53200), never answered by dropping a cursor someone is still reading.
 use crate::auth::Role;
 use crate::codes::coded;
-use crate::server::App;
+use crate::app::App;
 use crate::txn;
 use anyhow::Result;
 use datafusion::arrow::array::RecordBatch;

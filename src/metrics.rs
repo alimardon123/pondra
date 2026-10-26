@@ -1,7 +1,7 @@
 //! This node's counters, which every form keeps, and `GET /metrics` (a door: `render`), which says them and the lake's
 //! tables in Prometheus' text format.
 #[cfg(feature = "doors")]
-use crate::server::App;
+use crate::app::App;
 #[cfg(feature = "doors")]
 use crate::store::{table_key, TableMeta};
 #[cfg(feature = "doors")]
