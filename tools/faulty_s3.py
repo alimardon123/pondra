@@ -14,6 +14,10 @@ The faults (all off by default; probabilities per request; `methods` limits them
   hang   held `hang_secs` (default 30) and then dropped, never reaching the store
   slow_ms  added to every request
   down   every connection closed at once without an answer: the store unreachable
+  conflict  parts of paths, in turn: the first request whose path holds the first part (and is of
+         its method, written before it: "GET /catalog/") is answered 409 with R2's "error code:
+         1001", never reaching the store; then the next part is looked for (R2 answered a catalog
+         compactor's reads so on 10-25, and object_store reads a 409 as AlreadyExists, not retried)
 
 tools/resilience_check.py starts one in-process for each node (`Faulty`), so one node can lose
 the bucket while the others keep it.
@@ -25,7 +29,7 @@ through `HTTPS_PROXY` when one is set.
 """
 import argparse, hashlib, hmac, http.client, http.server, json, os, random, socketserver, ssl, threading, time, urllib.parse
 
-OFF = {"error": 0.0, "lost": 0.0, "hang": 0.0, "hang_secs": 30.0, "slow_ms": 0, "down": False, "methods": []}
+OFF = {"error": 0.0, "lost": 0.0, "hang": 0.0, "hang_secs": 30.0, "slow_ms": 0, "down": False, "methods": [], "conflict": []}
 ERRORS = [("500 Internal Server Error", "InternalError", "We encountered an internal error. Please try again."),
           ("503 Slow Down", "SlowDown", "Please reduce your request rate.")]
 
@@ -65,7 +69,9 @@ class Faulty:
 
             def forward(self):
                 body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-                fault = proxy.draw(self.command)
+                fault = proxy.draw(self.command, self.path)
+                if fault == "conflict":
+                    return self.answer(409, "Conflict", [("Content-Type", "text/plain")], b"error code: 1001\n")
                 if fault == "down":
                     return self.drop()
                 if fault == "hang":
@@ -154,12 +160,16 @@ class Faulty:
         with self.lock:
             self.faults = {**self.faults, **faults} if faults else dict(OFF)
 
-    def draw(self, method):
+    def draw(self, method, path=""):
         with self.lock:
             f = self.faults
             self.counts[method] = self.counts.get(method, 0) + 1
             fault = None
-            if not f["methods"] or method in f["methods"]:
+            want = f["conflict"] and f["conflict"][0].split(" ", 1)
+            if want and want[-1] in path and (len(want) == 1 or want[0] == method):
+                self.faults = {**f, "conflict": f["conflict"][1:]}
+                fault = "conflict"
+            elif not f["methods"] or method in f["methods"]:
                 if f["down"]:
                     fault = "down"
                 else:

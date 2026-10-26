@@ -9,6 +9,7 @@ pub mod keys;
 pub mod rows;
 pub mod txn;
 pub mod typed;
+pub mod types;
 
 #[cfg(feature = "server")]
 use crate::store::TableMeta;

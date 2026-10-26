@@ -201,7 +201,14 @@ impl Project {
     }
 }
 
+/// A YAML file under `objects/`: a pipeline or a dashboard (1.1), which 1.0 refuses by name (`project`). The gatherers list
+/// one by its name with no text, so it is never skipped silently.
+pub(crate) fn yaml_object(path: &str) -> bool { path.starts_with("objects/") && (path.ends_with(".yaml") || path.ends_with(".yml")) }
+
 pub(crate) fn project(ask: &Ask) -> Result<Project> {
+    if let Some(path) = ask.files.keys().find(|p| yaml_object(p.as_str())) {
+        return Err(crate::codes::coded("0A000", format!("{path}: pipelines and dashboards in YAML come in 1.1; until then a project's objects are .sql files")));
+    }
     let toml: Toml = match ask.files.get("pondra.toml") {
         Some(t) => toml::from_str(t).context("pondra.toml")?,
         None => Toml::default(),
@@ -1320,7 +1327,14 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
     let listed: Vec<object_store::ObjectMeta> = app.lake.store.list(Some(&object_store::path::Path::from(folder.as_str()))).try_collect().await?;
     for path in listed.into_iter().map(|o| o.location.to_string()) {
         let rel = path[folder.len()..].to_string();
-        if rel.split('/').any(|p| p.starts_with('.')) || !(rel == "pondra.toml" || rel.ends_with(".sql")) {
+        if rel.split('/').any(|p| p.starts_with('.')) {
+            continue;
+        }
+        if yaml_object(&rel) {
+            files.insert(rel, String::new()); // (listed, not read: `project` refuses it by name)
+            continue;
+        }
+        if !(rel == "pondra.toml" || rel.ends_with(".sql")) {
             continue;
         }
         files.insert(rel, String::from_utf8(app.lake.object(&path).await?.to_vec()).with_context(|| format!("{path} isn't text"))?);
@@ -1421,6 +1435,17 @@ mod tests {
         assert_eq!(labels("CREATE TYPE mood AS ENUM ('sad', 'it''s', 'ok')"), ["sad", "it's", "ok"]);
         assert_eq!(labels("-- an enum (not a label)\nCREATE TYPE enum AS ENUM ()"), Vec::<String>::new());
         assert_eq!(text("it's"), "'it''s'");
+    }
+
+    #[test]
+    fn yaml_objects_are_refused_by_name() {
+        assert!(yaml_object("objects/sales/overview.dashboard.yaml") && yaml_object("objects/p.yml"));
+        assert!(!yaml_object("objects/a.sql") && !yaml_object("seeds/a.yaml") && !yaml_object("pondra.toml"));
+        let mut files = BTreeMap::new();
+        files.insert("pondra.toml".to_string(), "[project]\nname = \"sales\"\n".to_string());
+        files.insert("objects/a.dashboard.yaml".to_string(), String::new());
+        let err = project(&Ask { files, ..Default::default() }).err().unwrap();
+        assert!(err.to_string().contains("objects/a.dashboard.yaml: pipelines and dashboards in YAML come in 1.1"));
     }
 
     #[test]

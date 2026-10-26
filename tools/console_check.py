@@ -802,6 +802,13 @@ def files_checks(browser, port, show):
     checks["the editor: an alias called c is a name, not a comment's start; after o. Tab lists the columns of the table o names"] = \
         '<span class="k">FROM</span>' in lit and '<span class="k">WHERE</span>' in lit and '<span class="c">/* c */</span>' in lit and offered == ["id", "region"]
     info_editor = {"highlighted": lit, "offered": offered}
+    # (the splitter, as the node splits: a pipeline's block and a task's `AS parallel` are one statement each; `statements` of sqlfile.js)
+    split_cases = ["CREATE PIPELINE p AS BEGIN PARALLEL STEP a AS BEGIN SELECT 1; SELECT 2; END; STEP b AS SELECT 3; END PARALLEL; END; SELECT 4",
+                   "CREATE TASK t SCHEDULE '1 hour' AS SELECT 1 AS parallel; SELECT 2",
+                   "CREATE PIPELINE p AS BEGIN STEP a AS SELECT 1; STEP b AS SELECT 2; END; SELECT 3"]
+    counts = p.evaluate("t => import('/console/sqlfile.js').then(m => t.map(s => m.statements(s).length))", split_cases)
+    checks["a SQL file's statements split as the node splits them: a pipeline's block (with PARALLEL STEP … AS BEGIN) and a task's AS parallel are one statement each"] = counts == [2, 2, 2]
+    info_editor["split"] = counts
     info = {"editor": info_editor, "variables": var_info, "task": task, "bound": bound, "results": results, "said": said, "each": each, "not run": left, "second": second, "last": last, "only": only, "plan": plan, "dirty": dirty, "saved": saved, "clean": clean, "shown": shown, "errors": pg.errors, "left": pg.left(), "toast": pg.toast(), "folders": folders, "renamed": renamed}
     pg.ctx.close()
     return checks, info

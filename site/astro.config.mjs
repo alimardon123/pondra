@@ -48,7 +48,7 @@ export default defineConfig({
         ] },
         { label: 'SQL', items: [
           'sql',
-          { label: 'Language', items: ['sql/statements', 'sql/functions', 'sql/table-options'] },
+          { label: 'Language', items: ['sql/statements', 'sql/functions', 'sql/row-patterns', 'sql/table-options'] },
           { label: 'Catalog', items: ['sql/system-tables', 'sql/glossary'] },
         ] },
         { label: 'APIs', items: [
@@ -57,6 +57,7 @@ export default defineConfig({
           { label: 'Command line', items: ['reference/cli'] },
           { label: 'Protocols', items: ['reference/http', 'reference/postgres', 'reference/flight', 'reference/kafka-protocol', 'reference/iceberg-rest', 'reference/mcp'] },
           { label: 'Configuration', items: ['reference/environment'] },
+          { label: 'Compatibility', items: ['reference/stability'] },
         ] },
       ],
     }),

@@ -5,8 +5,8 @@
 # (tools/upgrade_check.py all); a table's past: UNDROP and retention (tools/history_check.py, ADR-043);
 # branch databases on disk and in a bucket (tools/environments_check.py, ADR-047); a project in Git
 # deployed to them (tools/project_check.py); Git folders (tools/git_check.py, ADR-060 §8); backups (tools/backup_check.py, ADR-070).
-# In three parts side by side: the releases' checks, the bucket's (a leader on simulated R2, branches in a bucket),
-# and the rest.
+# In three parts side by side: every release's lake and a rolling upgrade; the bucket's (a leader on simulated R2,
+# branches in a bucket); and a newer format, drains and the rest.
 # build.yml calls it once a pull request's build is done (the label `ci` or `full-ci`): it tries
 # the binary that run made, so nothing is compiled here. By hand too.
 name: upgrade
@@ -30,8 +30,10 @@ jobs:
       fail-fast: false
       matrix:
         # (side by side: on 10-25 the releases took 8.8 minutes, the bucket 6.7 and the rest 6.0, which with the
-        # bucket's took 12.6 minutes, the train's longest job)
-        part: [releases, "past, branches", "a bucket"]
+        # bucket's took 12.6 minutes, the train's longest job. Then the releases' 9.1 minutes (run 1125: the lakes
+        # 3.9, the format 0.7, drains 1.8, the rolling upgrade 2.6) held the run's longest path after the build,
+        # so the format and drains moved to the rest's 5.5)
+        part: [releases, "drains, past, branches", "a bucket"]
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
@@ -54,40 +56,47 @@ jobs:
           mkdir -p target/release && tar xzf dist/pondra-linux-x64.tar.gz -C target/release && ls -l target/release
       - name: The checks' Python packages (tools/requirements.txt's versions)
         run: pip install -q $(grep -E '^(pyarrow|deltalake|pyiceberg|pyiceberg-core|psycopg\[binary\]|boto3|moto\[server\])==|^boto3$' tools/requirements.txt | sed 's/ *#.*//')
-      - name: Every release's lake, a newer format, drains, a rolling upgrade
+      - name: Every release's lake, a rolling upgrade
         if: matrix.part == 'releases'
         env:
           GITHUB_TOKEN: ${{ github.token }} # (the releases' list: a runner's shared address has a low limit)
         run: |
           set -o pipefail   # (the check's exit status, not tee's)
-          python3 tools/upgrade_check.py all --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
+          python3 tools/upgrade_check.py lakes,rolling --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
+      - name: A newer format refused, drains
+        if: matrix.part == 'drains, past, branches'
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # (the newest release, whose node refuses the newer format)
+        run: |
+          set -o pipefail
+          python3 tools/upgrade_check.py format,drain --new target/release/pondra --work "$RUNNER_TEMP/upgrade" | tee upgrade.json
       - name: A table's past (UNDROP, retention)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/history_check.py --new target/release/pondra --work "$RUNNER_TEMP/history" | tee history.json
       - name: Branch databases (CREATE DATABASE dev CLONE prod)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/environments_check.py --new target/release/pondra --work "$RUNNER_TEMP/environments" | tee environments.json
       - name: Branches across servers (ATTACH … READ_ONLY, GRANT CLONE; two buckets behind gates)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/environments_check.py --across --new target/release/pondra --work "$RUNNER_TEMP/environments-across" | tee environments-across.json
       - name: A project in Git made true in a database (pondra plan, deploy, branch, diff)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/project_check.py --new target/release/pondra --work "$RUNNER_TEMP/project" | tee project.json
       - name: Git folders (git_checkout, commit, pull, pull request against a stand-in GitHub)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/git_check.py --new target/release/pondra --work "$RUNNER_TEMP/git" | tee git.json
       - name: Backups (BACKUP DATABASE, RESTORE DATABASE, pondra backup and restore)
-        if: matrix.part == 'past, branches'
+        if: matrix.part == 'drains, past, branches'
         run: |
           set -o pipefail
           python3 tools/backup_check.py --new target/release/pondra --work "$RUNNER_TEMP/backup" | tee backup.json

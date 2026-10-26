@@ -1,6 +1,7 @@
 # MATCH_RECOGNIZE answers alike on every form (ADR-073): Oracle's ticker (ACME's 20 days), with and without
-# PARTITION BY, an empty match, and a refusal. Every query has an ORDER BY; the expected rows are tools/patterns_check.py's
-# (its FIXED examples: the ticker's matches worked out by hand there).
+# PARTITION BY, an empty match, ALL ROWS PER MATCH (RUNNING and FINAL measures), WITH UNMATCHED ROWS and WITHIN on a
+# timestamp. Every query has
+# an ORDER BY; the expected rows are tools/patterns_check.py's (its FIXED examples: worked out by hand there).
 statement ok
 CREATE TABLE ticker (symbol TEXT, day INT, price INT)
 
@@ -43,5 +44,49 @@ SELECT mn, s, e, n FROM flags MATCH_RECOGNIZE (ORDER BY day MEASURES MATCH_NUMBE
 3 NULL NULL 0
 4 5 5 1
 
-statement error 0A000 ALL ROWS PER MATCH
-SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day ALL ROWS PER MATCH PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+# ALL ROWS PER MATCH: each row of each match, in match order (day 10 is in two matches); RUNNING measures (c, d) see the
+# match's rows up to the row, FINAL (fl) the whole match. Rows: patterns_check.py's TICK_SHOW, without its f, n, fn, price.
+query TIITII
+SELECT symbol, day, m, c, d, fl FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES MATCH_NUMBER() AS m, CLASSIFIER() AS c, LAST(down.price) AS d, FINAL LAST(price) AS fl ALL ROWS PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY m, day
+----
+ACME 5 1 strt NULL 25
+ACME 6 1 down 12 25
+ACME 7 1 up 12 25
+ACME 8 1 up 12 25
+ACME 9 1 up 12 25
+ACME 10 1 up 12 25
+ACME 10 2 strt NULL 25
+ACME 11 2 down 19 25
+ACME 12 2 down 15 25
+ACME 13 2 up 15 25
+ACME 14 3 strt NULL 24
+ACME 15 3 down 14 24
+ACME 16 3 down 12 24
+ACME 17 3 up 12 24
+ACME 18 3 up 12 24
+
+# WITH UNMATCHED ROWS: the rows in no match (days 1 and 4) are given once more with every measure NULL. Matches: days 2-3
+# (1) and day 5 (2).
+query IIIII
+SELECT day, mn, s, e, n FROM flags MATCH_RECOGNIZE (ORDER BY day MEASURES MATCH_NUMBER() AS mn, FIRST(day) AS s, LAST(day) AS e, count(*) AS n ALL ROWS PER MATCH WITH UNMATCHED ROWS AFTER MATCH SKIP PAST LAST ROW PATTERN (a+) DEFINE a AS flag) ORDER BY day
+----
+1 NULL NULL NULL NULL
+2 1 2 2 1
+3 1 2 3 2
+4 NULL NULL NULL NULL
+5 2 5 5 1
+
+statement ok
+CREATE TABLE tickts (symbol TEXT, day INT, ts TIMESTAMP, price INT)
+
+statement ok
+INSERT INTO tickts VALUES ('ACME',1,TIMESTAMP '2026-03-02 01:00:00',12),('ACME',2,TIMESTAMP '2026-03-02 02:00:00',17),('ACME',3,TIMESTAMP '2026-03-02 03:00:00',19),('ACME',4,TIMESTAMP '2026-03-02 04:00:00',21),('ACME',5,TIMESTAMP '2026-03-02 05:00:00',25),('ACME',6,TIMESTAMP '2026-03-02 06:00:00',12),('ACME',7,TIMESTAMP '2026-03-02 07:00:00',15),('ACME',8,TIMESTAMP '2026-03-02 08:00:00',20),('ACME',9,TIMESTAMP '2026-03-02 09:00:00',24),('ACME',10,TIMESTAMP '2026-03-02 10:00:00',25),('ACME',11,TIMESTAMP '2026-03-02 11:00:00',19),('ACME',12,TIMESTAMP '2026-03-02 12:00:00',15),('ACME',13,TIMESTAMP '2026-03-02 13:00:00',25),('ACME',14,TIMESTAMP '2026-03-02 14:00:00',25),('ACME',15,TIMESTAMP '2026-03-02 15:00:00',14),('ACME',16,TIMESTAMP '2026-03-02 16:00:00',12),('ACME',17,TIMESTAMP '2026-03-02 17:00:00',14),('ACME',18,TIMESTAMP '2026-03-02 18:00:00',24),('ACME',19,TIMESTAMP '2026-03-02 19:00:00',23),('ACME',20,TIMESTAMP '2026-03-02 20:00:00',22)
+
+# WITHIN INTERVAL '4' HOUR: day d is at d:00 on 2 March 2026 (ts), so an hour is a day. The match from day 5 would run
+# to day 10, five hours on, so it stops at day 9; the match from day 14 reaches day 18, exactly four hours on, which is in.
+query TIII
+SELECT symbol, start_day, bottom_day, end_day FROM tickts MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) WITHIN INTERVAL '4' HOUR DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+----
+ACME 5 6 9
+ACME 10 12 13
+ACME 14 16 18

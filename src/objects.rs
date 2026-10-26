@@ -129,9 +129,9 @@ pub static PARTS: &[Part] = &[
 
 /// The patterns: ways of using objects and parts together, nothing stored, listed beside the kinds.
 pub static PATTERNS: &[Pattern] = &[
-    Pattern { name: "flow", lists: "pondra.flows", about: "materialized views of views, moved in one commit", also: &["pipeline", "DAG"] },
+    Pattern { name: "flow", lists: "pondra.flows", about: "materialized views of views, moved in one commit", also: &["DAG"] },
     Pattern { name: "branch", lists: "pondra.databases", about: "a database cloned from another with no data copied, and refreshed from it", also: &["zero-copy clone", "fork", "dev environment"] },
-    Pattern { name: "task graph", lists: "pondra.tasks", about: "tasks that run after others (AFTER), once per tick of the first", also: &["workflow", "job"] },
+    Pattern { name: "task graph", lists: "pondra.tasks", about: "tasks that run after others (AFTER), once per tick of the first", also: &["pipeline", "workflow", "job"] },
     Pattern { name: "history view", lists: "pondra.tables", about: "a materialized view keeping every version of each row", also: &["SCD type 2", "slowly changing dimension"] },
 ];
 

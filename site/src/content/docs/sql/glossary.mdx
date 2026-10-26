@@ -69,8 +69,8 @@ Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; `python3 t
 
 **branch**: a database cloned from another with no data copied, and refreshed from it; listed by `pondra.databases`. Other products call it zero-copy clone, fork, dev environment.
 
-**flow**: materialized views of views, moved in one commit; listed by `pondra.flows`. Other products call it pipeline, DAG.
+**flow**: materialized views of views, moved in one commit; listed by `pondra.flows`. Other products call it DAG.
 
 **history view**: a materialized view keeping every version of each row; listed by `pondra.tables`. Other products call it SCD type 2, slowly changing dimension.
 
-**task graph**: tasks that run after others (AFTER), once per tick of the first; listed by `pondra.tasks`. Other products call it workflow, job.
+**task graph**: tasks that run after others (AFTER), once per tick of the first; listed by `pondra.tasks`. Other products call it pipeline, workflow, job.

@@ -2222,6 +2222,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc-fast",
+ "csv-core",
  "datafusion",
  "datafusion-functions-json",
  "datafusion-spark",
@@ -2232,6 +2233,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "parquet",
+ "pondra-tokio-web",
  "regex",
  "serde",
  "serde_json",
@@ -2239,6 +2241,17 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "pondra-tokio-web"
+version = "0.34.0"
+dependencies = [
+ "futures",
+ "js-sys",
+ "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

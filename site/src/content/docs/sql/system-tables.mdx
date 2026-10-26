@@ -415,8 +415,9 @@ SELECT name, follows, kind FROM pondra.flows WHERE name = 'sold_by_item';
 
 <Aside type="caution">
 The tables in `pondra` are read-only: a write to one, such as `INSERT INTO pondra.runs`, fails with
-`no schema pondra (CREATE SCHEMA pondra)`. A schema of your own called `pondra` takes the name, and
-until you drop it the system tables are not there: `pondra.runs` then means your own table, or is
+`pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only`. `CREATE SCHEMA pondra`,
+`CREATE DATABASE pondra` and `ATTACH … AS pondra` are refused (42939), so nothing of your own can take the name; a schema called `pondra` made before 1.0 still
+has it, and until you drop it the system tables are not there, so `pondra.runs` means your own table, or is
 `table 'pondra.runs' not found`. The other tables in `pondra`, such as `pondra.history`,
 `pondra.audit`, `pondra.users` and `pondra.grants`, are on the [statements page](/pondra/sql/statements/#users-and-grants).
 </Aside>

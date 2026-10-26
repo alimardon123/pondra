@@ -106,7 +106,8 @@ impl Page {
     /// `ROLLBACK`: each table the transaction wrote is put back as it found it. (Its identity columns' numbers stay taken,
     /// as a sequence's do in Postgres.)
     async fn rollback(&self) -> anyhow::Result<&'static str> {
-        match self.txn().take() {
+        let txn = self.txn().take(); // (the lock goes before the tables are put back)
+        match txn {
             Some(txn) => self.put_back(txn.found).await?,
             None => self.note(format!("WARNING: {}", rules::NONE_OPEN)),
         }

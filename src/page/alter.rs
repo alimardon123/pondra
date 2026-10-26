@@ -138,7 +138,7 @@ impl Page {
     }
 
     /// A CREATE TABLE's text, parsed as the page's session parses SQL.
-    fn create_of(&self, text: &str) -> anyhow::Result<CreateTable> {
+    pub(super) fn create_of(&self, text: &str) -> anyhow::Result<CreateTable> {
         let DfStatement::Statement(s) = self.parsed(text)? else { anyhow::bail!("{text} is not a CREATE TABLE") };
         let SqlStatement::CreateTable(c) = *s else { anyhow::bail!("{text} is not a CREATE TABLE") };
         Ok(c)

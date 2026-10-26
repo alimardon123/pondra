@@ -406,21 +406,36 @@ fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bo
 /// what the leader has committed, then until this node holds it too (`Lake::caught_up` waits on
 /// it, and refuses meanwhile). Restarted after a failover, its catalog view lacks what the new
 /// leader took over from the old one's WAL until the new leader flushes it, a moment after it
-/// leads. The leader is asked for 30 s: a new one answers only once it has recovered what its
-/// followers held (up to 20 s, `replica::recover`), and an answer from an older catalog given up
-/// waiting sooner is what made a table just made "not found".
+/// leads. A new leader answers only once it has recovered what its followers held (up to 20 s,
+/// `replica::recover`), and an answer from an older catalog given up waiting sooner is what made a
+/// table just made "not found". After 30 s the leader is waited for as long as it holds its term:
+/// one that keeps its mark but doesn't answer is still opening the lake (replaying its catalog's
+/// WAL took one 11.5 minutes on R2 on 10-25), and this node's own catalog lacks what it took over,
+/// so reads answered from it went back 26 minutes (reviews/soak-day-4205277.md). A leader that never
+/// answers loses its term to its followers (`follow`), and this node starts again.
 pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     lake.caught.send_replace(false);
     crate::panics::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (since, mut said) = (tokio::time::Instant::now(), 0);
         let url = crate::tls::url(&format!("{}/cluster/visible", leader.addr));
-        let mut upto = None;
-        while upto.is_none() && tokio::time::Instant::now() < deadline {
-            upto = async { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }.await.ok();
-            if upto.is_none() {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+        let upto = loop {
+            if let Ok(upto) = async { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }.await {
+                break Some(upto);
             }
-        }
+            if since.elapsed() < Duration::from_secs(30) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+            if !alive(&store, &leader).await {
+                break None;
+            }
+            let mins = since.elapsed().as_secs() / 60;
+            if mins > said {
+                said = mins;
+                eprintln!("the leader at {} holds its term but hasn't answered in {mins} min (it is opening the lake): reads here wait for it", leader.addr);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        };
         match upto {
             Some(upto) => {
                 let mut hwm = lake.hwm.subscribe();
@@ -431,14 +446,13 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
             // A leader whose mark is old by now died before we started: this node takes over, or
             // follows whoever does, in a moment, and starts again (`follow`). Answering from this
             // catalog meanwhile would miss what it committed last (a lone node killed, then the shell).
-            None if !alive(&store, &leader).await => {
+            None => {
                 let gone = tokio::time::Instant::now() + Duration::from_secs(60);
                 while tokio::time::Instant::now() < gone && !alive(&store, &leader).await {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 eprintln!("the leader at {} is gone and nobody took over in 60 s: answering from this node's own catalog", leader.addr);
             }
-            None => eprintln!("the leader at {} didn't answer in 30 s: answering from this node's own catalog", leader.addr),
         }
         lake.caught.send_replace(true);
     });

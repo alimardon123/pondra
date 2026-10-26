@@ -583,18 +583,25 @@ fn named(t: &ast::DataType) -> bool {
 
 impl Table {
     /// The rules a CREATE TABLE declares, over `schema`: its columns as the form planned them (a uuid, json, varchar(n)
-    /// or enum column as text), without `_deleted`. A node's table has the same rules (`TableMeta::to_rules`).
+    /// or enum column as text), without `_deleted`; a named type's labels are `types`' (None: no such type, refused 42704). A node's
+    /// table has the same rules (`TableMeta::to_rules`).
     #[cfg_attr(feature = "server", allow(dead_code))] // (the node's tests make it; a page calls it)
-    pub fn of_create(c: &ast::CreateTable, schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<Table> {
+    pub fn of_create(c: &ast::CreateTable, schema: &datafusion::arrow::datatypes::SchemaRef, types: &dyn Fn(&str) -> Option<Vec<String>>) -> Result<Table> {
         // The statement's column types first, as the node reads them (`types::columns`, before the spec): an inline ENUM's
-        // labels, a held type, and a named type, which this form does not keep.
-        let mut written: BTreeMap<String, (Option<String>, Option<Vec<String>>)> = BTreeMap::new();
+        // labels, a held type, and a named type's labels with the type's name.
+        let mut written = BTreeMap::new();
         for w in &c.columns {
-            let labels = enum_labels(&w.data_type)?;
+            let inline = enum_labels(&w.data_type)?;
             let held = sql_type(&w.data_type)?;
-            if labels.is_none() && held.is_none() && named(&w.data_type) {
-                return Err(crate::codes::coded("0A000", format!("{} {}: a named type (CREATE TYPE) isn't kept on this form yet", ident(&w.name), w.data_type)));
-            }
+            let labels = match (inline, &w.data_type) {
+                (Some(labels), _) => Some((None, labels)),
+                (None, ast::DataType::Custom(name, _)) if held.is_none() && named(&w.data_type) => {
+                    let of = object(name);
+                    let Some(labels) = types(&of) else { return Err(crate::codes::coded("42704", crate::rules::types::missing(&of))) };
+                    Some((Some(of), labels))
+                }
+                _ => None,
+            };
             written.insert(ident(&w.name), (held, labels));
         }
         let d = declared(c)?;
@@ -623,7 +630,7 @@ impl Table {
                     },
                     always: identity.is_some_and(|i| i.always),
                     held,
-                    labels: labels.map(|l| (None, l)),
+                    labels,
                 }
             })
             .collect();
@@ -708,7 +715,7 @@ mod tests {
                 Ok(schema) => schema,
                 Err(_) => text_schema(&c),
             };
-            let page = Table::of_create(&c, &schema).err().unwrap_or_else(|| panic!("a page takes {sql}"));
+            let page = Table::of_create(&c, &schema, &|_| None).err().unwrap_or_else(|| panic!("a page takes {sql}"));
             assert_eq!(crate::codes::of(&page), crate::codes::of(&node), "{sql}");
             assert_eq!(format!("{page:#}"), format!("{node:#}"), "{sql}");
             assert_eq!(crate::codes::of(&page), code, "{sql}");
@@ -720,15 +727,23 @@ mod tests {
     }
 
     #[test]
-    fn a_named_type_is_refused_on_a_page_and_serial_and_variant_are_not() -> Result<()> {
+    fn a_named_type_that_is_not_there_is_refused_and_serial_and_variant_are_not_named() -> Result<()> {
         let c = create("CREATE TABLE t (a mood)");
-        let e = Table::of_create(&c, &text_schema(&c)).err().expect("a named type");
-        assert_eq!(crate::codes::of(&e), "0A000");
-        assert_eq!(crate::codes::words(&e), "a mood: a named type (CREATE TYPE) isn't kept on this form yet");
+        let Err(e) = Table::of_create(&c, &text_schema(&c), &|_| None) else { panic!("a named type") };
+        assert_eq!(crate::codes::of(&e), "42704");
+        assert_eq!(crate::codes::words(&e), "type \"mood\" does not exist");
         // (a serial is an integer column the form plans, a VARIANT a text one)
         let c = create("CREATE TABLE t (id SERIAL PRIMARY KEY, a VARIANT)");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false), Field::new("a", DataType::Utf8, true)]));
-        Table::of_create(&c, &schema)?;
+        Table::of_create(&c, &schema, &|_| None)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_named_type_takes_its_labels_and_its_name_from_the_types_it_is_given() -> Result<()> {
+        let c = create("CREATE TABLE t (a INT, m mood)");
+        let t = Table::of_create(&c, &text_schema(&c), &|n| (n == "mood").then(|| vec!["sad".into(), "ok".into()]))?;
+        assert_eq!(t.column("m").and_then(|m| m.labels.clone()), Some((Some("mood".into()), vec!["sad".into(), "ok".into()])));
         Ok(())
     }
 
@@ -748,7 +763,7 @@ mod tests {
         ] {
             let c = create(sql);
             let name = object(&c.name);
-            let page = Table::of_create(&c, &planned(&lake, &c).await?)?;
+            let page = Table::of_create(&c, &planned(&lake, &c).await?, &|_| None)?;
             let spec = crate::write::create_spec(&c, &lake, false).await?;
             crate::write::create_table(&lake, &name, &spec).await?;
             let node = lake.cat.get::<TableMeta>(&table_key(&name)).await?.expect("the table is made").to_rules()?;

@@ -1,25 +1,31 @@
-//! `MATCH_RECOGNIZE` (ADR-073, phase 1: ONE ROW PER MATCH), rewritten where SQL comes in into plain SQL around the window
-//! function `pondra_match` (`matcher.rs`), so the query after it is ordinary SQL: the result cache, a spread query, a
-//! view's stored SQL and history see nothing new. The clause becomes a derived table of four layers, each reading the
-//! one before it:
+//! `MATCH_RECOGNIZE` (ADR-073), rewritten where SQL comes in into plain SQL around the window functions `pondra_match`,
+//! `pondra_matches` and `pondra_nav` (`matcher.rs`), so the query after it is ordinary SQL: the result cache, a spread
+//! query, a view's stored SQL and history see nothing new. The clause becomes a derived table of layers, each reading
+//! the one before it:
 //!
 //! - L1: the table's rows, with each symbol's DEFINE as a Boolean column, the ORDER BY keys, and the PREV and NEXT
 //!   columns (`lag` and `lead` over the partition);
 //! - L2: `pondra_match` over the partition (`pondra_matches` where matches may share rows): each row's match, its
 //!   symbol and its place in the match;
-//! - L3: the rows that are in a match, with those as columns (an UNNEST first where matches may share rows);
-//! - L4: the measures, grouped by the partition and the match, which is one row per match.
+//! - L3: the rows that are in a match (all of them, WITH UNMATCHED ROWS), with those as columns (an UNNEST first where
+//!   matches may share rows);
+//! - L4: ONE ROW PER MATCH groups them into one row per match; ALL ROWS PER MATCH keeps each row, with its measures as
+//!   window columns over its match (RUNNING, or FINAL over the whole match);
+//! - L5 (ALL ROWS only): the partition and ORDER BY columns, the measures, then the input's other columns, without the
+//!   rows a `{- … -}` leaves out and the internal columns.
 //!
 //! `text` writes FINAL and RUNNING before a measure as calls that parse, and each PATTERN as one quoted name, since
-//! sqlparser refuses some standard forms; `matcher::read` reads the text. What phase 1 doesn't take is refused by name.
+//! sqlparser refuses some standard forms; `matcher::read` reads the text. What isn't taken is refused by name.
 use crate::codes::coded;
+use crate::matcher::Pattern;
 use crate::text::{ident, object, ROW_ID};
 use anyhow::{bail, Result};
 use datafusion::sql::sqlparser::ast::*;
+use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use serde_json::json;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
@@ -87,12 +93,14 @@ fn calls(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
 }
 
 /// Each MATCH_RECOGNIZE's PATTERN, as `PATTERN ("__mr_pattern_<hex>")`: the one quoted name sqlparser takes, whatever the
-/// pattern is. `pattern_text` reads the text back out.
+/// pattern is. A WITHIN after it goes into the name too (`__within_<hex>`), as `within_at` reads it. `pattern_text` reads
+/// the text back out.
 fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
     static CLAUSE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)(?P<clause>\bmatch_recognize\b)|\bpattern\s*(?P<open>\()").expect("a regex"));
     let mut out = vec![];
     let mut in_clause = false;
+    let mut clause_end = sql.len();
     for c in CLAUSE.captures_iter(sql) {
         let whole = c.get(0).expect("a whole match");
         if !code[whole.start()] {
@@ -100,6 +108,11 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         }
         if c.name("clause").is_some() {
             in_clause = true;
+            // the clause's own parenthesis closes it: a WITHIN runs no further
+            clause_end = (whole.end()..sql.len())
+                .find(|&i| code[i] && sql.as_bytes()[i] == b'(')
+                .and_then(|open| close_of(sql, code, open))
+                .unwrap_or(sql.len());
             continue;
         }
         let Some(open) = c.name("open") else { continue };
@@ -111,9 +124,45 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         if text.trim_start().starts_with("\"__mr_pattern_") {
             continue; // written already
         }
-        out.push((whole.start(), close + 1, format!("PATTERN (\"__mr_pattern_{}\")", hex(text))));
+        let (end, name) = match within_at(sql, code, close + 1, clause_end) {
+            Some((end, within)) => (end, format!("PATTERN (\"__mr_pattern_{}__within_{}\")", hex(text), hex(&within))),
+            None => (close + 1, format!("PATTERN (\"__mr_pattern_{}\")", hex(text))),
+        };
+        out.push((whole.start(), end, name));
     }
     out
+}
+
+/// The WITHIN that follows a PATTERN's `)` at `from`, when one does: where it ends (the interval's last character, before
+/// the DEFINE or the clause's end that comes first), and the interval as written. sqlparser can't read WITHIN, so it is
+/// taken out here and carried in the pattern's name.
+fn within_at(sql: &str, code: &[bool], from: usize, clause_end: usize) -> Option<(usize, String)> {
+    static WITHIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*within\s+").expect("a regex"));
+    static DEFINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bdefine\b").expect("a regex"));
+    let at = from + WITHIN.find(&sql[from..clause_end])?.end();
+    let stop = DEFINE.find_iter(&sql[at..clause_end]).map(|m| at + m.start()).find(|&p| code[p]).unwrap_or(clause_end);
+    let interval = &sql[at..stop];
+    Some((at + interval.trim_end().len(), interval.trim().to_string()))
+}
+
+/// WITHIN's interval as SQL: one interval literal (`INTERVAL '1' HOUR`), written into the call as parsed. Anything else (a
+/// number, a subquery, or more SQL after the interval) is refused, so the text can't change the query's shape.
+fn within_interval(text: &str) -> Result<String> {
+    let refused = || coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR");
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect).try_with_sql(text).map_err(|_| refused())?;
+    let expr = parser.parse_expr().map_err(|_| refused())?;
+    if !matches!(parser.peek_token().token, Token::EOF) {
+        return Err(refused());
+    }
+    match &expr {
+        Expr::Interval(Interval { value, .. })
+            if matches!(value.as_ref(), Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(_) | Value::Number(..), .. })) =>
+        {
+            Ok(expr.to_string())
+        }
+        _ => Err(refused()),
+    }
 }
 
 /// `s` in hex: two digits a byte.
@@ -130,14 +179,22 @@ fn unhex(s: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A clause's PATTERN as the text `matcher::read` reads: the text `patterns` wrote, or else sqlparser's form of it.
-fn pattern_text(p: &MatchRecognizePattern) -> String {
+/// A clause's PATTERN as the text `matcher::read` reads, and its WITHIN's interval as written when it has one: the name
+/// `patterns` wrote, or else sqlparser's form of the pattern. A name written before WITHIN has no `__within_` part (stored
+/// views hold such names, so they still read).
+fn pattern_text(p: &MatchRecognizePattern) -> (String, Option<String>) {
     if let MatchRecognizePattern::Symbol(MatchRecognizeSymbol::Named(id)) = p {
-        if let Some(text) = id.value.strip_prefix("__mr_pattern_").and_then(unhex) {
-            return text;
+        if let Some(rest) = id.value.strip_prefix("__mr_pattern_") {
+            let (pattern, within) = match rest.split_once("__within_") {
+                Some((pattern, within)) => (pattern, unhex(within)),
+                None => (rest, None),
+            };
+            if let Some(text) = unhex(pattern) {
+                return (text, within);
+            }
         }
     }
-    p.to_string()
+    (p.to_string(), None)
 }
 
 /// Which bytes of `sql` are code: not inside a string, a quoted name or a comment (so a word there is not read).
@@ -193,8 +250,9 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     if !scan.found {
         return Ok(false);
     }
-    // A lake table's rows that have `_row_id` are tied on their ORDER BY in that order, so every run finds the same
-    // matches (a CTE of the same name is not the table).
+    // The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
+    // that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
+    // one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
     let lake = host.name();
     let mut local = BTreeSet::new();
     let mut named = vec![];
@@ -204,14 +262,14 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
             named.push((name.clone(), l));
         }
     }
-    let ties: HashSet<String> = match local.is_empty() {
-        true => HashSet::new(),
+    let lake_cols: HashMap<String, Vec<String>> = match local.is_empty() {
+        true => HashMap::new(),
         false => {
             let cols = host.columns(local).await?;
-            named.into_iter().filter(|(_, l)| cols.get(l).is_some_and(|c| c.iter().any(|n| n == ROW_ID))).map(|(n, _)| n).collect()
+            named.into_iter().filter_map(|(n, l)| cols.get(&l).map(|c| (n, c.clone()))).collect()
         }
     };
-    let mut r = Rewrite { ties: &ties };
+    let mut r = Rewrite { lake: &lake_cols };
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
         if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
             return Err(e);
@@ -251,7 +309,7 @@ impl Visitor for Scan {
 
 /// Replaces each clause, innermost first (a clause's input is rewritten before the clause).
 struct Rewrite<'a> {
-    ties: &'a HashSet<String>,
+    lake: &'a HashMap<String, Vec<String>>,
 }
 
 impl VisitorMut for Rewrite<'_> {
@@ -261,7 +319,7 @@ impl VisitorMut for Rewrite<'_> {
         if !matches!(t, TableFactor::MatchRecognize { .. }) {
             return ControlFlow::Continue(());
         }
-        match layer(t, self.ties) {
+        match layer(t, self.lake) {
             Ok(d) => {
                 *t = d;
                 ControlFlow::Continue(())
@@ -282,42 +340,91 @@ enum Mode {
     Aggregate,
 }
 
+/// How a measure reads its match's rows in ALL ROWS PER MATCH: up to the row (RUNNING, the default), or all of them (FINAL).
+#[derive(Clone, Copy, PartialEq)]
+enum Frame {
+    Running,
+    Final,
+}
+
 /// What the translation of one clause knows: its symbols, how the expression at hand is read, the window the lag and
-/// lead columns are over (the partition, and the order as written), and those columns, which L1 computes per row.
+/// lead columns are over (the partition, and the order as written), and those columns, which L1 computes per row. `frame`
+/// is set in ALL ROWS PER MATCH, where a measure is a window over its match's rows (partitioned by `part`, and the
+/// match); None is ONE ROW PER MATCH, where it is over the match's group.
 struct Cx {
     syms: Vec<String>,
     mode: Mode,
     window: String,
     nav: Vec<String>,
+    frame: Option<Frame>,
+    part: Vec<String>,
 }
 
 /// One `MATCH_RECOGNIZE` as the derived table it stands for (the layers of the module doc).
-fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
+fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFactor> {
     let TableFactor::MatchRecognize { table, partition_by, order_by, measures, rows_per_match, after_match_skip, pattern, symbols, alias } = t
     else {
         bail!("MATCH_RECOGNIZE: not a MATCH_RECOGNIZE clause");
     };
-    if let Some(RowsPerMatch::AllRows(_)) = rows_per_match {
-        return Err(coded("0A000", "MATCH_RECOGNIZE: ALL ROWS PER MATCH isn't supported yet: ONE ROW PER MATCH with MEASURES gives each match, or join its first and last row back to the table"));
+    let all = matches!(rows_per_match, Some(RowsPerMatch::AllRows(_)));
+    let omit = matches!(rows_per_match, Some(RowsPerMatch::AllRows(Some(EmptyMatchesMode::Omit))));
+    let unmatched = matches!(rows_per_match, Some(RowsPerMatch::AllRows(Some(EmptyMatchesMode::WithUnmatched))));
+    let (text, within) = pattern_text(pattern);
+    let (read_pattern, syms) = crate::matcher::read(&text)?;
+    if unmatched && excludes(&read_pattern) {
+        return Err(coded("42601", "MATCH_RECOGNIZE: WITH UNMATCHED ROWS can't go with {- … -}: a row left out would be neither in a match nor unmatched; use SHOW EMPTY MATCHES, or keep the rows in the pattern"));
     }
-    let text = pattern_text(pattern);
-    let (_, syms) = crate::matcher::read(&text)?;
-    let has_row = match table.as_ref() {
-        TableFactor::Table { name, .. } => ties.contains(&object(name)),
-        _ => false,
+    // WITHIN reads the first ORDER BY as a time, ascending: its key is the first one, `__mr_o0`. Its interval goes into the
+    // call as parsed, so nothing else of the text does.
+    let within = match within {
+        Some(text) => {
+            match order_by.first() {
+                None => return Err(coded("42601", "MATCH_RECOGNIZE: WITHIN reads the first ORDER BY: add one, a date or a timestamp")),
+                Some(o) if o.options.asc == Some(false) => {
+                    return Err(coded("0A000", "MATCH_RECOGNIZE: WITHIN reads the first ORDER BY ascending"));
+                }
+                Some(_) => {}
+            }
+            Some(within_interval(&text)?)
+        }
+        None => None,
     };
+    // A lake table's columns (see `rewrite`): `_row_id` ties its rows, and ALL ROWS PER MATCH gives its columns beside the
+    // measures, so a measure can't have the name of one of them
+    let input = match table.as_ref() {
+        TableFactor::Table { name, .. } => Some(object(name)),
+        _ => None,
+    };
+    let input_cols = input.as_ref().and_then(|n| lake.get(n));
+    if let (true, Some(cols), Some(table_name)) = (all, input_cols, &input) {
+        for m in measures {
+            let alias = ident(&m.alias);
+            if cols.contains(&alias) {
+                return Err(coded(
+                    "42701",
+                    format!("MATCH_RECOGNIZE: the measure {alias} has the name of a column of {table_name}; ALL ROWS PER MATCH gives both, so name the measure otherwise"),
+                ));
+            }
+        }
+    }
+    let has_row = input_cols.is_some_and(|c| c.iter().any(|x| x == ROW_ID));
     let part_written: Vec<String> = partition_by.iter().map(|e| e.to_string()).collect();
     let part: Vec<String> = partition_by.iter().map(column_name).collect::<Result<Vec<String>>>()?;
+    let order_names: Vec<String> = match all {
+        true => order_by.iter().map(|o| order_column(&o.expr)).collect::<Result<Vec<String>>>()?,
+        false => vec![],
+    };
     let dirs: Vec<String> = order_by.iter().map(|o| direction(&o.options)).collect();
     let mut order_w: Vec<String> = order_by.iter().zip(&dirs).map(|(o, d)| format!("{}{d}", o.expr)).collect();
     if has_row {
         order_w.push(ROW_ID.to_string());
     }
-    let mut cx = Cx { syms, mode: Mode::Measure, window: over(&part_written, &order_w), nav: vec![] };
+    let frame = all.then_some(Frame::Running);
+    let mut cx = Cx { syms, mode: Mode::Measure, window: over(&part_written, &order_w), nav: vec![], frame, part: part.clone() };
     let conds = conditions(symbols, &text, &mut cx)?;
-    let mut cols = vec![];
+    let mut texts = vec![];
     for m in measures {
-        cols.push(format!("{} AS {}", written(m.expr.clone(), &mut cx)?, m.alias));
+        texts.push(written(m.expr.clone(), &mut cx)?);
     }
 
     // L1: the rows, with the keys, the conditions and the navigation columns
@@ -330,8 +437,11 @@ fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
     // L2: the window that matches the partition (`pondra_matches` where a row may be in several matches)
     let overlap = matches!(after_match_skip, Some(AfterMatchSkip::ToNextRow | AfterMatchSkip::ToFirst(_) | AfterMatchSkip::ToLast(_)));
     let skip = skip_json(after_match_skip.as_ref(), &cx.syms)?;
-    let spec = json!({ "pattern": &text, "skip": skip }).to_string();
-    let call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
+    let spec = json!({ "pattern": &text, "skip": skip, "unmatched": unmatched, "within": within.is_some() }).to_string();
+    let mut call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
+    if let Some(interval) = &within {
+        call.push_str(&format!(", __mr_o0, {interval}"));
+    }
     let mut order2: Vec<String> = dirs.iter().enumerate().map(|(i, d)| format!("__mr_o{i}{d}")).collect();
     if has_row {
         order2.push("__mr_row".to_string());
@@ -342,23 +452,71 @@ fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
     };
     let l2 = format!("SELECT *, {fun}({}{call}) {} AS {col} FROM ({l1}) AS __mr_c", quote(&spec), over(&part, &order2));
 
-    // L3: the rows in a match, with its fields as columns
-    let fields = "SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq";
+    // L3: the rows in a match, with its fields as columns. SHOW keeps the rows in a match, OMIT those with a place in it
+    // (an empty match's row has none), WITH UNMATCHED ROWS all of them (a row in no match has NULL fields).
+    let fields = "SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x";
+    let keep = match (omit, unmatched) {
+        (true, _) => " WHERE __mr_m['seq'] IS NOT NULL",
+        (false, false) => " WHERE __mr_m IS NOT NULL",
+        (false, true) => "",
+    };
     let l3 = match overlap {
-        true => format!("{fields} FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM ({l2}) AS __mr_mm) AS __mr_u"),
-        false => format!("{fields} FROM ({l2}) AS __mr_mm WHERE __mr_m IS NOT NULL"),
+        true => format!("{fields} FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM ({l2}) AS __mr_mm) AS __mr_u{keep}"),
+        false => format!("{fields} FROM ({l2}) AS __mr_mm{keep}"),
     };
 
-    // L4: one row per match
-    let mut group = part.clone();
-    group.push("__mr_match".to_string());
-    let mut proj = part.clone();
-    proj.extend(cols);
-    if proj.is_empty() {
-        return Err(coded("0A000", "MATCH_RECOGNIZE: no PARTITION BY and no MEASURES: no column to give"));
-    }
-    let l4 = format!("SELECT {} FROM ({l3}) AS __mr_r GROUP BY {}", proj.join(", "), group.join(", "));
-    Ok(TableFactor::Derived { lateral: false, subquery: Box::new(crate::expander::parse_query(&l4)?), alias: alias.clone(), sample: None })
+    // L4 and L5: one row per match (ONE ROW), or a row per match row with its measures (ALL ROWS)
+    let body = match all {
+        false => {
+            let mut group = part.clone();
+            group.push("__mr_match".to_string());
+            let mut proj = part.clone();
+            proj.extend(texts.iter().zip(measures).map(|(t, m)| format!("{t} AS {}", m.alias)));
+            if proj.is_empty() {
+                return Err(coded("0A000", "MATCH_RECOGNIZE: no PARTITION BY and no MEASURES: no column to give"));
+            }
+            format!("SELECT {} FROM ({l3}) AS __mr_r GROUP BY {}", proj.join(", "), group.join(", "))
+        }
+        true => {
+            // L4: each measure over the match's rows; WITH UNMATCHED ROWS, NULL where a row is in no match
+            let mut sel = vec!["*".to_string()];
+            for (i, t) in texts.iter().enumerate() {
+                let wrapped = match unmatched {
+                    true => format!("CASE WHEN __mr_match IS NOT NULL THEN ({t}) END"),
+                    false => t.clone(),
+                };
+                sel.push(format!("{wrapped} AS __mr_q{i}"));
+            }
+            let l4 = format!("SELECT {} FROM ({l3}) AS __mr_r", sel.join(", "));
+
+            // L5: the partition and order columns, the measures, then the input's other columns in their order, without
+            // the internal columns and the rows that a `{- … -}` leaves out
+            let mut own = part.clone();
+            for c in &order_names {
+                if !own.contains(c) {
+                    own.push(c.clone());
+                }
+            }
+            let mut hidden: Vec<String> = ["__mr_m", "__mr_match", "__mr_symbol", "__mr_seq", "__mr_x"].iter().map(|c| c.to_string()).collect();
+            if overlap {
+                hidden.push("__mr_ms".to_string());
+            }
+            if has_row {
+                hidden.push("__mr_row".to_string());
+            }
+            hidden.extend((0..order_by.len()).map(|i| format!("__mr_o{i}")));
+            hidden.extend((0..cx.syms.len()).map(|k| format!("__mr_d{k}")));
+            hidden.extend((0..cx.nav.len()).map(|j| format!("__mr_n{j}")));
+            hidden.extend((0..texts.len()).map(|i| format!("__mr_q{i}")));
+            let mut exclude = own.clone();
+            exclude.extend(hidden);
+            let mut out = own;
+            out.extend(measures.iter().enumerate().map(|(i, m)| format!("__mr_q{i} AS {}", m.alias)));
+            out.push(format!("* EXCLUDE ({})", exclude.join(", ")));
+            format!("SELECT {} FROM ({l4}) AS __mr_a WHERE __mr_x IS NOT TRUE", out.join(", "))
+        }
+    };
+    Ok(TableFactor::Derived { lateral: false, subquery: Box::new(crate::expander::parse_query(&body)?), alias: alias.clone(), sample: None })
 }
 
 /// Each symbol's condition as SQL over the rows: its DEFINE, read as the current row's, and `true` for a symbol with
@@ -399,6 +557,13 @@ fn column_name(e: &Expr) -> Result<String> {
     };
     last.map(|i| i.to_string()).ok_or_else(|| {
         coded("0A000", format!("MATCH_RECOGNIZE: PARTITION BY takes columns; compute {e} in a subquery and partition by its name"))
+    })
+}
+
+/// An ORDER BY item of ALL ROWS PER MATCH as the column it names: its rows carry the ORDER BY columns, not expressions.
+fn order_column(e: &Expr) -> Result<String> {
+    column_name(e).map_err(|_| {
+        coded("0A000", format!("MATCH_RECOGNIZE: ALL ROWS PER MATCH gives the ORDER BY columns; compute {e} in a subquery and order by its name"))
     })
 }
 
@@ -502,6 +667,16 @@ fn navigates(e: &Expr) -> bool {
 }
 
 fn lower_name(f: &Function) -> String { object(&f.name).to_lowercase() }
+
+/// Whether a pattern has a `{- … -}` anywhere in it.
+fn excludes(p: &Pattern) -> bool {
+    match p {
+        Pattern::Exclude(_) => true,
+        Pattern::Seq(v) | Pattern::Alt(v) | Pattern::Permute(v) => v.iter().any(excludes),
+        Pattern::Rep { body, .. } => excludes(body),
+        Pattern::Sym(_) | Pattern::Start | Pattern::End => false,
+    }
+}
 
 /// The arguments of a call that are plain expressions (a `*` or a `name => value` is refused).
 fn positional(f: &Function) -> Result<Vec<&Expr>> {
@@ -631,9 +806,17 @@ fn function(f: &Function, cx: &mut Cx) -> Result<Option<String>> {
     }
 }
 
-/// A call in a DEFINE: PREV and NEXT are the row's own lag and lead; the match so far is refused by name.
-fn define_call(f: &Function, name: &str, k: usize, cx: &Cx) -> Result<Option<String>> {
+/// A call in a DEFINE: PREV and NEXT are the row's own lag and lead; RUNNING is its argument (a DEFINE reads the rows so
+/// far), and FINAL is refused; the match so far is refused by name.
+fn define_call(f: &Function, name: &str, k: usize, cx: &mut Cx) -> Result<Option<String>> {
     Ok(Some(match name {
+        "pondra_running" => {
+            let args = positional(f)?;
+            written(first_arg(&args, name)?.clone(), cx)?
+        }
+        "pondra_final" => {
+            return Err(coded("42601", "MATCH_RECOGNIZE: FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL"))
+        }
         "prev" | "next" => {
             let args = positional(f)?;
             let e = first_arg(&args, name)?;
@@ -650,16 +833,22 @@ fn define_call(f: &Function, name: &str, k: usize, cx: &Cx) -> Result<Option<Str
 }
 
 /// A call in a measure: the navigations, CLASSIFIER and MATCH_NUMBER, the aggregates, and pondra_final and
-/// pondra_running (which read at the last row, where both agree).
+/// pondra_running. In ONE ROW PER MATCH they read at the last row, where both agree; in ALL ROWS PER MATCH they set the
+/// frame that the measure inside them is read by.
 fn measure_call(f: &Function, name: &str, cx: &mut Cx) -> Result<Option<String>> {
     Ok(Some(match name {
         "first" | "last" => navigation(f, name == "first", cx)?,
         "prev" | "next" => measure_lag(f, name == "prev", cx)?,
-        "classifier" => format!("last_value(__mr_symbol ORDER BY __mr_seq) FILTER (WHERE {})", filter_of(None, cx)),
+        "classifier" => nav_text(false, None, "__mr_symbol", None, cx),
         "match_number" => "__mr_match".to_string(),
         "pondra_final" | "pondra_running" => {
             let args = positional(f)?;
-            written(first_arg(&args, name)?.clone(), cx)?
+            let e = first_arg(&args, name)?.clone();
+            let saved = cx.frame;
+            cx.frame = saved.map(|_| if name == "pondra_final" { Frame::Final } else { Frame::Running });
+            let text = written(e, cx);
+            cx.frame = saved;
+            text?
         }
         n if AGGREGATES.contains(&n) => aggregate(f, cx)?,
         _ => return Ok(None),
@@ -688,14 +877,43 @@ fn aggregate_call(f: &Function, name: &str, cx: &mut Cx) -> Result<Option<String
 }
 
 /// The value of `col` at the rows of `var` in the match: the first or last of them, or the m-th from the first or last.
+/// ONE ROW PER MATCH reads it over the match's group. ALL ROWS PER MATCH reads it at each row, over the match's rows up
+/// to that row (RUNNING) or all of them (FINAL), through `pondra_nav`, which takes no frame of its own.
 fn nav_text(first: bool, m: Option<u64>, col: &str, var: Option<usize>, cx: &Cx) -> String {
-    let at = match (first, m) {
-        (true, None) => format!("first_value({col} ORDER BY __mr_seq)"),
-        (false, None) => format!("last_value({col} ORDER BY __mr_seq)"),
-        (true, Some(m)) => format!("nth_value({col}, {} ORDER BY __mr_seq)", m + 1),
-        (false, Some(m)) => format!("nth_value({col}, {} ORDER BY __mr_seq DESC)", m + 1),
+    let keep = filter_of(var, cx);
+    let Some(frame) = cx.frame else {
+        let at = match (first, m) {
+            (true, None) => format!("first_value({col} ORDER BY __mr_seq)"),
+            (false, None) => format!("last_value({col} ORDER BY __mr_seq)"),
+            (true, Some(m)) => format!("nth_value({col}, {} ORDER BY __mr_seq)", m + 1),
+            (false, Some(m)) => format!("nth_value({col}, {} ORDER BY __mr_seq DESC)", m + 1),
+        };
+        return format!("{at} FILTER (WHERE {keep})");
     };
-    format!("{at} FILTER (WHERE {})", filter_of(var, cx))
+    let fin = frame == Frame::Final;
+    format!("pondra_nav({col}, {keep}, {}, {first}, {fin}) {}", m.unwrap_or(0), over_match(cx, false))
+}
+
+/// The window of a measure in ALL ROWS PER MATCH: the match's rows in their order, within the partition and the match.
+/// An aggregate takes a frame (up to this row when RUNNING, all the match's rows when FINAL); a navigation reads the
+/// match itself, so it takes none.
+fn over_match(cx: &Cx, aggregate: bool) -> String {
+    let frame = match (aggregate, cx.frame) {
+        (false, _) => "",
+        (true, Some(Frame::Final)) => " ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        (true, _) => " ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+    };
+    let mut parts = cx.part.clone();
+    parts.push("__mr_match".to_string());
+    format!("OVER (PARTITION BY {} ORDER BY __mr_seq{frame})", parts.join(", "))
+}
+
+/// An aggregate's text in a measure: in ALL ROWS PER MATCH, a window over the match's rows (see `over_match`).
+fn windowed(call: String, cx: &Cx) -> String {
+    match cx.frame {
+        None => call,
+        Some(_) => format!("{call} {}", over_match(cx, true)),
+    }
 }
 
 /// FIRST or LAST of a column over the rows of its variable (`FIRST(v.x, m)` is the m-th from the first).
@@ -744,11 +962,26 @@ fn measure_lag(f: &Function, prev: bool, cx: &mut Cx) -> Result<String> {
     Ok(nav_text(first, m, &col, var, cx))
 }
 
+/// Whether a call has an ORDER BY of its own (`string_agg(x, ',' ORDER BY x)`).
+fn has_order_by(f: &Function) -> bool {
+    match &f.args {
+        FunctionArguments::List(list) => list.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))),
+        _ => false,
+    }
+}
+
 /// An aggregate over the rows of its variable: the same call over the columns, with a FILTER for the match's rows of
-/// that variable (and its own FILTER, if it has one). `count(v.*)` is the count of those rows.
+/// that variable (and its own FILTER, if it has one). `count(v.*)` is the count of those rows. In ALL ROWS PER MATCH it
+/// is a window over the match's rows, and an ORDER BY of its own is refused: its rows come in the match's order.
 fn aggregate(f: &Function, cx: &mut Cx) -> Result<String> {
     if f.over.is_some() {
         return Err(coded("0A000", "MATCH_RECOGNIZE: a window inside a measure isn't supported yet"));
+    }
+    if cx.frame.is_some() && has_order_by(f) {
+        return Err(coded(
+            "0A000",
+            "MATCH_RECOGNIZE: an aggregate's own ORDER BY isn't supported in ALL ROWS PER MATCH yet: its rows come in the match's order, so drop it",
+        ));
     }
     let own = match &f.filter {
         Some(e) => format!(" AND ({})", inside((**e).clone(), cx)?),
@@ -759,13 +992,13 @@ fn aggregate(f: &Function, cx: &mut Cx) -> Result<String> {
             return Err(coded("42601", format!("MATCH_RECOGNIZE: {v}.* is an argument of count only")));
         }
         let k = symbol_named(&v, cx)?;
-        return Ok(format!("count(*) FILTER (WHERE {}{own})", filter_of(Some(k), cx)));
+        return Ok(windowed(format!("count(*) FILTER (WHERE {}{own})", filter_of(Some(k), cx)), cx));
     }
     let var = variable_of(&f.args, cx)?;
     let mut call = f.clone();
     call.filter = None;
     let body = inside(call, cx)?;
-    Ok(format!("{body} FILTER (WHERE {}{own})", filter_of(var, cx)))
+    Ok(windowed(format!("{body} FILTER (WHERE {}{own})", filter_of(var, cx)), cx))
 }
 
 /// AFTER MATCH SKIP as the spec's node, its symbol by name (the matcher finds it in the pattern's). Past the last row is
@@ -830,7 +1063,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashSet::new()).expect("a layer") else { panic!("a derived table") };
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
         let text = subquery.to_string();
         assert!(text.contains("pondra_matches("));
         assert!(text.contains("GROUP BY symbol, __mr_match"));
@@ -843,6 +1076,80 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &written).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(s) = *q.body else { panic!("a select") };
         let TableFactor::MatchRecognize { pattern, .. } = &s.from[0].relation else { panic!("a clause") };
-        assert_eq!(pattern_text(pattern), "a {- b -} c");
+        assert_eq!(pattern_text(pattern).0, "a {- b -} c");
+    }
+
+    #[test]
+    fn within_is_carried_in_the_pattern_name() {
+        let written = text("SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true)");
+        assert!(!written.contains("WITHIN"));
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &written).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(s) = *q.body else { panic!("a select") };
+        let TableFactor::MatchRecognize { pattern, .. } = &s.from[0].relation else { panic!("a clause") };
+        assert_eq!(pattern_text(pattern), ("a b+ c".to_string(), Some("INTERVAL '1' HOUR".to_string())));
+    }
+
+    #[test]
+    fn within_needs_an_ascending_first_order_by() {
+        let no_order = "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(no_order)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42601");
+        let desc = "SELECT * FROM t MATCH_RECOGNIZE (ORDER BY ts DESC PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(desc)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+    }
+
+    #[test]
+    fn a_measure_named_like_a_lake_column_is_refused() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES LAST(up.price) AS price \
+                   ALL ROWS PER MATCH PATTERN (strt up+) DEFINE up AS up.price > PREV(up.price)) AS m";
+        let lake = HashMap::from([("ticker".to_string(), vec!["symbol".to_string(), "day".to_string(), "price".to_string()])]);
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let clause = s.from.remove(0).relation;
+        let err = layer(&clause, &lake).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42701");
+        // an input that isn't a lake table keeps DataFusion's own error
+        assert!(layer(&clause, &HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn the_all_rows_clause_is_one_derived_table() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day \
+                   MEASURES MATCH_NUMBER() AS m, CLASSIFIER() AS c, FINAL count(*) AS fn, FIRST(price) AS f \
+                   ALL ROWS PER MATCH PATTERN (strt down+ up+) \
+                   DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS t";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let clause = s.from.remove(0).relation;
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
+        let text = subquery.to_string();
+        assert!(text.contains("pondra_match("));
+        assert!(text.contains("pondra_nav("));
+        assert!(text.contains("PARTITION BY symbol, __mr_match ORDER BY __mr_seq ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING"));
+        assert!(text.contains("EXCLUDE ("));
+    }
+
+    #[test]
+    fn unmatched_rows_cant_go_with_an_exclusion() {
+        let sql = "SELECT * FROM t MATCH_RECOGNIZE (ALL ROWS PER MATCH WITH UNMATCHED ROWS PATTERN (a {- b -}) DEFINE b AS true) AS m";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let clause = s.from.remove(0).relation;
+        let err = layer(&clause, &HashMap::new()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42601");
+    }
+
+    #[test]
+    fn within_takes_one_interval_literal_only() {
+        assert_eq!(within_interval("INTERVAL '1' HOUR").unwrap(), "INTERVAL '1' HOUR");
+        for text in ["5", "(SELECT 1)", "INTERVAL '1' HOUR), x(", ""] {
+            let err = within_interval(text).expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "42601", "{text}");
+        }
     }
 }

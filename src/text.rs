@@ -11,6 +11,13 @@ pub fn object(n: &ast::ObjectName) -> String {
     n.0.iter().map(part).collect::<Vec<_>>().join(".")
 }
 
+/// A name as SQL resolves it (`S` is `s`, `"S"` is `S`), as `nextval('…')`, `ALTER` and `DROP TYPE` give it.
+pub fn object_of(name: &str) -> String {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let parsed = Parser::new(&GenericDialect {}).try_with_sql(name).and_then(|mut p| p.parse_object_name(false));
+    parsed.map(|n| object(&n)).unwrap_or_else(|_| name.to_lowercase())
+}
+
 /// One part of a name: as written if quoted, else in lower case.
 pub fn ident(i: &ast::Ident) -> String { if i.quote_style.is_some() { i.value.clone() } else { i.value.to_lowercase() } }
 
@@ -32,6 +39,11 @@ pub fn first_word(sql: &str) -> &str {
 /// `control` reads, so a word is whole (`merged` is not `MERGE`).
 pub fn first_words(sql: &str, n: usize) -> Vec<String> {
     first_word(sql).trim_end_matches(';').split_whitespace().take(n).map(|w| w.to_uppercase()).collect()
+}
+
+/// Whether `words` begin with `pattern`'s words (`first_words` gives them upper-cased, as a pattern is written).
+pub fn begins(words: &[String], pattern: &[&str]) -> bool {
+    words.len() >= pattern.len() && words.iter().zip(pattern).all(|(word, p)| word == p)
 }
 
 /// The words a `BEGIN` may take after its first (`control`).

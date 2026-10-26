@@ -3512,6 +3512,24 @@ def schemas():
     q("CREATE SCHEMA dbo", 2)
     checks["a schema must exist before its tables; CREATE SCHEMA on a follower"] = "CREATE SCHEMA dbo" in (before or "") and q("CREATE SCHEMA IF NOT EXISTS dbo", 1)["unchanged"] \
         and err("CREATE SCHEMA dbo") is not None and err("DROP SCHEMA public") is not None
+    # pondra is the system's schema: no schema of a user's takes its name, in any case (42939), and its tables still answer
+    # (status, the SQLSTATE in its header, the message as text: the node's own words, not a repr)
+    def answer(s):
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        c.request("POST", "/sql", s.encode(), {})
+        r = c.getresponse(); body = r.read().decode(errors="replace")
+        return r.status, r.getheader("x-pondra-sqlstate"), body
+    pondra_refused = [answer(s) for s in ("CREATE SCHEMA pondra", "CREATE SCHEMA IF NOT EXISTS Pondra", 'CREATE SCHEMA "PONDRA"')]
+    checks["CREATE SCHEMA pondra, in any case, is refused 42939 (pondra is the system's schema); pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_refused) and isinstance(q("SELECT * FROM pondra.tasks"), list)
+    # a write into a pondra table says the system's words (read-only, 25006 as a backup's write), and no CREATE SCHEMA hint that CREATE SCHEMA pondra refuses
+    st, code, body = answer("INSERT INTO pondra.runs (id) VALUES (1)")
+    checks["a write into pondra.runs: refused 25006, in the system's words (read-only), with no CREATE SCHEMA hint"] = \
+        st != 200 and code == "25006" and "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only" in body and "CREATE SCHEMA" not in body
+    # nor a database: ATTACH … AS pondra, CREATE DATABASE pondra (a branch's too) would hide the same tables, and are refused before anything is made
+    pondra_dbs = [answer(s) for s in ("ATTACH '/tmp/pondra-harness-never-made' AS pondra", "CREATE DATABASE Pondra", "CREATE DATABASE pondra CLONE lake")]
+    checks["ATTACH … AS pondra and CREATE DATABASE pondra (CLONE too) are refused 42939; pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_dbs) and isinstance(q("SELECT * FROM pondra.tasks"), list)
     q("CREATE TABLE t (k BIGINT, v DOUBLE)", 1)
     q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 2)
     q("INSERT INTO t VALUES (1, 1.0), (2, 2.0)", 1)
@@ -19152,14 +19170,15 @@ def find():
     checks["every word in one field"] = any(r.get("object") == "orders" and r["name"] == "amount" for r in both) \
         and not any(r["is"] == "object" and r["name"] == "revenue" for r in both)
 
-    # concepts, under other products' names; a kind leaves them out
+    # concepts, under other products' names; a kind leaves them out ('pipeline' is the task graph: a 1.0 task is a pipeline of one step)
     fk = q("SELECT * FROM pondra.find('foreign key')")
     pipe = q("SELECT * FROM pondra.find('pipeline')")
     fk_link = q("SELECT * FROM pondra.find('foreign key', kind => 'link')")
     info["concepts"] = [fk, pipe, fk_link]
-    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the flow pattern; a kind leaves them out"] = \
+    checks["concepts by other products' names: 'foreign key' is the link part, 'pipeline' the task graph pattern (not the flow); a kind leaves them out"] = \
         any(r["is"] == "part" and r["kind"] == "link" and r.get("matched") == "also" and r.get("object") is None for r in fk) \
-        and any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) and not any(r.get("object") is None for r in fk_link)
+        and any(r["is"] == "pattern" and r["kind"] == "task graph" for r in pipe) and not any(r["is"] == "pattern" and r["kind"] == "flow" for r in pipe) \
+        and not any(r.get("object") is None for r in fk_link)
 
     # an attached lake's objects
     prod = q("SELECT * FROM pondra.find('products')")
@@ -20845,6 +20864,12 @@ def variables():
     checks["pondra.variables lists them (name, value, type, declared), never a remembered answer; SET is still a setting"] = \
         got["listed"] == [{"name": "day", "value": "2026-09-29", "type": "Date32", "declared": "DATE"}] \
         and got["listed again"] == [{"name": "day", "value": "2026-09-30", "type": "Date32", "declared": "DATE"}]
+    # A struct variable's field is `$s.a` (1.1 reads a pipeline's `$daily.rows` so); a field of a value that is no struct is
+    # refused by DataFusion's words, so the form is kept free for 1.1 and means nothing else in the meantime (R5).
+    got["field"] = q("DECLARE $s = named_struct('a', 1); SELECT $s.a AS v", {})
+    got["field of a date"] = _raises_text(lambda: q("DECLARE $d = DATE '2026-09-30'; SELECT $d.from AS v", {}))
+    checks["$s.a reads a struct variable's field; a field of a DATE is refused (not a struct): the form stays free for 1.1"] = \
+        got["field"] == [{"v": 1}] and "is not Struct" in got["field of a date"]
     # A file's parameters, and runs.
     daily = ("-- The day to load\nDECLARE PARAMETER $day DATE = DATE '2026-09-29';\n-- $region: where the orders come from\nDECLARE PARAMETER $min DOUBLE DEFAULT 0;\n"
              "SELECT count(*) AS n, sum(amount) AS total, $region AS region FROM orders WHERE day = $day AND amount >= $min;\n")
@@ -22204,6 +22229,8 @@ def doors():
             "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
             "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
+            "CREATE PIPELINE, refused by name, 0A000": (["CREATE PIPELINE d_pipe AS BEGIN STEP a AS SELECT 1; END"], lambda r: r == "0A000"),
+            "SHOW PIPELINES, refused by name, 0A000": (["SHOW PIPELINES"], lambda r: r == "0A000"),
         }
     def rows_of(x):
         return [list(r.values()) if isinstance(r, dict) else list(r) for r in x] if isinstance(x, list) else x
@@ -22311,7 +22338,7 @@ finally {{ await db.close?.(); }}"""
         return out
     # The shell prints its errors without a SQLSTATE (the header `x-pondra-sqlstate` carries it), so the
     # codes this matrix checks are named by the words of their messages.
-    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000")]
+    shell_words = [("violates check constraint", "23514"), ("not found", "42P01"), ("no table", "42P01"), ("is a backup, so it is read-only", "25006"), ("SET LOCATION moves a lake held in memory", "0A000"), ("come in 1.1", "0A000")]
     def via_cli(stmts):
         # The shell on the lake, one process for the feature's statements: one session (`shell.rs`). It has no
         # `--url`, so it starts a node on the lake, which joins this one as a follower; its own address is an
@@ -22783,14 +22810,16 @@ def dialects():
 
 
 def patterns():
-    """MATCH_RECOGNIZE (ADR-073, phase 1): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random
-    queries (every pattern operator, every skip rule, empty matches, four partitions of 0-25 rows) against a reference
-    matcher of that file's own, the fixed examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets,
-    FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an
-    exclusion), and the refusals by name. Section 5, the doors: the ticker over the Postgres port equals HTTP; a
-    10,000-row table over 50 symbols answers the same from three nodes (?spread=1) as from one, and spreads; a stored
-    view and a materialized view equal the query, the view kept live through new rows. Without the matcher every
-    statement here is refused (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
+    """MATCH_RECOGNIZE (ADR-073): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random queries
+    (every pattern operator, every skip rule, empty matches, ONE ROW and ALL ROWS PER MATCH in its three forms with
+    RUNNING and FINAL measures, four partitions of 0-25 rows) against a reference matcher of that file's own, the fixed
+    examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets, FINAL and RUNNING, ties in five runs, an
+    empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS
+    PER MATCH, WITH UNMATCHED ROWS under TO NEXT ROW, WITHIN on timestamps), and the refusals by name. Section 5, the doors: the ticker and
+    its ALL ROWS form over the Postgres port equal HTTP's; a 10,000-row table over 50 symbols answers the same from
+    three nodes (?spread=1) as from one, and spreads, in both rows-per-match forms; a stored view and a materialized
+    view equal the query, the view kept live through new rows. Without the matcher every statement here is refused
+    (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
     import patterns_check as pc
     import psycopg
     checks, info = {}, {}
@@ -22798,13 +22827,13 @@ def patterns():
     lake = new_lake()
     node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
     ok, info["random"] = pc.random_checks(A.port, seed=1, queries=600)
-    checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions) answer as the reference does, or 22000 where it does"] = ok
+    checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions, WITHIN on one in five, by timestamps or by dates) answer as the reference does, or 22000 where it does"] = ok
     fixed = pc.fixed_checks(A.port)
     info["fixed missed"] = [k for k, v in fixed.items() if not v]
-    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion: the answers written in patterns_check.py"] = all(fixed.values())
+    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW), WITHIN on the ticker's timestamps (one match cut short, one later start that wins), Flink's WITHIN example (a drop of 10 in an hour; its DEFINE reads the match so far, so the engine refuses it, 0A000, until the next PR), a column and a symbol both named d: the answers written in patterns_check.py, names and rows"] = all(fixed.values())
     refused = pc.refusal_checks(A.port)
     info["refusals missed"] = [k for k, v in refused.items() if not v]
-    checks["refusals by name: ALL ROWS PER MATCH, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states"] = all(refused.values())
+    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states, WITHIN without an ORDER BY, descending or on an INT, a measure named like a column of the table, WITHIN with a number or a subquery"] = all(refused.values())
     # section 5: the ticker over the Postgres port, then three nodes on a lake of their own
     ticker_q = pc.FIXED[0]["query"]
     want = pc.post_sql(A.port, ticker_q)["value"]
@@ -22813,6 +22842,15 @@ def patterns():
         cols = [d.name for d in cur.description]
         over_pg = [dict(zip(cols, r)) for r in cur.fetchall()]
     checks["the ticker's matches over the Postgres port equal HTTP's, and there are the three of the brief"] = over_pg == want and len(want) == 3
+    # ALL ROWS PER MATCH over the Postgres port: the same column names and rows as HTTP's (the rows of the brief's 15)
+    answered = pc.post_sql(A.port, pc.ALL_ROWS_Q, arrow=True)
+    all_names, all_rows = answered["value"] if answered["ok"] else (None, None)
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=pondra dbname=pondra", autocommit=True) as c:
+        cur = c.execute(pc.ALL_ROWS_Q)
+        pg_names = [d.name for d in cur.description]
+        pg_rows = [tuple(r) for r in cur.fetchall()]
+    checks["ALL ROWS PER MATCH (the ticker, RUNNING and FINAL) over the Postgres port: the same column names and rows as HTTP's, 15 rows"] = \
+        bool(answered["ok"]) and pg_names == all_names and pg_rows == all_rows and len(all_rows) == 15
     node.kill()
     lake = new_lake()
     nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]
@@ -22855,6 +22893,19 @@ def patterns():
     others = [call(p, "POST", "/sql?spread=1", spread_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
     checks["the 10,000-row query over 50 symbols: each of three nodes with ?spread=1 == one node, and the query spread"] = \
         bool(one) and three == one and all(o == one for o in others) and info["spread on node 2"]
+    # the same rows-per-match as ALL ROWS PER MATCH (RUNNING and FINAL), repartitioned by symbol: equal, and spread
+    all_spread_q = ("SELECT symbol, day, m, d, n FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+                    "MEASURES MATCH_NUMBER() AS m, LAST(down.price) AS d, FINAL count(*) AS n ALL ROWS PER MATCH "
+                    "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+                    "up AS up.price > PREV(up.price)) ORDER BY symbol, m, day")
+    one_all = call(A.port, "POST", "/sql?spread=0", all_spread_q.encode(), timeout=120)
+    before = spreads(A.port + 1)
+    three_all = call(A.port + 1, "POST", "/sql?spread=1", all_spread_q.encode(), timeout=120)
+    spread_all = spreads(A.port + 1) - before > 0
+    others_all = [call(p, "POST", "/sql?spread=1", all_spread_q.encode(), timeout=120) for p in (A.port, A.port + 2)]
+    info["ALL ROWS rows over 50 symbols"] = len(one_all) if isinstance(one_all, list) else None
+    checks["the ALL ROWS query over the same 10,000 rows: each of three nodes with ?spread=1 == one node, and it spread"] = \
+        bool(one_all) and three_all == one_all and all(o == one_all for o in others_all) and spread_all
     # views: a stored view and a materialized view of the brief's query, the materialized one kept live
     view_q = ticker_q.rsplit(" ORDER BY ", 1)[0]
     q(f"CREATE VIEW ticker_v AS {view_q}")

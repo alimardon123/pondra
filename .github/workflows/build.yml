@@ -215,7 +215,7 @@ jobs:
           fi
           binary=false
           if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
-          suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 5) | {part: "harness, \(.) of 4", shard: "\(.)/4"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
+          suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 6) | {part: "harness, \(.) of 5", shard: "\(.)/5"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
           printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
             "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
@@ -418,8 +418,10 @@ jobs:
     steps: *build
 
   # The crate's own unit tests, and a node opened in a host's process (ADR-061), beside linux-x64's
-  # build (they need a build of their own: the release profile on this machine, not the dist one zig
-  # links for glibc 2.17).
+  # build (they need builds of their own: the release profile on this machine, not the dist one zig
+  # links for glibc 2.17). The crate is built twice, for its own tests and for a host's, so on two
+  # runners: one command compiling both side by side took 23.2 of a train's 24.3 minutes (run 1125,
+  # 10-25), and was the run's longest path by 2.4 minutes.
   unit:
     needs: plan
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.unit == 'true' }}
@@ -436,27 +438,45 @@ jobs:
         with:
           shared-key: unit
           cache-on-failure: true
-          save-if: ${{ needs.plan.outputs.event != 'pull_request' }} # (main's caches only, as the build's)
-      - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
-      # The crate's unit tests, and a node in a host's process (two lakes one after the other, and
-      # the library's four checks). One command, so the crate's two builds (for its own tests, and
-      # for the other two) compile side by side: two commands built them one after the other, 9.6
-      # and then 14.3 minutes on main's run 650.
-      - run: cargo test --release --lib --test node_twice --test node_library
+          save-if: false # (the host's job saves this key, with the workspace's crates: `host`)
+      - run: cargo test --release --lib
       # The core as the page form builds it (web/: no server feature), checked: a module every build has that
       # called one only a node has broke main's browser build after a pull request merged on Linux's CI alone (#131).
       - name: The browser's half of the crate compiles (no server feature)
         run: cargo check --release --lib --no-default-features
+
+  host:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.run == '' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.unit == 'true' }}
+    name: a node in a host's process
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: unit
+          cache-on-failure: true
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' }} # (main's caches only, as the build's)
+      - run: python3 tools/per_node_check.py # (a node leaves nothing of itself in its process: the source alone, ADR-061)
+      # Two lakes one after the other in one process, and the library's four checks.
+      - run: cargo test --release --test node_twice --test node_library
       # (on main, the workspace too: the cache this job saves is the one a pull request's linux-x64
       # builds from, in the release profile, and the program and the library need a few crates more)
       - if: needs.plan.outputs.event != 'pull_request'
         run: cargo build --release --workspace
 
-  # The suite, on linux-x64's very binary, in five parts side by side: the quick correctness suite
+  # The suite, on linux-x64's very binary, in six parts side by side: the quick correctness suite
   # (upserts, split brain, crashes, clients, Kafka, windows, sums, schemas, files on S3, lakes on
-  # GCS and Azure, scale, Flight…) in four, each section dealt by its measured time
+  # GCS and Azure, scale, Flight…) in five, each section dealt by its measured time
   # (`harness.py all --shard`), and frames against Polars, the console in Chromium, every example
-  # on the website, then a cluster losing its leader twice.
+  # on the website, then a cluster losing its leader twice. (In four, a part's sections took 426 s,
+  # the run's longest path after linux-x64's build; in five, about 376 s each, as long as the
+  # frames' part takes.)
   suite:
     needs: [plan, linux]
     if: ${{ !cancelled() && needs.linux.result == 'success' && needs.plan.outputs.docs == 'true' }}
@@ -484,7 +504,7 @@ jobs:
           path: dist
       - name: linux-x64's binary
         run: mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
-      - run: pip install -r tools/requirements.txt
+      - run: pip install --no-compile -r tools/requirements.txt # (a module compiles as it is first imported: pip compiling them all took a third of its 52 s)
       - uses: actions/cache@v5 # (Apache Kafka for harness.py kafkas: archive.apache.org takes minutes)
         if: matrix.shard
         id: kafka
@@ -606,7 +626,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, web, forms, linux, build, unit, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, forms, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:

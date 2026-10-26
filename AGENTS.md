@@ -2469,6 +2469,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    refused; one naming anything but the view's columns is refused. `harness.py facts`: "kept through CREATE
    OR REPLACE…", "refused by name, and nothing made", "SHOW CREATE VIEW run again after a drop makes the
    same view".
+360. **A row pattern is matched in the standard's order of preference, and only a window function sees it**
+   (`pattern.rs`, `matcher.rs`, ADR-073): `MATCH_RECOGNIZE` is rewritten where SQL comes in into plain SQL
+   around `pondra_match` (or `pondra_matches` where a skip rule lets matches share rows), so the result cache,
+   a spread query and history see ordinary SQL. Its `PATTERN` is read by the matcher's own parser, since
+   sqlparser takes `a {- b -} c`'s `{` for a count. A lake table's ties on the `ORDER BY` go in `_row_id`
+   order, so every node and every run finds the same matches. A coded error raised inside the window function
+   keeps its SQLSTATE (`matcher::external`). `harness.py patterns`: 600 random patterns == a reference matcher
+   written from the standard; three nodes == one node.
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
    (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used

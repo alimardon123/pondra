@@ -2,6 +2,11 @@
 //! Object storage — a local dir or s3://bucket/prefix (S3, R2, MinIO) — is the only state.
 #![recursion_limit = "256"] // (the Send check of a query's future, many awaits deep)
 
+// On a page, `tokio` is the stand-in in `web/tokio`, under its own name in Cargo.toml: this makes it `tokio` for every
+// module, as the native build's dependency is.
+#[cfg(target_arch = "wasm32")]
+extern crate pondra_tokio_web as tokio;
+
 // The parts every build has, a browser's too (feature `server` off): SQL's functions and
 // rewrites that need no lake.
 pub mod finish;
@@ -18,6 +23,8 @@ pub mod in_task;
 pub mod page;
 pub mod request_body;
 pub mod text;
+// The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
+mod kept;
 pub mod extension;
 pub mod ext_names;
 pub mod lake_files;
@@ -179,6 +186,7 @@ mod rules;
 #[cfg(feature = "server")] mod spill;
 #[cfg(feature = "server")] mod spmd;
 #[cfg(feature = "server")] mod status;
+#[cfg(feature = "server")] mod kv;
 #[cfg(feature = "server")] mod store;
 #[cfg(feature = "server")] mod sync;
 #[cfg(feature = "server")] mod sys;
