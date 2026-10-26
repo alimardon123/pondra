@@ -939,6 +939,7 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
         let held = crate::memory::store(&url);
         return Ok((url.clone(), held.clone(), Some((url, held)))); // (DataFusion reads its files at their URLs, as a bucket's)
     }
+    #[cfg(feature = "doors")]
     if served(url) {
         // (the store is the node that holds the lake's, read through its door: `served.rs`; nothing is connected yet)
         let at = url.trim_start_matches("pondra://").trim_end_matches('/');
@@ -946,6 +947,10 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
         let url = format!("pondra://{at}");
         let store: Store = Arc::new(Counted(Arc::new(crate::served::Served::new(at))));
         return Ok((url.clone(), store.clone(), Some((url, store)))); // (the lake and its bucket are one, as in memory)
+    }
+    #[cfg(not(feature = "doors"))]
+    if served(url) {
+        anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
     let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
         return folder(url);
