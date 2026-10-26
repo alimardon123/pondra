@@ -1493,7 +1493,9 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
     ensure!(followers.is_empty(), "{shown} is followed by {}: drop them first", followers.join(", "));
     let producers = crate::views::producers(name);
     let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
-    let (tables, mut copies) = ([name.to_string(), kept, crate::sys::deleted(name)], vec![]);
+    let mut tables: Vec<String> = vec![name.to_string(), kept, crate::sys::deleted(name)];
+    tables.extend(view.matches.iter().flat_map(|_| crate::matches::tables(name))); // (a MATCH_RECOGNIZE's held and resume rows)
+    let mut copies = vec![];
     for table in &tables {
         if let Some(meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? {
             let published = crate::delta::Copies::of(lake, table, meta.folder(table), &meta.publish).await?; // (as `drop_table`'s)
@@ -1532,7 +1534,10 @@ async fn detach_view(lake: &Lake, name: &str) -> Result<Value> {
     ensure!(lake.cat.get::<TableMeta>(&table_key(&format!("{name}_final"))).await?.is_none(),
         "{name} keeps windows, and those still open would be left half counted: make a table of what it has (CREATE TABLE t AS SELECT * FROM {name}_final), then drop it");
     let producers = crate::views::producers(name);
-    let gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
+    let mut gone: Vec<String> = [crate::views::view_key(name), format!("w/{name}")].into_iter().chain(producers.iter().map(|p| crate::store::producer_key(p))).collect();
+    if lake.cat.get::<crate::views::View>(&crate::views::view_key(name)).await?.is_some_and(|v| v.matches.is_some()) {
+        gone.extend(crate::matches::tables(name).iter().map(|t| table_key(t))); // (a MATCH_RECOGNIZE's held and resume rows: its table stays)
+    }
     lake.cat.commit(vec![], &gone).await?;
     crate::log::forget_producers(producers);
     crate::views::forget(lake);

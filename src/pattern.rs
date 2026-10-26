@@ -95,26 +95,6 @@ pub fn refused(sql: &str) -> Result<()> {
     }
 }
 
-/// Refuses `EMIT FINAL` on a view of MATCH_RECOGNIZE. `once::create` asks first: its window is a GROUP BY's time bucket, and
-/// a MATCH_RECOGNIZE has none.
-pub fn emit_final_refused(sql: &str) -> Result<()> {
-    if !wanted(sql) {
-        return Ok(());
-    }
-    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(()) };
-    let mut scan = Scan::default();
-    for s in &stmts {
-        let _ = Visit::visit(s, &mut scan);
-    }
-    match scan.found {
-        true => Err(coded(
-            "0A000",
-            "a view of MATCH_RECOGNIZE with EMIT FINAL comes later: make it without EMIT FINAL, and each run matches again only the partitions that changed",
-        )),
-        false => Ok(()),
-    }
-}
-
 /// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
 /// `PATTERN (<text>)`, with its WITHIN after the `)` when the name carries one, and each `pondra_final(…)` and
 /// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A name written before WITHIN reads as it did. Text with neither is
@@ -337,9 +317,20 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     if !scan.found {
         return Ok(false);
     }
-    // The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
-    // that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
-    // one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
+    let lake_cols = lake_columns(host, &scan).await?;
+    let mut r = Rewrite { lake: &lake_cols };
+    for s in stmts.iter_mut().filter(|s| !kept(s)) {
+        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+            return Err(e);
+        }
+    }
+    Ok(true)
+}
+
+/// The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
+/// that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
+/// one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
+async fn lake_columns<H: crate::front::Host>(host: &H, scan: &Scan) -> Result<HashMap<String, Vec<String>>> {
     let lake = host.name();
     let mut local = BTreeSet::new();
     let mut named = vec![];
@@ -349,20 +340,24 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
             named.push((name.clone(), l));
         }
     }
-    let lake_cols: HashMap<String, Vec<String>> = match local.is_empty() {
+    Ok(match local.is_empty() {
         true => HashMap::new(),
         false => {
             let cols = host.columns(local).await?;
             named.into_iter().filter_map(|(n, l)| cols.get(&l).map(|c| (n, c.clone()))).collect()
         }
-    };
-    let mut r = Rewrite { lake: &lake_cols };
-    for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
-            return Err(e);
-        }
+    })
+}
+
+/// The lake columns `open` takes for `sql` (an EMIT FINAL view's query): its inputs' columns, read from `host` as `rewrite`
+/// reads them. Asked first, so the session's functions are passed to `open` after this await.
+pub async fn open_columns<H: crate::front::Host>(host: &H, sql: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut scan = Scan::default();
+    {
+        let query = crate::expander::parse_query(&text(sql))?;
+        let _ = Visit::visit(&query, &mut scan);
     }
-    Ok(true)
+    lake_columns(host, &scan).await
 }
 
 /// A plan error for a measure with the name of a column of its input, in the refusal a lake table's rows get (42701): the
@@ -2151,17 +2146,12 @@ mod tests {
     }
 
     #[test]
-    fn subset_and_emit_final_are_refused_by_name() {
+    fn subset_is_refused_by_name() {
         let subset = refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a b c) SUBSET u = (b, c) DEFINE b AS true) AS m").expect_err("a refusal");
         assert_eq!(crate::codes::of(&subset), "0A000");
         assert!(subset.to_string().contains("write a measure per symbol, as LAST(b.price) and LAST(c.price)"), "{subset}");
         assert!(refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS subset = 1) AS m").is_ok());
         assert!(refused("SELECT subset FROM t").is_ok());
-        let view = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a) DEFINE a AS true) AS m";
-        let emit = emit_final_refused(view).expect_err("a refusal");
-        assert_eq!(crate::codes::of(&emit), "0A000");
-        assert!(emit.to_string().starts_with("a view of MATCH_RECOGNIZE with EMIT FINAL comes later"), "{emit}");
-        assert!(emit_final_refused("SELECT s, count(*) AS n FROM t GROUP BY s").is_ok());
     }
 
     /// A lake with one table of these columns.

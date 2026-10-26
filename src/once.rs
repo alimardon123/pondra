@@ -48,7 +48,9 @@ pub fn mark(d: &mut Ddl) -> bool {
 /// `EMIT FINAL`: a session view if the GROUP BY has `SESSION(ts, gap)`, else a view whose
 /// window is its time bucket (`views::create` under `{name}$open`, with the table `name`).
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
-    crate::pattern::emit_final_refused(sql)?; // (a MATCH_RECOGNIZE has no GROUP BY time bucket: refused by name, `pattern.rs`)
+    if crate::pattern::wanted(sql) {
+        return crate::matches::create(lake, name, sql, o).await; // (a MATCH_RECOGNIZE has no GROUP BY time bucket: `matches.rs`)
+    }
     ensure!(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL finds its window in the GROUP BY: no window, session, join or history options with it");
     ensure!(o.expect.is_empty(), "EMIT FINAL keeps a group once it's over: put expectations on a view of the rows before it");
     ensure!(matches!(o.refresh, None | Some(crate::views::Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each group once, when it's over, from the rows as they come: not by key, run whole or with a lag");
@@ -324,7 +326,7 @@ pub async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, o: &
 /// one of the watermark they were cut at): counted, as `pondra$expectations`' `$late` of the
 /// view. Only a row older than that watermark can be one, so most flushes cost a min().
 pub async fn late(lake: &Lake, view: &str, v: &View, o: &Once, rows: &[RecordBatch]) -> Result<Option<RecordBatch>> {
-    use datafusion::arrow::array::{BooleanArray, Int64Array, StringArray};
+    use datafusion::arrow::array::BooleanArray;
     let done: u64 = lake.cat.get(&producer_key(&format!("emit:{view}"))).await?.unwrap_or(0);
     if done == 0 {
         return Ok(None);
@@ -352,14 +354,20 @@ pub async fn late(lake: &Lake, view: &str, v: &View, o: &Once, rows: &[RecordBat
     if n == 0 {
         return Ok(None);
     }
+    Ok(Some(late_batch(&o.into, v.fill.as_ref().map_or("", |f| f.id.as_str()), n)?))
+}
+
+/// `n` late rows of `view` (its fill `id`), as a `pondra$expectations` row: the count `pondra.flows` shows.
+pub fn late_batch(view: &str, id: &str, n: i64) -> Result<RecordBatch> {
+    use datafusion::arrow::array::{Int64Array, StringArray};
     let text = |s: &str| Arc::new(StringArray::from(vec![s.to_string()])) as ArrayRef;
-    Ok(Some(RecordBatch::try_from_iter(vec![
-        ("view", text(&o.into)),
-        ("id", text(v.fill.as_ref().map_or("", |f| f.id.as_str()))),
+    Ok(RecordBatch::try_from_iter(vec![
+        ("view", text(view)),
+        ("id", text(id)),
         ("expectation", text(LATE)),
         ("action", text("keep")),
         ("failed", Arc::new(Int64Array::from(vec![n])) as ArrayRef),
-    ])?))
+    ])?)
 }
 
 /// The count of a view's late rows, among its expectations' (`pondra.flows`).
@@ -369,15 +377,11 @@ pub const LATE: &str = "$late";
 /// view's `SESSION(ts, INTERVAL '…')` back in its GROUP BY).
 pub fn written(v: &View) -> Option<(String, Vec<String>)> {
     let time = |s: u64| crate::objects::span(s);
+    if let Some(m) = &v.matches {
+        return Some((v.query().to_string(), with_clauses(m.lateness_secs, m.idle_secs))); // (its query as written: EMIT FINAL in it)
+    }
     if let Some(o) = &v.once {
-        let mut with = vec![];
-        if o.lateness_secs > 0 {
-            with.push(format!("lateness = '{}'", time(o.lateness_secs)));
-        }
-        if let Some(i) = o.idle_secs {
-            with.push(format!("idle = '{}'", time(i)));
-        }
-        return Some((format!("{}\nEMIT FINAL", v.query()), with));
+        return Some((format!("{}\nEMIT FINAL", v.query()), with_clauses(o.lateness_secs, o.idle_secs)));
     }
     let s = v.sessions.as_ref()?;
     let mut stmts = Parser::parse_sql(&GenericDialect {}, &v.sql).ok()?;
@@ -386,14 +390,20 @@ pub fn written(v: &View) -> Option<(String, Vec<String>)> {
     let ast::GroupByExpr::Expressions(by, _) = &mut sel.group_by else { return None };
     let session = format!("SESSION({}, INTERVAL '{}')", crate::objects::ident(&s.time), time(s.gap_secs));
     by.push(Parser::new(&GenericDialect {}).try_with_sql(&session).ok()?.parse_expr().ok()?);
+    Some((format!("{}\nEMIT FINAL", stmts[0]), with_clauses(s.lateness_secs, s.idle_secs)))
+}
+
+/// The `WITH` clauses of an EMIT FINAL view's lateness and idle time, as SQL writes them (none when both are off).
+fn with_clauses(lateness_secs: u64, idle_secs: Option<u64>) -> Vec<String> {
+    let time = |s: u64| crate::objects::span(s);
     let mut with = vec![];
-    if s.lateness_secs > 0 {
-        with.push(format!("lateness = '{}'", time(s.lateness_secs)));
+    if lateness_secs > 0 {
+        with.push(format!("lateness = '{}'", time(lateness_secs)));
     }
-    if let Some(i) = s.idle_secs {
+    if let Some(i) = idle_secs {
         with.push(format!("idle = '{}'", time(i)));
     }
-    Some((format!("{}\nEMIT FINAL", stmts[0]), with))
+    with
 }
 
 #[cfg(test)]

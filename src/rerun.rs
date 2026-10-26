@@ -553,6 +553,51 @@ pub enum How {
     Full,
 }
 
+/// Why a view can't follow its source's rows as they come, or by key: the table is keyed, a GROUP BY view's table, or a
+/// history view's (`create`'s refusals, and `matches::create`'s).
+#[derive(Clone, Copy)]
+pub enum Unfollow {
+    Keyed,
+    Partial,
+    History,
+}
+
+/// The reason a view can't follow `src`, in the order the refusals check them; None when it can.
+pub fn unfollow(src: &TableMeta) -> Option<Unfollow> {
+    if !src.key.is_empty() {
+        Some(Unfollow::Keyed)
+    } else if !src.merge.is_empty() || src.finish.is_some() {
+        Some(Unfollow::Partial)
+    } else if src.history.is_some() {
+        Some(Unfollow::History)
+    } else {
+        None
+    }
+}
+
+impl Unfollow {
+    /// What the table is, as the refusal names it; the view's own words follow it.
+    pub fn said(self, source: &str) -> String {
+        match self {
+            Unfollow::Keyed => format!("{source} is keyed: a new row replaces its key's row, which says nothing of the group that row was in"),
+            Unfollow::Partial => format!("{source} is a GROUP BY view, whose table keeps partial rows"),
+            Unfollow::History => format!("{source} is a history view, whose __start_at and __end_at are worked out as it is read"),
+        }
+    }
+}
+
+/// A view's columns as its plan runs them, and the SQL types its query keeps (`query_types`). None of the columns may be a
+/// system column's name: the view's own table has those.
+pub(crate) async fn table_columns(lake: &Lake, sql: &str, ctx: &datafusion::prelude::SessionContext, plan: &LogicalPlan) -> Result<(Vec<(String, String)>, std::collections::BTreeMap<String, String>)> {
+    let columns: Vec<(String, String)> = crate::query::run_schema(ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
+    if let Some((c, _)) = columns.iter().find(|(c, _)| crate::text::NAMES.contains(&c.as_str())) {
+        bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
+    }
+    let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
+    let sql_types = crate::write::query_types(lake, sql, &names).await;
+    Ok((columns, sql_types))
+}
+
 /// Make view `name` run again by key or whole (leader only): its table gets the query's columns,
 /// and its first run works every group out (`ddl::settle` waits for it). `why`: None when asked.
 #[allow(clippy::too_many_arguments)]
@@ -561,9 +606,13 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     let (keys, joins, full, reason) = match how {
         How::ByKey => {
             let keys = keys(plan).map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
-            ensure!(src.key.is_empty(), "{source} is keyed: a new row replaces its key's row, which says nothing of the group that row was in, so a view of it can't be kept by key. refresh = 'full' runs its query whole again");
-            ensure!(src.merge.is_empty() && src.finish.is_none(), "{source} is a GROUP BY view, whose table keeps partial rows: make {name} from {source}'s own source, or refresh = 'full'");
-            ensure!(src.history.is_none(), "{source} is a history view, whose __start_at and __end_at are worked out as it is read: make {name} with refresh = 'full'");
+            if let Some(u) = unfollow(src) {
+                bail!("{}", match u {
+                    Unfollow::Keyed => format!("{}, so a view of it can't be kept by key. refresh = 'full' runs its query whole again", u.said(source)),
+                    Unfollow::Partial => format!("{}: make {name} from {source}'s own source, or refresh = 'full'", u.said(source)),
+                    Unfollow::History => format!("{}: make {name} with refresh = 'full'", u.said(source)),
+                });
+            }
             ensure!(upstream.is_none_or(|u| u.sessions.is_none() || u.rerun.is_some()), "{source} cuts sessions as they close: make {name} from {source}'s own source");
             let joins = joins(lake, plan, sql, source).await.map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
             (keys, joins, None, why.unwrap_or_else(|| "asked for (refresh = 'by key')".into()))
@@ -576,15 +625,10 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     };
     crate::format::require(lake, 2, "a materialized view that runs its query again (median, count(DISTINCT …), ORDER BY … LIMIT, …)").await?;
     let ctx = crate::query::session(lake, sql, "").await?; // (the table's columns are the types the query runs with)
-    let columns: Vec<(String, String)> = crate::query::run_schema(&ctx, plan)?.fields().iter().map(|f| (f.name().clone(), crate::answer::type_name(f.data_type()))).collect();
-    if let Some((c, _)) = columns.iter().find(|(c, _)| crate::text::NAMES.contains(&c.as_str())) {
-        bail!("{c} is a system column of the view's own table: name it something else ({c} AS source{c})");
-    }
-    let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
-    let sql_types = crate::write::query_types(lake, sql, &names).await;
+    let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
-    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: Some(r) };
+    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: Some(r), matches: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (crate::views::view_key(name), json(&view))], &[]).await
 }
 
