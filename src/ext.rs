@@ -1429,8 +1429,10 @@ fn master() -> Result<[u8; 32]> {
     if let Some(k) = crate::env::get("PONDRA_SECRET_KEY") {
         if k.chars().count() < 16 {
             // (as the admin token's: the key opens what the bucket holds sealed, so whoever reads the bucket can try short ones offline)
-            static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| eprintln!("PONDRA_SECRET_KEY is short: it guards the lake's keys and secrets (use 32 random characters or more)"));
+            crate::per_node!(static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("PONDRA_SECRET_KEY is short: it guards the lake's keys and secrets (use 32 random characters or more)");
+            }
         }
         return Ok(sha256_of(&k));
     }
