@@ -4,7 +4,8 @@
 //! to record the result: one small commit, the leader's job (`Request`, `handle`). A machine that
 //! isn't a node reaches the leader over HTTP, through the bucket when it can't (`inbox.rs`), or
 //! leads for a moment itself when nobody does.
-use crate::cluster::{alive, claim, http, latest, release};
+use crate::cluster::http;
+use crate::terms::{alive, claim, latest, release};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::session;
 use crate::answer::schema;
@@ -2287,7 +2288,7 @@ pub(crate) fn job() -> &'static str {
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go. `req` None records
 /// nothing (`lead_only`).
 async fn lead(dir: &str, store: &Store, term: u64, req: Option<Request>) -> Result<Value> {
-    let marks = crate::cluster::mark_every(store.clone(), term);
+    let marks = crate::terms::mark_every(store.clone(), term);
     let lake = Lake::open(dir, true, false).await?; // (the catalog's writer: fences any older one)
     crate::replica::recover(&lake, "", term, None).await?;
     let (seq, lock) = (Sequencer::start(lake.clone(), None).await?, Mutex::new(()));

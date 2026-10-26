@@ -177,7 +177,7 @@ impl Held {
             }
         }
         if let Some((store, n)) = term {
-            cluster::step_down(store, *n).await;
+            terms::step_down(store, *n).await;
             tr("term");
         }
     }
@@ -308,7 +308,7 @@ impl Node {
             if lives {
                 cluster.clone().keep_alive(store.clone(), &dir); // (beside the catalog's opening, not before it: C5)
             } else {
-                let _ = cluster::mark_every(store.clone(), cluster.leader.n);
+                let _ = terms::mark_every(store.clone(), cluster.leader.n);
             }
         }
         // Read-only nodes follow the leader's commit stream too (when a live one is there to ask),
@@ -329,7 +329,7 @@ impl Node {
             // nor hold the term; and a restart would find the same place again)
             Err(e) if e.downcast_ref::<format::Newer>().is_some() || crate::memory::torn(&e) => {
                 if leader {
-                    cluster::release(&store, cluster.leader.n).await;
+                    terms::release(&store, cluster.leader.n).await;
                 }
                 return Err(e);
             }
@@ -419,7 +419,7 @@ impl Node {
                      Another token: pondra token --dir {dir}. Or set --admin-token on every node."),
                 Ok(None) => {}
                 Err(e) => {
-                    cluster::release(&store, cluster.leader.n).await; // (another node may lead it: not one with no first user)
+                    terms::release(&store, cluster.leader.n).await; // (another node may lead it: not one with no first user)
                     return Err(e.context("a node on the network with no token makes the lake's first user before it serves, and that failed: set --admin-token, or listen on 127.0.0.1"));
                 }
             }

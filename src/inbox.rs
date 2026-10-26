@@ -52,7 +52,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => return Err(e.into()),
         }
-        if tick % 10 == 0 && !matches!(&crate::cluster::latest(store).await?, Some(t) if crate::cluster::alive(store, t).await) {
+        if tick % 10 == 0 && !matches!(&crate::terms::latest(store).await?, Some(t) if crate::terms::alive(store, t).await) {
             let _ = store.delete(&req).await;
             return Ok(None);
         }

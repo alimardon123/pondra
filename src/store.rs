@@ -434,7 +434,7 @@ pub fn producer_key(p: &str) -> String { format!("p/{p}") }
 /// - an `auto-` id is resent only by its client's own retries (the clients' `retry_secs`, python/pondra/client.py,
 ///   js/index.js), by a fenced `pondra sql` starting over with its job (write.rs ~2299, `PONDRA_JOB` is passed on),
 ///   and by the inbox: a leader committed the request and died before it deleted it, and the next writer waits out
-///   `alive`'s 30 s (cluster.rs:554, inbox.rs);
+///   `alive`'s 30 s (terms.rs, inbox.rs);
 /// - a transaction's COMMIT (`txn:{id}:{table}`, a fresh id per transaction: txn.rs `start`) is sent once, by
 ///   the node that runs it (txn.rs `commit`: `write::post` to the leader, or `commit_here` on the leader), and
 ///   a failed send goes back to the client as an error with the transaction gone, so nothing sends it again;
