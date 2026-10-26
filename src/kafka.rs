@@ -211,12 +211,19 @@ fn api_versions(ver: i16, supported: bool) -> Vec<u8> {
     w
 }
 
+/// Topics one METADATA may name: a client asks for those it uses. (Unbounded, 63 million empty names in one
+/// signed-in request of 126 MB made a node of 3.7 GB, and each name was looked for through every table: security pass 2.)
+const ASKED: i32 = 10_000;
+
 async fn metadata(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let asked: Option<Vec<String>> = match r.i32()? {
         -1 => None, // all topics
-        n => Some((0..n).map(|_| r.str()).collect::<Result<_>>()?),
+        n => {
+            ensure!((0..=ASKED).contains(&n), "a METADATA request naming {n} topics (at most {ASKED})");
+            Some((0..n).map(|_| r.str()).collect::<Result<_>>()?)
+        }
     };
-    let tables: Vec<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t)).collect();
+    let tables: std::collections::BTreeSet<String> = app.lake.cat.scan::<TableMeta>("t/", "t0").await?.into_iter().map(|(k, _)| k[2..].to_string()).filter(|t| !crate::sys::hidden(t)).collect();
     let topics: Vec<(String, bool)> = match asked {
         None => tables.into_iter().map(|t| (t, true)).collect(),
         Some(names) => names.into_iter().map(|n| (n.clone(), tables.contains(&n))).collect(),

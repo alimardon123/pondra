@@ -210,7 +210,7 @@ jobs:
           if [ "$event" = pull_request ]; then
             if has "$bin|^python/|^tools/(upgrade_check|history_check|environments_check|backup_check|git_check|project_check|fake_github|sim_r2)\.py\$|^tools/(ci_artifact\.sh|requirements\.txt)\$|^\.github/workflows/(upgrade|build)\.yml\$"; then upgrade=true; fi
             if has '^(src/|Cargo\.(toml|lock)$|python/pondra/client\.py$|js/index\.js$|tools/(resilience_check|faulty_s3|sim_r2|harness)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(resilience|build)\.yml$)'; then resilience=true; fi
-            if has '^(src/(shares|sharing|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
+            if has '^(src/(shares|sharing|sharing_client|public|vend|read_delta|delta|ext|scan|audit|server)\.rs$|tools/(sharing_check|sim_r2)\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sharing|build)\.yml$)'; then sharing=true; fi
             if has '^(src/(sso|sso_flow|users|auth|pg|flight|kafka|tls|server|dbserver|project)\.rs$|src/console/(core|settings|sso)\.js$|python/pondra/client\.py$|js/index\.js$|tools/fake_idp\.py$|tools/ci_artifact\.sh$|\.github/workflows/(sso|build)\.yml$)'; then sso=true; fi
           fi
           binary=false

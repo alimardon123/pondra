@@ -83,8 +83,16 @@ async fn space(app: &crate::app::App, ns: &str) -> Result<(Vec<String>, std::syn
     Ok(found)
 }
 
+/// The namespaces the caller may see: an attached lake's only as `space` would open them (under its own sign-in, and
+/// not for a user granted some tables), as SQL's listings (`ddl::listed`, S27).
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::app::App>) -> axum::Json<Value> {
-    axum::Json(json!({"namespaces": spaces(&app).await.into_iter().map(|(p, _, _)| p).collect::<Vec<_>>()}))
+    let mut seen = vec![];
+    for (parts, lake, _) in spaces(&app).await {
+        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (crate::auth::limited().is_none() && crate::users::across(&lake, &parts[0]).await.is_ok()) {
+            seen.push(parts);
+        }
+    }
+    axum::Json(json!({"namespaces": seen}))
 }
 
 async fn namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
@@ -126,11 +134,13 @@ fn quoted(n: &str) -> String {
     format!("\"{}\"", n.replace('"', "\"\""))
 }
 
-/// The tables with Iceberg metadata published.
+/// The tables with Iceberg metadata published, those a user may read (S27: a name it isn't granted isn't shown).
 async fn tables(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
+    let limited = crate::auth::limited();
     let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::text::split(&k[2..]).0 == schema)
+        .filter(|(k, _)| limited.as_ref().is_none_or(|a| a.may("select", &k[2..])))
         .map(|(k, _)| json!({"namespace": parts, "name": crate::text::split(&k[2..]).1})).collect();
     Ok(axum::Json(json!({"identifiers": ids})))
 }
