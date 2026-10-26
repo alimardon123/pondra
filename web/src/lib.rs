@@ -101,6 +101,25 @@ impl Page {
         js_sys::Reflect::set(&out, &"body".into(), &js_sys::Uint8Array::from(&answer.body[..]).into())?;
         Ok(out.into())
     }
+
+    /// Ends the page's member on the core's lake (`lake`): its loops, its catalog, its term and its lake in memory, so
+    /// another `lake` can open in this module. A page opened another way has nothing to end. wasm-bindgen holds this page
+    /// mutably while `close` runs, so a `request` that is still running panics: await the requests first.
+    pub async fn close(&mut self) {
+        self.0.close().await
+    }
+}
+
+/// A page on the core's lake (designs/page-lake-p2.md): its `/sql` is answered by the core's own statement path, in its
+/// memory. One at a time in a module: `close()` ends it before another opens. Takes the options `new` takes. Rejected by
+/// name when this build has no core's lake (`--features lake`).
+#[wasm_bindgen(js_name = lake)]
+pub async fn lake(opts: JsValue) -> Result<Page, JsValue> {
+    set_panic_hook();
+    let given = Given::read(&opts)?;
+    give(given.settings)?;
+    let page = pondra::page::Page::open_lake(&options(None, given.node)).await;
+    Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?, None))
 }
 
 /// One unread file as `{file, why}`. A fresh object takes its keys, so setting them cannot fail.

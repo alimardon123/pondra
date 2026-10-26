@@ -188,6 +188,30 @@ pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool
         || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
+/// The header a `/sql` answer carries while its session holds temporary tables (`temp::holds`): the client keeps to this
+/// node meanwhile. Each door adds it (HTTP's `held_session`, a page's `lake_sql`).
+pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
+
+/// What the statement's procedures printed, for the caller: a JSON list of lines (all of it in ASCII, the first 32 KB of
+/// it; the run log has the rest), as the text of the `x-pondra-notices` header. None when nothing was said.
+pub fn notices(heard: &[String]) -> Option<String> {
+    if heard.is_empty() {
+        return None;
+    }
+    let (mut kept, mut size) = (vec![], 0);
+    for n in heard {
+        size += n.len() + 4;
+        if size > 32 << 10 {
+            kept.push("…".to_string());
+            break;
+        }
+        kept.push(n.clone());
+    }
+    let text = serde_json::to_string(&kept).ok()?;
+    let ascii: String = text.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect();
+    Some(ascii)
+}
+
 /// What one `/sql` request answers, by any door that reads one (the HTTP door, a page): its reply, the notices its
 /// statements said, and its session, which the door says it holds while it has temporary tables (`temp::holds`).
 pub struct Said {

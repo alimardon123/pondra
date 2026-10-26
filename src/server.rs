@@ -896,7 +896,7 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
         Err(e) => E::from(e).into_response(),
     };
     r = held_session(r, said.session.as_deref());
-    if let Some(h) = notices(&said.heard) {
+    if let Some(h) = crate::statement::notices(&said.heard).and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
     r
@@ -905,29 +905,10 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
 /// The header that keeps a client to this node while its session holds temporary tables (`temp::holds`).
 fn held_session(mut r: Response, session: Option<&str>) -> Response {
     if session.is_some_and(crate::temp::holds) {
-        r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
+        let (name, value) = crate::statement::HELD_SESSION;
+        r.headers_mut().insert(name, axum::http::HeaderValue::from_static(value)); // (a client keeps to this node meanwhile)
     }
     r
-}
-
-/// What the statement's procedures printed, for the caller: a JSON list of lines in a header (all
-/// of it in ASCII, the first 32 KB of it; the run log has the rest).
-fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
-    if heard.is_empty() {
-        return None;
-    }
-    let (mut kept, mut size) = (vec![], 0);
-    for n in heard {
-        size += n.len() + 4;
-        if size > 32 << 10 {
-            kept.push("…".to_string());
-            break;
-        }
-        kept.push(n.clone());
-    }
-    let text = serde_json::to_string(&kept).ok()?;
-    let ascii: String = text.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect();
-    axum::http::HeaderValue::from_str(&ascii).ok()
 }
 
 /// `GET /secrets/{name}`: a secret's values (`CREATE SECRET`), for a Python procedure's own code
