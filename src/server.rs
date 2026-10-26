@@ -1141,7 +1141,7 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
     let batch = concat_batches(&schema, &batches)?;
     let left_out = match given {
         Some(given) => rules.left_out(&given),
-        None if rules.fills() => crate::rules::LeftOut::PerRow(crate::defaults::absent_keys(&meta, &body)?), // (a JSON row without the key)
+        None if rules.fills() => crate::rules::LeftOut::PerRow(crate::rules::absent_keys(&meta, &body)?), // (a JSON row without the key)
         None => crate::rules::LeftOut::None,
     };
     let rows = crate::rules::shape(&rules, name, crate::rules::Rows::Named(batch, left_out), crate::rules::How::Load, &crate::defaults::Node(&app.lake)).await?;

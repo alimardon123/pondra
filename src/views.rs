@@ -647,7 +647,7 @@ async fn expectations(lake: &Lake, name: &str, source: &str, planned: &str, meta
     let mut names = std::collections::HashSet::new();
     for e in expect {
         ensure!(names.insert(e.name.to_lowercase()), "{name} has two expectations named {}", e.name);
-        crate::defaults::breaking(&empty, &e.check).with_context(|| format!("expectation {} of {name}: CHECK ({})", e.name, e.check))?;
+        crate::rules::fit::breaking(crate::defaults::base(), &empty, &e.check).with_context(|| format!("expectation {} of {name}: CHECK ({})", e.name, e.check))?;
         if e.on == OnViolation::Fail {
             let sql = format!("SELECT count(*) AS n FROM ({planned}) AS _v WHERE NOT ({})", e.check);
             let rows = crate::engine::sql(&session(lake, &sql, "").await?, &sql).await?.collect().await?;
@@ -666,7 +666,7 @@ pub fn refused(e: &anyhow::Error) -> bool { e.chain().any(|c| c.is::<crate::code
 fn let_in(v: &View, rows: RecordBatch) -> Result<RecordBatch> {
     let mut keep = vec![true; rows.num_rows()];
     for e in v.expect.iter().filter(|e| e.on != OnViolation::Keep) {
-        let bad = crate::defaults::breaking(&rows, &e.check)?;
+        let bad = crate::rules::fit::breaking(crate::defaults::base(), &rows, &e.check)?;
         keep.iter_mut().zip(bad.values().iter()).for_each(|(k, b)| *k &= !b);
     }
     Ok(match keep.iter().all(|k| *k) {
@@ -685,7 +685,7 @@ fn expected(view: &str, v: &View, rows: RecordBatch, filling: bool) -> Result<(R
     }
     let (mut keep, mut failed) = (vec![true; rows.num_rows()], vec![]);
     for e in &v.expect {
-        let bad = crate::defaults::breaking(&rows, &e.check)?;
+        let bad = crate::rules::fit::breaking(crate::defaults::base(), &rows, &e.check)?;
         let n = bad.true_count();
         if n == 0 {
             continue;

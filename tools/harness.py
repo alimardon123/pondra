@@ -7231,7 +7231,7 @@ def temps():
 
 def _temps_typed(checks, port):
     """A temporary table keeps its typed columns and checks every write as a lake table does (`temp::apply`, through
-    `defaults::check`, invariant 130): a JSON, JSONB, UUID or VARCHAR(n) value its column can't hold is refused by INSERT,
+    `rules::checked`, invariant 130): a JSON, JSONB, UUID or VARCHAR(n) value its column can't hold is refused by INSERT,
     INSERT … SELECT and UPDATE with Postgres 16's SQLSTATE and words, and nothing is written; a good one reads back as
     Postgres prints it (an upper-case uuid in lower case, JSON as written). A temporary view is read with the door's
     rewrites, as a stored view is: its `||` over jsonb merges the objects, as Postgres does, not the two texts joined.
@@ -17259,7 +17259,7 @@ def _jsons_spaces(check, over_http, over_port, info):
 def jsons():
     """JSON and JSONB columns keep their type (`TableMeta::sql_types`, as uuid's do; `types.rs`, `pg_types.rs`). The lake
     holds a json column's text as it was written, and a jsonb column's as jsonb writes it (keys sorted and once, Postgres's
-    spacing: `types::as_held`, which every write door runs through `defaults::fit`). Every write door refuses a value that
+    spacing: `rules::typed::as_held`, which every write door runs through `rules::checked`). Every write door refuses a value that
     isn't JSON with 22P02, writing nothing: SQL over HTTP and the Postgres port (INSERT, UPDATE), POST /append, COPY FROM
     STDIN and `pondra sql`. A valid value is taken: a json value is read back as written, a jsonb value as Postgres prints
     it, so DISTINCT and GROUP BY compare jsonb values as Postgres does (`jdoor_doors`). The Postgres port answers them as Postgres does (json 114, jsonb 3802), so psycopg
@@ -17734,7 +17734,7 @@ def jsons():
         return all(http) and all(ported)
 
     def jdoor_doors():
-        """A jsonb column holds jsonb's text whichever door wrote it (`types::as_held`, run by `defaults::fit`): written as text,
+        """A jsonb column holds jsonb's text whichever door wrote it (`rules::typed::as_held`, run by `rules::checked`): written as text,
         `{"b":2,"a":1}` reads back as Postgres 16 prints it, and DISTINCT and GROUP BY compare the values, not the texts. The
         INSERT … SELECT takes the bulk path (only VALUES goes through the log), so each of the two sites is run: `fit` in the
         plain INSERT's path and in the log's, and in a transaction's insert and its change."""

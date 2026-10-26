@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
 use crate::pg_casts::quoted;
-use crate::rules::create::{enum_labels, labelled};
+use crate::rules::create::{enum_labels, labelled, sql_type};
+use crate::rules::typed::length;
 use crate::rules::types::{add_label, exists, in_use, label_skipping, missing, skipping};
 
 pub use crate::rules::types::Change;
@@ -213,12 +214,6 @@ pub fn declared(written: &str) -> Result<Option<String>> {
 pub fn grows(had: Option<&str>, wanted: &str) -> bool {
     had == Some(wanted) || matches!((had.and_then(length), length(wanted)), (Some(k), Some(n)) if n >= k)
 }
-
-pub use crate::rules::typed::{held, length};
-
-pub use crate::rules::create::sql_type;
-
-pub use crate::pg_casts::uuid_of;
 
 /// `CREATE TYPE name AS ENUM (…)`, as `SHOW CREATE TYPE` writes it.
 pub fn create_sql(name: &str, t: &Type) -> String { format!("CREATE TYPE {name} AS ENUM ({})", quoted(&t.labels)) }
