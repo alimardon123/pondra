@@ -2205,10 +2205,10 @@ mod tests {
         let lake = lake_of("ticks", &["symbol", "ts", "price"]);
         let none = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES LAST(b.price) AS p \
                     ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > a.price)";
-        assert_eq!(open(none, &lake).expect("an open view").look, 0);
+        assert_eq!(open(none, &lake, &engine_functions()).expect("an open view").look, 0);
         let three = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES PREV(price, 3) AS p \
                      ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > a.price)";
-        assert_eq!(open(three, &lake).expect("an open view").look, 3);
+        assert_eq!(open(three, &lake, &engine_functions()).expect("an open view").look, 3);
     }
 
     #[test]
