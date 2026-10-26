@@ -1,5 +1,6 @@
 # MATCH_RECOGNIZE answers alike on every form (ADR-073): Oracle's ticker (ACME's 20 days), with and without
-# PARTITION BY, an empty match, ALL ROWS PER MATCH (RUNNING and FINAL measures) and WITH UNMATCHED ROWS. Every query has
+# PARTITION BY, an empty match, ALL ROWS PER MATCH (RUNNING and FINAL measures), WITH UNMATCHED ROWS and WITHIN on a
+# timestamp. Every query has
 # an ORDER BY; the expected rows are tools/patterns_check.py's (its FIXED examples: worked out by hand there).
 statement ok
 CREATE TABLE ticker (symbol TEXT, day INT, price INT)
@@ -74,3 +75,18 @@ SELECT day, mn, s, e, n FROM flags MATCH_RECOGNIZE (ORDER BY day MEASURES MATCH_
 3 1 2 3 2
 4 NULL NULL NULL NULL
 5 2 5 5 1
+
+statement ok
+CREATE TABLE tickts (symbol TEXT, day INT, ts TIMESTAMP, price INT)
+
+statement ok
+INSERT INTO tickts VALUES ('ACME',1,TIMESTAMP '2026-03-02 01:00:00',12),('ACME',2,TIMESTAMP '2026-03-02 02:00:00',17),('ACME',3,TIMESTAMP '2026-03-02 03:00:00',19),('ACME',4,TIMESTAMP '2026-03-02 04:00:00',21),('ACME',5,TIMESTAMP '2026-03-02 05:00:00',25),('ACME',6,TIMESTAMP '2026-03-02 06:00:00',12),('ACME',7,TIMESTAMP '2026-03-02 07:00:00',15),('ACME',8,TIMESTAMP '2026-03-02 08:00:00',20),('ACME',9,TIMESTAMP '2026-03-02 09:00:00',24),('ACME',10,TIMESTAMP '2026-03-02 10:00:00',25),('ACME',11,TIMESTAMP '2026-03-02 11:00:00',19),('ACME',12,TIMESTAMP '2026-03-02 12:00:00',15),('ACME',13,TIMESTAMP '2026-03-02 13:00:00',25),('ACME',14,TIMESTAMP '2026-03-02 14:00:00',25),('ACME',15,TIMESTAMP '2026-03-02 15:00:00',14),('ACME',16,TIMESTAMP '2026-03-02 16:00:00',12),('ACME',17,TIMESTAMP '2026-03-02 17:00:00',14),('ACME',18,TIMESTAMP '2026-03-02 18:00:00',24),('ACME',19,TIMESTAMP '2026-03-02 19:00:00',23),('ACME',20,TIMESTAMP '2026-03-02 20:00:00',22)
+
+# WITHIN INTERVAL '4' HOUR: day d is at d:00 on 2 March 2026 (ts), so an hour is a day. The match from day 5 would run
+# to day 10, five hours on, so it stops at day 9; the match from day 14 reaches day 18, exactly four hours on, which is in.
+query TIII
+SELECT symbol, start_day, bottom_day, end_day FROM tickts MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) WITHIN INTERVAL '4' HOUR DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) ORDER BY start_day
+----
+ACME 5 6 9
+ACME 10 12 13
+ACME 14 16 18

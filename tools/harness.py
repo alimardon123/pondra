@@ -22788,7 +22788,7 @@ def patterns():
     RUNNING and FINAL measures, four partitions of 0-25 rows) against a reference matcher of that file's own, the fixed
     examples (Oracle's ticker with both skip rules, PREV and NEXT with offsets, FINAL and RUNNING, ties in five runs, an
     empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS
-    PER MATCH, WITH UNMATCHED ROWS under TO NEXT ROW), and the refusals by name. Section 5, the doors: the ticker and
+    PER MATCH, WITH UNMATCHED ROWS under TO NEXT ROW, WITHIN on timestamps), and the refusals by name. Section 5, the doors: the ticker and
     its ALL ROWS form over the Postgres port equal HTTP's; a 10,000-row table over 50 symbols answers the same from
     three nodes (?spread=1) as from one, and spreads, in both rows-per-match forms; a stored view and a materialized
     view equal the query, the view kept live through new rows. Without the matcher every statement here is refused
@@ -22800,13 +22800,13 @@ def patterns():
     lake = new_lake()
     node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
     ok, info["random"] = pc.random_checks(A.port, seed=1, queries=600)
-    checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions) answer as the reference does, or 22000 where it does"] = ok
+    checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions, WITHIN on one in five, by timestamps or by dates) answer as the reference does, or 22000 where it does"] = ok
     fixed = pc.fixed_checks(A.port)
     info["fixed missed"] = [k for k, v in fixed.items() if not v]
-    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW): the answers written in patterns_check.py, names and rows"] = all(fixed.values())
+    checks["fixed examples: the ticker under both skip rules, PREV/NEXT with offsets, FINAL and RUNNING, ties in five runs, an empty match, anchors, PERMUTE, reluctant and bounded repetition, an exclusion, the ticker and flags under ALL ROWS PER MATCH (SHOW, OMIT, WITH UNMATCHED ROWS, bare, TO NEXT ROW), WITHIN on the ticker's timestamps (one match cut short, one later start that wins), Flink's WITHIN example (a drop of 10 in an hour; its DEFINE reads the match so far, so the engine refuses it, 0A000, until the next PR), a column and a symbol both named d: the answers written in patterns_check.py, names and rows"] = all(fixed.values())
     refused = pc.refusal_checks(A.port)
     info["refusals missed"] = [k for k, v in refused.items() if not v]
-    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states"] = all(refused.values())
+    checks["refusals by name: WITH UNMATCHED ROWS with {- -}, ALL ROWS ordered by an expression, FINAL in a DEFINE, an aggregate's own ORDER BY in ALL ROWS, a DEFINE reading another symbol, a DEFINE of an absent symbol, PARTITION BY an expression, a qualifier that isn't a variable, two variables in an aggregate, SKIP TO an absent symbol, past 10,000 states, WITHIN without an ORDER BY, descending or on an INT, a measure named like a column of the table, WITHIN with a number or a subquery"] = all(refused.values())
     # section 5: the ticker over the Postgres port, then three nodes on a lake of their own
     ticker_q = pc.FIXED[0]["query"]
     want = pc.post_sql(A.port, ticker_q)["value"]

@@ -21,10 +21,11 @@ use crate::matcher::Pattern;
 use crate::text::{ident, object, ROW_ID};
 use anyhow::{bail, Result};
 use datafusion::sql::sqlparser::ast::*;
+use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use serde_json::json;
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
@@ -92,12 +93,14 @@ fn calls(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
 }
 
 /// Each MATCH_RECOGNIZE's PATTERN, as `PATTERN ("__mr_pattern_<hex>")`: the one quoted name sqlparser takes, whatever the
-/// pattern is. `pattern_text` reads the text back out.
+/// pattern is. A WITHIN after it goes into the name too (`__within_<hex>`), as `within_at` reads it. `pattern_text` reads
+/// the text back out.
 fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
     static CLAUSE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?i)(?P<clause>\bmatch_recognize\b)|\bpattern\s*(?P<open>\()").expect("a regex"));
     let mut out = vec![];
     let mut in_clause = false;
+    let mut clause_end = sql.len();
     for c in CLAUSE.captures_iter(sql) {
         let whole = c.get(0).expect("a whole match");
         if !code[whole.start()] {
@@ -105,6 +108,11 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         }
         if c.name("clause").is_some() {
             in_clause = true;
+            // the clause's own parenthesis closes it: a WITHIN runs no further
+            clause_end = (whole.end()..sql.len())
+                .find(|&i| code[i] && sql.as_bytes()[i] == b'(')
+                .and_then(|open| close_of(sql, code, open))
+                .unwrap_or(sql.len());
             continue;
         }
         let Some(open) = c.name("open") else { continue };
@@ -116,9 +124,45 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         if text.trim_start().starts_with("\"__mr_pattern_") {
             continue; // written already
         }
-        out.push((whole.start(), close + 1, format!("PATTERN (\"__mr_pattern_{}\")", hex(text))));
+        let (end, name) = match within_at(sql, code, close + 1, clause_end) {
+            Some((end, within)) => (end, format!("PATTERN (\"__mr_pattern_{}__within_{}\")", hex(text), hex(&within))),
+            None => (close + 1, format!("PATTERN (\"__mr_pattern_{}\")", hex(text))),
+        };
+        out.push((whole.start(), end, name));
     }
     out
+}
+
+/// The WITHIN that follows a PATTERN's `)` at `from`, when one does: where it ends (the interval's last character, before
+/// the DEFINE or the clause's end that comes first), and the interval as written. sqlparser can't read WITHIN, so it is
+/// taken out here and carried in the pattern's name.
+fn within_at(sql: &str, code: &[bool], from: usize, clause_end: usize) -> Option<(usize, String)> {
+    static WITHIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*within\s+").expect("a regex"));
+    static DEFINE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bdefine\b").expect("a regex"));
+    let at = from + WITHIN.find(&sql[from..clause_end])?.end();
+    let stop = DEFINE.find_iter(&sql[at..clause_end]).map(|m| at + m.start()).find(|&p| code[p]).unwrap_or(clause_end);
+    let interval = &sql[at..stop];
+    Some((at + interval.trim_end().len(), interval.trim().to_string()))
+}
+
+/// WITHIN's interval as SQL: one interval literal (`INTERVAL '1' HOUR`), written into the call as parsed. Anything else (a
+/// number, a subquery, or more SQL after the interval) is refused, so the text can't change the query's shape.
+fn within_interval(text: &str) -> Result<String> {
+    let refused = || coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR");
+    let dialect = GenericDialect {};
+    let mut parser = Parser::new(&dialect).try_with_sql(text).map_err(|_| refused())?;
+    let expr = parser.parse_expr().map_err(|_| refused())?;
+    if !matches!(parser.peek_token().token, Token::EOF) {
+        return Err(refused());
+    }
+    match &expr {
+        Expr::Interval(Interval { value, .. })
+            if matches!(value.as_ref(), Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(_) | Value::Number(..), .. })) =>
+        {
+            Ok(expr.to_string())
+        }
+        _ => Err(refused()),
+    }
 }
 
 /// `s` in hex: two digits a byte.
@@ -135,14 +179,22 @@ fn unhex(s: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// A clause's PATTERN as the text `matcher::read` reads: the text `patterns` wrote, or else sqlparser's form of it.
-fn pattern_text(p: &MatchRecognizePattern) -> String {
+/// A clause's PATTERN as the text `matcher::read` reads, and its WITHIN's interval as written when it has one: the name
+/// `patterns` wrote, or else sqlparser's form of the pattern. A name written before WITHIN has no `__within_` part (stored
+/// views hold such names, so they still read).
+fn pattern_text(p: &MatchRecognizePattern) -> (String, Option<String>) {
     if let MatchRecognizePattern::Symbol(MatchRecognizeSymbol::Named(id)) = p {
-        if let Some(text) = id.value.strip_prefix("__mr_pattern_").and_then(unhex) {
-            return text;
+        if let Some(rest) = id.value.strip_prefix("__mr_pattern_") {
+            let (pattern, within) = match rest.split_once("__within_") {
+                Some((pattern, within)) => (pattern, unhex(within)),
+                None => (rest, None),
+            };
+            if let Some(text) = unhex(pattern) {
+                return (text, within);
+            }
         }
     }
-    p.to_string()
+    (p.to_string(), None)
 }
 
 /// Which bytes of `sql` are code: not inside a string, a quoted name or a comment (so a word there is not read).
@@ -198,8 +250,9 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     if !scan.found {
         return Ok(false);
     }
-    // A lake table's rows that have `_row_id` are tied on their ORDER BY in that order, so every run finds the same
-    // matches (a CTE of the same name is not the table).
+    // The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
+    // that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
+    // one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
     let lake = host.name();
     let mut local = BTreeSet::new();
     let mut named = vec![];
@@ -209,14 +262,14 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
             named.push((name.clone(), l));
         }
     }
-    let ties: HashSet<String> = match local.is_empty() {
-        true => HashSet::new(),
+    let lake_cols: HashMap<String, Vec<String>> = match local.is_empty() {
+        true => HashMap::new(),
         false => {
             let cols = host.columns(local).await?;
-            named.into_iter().filter(|(_, l)| cols.get(l).is_some_and(|c| c.iter().any(|n| n == ROW_ID))).map(|(n, _)| n).collect()
+            named.into_iter().filter_map(|(n, l)| cols.get(&l).map(|c| (n, c.clone()))).collect()
         }
     };
-    let mut r = Rewrite { ties: &ties };
+    let mut r = Rewrite { lake: &lake_cols };
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
         if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
             return Err(e);
@@ -256,7 +309,7 @@ impl Visitor for Scan {
 
 /// Replaces each clause, innermost first (a clause's input is rewritten before the clause).
 struct Rewrite<'a> {
-    ties: &'a HashSet<String>,
+    lake: &'a HashMap<String, Vec<String>>,
 }
 
 impl VisitorMut for Rewrite<'_> {
@@ -266,7 +319,7 @@ impl VisitorMut for Rewrite<'_> {
         if !matches!(t, TableFactor::MatchRecognize { .. }) {
             return ControlFlow::Continue(());
         }
-        match layer(t, self.ties) {
+        match layer(t, self.lake) {
             Ok(d) => {
                 *t = d;
                 ControlFlow::Continue(())
@@ -308,7 +361,7 @@ struct Cx {
 }
 
 /// One `MATCH_RECOGNIZE` as the derived table it stands for (the layers of the module doc).
-fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
+fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFactor> {
     let TableFactor::MatchRecognize { table, partition_by, order_by, measures, rows_per_match, after_match_skip, pattern, symbols, alias } = t
     else {
         bail!("MATCH_RECOGNIZE: not a MATCH_RECOGNIZE clause");
@@ -316,15 +369,45 @@ fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
     let all = matches!(rows_per_match, Some(RowsPerMatch::AllRows(_)));
     let omit = matches!(rows_per_match, Some(RowsPerMatch::AllRows(Some(EmptyMatchesMode::Omit))));
     let unmatched = matches!(rows_per_match, Some(RowsPerMatch::AllRows(Some(EmptyMatchesMode::WithUnmatched))));
-    let text = pattern_text(pattern);
+    let (text, within) = pattern_text(pattern);
     let (read_pattern, syms) = crate::matcher::read(&text)?;
     if unmatched && excludes(&read_pattern) {
         return Err(coded("42601", "MATCH_RECOGNIZE: WITH UNMATCHED ROWS can't go with {- … -}: a row left out would be neither in a match nor unmatched; use SHOW EMPTY MATCHES, or keep the rows in the pattern"));
     }
-    let has_row = match table.as_ref() {
-        TableFactor::Table { name, .. } => ties.contains(&object(name)),
-        _ => false,
+    // WITHIN reads the first ORDER BY as a time, ascending: its key is the first one, `__mr_o0`. Its interval goes into the
+    // call as parsed, so nothing else of the text does.
+    let within = match within {
+        Some(text) => {
+            match order_by.first() {
+                None => return Err(coded("42601", "MATCH_RECOGNIZE: WITHIN reads the first ORDER BY: add one, a date or a timestamp")),
+                Some(o) if o.options.asc == Some(false) => {
+                    return Err(coded("0A000", "MATCH_RECOGNIZE: WITHIN reads the first ORDER BY ascending"));
+                }
+                Some(_) => {}
+            }
+            Some(within_interval(&text)?)
+        }
+        None => None,
     };
+    // A lake table's columns (see `rewrite`): `_row_id` ties its rows, and ALL ROWS PER MATCH gives its columns beside the
+    // measures, so a measure can't have the name of one of them
+    let input = match table.as_ref() {
+        TableFactor::Table { name, .. } => Some(object(name)),
+        _ => None,
+    };
+    let input_cols = input.as_ref().and_then(|n| lake.get(n));
+    if let (true, Some(cols), Some(table_name)) = (all, input_cols, &input) {
+        for m in measures {
+            let alias = ident(&m.alias);
+            if cols.contains(&alias) {
+                return Err(coded(
+                    "42701",
+                    format!("MATCH_RECOGNIZE: the measure {alias} has the name of a column of {table_name}; ALL ROWS PER MATCH gives both, so name the measure otherwise"),
+                ));
+            }
+        }
+    }
+    let has_row = input_cols.is_some_and(|c| c.iter().any(|x| x == ROW_ID));
     let part_written: Vec<String> = partition_by.iter().map(|e| e.to_string()).collect();
     let part: Vec<String> = partition_by.iter().map(column_name).collect::<Result<Vec<String>>>()?;
     let order_names: Vec<String> = match all {
@@ -354,8 +437,11 @@ fn layer(t: &TableFactor, ties: &HashSet<String>) -> Result<TableFactor> {
     // L2: the window that matches the partition (`pondra_matches` where a row may be in several matches)
     let overlap = matches!(after_match_skip, Some(AfterMatchSkip::ToNextRow | AfterMatchSkip::ToFirst(_) | AfterMatchSkip::ToLast(_)));
     let skip = skip_json(after_match_skip.as_ref(), &cx.syms)?;
-    let spec = json!({ "pattern": &text, "skip": skip, "unmatched": unmatched }).to_string();
-    let call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
+    let spec = json!({ "pattern": &text, "skip": skip, "unmatched": unmatched, "within": within.is_some() }).to_string();
+    let mut call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
+    if let Some(interval) = &within {
+        call.push_str(&format!(", __mr_o0, {interval}"));
+    }
     let mut order2: Vec<String> = dirs.iter().enumerate().map(|(i, d)| format!("__mr_o{i}{d}")).collect();
     if has_row {
         order2.push("__mr_row".to_string());
@@ -977,7 +1063,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashSet::new()).expect("a layer") else { panic!("a derived table") };
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
         let text = subquery.to_string();
         assert!(text.contains("pondra_matches("));
         assert!(text.contains("GROUP BY symbol, __mr_match"));
@@ -990,7 +1076,45 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &written).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(s) = *q.body else { panic!("a select") };
         let TableFactor::MatchRecognize { pattern, .. } = &s.from[0].relation else { panic!("a clause") };
-        assert_eq!(pattern_text(pattern), "a {- b -} c");
+        assert_eq!(pattern_text(pattern).0, "a {- b -} c");
+    }
+
+    #[test]
+    fn within_is_carried_in_the_pattern_name() {
+        let written = text("SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true)");
+        assert!(!written.contains("WITHIN"));
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &written).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(s) = *q.body else { panic!("a select") };
+        let TableFactor::MatchRecognize { pattern, .. } = &s.from[0].relation else { panic!("a clause") };
+        assert_eq!(pattern_text(pattern), ("a b+ c".to_string(), Some("INTERVAL '1' HOUR".to_string())));
+    }
+
+    #[test]
+    fn within_needs_an_ascending_first_order_by() {
+        let no_order = "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(no_order)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42601");
+        let desc = "SELECT * FROM t MATCH_RECOGNIZE (ORDER BY ts DESC PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(desc)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+    }
+
+    #[test]
+    fn a_measure_named_like_a_lake_column_is_refused() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES LAST(up.price) AS price \
+                   ALL ROWS PER MATCH PATTERN (strt up+) DEFINE up AS up.price > PREV(up.price)) AS m";
+        let lake = HashMap::from([("ticker".to_string(), vec!["symbol".to_string(), "day".to_string(), "price".to_string()])]);
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let clause = s.from.remove(0).relation;
+        let err = layer(&clause, &lake).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "42701");
+        // an input that isn't a lake table keeps DataFusion's own error
+        assert!(layer(&clause, &HashMap::new()).is_ok());
     }
 
     #[test]
@@ -1002,7 +1126,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashSet::new()).expect("a layer") else { panic!("a derived table") };
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
         let text = subquery.to_string();
         assert!(text.contains("pondra_match("));
         assert!(text.contains("pondra_nav("));
@@ -1016,7 +1140,16 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let err = layer(&clause, &HashSet::new()).expect_err("a refusal");
+        let err = layer(&clause, &HashMap::new()).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "42601");
+    }
+
+    #[test]
+    fn within_takes_one_interval_literal_only() {
+        assert_eq!(within_interval("INTERVAL '1' HOUR").unwrap(), "INTERVAL '1' HOUR");
+        for text in ["5", "(SELECT 1)", "INTERVAL '1' HOUR), x(", ""] {
+            let err = within_interval(text).expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "42601", "{text}");
+        }
     }
 }
