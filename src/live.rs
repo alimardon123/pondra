@@ -6,7 +6,7 @@
 //! runs for it. `POST /live` with `{"queries": [{"id", "sql", "params"?, "session"?}]}` watches
 //! several on one connection, each line naming its query's `id` (a page's: a browser opens six
 //! connections to a host at most, and live answers each holding one left nothing for the rest).
-use crate::server::App;
+use crate::app::App;
 use crate::store::{seg_key, Segment, TableMeta};
 use axum::body::Body;
 use axum::extract::{Query, State};

@@ -95,7 +95,7 @@ PROCESS = {
     "reset.rs:USED": "what reset() sets back: every per-node static used since the process started",
     "runs.rs:WAKE": SIGNAL,
     "runs.rs:WRITTEN": SIGNAL,
-    "server.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
+    "app.rs:TURNS": SETTING + " (PONDRA_QUERIES, PONDRA_QUEUE_SECS; a stopped node's last queries give their turns back to it)",
     "service.rs:CONFIG": "the Windows service's file, set by its entry point once a process",
     "memory.rs:MADE": "the spill folders this process made and hasn't removed: a folder of a static (`store::SPILLS`) outlives a node until the program ends, when `memory::leave` removes what is left; `sweep` skips them",
     "memory.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`), and the program's end (`memory::leave`) empties the map",

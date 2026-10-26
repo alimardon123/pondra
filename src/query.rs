@@ -1438,7 +1438,7 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 /// Run `work` on `ctx`, and once more when it ran out of memory: on a frugal copy of `ctx` (`frugal`), which
 /// shares its catalogs, so the retry reads the tables the first try registered at the same snapshot, and changes
 /// only its own options (`ctx` itself is never changed). An answer half sent is never run again: its client has
-/// the first rows. The paths that run a query for someone go through it: a door's query (`server::run_query`),
+/// the first rows. The paths that run a query for someone go through it: a door's query (`app::App::run_query`),
 /// `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`) and a node's share of one (`spmd::insert_share`),
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.

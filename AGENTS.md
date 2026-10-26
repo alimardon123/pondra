@@ -764,7 +764,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    than here doesn't decide alone (`guard::spread_runs`: the other nodes saw the query cold), so
    the model decides until a second agrees; one slow first run kept the cluster bench's q1 on one
    node for good (`harness.py guard`: "one spread run slower than here doesn't decide alone").
-   Every run here is timed (`server::query_listed`), however quick: kept only past 20 ms, a query
+   Every run here is timed (`app::App::query_listed`), however quick: kept only past 20 ms, a query
    learned spread was never known to be faster here, and the third node of `harness.py guard`
    spread it now and then. Only the bytes it read, for this node's rate, wait for a run of 20 ms.
 73. **`pondra_object_requests_total` counts what the store was asked to do** (`store::Counted`), not
@@ -1897,7 +1897,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    columns to the table's types). Written as it was, a table with an `INTERVAL` column never left
    the log, and its `DROP TABLE` failed (the 0.33.0 gates). `harness.py tiering`: "INTERVAL columns
    tiered, merged and changed, read back exactly".
-258. **One table's tiering round failing stops no other table's** (`server::each`, in `tier_all`):
+258. **One table's tiering round failing stops no other table's** (`app::each`, in `app::App::tier_all`):
    each table's fold, purge and maintenance is its own, and the round names every table that failed
    once the rest are done. With one round for all, a table with an `INTERVAL` column stopped every
    table of the lake from leaving the log. (No test makes a table's round fail now that 257 holds;
@@ -2177,7 +2177,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (53200), the node answering after; 3M rows' peak at least half their JSON under rendering them
    whole (442 MB against 715 when written). A door's own query sends its answer from its plan
    (invariant 421).
-289. **A node runs at most `PONDRA_QUERIES` queries at once** (`server::TURNS`: four a core, 16 at
+289. **A node runs at most `PONDRA_QUERIES` queries at once** (`app::TURNS`: four a core, 16 at
    least), the rest in the order they asked, and one that waits `PONDRA_QUEUE_SECS` (60) is
    refused (53300: a client asks again, or another node). A query run inside one this task runs (a
    procedure's, a script's, a probe of DuckDB's spellings) uses its caller's turn (`TURN`), never
@@ -3008,6 +3008,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`smallint`, `bigint`; `numeric field overflow` for a decimal); never a quiet NULL, never Arrow's words. INSERT, a
    bulk INSERT, COPY INTO, the Postgres port's COPY, setval and a DEFAULT's check all cast through `casts::into`, and
    a new write path does too. `cargo test --lib casts:: codes::`, harness `loads`, `found`.
+434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`cluster::claim`,
+   `prune`). After its put, a claim lists `cluster/term` while it writes its `alive` mark, one round trip for both: a term
+   above its own number means a newer leader holds the lake, so the claim deletes its own `alive` mark, lets its lock go,
+   and returns no term (its record stays; a later prune removes it). Above 32 terms, the claim also lists `alive` and `left`
+   (one round trip) and deletes everything below the newest 16, awaited and capped at 10 s, so a one-off writer's prune
+   finishes before it exits. A lake of 32 or fewer pays no more than the term listing. The superseded check holds
+   (`cluster::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
+   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib cluster::`; harness `serverless`
+   (34 one-off INSERTs, which cross 32: at most 32 terms kept, the newest among them, the table reads back 34 rows, and
+   nothing below the oldest kept in `alive` or `left`).
 ## Tests: run these before and after any change
 
 ```bash

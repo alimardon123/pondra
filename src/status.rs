@@ -8,7 +8,7 @@
 use crate::apply::{self, Current, Declared, Project, Shape};
 use crate::objects::{ident, name_sql as quoted};
 use crate::routines::{Outcome, Who};
-use crate::server::App;
+use crate::app::App;
 use crate::store::json;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};

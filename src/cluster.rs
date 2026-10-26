@@ -36,6 +36,7 @@ const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reach
 /// How long a claimer has to mark its term after its bell rang (`deaf`). It looks every second, and a mark is one
 /// request: the rest is a slow bucket's margin, as long as the lease a follower gives a leader it stopped hearing.
 const HEARD: Duration = LEASE;
+const KEEP: u64 = 16; // (the newest terms whose leadership records a lake keeps: `prune`)
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
 pub const CUT_OFF_SAYS: &str = "this node leads but can't reach the bucket: another node will lead in a moment, ask it";
 
@@ -278,8 +279,8 @@ impl Cluster {
                     m.store(crate::log::now_ms(), std::sync::atomic::Ordering::Relaxed);
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
-                    if store.head(&Path::from(format!("cluster/term/{:020}", me.leader.n + 1))).await.is_ok() {
-                        restart(&format!("term {} has a newer leader", me.leader.n + 1));
+                    if superseded(&store, me.leader.n).await {
+                        restart("a newer term has a leader");
                     }
                 }
                 due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 }); // (C5: a key at most once a second, each look)
@@ -628,10 +629,28 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
     match store.put_opts(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term)?.into(), opts).await {
         Ok(_) => {
+            // (the term listing and our alive mark go at once, together: one round trip, not two. A newer term in the
+            // listing means this claim was made from an older view, or it raced the next number and lost: a newer leader
+            // holds the lake, so our mark goes, the lock with it, and we step aside. Our record stays: a later prune removes it.)
+            let (listed, marked) = futures::join!(numbered(store, "cluster/term"), mark_alive(store, n));
+            let listed = match (listed, marked) {
+                (Ok(listed), Ok(())) => listed,
+                (Err(e), _) | (_, Err(e)) => {
+                    discard(lock);
+                    return Err(e);
+                }
+            };
+            if listed.iter().any(|(k, _)| *k > n) {
+                let _ = store.delete(&Path::from(format!("cluster/alive/{n:020}"))).await;
+                discard(lock);
+                return Ok(None);
+            }
             if let Some(held) = lock {
                 HELD.lock().unwrap().insert(n, held);
             }
-            mark_alive(store, n).await.map(|_| Some(term))
+            // (capped: a bucket that stalls can't hold the claim; the next claim prunes what this one didn't)
+            let _ = tokio::time::timeout(Duration::from_secs(10), prune(store, n, &listed)).await;
+            Ok(Some(term))
         }
         Err(object_store::Error::AlreadyExists { .. }) => {
             discard(lock); // someone else won the term
@@ -642,6 +661,39 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
             Err(e.into())
         }
     }
+}
+
+/// The numbered records under one leadership prefix (`cluster/term`, `cluster/alive` or `cluster/left`), each as its
+/// number and location. A name that isn't a number is left out.
+async fn numbered(store: &Store, prefix: &str) -> Result<Vec<(u64, Path)>> {
+    let metas: Vec<_> = store.list(Some(&Path::from(prefix))).try_collect().await?;
+    Ok(metas.into_iter().filter_map(|m| Some((m.location.filename()?.parse::<u64>().ok()?, m.location))).collect())
+}
+
+/// Deletes the leadership records below the newest `KEEP` terms (`n` is the newest). The claim's own listing of
+/// `cluster/term` decides: only a lake holding more than twice `KEEP` terms lists `alive` and `left` (one round trip, both
+/// at once) and deletes everything below the floor in one call (S3 deletes in batches). So most claims pay nothing more
+/// than the listing they make. Nothing reads a superseded record (`superseded`). Errors are ignored: a record that didn't
+/// go goes at a later claim.
+async fn prune(store: &Store, n: u64, terms: &[(u64, Path)]) {
+    if terms.len() <= 2 * KEEP as usize {
+        return;
+    }
+    let floor = (n + 1).saturating_sub(KEEP); // (the newest KEEP terms stay: floor ..= n)
+    let (alive, left) = futures::join!(numbered(store, "cluster/alive"), numbered(store, "cluster/left"));
+    let rest = alive.unwrap_or_default().into_iter().chain(left.unwrap_or_default());
+    let gone: Vec<object_store::Result<Path>> = terms.iter().cloned().chain(rest).filter(|(k, _)| *k < floor).map(|(_, at)| Ok(at)).collect();
+    store.delete_stream(futures::stream::iter(gone).boxed()).collect::<Vec<_>>().await;
+}
+
+/// Is the leader of term `m` superseded? A newer term exists, or its own record is gone: `prune` keeps
+/// the newest `KEEP`, so a term with `KEEP` newer ones after it has no record. Only a record that isn't
+/// there counts (NotFound): a bucket that can't be reached says nothing, and a leader isn't restarted for it.
+async fn superseded(store: &Store, m: u64) -> bool {
+    if store.head(&Path::from(format!("cluster/term/{:020}", m + 1))).await.is_ok() {
+        return true;
+    }
+    matches!(store.head(&Path::from(format!("cluster/term/{m:020}"))).await, Err(object_store::Error::NotFound { .. }))
 }
 
 /// The holder of term `n` is still here (the leader: every 10 s).
@@ -1010,5 +1062,71 @@ mod tests {
         let old = elsewhere(9_003, false);
         mark_alive(&store, 9_003).await.unwrap();
         assert!(!deaf(&store, &old).await && alive(&store, &old).await);
+    }
+
+    /// The numbers of the records under `prefix`, sorted.
+    async fn numbers(store: &Store, prefix: &str) -> Vec<u64> {
+        let metas: Vec<_> = store.list(Some(&Path::from(prefix))).try_collect().await.unwrap();
+        let mut out: Vec<u64> = metas.iter().filter_map(|m| m.location.filename()?.parse().ok()).collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_claim_keeps_the_newest_sixteen_once_the_lake_has_more_than_thirty_two() {
+        let dir = std::env::temp_dir().join(format!("pondra-prune-{}", uuid::Uuid::new_v4().simple()));
+        let folder = crate::store::open_store(&dir.to_string_lossy()).unwrap().1;
+        let url = format!("memory://prune-{}", uuid::Uuid::new_v4().simple());
+        let memory = crate::memory::store(&url);
+        for store in [folder.clone(), memory.clone()] {
+            // (40 terms; each leader marked alive and never let go, a crash's marks too; three terms stepped down)
+            for n in 1..=40u64 {
+                let term = Term { n, addr: String::new(), lock: String::new(), bell: false };
+                store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
+                store.put(&Path::from(format!("cluster/alive/{n:020}")), Vec::<u8>::new().into()).await.unwrap();
+            }
+            for n in [2u64, 9, 30] {
+                store.put(&Path::from(format!("cluster/left/{n:020}")), Vec::<u8>::new().into()).await.unwrap();
+            }
+            assert_eq!(numbers(&store, "cluster/term").await.len(), 40);
+            let won = claim(&store, 41, "").await.unwrap().expect("term 41 is none's");
+            assert_eq!(won.n, 41);
+            // (41 is more than 32: the claim's own listing deletes what is below the newest 16, before it returns)
+            let (want, kept_left) = ((26..=41).collect::<Vec<u64>>(), vec![30u64]);
+            assert_eq!(numbers(&store, "cluster/term").await, want, "the newest 16 terms stay");
+            assert_eq!(numbers(&store, "cluster/alive").await, want, "the crashed term's mark is gone with its term");
+            assert_eq!(numbers(&store, "cluster/left").await, kept_left, "the stepped-down terms below the newest 16 are gone");
+            assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(41), "latest answers the newest");
+            release(&store, 41).await;
+        }
+        crate::memory::forget_memory(&url);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_claim_behind_a_newer_term_steps_aside() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        for n in 30..=50u64 {
+            let term = Term { n, addr: String::new(), lock: String::new(), bell: false };
+            store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
+        }
+        assert!(claim(&store, 20, "").await.unwrap().is_none(), "term 50 is newer: a claim of 20 steps aside");
+        assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(50), "latest stays the newest");
+        assert!(numbers(&store, "cluster/alive").await.is_empty(), "a claim that steps aside marks nothing alive");
+    }
+
+    #[tokio::test]
+    async fn a_leader_is_superseded_by_a_newer_term_or_by_its_own_going() {
+        async fn terms_at(ns: &[u64]) -> Store {
+            let store: Store = Arc::new(object_store::memory::InMemory::new());
+            for n in ns {
+                store.put(&Path::from(format!("cluster/term/{n:020}")), Vec::<u8>::new().into()).await.unwrap();
+            }
+            store
+        }
+        assert!(superseded(&terms_at(&[5, 6]).await, 5).await, "term 6 is there: 5 is superseded");
+        assert!(superseded(&terms_at(&[20]).await, 5).await, "5 and 6 are both pruned: 5's own record is gone");
+        assert!(!superseded(&terms_at(&[4, 5]).await, 5).await, "5 is the newest: its record is there and 6 isn't");
+        assert!(!superseded(&terms_at(&[5]).await, 5).await, "only 5 is there: nothing newer");
     }
 }

@@ -6,7 +6,7 @@
 //! (`pondra.runs`), named `files/<path>@<version>`: the file and the version that ran.
 use crate::auth::Role;
 use crate::routines::{Outcome, Who};
-use crate::server::App;
+use crate::app::App;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, RecordBatch, StringArray};
 use datafusion::sql::sqlparser::ast::FunctionArg;

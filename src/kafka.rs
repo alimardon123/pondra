@@ -23,7 +23,7 @@ use crate::auth::Role;
 use crate::log::{Ack, Src};
 use crate::answer::schema;
 use crate::reset::Once;
-use crate::server::App;
+use crate::app::App;
 use crate::store::{seg_key, table_key, Segment, TableMeta};
 use crate::kafka_wire::{MOST, decompress, Rd, put_str, put_nstr, put_len, put_varint, crc32c};
 use anyhow::{anyhow, bail, ensure, Result};

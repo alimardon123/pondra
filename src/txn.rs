@@ -263,7 +263,7 @@ pub fn id() -> Option<String> { with_txn(|t| t.id.clone()) }
 pub fn touched(table: &str) -> bool { with_txn(|t| t.tables.get(table).is_some_and(pending)).unwrap_or(false) }
 
 /// The leader a transaction on this node keeps its locks at (None: this node leads).
-fn leader_of(app: &crate::server::App) -> Option<String> { app.seq.is_none().then(|| app.cluster.leader.addr.clone()) }
+fn leader_of(app: &crate::app::App) -> Option<String> { app.seq.is_none().then(|| app.cluster.leader.addr.clone()) }
 
 /// `SHOW` of a transaction's setting (ADR-067 §1): what the open transaction runs at (the session's default outside
 /// one), and the session's defaults. None: not one of these.
@@ -318,7 +318,7 @@ fn writable(word: &str) -> Result<()> {
 
 /// `BEGIN`, `COMMIT` or `ROLLBACK` (`control`), or a savepoint word, for the current session. Its answer: the command's
 /// tag (a failed transaction's COMMIT is a ROLLBACK, as in Postgres), and a warning, if any.
-pub async fn command(app: &crate::server::App, word: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
+pub async fn command(app: &crate::app::App, word: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
     let s = crate::temp::current().context(NO_SESSION)?;
     // (an idle end: a COMMIT must not say its writes landed; a transaction word ends the refusal)
     if ended(&s) {
@@ -421,7 +421,7 @@ fn idle_commit() -> anyhow::Error {
 
 /// `BEGIN [modes]`: a transaction of this session, at the level and access mode its modes and the session's defaults
 /// give (ADR-067 §1).
-fn begin(app: &crate::server::App, s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
+fn begin(app: &crate::app::App, s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
     let (level, read_only) = plan(&begin_modes(sql)?)?;
     let level = level.map_or_else(default_level, Ok)?;
     let read_only = read_only.unwrap_or_else(default_read_only);
@@ -434,7 +434,7 @@ fn begin(app: &crate::server::App, s: &str, sql: &str) -> Result<(&'static str, 
 /// Opens a transaction for session `s` (false: it has one). Its snapshot is taken at its first statement (as Postgres
 /// takes it: `gate`), so this is a placeholder until then. Starts the upkeep loop if none runs. Its id is new each time; a
 /// `job` names its commit instead (`alone`).
-fn start(app: &crate::server::App, s: &str, level: Level, read_only: bool, job: Option<String>) -> bool {
+fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Option<String>) -> bool {
     let mut book = BOOK.lock().unwrap();
     if book.txns.contains_key(s) {
         return false;
@@ -538,7 +538,7 @@ impl Drop for Busy {
 
 /// Before each statement, at each door (ADR-067 §1, §2): the gate (`gate`). The statement runs while the guard it returns
 /// lives: a transaction with a statement in progress isn't idle, even while that statement waits for a lock.
-pub async fn next(app: &crate::server::App, sql: &str) -> Result<Busy> {
+pub async fn next(app: &crate::app::App, sql: &str) -> Result<Busy> {
     let busy = Busy(crate::temp::current().and_then(|s| {
         let leader = leader_of(app);
         at(&s, |t| {
@@ -716,7 +716,7 @@ pub fn temp_at_once() -> Result<Option<String>> { at_once_notice("CREATE TEMP TA
 /// DDL in this session's open transaction runs at once (ADR-067 §8): a commit of its own that ROLLBACK won't undo (the
 /// notice says so, once it has run: `on_node_listed`). Refused by name on a table this transaction has written, and under
 /// REPEATABLE READ (`at_once_notice`). None: the statement isn't DDL, or no transaction is open.
-pub async fn ddl_at_once(app: &crate::server::App, stmt: &Stmt) -> Result<Option<String>> {
+pub async fn ddl_at_once(app: &crate::app::App, stmt: &Stmt) -> Result<Option<String>> {
     if !is_ddl(stmt) {
         return Ok(None);
     }
@@ -933,7 +933,7 @@ pub async fn refuse_change(lake: &Lake, name: &str, meta: &TableMeta, stmt: &Stm
 
 /// A statement's kept writes of a transaction: an INSERT's rows, an UPDATE's or DELETE's changes, all under the transaction's
 /// own locks. Outside a transaction (none open) they are None: the statement goes to the leader.
-pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Result<Option<Value>> {
+pub async fn statement(app: &crate::app::App, stmt: &Stmt, files: bool) -> Result<Option<Value>> {
     // (every write comes here, whatever its text: a comment or a `WITH` in front of it doesn't get it past READ ONLY)
     // (the snapshot and the id are read together: a statement that outlives its transaction is refused at `keep`, ADR-067 §1)
     let began = began_id();
@@ -996,7 +996,7 @@ pub async fn statement(app: &crate::server::App, stmt: &Stmt, files: bool) -> Re
 /// takes no lake lock and no session state. The producer is the job's (`sql:{job}`), so a retried one is a duplicate. MERGE and
 /// a MERGE comes here only as a one-row upsert of one key (`change::Merge::point_upsert`), and tables with an enforced UNIQUE
 /// don't (`write::changes`, `write::run_listed`).
-pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Result<Value> {
+pub async fn autocommit(app: &crate::app::App, stmt: &Stmt, job: &str) -> Result<Value> {
     let owner = format!("auto-{}", uuid::Uuid::new_v4().simple());
     let taken = AtomicBool::new(false);
     let mut hold = Hold::new((app.lake.url.clone(), leader_of(app), owner.clone()));
@@ -1006,7 +1006,7 @@ pub async fn autocommit(app: &crate::server::App, stmt: &Stmt, job: &str) -> Res
     out
 }
 
-async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
     if matches!(stmt, Stmt::Insert(..)) {
         return insert_as(app, stmt, job, owner, taken, hold).await;
     }
@@ -1071,7 +1071,7 @@ async fn autocommit_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: 
 /// keys. An INSERT takes rows back from no one, so none of an UPDATE's or DELETE's checks apply (`refuse_change`,
 /// `views::can_follow`, `views::filling`). `key_check` runs under the locks; over `LOCK_MAX` keys no lock is taken, and the check
 /// still runs (the documented limit).
-async fn insert_as(app: &crate::server::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
+async fn insert_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &str, taken: &AtomicBool, hold: &mut Hold) -> Result<Value> {
     let lake = &app.lake;
     if crate::write::sent(lake, job).await? {
         return Ok(j!({"duplicate": true}));
@@ -1295,7 +1295,7 @@ impl Visitor for Locking {
 /// A locking read in a transaction (ADR-067 §3): a single table's `SELECT … FOR UPDATE` (or `FOR SHARE`, the same locks
 /// here) locks the rows it returns. It runs with their keys appended to its columns, so `ORDER BY 1` means what it says.
 /// Outside a transaction, and for any other statement, None: a plain read.
-pub async fn locked_read(app: &crate::server::App, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
+pub async fn locked_read(app: &crate::app::App, sql: &str) -> Result<Option<Vec<RecordBatch>>> {
     if !LOCKING.is_match(sql) {
         return Ok(None);
     }
@@ -1333,7 +1333,7 @@ fn lock_clause(stmt: &Statement) -> Result<Option<(&Query, &LockClause)>> {
 
 /// One locking read in the transaction (`locked_read`): its rows are locked (waited for as `lock_timeout` says; at once with
 /// NOWAIT) and returned as they are under the locks. The answer's rows are the last run's, without the key columns.
-async fn lock_select(app: &crate::server::App, (level, ro, snapshot): (Level, bool, u64), q: &Query, lock: &LockClause) -> Result<Vec<RecordBatch>> {
+async fn lock_select(app: &crate::app::App, (level, ro, snapshot): (Level, bool, u64), q: &Query, lock: &LockClause) -> Result<Vec<RecordBatch>> {
     let lake = &app.lake;
     if ro {
         let word = if matches!(lock.lock_type, LockType::Share) { "SELECT FOR SHARE" } else { "SELECT FOR UPDATE" };
@@ -1515,7 +1515,7 @@ fn unipc(s: &str) -> Result<Vec<RecordBatch>> {
 /// Sends the transaction's writes to the leader, here or over HTTP, and ends the transaction: its locks go (`release_txn`)
 /// whatever the answer. A failed send lets go too, and the lease covers a send that never arrived.
 /// COMMIT: the tag and warning Postgres gives, and what the leader answered (`duplicate`: a job's commit sent again).
-async fn commit(app: &crate::server::App, s: &str) -> Result<(&'static str, Option<String>, Value)> {
+async fn commit(app: &crate::app::App, s: &str) -> Result<(&'static str, Option<String>, Value)> {
     let Some(t) = BOOK.lock().unwrap().txns.remove(s) else { return Ok(("COMMIT", Some(crate::rules::txn::NONE_OPEN.into()), j!({}))) };
     if t.failed.is_some() {
         release_txn(&t);
@@ -1562,7 +1562,7 @@ pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
 /// returned, and they still land in one commit. A COMMIT refused with 40001 runs it again, three times at most, since nothing
 /// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
 /// transaction's commit, so its commit sent again is a duplicate.
-pub async fn alone(app: &crate::server::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
+pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
     let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
     let s = caller.clone().unwrap_or_else(crate::temp::of_script);
     let job = job.map(|j| as_job(&j));

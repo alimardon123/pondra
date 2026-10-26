@@ -24,7 +24,7 @@
 use crate::auth::Role;
 use crate::routines::{Outcome, Who};
 use crate::expander::{Kind, Routine};
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use chrono::{Datelike, TimeZone, Timelike};

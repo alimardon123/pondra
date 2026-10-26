@@ -2131,15 +2131,31 @@ def serverless():
     node2_leads = leads(node2)
     node2.kill()
     guest_checks, guest_times = serverless_guest(A.port + 3)  # (`pondra sql` as a guest node: its own lakes, one assertion each)
+    # 34 one-off writers, each a term of its own that lets go (invariant 434): more than 32, so a prune must run, and the lake
+    # keeps 16 to 32 term records, the newest of them the last claim's, and alive and left hold nothing below the oldest one
+    # kept. Every row reads back.
+    oneoff, ONEOFF = {}, 34
+    done(cli("CREATE TABLE oneoff (k BIGINT)"))
+    top = max(int(x) for x in os.listdir(terms) if x.isdigit()) if local else 0
+    for i in range(ONEOFF):
+        done(cli(f"INSERT INTO oneoff VALUES ({i})"))
+    if local:
+        kept = sorted(int(x) for x in os.listdir(terms) if x.isdigit())
+        below = {p: [int(x) for x in os.listdir(os.path.join(lake, "cluster", p)) if x.isdigit() and int(x) < kept[0]] for p in ("alive", "left") if os.path.isdir(os.path.join(lake, "cluster", p))}
+        oneoff = {"kept": len(kept), "newest_is_last_claim": kept[-1] == top + ONEOFF, "below_oldest_kept": below, "terms_16_to_32": 16 <= len(kept) <= 32}
+    rows = re.search(r"^\|\s*(\d+)\s*\|$", done(cli("SELECT count(*) AS n FROM oneoff")), re.M)
+    oneoff["rows"] = int(rows.group(1)) if rows else None
+    oneoff_ok = (oneoff["rows"] == ONEOFF and (not local or (oneoff["terms_16_to_32"] and oneoff["newest_is_last_claim"]
+                 and not any(oneoff["below_oldest_kept"].values()))))
     # 8000 rows, the leader started here adds 1000 more, the writer that couldn't reach it 1000 and the next one
     # elsewhere 1000: 11000.
     ok = (n == {"n": 11000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and live_kept and other_machine_leads and all(guest_checks.values()))
+          and after_kill_s < 10 and live_kept and other_machine_leads and all(guest_checks.values()) and oneoff_ok)
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
                                      "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "unreached_s": unreached_s, "live_leader_kept": live_kept,
                                      "other_machine_after_kill_s": other_after_s, "other_machine_leads": other_machine_leads,
                                      "unreached_err": unreached.stderr[-400:] if not live_kept else "", "other_err": other_after.stderr[-400:] if not other_machine_leads else "",
-                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "ok": ok}}))
+                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "one_off": oneoff, "one_off_ok": oneoff_ok, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
@@ -22884,7 +22900,10 @@ def patterns():
     its ALL ROWS form over the Postgres port equal HTTP's; a 10,000-row table over 50 symbols answers the same from
     three nodes (?spread=1) as from one, and spreads, in both rows-per-match forms; a stored view and a materialized
     view equal the query, the view kept live through new rows. Without the matcher every statement here is refused
-    (DataFusion has no MATCH_RECOGNIZE), so each check fails."""
+    (DataFusion has no MATCH_RECOGNIZE), so each check fails. Section 6, the views of a pattern kept by key (`pattern_views`,
+    design-pattern-view-by-key.md): five views of a 1,000-symbol table (ONE ROW, ALL ROWS, TO NEXT ROW, WITHIN, nested windows)
+    listed by key, equal to their queries through inserts, a late row, a delete, an UPDATE that moves rows between symbols, and
+    a restart, with the untouched symbols' rows kept; and 10 rows into a 1,000 x 1,000 table, by key against refresh = 'full'."""
     import patterns_check as pc
     import psycopg
     checks, info = {}, {}
@@ -23036,11 +23055,167 @@ def patterns():
     info["view after inserts"] = q("SELECT * FROM ticker_v ORDER BY start_day") == want_after
     for n in nodes:
         n.kill()
+    views_checks, views_info = pattern_views()  # the views kept by key (its own lake and node)
+    checks.update(views_checks)
+    info.update(views_info)
     ok = all(checks.values())
     print(json.dumps({"patterns": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"patterns: {len(pc.FIXED)} fixed examples, {len(pc.REFUSED)} refusals and 600 random queries agree with the reference; the doors agree: all {len(checks)} checks pass"
+
+
+# ---------------------------------------------------------------- views of a pattern, kept by key (ADR-073 step 7)
+
+PV_DEF = "DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)"
+PV_ONE = ("SELECT symbol, start_day, bottom_day, end_day FROM pv_ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+          "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+          "AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) " + PV_DEF + ")")
+PV_ALL = ("SELECT symbol, day, m, d, n FROM pv_ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+          "MEASURES MATCH_NUMBER() AS m, LAST(down.price) AS d, FINAL count(*) AS n ALL ROWS PER MATCH "
+          "AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) " + PV_DEF + ")")
+PV_OVER = ("SELECT symbol, start_day, end_day FROM pv_ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day "
+           "MEASURES strt.day AS start_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+           "AFTER MATCH SKIP TO NEXT ROW PATTERN (strt down+ up+) " + PV_DEF + ")")
+PV_WIN = ("SELECT symbol, start_ts, end_ts FROM pv_ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+          "MEASURES strt.ts AS start_ts, LAST(up.ts) AS end_ts ONE ROW PER MATCH "
+          "AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) WITHIN INTERVAL '45' MINUTE " + PV_DEF + ")")
+PV_NEST = ("SELECT symbol, day, price, s, rank() OVER (PARTITION BY symbol ORDER BY s DESC) AS r FROM "
+           "(SELECT symbol, day, price, sum(price) OVER (PARTITION BY symbol ORDER BY day) AS s FROM pv_ticks)")
+# name, query, the key of a row (its columns, which are unique), the columns of the row
+PV_VIEWS = (
+    ("pv_one", PV_ONE, "symbol, start_day", "symbol, start_day, bottom_day, end_day"),
+    ("pv_all", PV_ALL, "symbol, day", "symbol, day, m, d, n"),
+    ("pv_over", PV_OVER, "symbol, start_day", "symbol, start_day, end_day"),
+    ("pv_win", PV_WIN, "symbol, start_ts", "symbol, start_ts, end_ts"),
+    ("pv_nest", PV_NEST, "symbol, day", "symbol, day, price, s, r"),
+)
+PV_TOUCHED = {"s001", "s002", "s003", "s004", "s009", "s1000"}  # the symbols the changes below write to
+# seconds to let a view settle before a timed write: a view's next run waits for its last run's length to pass (ten times
+# that for a full run), so a write made sooner would time the pace, not the run
+PV_SETTLE = 25
+
+
+def _pv_row(sym, day, price):  # a row of pv_ticks: ts is the day in minutes from 2026-10-01 00:00, as the table was made
+    return f"('{sym}', {day}, TIMESTAMP '2026-10-01 00:00:00' + CAST({day} AS BIGINT) * INTERVAL '1 minute', {price})"
+
+
+def _pv_snapshot(q, name, cols, key):
+    """Each row of a view by its key: (symbol, _row_id, _version), so what a change wrote shows as the rows that moved."""
+    out = {}
+    for r in q(f"SELECT {cols}, _row_id, _version FROM {name}"):
+        out[tuple(r[k] for k in key.split(", "))] = (r["symbol"], r["_row_id"], r["_version"])
+    return out
+
+
+def _pv_kept(before, after):
+    """Every row of a symbol the changes didn't touch is the same row, at the same version, in the same place."""
+    keep = lambda rows: {k: (rid, ver) for k, (sym, rid, ver) in rows.items() if sym not in PV_TOUCHED}
+    return len(keep(before)) > 0 and keep(before) == keep(after)
+
+
+def _pv_witness_secs(q, name, sym, t0, secs):
+    """Seconds from t0 until the view has the match of the 10 rows written to sym (its end is day 1010), or inf."""
+    deadline = t0 + secs
+    while time.time() < deadline:
+        if q(f"SELECT count(*) AS n FROM {name} WHERE symbol = '{sym}' AND end_day = 1010")[0]["n"] >= 1:
+            return time.time() - t0
+        time.sleep(0.05)
+    return float("inf")
+
+
+def pattern_views():
+    """Views of a MATCH_RECOGNIZE kept by key (ADR-073 step 7; design-pattern-view-by-key.md, the checks): on a lake table
+    of 1,000 symbols with 40 rows each, the ticker's ONE ROW and ALL ROWS views, an overlapping (TO NEXT ROW) view, a WITHIN
+    view and the nested-window view. Each is listed by key in pondra.flows and == its query right after CREATE. Then new rows
+    at the end, a late row that changes a symbol's match, a delete, and rows moved from one symbol to another by UPDATE on the
+    plain table: each view == its query, and every row of a symbol none of those touched keeps its _row_id and _version.
+    After a restart, the same. Last, 10 rows into one symbol of a 1,000 x 1,000 table: the view kept by key against
+    refresh = 'full', the seconds until the new match is in each, the median of three symbols. Returns (checks, info)."""
+    checks, info = {}, {}
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE pv_ticks AS SELECT 's' || lpad(CAST(s AS VARCHAR), 3, '0') AS symbol, CAST(d * 10 AS INT) AS day, "
+      "TIMESTAMP '2026-10-01 00:00:00' + CAST(d * 10 AS BIGINT) * INTERVAL '1 minute' AS ts, "
+      "CAST(100 + (s * 37 + d * 53 + (s * d) % 17 * 11) % 41 - 20 AS INT) AS price "
+      "FROM range(0, 1000) AS a(s) CROSS JOIN range(1, 41) AS b(d)")
+    for name, query, key, cols in PV_VIEWS:
+        q(f"CREATE MATERIALIZED VIEW {name} AS {query}")
+    listed = {r["name"]: r["refresh"] for r in q("SELECT name, refresh FROM pondra.flows")}
+    made = {name: _bykey_same(q, name, query, key, secs=30) for name, query, key, cols in PV_VIEWS}
+    before = {name: _pv_snapshot(q, name, cols, key) for name, query, key, cols in PV_VIEWS}
+    s003_before = q(f"SELECT * FROM ({PV_ONE}) WHERE symbol = 's003' ORDER BY start_day")
+    # the changes: new rows at the end of two symbols, a late row in s003's middle (day 55 lands inside its match from
+    # day 20 to 80), a delete of one row, and six rows moved from s009 to a symbol of its own (s1000, which had none)
+    q("INSERT INTO pv_ticks VALUES " + ", ".join([_pv_row("s001", 410, 90), _pv_row("s001", 420, 80), _pv_row("s001", 430, 95),
+                                                 _pv_row("s002", 410, 130), _pv_row("s002", 420, 120)]))
+    q("INSERT INTO pv_ticks VALUES " + _pv_row("s003", 55, 50))
+    deleted = q("DELETE FROM pv_ticks WHERE symbol = 's004' AND day = 120")
+    moved = q("UPDATE pv_ticks SET symbol = 's1000' WHERE symbol = 's009' AND day <= 60")
+    info["moved rows"] = moved
+    info["deleted rows"] = deleted
+    s003_after = q(f"SELECT * FROM ({PV_ONE}) WHERE symbol = 's003' ORDER BY start_day")
+    info["late row changes s003's matches"] = s003_before != s003_after
+    same = {name: _bykey_same(q, name, query, key, secs=30) for name, query, key, cols in PV_VIEWS}
+    after = {name: _pv_snapshot(q, name, cols, key) for name, query, key, cols in PV_VIEWS}
+    kept = {name: _pv_kept(before[name], after[name]) for name, *_ in PV_VIEWS}
+    info["s003 rows changed"] = {name: sum(1 for k, v in after[name].items() if v[0] == "s003" and before[name].get(k) != v)
+                                 for name, *_ in PV_VIEWS}
+    moved_ok = q("SELECT count(*) AS n FROM pv_ticks WHERE symbol = 's1000'") == [{"n": 6}] and \
+        q("SELECT count(*) AS n FROM pv_ticks WHERE symbol = 's009' AND day <= 60") == [{"n": 0}]
+    # a restart: the views come back equal to their queries, the same rows as before the restart
+    node.kill()
+    node = Node(lake, A.port, tier_secs=1).start()
+    restarted = {name: _bykey_same(q, name, query, key, secs=60) for name, query, key, cols in PV_VIEWS}
+    info["ids kept across the restart"] = {name: _pv_snapshot(q, name, cols, key) == after[name] for name, query, key, cols in PV_VIEWS}
+    # 10 rows into one symbol of a 1,000 x 1,000 table: the view kept by key, and the same view refreshed whole. Each view
+    # reads a copy of the table of its own, and the writes go one after the other, so each run's time is its own (a write
+    # to one copy never runs the other view)
+    big_sql = ("SELECT 's' || lpad(CAST(s AS VARCHAR), 3, '0') AS symbol, CAST(d AS INT) AS day, "
+               "CAST(100 + (s * 37 + d * 53 + (s * d) % 17 * 11) % 41 - 20 AS INT) AS price FROM range(0, 1000) AS a(s) CROSS JOIN range(1, 1001) AS b(d)")
+    q(f"CREATE TABLE pv_big_a AS {big_sql}")
+    q(f"CREATE TABLE pv_big_b AS {big_sql}")
+    big = PV_ONE.replace("FROM pv_ticks", "FROM pv_big_a")
+    q(f"CREATE MATERIALIZED VIEW pv_big_key AS {big}")
+    q(f"CREATE MATERIALIZED VIEW pv_big_full WITH (refresh = 'full') AS {PV_ONE.replace('FROM pv_ticks', 'FROM pv_big_b')}")
+    listed.update({r["name"]: r["refresh"] for r in q("SELECT name, refresh FROM pondra.flows WHERE name LIKE 'pv_big%'")})
+    rounds, round_same = [], []
+    for sym in ("s500", "s501", "s502"):
+        values = [200, 190, 180, 170, 160, 150, 160, 170, 180, 190]  # days 1001-1010: a match that ends at day 1010
+        rows_sql = ", ".join(f"('{sym}', {1001 + k}, {v})" for k, v in enumerate(values))
+        time.sleep(PV_SETTLE)
+        t0 = time.time()
+        q(f"INSERT INTO pv_big_a VALUES {rows_sql}")
+        key_secs = _pv_witness_secs(q, "pv_big_key", sym, t0, 300)
+        time.sleep(PV_SETTLE)
+        t0 = time.time()
+        q(f"INSERT INTO pv_big_b VALUES {rows_sql}")
+        full_secs = _pv_witness_secs(q, "pv_big_full", sym, t0, 300)
+        rounds.append((sym, key_secs, full_secs))
+        round_same.append(_close(q(f"SELECT * FROM pv_big_key WHERE symbol = '{sym}' ORDER BY start_day"),
+                                 q(f"SELECT * FROM pv_big_full WHERE symbol = '{sym}' ORDER BY start_day")))
+    key_med = sorted(r[1] for r in rounds)[1]  # (the median of three)
+    full_med = sorted(r[2] for r in rounds)[1]
+    info["rounds (symbol, by key secs, full secs)"] = [(s_, round(a, 3), round(b, 3)) for s_, a, b in rounds]
+    info["median by key secs"] = round(key_med, 3)
+    info["median full secs"] = round(full_med, 3)
+    big_same = _bykey_same(q, "pv_big_key", big, "symbol, start_day", secs=60) and \
+        _bykey_same(q, "pv_big_full", PV_ONE.replace('FROM pv_ticks', 'FROM pv_big_b'), "symbol, start_day", secs=60)
+    node.kill()
+    checks["pondra.flows lists each of the five views by key (the ticker's ONE ROW and ALL ROWS, TO NEXT ROW, WITHIN, nested windows), and the 1,000 x 1,000 view too"] = \
+        all(listed.get(name) == "by key" for name, *_ in PV_VIEWS) and listed.get("pv_big_key") == "by key"
+    checks["right after CREATE, each of the five views == its query (1,000 symbols)"] = all(made.values())
+    checks["after new rows at the end, a late row that changes a match, a delete, and six rows moved to another symbol by UPDATE on the plain table: each of the five views == its query"] = \
+        all(same.values()) and moved_ok and info["late row changes s003's matches"]
+    checks["only the touched symbols' rows changed: every row of an untouched symbol (995 of the 1,000) keeps its _row_id and _version, in each of the five views"] = \
+        all(kept.values()) and all(v > 0 for v in info["s003 rows changed"].values())
+    checks["after a restart, each of the five views == its query again"] = all(restarted.values())
+    checks["10 rows into one symbol of a 1,000 x 1,000 table: each round's view kept by key == refresh = 'full' for that symbol, and both == their query"] = \
+        all(round_same) and big_same and all(a != float("inf") and b != float("inf") for _, a, b in rounds)
+    checks["10 rows into one symbol of a 1,000 x 1,000 table: the view kept by key takes at most half the time of refresh = 'full' (median of three symbols)"] = \
+        key_med * 2 <= full_med
+    return checks, info
 
 
 def _delta_commits(lake, table):

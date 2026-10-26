@@ -5,7 +5,7 @@
 //! A temporary table lives in the memory of the node the session talks to, within
 //! `PONDRA_TEMP_MB` (1024) for all of them, with system columns of its own: INSERT, UPDATE, DELETE
 //! and MERGE work on it as on a lake table (`change::rows_of` works out what changes). A query
-//! reading one runs on this node (`server::App::query_as`), and isn't answered from the result
+//! reading one runs on this node (`app::App::query_as`), and isn't answered from the result
 //! cache.
 //!
 //! A session is a Postgres connection, or a client's `x-pondra-session` header (the Python and
@@ -13,7 +13,7 @@
 //! ends after `PONDRA_SESSION_IDLE_SECS` (3600).
 use crate::ddl::Ddl;
 use crate::text::mentions;
-use crate::server::App;
+use crate::app::App;
 use crate::store::TableMeta;
 use crate::write::Stmt;
 use anyhow::{ensure, Context, Result};

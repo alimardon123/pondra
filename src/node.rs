@@ -195,7 +195,7 @@ pub struct Node {
     /// The key this node's own calls are signed with (`Auth::owner_key`): `ask` sends it as the owner.
     owner: Option<String>,
     /// A guest's App, for `finish`: what it drains and waits for before it stops.
-    guest: Option<server::App>,
+    guest: Option<app::App>,
 }
 
 /// A guest that reads opens its lake beside its term look (`Node::start`): this is that open, made at the same time as the
@@ -402,7 +402,7 @@ impl Node {
         let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(flush_ms), to)));
         tr("the sequencer");
         python::init(python);
-        let app = server::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
+        let app = app::App { lake: lake.clone(), cluster: cluster.clone(), log, seq, lock, retain_ms: retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth };
         crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
         learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
         // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
@@ -505,7 +505,7 @@ impl Node {
                 if !crate::iceberg::elsewhere(&l).await {
                     return;
                 }
-                let _lock = a.lock.lock().await; // (the lock tiering publishes under: `server::tier_all`)
+                let _lock = a.lock.lock().await; // (the lock tiering publishes under: `app::App::tier_all`)
                 if let Err(e) = crate::delta::publish_all(&l).await {
                     eprintln!("publishing at start: {e:#}");
                 }

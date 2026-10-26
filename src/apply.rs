@@ -27,7 +27,7 @@
 
 use crate::objects::{ident, materialized_sql, name_sql as quoted, routine_sql, sql_type, table_sql, task_sql}; // (`SHOW CREATE`'s statements: an export reads as it does)
 use crate::routines::{Outcome, Who};
-use crate::server::App;
+use crate::app::App;
 use crate::store::{json, Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
