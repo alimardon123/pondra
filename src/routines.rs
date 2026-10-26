@@ -896,7 +896,7 @@ fn verb(sql: &str) -> &str {
 }
 
 /// Whether `steps` takes `sql` apart: an ALTER TABLE with several actions, a DROP with CASCADE. The
-/// fast path of `server::sql_as` (a statement `write::parse` doesn't know, sent to the query path)
+/// fast path of `statement::run` (a statement `write::parse` doesn't know, sent to the query path)
 /// leaves these to `one_of`; the first word is looked at first, so other statements pay nothing.
 pub fn several(sql: &str) -> bool {
     let word = verb(sql);

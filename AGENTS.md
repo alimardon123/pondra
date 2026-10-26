@@ -119,7 +119,9 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
-          in the old one's place in one commit: invariant 425)
+          in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
+          path behind every door: a door reads its wire into a request and writes the answer back in
+          its own encoding, designs/statement-run.md)
 brand/    the logo (mark.svg), colours (colors.css) and fonts (fonts/: Geist and Geist Mono, SIL
           OFL): the only copies; tools/brand_check.py
 site/     the documentation website (Starlight; ADR-030): site/STYLE.md says how pages are written,
