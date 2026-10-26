@@ -12,7 +12,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::io::AsyncBufReadExt;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::process::{Child, ChildStdin, ChildStdout};
 #[cfg(target_arch = "wasm32")]

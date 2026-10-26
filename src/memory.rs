@@ -21,11 +21,11 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, WriteMultipart};
-use bytes::Bytes;
+use object_store::{CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, WriteMultipart};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Range;
 use std::path::{Path as FsPath, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use {bytes::Bytes, object_store::GetResultPayload, std::ops::Range};
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
