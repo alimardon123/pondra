@@ -1,6 +1,6 @@
 # ADR-073: Row patterns (`MATCH_RECOGNIZE`)
 
-**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, #231; ALL ROWS PER MATCH and its options, #234); phase 2 built (`WITHIN`, #240; conditions that read the match so far, 2026-10-26) · **Builds on:**
+**Date:** 2026-10-12 · **Status:** accepted (Alimardon chose "Before 1.0", 2026-10-12 21:07); phase 1 building (ONE ROW PER MATCH, every operator and skip rule, #231; ALL ROWS PER MATCH and its options, #234); phase 2 built (`WITHIN`, #240; conditions that read the match so far, #249); a view of a pattern kept by key (step 7, 2026-10-26) · **Builds on:**
 ADR-017 (watermarks), ADR-052 (`EMIT FINAL`), ADR-056 and ADR-059 (views that run their query
 again, by key), ADR-072 (one engine in every form) · **Lane:** the coordinator's call (L6 owns the
 SQL front; L1 owns `rerun.rs`, `views.rs`, `store.rs`)
@@ -120,10 +120,15 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
    BY`, the rows are one sequence and run on one node, as any window over all rows does.
 
 7. **A view of a pattern is live by key.** `CREATE MATERIALIZED VIEW v AS SELECT … MATCH_RECOGNIZE
-   (…)` is a view of windows partitioned by its keys (invariant 284), so each run matches only the
-   keys whose rows moved, and the view always equals the query, late rows too. For `ONE ROW PER
-   MATCH`'s `GROUP BY` and the unnest, `rerun::window` learns to pass an aggregation grouped by every
-   key and an unnest (the key still traces through as a group column).
+   (PARTITION BY k …)` is kept by key over `k` (invariant 284), so each run matches only the keys
+   whose rows changed, and the view always equals the query, late rows too. `rerun.rs` keeps by key
+   any stack that works within keys, down to one table: projections, filters, aliases, an unnest that
+   doesn't unnest a key, windows that each partition by the keys and `GROUP BY`s that hold them, with
+   no subquery, `LIMIT`, `DISTINCT` or join. The keys are traced to the table's own columns; a run cuts
+   the table's scan to the touched keys' rows, so every node above it sees each such key's rows whole.
+   A plain `GROUP BY` and windows over one table are the rule's simplest cases and keep their touched
+   keys as before, under the view's `WHERE`. A window over a subquery's window is kept by key the
+   same way. With no `PARTITION BY`, the view runs whole.
 
 8. **A pattern view with `EMIT FINAL` keeps each match once, when it is decided**, as Flink's CEP
    does, at a cost that doesn't grow with each key's history:

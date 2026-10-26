@@ -972,15 +972,27 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
         }
         return Ok(keys.context("no table")?.distinct()?.collect().await?);
     }
-    ctx.deregister_table(table_ref(&v.source))?;
-    ctx.register_table(table_ref(&v.source), changed(lake, &v.source, done, now).await?.into_view())?;
     let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
     // (the lowest key node's keys over the changed rows, through the nodes under it alone: a filter there,
     // the view's WHERE under a GROUP BY, cuts the keys as it cuts the view's rows)
     let k = keyed(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
+    let rows = changed(lake, &v.source, done, now).await?.into_unoptimized_plan();
+    let low = cut_scan(&k.low, &|scan: &LogicalPlan| in_place_of(scan, &rows))?;
     let keys: Vec<Expr> = k.low_by.iter().enumerate().map(|(i, g)| g.clone().alias(format!("__k{i}"))).collect();
-    let p = LogicalPlanBuilder::from(k.low).project(keys)?.distinct()?.build()?;
+    let p = LogicalPlanBuilder::from(low).project(keys)?.distinct()?.build()?;
     Ok(ctx.execute_logical_plan(p).await?.collect().await?)
+}
+
+/// `rows` in the place of the table's `scan`: the scan's columns by name and type (NULL where `rows` has
+/// none, as a system column), under the scan's name, so the nodes over it read them as they read the table.
+/// (A view registered under the table's name would be planned inline, as a union under the stack.)
+fn in_place_of(scan: &LogicalPlan, rows: &LogicalPlan) -> Result<LogicalPlan> {
+    let LogicalPlan::TableScan(t) = scan else { bail!("the view's table is read another way") };
+    let columns = scan.schema().fields().iter().map(|f| Ok(match rows.schema().has_column_with_unqualified_name(f.name()) {
+        true => cast(ident(f.name()), f.data_type().clone()).alias(f.name()),
+        false => lit(ScalarValue::try_from(f.data_type())?).alias(f.name()),
+    }));
+    Ok(LogicalPlanBuilder::from(rows.clone()).project(columns.collect::<Result<Vec<_>>>()?)?.alias(t.table_name.clone())?.build()?)
 }
 
 /// `source`'s rows commits (after, upto] changed, its columns as SQL names them: what they wrote
