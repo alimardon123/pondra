@@ -184,10 +184,10 @@ impl Opened {
         crate::env::give(o.into_iter().map(|(k, v)| (if k == "launcher" { "PONDRA_LAUNCHER".into() } else { k }, text(v))))?;
         crate::tls::init()?; // (a certificate that can't be read: said now)
         let mut options = Options::local(&lake, &addr);
-        options.python = python;
+        options.start.python = python;
         options.attach = attach;
         // (its loopback door answers only its host, with the key, as a node `connect()` starts beside its program does: S21)
-        options.auth = Arc::new(crate::auth::Auth::from_env().owned_by(Some(owner.clone())));
+        options.start.auth = Arc::new(crate::auth::Auth::from_env().owned_by(Some(owner.clone())));
         let mut opened = Opened::open(options)?;
         opened.owner = Some(owner);
         Ok(opened)

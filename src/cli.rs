@@ -59,24 +59,24 @@ pub(crate) enum Cmd {
         serve_store: bool,
         /// Minimum milliseconds between a node's flushes. 0: flush as soon as the previous flush
         /// is committed (what queued up meanwhile goes together), for the lowest latency.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = node::Start::default().flush_ms)]
         flush_ms: u64,
         /// Tiering starts as soon as rows commit, at most once per this many seconds (fractions
         /// allowed): how soon new rows are Parquet, and a Delta or Iceberg version other engines
         /// can read (Pondra's own reads see every commit at once). Each run costs a few
         /// object-store writes per busy table, so not more often than that by default; a table
         /// with a million rows waiting is tiered within a second anyway (0 = only via POST /tier).
-        #[arg(long, default_value_t = 10.0)]
+        #[arg(long, default_value_t = node::Start::default().tier_secs)]
         tier_secs: f64,
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = node::Start::default().task_ms)]
         task_ms: u64,
         /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the machine's).
         /// Sorts, joins and aggregations that need more spill to the temp dir.
         #[arg(long)]
         memory_gb: Option<f64>,
         /// Seconds to keep consumed log segments and replaced files before deleting them.
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = node::Start::default().retain_secs)]
         retain_secs: u64,
         /// Keep the log this many seconds as a change feed: `/watch/{t}?after=N` replays every
         /// change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs`.
@@ -84,7 +84,7 @@ pub(crate) enum Cmd {
         changelog_secs: u64,
         /// Rows allowed to wait in the log for tiering before commits pause (backpressure).
         /// Lower it for less memory, raise it to absorb longer bursts.
-        #[arg(long, default_value_t = 10_000_000)]
+        #[arg(long, default_value_t = node::Start::default().backlog)]
         backlog: u64,
         /// Lakes on object storage: where this node keeps its local SSD copy of recent objects
         /// (default: <temp dir>/pondra-cache).
@@ -524,7 +524,7 @@ async fn run() -> anyhow::Result<()> {
             // starts again, so the selects below poll this one alone)
             let mut stop = Box::pin(stopped(stop_with_stdin));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
-            let mut options = node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth, guest: None };
+            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
                 let mut node = tokio::select! {
