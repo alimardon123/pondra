@@ -1351,6 +1351,8 @@ impl SimpleQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // (pgwire writes the answer's rows inside this call, so the drain counts the call until they are written)
+        let _busy = crate::drain::Busy::new();
         let out = self._on_query(client, query).await;
         self.cancelled(&out);
         out
@@ -1387,6 +1389,8 @@ impl ExtendedQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
+        let _busy = crate::drain::Busy::new();
         let out = self._on_execute(client, message).await;
         self.cancelled(&out);
         out

@@ -433,7 +433,7 @@ async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Futu
 /// What a statement's work hands its Flight stream: its whole answer, or the pieces its plan made (`query::Handed`), with the
 /// count its body holds until the last piece is read (`drain::Busy`).
 enum Sent {
-    Whole(SchemaRef, Vec<RecordBatch>),
+    Whole(SchemaRef, Vec<RecordBatch>, crate::drain::Busy),
     Pieces(crate::query::Handed, crate::drain::Busy),
 }
 
@@ -454,7 +454,7 @@ where
             biased;
             done = &mut go => match handed.try_recv() {
                 Ok(h) => Ok(Sent::Pieces(h, crate::drain::Busy::carried())), // (handed as the statement ended: its rows still come in pieces)
-                Err(_) => done.map(|(schema, batches)| Sent::Whole(schema, batches)),
+                Err(_) => done.map(|(schema, batches)| Sent::Whole(schema, batches, crate::drain::Busy::carried())), // (its messages are written as the client reads them, as the pieces' are)
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
@@ -465,15 +465,16 @@ where
     })
     .await?;
     Ok(match sent {
-        Sent::Whole(schema, batches) => whole(schema, batches),
+        Sent::Whole(schema, batches, busy) => whole(schema, batches, busy),
         Sent::Pieces(h, busy) => piece_stream(h, busy),
     })
 }
 
 /// A statement's whole answer as Flight data, encoded as the client reads it: each batch's pieces (`piece_rows`) through one
 /// Arrow encoder on `schema` (`answer::Encoding::with_schema`), each step's messages as the step is written. With no batches,
-/// the schema and the end. An encoding error ends the stream with its status.
-fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
+/// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
+/// dropped, as `piece_stream`'s is.
+fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy) -> Out<FlightData> {
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut few: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).take(2).collect();
@@ -494,17 +495,22 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
                 }
             }
         }
-        return Box::pin(futures::stream::iter(out));
+        return Box::pin(futures::stream::unfold((futures::stream::iter(out), busy), |(mut out, busy)| async move {
+            match out.next().await {
+                Some(item) => Some((item, (out, busy))),
+                None => None,
+            }
+        }));
     }
     let pieces = batches.into_iter().flat_map(|b| crate::answer::piece_rows(&b));
-    let steps = futures::stream::try_unfold(Some((crate::answer::Encoding::with_schema(schema), pieces)), |state| async move {
+    let steps = futures::stream::try_unfold((Some((crate::answer::Encoding::with_schema(schema), pieces)), busy), |(state, busy)| async move {
         let Some((mut enc, mut pieces)) = state else { return Ok::<_, Status>(None) };
         let (step, next) = match pieces.next() {
             Some(piece) => (enc.step(Some(&piece)), Some((enc, pieces))),
             None => (enc.step(None), None),
         };
         let data = step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(status)?;
-        Ok(Some((data, next)))
+        Ok(Some((data, (next, busy))))
     });
     Box::pin(steps.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten())
 }
@@ -1189,12 +1195,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
 
-        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch]).try_collect().await?;
+        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch], crate::drain::Busy::new()).try_collect().await?;
         let streamed = arrow_flight::utils::flight_data_to_batches(&sent)?;
         assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&schema));
         assert_eq!(streamed[0].column(0).data_type(), &DataType::Utf8, "a dictionary arrives as its values");
 
-        let empty: Vec<FlightData> = whole(schema.clone(), vec![]).try_collect().await?;
+        let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::drain::Busy::new()).try_collect().await?;
         assert_eq!(empty.len(), 1, "the schema alone");
         assert_eq!(names_and_types(&Schema::try_from(&empty[0])?), names_and_types(&schema));
         Ok(())
