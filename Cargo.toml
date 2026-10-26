@@ -17,7 +17,8 @@ server = ["lake", "doors"]
 # --features lake` counts what is left.
 lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
         "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka",
-        "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier"]
+        "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier",
+        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom"]
 # What listens and how a node is run: the HTTP, Postgres, Kafka and Flight doors, the cluster's own calls, the command
 # line and the service. A module is `lake` unless it is one of these; what reaches outside to answer a statement (Python,
 # Git, another Kafka cluster, a function's Flight server) is lake, and on a page it is the platform's or refused by name.
@@ -41,8 +42,6 @@ required-features = ["server"] # (the program is a node's command line)
 [dependencies]
 parquet = { version = "59", default-features = false, features = ["snap", "zstd", "lz4"] }
 datafusion = { version = "55", default-features = false, features = ["parquet", "sql", "nested_expressions", "datetime_expressions", "string_expressions", "unicode_expressions", "regex_expressions", "crypto_expressions", "encoding_expressions"] }
-slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
-moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 arrow-ipc = { version = "59", features = ["zstd"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"], optional = true }
 axum = { version = "0.8", optional = true }
@@ -70,9 +69,6 @@ regex = "1" # (COPY FROM: its NULL string; already built for arrow-csv)
 csv-core = "0.1.13" # (the CSV reader Arrow reads with: a COPY INTO refusal's line is found by reading the file as it does)
 postgres-types = { version = "0.2", optional = true } # (DECIMAL as NUMERIC over the Postgres protocol; already built for pgwire)
 pgwire = { version = "0.41", default-features = false, features = ["server-api-aws-lc-rs", "pg-type-chrono"], optional = true } # the Postgres wire protocol (psql, drivers, BI tools); TLS as sslmode=require asks
-# Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
-arrow-flight = { version = "59", features = ["flight-sql"], optional = true }
-tonic = { version = "0.14", default-features = false, features = ["transport", "router"], optional = true }
 prost = { version = "0.14", default-features = false, optional = true }
 base64 = "0.22" # (Flight's basic-auth handshake; already built for object_store)
 # Kafka record batches: their compression codecs and CRC (all already built for parquet, arrow and object_store)
@@ -82,21 +78,35 @@ snap = "1"
 zstd = { version = "0.13", optional = true }
 crc-fast = "1.10"
 # S3 / R2 / MinIO. SlateDB and our own I/O use object_store 0.14; DataFusion 55 reads through 0.13.
-object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
 object_store_df = { package = "object_store", version = "0.13", default-features = false, optional = true }
 glob = "0.3" # (a URL's glob: DataFusion splits only paths'; already built for it)
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["sync", "rt"] } # (asof.rs's OnceCell in every build; `server` adds the rest: "tokio/full")
+# What a page can't build, though the lake names it: a page has its own catalog store (`kv`), seal and hashes (`crypto`),
+# memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
+object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
+slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
+# Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
+arrow-flight = { version = "59", features = ["flight-sql"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["transport", "router"], optional = true }
 aws-lc-rs = { version = "1", optional = true } # (secrets sealed with AES-256-GCM: already built for object_store's TLS)
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"], optional = true } # (Kafka clusters over TLS: already built for reqwest)
 rustls-platform-verifier = { version = "0.7", optional = true } # (…checked against the system's certificates, as reqwest does)
 sysinfo = { version = "0.35", default-features = false, features = ["system"], optional = true } # (RAM and resident memory where there is no /proc: Windows, macOS; already built for SlateDB)
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { version = "1", features = ["sync", "rt"] } # (asof.rs's OnceCell in every build; `server` adds the rest: "tokio/full")
-
 # (a page's stand-in for tokio: sleeps, timeouts and tasks over the browser, `web/tokio`, named `tokio` in `lib.rs`: Cargo
 # refuses one name with two sources across targets)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 pondra-tokio-web = { path = "web/tokio" }
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "gcp-base", "azure-base", "http-base", "reqwest"], optional = true } # (the bucket clients over the browser's fetch, without the TLS and aws-lc-rs a page can't build: their crypto is crypto.rs's)
+# (a page's crypto: crypto.rs's page bodies, RustCrypto and getrandom in a browser; a node's are aws-lc-rs)
+sha1 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+hmac = { version = "0.13", optional = true }
+subtle = { version = "2.6", optional = true }
+getrandom = { version = "0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true } # (free disk space: statvfs)
@@ -110,6 +120,14 @@ mimalloc = { version = "0.1", default-features = false, features = ["local_dynam
 
 [target.'cfg(windows)'.dependencies]
 windows-service = { version = "0.8", optional = true } # (`pondra service` on Windows: the service manager's dispatcher; its windows-sys is already built for tokio)
+
+# (the native tests build a page's crypto bodies, `crypto.rs`, to compare them with the node's: the same crates a page has)
+[dev-dependencies]
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+subtle = "2.6"
+getrandom = "0.3"
 
 [profile.release]
 # (panics unwind: a request's is answered as an error; the node's own loops still stop it: `panics.rs`)
