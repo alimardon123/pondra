@@ -331,7 +331,7 @@ impl Auth {
 
     /// Is `key` the key of the program that started this node (`owned_by`)? Compared in constant time.
     pub fn is_owner(&self, key: &str) -> bool {
-        self.owner.as_ref().is_some_and(|k| aws_lc_rs::constant_time::verify_slices_are_equal(k.as_bytes(), key.as_bytes()).is_ok())
+        self.owner.as_ref().is_some_and(|k| crate::crypto::same(k.as_bytes(), key.as_bytes()))
     }
 
     /// The role a bearer token grants.
@@ -347,7 +347,7 @@ impl Auth {
 
     /// The role one of the three tokens (or the program's key: an admin's) grants, compared in constant time, or None.
     pub fn token_role(&self, token: &str) -> Role {
-        let is = |t: &Option<String>| t.as_ref().is_some_and(|t| aws_lc_rs::constant_time::verify_slices_are_equal(t.as_bytes(), token.as_bytes()).is_ok());
+        let is = |t: &Option<String>| t.as_ref().is_some_and(|t| crate::crypto::same(t.as_bytes(), token.as_bytes()));
         match () {
             _ if is(&self.admin) || is(&self.owner) => Role::Admin,
             _ if is(&self.write) => Role::Write,

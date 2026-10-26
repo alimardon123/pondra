@@ -429,7 +429,7 @@ fn partitions_of(table: &str, meta: &TableMeta, asked: Vec<(String, String)>) ->
 /// A recipient's token (`pds_…`), and its hash, which is all that is kept.
 fn token() -> Result<(String, String)> {
     let mut secret = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut secret).map_err(|_| anyhow!("no randomness"))?;
+    crate::crypto::random(&mut secret)?;
     let token = format!("pds_{}", B64U.encode(secret));
     let hash = crate::users::sha256(&token);
     Ok((token, hash))

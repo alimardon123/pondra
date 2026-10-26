@@ -60,7 +60,7 @@ fn signer(scheme: &str, bucket: &str) -> Result<Arc<dyn Signer>> {
 /// hasn't ended.
 pub async fn opened(lake: &Lake, payload: &str, sig: &str) -> Result<(String, String)> {
     let want = crate::users::sign_for(lake, LINK, payload.as_bytes()).await?;
-    ensure!(aws_lc_rs::constant_time::verify_slices_are_equal(want.as_bytes(), sig.as_bytes()).is_ok(), "a link that wasn't made here");
+    ensure!(crate::crypto::same(want.as_bytes(), sig.as_bytes()), "a link that wasn't made here");
     let v: serde_json::Value = serde_json::from_slice(&B64U.decode(payload)?)?;
     ensure!(v["x"].as_u64().unwrap_or(0) > crate::log::now_ms(), "this link has ended: ask the sharing server for the table's files again");
     let key = v["k"].as_str().context("a link without its file")?.to_string();

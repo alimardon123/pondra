@@ -365,7 +365,7 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
         _ => bail!("permission denied: a branch's key renews or lets go of its own pin, and does nothing else"),
     };
     let want = key_for(lake, branch).await?;
-    ensure!(aws_lc_rs::constant_time::verify_slices_are_equal(want.as_bytes(), key.as_bytes()).is_ok(), "permission denied: not {branch}'s key");
+    ensure!(crate::crypto::same(want.as_bytes(), key.as_bytes()), "permission denied: not {branch}'s key");
     ensure!(matches!(d, Ddl::Unpin { .. }) || lake.cat.get::<Pin>(&pin_key(branch)).await?.is_some(), "permission denied: {branch} has no pin in {}: a branch's key renews its pin, it never makes one", lake.url);
     Ok(())
 }

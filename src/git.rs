@@ -14,7 +14,6 @@ use crate::routines::{Outcome, Who};
 use crate::server::App;
 use crate::store::{Changed, Lake};
 use anyhow::{anyhow, bail, ensure, Context, Result};
-use aws_lc_rs::digest;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use datafusion::arrow::array::{ArrayRef, RecordBatch, StringArray};
 use datafusion::sql::sqlparser::ast::FunctionArg;
@@ -258,10 +257,7 @@ async fn host_for(lake: &Lake, repository: &str, secret: Option<&str>) -> Result
 
 /// git's id of a blob: SHA-1 of `blob <size>\0` and the bytes (what `git hash-object` prints).
 pub fn blob_id(bytes: &[u8]) -> String {
-    let mut ctx = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
-    ctx.update(format!("blob {}\0", bytes.len()).as_bytes());
-    ctx.update(bytes);
-    crate::text::hex(ctx.finish().as_ref())
+    crate::text::hex(&crate::crypto::sha1(&[format!("blob {}\0", bytes.len()).as_bytes(), bytes]))
 }
 
 /// `'sales'` or `'files/sales'`: the folder of the workspace it names. The workspace itself, and the
