@@ -1,5 +1,6 @@
 //! The catalog's key-value store, behind one trait: the catalog (`store.rs`) keeps its keys here and names no
-//! other store. On a node it is SlateDB (`kv::slate`); a page gives its own later (designs/page-same-core.md).
+//! other store. On a node it is SlateDB (`kv::slate`); on a page it is a log in the lake's own store (`kv::page`,
+//! designs/page-same-core.md).
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use std::collections::BTreeMap;
@@ -7,6 +8,9 @@ use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod slate;
+
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) mod page;
 
 /// The catalog's store as its leader opens it: SlateDB's writer on a node.
 #[cfg(not(target_arch = "wasm32"))]
@@ -20,21 +24,19 @@ pub(crate) async fn reader(store: crate::store::Store, streamed: bool, cache_dir
     Ok(Arc::new(slate::Reader::open(store, streamed, cache_dir, poll).await?))
 }
 
-/// A page's catalog store comes with the lake on a page (designs/page-same-core.md P2); until then a page opens none.
+/// The catalog's store as its leader opens it on a page: a `page::Log` in the lake's own store (designs/page-same-core.md P2).
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn writer(_: crate::store::Store, _: Option<std::path::PathBuf>, _: bool) -> Result<Arc<dyn Kv>, Error> {
-    Err(Error { closed: false, source: NO_PAGE_KV.into() })
+pub(crate) async fn writer(store: crate::store::Store, _: Option<std::path::PathBuf>, _: bool) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(page::Log::open(store, true).await?))
 }
 
+/// The catalog's store as a follower or a reader opens it on a page: the same log, read only.
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn reader(_: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, _: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
-    Err(Error { closed: false, source: NO_PAGE_KV.into() })
+pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, _: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(page::Log::open(store, false).await?))
 }
 
-#[cfg(target_arch = "wasm32")]
-const NO_PAGE_KV: &str = "a page keeps no lake's catalog yet";
-
-/// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`); a page's own later (designs/page-same-core.md).
+/// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`), a page's log in the lake's store (`kv::page`).
 #[async_trait::async_trait]
 pub(crate) trait Kv: Send + Sync {
     /// A key's value. `remote`: only what the bucket holds (a writer's memtable left out, as `DurabilityLevel::Remote`).
