@@ -357,7 +357,8 @@ first_day  last_day  spent
 The cost grows with the match. Each search thread that reaches a condition that reads the match works it out, so a
 search can take time that grows with the square of a match's length: `(a | b)+ c` with `count(a.*) > 5` keeps a
 thread for each start at every row. Past 100,000 partial matches at once the query is refused (`54000`), which bounds
-the memory, not the time. The engine also works out threads that a backtracking matcher never reaches, so a
+the memory, not the time; a `statement_timeout`, a cancel or a client that goes stops the search at its next row, with
+`57014`. The engine also works out threads that a backtracking matcher never reaches, so a
 condition that can fail, such as a division by a column, can fail here where another engine gives an answer.
 
 ## RUNNING and FINAL
@@ -397,7 +398,7 @@ These are refused by the standard or by how the answer is shaped. Each refusal s
 | a function the engine doesn't have, in a `DEFINE` | refused, `42883`, the message starts with the symbol: `MATCH_RECOGNIZE: DEFINE b: ...` | use a function the engine has, as in a `SELECT` |
 | `WITH UNMATCHED ROWS` with `{- -}` | refused, `42601` | use `SHOW EMPTY MATCHES`, or keep the rows in the pattern |
 | `PARTITION BY` an expression | refused, `0A000`: `takes columns; compute <e> in a subquery` | compute it in a subquery, and partition by its name |
-| a measure named like a column of the table, in `ALL ROWS PER MATCH`, such as `strt.day AS price` over `ticker` | refused, `42701`: `the measure price has the name of a column of ticker; ALL ROWS PER MATCH gives both, so name the measure otherwise` | name the measure otherwise, such as `start_price` |
+| a measure named like a column of the input, in `ALL ROWS PER MATCH`, such as `strt.day AS price` over `ticker` | refused, `42701`: `the measure price has the name of a column of ticker; ALL ROWS PER MATCH gives both, so name the measure otherwise`. A CTE or a view as the input gets the same words, with `its input` for the name | name the measure otherwise, such as `start_price` |
 
 ## Not supported yet
 
@@ -409,6 +410,8 @@ These don't run yet. Each has a way to write the same question.
 | a subquery in `MEASURES` or `DEFINE` | refused, `0A000` | compute the value in a subquery, and join it on the rows |
 | a window function in a measure | refused, `0A000` | compute the window in a subquery, and read its column in the measure |
 | `FIRST` or `LAST` inside an aggregate, `sum(LAST(down.price))` | refused, `0A000`: `last inside an aggregate isn't supported yet: aggregate the column over its variable instead` | aggregate the column over its variable, `sum(down.price)` |
+| `SUBSET u = (b, c)` | refused, `0A000` | a measure per symbol, as `LAST(b.price)` and `LAST(c.price)`, or one symbol whose `DEFINE` ORs the two conditions |
+| a materialized view of `MATCH_RECOGNIZE` with `EMIT FINAL` | refused, `0A000` | make the view without `EMIT FINAL`: each run matches again only the partitions that changed |
 
 <Aside>
 A `MATCH_RECOGNIZE` query with `PARTITION BY` on a cluster is shuffled by its partition key: each node
