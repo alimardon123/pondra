@@ -22943,7 +22943,8 @@ def patterns():
     checks, info = {}, {}
     q = lambda s: sql(A.port, s)
     lake = new_lake()
-    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}").start()
+    py = {"PYTHONPATH": os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python")}  # (a DEFINE calls a Python function)
+    node = Node(lake, A.port, pg=f"127.0.0.1:{A.port + 10}", python=sys.executable, env=py).start()
     ok, info["random"] = pc.random_checks(A.port, seed=1, queries=600)
     checks["random: 600 queries (every operator, every skip rule, empty matches, four partitions, WITHIN on one in five, by timestamps or by dates) answer as the reference does, or 22000 where it does"] = ok
     fixed = pc.fixed_checks(A.port)
@@ -22979,7 +22980,7 @@ def patterns():
         bool(answered["ok"]) and pg_names == all_names and pg_rows == all_rows and len(all_rows) == 15
     # a DEFINE calls the lake's Python function on the row's values; one that reads the match is refused by name, since
     # an async function runs only as a plan step of its own
-    q("CREATE FUNCTION near(x INT, y INT) RETURNS BOOLEAN LANGUAGE python AS $$ return abs(x - y) <= 2 $$")
+    q("CREATE FUNCTION near(x INT, y INT) RETURNS BOOLEAN LANGUAGE python AS $$ return x is not None and y is not None and abs(x - y) <= 2 $$")
     q("CREATE TABLE near_t AS SELECT * FROM (VALUES (1, 10), (2, 11), (3, 12), (4, 20), (5, 21)) AS x(i, v)")
     near_q = "SELECT * FROM near_t MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(a.i) AS s, LAST(b.i) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS {})"
     near = q(near_q.format("near(b.v, PREV(b.v))"))
