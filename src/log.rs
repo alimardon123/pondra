@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 /// Small flushes ride inside the commit; big ones (high volume) are objects. With replicated
@@ -991,8 +992,21 @@ pub fn decode(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(StreamReader::try_new(ipc, None)?.collect::<Result<_, _>>()?)
 }
 
+/// Milliseconds since the Unix epoch: the machine's clock on a node, the browser's on a page.
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    now_us() / 1000
+}
+
+/// Microseconds since the Unix epoch.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros() as u64
+}
+
+/// (a page's clock counts whole milliseconds)
+#[cfg(target_arch = "wasm32")]
+pub fn now_us() -> u64 {
+    tokio::clock::now_ms() * 1000
 }
 
 #[cfg(test)]
@@ -1016,9 +1030,9 @@ mod tests {
             w.finish().unwrap();
             w.into_inner().unwrap()
         };
-        let t0 = std::time::Instant::now();
+        let t0 = datafusion::common::instant::Instant::now();
         (0..1000).for_each(|_| drop(zstd()));
-        let t1 = std::time::Instant::now();
+        let t1 = datafusion::common::instant::Instant::now();
         (0..1000).for_each(|_| drop(encode_ipc(std::slice::from_ref(&one))));
         eprintln!("a one-row batch: {:.1} µs with ZSTD ({} bytes), {:.1} µs as written ({} bytes)", (t1 - t0).as_secs_f64() * 1e3, zstd().len(), t1.elapsed().as_secs_f64() * 1e3, encode_ipc(std::slice::from_ref(&one)).unwrap().len());
     }

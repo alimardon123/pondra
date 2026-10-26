@@ -74,7 +74,7 @@ pub fn control(sql: &str) -> Option<&'static str> {
     }
 }
 
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collect::<Vec<_>>().join(";\n") }
 
 /// A statement as SQL text again. sqlparser writes `- -3` (or `- $x`, `$x` bound to -3) as `--3`,

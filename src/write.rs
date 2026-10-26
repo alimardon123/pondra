@@ -1484,8 +1484,8 @@ pub async fn seen_here(app: &crate::app::App) {
     let url = crate::tls::url(&format!("{}/cluster/visible", app.cluster.leader.addr));
     let asked = async { http().get(url).timeout(std::time::Duration::from_secs(2)).send().await?.json::<u64>().await };
     let Ok(upto) = asked.await else { return };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while app.lake.visible() < upto && std::time::Instant::now() < deadline {
+    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
+    while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
 }
@@ -1515,8 +1515,8 @@ fn no_table(table: &str) -> anyhow::Error {
 /// (`mark`: its job's progress, or the table made), 5 s at most.
 async fn seen_there(other: &Lake, mark: Option<String>) {
     let Some(key) = mark else { return };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && std::time::Instant::now() < deadline {
+    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(other.cat.get::<Value>(&key).await, Ok(Some(_))) && datafusion::common::instant::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     // (and how far this node reads it, which its refresh moves every 250 ms: a read before then

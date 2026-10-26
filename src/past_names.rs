@@ -191,14 +191,14 @@ pub fn names(sql: &str) -> Vec<String> {
     out
 }
 
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
 pub(crate) static RESTORE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r#"(?is)^\s*RESTORE\s+(?:TABLE\s+)?([\w."-]+)\s+(?:TO\s+)?(VERSION|TIMESTAMP)\s+AS\s+OF\s+(.+?)\s*;?\s*$"#).expect("a regex")
 });
 
 /// A RESTORE's text before its moment, and the moment (`$day` in it is bound by `routines::bind`:
 /// the parser doesn't read a RESTORE). None: not a RESTORE.
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a node's RESTORE reads it; a page has no past)
 pub fn restore_moment(sql: &str) -> Option<(&str, &str)> {
     if crate::text::head(sql) != "restore" {
         return None;

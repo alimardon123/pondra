@@ -514,7 +514,7 @@ const PAIRS: usize = 10_000; // (the pairs held at once: when full, the one whos
 
 #[derive(Default)]
 pub struct Guesses {
-    failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<std::time::Instant>>>,
+    failures: std::sync::Mutex<std::collections::HashMap<(std::net::IpAddr, String), std::collections::VecDeque<datafusion::common::instant::Instant>>>,
 }
 
 // (a node's own: two nodes in one process count apart, ADR-061 §3)
@@ -525,10 +525,10 @@ crate::per_node!(static GUESSED: Guesses = Guesses::default(); clear = |g| {
 
 /// Seconds to wait before this address may try this user name again, when it has had ten failures in
 /// the last minute (None: it may try). A door that can't tell the address counts under 0.0.0.0.
-pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, std::time::Instant::now()) }
+pub fn guessing(addr: Option<std::net::IpAddr>, user: &str) -> Option<u64> { GUESSED.guessing_at(addr, user, datafusion::common::instant::Instant::now()) }
 
 /// A failed sign-in of this address and user name, now.
-pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, std::time::Instant::now()) }
+pub fn guessed(addr: Option<std::net::IpAddr>, user: &str) { GUESSED.guessed_at(addr, user, datafusion::common::instant::Instant::now()) }
 
 /// What a sign-in refused for its failures is told, with how long to wait (`guessing`), at every door.
 pub fn guessing_says(user: &str, wait: u64) -> String { format!("too many failed sign-ins for {user} from this address: wait {wait} s") }
@@ -538,7 +538,7 @@ impl Guesses {
         (addr.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)), user.to_string())
     }
 
-    fn guessing_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: std::time::Instant) -> Option<u64> {
+    fn guessing_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: datafusion::common::instant::Instant) -> Option<u64> {
         let key = Self::key(addr, user);
         let mut all = self.failures.lock().unwrap();
         let times = all.get_mut(&key)?;
@@ -559,7 +559,7 @@ impl Guesses {
         Some(left.as_secs_f64().ceil().max(1.0) as u64)
     }
 
-    fn guessed_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: std::time::Instant) {
+    fn guessed_at(&self, addr: Option<std::net::IpAddr>, user: &str, now: datafusion::common::instant::Instant) {
         let key = Self::key(addr, user);
         let mut all = self.failures.lock().unwrap();
         if !all.contains_key(&key) && all.len() >= PAIRS {

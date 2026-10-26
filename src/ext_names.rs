@@ -140,7 +140,7 @@ pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)>
 }
 
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the node's readers call it; a page's build doesn't yet)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the node's readers call it; a page's build doesn't yet)
 pub(crate) fn scheme(url: &str) -> Option<&str> {
     let s = url.split_once("://")?.0;
     ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)

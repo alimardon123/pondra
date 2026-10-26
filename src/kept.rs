@@ -17,10 +17,10 @@ const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
 
 /// A task's `AFTER … FAILED` or `AFTER … ALWAYS` (`runs::task`): a pipeline's step, not a task's.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) const AFTER_FAILED: &str = "AFTER … FAILED and AFTER … ALWAYS are a pipeline step's, coming in 1.1: a task after others runs when they all succeeded";
 /// A task's `ON FILES` or `ON CHANGE OF`, where a task's SCHEDULE or AFTER goes (`runs::task`).
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) const ON_FILES: &str = "ON FILES and ON CHANGE OF start a pipeline, coming in 1.1: a task runs on SCHEDULE '…' or AFTER task";
 
 /// The statements refused by their first words (`text::first_words`, upper-cased), and what each says.

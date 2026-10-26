@@ -18,7 +18,8 @@ use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, T
 use std::future::Future;
 use crate::reset::Once;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 pub const TABLE: &str = "pondra$audit";
 

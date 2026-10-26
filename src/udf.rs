@@ -45,7 +45,7 @@ pub async fn register(lake: &Lake, ctx: &SessionContext) -> Result<()> {
     Ok(())
 }
 
-type Cache = Mutex<HashMap<String, (std::time::Instant, Arc<Vec<(String, Udf)>>)>>;
+type Cache = Mutex<HashMap<String, (datafusion::common::instant::Instant, Arc<Vec<(String, Udf)>>)>>;
 crate::per_node!(static SEEN: Cache = Default::default());
 
 /// A function made or dropped here: the next query sees it (other nodes, within a second).
@@ -60,7 +60,7 @@ async fn listed(lake: &Lake) -> Result<Arc<Vec<(String, Udf)>>> {
         }
     }
     let fns = Arc::new(lake.cat.scan::<Udf>("f/", "f0").await?);
-    seen.lock().unwrap().insert(lake.url.clone(), (std::time::Instant::now(), fns.clone()));
+    seen.lock().unwrap().insert(lake.url.clone(), (datafusion::common::instant::Instant::now(), fns.clone()));
     Ok(fns)
 }
 

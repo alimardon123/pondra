@@ -77,18 +77,6 @@ impl HttpConnector for Connector {
     #[cfg(not(target_arch = "wasm32"))]
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
         let http = options.get_config_value(&ClientConfigKey::AllowHttp).as_deref() == Some("true");
-        let redirect = reqwest::redirect::Policy::custom(|to| {
-            if to.previous().len() >= 10 {
-                return to.error("more than 10 redirects");
-            }
-            match check(to.url()) {
-                Ok(()) => to.follow(),
-                Err(e) => {
-                    let why = format!("redirected to {}: {e}", to.url());
-                    to.error(why)
-                }
-            }
-        });
         let client = reqwest::Client::builder()
             .user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION")))
             .default_headers(self.headers.clone())
@@ -98,7 +86,7 @@ impl HttpConnector for Connector {
             .no_gzip().no_brotli().no_zstd().no_deflate() // (sizes are read from Content-Length)
             .https_only(!http)
             .dns_resolver(Names)
-            .redirect(redirect)
+            .redirect(redirects())
             .build()
             .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
         Ok(HttpClient::new(client))
@@ -114,6 +102,38 @@ impl HttpConnector for Connector {
             .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
         Ok(HttpClient::new(client))
     }
+}
+
+/// Each redirect checked as the first request was (`check`; a name is checked as it resolves), ten at most.
+#[cfg(not(target_arch = "wasm32"))]
+fn redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|to| {
+        if to.previous().len() >= 10 {
+            return to.error("more than 10 redirects");
+        }
+        match check(to.url()) {
+            Ok(()) => to.follow(),
+            Err(e) => {
+                let why = format!("redirected to {}: {e}", to.url());
+                to.error(why)
+            }
+        }
+    })
+}
+
+/// A client for the lake's outside calls to URLs someone other than the node's admin named (a share's links to its
+/// files): each address it reaches, and each redirect, is the public internet's. Ask `check` of the URL first. On a
+/// page it is the web client: a browser's fetch reaches what the page's origin may, under CORS.
+pub fn web() -> &'static reqwest::Client {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| {
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).dns_resolver(Names).redirect(redirects()).build().expect("an HTTP client")
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    crate::ext::web()
 }
 
 /// Resolves a name, and refuses it if any of its addresses isn't public: a connection may be tried

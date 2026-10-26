@@ -35,47 +35,47 @@ mod multiply;
 mod sparksql;
 mod past_names;
 mod diff;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod expander;
 mod front;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
 mod friendly;
 mod matcher;
 mod pattern;
 mod lateral;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
 // Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_formats;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_functions;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_json;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_json_make;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_json_edit;
 mod pg_json_sets;
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
+#[cfg_attr(not(feature = "lake"), allow(dead_code))]
 mod pg_text;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the length and category columns are the node's catalog's: a page's pg_typeof reads names)
 mod pg_oids;
 mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
 mod held;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod scan;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a page reads with it from step 4i-3)
 mod reach;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a page reads with it from step 4i-3)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a page reads with it from step 4i-3)
 mod read_delta;
-#[cfg_attr(not(feature = "server"), allow(dead_code))] // (a write's rules: a node makes its table from its entry; a page's come with `shape`)
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a write's rules: a node makes its table from its entry; a page's come with `shape`)
 mod rules;
 
 // A node: the catalog in the bucket, the doors, the cluster and the command line (`cli.rs`).

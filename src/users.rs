@@ -888,7 +888,7 @@ crate::per_node!(
     static SIGNED_LAKES: Mutex<HashSet<String>> = Default::default());
 crate::per_node!(
     /// Lakes read as unsigned, and when (as `any` remembers its answers).
-    static UNSIGNED_LAKES: Mutex<HashMap<String, (Option<u64>, std::time::Instant)>> = Default::default());
+    static UNSIGNED_LAKES: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant)>> = Default::default());
 
 /// Leader, with a token set: the lake remembers it (once; nothing clears it, `pondra token` is the way back
 /// in). A node started without tokens on such a lake is never open, and makes no user (`signed`).
@@ -921,7 +921,7 @@ pub async fn signed(lake: &Lake) -> bool {
             true
         }
         Ok(None) => {
-            UNSIGNED_LAKES.lock().unwrap().insert(lake.url.clone(), (version, std::time::Instant::now()));
+            UNSIGNED_LAKES.lock().unwrap().insert(lake.url.clone(), (version, datafusion::common::instant::Instant::now()));
             false
         }
         Err(_) => true,
@@ -1009,7 +1009,7 @@ async fn session_principal(lake: &Lake, token: &str) -> Option<Principal> {
 crate::per_node!(
     /// Passwords checked lately (by their hash with the user's name): a minute, so a client that sends
     /// its password with every request (HTTP Basic) pays for SCRAM's hashing once.
-    static VERIFIED: Mutex<HashMap<String, std::time::Instant>> = Default::default());
+    static VERIFIED: Mutex<HashMap<String, datafusion::common::instant::Instant>> = Default::default());
 
 /// Is this `user`'s password? (Its verifier checked, or remembered as checked.)
 pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
@@ -1027,7 +1027,7 @@ pub async fn password_ok(lake: &Lake, user: &str, password: &str) -> bool {
         if all.len() > 10_000 {
             all.clear();
         }
-        all.insert(key, std::time::Instant::now());
+        all.insert(key, datafusion::common::instant::Instant::now());
     }
     ok
 }
@@ -1114,7 +1114,7 @@ impl Access {
 
 crate::per_node!(
     /// Users' access, by name, as of a catalog version (grants change seldom: a check is a lookup).
-    static ACCESS: Mutex<HashMap<String, (Option<u64>, std::time::Instant, Arc<Access>, bool)>> = Default::default());
+    static ACCESS: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, Arc<Access>, bool)>> = Default::default());
 
 pub(crate) fn forget() {
     ACCESS.lock().unwrap().clear();
@@ -1179,7 +1179,7 @@ async fn principal_with(lake: &Lake, user: &str, claimed: &[String], unmade: boo
                 todo.extend(u.roles.iter().map(|r| (r.clone(), None, false)));
             }
             let access = Arc::new(Access { grants, names: seen, limits: me.limits });
-            ACCESS.lock().unwrap().insert(id, (version, std::time::Instant::now(), access.clone(), superuser));
+            ACCESS.lock().unwrap().insert(id, (version, datafusion::common::instant::Instant::now(), access.clone(), superuser));
             (access, superuser)
         }
     };
@@ -1268,7 +1268,7 @@ impl Quota {
 /// Is what was worked out at catalog version `then` (at `at`) still so? On the leader, until the
 /// catalog changes; elsewhere (a follower's version may not move with every commit it is sent), a
 /// second at most.
-pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: std::time::Instant) -> bool {
+pub(crate) fn fresh(lake: &Lake, now: Option<u64>, then: Option<u64>, at: datafusion::common::instant::Instant) -> bool {
     (lake.cat.is_writer() && now.is_some() && now == then) || at.elapsed() < std::time::Duration::from_secs(1)
 }
 
@@ -1312,7 +1312,7 @@ pub async fn across_write(other: &Lake, ns: &str, table: &str, stmt: &crate::wri
     }
 }
 
-crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, std::time::Instant, bool)>> = Default::default());
+crate::per_node!(static ANY: Mutex<HashMap<String, (Option<u64>, datafusion::common::instant::Instant, bool)>> = Default::default());
 
 /// Does the lake have a user who signs in (a password or a token), or an identity provider? Then a
 /// request with nothing signed is refused, as with a token set.
@@ -1325,7 +1325,7 @@ pub async fn any(lake: &Lake) -> bool {
         Ok(all) => all.iter().any(|(_, u)| u.login && (u.verifier.is_some() || !u.tokens.is_empty())) || !crate::sso::all(lake).await.is_ok_and(|p| p.is_empty()),
         Err(_) => return true, // (users that can't be read are taken for ones who sign in, and read again next time: open only when surely so)
     };
-    ANY.lock().unwrap().insert(lake.url.clone(), (version, std::time::Instant::now(), yes));
+    ANY.lock().unwrap().insert(lake.url.clone(), (version, datafusion::common::instant::Instant::now(), yes));
     yes
 }
 

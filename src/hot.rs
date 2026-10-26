@@ -51,7 +51,8 @@ use datafusion::physical_plan::projection::{all_alias_free_columns, new_projecti
 use datafusion::prelude::ParquetReadOptions;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 const IDLE: Duration = Duration::from_secs(60); // unread this long: may make room for others
 const BATCH: usize = 8192;

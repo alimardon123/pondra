@@ -27,7 +27,8 @@ use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, ListBuilder, 
 use datafusion::physical_plan::ExecutionPlan;
 use crate::reset::Once;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 pub const TABLE: &str = "pondra$history"; // (commits only to it are quiet: `store::RECORDS`)
 

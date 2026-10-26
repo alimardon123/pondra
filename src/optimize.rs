@@ -70,9 +70,9 @@ pub fn rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     rules.insert(marked, Arc::new(SubqueriesMarked)); // (before DataFusion's scalar subqueries become joins: it makes one)
     rules.insert(0, Arc::new(InListOfRows)); // (before DataFusion's simplifier meets two lists of one column)
     rules.insert(0, Arc::new(Seconds)); // (before a literal is folded into a timestamp)
-    #[cfg(feature = "server")] // (first: the filters and projections after it see the join it makes; a node's only, like frugal.rs)
+    #[cfg(feature = "lake")] // (first: the filters and projections after it see the join it makes; a node's only, like frugal.rs)
     rules.insert(0, Arc::new(crate::frugal::WholePartition));
-    #[cfg(feature = "server")] // (a node's only, as WholePartition is)
+    #[cfg(feature = "lake")] // (a node's only, as WholePartition is)
     rules.insert(0, Arc::new(crate::frugal::MiddleRows));
     rules.push(Arc::new(ScaledLiterals)); // (after the simplifier folds a literal's cast)
     rules.push(Arc::new(crate::multiply::Products)); // (a DECIMAL product in native integers when its values are small)
@@ -1120,7 +1120,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(AndsOnce)); // (last: the filters are where they will run)
     // (the hot columns are the node's)
-    #[cfg(feature = "server")]
+    #[cfg(feature = "lake")]
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)
     rules.insert(end, Arc::new(MinMaxBounds)); // (after the filters are pushed down)
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
@@ -2390,12 +2390,12 @@ fn number(v: &datafusion::common::ScalarValue) -> Option<f64> {
 
 /// The share of its table's rows a run measured for a filter (`learned.rs`). Only a node learns them:
 /// elsewhere a filter is counted by DataFusion's own estimates alone.
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 fn learned_share(table: &datafusion::common::TableReference, predicate: &Expr) -> Option<f64> {
     crate::learned::share(table, predicate)
 }
 
-#[cfg(not(feature = "server"))]
+#[cfg(not(feature = "lake"))]
 fn learned_share(_: &datafusion::common::TableReference, _: &Expr) -> Option<f64> {
     None
 }

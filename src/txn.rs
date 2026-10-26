@@ -37,7 +37,8 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 /// A table's changes in a transaction: rows it adds (new rows, whose `_row_id` is negative until the commit stamps
 /// them, and new versions, which keep theirs), and the snapshot's rows it replaces or deletes. Under SQL's names.

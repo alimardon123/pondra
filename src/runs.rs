@@ -172,7 +172,7 @@ static WRITTEN: tokio::sync::Notify = tokio::sync::Notify::const_new();
 /// for another node's; a run not in the log after 10 s is no run.
 pub async fn wait(app: &App, id: &str) -> Result<()> {
     let sql = format!("SELECT status, error FROM pondra.runs WHERE id = '{}'", id.replace('\'', "''"));
-    let since = std::time::Instant::now();
+    let since = datafusion::common::instant::Instant::now();
     loop {
         let written = WRITTEN.notified(); // (woken by any write from here on)
         let rows = Box::pin(app.query(&sql, Some("0"))).await?;

@@ -20,6 +20,10 @@ runtime's handle) outside `panics.rs`, which `Node::stop` can't end (start it wi
 or `panics::task`), and `std::env::set_var` anywhere (the environment is the process's: the next
 node and every child process would read it, and beside a library's host it is a data race).
 
+And a page builds every module but the doors' (ADR-072): std's `Instant` and `SystemTime::now` panic
+there, so those modules read the time through DataFusion's `Instant` (std's own on a node) and
+`log::now_us` or `now_ms`, and a std clock in one fails (CLOCKS below names a file that may, and why).
+
 And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read with `std::env`
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
 lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
@@ -84,6 +88,7 @@ PROCESS = {
     "pg_json_edit.rs:FUNCTIONS": "the JSON edits' definitions, made once: nothing of a lake",
     "pg_json_sets.rs:SETS": "the JSON set functions' names and columns, built into the binary",
     "pyfn.rs:SEEN": "SQL type names worked out by a session with nothing of a lake",
+    "public.rs:CLIENT": "a client with no token, for links someone other than the admin named (a share's): only its keep-alive sockets",
     "python.rs:BUSY": LOCK,
     "python.rs:CHOSEN": "the Python chosen in the console: the machine's, kept in python.txt beside the console's settings",
     "python.rs:EXE": SETTING + " (--python)",
@@ -139,6 +144,13 @@ NAME = re.compile(r'"(PONDRA_[A-Z0-9_]+)"')
 SPAWN = re.compile(r"\btokio::(?:task::)?spawn\(|Handle::(?:current|try_current)\(\)[^;]*?\.spawn\(")
 REGEX = re.compile(r"^(?:std::sync::)?LazyLock<(?:regex::)?Regex>$")
 STATIC = re.compile(r"\bstatic\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)\s*:")
+
+
+# Files a page builds that may read std's clock, each with why.
+CLOCKS = {
+    "log.rs": "now_us itself: the machine's clock on a node (a page's is the browser's, tokio::clock)",
+}
+STD_CLOCK = re.compile(r"\bstd::time::(?:Instant|SystemTime)\b|\bstd::time::\{[^}]*\b(?:Instant|SystemTime)\b|(?<![\w:])SystemTime::now\(")
 
 
 def tests_cut(text):
@@ -290,6 +302,27 @@ def settings():
     return bad + [f"src/env.rs: NAMES lists {name}, which nothing reads: take it out" for name in sorted(names - read)]
 
 
+def clocks():
+    """std's clocks in a module a page builds (all but the `doors` ones, lib.rs's or a module's own): they panic on a page."""
+    sources, doors = {}, {"main"}
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if f.endswith(".rs"):
+                rel = os.path.relpath(os.path.join(base, f), SRC).replace(os.sep, "/")
+                sources[rel] = open(os.path.join(base, f), encoding="utf-8").read()
+                parent = "" if rel == "lib.rs" else rel.removesuffix("/mod.rs").removesuffix(".rs") + "/"
+                doors |= {parent + m for m in re.findall(r'#\[cfg\([^\]]*"doors"[^\]]*\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;', sources[rel])}
+    bad = []
+    for rel, text in sorted(sources.items()):
+        module = rel.removesuffix("/mod.rs").removesuffix(".rs")
+        if rel in CLOCKS or any(module == d or module.startswith(d + "/") for d in doors):
+            continue
+        for n, line in enumerate(tests_cut(text).split("\n"), 1):
+            if STD_CLOCK.search(line.split("//", 1)[0]):
+                bad.append(f"src/{rel}:{n}: std's clock panics on a page: use datafusion::common::instant::Instant (std's own on a node) or crate::log::now_us / now_ms (or add the file to CLOCKS in tools/per_node_check.py with why)")
+    return bad
+
+
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
     whatever lock it holds (`library::restart`), and the next start must still read it."""
@@ -318,7 +351,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + poisoned(found)
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found)
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

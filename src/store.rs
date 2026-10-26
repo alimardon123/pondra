@@ -25,7 +25,8 @@ use crate::kv::{self, Kv, Written};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub type Store = Arc<dyn ObjectStore>;
@@ -1213,7 +1214,7 @@ impl Lake {
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
-                    let t0 = std::time::Instant::now();
+                    let t0 = datafusion::common::instant::Instant::now();
                     let kv = kv::writer(store.clone(), cache_dir, local).await?;
                     trace("the catalog's writer open", t0);
                     Catalog::writer(kv, t0).await?
@@ -2086,7 +2087,7 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
 }
 
 /// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5).
-pub fn trace(what: &str, since: std::time::Instant) {
+pub fn trace(what: &str, since: datafusion::common::instant::Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }

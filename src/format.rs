@@ -116,7 +116,7 @@ pub async fn require(lake: &Lake, n: u32, what: &str) -> Result<()> {
     if of(&lake.cat).await?.format >= n {
         return Ok(());
     }
-    let started = std::time::Instant::now();
+    let started = datafusion::common::instant::Instant::now();
     while READY.load(Relaxed) == 1 && started.elapsed() < Duration::from_secs(15) {
         tokio::time::sleep(Duration::from_millis(100)).await; // (the first look: `raise`)
     }

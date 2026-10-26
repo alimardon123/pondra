@@ -668,7 +668,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
 
 /// The base's catalog at a version that holds `pin`, written at `at_ms` or later.
 pub(crate) async fn snapshot(base: &Lake, pin: &str, at_ms: u64) -> Result<BTreeMap<String, bytes::Bytes>> {
-    let started = std::time::Instant::now();
+    let started = datafusion::common::instant::Instant::now();
     loop {
         let all = base.cat.scan_raw("", "\x7f").await?;
         if all.get(pin).and_then(|v| serde_json::from_slice::<Pin>(v).ok()).is_some_and(|p| p.at_ms >= at_ms) {

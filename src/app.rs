@@ -40,9 +40,9 @@ type Flight = (std::sync::atomic::AtomicU64, Mutex<(u64, Option<bytes::Bytes>)>)
 
 struct Cached {
     version: u64,
-    at: std::time::Instant,
+    at: datafusion::common::instant::Instant,
     body: bytes::Bytes,
-    refreshing: Option<std::time::Instant>, // a request is computing a newer one (stale mode)
+    refreshing: Option<datafusion::common::instant::Instant>, // a request is computing a newer one (stale mode)
 }
 
 impl Default for Results {
@@ -71,7 +71,7 @@ impl Results {
             return Some(e.body.clone());
         }
         if stale.is_some() {
-            e.refreshing = Some(std::time::Instant::now()); // this caller recomputes; the rest wait on nobody
+            e.refreshing = Some(datafusion::common::instant::Instant::now()); // this caller recomputes; the rest wait on nobody
         }
         None
     }
@@ -82,7 +82,7 @@ impl Results {
         }
         let mut c = self.0.lock().unwrap();
         c.1 += body.len();
-        if let Some(old) = c.0.put(key, Cached { version, at: std::time::Instant::now(), body, refreshing: None }) {
+        if let Some(old) = c.0.put(key, Cached { version, at: datafusion::common::instant::Instant::now(), body, refreshing: None }) {
             c.1 -= old.body.len();
         }
         while c.1 > Self::MAX {
@@ -209,7 +209,7 @@ impl App {
         if crate::pg_catalog::asked(query) {
             return crate::pg_catalog::over_http(&self.lake, query).await; // (a request that speaks Postgres, reading its catalog: `?catalog=postgres`)
         }
-        let start = std::time::Instant::now();
+        let start = datafusion::common::instant::Instant::now();
         crate::history::read_at(self.lake.visible()); // (its answer again: `t AT (VERSION => n)`)
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
@@ -229,7 +229,7 @@ impl App {
                 Ok(None) => {}
                 Err(e) => eprintln!("distributed query failed, running it here: {e:#}"),
             }
-            let here = std::time::Instant::now();
+            let here = datafusion::common::instant::Instant::now();
             let ctx = session(&self.lake, query, "").await?;
             crate::query::mark("session with its tables");
             let ctx = if files { ctx.enable_url_table() } else { ctx };
@@ -318,7 +318,7 @@ impl App {
         }
         let _guard = self.lock.lock().await;
         let _tiering = self.seq.as_ref().map(|s| s.tiering()); // (writers paused by backpressure stay paused: `log::Pace`)
-        let start = std::time::Instant::now();
+        let start = datafusion::common::instant::Instant::now();
         let hwm = *self.lake.hwm.borrow();
         let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;
         let backlog = crate::tier::backlog(&self.lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), None).await?;
