@@ -394,9 +394,11 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             }
         };
     }
-    // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`)
+    // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. It only narrows: the user's
+    // rights within the caller's role, so a read or write token never acts as more than itself, as a superuser)
     let who = match req.headers().get(crate::auth::AS_USER).and_then(|v| v.to_str().ok()) {
         Some(user) if who.operator => match crate::users::principal(&app.lake, user).await {
+            Ok(p) if p.role > who.role => crate::auth::Principal { role: who.role, ..p.at("http", from) },
             Ok(p) => p.at("http", from),
             Err(e) => return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(),
         },

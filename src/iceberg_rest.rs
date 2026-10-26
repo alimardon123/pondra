@@ -48,13 +48,19 @@ fn missing(what: &str, kind: &str) -> (axum::http::StatusCode, axum::Json<Value>
     (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error": {"message": format!("no {what}"), "type": kind, "code": 404}})))
 }
 
-/// Every namespace: its parts, its lake, and the schema in it.
+/// Every namespace the caller may see: its parts, its lake, and the schema in it. An attached lake's only under its
+/// own sign-in, and not for a user granted some tables (`space`), as SQL's listings (`ddl::listed`, S27).
 async fn spaces(app: &crate::app::App) -> Vec<(Vec<String>, std::sync::Arc<Lake>, String)> {
     use crate::ddl::schemas;
     use crate::text::PUBLIC;
     let attached = app.lake.attached.read().unwrap().clone();
     let mut out = vec![];
     for (name, lake) in [(None, app.lake.clone())].into_iter().chain(attached.into_iter().map(|(n, l)| (Some(n), l))) {
+        if let Some(n) = &name {
+            if crate::auth::limited().is_some() || crate::users::across(&lake, n).await.is_err() {
+                continue;
+            }
+        }
         for s in schemas(&lake).await.unwrap_or_default() {
             let parts = match (&name, s == PUBLIC) {
                 (None, true) => vec!["default".to_string()],
@@ -126,11 +132,13 @@ fn quoted(n: &str) -> String {
     format!("\"{}\"", n.replace('"', "\"\""))
 }
 
-/// The tables with Iceberg metadata published.
+/// The tables with Iceberg metadata published, those a user may read (S27: a name it isn't granted isn't shown).
 async fn tables(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {
     let (parts, lake, schema) = space(&app, &ns).await?;
     let published = lake.cat.scan::<Published>("i/", "i0").await.unwrap_or_default();
+    let limited = crate::auth::limited();
     let ids: Vec<Value> = published.iter().filter(|(k, p)| p.version > 0 && crate::text::split(&k[2..]).0 == schema)
+        .filter(|(k, _)| limited.as_ref().is_none_or(|a| a.may("select", &k[2..])))
         .map(|(k, _)| json!({"namespace": parts, "name": crate::text::split(&k[2..]).1})).collect();
     Ok(axum::Json(json!({"identifiers": ids})))
 }

@@ -10285,12 +10285,32 @@ def guarded():
         and said["fay: Kafka tombstone"] == ["None"] and said["fay: Iceberg DELETE"] == "ok" \
         and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
         and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
+    # (the REST catalog's listing shows a user only the tables it may read, as SQL's listings do: S27)
+    listed = {u: sorted(".".join(t) for t in iceberg(u).list_tables("default")) for u in ("boss", "bob")}
+    info["iceberg listing"] = listed
+    checks["the Iceberg REST catalog lists a user only the tables it may read (S27)"] = "default.ice" in listed["boss"] and "default.ice" not in listed["bob"]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
-    c = Node(lake2, P + 2, write_token="w", admin_token="adm").start()
+    c = Node(lake2, P + 2, write_token="w", admin_token="adm", read_token="rd").start()
     ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
+    ask(P + 2, "CREATE USER chief PASSWORD 'chief-password-1' SUPERUSER", auth="Bearer adm")
     w = "Bearer w"
+    # (x-pondra-as, a forwarded change's user, only narrows: a read or write token acting as a superuser keeps its own role)
+    chief = {"x-pondra-as": "chief"}
+    acting = {
+        "a read token as a superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer rd", headers=chief),
+        "…making a superuser": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth="Bearer rd", headers=chief),
+        "a write token as a superuser, making one": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth=w, headers=chief),
+        "…its writes still made": ask(P + 2, "INSERT INTO t VALUES (2)", auth=w, headers=chief),
+        "the admin token as the superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
+    }
+    info["acting as"] = acting
+    checks["a token acting as a user (x-pondra-as) keeps its own role: a read or write token never makes a superuser"] = \
+        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" \
+        and "ERROR" in str(acting["…making a superuser"]) and "ERROR" in str(acting["a write token as a superuser, making one"]) \
+        and not str(acting["…its writes still made"]).startswith("ERROR") \
+        and isinstance(acting["the admin token as the superuser"], dict) and acting["the admin token as the superuser"].get("superuser") is True
     said = {
         "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
         "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),

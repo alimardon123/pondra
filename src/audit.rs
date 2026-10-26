@@ -250,10 +250,45 @@ pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std
     }
 }
 
-/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement).
+/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement). Anyone may
+/// knock, so an address's refusals past `KNOCKS` a minute aren't written: the last one written says so.
 pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
-    if on() {
-        write(app, Line { at: crate::log::now_ms(), user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message.to_string()), ms: None });
+    if !on() {
+        return;
+    }
+    let message = match knocked(from.map(|a| a.ip()), crate::log::now_ms()) {
+        Some(false) => message.to_string(),
+        Some(true) => format!("{message} (this address's refusals past {KNOCKS} a minute aren't written until its minute ends)"),
+        None => return,
+    };
+    write(app, Line { at: crate::log::now_ms(), user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
+}
+
+/// Refusals written a minute from one address (security pass 2: 400 anonymous `/sso/…` calls wrote 400 rows).
+const KNOCKS: u32 = 60;
+const ADDRESSES: usize = 10_000; // (the addresses held at once: when full, those whose minute ended go, or all)
+
+crate::per_node!(static KNOCKED: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (i64, u32)>> = std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Is a refusal from `ip` at `now_ms` written: Some(false) yes, Some(true) yes and it is the last this minute,
+/// None no. (No address: a door that can't tell, counted under 0.0.0.0.)
+fn knocked(ip: Option<std::net::IpAddr>, now_ms: i64) -> Option<bool> {
+    let mut all = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if all.len() >= ADDRESSES {
+        all.retain(|_, (since, _)| now_ms - *since < 60_000);
+        if all.len() >= ADDRESSES {
+            all.clear();
+        }
+    }
+    let (since, n) = all.entry(ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))).or_insert((now_ms, 0));
+    if now_ms - *since >= 60_000 {
+        (*since, *n) = (now_ms, 0);
+    }
+    *n += 1;
+    match *n {
+        n if n < KNOCKS => Some(false),
+        n if n == KNOCKS => Some(true),
+        _ => None,
     }
 }
 
@@ -336,5 +371,16 @@ mod tests {
         assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
         assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
+    }
+
+    #[test]
+    fn an_address_has_its_refusals_written_up_to_sixty_a_minute() {
+        let (ip, other) = (Some("203.0.113.7".parse().unwrap()), Some("203.0.113.8".parse().unwrap()));
+        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(ip, 1_000)).collect();
+        assert!(said[..KNOCKS as usize - 1].iter().all(|s| *s == Some(false)), "the first 59 written");
+        assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest aren't");
+        assert!(said[KNOCKS as usize..].iter().all(Option::is_none), "the rest of the minute not written");
+        assert_eq!(knocked(other, 1_000), Some(false), "another address counts apart");
+        assert_eq!(knocked(ip, 61_000), Some(false), "a new minute, written again");
     }
 }
