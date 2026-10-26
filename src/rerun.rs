@@ -553,7 +553,7 @@ pub enum How {
     Full,
 }
 
-/// Why a view can't follow its source's rows as they come, or by key: the table is keyed, a GROUP BY view's table, or a
+/// Why a view can't follow its source's rows as they come, or by key: the table is a GROUP BY view's table, keyed, or a
 /// history view's (`create`'s refusals, and `matches::create`'s).
 #[derive(Clone, Copy)]
 pub enum Unfollow {
@@ -564,10 +564,10 @@ pub enum Unfollow {
 
 /// The reason a view can't follow `src`, in the order the refusals check them; None when it can.
 pub fn unfollow(src: &TableMeta) -> Option<Unfollow> {
-    if !src.key.is_empty() {
+    if !src.merge.is_empty() || src.finish.is_some() {
+        Some(Unfollow::Partial) // (a GROUP BY view's table is keyed by its groups: named for what it is)
+    } else if !src.key.is_empty() {
         Some(Unfollow::Keyed)
-    } else if !src.merge.is_empty() || src.finish.is_some() {
-        Some(Unfollow::Partial)
     } else if src.history.is_some() {
         Some(Unfollow::History)
     } else {

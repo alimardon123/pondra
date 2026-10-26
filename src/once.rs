@@ -378,7 +378,7 @@ pub const LATE: &str = "$late";
 pub fn written(v: &View) -> Option<(String, Vec<String>)> {
     let time = |s: u64| crate::objects::span(s);
     if let Some(m) = &v.matches {
-        return Some((v.query().to_string(), with_clauses(m.lateness_secs, m.idle_secs))); // (its query as written: EMIT FINAL in it)
+        return Some((crate::views::shown(v.query()), with_clauses(m.lateness_secs, m.idle_secs))); // (its query as written: EMIT FINAL in it)
     }
     if let Some(o) = &v.once {
         return Some((format!("{}\nEMIT FINAL", v.query()), with_clauses(o.lateness_secs, o.idle_secs)));

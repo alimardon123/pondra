@@ -1533,6 +1533,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
             histories.insert(name.clone());
         }
         kinds.push(match () {
+            _ if v.matches.is_some() => "matches",
             _ if v.emit.is_some() || v.once.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
@@ -1554,7 +1555,11 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
-    let late = |v: &View| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), crate::once::LATE.to_string())).copied().unwrap_or(0);
+    // (a view's late rows are counted under its fill's id; a matches view's, under its own)
+    let late = |v: &View| {
+        let id = v.matches.as_ref().map(|m| m.id.clone()).or_else(|| v.fill.as_ref().map(|f| f.id.clone())).unwrap_or_default();
+        failed.get(&(id, crate::once::LATE.to_string())).copied().unwrap_or(0)
+    };
     let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
         ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
@@ -1563,7 +1568,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("reason", s(&|_, (_, v)| v.rerun.as_ref().map(|b| b.reason.clone()))),
         ("reads", s(&|_, (_, v)| reads(v))),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
-        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
+        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| (v.once.is_some() || v.matches.is_some()).then(|| late(v))).collect::<Int64Array>())),
         ("definition", s(&|_, (_, v)| Some(shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();

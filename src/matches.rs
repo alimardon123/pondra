@@ -8,6 +8,7 @@ use crate::query::{over_ctx, session, session_at, table_ref};
 use crate::store::*;
 use crate::text::{ROW_ID, VERSION};
 use crate::views::{Options, Refresh, View, EXPECTED};
+use crate::codes::coded;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StructArray};
 use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch};
@@ -54,9 +55,9 @@ pub fn tables(name: &str) -> Vec<String> { vec![held_of(name), resume_of(name)] 
 /// `CREATE MATERIALIZED VIEW v AS SELECT … MATCH_RECOGNIZE (…) EMIT FINAL`, as `once::create` hands it over: the query
 /// without EMIT FINAL. Makes the view, `{v}$held` and `{v}$resume` in one commit.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
-    ensure!(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL keeps each match once: no window, session, join or history options with it");
-    ensure!(o.expect.is_empty(), "EMIT FINAL keeps each match once, when it's decided: put expectations on a view of the rows before it");
-    ensure!(matches!(o.refresh, None | Some(Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each match once, when it's decided, from the rows as they come: not by key, run whole or with a lag");
+    takes(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL keeps each match once: no window, session, join or history options with it")?;
+    takes(o.expect.is_empty(), "EMIT FINAL keeps each match once, when it's decided: put expectations on a view of the rows before it")?;
+    takes(matches!(o.refresh, None | Some(Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each match once, when it's decided, from the rows as they come: not by key, run whole or with a lag")?;
     let written = format!("{}\nEMIT FINAL", sql.trim_end());
     if let Some(v) = lake.cat.get::<View>(&crate::views::view_key(name)).await? {
         ensure!(v.matches.is_some() && v.query() == written, "view {name} already exists, with other SQL or options");
@@ -74,16 +75,16 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let cols = crate::pattern::open_columns(lake, sql).await?;
     let open = crate::pattern::open(sql, &cols, &ctx.state())?;
     let (other, source) = crate::ddl::resolve(lake, &open.table).await?;
-    ensure!(other.is_none(), "a view follows a table of this lake");
-    ensure!(source == open.table, "{}: a view follows the table by its name in this lake: write {source}", open.table);
+    takes(other.is_none(), "a view follows a table of this lake")?;
+    takes(source == open.table, format!("{}: a view follows the table by its name in this lake: write {source}", open.table))?;
     let src: TableMeta = table_meta(lake, &source).await?.logical(); // (SQL's names)
     if let Some(u) = crate::rerun::unfollow(&src) {
-        bail!("{}, so {name} follows its rows as they come: write it from a table of plain rows", u.said(&source));
+        return Err(coded("0A000", format!("{}, so {name} follows its rows as they come: write it from a table of plain rows", u.said(&source))));
     }
     let time_type = column_type(&src, &open.time)?;
-    ensure!(time_type.starts_with("Timestamp") || time_type.starts_with("Date"), "ORDER BY {} takes a date or a timestamp, as the event time", open.time);
+    takes(time_type.starts_with("Timestamp") || time_type.starts_with("Date"), format!("ORDER BY {} takes a date or a timestamp, as the event time", open.time))?;
     let part: Vec<(String, String)> = open.part.iter().map(|p| Ok((p.clone(), column_type(&src, p)?))).collect::<Result<_>>()?;
-    ensure!(part.iter().all(|(c, _)| !["k", "m", "due", "_deleted"].contains(&c.as_str())), "a PARTITION BY column named k, m, due or _deleted can't be kept beside the view's own counts: rename it in {source}");
+    takes(part.iter().all(|(c, _)| !["k", "m", "due", "_deleted"].contains(&c.as_str())), format!("a PARTITION BY column named k, m, due or _deleted can't be kept beside the view's own counts: rename it in {source}"))?;
 
     // The view's columns: the plain query's, planned and checked as `rerun::create` plans them.
     let plain = crate::routines::expand(lake, sql).await?;
@@ -333,7 +334,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     if at > at0 {
         let batch = match late {
             0 => RecordBatch::new_empty(crate::answer::schema(&crate::views::expected_table(lake).columns)?),
-            n => crate::once::late_batch(view, "", n)?,
+            n => crate::once::late_batch(view, &m.id, n)?,
         };
         pending.push(Append { table: EXPECTED.into(), src: Src { producer: late_producer, seq: at, prev: Some(at0) }, batch, ack: tokio::sync::oneshot::channel().0 });
     }
@@ -363,6 +364,14 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
         _ => {} // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
     }
     Ok(())
+}
+
+/// What the view takes: when `ok` doesn't hold, the statement is refused 0A000 with `why`, which says what to write.
+fn takes(ok: bool, why: impl Into<String>) -> Result<()> {
+    match ok {
+        true => Ok(()),
+        false => Err(coded("0A000", why)),
+    }
 }
 
 /// A table's catalog entry.
