@@ -21,6 +21,7 @@ use crate::matcher::Pattern;
 use crate::text::{ident, object, ROW_ID};
 use anyhow::{bail, Result};
 use datafusion::sql::sqlparser::ast::*;
+use datafusion::common::{DataFusionError, SchemaError};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use serde_json::json;
@@ -69,6 +70,92 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     for (start, end, new) in edits {
         if start < last {
             continue; // inside an edit already made: a FINAL call in a PATTERN is read as the pattern
+        }
+        out.push_str(&sql[last..start]);
+        out.push_str(&new);
+        last = end;
+    }
+    out.push_str(&sql[last..]);
+    Cow::Owned(out)
+}
+
+/// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read.
+/// `front::expand` asks first, at every door.
+pub fn refused(sql: &str) -> Result<()> {
+    static SUBSET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bsubset\s+[a-z_][a-z0-9_]*\s*=").expect("a regex"));
+    if !wanted(sql) {
+        return Ok(());
+    }
+    let code = code_mask(sql);
+    match SUBSET.find_iter(sql).any(|m| code[m.start()]) {
+        true => Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions")),
+        false => Ok(()),
+    }
+}
+
+/// Refuses `EMIT FINAL` on a view of MATCH_RECOGNIZE. `once::create` asks first: its window is a GROUP BY's time bucket, and
+/// a MATCH_RECOGNIZE has none.
+pub fn emit_final_refused(sql: &str) -> Result<()> {
+    if !wanted(sql) {
+        return Ok(());
+    }
+    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(()) };
+    let mut scan = Scan::default();
+    for s in &stmts {
+        let _ = Visit::visit(s, &mut scan);
+    }
+    match scan.found {
+        true => Err(coded(
+            "0A000",
+            "a view of MATCH_RECOGNIZE with EMIT FINAL comes later: make it without EMIT FINAL, and each run matches again only the partitions that changed",
+        )),
+        false => Ok(()),
+    }
+}
+
+/// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
+/// `PATTERN (<text>)`, with its WITHIN after the `)` when the name carries one, and each `pondra_final(…)` and
+/// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A name written before WITHIN reads as it did. Text with neither is
+/// borrowed.
+pub fn shown(sql: &str) -> Cow<'_, str> {
+    static NAMED: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)\bpattern\s*\(\s*"__mr_pattern_([0-9a-f]*)(?:__within_([0-9a-f]*))?"\s*\)"#).expect("a regex")
+    });
+    static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bpondra_(final|running)\(").expect("a regex"));
+    if !sql.contains("__mr_pattern_") && !sql.contains("pondra_") {
+        return Cow::Borrowed(sql);
+    }
+    let code = code_mask(sql);
+    let mut edits: Vec<(usize, usize, String)> = vec![];
+    for c in NAMED.captures_iter(sql) {
+        let whole = c.get(0).expect("a whole match");
+        if !code[whole.start()] {
+            continue;
+        }
+        match (unhex(&c[1]), c.get(2).map(|w| unhex(w.as_str()))) {
+            (Some(p), None) => edits.push((whole.start(), whole.end(), format!("PATTERN ({p})"))),
+            (Some(p), Some(Some(w))) => edits.push((whole.start(), whole.end(), format!("PATTERN ({p}) WITHIN {w}"))),
+            _ => {}
+        }
+    }
+    for c in CALL.captures_iter(sql) {
+        let whole = c.get(0).expect("a whole match");
+        if !code[whole.start()] {
+            continue;
+        }
+        let open = whole.end() - 1;
+        let Some(close) = close_of(sql, &code, open) else { continue };
+        edits.push((whole.start(), close + 1, format!("{} {}", c[1].to_uppercase(), &sql[open + 1..close])));
+    }
+    if edits.is_empty() {
+        return Cow::Borrowed(sql);
+    }
+    edits.sort_by_key(|e| e.0);
+    let mut out = String::new();
+    let mut last = 0;
+    for (start, end, new) in edits {
+        if start < last {
+            continue;
         }
         out.push_str(&sql[last..start]);
         out.push_str(&new);
@@ -128,8 +215,8 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
             continue; // written already
         }
         let (end, name) = match within_at(sql, code, close + 1, clause_end) {
-            Some((end, within)) => (end, format!("PATTERN (\"__mr_pattern_{}__within_{}\")", hex(text), hex(&within))),
-            None => (close + 1, format!("PATTERN (\"__mr_pattern_{}\")", hex(text))),
+            Some((end, within)) => (end, format!("PATTERN (\"__mr_pattern_{}__within_{}\")", crate::text::hex(text.as_bytes()), crate::text::hex(within.as_bytes()))),
+            None => (close + 1, format!("PATTERN (\"__mr_pattern_{}\")", crate::text::hex(text.as_bytes()))),
         };
         out.push((whole.start(), end, name));
     }
@@ -168,12 +255,7 @@ fn within_interval(text: &str) -> Result<String> {
     }
 }
 
-/// `s` in hex: two digits a byte.
-fn hex(s: &str) -> String {
-    s.bytes().map(|b| format!("{b:02x}")).collect()
-}
-
-/// The text `hex` wrote, or None when `s` is not hex.
+/// The text `text::hex` wrote, or None when `s` is not hex.
 fn unhex(s: &str) -> Option<String> {
     let bytes: Vec<u8> = (0..s.len())
         .step_by(2)
@@ -279,6 +361,31 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
         }
     }
     Ok(true)
+}
+
+/// A plan error for a measure with the name of a column of its input, in the refusal a lake table's rows get (42701): the
+/// duplicate or ambiguous field DataFusion names is the measure's, when the rewrite's window (`pondra_match`) names it as a measure's
+/// alias. Any other error passes as it is. ALL ROWS PER MATCH gives both the measure and the input's column; ONE ROW PER
+/// MATCH gives the measure next to a PARTITION BY column, or to another measure of the same name.
+pub fn reworded(err: DataFusionError, sql: &str) -> anyhow::Error {
+    let name = match err.find_root() {
+        DataFusionError::SchemaError(e, _) => match e.as_ref() {
+            SchemaError::DuplicateUnqualifiedField { name } => Some(name.clone()),
+            // (a qualified column of the input beside the measure's unqualified one: DataFusion's other words for the same clash)
+            SchemaError::AmbiguousReference { field } if field.relation.is_some() => Some(field.name.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let measure = name.filter(|n| sql.contains("pondra_match") && [format!("AS {n}"), format!("AS \"{n}\"")].iter().any(|a| sql.contains(a.as_str())));
+    match measure {
+        Some(name) if sql.contains("EXCLUDE") => coded(
+            "42701",
+            format!("MATCH_RECOGNIZE: the measure {name} has the name of a column of its input; ALL ROWS PER MATCH gives both, so name the measure otherwise"),
+        ),
+        Some(name) => coded("42701", format!("MATCH_RECOGNIZE: the measure {name} has the name of a PARTITION BY column or of another measure: name each one apart")),
+        None => anyhow::Error::new(err),
+    }
 }
 
 /// The statements' clauses (outside the kept ones): whether any is there, and the names its inputs and CTEs have.
@@ -1674,5 +1781,73 @@ mod tests {
         let (code, msg) = refused_clause(&format!("{TICK}FINAL last(a.price) > 1) AS m"));
         assert_eq!(code, "42601", "{msg}");
         assert!(msg.contains("FINAL is for MEASURES"), "{msg}");
+    }
+
+    #[test]
+    fn shown_reads_back_what_text_wrote() {
+        let ticker = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m";
+        let measures = "SELECT * FROM t MATCH_RECOGNIZE (MEASURES FINAL last(a.x) AS y, RUNNING max(b) AS z)";
+        let within = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true)";
+        for sql in [ticker, measures, within] {
+            assert_eq!(shown(&text(sql)).as_ref(), sql);
+        }
+        // the stored form (sqlparser's own text, which spaces the keyword differently) reads back its clause as written
+        let stored = Parser::parse_sql(&GenericDialect {}, &text(within)).expect("a query")[0].to_string();
+        let back = shown(&stored);
+        assert!(back.contains("PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true)"), "{back}");
+        assert!(!back.contains("__mr_pattern"), "{back}");
+        assert!(matches!(shown("SELECT 1"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn names_written_before_read_as_they_did() {
+        assert_eq!(crate::text::hex(b"a b+"), "6120622b");
+        assert_eq!(unhex("6120622b").as_deref(), Some("a b+"));
+        let stored = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (\"__mr_pattern_6120622b\") DEFINE b AS true) AS m";
+        assert_eq!(shown(stored).as_ref(), "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) AS m");
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, stored).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(s) = *q.body else { panic!("a select") };
+        let TableFactor::MatchRecognize { pattern, .. } = &s.from[0].relation else { panic!("a clause") };
+        assert_eq!(pattern_text(pattern).0, "a b+");
+    }
+
+    #[test]
+    fn subset_and_emit_final_are_refused_by_name() {
+        let subset = refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a b c) SUBSET u = (b, c) DEFINE b AS true) AS m").expect_err("a refusal");
+        assert_eq!(crate::codes::of(&subset), "0A000");
+        assert!(subset.to_string().contains("write a measure per symbol, as LAST(b.price) and LAST(c.price)"), "{subset}");
+        assert!(refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS subset = 1) AS m").is_ok());
+        assert!(refused("SELECT subset FROM t").is_ok());
+        let view = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a) DEFINE a AS true) AS m";
+        let emit = emit_final_refused(view).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&emit), "0A000");
+        assert!(emit.to_string().starts_with("a view of MATCH_RECOGNIZE with EMIT FINAL comes later"), "{emit}");
+        assert!(emit_final_refused("SELECT s, count(*) AS n FROM t GROUP BY s").is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_measure_named_like_a_column_of_a_subquery_or_a_cte_is_refused() -> Result<()> {
+        use datafusion::execution::runtime_env::RuntimeEnv;
+        use datafusion::prelude::SessionConfig;
+        use std::sync::Arc;
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let clause = "MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES LAST(up.day) AS price ALL ROWS PER MATCH PATTERN (strt up+) DEFINE up AS up.price > PREV(up.price)) AS m";
+        // sqlparser takes a MATCH_RECOGNIZE only on a named table, so a subquery reaches the rewrite as a view's query: a view
+        // here is that input, and not a lake table
+        ctx.sql("CREATE VIEW sub AS SELECT symbol, day, price FROM (VALUES ('a', 1, 10.0), ('a', 2, 11.0)) AS v(symbol, day, price)")
+            .await?
+            .collect()
+            .await?;
+        let cte = format!("WITH t(symbol, day, price) AS (VALUES ('a', 1, 10.0), ('a', 2, 11.0)) SELECT * FROM t {clause}");
+        let sub = format!("SELECT * FROM sub {clause}");
+        for sql in [cte, sub] {
+            let err = crate::engine::planned(&ctx, &rewritten(&sql)?).await.expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "42701", "{err}");
+            assert_eq!(
+                err.to_string(),
+                "MATCH_RECOGNIZE: the measure price has the name of a column of its input; ALL ROWS PER MATCH gives both, so name the measure otherwise"
+            );
+        }
+        Ok(())
     }
 }

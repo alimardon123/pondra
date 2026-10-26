@@ -48,6 +48,7 @@ pub fn mark(d: &mut Ddl) -> bool {
 /// `EMIT FINAL`: a session view if the GROUP BY has `SESSION(ts, gap)`, else a view whose
 /// window is its time bucket (`views::create` under `{name}$open`, with the table `name`).
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+    crate::pattern::emit_final_refused(sql)?; // (a MATCH_RECOGNIZE has no GROUP BY time bucket: refused by name, `pattern.rs`)
     ensure!(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL finds its window in the GROUP BY: no window, session, join or history options with it");
     ensure!(o.expect.is_empty(), "EMIT FINAL keeps a group once it's over: put expectations on a view of the rows before it");
     ensure!(matches!(o.refresh, None | Some(crate::views::Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each group once, when it's over, from the rows as they come: not by key, run whole or with a lag");

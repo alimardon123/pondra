@@ -332,9 +332,10 @@ pub async fn sql_checked(ctx: &SessionContext, sql: &str, may: impl Fn(&LogicalP
 pub async fn planned(ctx: &SessionContext, sql: &str) -> anyhow::Result<LogicalPlan> {
     use datafusion::config::Dialect;
     let generic = matches!(ctx.state().config().options().sql_parser.dialect, Dialect::Generic);
+    // (a MATCH_RECOGNIZE's measure named like an input's column: DataFusion's duplicate field, said as the refusal: `pattern::reworded`)
     Ok(match crate::friendly::lambdas(sql).filter(|_| generic) {
-        Some(stmt) => ctx.state().statement_to_plan(stmt).await?,
-        None => ctx.state().create_logical_plan(sql).await?,
+        Some(stmt) => ctx.state().statement_to_plan(stmt).await.map_err(|e| crate::pattern::reworded(e, sql))?,
+        None => ctx.state().create_logical_plan(sql).await.map_err(|e| crate::pattern::reworded(e, sql))?,
     })
 }
 
