@@ -48,3 +48,28 @@ query T
 SELECT to_json(o)::text FROM o
 ----
 {"id":1,"name":"a"}
+
+statement ok
+CREATE TABLE held_j (id INT, d JSONB)
+
+statement ok
+INSERT INTO held_j VALUES (1, '{"b":1,"a":2}'), (2, '[1,  2]')
+
+query IT rowsort
+SELECT id, d::text FROM held_j
+----
+1 {"a": 2, "b": 1}
+2 [1, 2]
+
+statement ok
+UPDATE held_j SET d = '{"z": 0, "y":[3]}' WHERE id = 2
+
+query T
+SELECT d::text FROM held_j WHERE id = 2
+----
+{"y": [3], "z": 0}
+
+query I
+SELECT count(DISTINCT d::text) FROM (SELECT d FROM held_j WHERE id = 1 UNION ALL SELECT '{"a": 2, "b": 1}'::jsonb) x
+----
+1

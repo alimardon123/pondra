@@ -27,7 +27,7 @@ tokio::task_local! {
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
-    /// The lake a statement was sent to (`{url}/`, `sent`): a client's relative LOCATION is stored as a file of its own,
+    /// The lake a statement was sent to, its URL and a slash (`sent`): a client's relative LOCATION is stored as a file of its own,
     /// written whole, so every door reads the same file (`own_file`), the shell and `connect()` too.
     static ROOT: String;
     /// The statement's listing: the files each table of files in it reads, listed once for it (planning asks
