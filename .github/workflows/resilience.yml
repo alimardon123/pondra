@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: The checks' Python packages (tools/requirements.txt's versions)
-        run: pip install -r <(grep -iE '^(moto|boto3|psycopg\[|confluent-kafka|pyarrow)' tools/requirements.txt)
+        run: pip install --no-compile -r <(grep -iE '^(moto|boto3|psycopg\[|confluent-kafka|pyarrow)' tools/requirements.txt)
       # (Called from build.yml: its run's own packages, with no API call, whatever started that run. By hand: a build run's.)
       - uses: actions/download-artifact@v7
         if: inputs.artifact
