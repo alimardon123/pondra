@@ -466,7 +466,7 @@ const PROPOSED_TABLE: &str = "__pondra_proposed";
 
 tokio::task_local! {
     /// The change's SQL may read files on this machine (`MERGE … USING 'new.csv'` from the shell's
-    /// own node: `server::owner`).
+    /// own node: `statement::owner`).
     pub static FILES: bool;
 }
 

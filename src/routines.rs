@@ -686,7 +686,7 @@ impl Request {
 }
 
 /// Who a statement runs for: the caller's rights (`files`: it may read files on this machine,
-/// `server::owner`), and how deep in procedures calling procedures it is.
+/// `statement::owner`), and how deep in procedures calling procedures it is.
 #[derive(Clone, Copy)]
 pub struct Who {
     pub role: Role,

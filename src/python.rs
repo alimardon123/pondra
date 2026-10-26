@@ -229,7 +229,7 @@ pub enum Use {
 
 tokio::task_local! {
     /// Set in what a Python procedure, a session's cell or a file's run calls while it holds one of
-    /// the node's slots for them (its calls back come with its lent token: `server::sql`): those
+    /// the node's slots for them (its calls back come with its lent token: `statement::sql`): those
     /// take none, since they would wait for their caller's. Anything else takes one, however deep
     /// it is called (a SQL procedure calling a Python one took none, so there was no limit).
     static HELD: ();

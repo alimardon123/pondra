@@ -1359,7 +1359,7 @@ pub async fn stamp(lake: &Lake, table: &str, to: Option<&crate::log::To>) -> Res
 pub async fn on_node(app: &crate::app::App, stmt: Stmt, job: Option<String>) -> Result<Value> { on_node_as(app, stmt, job, false).await }
 
 /// `on_node`; `files`: its SQL may read files on this machine (`FROM 'jan.csv'`: the shell's own
-/// node, `server::owner`).
+/// node, `statement::owner`).
 #[inline(never)] // (its work on the heap, made here: `App::query_as`)
 pub fn on_node_as(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool) -> futures::future::BoxFuture<'_, Result<Value>> {
     Box::pin(async move {
