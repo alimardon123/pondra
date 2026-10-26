@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::process::{Child, ChildStdin, ChildStdout};
+#[cfg(target_arch = "wasm32")]
+use process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static EXE: OnceLock<Option<String>> = OnceLock::new();
@@ -82,6 +85,7 @@ async fn candidates() -> Vec<String> {
     for dir in var("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default() {
         out.extend(names.iter().map(|n| dir.join(n)));
     }
+    #[cfg(not(target_arch = "wasm32"))]
     if cfg!(windows) { // (the py launcher knows every python.org install)
         let listed = tokio::time::timeout(Duration::from_secs(5), tokio::process::Command::new("py").arg("-0p").stdin(std::process::Stdio::null()).kill_on_drop(true).output()).await;
         if let Ok(Ok(o)) = listed {
@@ -107,6 +111,7 @@ async fn candidates() -> Vec<String> {
 /// hangs (a broken install) is one that doesn't work, never a wait for everyone.
 pub async fn pythons() -> Vec<Value> { probe(candidates().await).await }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn probe(paths: Vec<String>) -> Vec<Value> {
     const TRY: &str = "import sys, json, importlib.util as u\nr = {'version': sys.version.split()[0], 'pondra': bool(u.find_spec('pondra')), 'pyarrow': bool(u.find_spec('pyarrow'))}\ntry:\n    import pyarrow, pondra, pondra.worker\n    r['ok'] = True; r['pondra_version'] = getattr(pondra, '__version__', '')\nexcept BaseException as e:\n    r['ok'] = False; r['error'] = (type(e).__name__ + ': ' + str(e))[:300]\nprint(json.dumps(r))";
     let limit = Duration::from_secs(crate::env::or::<u64>("PONDRA_PYTHON_PROBE_SECS", 15));
@@ -121,6 +126,11 @@ async fn probe(paths: Vec<String>) -> Vec<Value> {
         v
     });
     futures::future::join_all(probes).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn probe(paths: Vec<String>) -> Vec<Value> {
+    paths.into_iter().map(|path| json!({"ok": false, "error": "a page runs no Python: a browser starts no processes", "path": path})).collect()
 }
 
 /// The Python in use, and how it came to be: for the console's Python menu.
@@ -147,6 +157,38 @@ pub async fn choose(path: &str) -> Result<Value> {
         PIDS.lock().unwrap().remove(&s);
     }
     Ok(probe)
+}
+
+// A page starts no process (`spawn` and `install` refuse), so no worker is ever made on it: these are the types the worker
+// code names, each empty so that none can be made. They let that code compile on a page as it does on a node.
+#[cfg(target_arch = "wasm32")]
+mod process {
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    pub enum Child {}
+
+    impl Child {
+        pub fn id(&self) -> Option<u32> { match *self {} }
+        pub fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> { match *self {} }
+        pub async fn wait(&mut self) -> io::Result<std::process::ExitStatus> { match *self {} }
+    }
+
+    pub enum ChildStdin {}
+
+    impl AsyncWrite for ChildStdin {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> { match *self.get_mut() {} }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { match *self.get_mut() {} }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { match *self.get_mut() {} }
+    }
+
+    pub enum ChildStdout {}
+
+    impl AsyncRead for ChildStdout {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> { match *self.get_mut() {} }
+    }
 }
 
 struct Worker {
@@ -232,6 +274,7 @@ async fn pool(packages: &str) -> Result<Arc<Pool>> {
 
 /// A routine's packages, into a folder of this node's keyed by the list (uv when it is there,
 /// else pip), once: `--target`, so the `--python` environment itself never changes.
+#[cfg(not(target_arch = "wasm32"))]
 async fn install(packages: &str) -> Result<String> {
     static BUSY: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
     let _one = BUSY.lock().await;
@@ -251,14 +294,22 @@ async fn install(packages: &str) -> Result<String> {
     Ok(dir.to_string_lossy().to_string())
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn install(_: &str) -> Result<String> {
+    Err(crate::codes::coded("0A000", "a page runs no Python: a browser starts no processes"))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn which(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("PATH").and_then(|paths| std::env::split_paths(&paths).map(|p| p.join(name)).find(|p| p.is_file()))
 }
 
 /// The most of one line of a worker's standard error kept.
+#[cfg(not(target_arch = "wasm32"))]
 const LINE: usize = 4096;
 
 /// A short, stable name for a text (FNV-1a).
+#[cfg(not(target_arch = "wasm32"))]
 fn fnv(s: &str) -> u64 { s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) }
 
 /// A worker lent out, and the slot it holds; back to its pool (or stopped) when done.
@@ -303,6 +354,7 @@ impl Pool {
 /// start (a missing package, one that hangs importing) is an error that says so, within
 /// `PONDRA_WORKER_START_SECS` (60), not a cell that waits forever. What it writes to its standard
 /// error goes to the node's, its last lines kept for that error.
+#[cfg(not(target_arch = "wasm32"))]
 async fn spawn(path: Option<&str>) -> Result<Worker> {
     let exe = &exe().await?;
     let mut cmd = tokio::process::Command::new(exe);
@@ -361,6 +413,11 @@ async fn spawn(path: Option<&str>) -> Result<Worker> {
         Ok(Err(e)) => bail!("{exe} -m pondra.worker stopped as it started ({e:#}){}", w.tail().await),
         Err(_) => bail!("{exe} -m pondra.worker didn't answer within {} s of starting{}", limit.as_secs(), w.tail().await),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn spawn(_: Option<&str>) -> Result<Worker> {
+    Err(crate::codes::coded("0A000", "a page runs no Python: a browser starts no processes"))
 }
 
 impl Lent {

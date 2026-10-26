@@ -67,11 +67,22 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>) -> Result<Opti
 pub async fn lead_once(dir: &str) -> Result<()> {
     // (another process would lead a lake of its own memory, gone when it ends)
     anyhow::ensure!(!crate::memory::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
+    lead_in_process(dir).await
+}
+
+/// Leads the lake at `dir` in a `pondra lead` process of its own.
+#[cfg(not(target_arch = "wasm32"))]
+async fn lead_in_process(dir: &str) -> Result<()> {
     let out = tokio::process::Command::new(crate::library::exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
         .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
         .stdin(std::process::Stdio::null()).output().await?;
     anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn lead_in_process(_: &str) -> Result<()> {
+    Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
 }
 
 /// Leader: answer the inbox whenever the bell rings (and once at start: requests may have waited

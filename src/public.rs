@@ -6,8 +6,12 @@
 //! address written in a URL, and every redirect, is checked before it is asked.
 
 use anyhow::{Result, ensure};
-use object_store::client::{ClientConfigKey, ClientOptions, HttpClient, HttpConnector};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(not(target_arch = "wasm32"))]
+use object_store::client::ClientConfigKey;
+use object_store::client::{ClientOptions, HttpClient, HttpConnector};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::SocketAddr;
 
 /// Is `ip` an address of the public internet? Not this machine's, a private network's, a link's
 /// (the clouds' metadata address is one), carrier-grade NAT's, or one kept for something else.
@@ -70,6 +74,7 @@ pub struct Connector {
 }
 
 impl HttpConnector for Connector {
+    #[cfg(not(target_arch = "wasm32"))]
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
         let http = options.get_config_value(&ClientConfigKey::AllowHttp).as_deref() == Some("true");
         let redirect = reqwest::redirect::Policy::custom(|to| {
@@ -98,12 +103,25 @@ impl HttpConnector for Connector {
             .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
         Ok(HttpClient::new(client))
     }
+
+    // (a browser's fetch follows redirects and resolves names itself, under CORS: its client has no redirect policy or resolver)
+    #[cfg(target_arch = "wasm32")]
+    fn connect(&self, _: &ClientOptions) -> object_store::Result<HttpClient> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("pondra/", env!("CARGO_PKG_VERSION")))
+            .default_headers(self.headers.clone())
+            .build()
+            .map_err(|e| object_store::Error::Generic { store: "outside", source: Box::new(e) })?;
+        Ok(HttpClient::new(client))
+    }
 }
 
 /// Resolves a name, and refuses it if any of its addresses isn't public: a connection may be tried
 /// on any of them.
+#[cfg(not(target_arch = "wasm32"))]
 struct Names;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl reqwest::dns::Resolve for Names {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
