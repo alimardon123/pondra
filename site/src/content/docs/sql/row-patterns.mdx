@@ -375,8 +375,10 @@ Excluded rows count in every aggregate. `PREV` and `NEXT` take their lag and lea
 
 ## Materialized views
 
-A materialized view over `MATCH_RECOGNIZE` is kept current by running it whole on each change, as views without a `GROUP BY`
-by key are. Keeping it by key, so that only the partitions that changed are run again, comes later.
+A materialized view over `MATCH_RECOGNIZE` with a `PARTITION BY` is kept by key: when rows change, only the partitions they
+belong to are matched again, and the view always equals its query, late rows and deletes included. An `UPDATE` that moves a
+row from one partition to another matches both again. `pondra.flows` lists such a view as `by key`. Without a `PARTITION BY`
+the rows are one sequence, so the view runs whole on each change.
 
 ## What's refused
 
