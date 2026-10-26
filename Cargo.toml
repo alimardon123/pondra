@@ -17,7 +17,8 @@ server = ["lake", "doors"]
 # --features lake` counts what is left.
 lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
         "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka",
-        "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier"]
+        "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier",
+        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom"]
 # What listens and how a node is run: the HTTP, Postgres, Kafka and Flight doors, the cluster's own calls, the command
 # line and the service. A module is `lake` unless it is one of these; what reaches outside to answer a statement (Python,
 # Git, another Kafka cluster, a function's Flight server) is lake, and on a page it is the platform's or refused by name.
@@ -100,6 +101,12 @@ sysinfo = { version = "0.35", default-features = false, features = ["system"], o
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 pondra-tokio-web = { path = "web/tokio" }
 object_store = { version = "0.14", default-features = false, features = ["aws-base", "gcp-base", "azure-base", "http-base", "reqwest"], optional = true } # (the bucket clients over the browser's fetch, without the TLS and aws-lc-rs a page can't build: their crypto is crypto.rs's)
+# (a page's crypto: crypto.rs's page bodies, RustCrypto and getrandom in a browser; a node's are aws-lc-rs)
+sha1 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+hmac = { version = "0.13", optional = true }
+subtle = { version = "2.6", optional = true }
+getrandom = { version = "0.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true } # (free disk space: statvfs)
@@ -113,6 +120,14 @@ mimalloc = { version = "0.1", default-features = false, features = ["local_dynam
 
 [target.'cfg(windows)'.dependencies]
 windows-service = { version = "0.8", optional = true } # (`pondra service` on Windows: the service manager's dispatcher; its windows-sys is already built for tokio)
+
+# (the native tests build a page's crypto bodies, `crypto.rs`, to compare them with the node's: the same crates a page has)
+[dev-dependencies]
+sha1 = "0.11"
+sha2 = "0.11"
+hmac = "0.13"
+subtle = "2.6"
+getrandom = "0.3"
 
 [profile.release]
 # (panics unwind: a request's is answered as an error; the node's own loops still stop it: `panics.rs`)
