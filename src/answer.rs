@@ -33,6 +33,8 @@ pub fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | 
 
 /// About how much Arrow a door sends at a time: at SF1, lineitem over HTTP comes in 0.98 s in pieces of 4 MB that take
 /// the batches a plan has ready together (`pieces`), against 1.22 s in pieces of 4 MB alone and 1.94 s in pieces of 1 MB.
+/// What an answer holds as it goes is bounded by it, whatever the answer's size: about 50 MB over a fetch of SF1
+/// lineitem over HTTP (6M rows), against about 17 MB in pieces of 1 MB.
 pub const PIECE: usize = 4 << 20;
 
 /// A batch cut into pieces of about `PIECE` of Arrow (by its rows' average size). An empty batch is one
@@ -527,19 +529,21 @@ mod tests {
 
     #[test]
     fn pieces_are_the_whole() {
-        let batch = sample(200_000);
-        let pieces = piece_rows(&batch);
-        assert!(pieces.len() > 1, "a piece is about PIECE of Arrow: {} pieces", pieces.len());
+        let batch = sample(400_000);
         for f in [None, Some("csv"), Some("tsv"), Some("ndjson"), Some("arrow")] {
+            // (cut as a door cuts them: the batch as its format sends it, in `pieces`)
+            let parts = pieces([Encoding::new(f).lean(batch.clone())]);
+            assert!(parts.len() > 1, "{f:?}: a piece is about PIECE of Arrow: {} pieces", parts.len());
             let whole = render(&[batch.clone()], f, |_| None).unwrap();
-            assert!(written(f, &pieces) == whole.as_ref(), "{f:?}: the pieces are not the answer render writes");
+            assert!(written(f, &parts) == whole.as_ref(), "{f:?}: the pieces are not the answer render writes");
         }
-        // Arrow: the pieces and the whole decode to the same rows.
+        // Arrow: the pieces and the whole decode to the rows as they are sent (a view as its string).
+        let sent = as_sent(batch.clone(), Some("arrow"));
         let decoded = |bytes: &[u8]| -> Vec<RecordBatch> { StreamReader::try_new(Cursor::new(bytes), None).unwrap().map(|b| b.unwrap()).collect() };
-        let same = |bs: &[RecordBatch]| concat_batches(&batch.schema(), bs).unwrap();
+        let same = |bs: &[RecordBatch]| concat_batches(&sent.schema(), bs).unwrap();
         let whole = render(&[batch.clone()], Some("arrow"), |_| None).unwrap();
-        assert_eq!(same(&decoded(&written(Some("arrow"), &pieces))), batch);
-        assert_eq!(same(&decoded(&whole)), batch);
+        assert_eq!(same(&decoded(&written(Some("arrow"), &pieces([sent.clone()])))), sent);
+        assert_eq!(same(&decoded(&whole)), sent);
         // An empty batch: JSON's [] and CSV's header alone, whole or in pieces.
         let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)])));
         assert_eq!(render(&[empty.clone()], None, |_| None).unwrap().as_ref(), b"[]");
@@ -590,13 +594,16 @@ mod tests {
     }
 
     #[test]
-    fn arrow_batch_of_a_batch_with_no_dictionary_keeps_its_columns() -> anyhow::Result<()> {
+    fn arrow_batch_keeps_the_columns_it_need_not_cast_and_sends_a_view_as_its_string() -> anyhow::Result<()> {
         let batch = sample(10);
         let schema = Arc::new(arrow_schema(&batch.schema()));
         let out = arrow_batch(&schema, batch.clone())?;
         assert_eq!(out.schema().as_ref(), schema.as_ref());
         for (a, b) in out.columns().iter().zip(batch.columns()) {
-            assert!(Arc::ptr_eq(a, b));
+            match b.data_type() {
+                DataType::Utf8View => assert_eq!(a.as_ref(), cast(b, &DataType::Utf8)?.as_ref()),
+                _ => assert!(Arc::ptr_eq(a, b)),
+            }
         }
         Ok(())
     }
