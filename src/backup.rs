@@ -67,6 +67,10 @@ pub struct Take {
     pub restore: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<u64>,
+    /// The place was empty when the statement asked: this run makes the lake. (A lake with only its own
+    /// keys that someone made, as `pondra serve` makes one, is not a backup's to take over.)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh: bool,
 }
 
 /// Keys that are each lake's own, never carried from one to another: its counters, format and
@@ -134,25 +138,39 @@ pub async fn tend(lake: &Lake) -> Result<()> {
 
 // ---------------------------------------------------------------- the statements
 
-/// BACKUP and RESTORE DATABASE, on the leader of the database they were sent to, beside its lock:
-/// a run takes long, and only a pin and an attachment take the lock, for a moment.
-pub async fn statement(lake: &Lake, lock: &tokio::sync::Mutex<()>, d: Ddl) -> Result<Value> {
+/// BACKUP and RESTORE DATABASE, on the node the statement reached (`write.rs`'s DDL loop), so that the
+/// owner of that node decides the places on its own disk. `lock` is the leader's lock when this node
+/// leads: a run takes long, and only a pin and an attachment take the lock, for a moment. Without it,
+/// the pin and the attachment go to the leader as DDL.
+pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -> Result<Value> {
     match d {
         Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days).await,
         Ddl::RestoreDatabase { name, from, dir, at } => {
             crate::ddl::attachable(lake, &name, true).await?; // (before anything is copied)
+            owners_only(&from, format!("RESTORE … FROM {from}: a path on the server's own disk, which only the node's owner restores from (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore from a bucket (s3://, gs://, az://)"))?;
+            if let Some(d) = &dir {
+                owners_only(d, format!("RESTORE … LOCATION {d}: a path on the server's own disk, which only the node's owner restores into (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore into a bucket (s3://, gs://, az://), or leave LOCATION out to restore beside this database"))?;
+            }
             let to = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, &name)))?;
             apart(lake, &to)?;
             for place in [&crate::ddl::full(&from)?, &to] {
                 crate::ext::reach_place(lake, place).await?; // (a backup in another bucket: the secret that reaches it)
             }
             let mut out = restore(&from, &to, at).await?;
-            let _guard = lock.lock().await;
-            crate::ddl::apply(lake, Ddl::Attach { name: name.clone(), dir: to, read_only: false, endpoint: None }).await?;
+            let attach = Ddl::Attach { name: name.clone(), dir: to, read_only: false, endpoint: None };
+            match lock {
+                Some(lock) => {
+                    let _guard = lock.lock().await;
+                    crate::ddl::apply(lake, attach).await?;
+                }
+                None => {
+                    Box::pin(crate::write::send(&lake.url, Request::Ddl(attach))).await?; // (the leader attaches it, under its lock; boxed: `send` leads back here)
+                }
+            }
             out["attached"] = name.into();
             Ok(out)
         }
-        _ => anyhow::bail!("only BACKUP and RESTORE DATABASE are run beside the lock"),
+        _ => anyhow::bail!("only BACKUP and RESTORE DATABASE are run by backup::statement"),
     }
 }
 
@@ -169,9 +187,16 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
     Ok(())
 }
 
+/// A place on this machine's own disk is the node's owner's to use, as COPY's is (`ext::on_disk`, `ext::owner`): `words`
+/// is the refusal a client gets for it, saying what it may do instead.
+fn owners_only(place: &str, words: String) -> Result<()> {
+    ensure!(crate::ext::owner() || !crate::ext::on_disk(place), crate::codes::coded("42501", words));
+    Ok(())
+}
+
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
-async fn backup(lake: &Lake, lock: &tokio::sync::Mutex<()>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
+async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
     let source = match database.map(|n| n.trim_matches('"').to_lowercase()) {
         None => lake.arc(),
         Some(n) if n == crate::ddl::lake_name(lake) => lake.arc(),
@@ -185,21 +210,23 @@ async fn backup(lake: &Lake, lock: &tokio::sync::Mutex<()>, database: Option<&st
     ensure!(crate::store::reach_of(&source.url).is_none(), "{} is on another server: back it up from there", source.url);
     ensure!(retention_days.is_none_or(|d| d > 0), "retention_days is at least 1");
     let to = crate::ddl::full(to)?;
+    owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
     apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (another bucket or provider: the secret whose SCOPE covers it)
-    ensure!(crate::ddl::has_catalog(&to).await? || empty(&to).await?, "{to} holds other things: back up into a new place (or an empty folder)");
+    let fresh = empty(&to).await?; // (nothing there yet: this run makes the lake)
+    ensure!(fresh || crate::ddl::has_catalog(&to).await?, "{to} holds other things: back up into a new place (or an empty folder)");
     let pin = format!("{to}#backup");
-    let take = Take { source: source.url.clone(), pin: pin.clone(), retention_days, restore: false, at: None };
-    // (this lake pinned here, under its lock: its leader may be this process alone, a `pondra sql`
-    // leading for a moment, which nothing else could reach)
+    let take = Take { source: source.url.clone(), pin: pin.clone(), retention_days, restore: false, at: None, fresh };
+    // (this lake pinned here, under its lock where this node leads it: its leader may be this process alone, a `pondra sql`
+    // leading for a moment, which nothing else could reach; a node that doesn't lead it sends the pin to the leader)
     let here = source.url == lake.url;
     let ask = |d: Ddl| async {
-        match here {
-            true => {
+        match lock.filter(|_| here) {
+            Some(lock) => {
                 let _guard = lock.lock().await;
                 crate::ddl::apply(lake, d).await
             }
-            false => Box::pin(crate::write::send(&source.url, Request::Ddl(d))).await,
+            None => Box::pin(crate::write::send(&source.url, Request::Ddl(d))).await,
         }
     };
     let first = ask(Ddl::Pin { lake: pin.clone(), ms: None, lease: false }).await.with_context(|| format!("pinning {}", source.url))?;
@@ -289,12 +316,20 @@ pub async fn restore(from: &str, to: &str, at: Option<u64>) -> Result<Value> {
     ensure!(crate::ddl::has_catalog(&from).await?, "{from} holds no lake");
     ensure!(!crate::ddl::has_catalog(&to).await?, "a lake is at {to} already: restore into a new place");
     ensure!(empty(&to).await?, "{to} holds other things: restore into a new place (or an empty folder)");
-    let take = Take { source: from, pin: String::new(), retention_days: None, restore: true, at };
+    let take = Take { source: from, pin: String::new(), retention_days: None, restore: true, at, fresh: true }; // (checked empty above)
     let out = Box::pin(crate::write::send(&to, Request::Ddl(Ddl::Backup(take)))).await;
     if out.is_err() {
         let _ = crate::ddl::delete_lake(&to).await; // (nothing half made stays)
     }
     out
+}
+
+/// What a restore copies from a run's catalog: all but the keys a lake keeps of its own. `take` never puts
+/// them in a run's catalog, so one that holds them (a tampered backup's `z/auth`, the source's signing key)
+/// must not give the restored lake them. The counters, format and backup entry that `restore_into` sets itself
+/// are among them.
+fn carried(cat: &BTreeMap<String, Bytes>) -> Vec<(String, Vec<u8>)> {
+    cat.iter().filter(|(k, _)| !own(k)).map(|(k, v)| (k.clone(), v.to_vec())).collect()
 }
 
 /// Nothing at `dir` yet (a restore that fails takes away what it made there, and only that).
@@ -342,9 +377,11 @@ pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
     match &kept {
         Some(b) => ensure!(b.source == t.source, "{} is a backup of {}: back {} up somewhere else", lake.url, b.source, t.source),
         // (a lake made for this backup holds only what every lake makes of its own, and what a first
-        // run stopped half way copied; a lake with anything of its own would lose it)
+        // run stopped half way copied; a lake with anything of its own would lose it. A lake someone
+        // made before this run (`pondra serve`, say) holds its own keys and no data, which looks the
+        // same: so it is taken only when the place was empty when asked, or a first run left its mark)
         None => ensure!(
-            mine.keys().all(|k| own(k)) && (resuming || target.list(Some(&Path::from("files"))).next().await.is_none()),
+            (t.fresh || resuming) && mine.keys().all(|k| own(k)) && (resuming || target.list(Some(&Path::from("files"))).next().await.is_none()),
             "a lake that isn't a backup is at {}: back up into a new place",
             lake.url
         ),
@@ -439,7 +476,7 @@ async fn restore_into(lake: &Lake, t: &Take) -> Result<Value> {
     copying.sort_by_key(|(_, _, w)| !w.log);
     let (copied, copied_bytes) = copy_all(&backup, &target, copying, false).await.with_context(|| format!("restoring {} (a run past the backup's retention lets its files go)", when(run.ms)))?;
     let (files, files_bytes) = workspace(&backup, &target).await?;
-    let mut puts: Vec<(String, Vec<u8>)> = cat.iter().map(|(k, v)| (k.clone(), v.to_vec())).collect();
+    let mut puts = carried(&cat);
     puts.push(("n".into(), json(&run.next)));
     puts.push(("b".into(), json(&run.block)));
     if let Some(f) = backup.cat.get::<crate::format::Stamp>("format").await? {
@@ -758,5 +795,23 @@ mod tests {
         assert_eq!(instant("2026-10-12 03:00:00").unwrap(), instant("2026-10-12T03:00:00Z").unwrap());
         assert_eq!(instant("'2026-10-12'").unwrap(), instant("2026-10-12 00:00").unwrap());
         assert!(instant("yesterday").is_err());
+    }
+
+    #[test]
+    fn a_restore_gives_its_lake_none_of_the_backups_own_keys() {
+        // (a run's catalog holding the source's signing key and counters, as a tampered backup's would)
+        let cat: BTreeMap<String, Bytes> = ["z/auth", "c", "bk", "n", "format", "t/ev"].into_iter().map(|k| (k.to_string(), Bytes::from_static(b"x"))).collect();
+        let kept: Vec<String> = carried(&cat).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(kept, ["t/ev"]);
+    }
+
+    #[test]
+    fn a_place_on_this_machines_disk_is_the_owners_alone() {
+        for place in ["/a", "a/b", "file:///a", "memory://x"] {
+            assert!(crate::ext::on_disk(place), "{place} is this machine's");
+        }
+        for place in ["s3://b/a", "gs://b/a", "https://h/a"] {
+            assert!(!crate::ext::on_disk(place), "{place} is a bucket or a server's");
+        }
     }
 }

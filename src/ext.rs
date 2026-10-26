@@ -68,6 +68,11 @@ pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 
 pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 
+/// Is a place on this machine's own disk (no scheme, or `file://`), rather than a bucket or a server's (`s3://`, `https://`,
+/// `kafka://`)? A client may name only the places its secrets reach: a folder here is the node's owner's (`owner`). A scheme
+/// `scheme` doesn't name, such as `memory://`, counts as this machine's too, as COPY has always had it.
+pub(crate) fn on_disk(place: &str) -> bool { scheme(place).is_none_or(|s| s == "file") }
+
 // ---------------------------------------------------------------- what a query reads
 
 /// DataFusion's (and Hive's) `CREATE EXTERNAL TABLE t [(columns)] STORED AS PARQUET | CSV | JSON

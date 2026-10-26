@@ -373,6 +373,11 @@ pub struct Task {
     /// follows it (`EXECUTE TASK` runs it, and its whole graph).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspended: bool,
+    /// Made by the node's owner (`ext::owner()` where `CREATE TASK` runs on the leader): its SQL runs as the owner,
+    /// so a BACKUP or RESTORE the owner may run runs here too. Made any other way, false (a follower's CREATE
+    /// forwarded to the leader is made with no owner there).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_owner: bool,
 }
 
 /// `WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = notify)`.
@@ -656,6 +661,7 @@ pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool)
         roots(&all, other, t, &mut vec![])?; // (replaced: what follows it still has one start, no loop)
     }
     task.created_ms = now_ms();
+    task.by_owner = crate::ext::owner(); // (what the request says is not taken: this is the leader's own context)
     lake.cat.commit(vec![(task_key(&name), json(&task))], &[]).await?;
     let next = every(&task.schedule).ok().filter(|_| task.after.is_empty() && !task.suspended).map(|e| next_after(&e, task.created_ms));
     let mut out = serde_json::json!({"task": name, "next": next, "after": task.after});
@@ -736,7 +742,7 @@ pub fn schedule(app: App) {
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
                 crate::panics::task(async move {
-                    run_tick(&app, &name, &task, tick).await;
+                    crate::ext::scope(task.by_owner, run_tick(&app, &name, &task, tick)).await; // (as the task's owner: `by_owner`)
                     drop(ran);
                 });
             }
@@ -864,7 +870,7 @@ async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
             }
             let after = last.as_ref().map_or(task.created_ms, |t| t.at.max(task.created_ms));
             let Some(at) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
-            let params = tokio::time::timeout(Duration::from_secs(30), values(app, task, HashMap::new())).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
+            let params = tokio::time::timeout(Duration::from_secs(30), crate::ext::scope(task.by_owner, values(app, task, HashMap::new()))).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
             Tick { at, params, ..Default::default() }
         }
         false => {
@@ -1190,5 +1196,21 @@ mod tests {
         // (the schedule text refuses what it doesn't know: room for event triggers, kept free)
         assert!(every("on files drop/").is_err());
         assert!(every("on change raw.orders").is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_task_remembers_whether_its_owner_made_it() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-task-owner-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        // (what the wire says is no say: `by_owner` is stamped where CREATE TASK runs, from its owner)
+        let sent = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), by_owner: true, ..Default::default() };
+        create_task(&lake, "theirs", sent, false).await?;
+        let stored = lake.cat.get::<Task>(&task_key("theirs")).await?.context("no task theirs")?;
+        assert!(!stored.by_owner, "a task made with no owner is not the owner's");
+        let owned = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
+        crate::ext::scope(true, create_task(&lake, "mine", owned, false)).await?;
+        let stored = lake.cat.get::<Task>(&task_key("mine")).await?.context("no task mine")?;
+        assert!(stored.by_owner, "the owner's task is stamped");
+        Ok(())
     }
 }
