@@ -48,19 +48,13 @@ fn missing(what: &str, kind: &str) -> (axum::http::StatusCode, axum::Json<Value>
     (axum::http::StatusCode::NOT_FOUND, axum::Json(json!({"error": {"message": format!("no {what}"), "type": kind, "code": 404}})))
 }
 
-/// Every namespace the caller may see: its parts, its lake, and the schema in it. An attached lake's only under its
-/// own sign-in, and not for a user granted some tables (`space`), as SQL's listings (`ddl::listed`, S27).
+/// Every namespace: its parts, its lake, and the schema in it.
 async fn spaces(app: &crate::app::App) -> Vec<(Vec<String>, std::sync::Arc<Lake>, String)> {
     use crate::ddl::schemas;
     use crate::text::PUBLIC;
     let attached = app.lake.attached.read().unwrap().clone();
     let mut out = vec![];
     for (name, lake) in [(None, app.lake.clone())].into_iter().chain(attached.into_iter().map(|(n, l)| (Some(n), l))) {
-        if let Some(n) = &name {
-            if crate::auth::limited().is_some() || crate::users::across(&lake, n).await.is_err() {
-                continue;
-            }
-        }
         for s in schemas(&lake).await.unwrap_or_default() {
             let parts = match (&name, s == PUBLIC) {
                 (None, true) => vec!["default".to_string()],
@@ -89,8 +83,16 @@ async fn space(app: &crate::app::App, ns: &str) -> Result<(Vec<String>, std::syn
     Ok(found)
 }
 
+/// The namespaces the caller may see: an attached lake's only as `space` would open them (under its own sign-in, and
+/// not for a user granted some tables), as SQL's listings (`ddl::listed`, S27).
 async fn namespaces(axum::extract::State(app): axum::extract::State<crate::app::App>) -> axum::Json<Value> {
-    axum::Json(json!({"namespaces": spaces(&app).await.into_iter().map(|(p, _, _)| p).collect::<Vec<_>>()}))
+    let mut seen = vec![];
+    for (parts, lake, _) in spaces(&app).await {
+        if std::sync::Arc::ptr_eq(&lake, &app.lake) || (crate::auth::limited().is_none() && crate::users::across(&lake, &parts[0]).await.is_ok()) {
+            seen.push(parts);
+        }
+    }
+    axum::Json(json!({"namespaces": seen}))
 }
 
 async fn namespace(axum::extract::State(app): axum::extract::State<crate::app::App>, axum::extract::Path(ns): axum::extract::Path<String>) -> Reply {

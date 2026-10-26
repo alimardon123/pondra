@@ -1333,8 +1333,9 @@ pub async fn any(lake: &Lake) -> bool {
 /// name and password (Basic). None: nobody (refused where a sign-in is needed).
 pub async fn who(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>) -> Option<Principal> { who_at(lake, auth, header, false).await }
 
-/// `who`, for a request from this machine (`here`) or from elsewhere: the nodes' key counts as `nodes_key` says.
-pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>, here: bool) -> Option<Principal> {
+/// `who`, for a request from this machine or with the nodes' authority's certificate (`vouched`) or from anyone
+/// else: the nodes' key counts as `nodes_key` says.
+pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>, vouched: bool) -> Option<Principal> {
     let header = header?;
     if let Some(token) = header.strip_prefix("Bearer ") {
         if let Some(p) = auth.lent_principal(token) {
@@ -1348,7 +1349,7 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>,
             return claimed(lake, &c.ok()?).await.ok(); // (an identity provider's: ADR-074)
         }
         // (where an admin token is set the nodes call each other with it, so a `pn_` key read from the bucket opens nothing)
-        if token.starts_with("pn_") && nodes_key(auth.admin_set(), crate::ext::shared_master(), here) && keys(lake).await.is_ok_and(|k| crate::crypto::same(k.node.as_bytes(), token.as_bytes())) {
+        if token.starts_with("pn_") && nodes_key(auth.admin_set(), crate::ext::shared_master(), vouched) && keys(lake).await.is_ok_and(|k| crate::crypto::same(k.node.as_bytes(), token.as_bytes())) {
             return Some(Principal::token(Role::Admin));
         }
         if token.starts_with("ps_") {
@@ -1363,9 +1364,10 @@ pub async fn who_at(lake: &Lake, auth: &crate::auth::Auth, header: Option<&str>,
 
 /// Does the lake's key for its nodes (`pn_`) sign a request in? Only without an admin token (the nodes call each
 /// other with that), and, while the lake's keys are in the clear in its bucket (no shared master key to seal them:
-/// `ext::shared_master`), only from this machine: read from the bucket, it signs nobody in from elsewhere
-/// (invariant 260; security pass 2 found a bucket reader signing in as admin on a node with users and no token).
-pub fn nodes_key(admin_set: bool, sealed: bool, here: bool) -> bool { !admin_set && (sealed || here) }
+/// `ext::shared_master`), only from this machine or with a certificate the nodes' authority signed (`vouched`,
+/// which the bucket doesn't hold): read from the bucket, it signs nobody in from elsewhere (invariant 260; security
+/// pass 2 found a bucket reader signing in as admin on a node with users and no token).
+pub fn nodes_key(admin_set: bool, sealed: bool, vouched: bool) -> bool { !admin_set && (sealed || vouched) }
 
 /// Is this sign-in's password a token, by `sign_in`'s own rule (a token's name, or a user's `pt_…`)? A token
 /// may cross a plain connection under `PONDRA_TLS=optional`, a password never (`tls::may_send_password`).
@@ -1434,7 +1436,7 @@ mod tests {
     #[test]
     fn the_nodes_key_from_the_bucket_signs_in_only_from_this_machine_while_the_keys_are_in_the_clear() {
         assert!(nodes_key(false, true, false), "sealed keys: a node on another machine");
-        assert!(nodes_key(false, false, true), "in the clear: a node on this machine");
+        assert!(nodes_key(false, false, true), "in the clear: a node on this machine, or with the authority's certificate");
         assert!(!nodes_key(false, false, false), "in the clear: from elsewhere, nobody (a bucket reader)");
         assert!(!nodes_key(true, true, true), "an admin token: the nodes call with it, the key opens nothing");
     }
