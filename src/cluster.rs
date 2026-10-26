@@ -225,7 +225,7 @@ impl Cluster {
                     // (a newer term claimed meanwhile: cut off a moment ago, or paused for longer
                     // than a lease. SlateDB's fencing stops our commits; this stops our reads too.)
                     if superseded(&store, me.leader.n).await {
-                        restart("a newer term has a leader");
+                        crate::node::restart("a newer term has a leader");
                     }
                 }
                 due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 }); // (C5: a key at most once a second, each look)
@@ -264,10 +264,10 @@ impl Cluster {
                     // seconds (claiming needs it): if the bucket was down for everyone, the leader
                     // reaches it again in those seconds, and keeps leading.
                     match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)),
+                        Ok(Some(t)) if t.n > self.leader.n => crate::node::restart(&format!("term {} has a newer leader", t.n)),
                         Ok(_) if reached.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(3) => {
                             if claim(&store, self.leader.n + 1, &self.addr).await.is_ok() {
-                                restart("the leader can't reach the bucket: the next term was claimed");
+                                crate::node::restart("the leader can't reach the bucket: the next term was claimed");
                             }
                         }
                         Ok(_) => {}
@@ -280,12 +280,12 @@ impl Cluster {
                     Ok(r) => {
                         let (term, nodes): (u64, Vec<String>) = r.json().await.unwrap_or_default();
                         if term != self.leader.n {
-                            restart("a new leader answers at the leader's address");
+                            crate::node::restart("a new leader answers at the leader's address");
                         }
                         // (a holder away past the lease may hold another lake now: a lake in memory started
                         // again claims the same first term, so the term alone doesn't tell them apart)
                         if !self.may_lead && !self.leader_ok() {
-                            restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)");
+                            crate::node::restart("its holder answers again after the lease: it may hold another lake now (a lake in memory started again)");
                         }
                         *self.view.lock().unwrap() = nodes;
                         *self.last_ok.lock().unwrap() = Instant::now();
@@ -296,17 +296,17 @@ impl Cluster {
                         if !matches!(latest(&store).await, Ok(Some(t)) if t.n > self.leader.n) {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok();
                         }
-                        restart("the leader stepped down");
+                        crate::node::restart("the leader stepped down");
                     }
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader is gone (`alive`): it never deposes a live one.
                     Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await || deaf(&store, &self.leader).await } => match latest(&store).await {
-                        Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)), // follow it
+                        Ok(Some(t)) if t.n > self.leader.n => crate::node::restart(&format!("term {} has a newer leader", t.n)), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
                             claim(&store, self.leader.n + 1, &self.addr).await.ok(); // we win the term, or someone else does
-                            restart("the leader stopped answering (and no peer hears it): the next term was claimed");
+                            crate::node::restart("the leader stopped answering (and no peer hears it): the next term was claimed");
                         }
                         Err(_) => {} // can't reach the bucket either: wait
                     },
@@ -328,7 +328,7 @@ impl Cluster {
                 for _ in 0..15 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     if STREAM_DOWN.load(std::sync::atomic::Ordering::Relaxed) && matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                        restart("another leads");
+                        crate::node::restart("another leads");
                     }
                 }
                 // Following a leader that has been gone for two checks: reopen reading the
@@ -336,7 +336,7 @@ impl Cluster {
                 // files our view reads) would stay invisible until a new leader appears.
                 gone = if streamed && !self.leader_alive().await { gone + 1 } else { 0 };
                 if gone >= 2 || matches!(latest(&store).await, Ok(Some(t)) if t.n != self.leader.n) {
-                    restart("the leader is gone or another leads");
+                    crate::node::restart("the leader is gone or another leads");
                 }
             }
         });
@@ -649,59 +649,5 @@ fn relock(t: &Term) {
             });
         }
         Err(_) => {} // the mark still covers it
-    }
-}
-
-/// Re-run this same binary with the same arguments: the new process re-reads its role.
-/// (By the path it was started with: if the binary was upgraded in place, the new one starts.)
-pub fn restart(why: &str) -> ! {
-    restart_with(why, &[])
-}
-
-/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
-/// tries: `env.rs`), on top of what this process was given.
-pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
-    let guest = crate::node::is_guest();
-    if guest && crate::write::tries() >= 5 {
-        eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
-        crate::memory::leave();
-        std::process::exit(1);
-    }
-    eprintln!("restarting to rejoin the cluster: {why}");
-    // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
-    // them for a moment, and nobody here may take that for our end: `gone_here`. A guest's don't: its
-    // lock is let go by the exec, and counts as gone at once, so the next writer doesn't wait on it)
-    if !guest {
-        if let Ok(held) = HELD.lock() {
-            held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
-        }
-    }
-    if crate::node::hosted() {
-        crate::library::restart(why); // (in place: a library's host keeps its process)
-    }
-    crate::memory::leave(); // (what this process made goes first: exec and `process::exit` run no destructor)
-    let mut args = std::env::args_os();
-    let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
-    // (a guest's rerun keeps its job, so a write it recorded once isn't recorded again by the rerun: `write::job`)
-    let mut carry = carried.to_vec();
-    if guest && !carried.iter().any(|(k, _)| *k == "PONDRA_JOB") {
-        carry.push(("PONDRA_JOB", crate::write::job().to_string()));
-        carry.push(("PONDRA_TRIES", (crate::write::tries() + 1).to_string()));
-    }
-    cmd.args(args).envs(crate::env::given()).envs(carry.iter().map(|(k, v)| (k, v)));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        panic!("restart failed: {}", cmd.exec()); // replaces this process; only returns on failure
-    }
-    #[cfg(not(unix))]
-    if crate::env::is_set("PONDRA_SUPERVISED") {
-        std::process::exit(75); // (`pondra service`'s supervisor starts it again: one node, as exec keeps it elsewhere)
-    }
-    #[cfg(not(unix))]
-    match cmd.spawn() {
-        // No exec() on Windows: start the replacement, then leave (it binds our address once we're gone).
-        Ok(_) => std::process::exit(0),
-        Err(e) => panic!("restart failed: {e}"),
     }
 }

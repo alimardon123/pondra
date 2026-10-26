@@ -3,7 +3,10 @@
 //! A guest (`Options::guest`) is a node a program starts for its own statements: it answers them and ends.
 //!
 //! This file is the lake half: what a node is made of that a page has too (`stop`, `say`, the guest's and the moves'
-//! state), and a host's state (`hosted`, `host`, the supervisor's events). The doors half is `node/run.rs`.
+//! state), a host's state (`hosted`, `host`, the supervisor's events), and what a node does to start again
+//! (`restart`, `restart_with`), the program's own path (`exe`) and the lead of a lake nobody leads (`lead_once`).
+//! The doors half is `node/run.rs`.
+use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
 use tokio::sync::mpsc;
 
@@ -21,7 +24,7 @@ pub enum Guest {
 }
 
 crate::per_node!(
-    /// Is the node open in this process a guest? Set at its start, set back when it stops: `cluster::restart_with`
+    /// Is the node open in this process a guest? Set at its start, set back when it stops: `restart_with`
     /// keeps a guest's job, and a guest's lock file counts as gone at once.
     static GUEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false));
 
@@ -97,7 +100,7 @@ pub fn hosted() -> bool { HOSTED.load(SeqCst) }
 /// (a library's `Opened`).
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's supervisor is the doors half's)
 pub(crate) enum Event {
-    /// Halt the node and start it again (`cluster::restart_with`).
+    /// Halt the node and start it again (`restart_with`).
     Restart(String),
     /// Stop the node and say why until it is opened again.
     Failed(String),
@@ -138,3 +141,86 @@ pub(crate) fn unhost() { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inne
 /// Is a node open in this process as a library's? (`host` refuses a second one.)
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the library's open of a lake from JSON asks it first)
 pub(crate) fn hosting() -> bool { SUPERVISOR.lock().unwrap_or_else(PoisonError::into_inner).is_some() }
+
+/// What a node restarting in place unwinds with ([`restart_with`]): `panics::spawn` lets it go, and
+/// `panics::door` answers the request 57P03, as a node catching up does.
+#[derive(Debug)]
+pub struct Restarting(pub String);
+
+impl std::fmt::Display for Restarting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the node is restarting to rejoin the cluster ({}), catching up with its leader: try again, or ask another node", self.0)
+    }
+}
+
+/// The node must start again, to rejoin its cluster: `restart_with`, with nothing carried.
+pub fn restart(why: &str) -> ! {
+    restart_with(why, &[])
+}
+
+/// `restart`, with settings of the command line's own for the next run (`pondra sql`'s job and its
+/// tries: `env.rs`), on top of what this process was given. A guest sent back five times gives up: its statement
+/// fails, saying why. In a library the node is halted and started again in place: the supervisor is told, and the
+/// task that asked unwinds, past the panic hook (a host's error reporting sees no panic for a takeover). In the
+/// program the same binary runs again (`run::exec_again`). On a page there is no program to run again, so a restart
+/// is a stop until the page decides otherwise (L2's answer in the design).
+pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
+    let guest = is_guest();
+    if guest && crate::write::tries() >= 5 {
+        eprintln!("gave up after 5 restarts: {why}"); // (a guest that is sent back five times is a statement that fails: it says why)
+        crate::memory::leave();
+        std::process::exit(1);
+    }
+    eprintln!("restarting to rejoin the cluster: {why}");
+    // (our claims' lock files say we're coming back: an exec, or a new process on Windows, lets go of
+    // them for a moment, and nobody here may take that for our end: `gone_here`. A guest's don't: its
+    // lock is let go by the exec, and counts as gone at once, so the next writer doesn't wait on it)
+    if !guest {
+        if let Ok(held) = crate::terms::HELD.lock() {
+            held.values().for_each(|(_, f)| crate::terms::say(f, &format!("restarting {}", crate::log::now_ms())));
+        }
+    }
+    if hosted() {
+        send(Event::Restart(why.to_string())); // (in place: a library's host keeps its process)
+        std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
+    }
+    #[cfg(feature = "doors")]
+    run::exec_again(carried);
+    #[cfg(not(feature = "doors"))]
+    {
+        stop(format!("{why}")); // (a page: a restart is a stop, until the page decides otherwise)
+        unreachable!("stop ends an unhosted process")
+    }
+}
+
+/// The program a node starts helpers with (`pondra lead`, Python workers looked for beside it): this
+/// executable in the program; in a library, the one the packages ship beside it (`PONDRA_LAUNCHER`,
+/// which `pondra.open` gives), since the host's executable is Python or Node.
+pub fn exe() -> anyhow::Result<PathBuf> {
+    if cfg!(target_arch = "wasm32") {
+        anyhow::bail!("a page has no pondra program to start"); // (`std::env::current_exe` isn't there)
+    }
+    match hosted() {
+        false => Ok(std::env::current_exe()?),
+        true => crate::env::get("PONDRA_LAUNCHER").map(PathBuf::from).ok_or_else(|| {
+            anyhow::anyhow!("this needs the pondra program, and the library was opened without it: give PONDRA_LAUNCHER, the path of the pondra binary (pondra.open gives the one its package ships)")
+        }),
+    }
+}
+
+/// Leads the lake at `dir` for a moment, making it if nothing is there yet, and answers its inbox, in a `pondra lead`
+/// process of its own (`run::lead_once`). For a lake nobody leads, and for a writer whose leader is gone (`inbox::send`).
+/// A node never leads another lake itself: that lake's catalog writer would outlive the moment in the node, and a
+/// later leader of it would fence it out.
+#[cfg(feature = "doors")]
+pub async fn lead_once(dir: &str) -> anyhow::Result<()> {
+    // (another process would lead a lake of its own memory, gone when it ends)
+    anyhow::ensure!(!crate::memory::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
+    run::lead_once(dir).await
+}
+
+/// A page starts no process, so it leads no lake but its own.
+#[cfg(not(feature = "doors"))]
+pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
+    Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
+}

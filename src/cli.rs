@@ -245,7 +245,7 @@ pub(crate) enum Cmd {
         name: Option<String>,
     },
     /// Lead a lake for a moment: make it if nothing is there yet, answer what waits in its inbox,
-    /// let go. A node runs it for a lake nobody leads (`inbox::lead_once`, invariant 62).
+    /// let go. A node runs it for a lake nobody leads (`node::lead_once`, invariant 62).
     #[command(hide = true)]
     Lead {
         #[arg(long)]
@@ -680,7 +680,7 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            cluster::restart_with("fenced while writing", &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())]);
+            crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())]);
         }
         return Err(err);
     }

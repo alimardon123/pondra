@@ -4,54 +4,22 @@
 //! supervisor, a thread of its own: a restart halts the node and starts it again in place, and a
 //! failure stops it and says why to every request after, until it is opened again.
 //!
-//! The places that exec, abort or exit ask [`hosted`](crate::node::hosted) first and call [`restart`] or
-//! [`failed`](crate::node::failed) instead (`cluster::restart_with`, `panics::spawn`, `format::watch`, the catalog's
-//! compactor). The node's host state is kept in `node.rs`, beside the rest of the node. Helpers the
-//! node starts (`pondra lead`, Python looked for beside it) are the program the packages give
-//! ([`exe`]), never the host's own executable.
+//! The places that exec, abort or exit ask [`hosted`](crate::node::hosted) first and call
+//! [`restart`](crate::node::restart) or [`failed`](crate::node::failed) instead (`node::restart_with`, `panics::spawn`,
+//! `format::watch`, the catalog's compactor). The node's host state is kept in `node.rs`, beside the rest of the node.
+//! Helpers the node starts (`pondra lead`, Python looked for beside it) are the program the packages give
+//! ([`exe`](crate::node::exe)), never the host's own executable.
 //!
 //! A host reaches the node through [`Opened::ask`], straight to its router as its owner (the C ABI,
 //! `capi/`, for Python's `pondra.open`, and its Node-API module for JavaScript's: `designs/l2-step4-open.md`),
 //! answers that stream included. The loopback door the node opens is for what lives outside the host's
 //! process: the console in a browser, Python's workers calling back, other processes on the lake.
-use crate::node::{Event, Node, Options};
+use crate::node::{Event, Node, Options, Restarting};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use futures::FutureExt;
 use tokio::sync::mpsc;
-
-/// The program a node starts helpers with (`pondra lead`, Python workers looked for beside it): this
-/// executable in the program; in a library, the one the packages ship beside it (`PONDRA_LAUNCHER`,
-/// which `pondra.open` gives), since the host's executable is Python or Node.
-pub fn exe() -> anyhow::Result<PathBuf> {
-    match crate::node::hosted() {
-        false => Ok(std::env::current_exe()?),
-        true => crate::env::get("PONDRA_LAUNCHER").map(PathBuf::from).ok_or_else(|| {
-            anyhow::anyhow!("this needs the pondra program, and the library was opened without it: give PONDRA_LAUNCHER, the path of the pondra binary (pondra.open gives the one its package ships)")
-        }),
-    }
-}
-
-/// What a node restarting in place unwinds with ([`restart`]): `panics::spawn` lets it go, and
-/// `panics::door` answers the request 57P03, as a node catching up does.
-#[derive(Debug)]
-pub struct Restarting(pub String);
-
-impl std::fmt::Display for Restarting {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the node is restarting to rejoin the cluster ({}), catching up with its leader: try again, or ask another node", self.0)
-    }
-}
-
-/// In a library, a node that must start again (`cluster::restart_with` calls this after its lock
-/// files say "restarting"): the supervisor is told, and the task that asked unwinds, past the panic
-/// hook (a host's error reporting sees no panic for a takeover).
-pub fn restart(why: &str) -> ! {
-    crate::node::send(Event::Restart(why.to_string()));
-    std::panic::resume_unwind(Box::new(Restarting(why.to_string())))
-}
 
 /// What the node open in this process is doing now.
 #[derive(Clone, Debug, PartialEq)]
