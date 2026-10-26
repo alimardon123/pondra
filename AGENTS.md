@@ -2999,6 +2999,16 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`smallint`, `bigint`; `numeric field overflow` for a decimal); never a quiet NULL, never Arrow's words. INSERT, a
    bulk INSERT, COPY INTO, the Postgres port's COPY, setval and a DEFAULT's check all cast through `casts::into`, and
    a new write path does too. `cargo test --lib casts:: codes::`, harness `loads`, `found`.
+434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`cluster::claim`,
+   `prune`). After its put, a claim lists `cluster/term` while it writes its `alive` mark, one round trip for both: a term
+   above its own number means a newer leader holds the lake, so the claim deletes its own `alive` mark, lets its lock go,
+   and returns no term (its record stays; a later prune removes it). Above 32 terms, the claim also lists `alive` and `left`
+   (one round trip) and deletes everything below the newest 16, awaited and capped at 10 s, so a one-off writer's prune
+   finishes before it exits. A lake of 32 or fewer pays no more than the term listing. The superseded check holds
+   (`cluster::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
+   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib cluster::`; harness `serverless`
+   (34 one-off INSERTs, which cross 32: at most 32 terms kept, the newest among them, the table reads back 34 rows, and
+   nothing below the oldest kept in `alive` or `left`).
 ## Tests: run these before and after any change
 
 ```bash

@@ -2127,12 +2127,28 @@ def serverless():
     node2_leads = leads(node2)
     node2.kill()
     guest_checks, guest_times = serverless_guest(A.port + 3)  # (`pondra sql` as a guest node: its own lakes, one assertion each)
+    # 34 one-off writers, each a term of its own that lets go (invariant 434): more than 32, so a prune must run, and the lake
+    # keeps 16 to 32 term records, the newest of them the last claim's, and alive and left hold nothing below the oldest one
+    # kept. Every row reads back.
+    oneoff, ONEOFF = {}, 34
+    done(cli("CREATE TABLE oneoff (k BIGINT)"))
+    top = max(int(x) for x in os.listdir(terms) if x.isdigit()) if local else 0
+    for i in range(ONEOFF):
+        done(cli(f"INSERT INTO oneoff VALUES ({i})"))
+    if local:
+        kept = sorted(int(x) for x in os.listdir(terms) if x.isdigit())
+        below = {p: [int(x) for x in os.listdir(os.path.join(lake, "cluster", p)) if x.isdigit() and int(x) < kept[0]] for p in ("alive", "left") if os.path.isdir(os.path.join(lake, "cluster", p))}
+        oneoff = {"kept": len(kept), "newest_is_last_claim": kept[-1] == top + ONEOFF, "below_oldest_kept": below, "terms_16_to_32": 16 <= len(kept) <= 32}
+    rows = re.search(r"^\|\s*(\d+)\s*\|$", done(cli("SELECT count(*) AS n FROM oneoff")), re.M)
+    oneoff["rows"] = int(rows.group(1)) if rows else None
+    oneoff_ok = (oneoff["rows"] == ONEOFF and (not local or (oneoff["terms_16_to_32"] and oneoff["newest_is_last_claim"]
+                 and not any(oneoff["below_oldest_kept"].values()))))
     # 8000 rows, and the leader started here adds 1000 more: 9000.
     ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and other_machine_waits and all(guest_checks.values()))
+          and after_kill_s < 10 and other_machine_waits and all(guest_checks.values()) and oneoff_ok)
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
                                      "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
-                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "ok": ok}}))
+                                     "rows": n, "guest": guest_checks, "guest_times": guest_times, "one_off": oneoff, "one_off_ok": oneoff_ok, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
