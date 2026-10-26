@@ -31,7 +31,7 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
         crate::ext::create(lake, &format!("share_{name}"), params, true, false).await?;
     }
     let token = crate::ext::share_token(lake, endpoint).await?.with_context(|| format!("no token for {endpoint}: ATTACH '<the share's profile>' AS {name} (TYPE share), or add TOKEN '…'"))?;
-    let r = crate::ext::web().get(format!("{endpoint}/shares")).bearer_auth(&token).timeout(std::time::Duration::from_secs(15)).send().await.with_context(|| format!("reaching {endpoint}"))?;
+    let r = crate::fetch::send(crate::fetch::timeout(crate::ext::web().get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
     let (status, body) = (r.status(), r.json::<Value>().await.unwrap_or_default());
     ensure!(status.is_success(), "{endpoint} says {status}: {}", body["message"].as_str().unwrap_or_default());
     let shares: Vec<String> = body["items"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str().map(str::to_string)).collect();
@@ -58,7 +58,7 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         ask["version"] = j!(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?);
     }
     let at = format!("{endpoint}/shares/{}/schemas/{}/tables/{}/query", o("share"), o("schema"), o("table"));
-    let r = crate::ext::web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask).send().await.with_context(|| format!("reaching {endpoint}"))?;
+    let r = crate::fetch::send(crate::ext::web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask)).await.with_context(|| format!("reaching {endpoint}"))?;
     let status = r.status();
     let delta = r.headers().get("delta-sharing-capabilities").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("responseformat=delta"));
     let text = r.text().await?;
@@ -123,7 +123,7 @@ impl object_store_df::ObjectStore for Links {
             (Some(r), _) => ours(r),
             (None, _) => object_store::GetRange::Offset(0),
         };
-        let r = crate::ext::web().get(&url).header("range", byte_range::header(&want)).send().await.map_err(links_error)?;
+        let r = crate::fetch::send(crate::ext::web().get(&url).header("range", byte_range::header(&want))).await.map_err(links_error)?;
         match r.status().as_u16() {
             200 | 206 => {}
             404 => return Err(object_store_df::Error::NotFound { path: location.to_string(), source: "the provider has no such file now".into() }),

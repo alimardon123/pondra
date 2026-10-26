@@ -21,7 +21,7 @@ use object_store::ClientConfigKey;
 use object_store::local::LocalFileSystem;
 use object_store::{path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use crate::kv::{self, slate, Kv, Written};
+use crate::kv::{self, Kv, Written};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
@@ -1214,11 +1214,11 @@ impl Lake {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
                     let t0 = std::time::Instant::now();
-                    let kv = slate::Writer::open(store.clone(), cache_dir, local).await?;
+                    let kv = kv::writer(store.clone(), cache_dir, local).await?;
                     trace("the catalog's writer open", t0);
-                    Catalog::writer(Arc::new(kv), t0).await?
+                    Catalog::writer(kv, t0).await?
                 }
-                false => match Catalog::opened(store.clone(), streamed, slate::Reader::open(store.clone(), streamed, cache_dir, poll)).await {
+                false => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
                     Ok(cat) => cat,
                     // (no catalog at all: say so, rather than the database's own words for it)
                     Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -2120,7 +2120,7 @@ impl Drop for Catalog {
 }
 
 impl Catalog {
-    /// The catalog as its leader opens it, on `kv` (the leader's store, `slate::Writer::open`). `since`: when its
+    /// The catalog as its leader opens it, on `kv` (the leader's store, `kv::writer`). `since`: when its
     /// opening began, for `PONDRA_TRACE_START`.
     async fn writer(kv: Arc<dyn Kv>, since: Instant) -> Result<Self> {
         let mut cat = Self::new(kv);
@@ -2148,7 +2148,7 @@ impl Catalog {
         Ok(cat)
     }
 
-    /// The catalog as a follower or a reader opens it, on `kv` (`slate::Reader::open`).
+    /// The catalog as a follower or a reader opens it, on `kv` (`kv::reader`).
     async fn reader(kv: Arc<dyn Kv>, streamed: bool) -> Result<Self> {
         let mut cat = Self::new(kv);
         cat.follows = streamed;
@@ -2161,8 +2161,8 @@ impl Catalog {
     /// for ever. When opening takes a while, a listing (after the store's own retries) says
     /// whether there is a catalog to wait for. `reader_open` is the reader's opening: this waits
     /// for it, and for the catalog's first view of the bucket, under the one timeout.
-    async fn opened(store: Store, streamed: bool, reader_open: impl std::future::Future<Output = Result<slate::Reader, kv::Error>>) -> Result<Self> {
-        let open = async { Self::reader(Arc::new(reader_open.await?), streamed).await };
+    async fn opened(store: Store, streamed: bool, reader_open: impl std::future::Future<Output = Result<Arc<dyn Kv>, kv::Error>>) -> Result<Self> {
+        let open = async { Self::reader(reader_open.await?, streamed).await };
         tokio::pin!(open);
         if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
             return cat;
@@ -2843,7 +2843,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
@@ -2907,7 +2907,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
         let first = cat.parsed("t/a", &raw)?;
@@ -2944,7 +2944,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
-        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
+        let cat = Catalog::writer(kv::writer(store, None, true).await?, Instant::now()).await?;
         let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
         cat.send(change(1, data_key(1), b"rows"));
         assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));

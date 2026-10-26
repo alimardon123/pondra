@@ -189,17 +189,18 @@ async fn call(embed: bool, inputs: &[&str], model: &str) -> anyhow::Result<Vec<V
     let secs = crate::env::or("PONDRA_AI_TIMEOUT_SECS", 300);
     let mut wait = Duration::from_millis(500);
     for tries in 1.. {
-        let mut req = crate::cluster::http_bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body).timeout(Duration::from_secs(secs)); // (not the nodes' client: its token is theirs alone)
+        let req = crate::cluster::http_bare().post(format!("{}/{path}", url.trim_end_matches('/'))).json(&body); // (not the nodes' client: its token is theirs alone)
+        let mut req = crate::fetch::timeout(req, Duration::from_secs(secs));
         if let Some(key) = crate::env::get("PONDRA_AI_KEY") {
             req = req.bearer_auth(key);
         }
-        let reply = req.send().await;
+        let reply = crate::fetch::send(req).await;
         let again = match &reply {
             Ok(r) if r.status() == 429 || r.status().is_server_error() => {
                 let said = r.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse::<f64>().ok());
                 Some(said.map_or(wait, |s| Duration::from_secs_f64(s.clamp(0.0, 60.0))))
             }
-            Err(e) if (e.is_connect() || e.is_request()) && !e.is_timeout() => Some(wait),
+            Err(e) if crate::fetch::unreached(e) => Some(wait),
             _ => None,
         };
         match again {

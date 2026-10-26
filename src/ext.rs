@@ -731,7 +731,11 @@ pub async fn secret_for(lake: &Lake, url: &str) -> Result<Option<BTreeMap<String
 /// A client for other engines' services (REST catalogs): Pondra's own tokens never go there.
 pub fn web() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client"))
+    #[cfg(not(target_arch = "wasm32"))]
+    let client = || reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).build().expect("an HTTP client");
+    #[cfg(target_arch = "wasm32")]
+    let client = reqwest::Client::new; // (a page's fetch keeps the browser's own time limits)
+    CLIENT.get_or_init(client)
 }
 
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
@@ -822,7 +826,7 @@ pub async fn rest_token(lake: &Lake, url: &str) -> Result<Option<String>> {
     let at = p.get("oauth2_server_uri").cloned().unwrap_or_else(|| format!("{url}/v1/oauth/tokens"));
     let form = [("grant_type", "client_credentials"), ("client_id", id), ("client_secret", pass), ("scope", p.get("oauth2_scope").map_or("catalog", String::as_str))];
     let body = url::form_urlencoded::Serializer::new(String::new()).extend_pairs(form).finish();
-    let r = web().post(&at).header("content-type", "application/x-www-form-urlencoded").body(body).send().await.with_context(|| format!("asking {at} for a token"))?;
+    let r = crate::fetch::send(web().post(&at).header("content-type", "application/x-www-form-urlencoded").body(body)).await.with_context(|| format!("asking {at} for a token"))?;
     let status = r.status();
     let body: serde_json::Value = r.json().await.unwrap_or_default();
     ensure!(status.is_success(), "{at} gave no token ({status}): {}", body["error_description"].as_str().or(body["error"].as_str()).unwrap_or(""));

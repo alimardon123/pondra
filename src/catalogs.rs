@@ -116,7 +116,7 @@ impl Rest {
                 }
             }
         }
-        let r = r.body(bytes).send().await.with_context(|| format!("reaching {url}"))?;
+        let r = crate::fetch::send(r.body(bytes)).await.with_context(|| format!("reaching {url}"))?;
         let status = r.status();
         Ok((status, r.json().await.unwrap_or_default()))
     }

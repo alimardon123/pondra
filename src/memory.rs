@@ -561,6 +561,7 @@ const PIECE: u64 = 8 << 20;
 
 /// `range` of a spilled file, as a stream of pieces of at most `PIECE`, each read in one blocking call.
 /// The file stays open while it is read, as a file's own stream keeps it: deleted meanwhile, it still reads.
+#[cfg(not(target_arch = "wasm32"))]
 fn pieces(file: std::fs::File, range: Range<u64>) -> BoxStream<'static, object_store::Result<Bytes>> {
     futures::stream::try_unfold((file, range.start), move |(mut file, at)| async move {
         if at >= range.end {
@@ -659,9 +660,11 @@ impl ObjectStore for Held {
     async fn get_opts(&self, at: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
         let got = self.0.objects.get_opts(at, opts.clone()).await;
         let (Err(object_store::Error::NotFound { .. }), Some(disk)) = (&got, self.0.disk_of(at)) else { return got };
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut found = disk.store.get_opts(at, opts).await?;
         // (a file's own stream reads 8 KB a blocking call, which made queries over a spilled lake 1.4x
         // slower: read it a piece at a time instead, each piece one call)
+        #[cfg(not(target_arch = "wasm32"))] // (a page has no files: its spills are refused, `Disk::make`)
         if let GetResultPayload::File(file, _) = found.payload {
             found.payload = GetResultPayload::Stream(pieces(file, found.range.clone()));
         }

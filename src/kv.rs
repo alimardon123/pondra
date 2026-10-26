@@ -5,7 +5,34 @@ use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod slate;
+
+/// The catalog's store as its leader opens it: SlateDB's writer on a node.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn writer(store: crate::store::Store, cache_dir: Option<std::path::PathBuf>, local: bool) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(slate::Writer::open(store, cache_dir, local).await?))
+}
+
+/// The catalog's store as a follower or a reader opens it: SlateDB's reader on a node.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn reader(store: crate::store::Store, streamed: bool, cache_dir: Option<std::path::PathBuf>, poll: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(slate::Reader::open(store, streamed, cache_dir, poll).await?))
+}
+
+/// A page's catalog store comes with the lake on a page (designs/page-same-core.md P2); until then a page opens none.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn writer(_: crate::store::Store, _: Option<std::path::PathBuf>, _: bool) -> Result<Arc<dyn Kv>, Error> {
+    Err(Error { closed: false, source: NO_PAGE_KV.into() })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn reader(_: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, _: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
+    Err(Error { closed: false, source: NO_PAGE_KV.into() })
+}
+
+#[cfg(target_arch = "wasm32")]
+const NO_PAGE_KV: &str = "a page keeps no lake's catalog yet";
 
 /// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`); a page's own later (designs/page-same-core.md).
 #[async_trait::async_trait]
