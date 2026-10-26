@@ -343,7 +343,7 @@ impl Client {
                 }
                 r.i32()?; // preferred read replica
                 let records = r.nbytes()?.unwrap_or_default();
-                let (recs, next) = decode(&records, offset, &aborted)?;
+                let (recs, next) = decode(&records, offset, &aborted, MOST)?;
                 return Ok((recs, next, stable));
             }
         }
@@ -399,8 +399,9 @@ impl Client {
 /// A fetch's record batches as records from `from` on: control batches and aborted
 /// transactions' records left out, a batch cut short at the end ignored. And the offset after
 /// the last whole batch (markers and aborted records count: the next fetch starts there).
-fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)]) -> Result<(Vec<Record>, i64)> {
-    let (mut out, mut next) = (vec![], from);
+/// Batches hold `most` bytes decompressed, all together (`kafka_wire::MOST`).
+fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)], most: u64) -> Result<(Vec<Record>, i64)> {
+    let (mut out, mut next, mut left) = (vec![], from, most);
     let mut aborting: std::collections::HashSet<i64> = Default::default();
     let mut starts: Vec<(i64, i64)> = aborted.to_vec(); // (producer, first offset)
     starts.sort_by_key(|a| a.1);
@@ -416,7 +417,7 @@ fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)]) -> Result<(Vec<Record
         let base = i64::from_be_bytes(batch[..8].try_into()?);
         let mut r = Rd { b: Bytes::copy_from_slice(&batch[21..]), at: 0 };
         let attributes = r.i16()?;
-        next = next.max(base + r.i32()? as i64 + 1);
+        let after = base + r.i32()? as i64 + 1;
         let base_ts = r.i64()?;
         r.i64()?;
         let (producer, _, _, count) = (r.i64()?, r.i16()?, r.i32()?, r.i32()?);
@@ -425,12 +426,21 @@ fn decode(mut b: &[u8], from: i64, aborted: &[(i64, i64)]) -> Result<(Vec<Record
         }
         if attributes & 0x20 != 0 {
             aborting.remove(&producer); // (a control batch: its transaction ends here)
+            next = next.max(after);
             continue;
         }
         if attributes & 0x10 != 0 && aborting.contains(&producer) {
+            next = next.max(after);
             continue; // (a transaction that was aborted)
         }
-        let body = decompress(attributes & 7, &r.b[r.at..], MOST)?; // (a batch at a time: the fetch's size bounds the answer, and a topic is an admin's to name)
+        // (the fetch's size bounds what is sent, not what it decompresses to: past what is left, this batch comes
+        // first in the next fetch, with the whole of it; security pass 2)
+        let body = match decompress(attributes & 7, &r.b[r.at..], left) {
+            Err(_) if left < most => break,
+            body => body?,
+        };
+        left -= body.len() as u64;
+        next = next.max(after);
         let log_append = attributes & 8 != 0;
         let mut r = Rd { b: body.into(), at: 0 };
         for _ in 0..count {
@@ -712,4 +722,24 @@ fn murmur2(data: &[u8]) -> u32 {
     h ^= h >> 13;
     h = h.wrapping_mul(m);
     h ^ (h >> 15)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fetch_decompresses_what_its_budget_holds_and_the_next_batch_waits_for_the_next_fetch() {
+        let batch = |base: i64| {
+            let mut b = encode((1, 0, 0), &[(None, Some(vec![7u8; 100])), (None, Some(vec![8u8; 100]))]);
+            b[..8].copy_from_slice(&base.to_be_bytes()); // (the CRC covers what follows the base offset)
+            b
+        };
+        let fetched = [batch(0), batch(2)].concat();
+        let (all, next) = decode(&fetched, 0, &[], MOST).unwrap();
+        assert_eq!((all.iter().map(|r| r.offset).collect::<Vec<_>>(), next), (vec![0, 1, 2, 3], 4));
+        let (first, next) = decode(&fetched, 0, &[], 300).unwrap();
+        assert_eq!((first.iter().map(|r| r.offset).collect::<Vec<_>>(), next), (vec![0, 1], 2), "the second batch is past the budget: it is fetched next");
+        assert!(decode(&batch(0), 0, &[], 100).is_err(), "a batch alone over the budget is refused, as before");
+    }
 }
