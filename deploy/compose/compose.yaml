@@ -35,6 +35,10 @@ x-node: &node
     - AWS_REGION
     - AWS_ENDPOINT
     - AWS_ALLOW_HTTP
+    # (the key that seals secrets and the lake's own keys, on the volume every node mounts: without a
+    # token, the nodes sign each other in from their own containers by it; a token or
+    # PONDRA_SECRET_KEY, when set, is the key instead)
+    - PONDRA_SHARED_KEY_FILE=/data/.pondra/secret.key
 
 services:
   node1:

@@ -187,6 +187,8 @@ def compose(a):
                         and sorted(x["role"] for x in s) == ["follower", "follower", "leader"] and len(s[0]["nodes"]) == 3 and s, 60)
         info["at start"] = [(x["role"], x["leader"], x["term"]) for x in settled or up]
         check("they are one cluster: one leader, the others following it", settled, info["at start"])
+        # (the key file every node mounts seals them, so the nodes' key in the lake opens nothing alone)
+        check("the lake's own keys are sealed", (stats(8080, token) or {}).get("keys") == "sealed", (stats(8080, token) or {}).get("keys"))
         sql(8081, "CREATE TABLE t (id BIGINT, at TIMESTAMP)", token=token)
         sql(8081, "INSERT INTO t SELECT x, now() FROM generate_series(1, 30000) AS g(x)", token=token)
         check("a write on one node is read on another", until(lambda: count(8082, token=token) == 30000, 30), count(8082, token=token))

@@ -354,7 +354,8 @@ cover `s3://data-other`.
 
 The master key is `PONDRA_SECRET_KEY`, and **every node of a cluster needs the same one**: a node
 with another key stops with `was sealed with another master key`. Without it a node makes a key for its
-machine at `~/.pondra/secret.key`, which is enough for nodes that share that file. Better, a key
+machine at `~/.pondra/secret.key`, which is enough for nodes that share that file; nodes on one volume
+give its path as `PONDRA_SHARED_KEY_FILE`, which makes it their master key (Compose's do). Better, a key
 service keeps it: `PONDRA_KMS_COMMAND` names a command the node runs with `wrap` or `unwrap` and a data
 key on its input (a short script over `aws kms`, `gcloud kms`, `az keyvault key` or Vault's
 `transit`), so the master key is never in a file, a variable or the lake. To change the master key,
