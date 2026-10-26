@@ -1,21 +1,18 @@
 //! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines and dashboards, the
 //! grants on them, and `GRANT EXECUTE`. One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
-//! WAIT FOR are read by a script (`script.rs`, where a statement starts) with the texts below. A statement that starts
-//! with none of the heads below is not read further, and a query pays nothing.
+//! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
+//! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
 
 /// What a pipeline's statements say; `{}` is the statement's words.
 const PIPELINE: &str = "{}: pipelines come in 1.1; until then, tasks that follow others run statements in order (CREATE TASK … AFTER …)";
 /// What a dashboard's statements say; `{}` is the statement's words.
 const DASHBOARD: &str = "{}: dashboards come in 1.1; until then, a SQL file's Chart tab in the console draws an answer";
 /// A pipeline's STEP, where a script's statement starts.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 const STEP: &str = "STEP is a pipeline's, coming in 1.1 (CREATE PIPELINE … AS BEGIN STEP … END); in a script each statement is already a step";
 /// A pipeline's PARALLEL, where a script's statement starts.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1; in a script, ASYNC … AWAIT ALL runs statements side by side, and FOR … PARALLEL n a loop's passes";
 /// A pipeline's WAIT FOR, where a script's statement starts.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
 
@@ -53,6 +50,10 @@ const HEADS: &[&str] = &["create", "alter", "drop", "show", "explain", "comment"
 /// What is refused in `sql`, if it is one of 1.1's statements: the words that say what to write instead. None for any other.
 pub fn refusal(sql: &str) -> Option<String> {
     let first = crate::text::head(sql);
+    if matches!(first.as_str(), "step" | "parallel" | "wait") {
+        let next = crate::text::first_words(sql, 2).into_iter().nth(1);
+        return pipeline_part(&first, next.as_deref()).map(str::to_string); // (a page has no scripts: it reads these here)
+    }
     if !HEADS.contains(&first.as_str()) {
         return None;
     }
@@ -97,7 +98,6 @@ fn execute_pipeline(words: &[String]) -> Option<String> {
 
 /// A pipeline's word where a script's statement starts (`script.rs`, lower-cased): STEP, PARALLEL, and WAIT only before FOR
 /// (any other WAIT is a statement like the rest, and None). `next` is the word after it.
-#[cfg_attr(not(feature = "server"), allow(dead_code))]
 pub fn pipeline_part(word: &str, next: Option<&str>) -> Option<&'static str> {
     match word {
         "step" => Some(STEP),
@@ -132,6 +132,9 @@ mod tests {
         assert!(refusal("REVOKE EXECUTE ON FUNCTION f FROM r").unwrap().starts_with("GRANT EXECUTE comes in 1.1"));
         assert!(refusal("EXECUTE PIPELINE sales.orders (day => 1)").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
         assert!(refusal("EXECUTE PIPELINE nightly").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
+        assert_eq!(refusal("STEP a AS SELECT 1").as_deref(), Some(STEP));
+        assert_eq!(refusal("parallel SELECT 1").as_deref(), Some(PARALLEL));
+        assert_eq!(refusal("WAIT FOR p").as_deref(), Some(WAIT_FOR));
     }
 
     #[test]
@@ -161,6 +164,7 @@ mod tests {
             "EXECUTE TASK nightly",
             "SELECT step, parallel FROM t",
             "SELECT 1 AS parallel",
+            "WAIT 5",
         ] {
             assert!(refusal(sql).is_none(), "{sql}");
         }
