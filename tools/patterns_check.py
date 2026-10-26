@@ -1417,11 +1417,11 @@ FIXED += [
                  {"s": 7, "e": 7, "n": 1, "sx": 20}]),
     # Oracle's 22-7 (ALL ROWS PER MATCH, RUNNING and FINAL AVG): its DEFINE is A.Price >= AVG(A.Price), which reads A's own
     # rows including the tested one. XYZ's prices 10, 16, 13, 9 (Table 22-2): day 1 is 10 >= 10; day 2 is 16 >= 13; day 3
-    # is 13 >= 13; day 4 is 9 >= 12, false in the match that starts at day 1. The match is days 1-3, and the page's Table
-    # 22-3 gives those three rows (running averages 10, 13, 13; final averages 13, 13, 13). DISAGREEMENT WITH THE PAGE:
-    # the table leaves out day 4, but after the match 1-3 (PAST LAST ROW) a new match starts at day 4, and its one row
-    # is its own average: 9 >= 9 holds, so it is a match (running and final 9). The answer here is the rule's, with that
-    # fourth row; the page's table is the three rows only.
+    # is 13 >= 13; day 4 is 9 >= 12, false in the match that starts at day 1. The match is days 1-3: the page's
+    # walkthrough covers only this first match, {R1, R2, R3}, where R4 fails (9 >= 12), and its Table 22-3 prints the
+    # three rows (running averages 10, 13, 13; final averages 13, 13, 13). With the default SKIP PAST LAST ROW the search
+    # goes on at R4, where 9 >= AVG(9) holds, so R4 is a match of its own (running and final 9): the printed table stops
+    # at the first match. This answer keeps that fourth row.
     dict(name="Oracle's 22-7: DEFINE A AS A.price >= AVG(A.price), RUNNING and FINAL AVG (its table gives days 1-3 only)", table="xyz",
          partition="symbol", order="day", pattern="a+", skip="PAST LAST ROW", define_text={"a": "a.price >= AVG(a.price)"}, mode="show",
          spec=(("running_avg", "avg", "price", "a", "RUNNING"), ("final_avg", "avg", "price", "a", "FINAL")),
