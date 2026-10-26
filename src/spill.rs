@@ -61,7 +61,7 @@ impl Spill {
     pub fn push(&mut self, batch: RecordBatch) -> Result<()> {
         let batch = crate::answer::compact(batch); // (a shuffle cuts every batch into a piece per node and partition: without it, each piece carries, writes and sends all of the batch's strings; TPC-H q21 wrote 2.5 GB a node, not a tenth of that)
         self.schema.get_or_insert_with(|| batch.schema());
-        self.bytes += size(&batch);
+        self.bytes += crate::answer::size(&batch);
         self.rows.push(batch);
         if self.bytes >= piece() {
             self.write()?;
@@ -144,7 +144,7 @@ impl Spill {
         crate::metrics::add(&crate::metrics::WIRE, piece.len() as u64);
         if self.files.is_empty() && piece.len() < self::piece() / 8 && self.rows.is_empty() {
             self.rows = crate::log::decode(piece)?;
-            self.bytes = self.rows.iter().map(size).sum();
+            self.bytes = self.rows.iter().map(crate::answer::size).sum();
             self.schema = self.rows.first().map(|b| b.schema());
             return Ok(());
         }
@@ -155,13 +155,6 @@ impl Spill {
         self.files.push(path);
         Ok(())
     }
-}
-
-/// The bytes a batch's rows take — not the buffers they sit in, which a batch cut from a bigger
-/// one shares with it, and a builder leaves half empty.
-fn size(b: &RecordBatch) -> usize {
-    use datafusion::arrow::array::Array;
-    b.columns().iter().map(|c| c.to_data().get_slice_memory_size().unwrap_or_else(|_| c.get_array_memory_size())).sum()
 }
 
 /// One piece with its length before it, as `framed` sends them.
