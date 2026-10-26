@@ -1390,7 +1390,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             let old = crate::answer::dtype(&m.columns[at].1)?;
             if let Some(wanted) = declared.filter(|_| old == new) {
                 // A length on text only grows: the rows there were checked against the one it had.
-                match (held.as_deref().and_then(crate::types::length), crate::types::length(&wanted)) {
+                match (held.as_deref().and_then(crate::rules::typed::length), crate::rules::typed::length(&wanted)) {
                     (Some(k), Some(n)) if n == k => return Ok(j!({"table": name, "unchanged": true})),
                     (Some(k), Some(n)) if n > k => {}
                     (Some(k), _) => return Err(crate::codes::coded("42804", format!("{column} is VARCHAR({k}): its length only grows, since its rows may be {k} characters long (VARCHAR({k}) or more, or TEXT)"))),

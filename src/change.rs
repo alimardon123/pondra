@@ -203,7 +203,7 @@ impl Merge {
     /// row takes its default, as before).
     pub fn written(&self, t: &crate::rules::Table) -> Written {
         use crate::rules::keys::Said;
-        let is_default = |v: &str| crate::defaults::is_word(v);
+        let is_default = |v: &str| crate::rules::rows::is_word(v);
         let table: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
         let mut given: Vec<(Vec<String>, Said)> = vec![];
         let mut set: Vec<String> = vec![];
@@ -635,14 +635,14 @@ async fn select_as(lake: &Lake, meta: &TableMeta, set: Option<&[(String, String)
     }
     if let Some(set) = set {
         items.extend(cols.iter().map(|c| match set.iter().find(|(s, _)| s == *c) {
-            Some((_, e)) => format!("({}) AS {}", crate::defaults::value(meta, c, e), q(&format!("__n_{c}"))),
+            Some((_, e)) => format!("({}) AS {}", crate::rules::rows::value(meta, c, e), q(&format!("__n_{c}"))),
             // (an unchanged column keeps the row's own value: a keyed table's `_deleted` too, so an
             // updated row isn't marked deleted, and rows not deleted keep NULL)
             None => format!("{a}.{} AS {}", q(c), q(&format!("__n_{c}"))),
         }));
     }
     if let Some(values) = insert {
-        items.extend(cols.iter().zip(values).map(|(c, v)| format!("({}) AS {}", crate::defaults::value(meta, c, v), q(&format!("__n_{c}")))));
+        items.extend(cols.iter().zip(values).map(|(c, v)| format!("({}) AS {}", crate::rules::rows::value(meta, c, v), q(&format!("__n_{c}")))));
     }
     let sql = format!("SELECT {} {rest}", items.join(", "));
     let ctx = session(lake, &sql, upto).await?;

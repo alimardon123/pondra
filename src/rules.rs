@@ -10,6 +10,8 @@ pub mod rows;
 pub mod txn;
 pub mod typed;
 
+#[cfg(feature = "server")]
+use crate::store::TableMeta;
 use anyhow::{bail, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use datafusion::arrow::datatypes::SchemaRef;
@@ -103,6 +105,20 @@ pub enum LeftOut {
     None,
     Columns(Vec<String>),
     PerRow(HashMap<String, BooleanArray>),
+}
+
+/// JSON lines: for each default's column, the rows whose object hasn't the key.
+#[cfg(feature = "server")]
+pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::HashMap<String, BooleanArray>> {
+    let names: Vec<String> = meta.defaults.keys().map(|s| meta.name_of(s).to_string()).collect();
+    let mut out: std::collections::HashMap<String, Vec<bool>> = names.iter().map(|n| (n.clone(), vec![])).collect();
+    for v in serde_json::Deserializer::from_slice(lines).into_iter::<serde_json::Value>() {
+        let v = v?;
+        for n in &names {
+            out.get_mut(n).expect("a name").push(v.get(n).is_none());
+        }
+    }
+    Ok(out.into_iter().map(|(k, v)| (k, BooleanArray::from(v))).collect())
 }
 
 /// What the rows are for, which says whether `shape` looks for a key given twice among them (step 8): a plain INSERT (`Insert`:

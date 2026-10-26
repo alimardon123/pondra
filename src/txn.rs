@@ -1844,12 +1844,12 @@ async fn change_one(lake: &Lake, name: &str, meta: &TableMeta, key: &[String], s
     };
     let mut new = row.clone();
     for (c, e) in set_to {
-        // (a value that won't evaluate here goes the planned way, which says what is wrong: `evaluate` errs on an
+        // (a value that won't evaluate here goes the planned way, which says what is wrong: `rules::fit::evaluate` errs on an
         // unsimplified `now()`, which a default may be)
-        let expr = crate::defaults::value(meta, c, e);
+        let expr = crate::rules::rows::value(meta, c, e);
         let value = match &both {
             Some((rows, schema)) => crate::rules::fit::evaluate_in(crate::defaults::base(), rows, schema, &expr).ok().flatten(),
-            None => crate::defaults::evaluate(&row, &expr).ok().flatten(),
+            None => crate::rules::fit::evaluate(crate::defaults::base(), &row, &expr).ok().flatten(),
         };
         let Some(v) = value else { return Ok(None) };
         let t = new.schema().field_with_name(c)?.data_type().clone();

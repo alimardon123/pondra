@@ -129,7 +129,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         if let Some(c) = enums.keys().find(|c| !columns.iter().any(|(n, t)| n == *c && t == "Utf8")) {
             bail!("{c}: an enum column holds text (a column of the table, of type VARCHAR)");
         }
-        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::types::held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
+        if let Some((c, t)) = sql_types.iter().find(|(c, t)| !crate::rules::typed::held(t) || !columns.iter().any(|(n, ty)| n == *c && ty == "Utf8")) {
             bail!("{c} {t}: a uuid, JSON or VARCHAR(n) column holds text (a column of the table, of type VARCHAR)");
         }
         for (c, expr) in &defaults {
@@ -302,7 +302,7 @@ impl Stmt {
         let w = |cond: &Option<String>| cond.as_ref().map(|c| format!(" WHERE {c}")).unwrap_or_default();
         match self {
             // (a DEFAULT is written bare: `(DEFAULT)` would be read as a column, `rows_sql` takes the word)
-            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| match crate::defaults::is_word(e) {
+            Stmt::Update(t, set, cond) => Some(format!("UPDATE {} SET {}{}", sql_name(t), set.iter().map(|(c, e)| match crate::rules::rows::is_word(e) {
                 true => format!("\"{c}\" = DEFAULT"),
                 false => format!("\"{c}\" = ({e})"),
             }).collect::<Vec<_>>().join(", "), w(cond))),
@@ -816,10 +816,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
 }
 
 /// The type an ADD COLUMN passes on: a type the lake checks (uuid, JSON, VARCHAR(n)) keeps its own
-/// spelling, so the AddColumn branch holds it as text and records it (`types::sql_type`); any
+/// spelling, so the AddColumn branch holds it as text and records it (`rules::create::sql_type`); any
 /// other is as DataFusion plans it (`sql_type`).
 fn added_type(t: &ast::DataType) -> String {
-    match crate::types::sql_type(t) {
+    match crate::rules::create::sql_type(t) {
         Ok(Some(_)) => t.to_string(),
         _ => sql_type(t),
     }
@@ -951,7 +951,7 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
                 Err(_) => None,
             };
             let held = match &declared {
-                Ok(t) => crate::types::sql_type(t)?,
+                Ok(t) => crate::rules::create::sql_type(t)?,
                 Err(_) => None,
             };
             let sql_type = if enumerated.is_some() || held.is_some() { "VARCHAR" } else { sql_type }; // (an enum, a uuid or a VARCHAR(n) column holds text)
@@ -1004,7 +1004,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             if !meta.merge.is_empty() { return Err(crate::codes::coded("0A000", "merge tables combine rows per key: INSERT into them instead of UPDATE")); }
             ensure!(set.iter().all(|(c, _)| !meta.key.contains(c) && meta.columns.iter().any(|(n, _)| n == c)), "UPDATE sets existing non-key columns");
             let pick = |c: &str| match set.iter().find(|(s, _)| s == c) {
-                Some((_, e)) => format!("({})", crate::defaults::value(meta, c, e)),
+                Some((_, e)) => format!("({})", crate::rules::rows::value(meta, c, e)),
                 None => q(c), // (`_deleted` too: an updated row keeps its own, as `change::select_as` does)
             };
             Ok(select(&pick, t, cond))
@@ -1032,7 +1032,7 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
 pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str) -> Result<String> {
     let columns = crate::rules::rows::row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
     let names = if names.is_empty() { implicit(&columns, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
-    let default = |c: &str| crate::defaults::sql_of(meta, c);
+    let default = |c: &str| crate::rules::rows::default_sql(meta, c);
     if crate::rules::rows::plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
         let used = std::cell::RefCell::new(vec![]);
@@ -1809,7 +1809,7 @@ pub(crate) async fn identity(lake: &Lake, stmt: &Stmt) -> Result<()> {
         // is not given, and the first columns the rows have are the ones a positional row gives)
         Stmt::Insert(_, query) => crate::rules::keys::inserted(&t, &table, &[], query),
         Stmt::InsertInto(_, names, query) => crate::rules::keys::inserted(&t, &table, names, query),
-        Stmt::Update(_, assigned, _) => set(&t, &assigned.iter().filter(|(_, e)| !crate::defaults::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>()),
+        Stmt::Update(_, assigned, _) => set(&t, &assigned.iter().filter(|(_, e)| !crate::rules::rows::is_word(e)).map(|(c, _)| c.clone()).collect::<Vec<_>>()),
         Stmt::Merge(m) => {
             let written = m.written(&t);
             for (columns, said) in written.given {

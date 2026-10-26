@@ -440,7 +440,7 @@ async fn queue(app: &App, who: &crate::auth::Principal, table: &str, meta: &Tabl
         };
         // (a JSON row without a key takes its column's DEFAULT)
         let left_out = match rules.fills() {
-            true => match crate::defaults::absent_keys(meta, &lines) {
+            true => match crate::rules::absent_keys(meta, &lines) {
                 Ok(masks) => crate::rules::LeftOut::PerRow(masks),
                 Err(e) => return invalid(e),
             },

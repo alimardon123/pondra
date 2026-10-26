@@ -180,7 +180,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
         return Ok(None);
     }
     // (a uuid key written another way Postgres takes, `'A0EE…'`, is looked up as the column holds it)
-    let key = meta.key.iter().map(|k| eqs.iter().find(|(c, _)| c == k).and_then(|(_, v)| v.clone()).map(|v| if meta.uuid(k) { crate::types::uuid_of(&v).unwrap_or(v) } else { v })).collect();
+    let key = meta.key.iter().map(|k| eqs.iter().find(|(c, _)| c == k).and_then(|(_, v)| v.clone()).map(|v| if meta.uuid(k) { crate::pg_casts::uuid_of(&v).unwrap_or(v) } else { v })).collect();
     Ok(Some(Point { table, meta, names, key, params }))
 }
 

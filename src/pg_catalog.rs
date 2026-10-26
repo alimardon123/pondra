@@ -315,7 +315,7 @@ fn held_types(l: &TableMeta) -> impl Iterator<Item = (String, (u32, i32))> + '_ 
         "uuid" => Some((c.clone(), (UUID, -1))),
         "json" => Some((c.clone(), (JSON, -1))),
         "jsonb" => Some((c.clone(), (JSONB, -1))),
-        t => crate::types::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
+        t => crate::rules::typed::length(t).map(|n| (c.clone(), (1043, n as i32 + 4))),
     })
 }
 

@@ -6,14 +6,14 @@
 use crate::ddl::Change;
 use crate::store::{Lake, TableMeta};
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch};
+use datafusion::arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 /// The session CHECKs, DEFAULTs and expectations are planned in: every function a query's session has but the lake's
 /// (`store::functions`, Postgres's JSON operators among them), so a condition that works in a query works here, and one
-/// that doesn't is refused at CREATE, as Postgres refuses it. Built once: `evaluate` and `breaking` run it as it is;
-/// `values` and `validate` take a copy (`copy`), so what they register is theirs alone.
+/// that doesn't is refused at CREATE, as Postgres refuses it. Built once: `rules::fit::evaluate` and `rules::fit::breaking`
+/// run it as it is; `values` and `validate` take a copy (`copy`), so what they register is theirs alone.
 static BASE: std::sync::LazyLock<SessionContext> =
     std::sync::LazyLock::new(|| crate::store::functions(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(Default::default())));
 
@@ -23,14 +23,6 @@ pub fn base() -> &'static SessionContext { &BASE }
 /// A session with BASE's functions, for what registers functions of its own (`nextval`): what holds the lake must never
 /// go into BASE, which every check shares (invariants 199, 301).
 fn copy() -> SessionContext { SessionContext::new_with_state(BASE.state()) }
-
-/// `expr` over `rows` (their columns by name), a value for each row; None if it doesn't plan
-/// over them alone (a qualified name, a subquery: SQL works it out instead).
-pub fn evaluate(rows: &RecordBatch, expr: &str) -> Result<Option<ArrayRef>> { crate::rules::fit::evaluate(&BASE, rows, expr) }
-
-/// Which of `rows` break `check`, a condition over their columns by name: those it is false for
-/// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
-pub fn breaking(rows: &RecordBatch, check: &str) -> Result<BooleanArray> { crate::rules::fit::breaking(&BASE, rows, check) }
 
 /// A table's DEFAULTs and CHECKs, checked as its CREATE checks them: a default gives one value of its column's type,
 /// and a CHECK is a condition over the table's columns. A lake table's CREATE (`write::create_table`) and a temporary
@@ -42,7 +34,7 @@ pub async fn definition(columns: &[(String, String)], defaults: &std::collection
     }
     let empty = RecordBatch::new_empty(crate::answer::schema(columns)?);
     for (n, c) in checks {
-        breaking(&empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?;
+        crate::rules::fit::breaking(base(), &empty, c).with_context(|| format!("CONSTRAINT {n} CHECK ({c})"))?;
     }
     Ok(())
 }
@@ -85,36 +77,7 @@ pub async fn validate(column: &str, sql_type: &str, expr: &str) -> Result<()> {
     }
 }
 
-/// JSON lines: for each default's column, the rows whose object hasn't the key.
-pub fn absent_keys(meta: &TableMeta, lines: &[u8]) -> Result<std::collections::HashMap<String, BooleanArray>> {
-    let names: Vec<String> = meta.defaults.keys().map(|s| meta.name_of(s).to_string()).collect();
-    let mut out: std::collections::HashMap<String, Vec<bool>> = names.iter().map(|n| (n.clone(), vec![])).collect();
-    for v in serde_json::Deserializer::from_slice(lines).into_iter::<serde_json::Value>() {
-        let v = v?;
-        for n in &names {
-            out.get_mut(n).expect("a name").push(v.get(n).is_none());
-        }
-    }
-    Ok(out.into_iter().map(|(k, v)| (k, BooleanArray::from(v))).collect())
-}
-
-/// A column's default as SQL, for an INSERT that leaves the column out (its rows are cast to
-/// the table's types after).
-pub fn sql_of(meta: &TableMeta, column: &str) -> Option<String> {
-    Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
-}
-
-/// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
-/// reads it in an UPDATE's SET, a MERGE's INSERT and an upsert; anything else is the value as written.
-pub fn value(meta: &TableMeta, column: &str, text: &str) -> String {
-    match is_word(text) {
-        true => sql_of(meta, column).unwrap_or_else(|| "NULL".into()),
-        false => text.to_string(),
-    }
-}
-
 pub use crate::rules::alter::is_null; // (`DEFAULT NULL` is no default: the core reads it for every form)
-pub use crate::rules::rows::is_word;
 
 /// `ALTER TABLE t ALTER COLUMN c SET DEFAULT e | DROP DEFAULT | SET NOT NULL | DROP NOT NULL`
 /// (leader, under the lake's lock), with Postgres's meanings: a default is worked out for the rows
@@ -209,24 +172,10 @@ mod tests {
     }
 
     #[test]
-    fn the_word_default_is_the_column_default() {
-        // (one test of the word: a SET, a VALUES item, an upsert and a MERGE all take it from `value`)
-        let meta = TableMeta { columns: vec![("n".into(), "Int32".into()), ("t".into(), "Utf8".into())], defaults: [("n".to_string(), "3".to_string())].into(), ..Default::default() };
-        for w in ["DEFAULT", "default", " DEFAULT "] {
-            assert!(is_word(w), "{w}");
-            assert_eq!(value(&meta, "n", w), "(3)", "{w}");
-            assert_eq!(value(&meta, "t", w), "NULL", "{w}");
-        }
-        assert!(!is_word("\"default\""));
-        assert_eq!(value(&meta, "n", "\"default\""), "\"default\"");
-        assert_eq!(value(&meta, "n", "n + 1"), "n + 1");
-    }
-
-    #[test]
     fn the_shared_base_plans_postgres_json_operators() {
         // (CHECK, DEFAULT and expectations are planned in BASE: its `->>` comes from the JSON functions, as a session's does)
         let doc: ArrayRef = std::sync::Arc::new(datafusion::arrow::array::StringArray::from(vec!["{\"a\": 1}"]));
         let rows = RecordBatch::try_from_iter(vec![("doc", doc)]).unwrap();
-        assert!(evaluate(&rows, "doc ->> 'a'").unwrap().is_some());
+        assert!(crate::rules::fit::evaluate(base(), &rows, "doc ->> 'a'").unwrap().is_some());
     }
 }
