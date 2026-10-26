@@ -207,9 +207,9 @@ def run_file(name, form, path, refusal):
 
 
 def split(table):
-    """src/lib.rs's modules built for the server only that forms.json's `server_only` doesn't list, and those it lists
-    that aren't."""
-    built = set(re.findall(r'^#\[cfg\((?:all\()?feature = "server"[^\]]*\)\] (?:pub )?mod (\w+);', open(os.path.join(REPO, "src/lib.rs")).read(), re.M))
+    """src/lib.rs's modules built for the server only (its `lake` and `doors`) that forms.json's `server_only` doesn't
+    list, and those it lists that aren't."""
+    built = set(re.findall(r'^#\[cfg\((?:all\()?feature = "(?:server|lake|doors)"[^\]]*\)\] (?:pub )?mod (\w+);', open(os.path.join(REPO, "src/lib.rs")).read(), re.M))
     listed = {m for group in table["server_only"].values() for m in group["modules"]}
     return sorted(built - listed), sorted(listed - built)
 
