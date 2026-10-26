@@ -765,7 +765,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
 /// are under their SQL names (the log takes them so: `log::pack`). `plain`: a plain INSERT's rows.
 /// `shaped`: the rows are a plain INSERT's that `run` shaped for `meta`, its job found new first.
 #[allow(clippy::too_many_arguments)]
-async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str, plain: bool, shaped: bool) -> Result<Value> {
+async fn commit(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<TableMeta>, old: Vec<RecordBatch>, new: Vec<RecordBatch>, job: &str, plain: bool, shaped: bool) -> Result<Value> {
     // A retried job's change is in already: say so before the key check, which would find the
     // change's own rows and refuse a retried plain INSERT (23505) where the job is a duplicate.
     if !shaped && !job.is_empty() && lake.cat.get::<u64>(&producer_key(&format!("sql:{job}"))).await?.unwrap_or(0) > 0 {
@@ -799,7 +799,7 @@ pub async fn submit(lake: &Lake, seq: &Sequencer, pending: &[Append]) -> Result<
 /// shaped for `meta` under this same lock (`How::Insert`): they aren't checked again, and no key is looked for twice
 /// among them again.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str, plain: bool, shaped: bool) -> Result<(Vec<Append>, (usize, usize, usize))> {
+pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<TableMeta>, old: Vec<RecordBatch>, new: Vec<RecordBatch>, producer: &str, plain: bool, shaped: bool) -> Result<(Vec<Append>, (usize, usize, usize))> {
     let rows = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let (replaced, added) = (rows(&old), rows(&new));
     if replaced + added == 0 {
@@ -817,7 +817,13 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &TableMeta
         Some(s) => one(old, s)?,
         None => None,
     };
-    let new = one(new, ids.clone())?.map(|n| if shaped { Ok(n) } else { crate::defaults::fit(meta, table, n) }).transpose()?; // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
+    let new = match one(new, ids.clone())? {
+        Some(n) if !shaped => {
+            let rules = meta.rules()?;
+            Some(crate::rules::checked(&rules, table, n, true, crate::defaults::base())?) // (an UPDATE may not empty a NOT NULL column; jsonb in its own form)
+        }
+        n => n,
+    };
     if crate::constraints::needs_check(meta, plain) {
         crate::constraints::check(lake, table, meta, old.as_ref(), new.as_ref(), plain, shaped).await?; // (under the lake's lock: no other write of the table between)
     }

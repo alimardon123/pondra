@@ -888,8 +888,9 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
         None => changing(l, stmt, snapshot).await?,
     };
     let rules = stored.rules()?;
+    let host = crate::defaults::Node(&l.app.lake);
     for b in changed.1.iter_mut().filter(|b| b.num_rows() > 0) {
-        *b = crate::rules::checked(&rules, l.name, b.clone(), true, crate::defaults::base())?; // (every batch of the new rows: as the table holds them)
+        *b = crate::rules::shape(&rules, l.name, crate::rules::Rows::Whole(b.clone()), crate::rules::How::Change, &host).await?.into_rows(); // (every batch of the new rows: as the table holds them)
     }
     Ok(changed)
 }
@@ -1614,7 +1615,7 @@ async fn write_changes(lake: &Lake, seq: &crate::log::Sequencer, c: Commit) -> R
             Some((n, o)) => (n.clone(), o.clone()),
             None => (unipc(new)?, unipc(old)?),
         };
-        let stored: TableMeta = lake.cat.get(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
+        let stored = lake.cat.meta(&table_key(name)).await?.with_context(|| format!("no table {name} (dropped while the transaction ran)"))?;
         let meta = stored.logical();
         let append = meta.key.is_empty();
         if old.iter().any(|b| b.num_rows() > 0) {

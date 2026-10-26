@@ -756,7 +756,7 @@ async fn run(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::sync::Mutex
         }
         let meta: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
         crate::change::companion(lake, view, &meta).await?; // (its `$deleted`, which every run names)
-        let meta: TableMeta = lake.cat.get(&table_key(view)).await?.context("view without table")?;
+        let meta = lake.cat.meta(&table_key(view)).await?.context("view without table")?;
         let at = lake.visible();
         let stands = none || meta.columns == before.columns && !moved_since(lake, seen, at, &[view.to_string()]).await?;
         let (old, new) = match stands {
