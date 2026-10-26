@@ -283,11 +283,14 @@ fn traced(plan: &LogicalPlan, i: usize) -> Option<usize> {
 }
 
 /// The stack a view kept by key works out a key at a time over: its key nodes (windows and `GROUP BY`s,
-/// top down), the table's scan under them (`base`), and the keys `by`: each key node's keys over the
-/// table that every key node has too, in the lowest node's order. `grouped`: a `GROUP BY` is a node.
+/// top down), and the keys `by`: each key node's keys over the table that every key node has too, in
+/// the lowest node's order. `low`: the lowest key node's input, and `low_by`: `by` as that node writes
+/// them over `low` (what `touched` reads: only the rows under the lowest node). `grouped`: a `GROUP BY`
+/// is a node.
 struct Keyed {
-    base: LogicalPlan,
+    low: LogicalPlan,
     by: Vec<Expr>,
+    low_by: Vec<Expr>,
     grouped: bool,
 }
 
@@ -296,20 +299,22 @@ struct Keyed {
 fn keyed(plan: &LogicalPlan) -> Result<Keyed> {
     let top = peeled(plan);
     let mut nodes = vec![];
-    let base = stacked(top, &mut nodes)?.clone();
+    stacked(top, &mut nodes)?;
     ensure!(!nodes.is_empty(), "ORDER BY, LIMIT, DISTINCT or a window over its groups looks across groups");
     let grouped = nodes.iter().any(|n| matches!(n, LogicalPlan::Aggregate(_)));
-    let lists: Vec<Vec<Expr>> = nodes.iter().map(|n| node_keys(n)).collect();
+    let low = nodes.last().context("a key node")?.inputs()[0].clone();
+    let lists: Vec<Vec<(Expr, Expr)>> = nodes.iter().map(|n| node_keys(n)).collect();
     let (lowest, above) = lists.split_last().context("a key node")?;
-    let mut by: Vec<Expr> = vec![];
-    for k in lowest {
-        if !by.contains(k) && above.iter().all(|l| l.contains(k)) {
-            by.push(k.clone());
+    let (mut by, mut low_by): (Vec<Expr>, Vec<Expr>) = (vec![], vec![]);
+    for (raw, base) in lowest {
+        if !by.contains(base) && above.iter().all(|l| l.iter().any(|(_, b)| b == base)) {
+            by.push(base.clone());
+            low_by.push(raw.clone());
         }
     }
     let why = if grouped { "its GROUP BYs and windows share no column of the table, so a key's rows don't come from its own rows alone" } else { "a window over all its rows, or windows that share no PARTITION BY column, look across every row" };
     ensure!(!by.is_empty(), "{why}");
-    Ok(Keyed { base, by, grouped })
+    Ok(Keyed { low, by, low_by, grouped })
 }
 
 /// A stack from its top down to its table, which it returns: each node key-local (a projection, filter,
@@ -338,9 +343,10 @@ fn stacked<'a>(plan: &'a LogicalPlan, nodes: &mut Vec<&'a LogicalPlan>) -> Resul
     }
 }
 
-/// The keys one key node has over the table: a window's partition columns that every one of its
-/// functions partitions by, or a `GROUP BY`'s expressions. Those that trace to the table only.
-fn node_keys(n: &LogicalPlan) -> Vec<Expr> {
+/// The keys one key node has, each as the node writes it over its input (`raw`) and over the table
+/// (`base`): a window's partition columns that every one of its functions partitions by, or a `GROUP
+/// BY`'s expressions. Those that trace to the table only.
+fn node_keys(n: &LogicalPlan) -> Vec<(Expr, Expr)> {
     match n {
         LogicalPlan::Window(w) => {
             let mut shared: Option<Vec<Column>> = None;
@@ -357,9 +363,9 @@ fn node_keys(n: &LogicalPlan) -> Vec<Expr> {
                     Some(s) => s.into_iter().filter(|c| cols.contains(c)).collect(),
                 });
             }
-            shared.unwrap_or_default().into_iter().filter_map(|c| to_base(&w.input, &Expr::Column(c))).collect()
+            shared.unwrap_or_default().into_iter().map(Expr::Column).filter_map(|raw| to_base(&w.input, &raw).map(|base| (raw, base))).collect()
         }
-        LogicalPlan::Aggregate(a) => a.group_expr.iter().filter_map(|g| to_base(&a.input, &g.clone().unalias_nested().data)).collect(),
+        LogicalPlan::Aggregate(a) => a.group_expr.iter().map(|g| g.clone().unalias_nested().data).filter_map(|raw| to_base(&a.input, &raw).map(|base| (raw, base))).collect(),
         _ => vec![],
     }
 }
@@ -969,10 +975,11 @@ async fn touched(lake: &Lake, v: &View, done: u64, now: u64) -> Result<Vec<Recor
     ctx.deregister_table(table_ref(&v.source))?;
     ctx.register_table(table_ref(&v.source), changed(lake, &v.source, done, now).await?.into_view())?;
     let plan = crate::engine::sql(&ctx, &crate::sys::planned(&v.sql)?).await?.into_unoptimized_plan();
-    // (the keys of the changed rows themselves, with no filter of the view's: a superset of the touched keys)
+    // (the lowest key node's keys over the changed rows, through the nodes under it alone: a filter there,
+    // the view's WHERE under a GROUP BY, cuts the keys as it cuts the view's rows)
     let k = keyed(&plan).context("a view kept by key is a GROUP BY or windows within keys")?;
-    let keys: Vec<Expr> = k.by.iter().enumerate().map(|(i, g)| g.clone().alias(format!("__k{i}"))).collect();
-    let p = LogicalPlanBuilder::from(k.base).project(keys)?.distinct()?.build()?;
+    let keys: Vec<Expr> = k.low_by.iter().enumerate().map(|(i, g)| g.clone().alias(format!("__k{i}"))).collect();
+    let p = LogicalPlanBuilder::from(k.low).project(keys)?.distinct()?.build()?;
     Ok(ctx.execute_logical_plan(p).await?.collect().await?)
 }
 
@@ -1208,7 +1215,7 @@ fn same(l: Expr, r: Expr) -> Expr {
 mod tests {
     use super::*;
     use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray, TimestampMicrosecondArray};
-    use datafusion::arrow::datatypes::{Int64Type, TimestampMicrosecondType};
+    use datafusion::arrow::datatypes::{Int64Type, TimeUnit, TimestampMicrosecondType};
 
     /// The batch's column names.
     fn names(b: &RecordBatch) -> Vec<String> {
@@ -1276,13 +1283,14 @@ mod tests {
     }
 
     /// `sql`'s plan as a view's query is planned (a MATCH_RECOGNIZE rewritten first), over `ticker` (symbol,
-    /// day, price) and `other` (symbol), both empty, with the pattern functions registered.
+    /// day, price), `other` (symbol) and `events` (ts), all empty, with the pattern functions registered.
     async fn planned(sql: &str) -> Result<LogicalPlan> {
         let ctx = SessionContext::new();
         crate::matcher::register(&ctx);
         let ticker = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Utf8, true), Field::new("day", DataType::Int64, true), Field::new("price", DataType::Int64, true)]));
         let other = Arc::new(Schema::new(vec![Field::new("symbol", DataType::Utf8, true)]));
-        for (name, schema) in [("ticker", ticker), ("other", other)] {
+        let events = Arc::new(Schema::new(vec![Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true)]));
+        for (name, schema) in [("ticker", ticker), ("other", other), ("events", events)] {
             let table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![RecordBatch::new_empty(schema)]])?;
             ctx.register_table(name, Arc::new(table))?;
         }
@@ -1352,5 +1360,26 @@ mod tests {
     async fn a_top_order_by_is_not_a_limit() {
         let plan = planned("SELECT symbol, count(*) AS n FROM ticker GROUP BY symbol ORDER BY symbol").await.unwrap();
         assert_eq!(keys(&plan).unwrap(), ["symbol"]);
+    }
+
+    /// A GROUP BY under a WHERE: the lowest key node's input holds the filter, and the keys touched are read through it.
+    #[tokio::test]
+    async fn touched_keys_are_read_under_the_lowest_key_node() {
+        let plan = planned("SELECT symbol, count(*) AS n FROM ticker WHERE price > 5 GROUP BY symbol").await.unwrap();
+        let k = keyed(&plan).unwrap();
+        assert!(matches!(k.low, LogicalPlan::Filter(_)), "{}", k.low);
+        assert_eq!(k.low_by, [Expr::Column(Column::new(Some("ticker"), "symbol"))]);
+        assert_eq!(k.low_by, k.by);
+    }
+
+    /// A GROUP BY expression is a key as the node writes it, and as the table holds it: `by` and `low_by` agree.
+    #[tokio::test]
+    async fn a_group_by_expression_is_a_key_in_both_halves() {
+        let plan = planned("SELECT date_trunc('day', ts) AS d, count(*) AS n FROM events GROUP BY 1").await.unwrap();
+        let k = keyed(&plan).unwrap();
+        assert_eq!(k.by.len(), 1);
+        assert!(matches!(k.by[0], Expr::ScalarFunction(_)), "{}", k.by[0]);
+        assert_eq!(k.low_by, k.by);
+        assert_eq!(keys(&plan).unwrap(), ["d"]);
     }
 }
