@@ -10,7 +10,7 @@ write a second to a key (429):
 - **the bell**: four `pondra sql` writers that can't reach the leader leave their INSERTs in the
   bucket's inbox at once, each ringing `inbox/bell`; a ring refused (429) counts as rung, so
   every one is answered. They run as on another machine (a temp folder of their own), so each
-  watches for the leader's mark after it rang (`cluster::deaf`): the leader marks in time
+  watches for the leader's mark after it rang (`terms::deaf`): the leader marks in time
   through the bucket's slow-downs, and keeps its term.
 
   c5_check.py [--bin target/release/pondra] [--rate 30] [--port 9581]

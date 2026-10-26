@@ -199,6 +199,7 @@ mod rules;
 #[cfg(feature = "lake")] mod sys;
 #[cfg(feature = "lake")] mod tasks;
 #[cfg(feature = "lake")] mod temp;
+#[cfg(feature = "lake")] mod terms;
 #[cfg(feature = "lake")] mod tier;
 #[cfg(feature = "lake")] mod udf;
 #[cfg(feature = "lake")] mod users;
