@@ -212,14 +212,18 @@ ALTER TASK report SUSPEND;  ALTER TASK report RESUME;
   and each task's run in it is `task-<name>-<tick>` in `pondra.runs`.
 - **What follows a failure doesn't run.** A failed task (after its `retries`) calls `on_failure`
   with its name and error, and the tasks after it wait for the next run of the graph. A suspended
-  task, and so what follows it, doesn't run in the graph's runs. `EXECUTE TASK` still runs it.
+  task, and so what follows it, doesn't run in the graph's scheduled runs. `EXECUTE TASK` runs its whole
+  graph, suspended tasks too: a branch's tasks start suspended, so `EXECUTE TASK nightly` there runs
+  nightly's graph once.
 - **Results** are kept with the task's last run (`pondra.tasks.last_result`): its `RETURN`, or the
   first value of its last query. `pondra.result('t')` is put in as that value, and is NULL when
   `t` gave none in this run.
-- **Values passed down the graph** are `EXECUTE TASK`'s, bound as `$name` in every task, its
-  `WHEN` too. A scheduled run gives none, so a task gives its own default with `DECLARE PARAMETER`
-  at its top. A task that is one `BEGIN … END` block has that block's top as its top, and so does a
-  file that is one block.
+- **Values passed down the graph** are worked out once, when the run's tick is claimed: `EXECUTE
+  TASK`'s values, then the first task's `DECLARE PARAMETER` defaults for the names they don't give. Every
+  task in the run binds them as `$name`, its `WHEN` too, through its retries and a failover, so a run that
+  crosses midnight still has one `$day`. A later task's own `DECLARE PARAMETER` of a name the first task
+  doesn't declare takes its own default. A task that is one `BEGIN … END` block has that block's top as
+  its top, and so does a file that is one block.
 - **`EXECUTE TASK`** claims a tick that the leader's scheduler runs at once. It is refused while
   the task's last run is still going.
 - **Every pass of a loop yields.** A loop that only read variables never waited, so it held its
