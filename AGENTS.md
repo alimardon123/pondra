@@ -500,13 +500,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`Catalog::wait_durable`). With replicated acks, a commit that recovery can't find must never
    have reached another engine or deleted a file.
 17. **Nobody deposes a live leader from outside the cluster.** A node joining, or a `pondra sql`
-   INSERT, claims a new term only if the latest term's `cluster/alive` mark is over 30 s old. A
-   follower that has never reached its leader (`Cluster::heard`) waits for that too; only
-   members that lost a leader they were talking to use the 5 s lease.
+   INSERT, claims a new term only if the latest term's `cluster/alive` mark is over 30 s old, or
+   its claimer didn't answer the bell. A follower that has never reached its leader
+   (`Cluster::heard`) waits for that too; only members that lost a leader they were talking to
+   use the 5 s lease.
    A one-off writer claims with an empty address, keeps its mark fresh while it works, and
    deletes it when done. Nodes and other writers wait for it; they never follow it. On the
    claimer's own machine nobody waits: a term names its lock file (invariant 370), and a free one
-   means its process ended, so the next node or writer there claims at once.
+   means its process ended, so the next node or writer there claims at once. Elsewhere, a claimer
+   that says so in its term (`Term::bell`) looks at the inbox's bell every second and marks its
+   term when it rang (`cluster::listen`), on bucket turns of its own (`budget::urgent`), so a scan
+   holding every other turn doesn't stop it. A writer that would wait rings and watches the mark
+   (`cluster::deaf`, `cluster::Ear`): none in 5 s, by its own clock, means the claimer is gone (a
+   process killed or a machine lost: nothing marks for it), and it claims. One that answered isn't
+   rung again by that process for 30 s. `harness.py serverless`: a writer elsewhere that can't
+   reach a live leader writes through the inbox and leaves its term; after the leader is killed,
+   the next writer there leads in about 6 s (30 s before).
 18. **The inbox is just another door to the leader.** Its requests carry the same exactly-once
    keys as HTTP (a bulk INSERT's job id, a flush's `(producer, seq)`), and only a process that
    leads answers them (`inbox::drain`, from the leader loop or a one-off writer that leads). A

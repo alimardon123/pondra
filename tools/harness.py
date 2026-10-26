@@ -2105,24 +2105,28 @@ def serverless():
             if keys:
                 S3[0].delete_objects(Bucket=bucket, Delete={"Objects": keys, "Quiet": True})
 
-    # Another machine: a writer with a temp folder of its own finds no lock file for the leader, so
-    # it waits for the leader's mark, as it always did. A leader here is killed, and that writer
-    # waits 5 s: it adds no term (the mark is still fresh), and it is stopped.
+    # Another machine: a writer with a temp folder of its own finds no lock file for the leader. One
+    # that can't reach a live leader writes through the inbox, and the leader keeps its term: it
+    # marked itself when the writer rang. Once that leader is killed, the next writer there rings,
+    # sees no mark in 5 s, and leads (it waited 30 s for the mark to go stale before).
     node3 = Node(lake, A.port + 2).start()
     timed(insert)  # a leader started here takes the rows like any other
-    node3.kill()
     terms, local = os.path.join(lake, "cluster", "term"), not lake.startswith("s3://")  # (a bucket's terms aren't files here)
     before = os.listdir(terms) if local else []
     other = tempfile.mkdtemp(prefix="pondra-other-")
-    waiting = subprocess.Popen([BIN, "sql", "--dir", lake, insert], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                               env={**os.environ, "TMPDIR": other, "TEMP": other, "TMP": other})
-    time.sleep(5)
-    other_machine_waits = waiting.poll() is None and (not local or os.listdir(terms) == before)
-    waiting.kill()
-    waiting.wait()
+    elsewhere = {**os.environ, "TMPDIR": other, "TEMP": other, "TMP": other}
+    t = time.time()
+    unreached = subprocess.run([BIN, "sql", "--dir", lake, insert], capture_output=True, text=True, env={**elsewhere, "PONDRA_NO_DIRECT": "1"}, timeout=120)
+    unreached_s = round(time.time() - t, 2)
+    live_kept = unreached.returncode == 0 and (not local or os.listdir(terms) == before) and "restarting" not in open(node3.log).read()
+    node3.kill()
+    t = time.time()
+    other_after = subprocess.run([BIN, "sql", "--dir", lake, insert], capture_output=True, text=True, env=elsewhere, timeout=120)
+    other_after_s = round(time.time() - t, 2)
+    other_machine_leads = other_after.returncode == 0 and other_after_s < 12 and (not local or len(os.listdir(terms)) == len(before) + 1)
     withdraw_requests()
     shutil.rmtree(other, ignore_errors=True)
-    node2 = Node(lake, A.port + 1).start()  # the other machine's writer is gone: this node leads at once
+    node2 = Node(lake, A.port + 1).start()  # the other machine's writer let go: this node leads at once
     n = sql(node2.port, "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM sales")[0]
     node2_leads = leads(node2)
     node2.kill()
@@ -2143,17 +2147,21 @@ def serverless():
     oneoff["rows"] = int(rows.group(1)) if rows else None
     oneoff_ok = (oneoff["rows"] == ONEOFF and (not local or (oneoff["terms_16_to_32"] and oneoff["newest_is_last_claim"]
                  and not any(oneoff["below_oldest_kept"].values()))))
-    # 8000 rows, and the leader started here adds 1000 more: 9000.
-    ok = (n == {"n": 9000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
-          and after_kill_s < 10 and other_machine_waits and all(guest_checks.values()) and oneoff_ok)
+    # 8000 rows, the leader started here adds 1000 more, the writer that couldn't reach it 1000 and the next one
+    # elsewhere 1000: 11000.
+    ok = (n == {"n": 11000, "ids": 1000} and '"duplicate":true' in once[1] and node_leads and node2_leads and node_start_s < 10
+          and after_kill_s < 10 and live_kept and other_machine_leads and all(guest_checks.values()) and oneoff_ok)
     print(json.dumps({"serverless": {"alone_s": alone_s, "retry": once, "four_at_once": together, "node_start_s": node_start_s, "node_leads": node_leads,
-                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "other_machine_waits": other_machine_waits,
+                                     "via_node_s": via_node_s, "after_leader_killed_s": after_kill_s, "unreached_s": unreached_s, "live_leader_kept": live_kept,
+                                     "other_machine_after_kill_s": other_after_s, "other_machine_leads": other_machine_leads,
+                                     "unreached_err": unreached.stderr[-400:] if not live_kept else "", "other_err": other_after.stderr[-400:] if not other_machine_leads else "",
                                      "rows": n, "guest": guest_checks, "guest_times": guest_times, "one_off": oneoff, "one_off_ok": oneoff_ok, "ok": ok}}))
     if not ok:
         sys.exit(1)
     return (f"INSERT from a process with no server: {alone_s}s alone, 4 at once, retries once; a node on the idle lake leads "
             f"in {node_start_s}s; via a running leader {via_node_s}s; after the leader is killed {after_kill_s}s (this machine's writer "
-            f"finds its lock free); another machine's writer waits for the mark (no new term in 5 s: {other_machine_waits}); "
+            f"finds its lock free); another machine's writer that can't reach a live leader writes through its inbox in {unreached_s}s "
+            f"and the leader keeps its term; after it is killed, the next writer there leads in {other_after_s}s (it rang, no mark came); "
             f"{n['n']} rows, no duplicates")
 
 
