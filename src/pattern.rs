@@ -39,6 +39,9 @@ const AGGREGATES: &[&str] = &[
 /// The functions that navigate the match: they are refused where a navigation can't be taken.
 const NAVIGATIONS: &[&str] = &["first", "last", "prev", "next", "classifier", "match_number"];
 
+/// The refusal of CLASSIFIER() inside a navigation of a DEFINE, with the way to write it.
+const CLASSIFIER_IN_NAV: &str = "CLASSIFIER() inside a navigation isn't supported in a DEFINE yet: test CLASSIFIER() on its own, as CLASSIFIER() = 'b'";
+
 /// Whether `sql` may hold a `MATCH_RECOGNIZE`: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmatch_recognize\b").expect("a regex"));
@@ -589,6 +592,9 @@ fn conditions(symbols: &[SymbolDefinition], text: &str, cx: &mut Cx) -> Result<(
 fn one_define(e: Expr, k: usize, cx: &mut Cx, glued: &mut Vec<serde_json::Value>) -> Result<String> {
     let mut e = e;
     unwrap_running(&mut e)?;
+    if nav_of_classifier(&e) {
+        return Err(refuse_define(&cx.syms[k], CLASSIFIER_IN_NAV));
+    }
     let parts = conjuncts(&e);
     let reads: Vec<bool> = parts.iter().map(|c| reads_match(c, k, cx)).collect();
     if !reads.contains(&true) {
@@ -614,6 +620,26 @@ fn one_define(e: Expr, k: usize, cx: &mut Cx, glued: &mut Vec<serde_json::Value>
     let slots = std::mem::replace(&mut cx.defined, outer);
     glued.push(json!({ "symbol": k, "glue": texts.join(" AND "), "slots": slots }));
     Ok(row)
+}
+
+/// Whether a PREV, NEXT, FIRST or LAST of `e` has a CLASSIFIER() anywhere in its arguments.
+fn nav_of_classifier(e: &Expr) -> bool {
+    visit_expressions(e, |x| match x {
+        Expr::Function(f) if ["first", "last", "prev", "next"].contains(&lower_name(f).as_str()) && has_classifier(x) => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// Whether `e` has a CLASSIFIER() call anywhere in it.
+fn has_classifier(e: &Expr) -> bool {
+    visit_expressions(e, |x| match x {
+        Expr::Function(f) if lower_name(f) == "classifier" => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
 }
 
 /// RUNNING takes its argument as it is (a DEFINE reads the rows so far); FINAL is for MEASURES and is refused.
@@ -813,7 +839,7 @@ fn nav_slot(base: &Expr, first: bool, m: u64, offset: i64, k: usize, cx: &mut Cx
     let sym = cx.syms[k].clone();
     if let Some(inner) = nested(base) {
         let what = match inner.as_str() {
-            "classifier" => "CLASSIFIER() inside a navigation isn't supported in a DEFINE yet: test CLASSIFIER() on its own, as CLASSIFIER() = 'b'".to_string(),
+            "classifier" => CLASSIFIER_IN_NAV.to_string(),
             n if AGGREGATES.contains(&n) => format!("{n} inside a navigation isn't supported in a DEFINE yet: take {n} on its own, as {n}(a.x) > 2"),
             _ => "a navigation inside a navigation isn't supported in a DEFINE yet: write PREV(LAST(a.x)) or FIRST(a.x, m), and nothing deeper".to_string(),
         };
@@ -1631,6 +1657,8 @@ mod tests {
             ("sum(DISTINCT a.price) > 1", "DISTINCT …) isn't supported in a DEFINE yet"),
             ("sum(a.price ORDER BY a.price) > 1", "ORDER BY isn't supported in a DEFINE yet"),
             ("LAST(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
+            ("PREV(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
+            ("NEXT(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
             ("FIRST(PREV(a.price)) > 1", "a navigation inside a navigation isn't supported"),
             ("PREV(PREV(a.price)) > 1", "a navigation inside a navigation isn't supported"),
             ("sum(FIRST(a.price)) > 1", "first inside sum isn't supported"),
