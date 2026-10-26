@@ -396,15 +396,15 @@ enum Acc {
     Unit,
 }
 
-/// A sum, in the type it is added in: wrapping integers, a decimal's unscaled value, a DOUBLE as fsum's (hi, lo) pair (bits),
-/// or a REAL. Floats are kept by their bits, so two sums are equal when their bits are.
+/// A sum, in the type it is added in: wrapping integers, a decimal's unscaled value, or a DOUBLE as fsum's (hi, lo) pair
+/// (bits). A REAL is summed as a DOUBLE, since sum's argument is coerced to one. Floats are kept by their bits, so two sums
+/// are equal when their bits are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Num {
     Int(i64),
     Uint(u64),
     Dec(i128),
     Float(u64, u64),
-    Single(u32),
 }
 
 /// Adds a value to a sum (`None`: the first value).
@@ -418,8 +418,6 @@ fn num_add(acc: Option<Num>, v: &ScalarValue) -> Result<Num> {
         (Some(Num::Dec(s)), ScalarValue::Decimal128(Some(x), _, _)) => Num::Dec(s.wrapping_add(*x)),
         (None, ScalarValue::Float64(Some(x))) => float_add(0.0, 0.0, *x),
         (Some(Num::Float(h, l)), ScalarValue::Float64(Some(x))) => float_add(f64::from_bits(h), f64::from_bits(l), *x),
-        (None, ScalarValue::Float32(Some(x))) => Num::Single(x.to_bits()),
-        (Some(Num::Single(s)), ScalarValue::Float32(Some(x))) => Num::Single((f32::from_bits(s) + *x).to_bits()),
         _ => bail!("MATCH_RECOGNIZE: a sum of {v} doesn't add to the sum so far"),
     })
 }
@@ -439,7 +437,6 @@ impl Num {
             (Num::Uint(v), _) => ScalarValue::UInt64(Some(v)),
             (Num::Dec(v), DataType::Decimal128(p, s)) => ScalarValue::Decimal128(Some(v), *p, *s),
             (Num::Float(h, l), _) => ScalarValue::Float64(Some(fsum::total(f64::from_bits(h), f64::from_bits(l)))),
-            (Num::Single(b), _) => ScalarValue::Float32(Some(f32::from_bits(b))),
             _ => bail!("MATCH_RECOGNIZE: a sum's result is {result}, which its value isn't"),
         })
     }
@@ -1223,7 +1220,7 @@ fn slot_types(slot: &SlotSpec, values: &[DataType], base: &SessionState) -> Resu
                     "sum" => {
                         let (arg, result) = aggregate_types(base, "sum", vt)?;
                         let ok = match (&arg, &result) {
-                            (DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Float32, _) => true,
+                            (DataType::Int64 | DataType::UInt64 | DataType::Float64, _) => true,
                             (DataType::Decimal128(_, s), DataType::Decimal128(_, r)) => s == r,
                             _ => false,
                         };
