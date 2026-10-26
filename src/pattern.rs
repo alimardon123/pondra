@@ -1349,6 +1349,20 @@ fn skip_json(skip: Option<&AfterMatchSkip>, syms: &[String]) -> Result<serde_jso
     })
 }
 
+/// A statement's text as the engine runs it, for the tests: its clauses written as their derived tables.
+#[cfg(test)]
+pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
+    let t = text(sql);
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, &t)?;
+    let mut r = Rewrite { lake: &HashMap::new() };
+    for s in stmts.iter_mut() {
+        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+            return Err(e);
+        }
+    }
+    Ok(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
