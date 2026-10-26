@@ -1,6 +1,6 @@
 # MATCH_RECOGNIZE answers alike on every form (ADR-073): Oracle's ticker (ACME's 20 days), with and without
-# PARTITION BY, an empty match, ALL ROWS PER MATCH (RUNNING and FINAL measures), WITH UNMATCHED ROWS and WITHIN on a
-# timestamp. Every query has
+# PARTITION BY, an empty match, ALL ROWS PER MATCH (RUNNING and FINAL measures), WITH UNMATCHED ROWS, WITHIN on a
+# timestamp, and a DEFINE that reads the match so far (Flink's example, last). Every query has
 # an ORDER BY; the expected rows are tools/patterns_check.py's (its FIXED examples: worked out by hand there).
 statement ok
 CREATE TABLE ticker (symbol TEXT, day INT, price INT)
@@ -90,3 +90,16 @@ SELECT symbol, start_day, bottom_day, end_day FROM tickts MATCH_RECOGNIZE (PARTI
 ACME 5 6 9
 ACME 10 12 13
 ACME 14 16 18
+
+statement ok
+CREATE TABLE flink_ticker (symbol TEXT, rowtime TIMESTAMP, price INT, tax INT)
+
+statement ok
+INSERT INTO flink_ticker VALUES ('ACME',TIMESTAMP '2011-04-01 10:00:00',20,1),('ACME',TIMESTAMP '2011-04-01 10:20:00',17,2),('ACME',TIMESTAMP '2011-04-01 10:40:00',18,1),('ACME',TIMESTAMP '2011-04-01 11:00:00',11,3),('ACME',TIMESTAMP '2011-04-01 11:20:00',14,2),('ACME',TIMESTAMP '2011-04-01 11:40:00',9,1),('ACME',TIMESTAMP '2011-04-01 12:00:00',15,1),('ACME',TIMESTAMP '2011-04-01 12:20:00',14,2),('ACME',TIMESTAMP '2011-04-01 12:40:00',24,2),('ACME',TIMESTAMP '2011-04-01 13:00:00',1,2),('ACME',TIMESTAMP '2011-04-01 13:20:00',19,1)
+
+# Flink's WITHIN example: B and C read A, the match's first row (LAST of a one-row variable), so the DEFINEs read the match
+# so far. The match from 12:00 (15) drops to 13:00 (1), exactly an hour on, which the bound includes: 15 - 1 = 14.
+query TI
+SELECT symbol, dropDiff FROM flink_ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY rowtime MEASURES A.price - C.price AS dropDiff ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (A B* C) WITHIN INTERVAL '1' HOUR DEFINE B AS B.price > A.price - 10, C AS C.price < A.price - 10) ORDER BY dropDiff
+----
+ACME 14

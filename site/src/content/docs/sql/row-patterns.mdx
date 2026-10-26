@@ -306,8 +306,59 @@ of day 5: day 10 is five hours on. The match from day 14 reaches day 18, exactly
 
 - `PREV(col)` and `PREV(col, n)` read the row `n` before in the partition; `NEXT(col, n)` reads the row `n`
   after. The first row has no `PREV`, and the last has no `NEXT`: the condition is then false.
-- A condition can read its own row, and `PREV` and `NEXT` of the partition. It can't read another symbol's
-  rows. See [not supported yet](#not-supported-yet).
+- A condition can read its own row, `PREV` and `NEXT` of the partition, and the rows the match has so far.
+  See [what a DEFINE can read](#what-a-define-can-read).
+
+## What a DEFINE can read
+
+A condition can read the rows the match has given so far, not only its own row. Say the match so far has given
+rows to `a`, and the row being tested would be `b`:
+
+- `a.price` is the last row given to `a`, the same as `LAST(a.price)`. `FIRST(a.price)` is the first one, and
+  `LAST(a.price, 1)` the one before the last. `PREV(a.price)` is the row before that last one, in the partition.
+- `count(*)`, `count(a.*)`, `count(a.price)`, `sum`, `avg`, `min` and `max` of `a.price` run over the rows `a` has
+  so far. With no symbol, as in `sum(price)`, they run over every row so far.
+- `MATCH_NUMBER()` is the number of the match: the matches so far in the partition, empty ones included, plus one.
+  `CLASSIFIER()` is the symbol being defined.
+
+The row being tested counts as a row of its own symbol and among the rows with no symbol, but not among another
+symbol's rows: in `b AS count(*) >= 1`, the row counts itself. Excluded rows (`{- -}`) count in every one of these.
+
+A symbol with no rows yet is where a NULL comes from. `a.price` is then NULL, so `a.price IS NULL` is true and
+`a.price < 3` is NULL, which is false. `COALESCE(a.price, 0)` gives 0. `count` over no rows is 0, and `sum`, `avg`,
+`min` and `max` over no value are NULL.
+
+This query keeps a run of days whose spending stays at 30 or less. Day 3 starts a new run, since 22 and 11 is 33:
+
+```sql
+CREATE TABLE spend (day INT, amount INT);
+INSERT INTO spend VALUES (1,10),(2,12),(3,11),(4,15),(5,14),(6,13),(7,20);
+
+SELECT first_day, last_day, spent
+FROM spend MATCH_RECOGNIZE (
+  ORDER BY day
+  MEASURES FIRST(day) AS first_day, LAST(day) AS last_day, SUM(a.amount) AS spent
+  ONE ROW PER MATCH
+  AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (a+)
+  DEFINE a AS SUM(a.amount) <= 30
+)
+ORDER BY first_day;
+```
+
+```text
+first_day  last_day  spent
+1          2         22
+3          4         26
+5          6         27
+7          7         20
+```
+
+The cost grows with the match. Each search thread that reaches a condition that reads the match works it out, so a
+search can take time that grows with the square of a match's length: `(a | b)+ c` with `count(a.*) > 5` keeps a
+thread for each start at every row. Past 100,000 partial matches at once the query is refused (`54000`), which bounds
+the memory, not the time. The engine also works out threads that a backtracking matcher never reaches, so a
+condition that can fail, such as a division by a column, can fail here where another engine gives an answer.
 
 ## RUNNING and FINAL
 
@@ -334,7 +385,14 @@ These are refused by the standard or by how the answer is shaped. Each refusal s
 | What you write | What happens | What to write instead |
 |---|---|---|
 | `ALL ROWS PER MATCH` ordered by an expression | refused, `0A000`: `gives the ORDER BY columns; compute <e> in a subquery and order by its name` | compute the expression in a subquery, and order by its name |
-| `FINAL` in a `DEFINE`, such as `b AS FINAL LAST(b.price) < 10` | refused, `42601`: `FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL` | drop `FINAL LAST`: write `b AS b.price < 10`, which reads the row itself (`LAST` in a `DEFINE` is refused too) |
+| `FINAL` in a `DEFINE`, such as `b AS FINAL LAST(b.price) < 10` | refused, `42601`: `FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL` | drop `FINAL`: write `b AS LAST(b.price) < 10`, or `b AS b.price < 10`, which reads the row itself |
+| an aggregate's `FILTER`, `DISTINCT` or `ORDER BY` in a `DEFINE`, such as `sum(DISTINCT a.price) > 0` | refused, `0A000` | drop it: aggregate the rows the match has given, as `sum(a.price)` does |
+| an aggregate other than `count`, `sum`, `avg`, `min` and `max` in a `DEFINE`, such as `stddev(a.price)` | refused, `0A000` | use one of the five, or compare the rows with `PREV` or `NEXT` |
+| `avg` of a `DECIMAL` column in a `DEFINE` | refused, `0A000` | store the column as `DOUBLE`, or compare `sum(a.amt)` with `count(a.*)` times the bound |
+| `CLASSIFIER()` inside a navigation or an aggregate, such as `PREV(CLASSIFIER())` | refused, `0A000` | compare `CLASSIFIER()` itself, which is the symbol being defined |
+| a navigation of a navigation, such as `FIRST(LAST(a.price))` | refused, `0A000` | write `FIRST(a.price)`, or `PREV(LAST(a.price))`, the forms that navigate |
+| a match with more than 100,000 partial matches at once | refused, `54000` | make the conditions narrower, give a repetition a bound, such as `{1,5}`, or add a `WITHIN` interval |
+| a function the engine doesn't have, in a `DEFINE` | refused, `42883`, the message starts with the symbol: `MATCH_RECOGNIZE: DEFINE b: ...` | use a function the engine has, as in a `SELECT` |
 | `WITH UNMATCHED ROWS` with `{- -}` | refused, `42601` | use `SHOW EMPTY MATCHES`, or keep the rows in the pattern |
 | `PARTITION BY` an expression | refused, `0A000`: `takes columns; compute <e> in a subquery` | compute it in a subquery, and partition by its name |
 | a measure named like a column of the table, in `ALL ROWS PER MATCH`, such as `strt.day AS price` over `ticker` | refused, `42701`: `the measure price has the name of a column of ticker; ALL ROWS PER MATCH gives both, so name the measure otherwise` | name the measure otherwise, such as `start_price` |
@@ -345,7 +403,6 @@ These don't run yet. Each has a way to write the same question.
 
 | What you write | What happens | What to write instead |
 |---|---|---|
-| a `DEFINE` that reads another symbol's rows, `b AS b.price < a.price` | refused, `0A000`: `DEFINE b reads the match so far (a.price), which isn't supported yet: compare with the row before, PREV(price)` | compare with `PREV` or `NEXT` of the same column, or with a value in the row itself |
 | an aggregate with its own `ORDER BY` in `ALL ROWS PER MATCH` | refused, `0A000` | drop it: the rows already come in the match's order |
 | a subquery in `MEASURES` or `DEFINE` | refused, `0A000` | compute the value in a subquery, and join it on the rows |
 | a window function in a measure | refused, `0A000` | compute the window in a subquery, and read its column in the measure |

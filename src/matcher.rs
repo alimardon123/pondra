@@ -8,29 +8,40 @@
 //! row. So a partition takes time in proportion to its rows, and the match is the one the standard asks for.
 
 use crate::codes::coded;
-use anyhow::{anyhow, Context, Result};
+use crate::fsum;
+use anyhow::{anyhow, bail, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray, UInt32Array};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::kernels::numeric::sub;
-use datafusion::arrow::compute::{cast, take};
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
-use datafusion::common::ScalarValue;
+use datafusion::arrow::compute::cast;
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::execution::{FunctionRegistry, SessionState};
 use datafusion::logical_expr::function::{PartitionEvaluatorArgs, WindowUDFFieldArgs};
-use datafusion::logical_expr::{PartitionEvaluator, Signature, Volatility, WindowUDF, WindowUDFImpl};
+use datafusion::logical_expr::simplify::SimplifyContext;
+use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
+use datafusion::logical_expr::{EmptyRelation, Expr, LogicalPlan, PartitionEvaluator, Projection, Signature, Volatility, WindowUDF, WindowUDFImpl};
+use datafusion::optimizer::simplify_expressions::ExprSimplifier;
 use datafusion::physical_expr::expressions::Literal;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-/// The states a pattern may compile to. A count in `{n,m}` multiplies its body, so past this a pattern is refused by
-/// name rather than run slowly.
-const STATES: usize = 10_000;
+/// The most partial matches a search holds at once when a DEFINE reads the match so far (the ADR's number): past it the
+/// query is refused (54000). A test may use a smaller cap, through `Part`.
+const STATE_CAP: usize = 100_000;
 
-/// The spec `pattern.rs` writes: the pattern's text (`read` reads it and names its symbols) and the skip rule.
+/// The spec `pattern.rs` writes: the pattern's text (`read` reads it and names its symbols), the skip rule, and the
+/// DEFINEs that read the match so far, with the columns their glue reads (`rows`: the row-only parts; `values`: the values
+/// the navigations and aggregates read).
 #[derive(Deserialize)]
 struct Spec {
     pattern: String,
@@ -41,7 +52,136 @@ struct Spec {
     /// WITHIN: each row is within the interval of its match's first row, by the first ORDER BY key (the time argument).
     #[serde(default)]
     within: bool,
+    #[serde(default)]
+    defines: Vec<DefineSpec>,
+    #[serde(default)]
+    rows: usize,
+    #[serde(default)]
+    values: usize,
 }
+
+/// A DEFINE that reads the match so far: its symbol, its glue (SQL over `__mr_r{j}` and `__mr_s{index}`), and its slots.
+#[derive(Deserialize)]
+struct DefineSpec {
+    symbol: usize,
+    glue: String,
+    slots: Vec<SlotSpec>,
+}
+
+/// A slot of a glue, by its index (`__mr_s{index}`): a navigation (the row of `var`'s m-th first or last row, moved by
+/// `offset` rows, and the value column it reads), an aggregate over `var`'s rows (a value column, or none for count(*)),
+/// or MATCH_NUMBER().
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SlotSpec {
+    Nav { index: usize, var: Option<usize>, first: bool, m: usize, offset: i64, value: usize },
+    Agg { index: usize, fun: String, var: Option<usize>, value: Option<usize> },
+    MatchNumber { index: usize },
+}
+
+impl SlotSpec {
+    fn index(&self) -> usize {
+        match self {
+            SlotSpec::Nav { index, .. } | SlotSpec::Agg { index, .. } | SlotSpec::MatchNumber { index } => *index,
+        }
+    }
+
+    /// The variable whose rows the slot takes (None: every row of the match).
+    fn var(&self) -> Option<usize> {
+        match self {
+            SlotSpec::Nav { var, .. } | SlotSpec::Agg { var, .. } => *var,
+            SlotSpec::MatchNumber { .. } => None,
+        }
+    }
+
+    /// The value column the slot reads, if any.
+    fn value(&self) -> Option<usize> {
+        match self {
+            SlotSpec::Nav { value, .. } => Some(*value),
+            SlotSpec::Agg { value, .. } => *value,
+            SlotSpec::MatchNumber { .. } => None,
+        }
+    }
+}
+
+/// A pattern as a program, with its symbols, its skip rule, and its DEFINEs that read the match (by symbol, with their
+/// slots by index into `slots`).
+#[derive(Debug)]
+struct Plan {
+    syms: Vec<String>,
+    code: Vec<Inst>,
+    skip: Skip,
+    unmatched: bool,
+    within: bool,
+    defines: Vec<Define>,
+    slots: Vec<SlotSpec>,
+    rows: usize,
+    values: usize,
+}
+
+/// A DEFINE of symbol `symbol` that reads the match: its glue, and the indices of its slots.
+#[derive(Debug)]
+struct Define {
+    symbol: usize,
+    glue: String,
+    slots: Vec<usize>,
+}
+
+/// The plan of a spec, refused by name when it is malformed or too big.
+fn compile(text: &str) -> Result<Plan> {
+    let spec: Spec = serde_json::from_str(text).map_err(|e| anyhow!("MATCH_RECOGNIZE: the pattern's spec doesn't read: {e}"))?;
+    let (pattern, syms) = read(&spec.pattern)?;
+    let (defines, slots) = defines_of(&spec, syms.len())?;
+    let mut c = Compiler { code: vec![] };
+    c.emit(&pattern, false)?;
+    c.push(Inst::Match)?;
+    Ok(Plan {
+        syms,
+        code: c.code,
+        skip: spec.skip,
+        unmatched: spec.unmatched,
+        within: spec.within,
+        defines,
+        slots,
+        rows: spec.rows,
+        values: spec.values,
+    })
+}
+
+/// The spec's DEFINEs and slots, checked: the slots are numbered from 0, each once; each DEFINE names one of the pattern's
+/// symbols; and each slot reads a symbol and a value the spec has.
+fn defines_of(spec: &Spec, syms: usize) -> Result<(Vec<Define>, Vec<SlotSpec>)> {
+    let total: usize = spec.defines.iter().map(|d| d.slots.len()).sum();
+    let mut table: Vec<Option<SlotSpec>> = vec![None; total];
+    let mut defines = vec![];
+    for d in &spec.defines {
+        if d.symbol >= syms {
+            bail!("MATCH_RECOGNIZE: a DEFINE of the spec names no symbol of its pattern");
+        }
+        let mut ids = vec![];
+        for s in &d.slots {
+            let index = s.index();
+            let cell = table.get_mut(index).context("MATCH_RECOGNIZE: the spec's slots don't number from 0")?;
+            if cell.is_some() {
+                bail!("MATCH_RECOGNIZE: the spec's slot {index} is given twice");
+            }
+            *cell = Some(s.clone());
+            ids.push(index);
+        }
+        defines.push(Define { symbol: d.symbol, glue: d.glue.clone(), slots: ids });
+    }
+    let slots: Vec<SlotSpec> = table.into_iter().collect::<Option<Vec<SlotSpec>>>().context("MATCH_RECOGNIZE: the spec's slots don't number from 0")?;
+    for s in &slots {
+        if s.var().is_some_and(|v| v >= syms) || s.value().is_some_and(|v| v >= spec.values) {
+            bail!("MATCH_RECOGNIZE: a slot of the spec reads a symbol or a value the spec doesn't have");
+        }
+    }
+    Ok((defines, slots))
+}
+
+/// The states a pattern may compile to. A count in `{n,m}` multiplies its body, so past this a pattern is refused by
+/// name rather than run slowly.
+const STATES: usize = 10_000;
 
 /// AFTER MATCH SKIP: where the search for the next match goes on. A symbol is named, as the pattern names it.
 #[derive(Debug, Deserialize)]
@@ -80,26 +220,6 @@ enum Inst {
     /// `$`: holds at the partition's end only.
     End,
     Match,
-}
-
-/// A pattern as a program, with its symbols and skip rule.
-#[derive(Debug)]
-struct Plan {
-    syms: Vec<String>,
-    code: Vec<Inst>,
-    skip: Skip,
-    unmatched: bool,
-    within: bool,
-}
-
-/// The plan of a spec, refused by name when it is malformed or too big.
-fn compile(text: &str) -> Result<Plan> {
-    let spec: Spec = serde_json::from_str(text).map_err(|e| anyhow!("MATCH_RECOGNIZE: the pattern's spec doesn't read: {e}"))?;
-    let (pattern, syms) = read(&spec.pattern)?;
-    let mut c = Compiler { code: vec![] };
-    c.emit(&pattern, false)?;
-    c.push(Inst::Match)?;
-    Ok(Plan { syms, code: c.code, skip: spec.skip, unmatched: spec.unmatched, within: spec.within })
 }
 
 /// Writes a pattern's program: a sequence is its parts in order, and a choice is a Split that prefers its first branch.
@@ -246,12 +366,401 @@ struct Step {
 
 type Path = Option<Rc<Step>>;
 
-/// A thread: a state, the row its match started at, and its path.
+/// A thread's state: one entry per slot of the spec, in its order (`Thread::state`).
+type State = Vec<Acc>;
+
+/// A thread: a state, the row its match started at, its path, and the state of its slots (empty when no DEFINE reads the
+/// match, which keeps the search on its stamps).
 #[derive(Clone)]
 struct Thread {
     pc: usize,
     start: usize,
     path: Path,
+    state: Rc<State>,
+}
+
+/// What a slot holds of the match so far. A navigation keeps the rows it reads (so equal values on different rows stay
+/// apart); a count, a sum, an average and a min or max keep their values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Acc {
+    /// The rows of a navigation: the first m+1 (FIRST) or the last m+1 (LAST), oldest first.
+    Rows(VecDeque<usize>),
+    Count(i64),
+    /// A sum: None until a value is taken (a sum over no value is NULL).
+    Sum(Option<Num>),
+    /// An average: the f64 sum of its values (bits) and their number.
+    Avg(u64, i64),
+    /// A min or max: None until a value is taken.
+    Extreme(Option<ScalarValue>),
+    /// MATCH_NUMBER(), which keeps nothing.
+    Unit,
+}
+
+/// A sum, in the type it is added in: wrapping integers, a decimal's unscaled value, or a DOUBLE as fsum's (hi, lo) pair
+/// (bits). A REAL is summed as a DOUBLE, since sum's argument is coerced to one. Floats are kept by their bits, so two sums
+/// are equal when their bits are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Num {
+    Int(i64),
+    Uint(u64),
+    Dec(i128),
+    Float(u64, u64),
+}
+
+/// Adds a value to a sum (`None`: the first value).
+fn num_add(acc: Option<Num>, v: &ScalarValue) -> Result<Num> {
+    Ok(match (acc, v) {
+        (None, ScalarValue::Int64(Some(x))) => Num::Int(*x),
+        (Some(Num::Int(s)), ScalarValue::Int64(Some(x))) => Num::Int(s.wrapping_add(*x)),
+        (None, ScalarValue::UInt64(Some(x))) => Num::Uint(*x),
+        (Some(Num::Uint(s)), ScalarValue::UInt64(Some(x))) => Num::Uint(s.wrapping_add(*x)),
+        (None, ScalarValue::Decimal128(Some(x), _, _)) => Num::Dec(*x),
+        (Some(Num::Dec(s)), ScalarValue::Decimal128(Some(x), _, _)) => Num::Dec(s.wrapping_add(*x)),
+        (None, ScalarValue::Float64(Some(x))) => float_add(0.0, 0.0, *x),
+        (Some(Num::Float(h, l)), ScalarValue::Float64(Some(x))) => float_add(f64::from_bits(h), f64::from_bits(l), *x),
+        _ => bail!("MATCH_RECOGNIZE: a sum of {v} doesn't add to the sum so far"),
+    })
+}
+
+/// fsum's two-sum step, from the sum `hi` and its rounding error `lo`, as a sum's bits.
+fn float_add(hi: f64, lo: f64, x: f64) -> Num {
+    let (mut hi, mut lo) = (hi, lo);
+    fsum::add(&mut hi, &mut lo, x);
+    Num::Float(hi.to_bits(), lo.to_bits())
+}
+
+impl Num {
+    /// The sum as a value of its result type (a decimal keeps the result's precision and scale).
+    fn scalar(self, result: &DataType) -> Result<ScalarValue> {
+        Ok(match (self, result) {
+            (Num::Int(v), _) => ScalarValue::Int64(Some(v)),
+            (Num::Uint(v), _) => ScalarValue::UInt64(Some(v)),
+            (Num::Dec(v), DataType::Decimal128(p, s)) => ScalarValue::Decimal128(Some(v), *p, *s),
+            (Num::Float(h, l), _) => ScalarValue::Float64(Some(fsum::total(f64::from_bits(h), f64::from_bits(l)))),
+            _ => bail!("MATCH_RECOGNIZE: a sum's result is {result}, which its value isn't"),
+        })
+    }
+}
+
+/// A slot's types as planned: its result's type, and the type its value is cast to first (a sum's or an average's
+/// coerced argument; a value's own type otherwise).
+#[derive(Clone, Debug)]
+struct Typed {
+    arg: DataType,
+    result: DataType,
+}
+
+impl Typed {
+    fn same(t: DataType) -> Typed {
+        Typed { arg: t.clone(), result: t }
+    }
+}
+
+/// A DEFINE's glue as planned: the schema it reads (`__mr_r{j}` for each row-only part, then its slots' columns), its
+/// physical expression, and its slots' indices.
+#[derive(Debug)]
+struct Glued {
+    schema: SchemaRef,
+    slots: Vec<usize>,
+    expr: Arc<dyn PhysicalExpr>,
+}
+
+/// A spec's glue as planned against the engine's functions: each DEFINE's glue (by its position), the DEFINE of each
+/// symbol, and each slot's types.
+#[derive(Debug)]
+struct Planned {
+    glued: Vec<Glued>,
+    by_symbol: Vec<Option<usize>>,
+    types: Vec<Typed>,
+}
+
+/// One partition as the search reads it: each symbol's row-only conditions, WITHIN's times, the glue's row-only columns and
+/// value columns, the planned glue (when a DEFINE reads the match), and the cap on the partial matches a search holds.
+struct Part<'a> {
+    cond: &'a [Vec<bool>],
+    within: Option<&'a Within>,
+    n: usize,
+    rows: &'a [ArrayRef],
+    values: &'a [ArrayRef],
+    planned: Option<&'a Planned>,
+    cap: usize,
+}
+
+/// A thread that took row `i`, waiting for its glue (`check`: the glue's index and its place in that glue's batch) when it
+/// has one. Its path and state are as they stand after the row.
+struct Decision {
+    pc: usize,
+    start: usize,
+    path: Path,
+    state: Rc<State>,
+    check: Option<(usize, usize)>,
+}
+
+/// The partial matches one generation has reached: by (state, start when WITHIN) for a state-carrying pattern, by
+/// (state, start) for WITHIN without one.
+#[derive(Default)]
+struct Reached {
+    pairs: HashSet<(usize, usize)>,
+    keys: HashSet<(usize, usize, Rc<State>)>,
+}
+
+/// Which thread reaches a state first, in one generation of threads. Without WITHIN and without a DEFINE that reads the
+/// match, a state holds one thread (its stamp is the generation). With WITHIN two starts' threads at a state have different
+/// futures, so a state holds one thread per start. A DEFINE that reads the match puts the state itself in the key.
+enum Seen<'a> {
+    Stamp(&'a mut [usize], usize),
+    Start(&'a mut HashSet<(usize, usize)>),
+    Keys(&'a mut HashSet<(usize, usize, Rc<State>)>, bool),
+}
+
+impl<'a> Seen<'a> {
+    fn of(w: Option<&Within>, stated: bool, stamp: &'a mut [usize], gen: usize, reached: &'a mut Reached) -> Seen<'a> {
+        match (stated, w.is_some()) {
+            (true, within) => Seen::Keys(&mut reached.keys, within),
+            (false, true) => Seen::Start(&mut reached.pairs),
+            (false, false) => Seen::Stamp(stamp, gen),
+        }
+    }
+
+    /// Whether a thread that started at `start` in `state` is the first of this generation to reach `pc`.
+    fn first(&mut self, pc: usize, start: usize, state: &Rc<State>) -> bool {
+        match self {
+            Seen::Stamp(stamp, gen) => {
+                let fresh = stamp[pc] != *gen;
+                stamp[pc] = *gen;
+                fresh
+            }
+            Seen::Start(pairs) => pairs.insert((pc, start)),
+            Seen::Keys(keys, within) => keys.insert((pc, if *within { start } else { 0 }, state.clone())),
+        }
+    }
+}
+
+/// Adds the threads a state reaches at a row (its epsilon closure) to `out`, in priority order (a Split's first target
+/// first). A state holds the first thread to reach it, which is the one preferred (see `Seen`).
+#[allow(clippy::too_many_arguments)]
+fn close(code: &[Inst], out: &mut Vec<Thread>, seen: &mut Seen<'_>, pc: usize, start: usize, path: Path, state: &Rc<State>, at: usize, n: usize) {
+    let mut todo = vec![pc];
+    while let Some(pc) = todo.pop() {
+        if !seen.first(pc, start, state) {
+            continue;
+        }
+        match code[pc] {
+            Inst::Jmp(x) => todo.push(x),
+            Inst::Split(x, y) => {
+                todo.push(y);
+                todo.push(x);
+            }
+            Inst::Start => {
+                if at == 0 {
+                    todo.push(pc + 1);
+                }
+            }
+            Inst::End => {
+                if at == n {
+                    todo.push(pc + 1);
+                }
+            }
+            Inst::Sym(..) | Inst::Match => out.push(Thread { pc, start, path: path.clone(), state: state.clone() }),
+        }
+    }
+}
+
+/// The state of a thread that starts at a row: nothing taken yet.
+fn start_state(plan: &Plan) -> State {
+    plan.slots
+        .iter()
+        .map(|slot| match slot {
+            SlotSpec::Nav { .. } => Acc::Rows(VecDeque::new()),
+            SlotSpec::Agg { fun, .. } => match fun.as_str() {
+                "count" => Acc::Count(0),
+                "sum" => Acc::Sum(None),
+                "avg" => Acc::Avg(0f64.to_bits(), 0),
+                _ => Acc::Extreme(None),
+            },
+            SlotSpec::MatchNumber { .. } => Acc::Unit,
+        })
+        .collect()
+}
+
+/// The state once row `i` is taken as symbol `k`: each slot of that symbol, or of every row, takes the row.
+fn take(state: &State, plan: &Plan, part: &Part, k: usize, i: usize) -> Result<State> {
+    let types = &part.planned.context("MATCH_RECOGNIZE: a DEFINE has no glue planned")?.types;
+    let mut out = state.clone();
+    for (s, slot) in plan.slots.iter().enumerate() {
+        if matches!(slot, SlotSpec::MatchNumber { .. }) || slot.var().is_some_and(|v| v != k) {
+            continue;
+        }
+        out[s].take_row(slot, &types[s], i, part)?;
+    }
+    Ok(out)
+}
+
+/// The most preferred match that starts at or after `from`: the Pike VM's leftmost answer. A row's threads run in
+/// priority order; a match cuts the threads after it, and a higher-priority thread that matches later replaces it.
+/// No new thread starts once a match is found.
+/// `stamp` and `last` are the partition's, so a search costs its rows, not a clear of every state. With WITHIN a thread that
+/// would take a row too late dies (`within_ok`), and the threads of each start are kept apart (`Seen`).
+/// A row is taken in three phases: each thread at a symbol takes the row and decides its row-only conditions (phase 1);
+/// each glue is evaluated once over its batch (phase 2); and the passing threads go on, in the order they came (phase 3).
+/// `m` is MATCH_NUMBER(): the matches so far, plus one.
+fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut usize, m: i64) -> Result<Option<Found>> {
+    let code = &plan.code;
+    let (n, w) = (part.n, part.within);
+    let stated = !plan.defines.is_empty();
+    let cap = if stated { part.cap } else { MAX_THREADS };
+    let initial: Rc<State> = Rc::new(start_state(plan));
+    let glued = part.planned.map_or(0, |p| p.glued.len());
+    let mut best: Option<Found> = None;
+    let mut now: Vec<Thread> = vec![];
+    let mut now_reached = Reached::default();
+    let mut gen = *last + 1;
+    let mut i = from;
+    loop {
+        // (a new thread starts at this row last in line, so it is the least preferred)
+        if best.is_none() && i < n {
+            let mut seen = Seen::of(w, stated, stamp, gen, &mut now_reached);
+            close(code, &mut now, &mut seen, 0, i, None, &initial, i, n);
+        }
+        // phase 1: the threads at a symbol, in order, up to the first that matches
+        let mut decisions: Vec<Decision> = vec![];
+        let mut batch: Vec<Vec<usize>> = vec![vec![]; glued];
+        for t in &now {
+            match code[t.pc] {
+                Inst::Match => {
+                    best = Some(Found::of(t, i));
+                    break;
+                }
+                Inst::Sym(k, excluded) => {
+                    if i < n && part.cond[k][i] && within_ok(w, t.start, i) {
+                        let state = match stated {
+                            true => Rc::new(take(&t.state, plan, part, k, i)?),
+                            false => t.state.clone(),
+                        };
+                        let step = Rc::new(Step { sym: k, excluded, prev: t.path.clone() });
+                        let waits = match part.planned.and_then(|p| p.by_symbol[k]) {
+                            Some(g) => {
+                                batch[g].push(decisions.len());
+                                Some((g, batch[g].len() - 1))
+                            }
+                            None => None,
+                        };
+                        decisions.push(Decision { pc: t.pc + 1, start: t.start, path: Some(step), state, check: waits });
+                    }
+                }
+                _ => {}
+            }
+        }
+        // phase 2: each glue once over its batch, at this row
+        let mut passed: Vec<Vec<bool>> = vec![];
+        if let Some(p) = part.planned {
+            for (g, members) in batch.iter().enumerate() {
+                let states: Vec<&State> = members.iter().map(|&d| &*decisions[d].state).collect();
+                let out = match states.is_empty() {
+                    true => vec![],
+                    false => check(part, plan, &p.glued[g], &p.types, &states, i, m)?,
+                };
+                passed.push(out);
+            }
+        }
+        // phase 3: the passing threads go on, in their order
+        let gen_next = gen + 1;
+        let mut next: Vec<Thread> = vec![];
+        let mut next_reached = Reached::default();
+        {
+            let mut seen = Seen::of(w, stated, stamp, gen_next, &mut next_reached);
+            for d in &decisions {
+                let pass = match d.check {
+                    Some((g, pos)) => passed[g][pos],
+                    None => true,
+                };
+                if pass {
+                    close(code, &mut next, &mut seen, d.pc, d.start, d.path.clone(), &d.state, i + 1, n);
+                }
+            }
+        }
+        if next.len() > cap {
+            return Err(cap_error(stated, w.is_some(), cap));
+        }
+        if i == n || (best.is_some() && next.is_empty()) {
+            break;
+        }
+        now = next;
+        now_reached = next_reached;
+        gen = gen_next;
+        i += 1;
+    }
+    *last = gen + 1;
+    Ok(best)
+}
+
+/// A count with its thousands set off by commas, as the cap messages print it (100000 is 100,000).
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The refusal of a search past its cap. A pattern with no DEFINE that reads the match says what it said before; one that
+/// does says to narrow the conditions, and to narrow WITHIN too when there is one.
+fn cap_error(stated: bool, within: bool, cap: usize) -> anyhow::Error {
+    let cap = thousands(cap);
+    let msg = match (stated, within) {
+        (false, _) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: narrow WITHIN or the conditions"),
+        (true, true) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: narrow WITHIN or the conditions"),
+        (true, false) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: make the conditions narrower"),
+    };
+    coded("54000", msg)
+}
+
+/// The glue's answer for each thread of its batch at row `i` (NULL is false): the row-only columns of row `i`, broadcast, and
+/// each slot's value in each thread's state, as the glue's columns.
+fn check(part: &Part, plan: &Plan, glued: &Glued, types: &[Typed], states: &[&State], i: usize, m: i64) -> Result<Vec<bool>> {
+    let len = states.len();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(part.rows.len() + glued.slots.len());
+    for column in part.rows {
+        columns.push(ScalarValue::try_from_array(column.as_ref(), i)?.to_array_of_size(len)?);
+    }
+    for &s in &glued.slots {
+        let values = states
+            .iter()
+            .map(|st| st[s].scalar(&plan.slots[s], &types[s], part, m))
+            .collect::<Result<Vec<ScalarValue>>>()?;
+        columns.push(ScalarValue::iter_to_array(values)?);
+    }
+    let batch = RecordBatch::try_new(glued.schema.clone(), columns)?;
+    let out = glued.expr.evaluate(&batch)?.into_array(len)?;
+    bools(&out)
+}
+
+/// The partition's matches, as each row's memberships (see `search`, with `partition`'s skip rule between them).
+/// Matches go on from the skip rule's place; an empty match goes on one row later.
+fn partition(plan: &Plan, part: &Part) -> Result<Vec<Vec<Mem>>> {
+    let n = part.n;
+    let mut rows: Vec<Vec<Mem>> = vec![Vec::new(); n];
+    let (mut from, mut m) = (0usize, 0i64);
+    let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
+    while from < n {
+        // (MATCH_NUMBER is the matches so far, plus one: the one this search finds)
+        let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1)? else { break };
+        m += 1;
+        if f.start == f.end {
+            rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
+            from = f.start + 1;
+        } else {
+            for (j, &(sym, excluded)) in f.steps.iter().enumerate() {
+                rows[f.start + j].push(Mem { m, sym: Some(sym), seq: Some(j as i64 + 1), excluded });
+            }
+            from = skip(plan, &f, m)?;
+        }
+    }
+    Ok(rows)
 }
 
 /// A match: its rows `start..end`, and each row's symbol and excluded flag in order.
@@ -274,63 +783,6 @@ impl Found {
     }
 }
 
-/// The most preferred match that starts at or after `from`: the Pike VM's leftmost answer. A row's threads run in
-/// priority order; a match cuts the threads after it, and a higher-priority thread that matches later replaces it.
-/// No new thread starts once a match is found.
-/// `stamp` and `gen` are the partition's, so a search costs its rows, not a clear of every state. With WITHIN a thread that
-/// would take a row too late dies (`within_ok`), and the threads of each start are kept apart (`Seen`).
-fn search(plan: &Plan, cond: &[Vec<bool>], w: Option<&Within>, n: usize, from: usize, stamp: &mut [usize], last: &mut usize) -> Result<Option<Found>> {
-    let code = &plan.code;
-    let mut best: Option<Found> = None;
-    let mut now: Vec<Thread> = vec![];
-    let mut now_pairs = HashSet::new();
-    let mut gen = *last + 1;
-    let mut i = from;
-    loop {
-        // (a new thread starts at this row last in line, so it is the least preferred)
-        if best.is_none() && i < n {
-            let mut seen = Seen::of(w, stamp, gen, &mut now_pairs);
-            close(code, &mut now, &mut seen, 0, i, None, i, n);
-        }
-        let mut next = vec![];
-        let mut next_pairs = HashSet::new();
-        let gen_next = gen + 1;
-        {
-            let mut seen = Seen::of(w, stamp, gen_next, &mut next_pairs);
-            for t in &now {
-                match code[t.pc] {
-                    Inst::Match => {
-                        best = Some(Found::of(t, i));
-                        break;
-                    }
-                    Inst::Sym(k, excluded) => {
-                        if i < n && cond[k][i] && within_ok(w, t.start, i) {
-                            let step = Rc::new(Step { sym: k, excluded, prev: t.path.clone() });
-                            close(code, &mut next, &mut seen, t.pc + 1, t.start, Some(step), i + 1, n);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if next.len() > MAX_THREADS {
-            return Err(coded(
-                "54000",
-                format!("MATCH_RECOGNIZE: the search holds more than {MAX_THREADS} partial matches at once: narrow WITHIN or the conditions"),
-            ));
-        }
-        if i == n || (best.is_some() && next.is_empty()) {
-            break;
-        }
-        now = next;
-        now_pairs = next_pairs;
-        gen = gen_next;
-        i += 1;
-    }
-    *last = gen + 1;
-    Ok(best)
-}
-
 /// The most threads a search may hold at once: past it the search is refused (54000), as WITHIN keeps one per start.
 const MAX_THREADS: usize = 1_000_000;
 
@@ -351,65 +803,6 @@ fn within_ok(w: Option<&Within>, start: usize, i: usize) -> bool {
     }
 }
 
-/// Which thread reaches a state first, in one generation of threads. Without WITHIN a state holds one thread (its stamp
-/// is the generation). With WITHIN two starts' threads at a state have different futures (their times differ), so a state
-/// holds one thread per start, and `Start` is the generation's set of (state, start).
-enum Seen<'a> {
-    Stamp(&'a mut [usize], usize),
-    Start(&'a mut HashSet<(usize, usize)>),
-}
-
-impl<'a> Seen<'a> {
-    fn of(w: Option<&Within>, stamp: &'a mut [usize], gen: usize, pairs: &'a mut HashSet<(usize, usize)>) -> Seen<'a> {
-        match w {
-            Some(_) => Seen::Start(pairs),
-            None => Seen::Stamp(stamp, gen),
-        }
-    }
-
-    /// Whether a thread that started at `start` is the first of this generation to reach `pc`.
-    fn first(&mut self, pc: usize, start: usize) -> bool {
-        match self {
-            Seen::Stamp(stamp, gen) => {
-                let fresh = stamp[pc] != *gen;
-                stamp[pc] = *gen;
-                fresh
-            }
-            Seen::Start(pairs) => pairs.insert((pc, start)),
-        }
-    }
-}
-
-/// Adds the threads a state reaches at a row (its epsilon closure) to `out`, in priority order (a Split's first target
-/// first). A state holds the first thread to reach it, which is the one preferred (see `Seen`).
-#[allow(clippy::too_many_arguments)]
-fn close(code: &[Inst], out: &mut Vec<Thread>, seen: &mut Seen<'_>, pc: usize, start: usize, path: Path, at: usize, n: usize) {
-    let mut todo = vec![pc];
-    while let Some(pc) = todo.pop() {
-        if !seen.first(pc, start) {
-            continue;
-        }
-        match code[pc] {
-            Inst::Jmp(x) => todo.push(x),
-            Inst::Split(x, y) => {
-                todo.push(y);
-                todo.push(x);
-            }
-            Inst::Start => {
-                if at == 0 {
-                    todo.push(pc + 1);
-                }
-            }
-            Inst::End => {
-                if at == n {
-                    todo.push(pc + 1);
-                }
-            }
-            Inst::Sym(..) | Inst::Match => out.push(Thread { pc, start, path: path.clone() }),
-        }
-    }
-}
-
 /// A row's membership in one match: the match's number, the row's symbol (None for the row of an empty match), its
 /// place in the match, and whether `{- -}` leaves it out of the output.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -418,28 +811,6 @@ struct Mem {
     sym: Option<usize>,
     seq: Option<i64>,
     excluded: bool,
-}
-
-/// Every match of one partition of `n` rows, as each row's memberships (a row in none has an empty list). Matches go on
-/// from the skip rule's place; an empty match goes on one row later.
-fn partition(plan: &Plan, cond: &[Vec<bool>], w: Option<&Within>, n: usize) -> Result<Vec<Vec<Mem>>> {
-    let mut rows: Vec<Vec<Mem>> = vec![Vec::new(); n];
-    let (mut from, mut m) = (0usize, 0i64);
-    let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
-    while from < n {
-        let Some(f) = search(plan, cond, w, n, from, &mut stamp, &mut gen)? else { break };
-        m += 1;
-        if f.start == f.end {
-            rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
-            from = f.start + 1;
-        } else {
-            for (j, &(sym, excluded)) in f.steps.iter().enumerate() {
-                rows[f.start + j].push(Mem { m, sym: Some(sym), seq: Some(j as i64 + 1), excluded });
-            }
-            from = skip(plan, &f, m)?;
-        }
-    }
-    Ok(rows)
 }
 
 /// Where the search goes on after a match, by the skip rule (AFTER MATCH SKIP). `TO FIRST v` and `TO LAST v` go to
@@ -562,12 +933,143 @@ fn external(e: anyhow::Error) -> DataFusionError {
     }
 }
 
+impl Acc {
+    /// Takes row `i` into the slot: a navigation keeps the row, a count counts it (when its value is not NULL), a sum or an
+    /// average adds its value, and a min or max keeps the smaller or larger. A NULL value is not taken by an aggregate.
+    fn take_row(&mut self, slot: &SlotSpec, types: &Typed, i: usize, part: &Part) -> Result<()> {
+        match (slot, self) {
+            (SlotSpec::Nav { first, m, .. }, Acc::Rows(rows)) => {
+                let keep = *m + 1;
+                if *first {
+                    if rows.len() < keep {
+                        rows.push_back(i);
+                    }
+                } else {
+                    rows.push_back(i);
+                    if rows.len() > keep {
+                        rows.pop_front();
+                    }
+                }
+            }
+            (SlotSpec::Agg { fun, value, .. }, acc) => match (fun.as_str(), acc) {
+                ("count", Acc::Count(c)) => {
+                    let counts = match *value {
+                        None => true,
+                        Some(j) => part.values.get(j).context("MATCH_RECOGNIZE: a value is missing")?.is_valid(i),
+                    };
+                    if counts {
+                        *c += 1;
+                    }
+                }
+                ("sum", Acc::Sum(total)) => {
+                    if let Some(v) = value_at(part, *value, i, &types.arg)? {
+                        *total = Some(num_add(*total, &v)?);
+                    }
+                }
+                ("avg", Acc::Avg(sum, n)) => {
+                    if let Some(ScalarValue::Float64(Some(x))) = value_at(part, *value, i, &DataType::Float64)? {
+                        *sum = (f64::from_bits(*sum) + x).to_bits();
+                        *n += 1;
+                    }
+                }
+                (name @ ("min" | "max"), Acc::Extreme(best)) => {
+                    if let Some(v) = value_at(part, *value, i, &types.arg)? {
+                        let better = match best.as_ref() {
+                            None => true,
+                            Some(b) => match order(&v, b) {
+                                Ordering::Less => name == "min",
+                                Ordering::Greater => name == "max",
+                                Ordering::Equal => false,
+                            },
+                        };
+                        if better {
+                            *best = Some(v);
+                        }
+                    }
+                }
+                _ => bail!("MATCH_RECOGNIZE: a DEFINE's state doesn't match its slot"),
+            },
+            (SlotSpec::MatchNumber { .. }, _) => {}
+            _ => bail!("MATCH_RECOGNIZE: a DEFINE's state doesn't match its slot"),
+        }
+        Ok(())
+    }
+
+    /// The slot's value now, as a value of its result type: a navigation reads its value column at the row it names, moved by
+    /// its offset (NULL outside the partition or with no such row); an aggregate is its state's value; MATCH_NUMBER is `m`.
+    fn scalar(&self, slot: &SlotSpec, types: &Typed, part: &Part, m: i64) -> Result<ScalarValue> {
+        let null = ScalarValue::try_from(&types.result)?;
+        Ok(match (slot, self) {
+            (SlotSpec::MatchNumber { .. }, _) => ScalarValue::Int64(Some(m)),
+            (SlotSpec::Nav { first, m: want, offset, value, .. }, Acc::Rows(rows)) => {
+                let row = match rows.len() == *want + 1 {
+                    false => None,
+                    true => match *first {
+                        true => rows.get(*want).copied(),
+                        false => rows.front().copied(),
+                    },
+                };
+                match row.map(|r| r as i64 + *offset) {
+                    Some(p) if p >= 0 && (p as usize) < part.n => {
+                        let column = part.values.get(*value).context("MATCH_RECOGNIZE: a value is missing")?;
+                        ScalarValue::try_from_array(column.as_ref(), p as usize)?
+                    }
+                    _ => null,
+                }
+            }
+            (_, Acc::Count(c)) => ScalarValue::Int64(Some(*c)),
+            (_, Acc::Sum(None)) => null,
+            (_, Acc::Sum(Some(x))) => x.scalar(&types.result)?,
+            (_, Acc::Avg(sum, n)) => ScalarValue::Float64(match *n {
+                0 => None,
+                n => Some(f64::from_bits(*sum) / n as f64),
+            }),
+            (_, Acc::Extreme(Some(v))) => v.clone(),
+            (_, Acc::Extreme(None)) => null,
+            _ => bail!("MATCH_RECOGNIZE: a DEFINE's state doesn't match its slot"),
+        })
+    }
+}
+
+/// The value of value column `value` at row `i`, cast to `to`; None when it is NULL there.
+fn value_at(part: &Part, value: Option<usize>, i: usize, to: &DataType) -> Result<Option<ScalarValue>> {
+    let j = value.context("MATCH_RECOGNIZE: an aggregate reads a value")?;
+    let column = part.values.get(j).context("MATCH_RECOGNIZE: a value is missing")?;
+    if !column.is_valid(i) {
+        return Ok(None);
+    }
+    Ok(Some(ScalarValue::try_from_array(column.as_ref(), i)?.cast_to(to)?))
+}
+
+/// The order MIN and MAX use: a float's NaN is the largest (as arrow's), and any other value is compared as SQL compares.
+fn order(a: &ScalarValue, b: &ScalarValue) -> Ordering {
+    match (a, b) {
+        (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y))) => float_order(*x, *y),
+        (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y))) => float_order(f64::from(*x), f64::from(*y)),
+        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+    }
+}
+
+fn float_order(x: f64, y: f64) -> Ordering {
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        _ => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+    }
+}
+
 /// The evaluator of one partition. The whole partition is matched at once: a match may look at any of its rows, so
 /// the window's frame and a bounded run don't apply.
 #[derive(Debug)]
 struct Evaluator {
     all: bool,
+    planner: Arc<Planner>,
+    /// The spec's text, and its plan, once read.
+    text: String,
     plan: Option<Plan>,
+    /// The spec's glue, planned against the input types, when a DEFINE reads the match.
+    planned: Option<Arc<Planned>>,
 }
 
 impl PartitionEvaluator for Evaluator {
@@ -581,20 +1083,27 @@ impl PartitionEvaluator for Evaluator {
 }
 
 impl Evaluator {
-    /// The answer for `n` rows. `values[0]` is the spec, then one condition column per symbol.
+    /// The answer for `n` rows. `values[0]` is the spec, then one condition column per symbol, WITHIN's time and interval when
+    /// within, the glue's row-only columns, and its value columns.
     fn run(&mut self, values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         if n == 0 {
             return answer(&[], &[], self.all, false);
         }
         if self.plan.is_none() {
-            self.plan = Some(compile(&spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?)?);
+            let text = spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?;
+            self.plan = Some(compile(&text)?);
+            self.text = text;
         }
         let plan = self.plan.as_ref().context("MATCH_RECOGNIZE: no plan")?;
+        if !plan.defines.is_empty() && self.planned.is_none() {
+            let types: Vec<DataType> = values.iter().map(|v| v.data_type().clone()).collect();
+            self.planned = Some(self.planner.planned(&self.text, plan, &types)?);
+        }
         let mut cond = vec![];
         for k in 0..plan.syms.len() {
             cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
         }
-        // the time and the interval come after the symbols' conditions
+        // WITHIN's time and interval come after the symbols' conditions
         let within = match plan.within {
             true => {
                 let time = values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?;
@@ -603,16 +1112,187 @@ impl Evaluator {
             }
             false => None,
         };
-        answer(&partition(plan, &cond, within.as_ref(), n)?, &plan.syms, self.all, plan.unmatched)
+        // the glue's row-only columns, then its value columns
+        let first = 1 + plan.syms.len() + if plan.within { 2 } else { 0 };
+        let rows = values.get(first..first + plan.rows).context("MATCH_RECOGNIZE: the glue's row columns are missing")?;
+        let columns = values
+            .get(first + plan.rows..first + plan.rows + plan.values)
+            .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
+        let part = Part {
+            cond: &cond,
+            within: within.as_ref(),
+            n,
+            rows,
+            values: columns,
+            planned: self.planned.as_deref(),
+            cap: STATE_CAP,
+        };
+        answer(&partition(plan, &part)?, &plan.syms, self.all, plan.unmatched)
     }
 }
 
+/// Plans the glue of specs against the engine's functions. `base` is the session's snapshot that `register` takes. A plan is
+/// kept per spec text and input types, so the partitions of one query plan once.
+struct Planner {
+    base: Arc<SessionState>,
+    cache: Mutex<HashMap<(String, Vec<DataType>), Arc<Planned>>>,
+}
+
+impl std::fmt::Debug for Planner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Planner")
+    }
+}
+
+impl Planner {
+    /// The spec's glue planned for these input types (see `plan_glue`), from the cache when it is there.
+    fn planned(&self, text: &str, plan: &Plan, types: &[DataType]) -> Result<Arc<Planned>> {
+        let key = (text.to_string(), types.to_vec());
+        if let Some(p) = lock(&self.cache).get(&key) {
+            return Ok(p.clone());
+        }
+        let p = Arc::new(plan_glue(&self.base, plan, types)?);
+        lock(&self.cache).insert(key, p.clone());
+        Ok(p)
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A spec's glue planned: each DEFINE's columns typed as the call's arguments say, and each slot's types. The call's arguments,
+/// in order: the spec, one condition per symbol, WITHIN's time and interval when within, the row-only columns, the values.
+/// A glue that names a function the engine lacks, or a slot the engine can't add up, is refused with the DEFINE's name.
+fn plan_glue(base: &SessionState, plan: &Plan, types: &[DataType]) -> Result<Planned> {
+    let first = 1 + plan.syms.len() + if plan.within { 2 } else { 0 };
+    let rows = types.get(first..first + plan.rows).context("MATCH_RECOGNIZE: the glue's row columns are missing")?;
+    let values = types
+        .get(first + plan.rows..first + plan.rows + plan.values)
+        .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
+    let mut typed: Vec<Option<Typed>> = vec![None; plan.slots.len()];
+    let mut glued = vec![];
+    let mut by_symbol: Vec<Option<usize>> = vec![None; plan.syms.len()];
+    for d in &plan.defines {
+        let sym = plan.syms[d.symbol].as_str();
+        let mut fields: Vec<Field> = rows.iter().enumerate().map(|(j, t)| Field::new(format!("__mr_r{j}"), t.clone(), true)).collect();
+        for &s in &d.slots {
+            let t = slot_types(&plan.slots[s], values, base).map_err(|e| define_error(sym, e))?;
+            fields.push(Field::new(format!("__mr_s{s}"), t.result.clone(), true));
+            typed[s] = Some(t);
+        }
+        let schema: SchemaRef = Arc::new(Schema::new(fields.clone()));
+        let frame = DFSchema::from_unqualified_fields(Fields::from(fields), HashMap::new()).map_err(|e| define_error(sym, e.into()))?;
+        let expr = glue_expr(base, &d.glue, &frame).map_err(|e| define_error(sym, e))?;
+        by_symbol[d.symbol] = Some(glued.len());
+        glued.push(Glued { schema, slots: d.slots.clone(), expr });
+    }
+    let typed_slots = typed.into_iter().collect::<Option<Vec<Typed>>>().context("MATCH_RECOGNIZE: a slot belongs to no DEFINE")?;
+    Ok(Planned { glued, by_symbol, types: typed_slots })
+}
+
+/// A glue as a physical expression over `frame`: planned as SQL, run through the engine's analyzer (its rules, as on the row
+/// path), and made physical.
+fn glue_expr(base: &SessionState, text: &str, frame: &DFSchema) -> Result<Arc<dyn PhysicalExpr>> {
+    let expr = base.create_logical_expr(text, frame)?;
+    let input = LogicalPlan::EmptyRelation(EmptyRelation { produce_one_row: false, schema: Arc::new(frame.clone()) });
+    let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], Arc::new(input))?);
+    let checked = base.analyzer().execute_and_check(plan, base.config_options(), |_, _| {})?;
+    let LogicalPlan::Projection(p) = checked else { bail!("MATCH_RECOGNIZE: a DEFINE's glue didn't plan as an expression") };
+    let expr = match p.expr.into_iter().next() {
+        Some(Expr::Alias(a)) => *a.expr,
+        Some(e) => e,
+        None => bail!("MATCH_RECOGNIZE: a DEFINE's glue is empty"),
+    };
+    // The optimizer rewrites COALESCE and its kin to CASE before a plan runs; a glue has no plan, so it is simplified here.
+    let info = SimplifyContext::builder().with_schema(Arc::new(frame.clone())).build();
+    let expr = ExprSimplifier::new(info).simplify(expr)?;
+    Ok(base.create_physical_expr(expr, frame)?)
+}
+
+/// A DEFINE's error, named by its variable. The SQLSTATE is the error's own: a refusal's, or the one its words give (a
+/// function the engine lacks is 42883).
+fn define_error(sym: &str, e: anyhow::Error) -> anyhow::Error {
+    let code = crate::codes::of(&e);
+    coded(code, format!("MATCH_RECOGNIZE: DEFINE {sym}: {e}"))
+}
+
+/// A slot's types: a navigation's and a MIN's or MAX's are their value's; a count's and MATCH_NUMBER's are Int64. A sum's and an
+/// average's are the argument and result DataFusion's own aggregate gives the value. A sum of a type not added here, and an
+/// average of a DECIMAL, are refused.
+fn slot_types(slot: &SlotSpec, values: &[DataType], base: &SessionState) -> Result<Typed> {
+    Ok(match slot {
+        SlotSpec::MatchNumber { .. } => Typed::same(DataType::Int64),
+        SlotSpec::Nav { value, .. } => Typed::same(values.get(*value).context("MATCH_RECOGNIZE: a value is missing")?.clone()),
+        SlotSpec::Agg { fun, value, .. } => match fun.as_str() {
+            "count" => Typed::same(DataType::Int64),
+            name => {
+                let j = (*value).context("MATCH_RECOGNIZE: an aggregate reads a value")?;
+                let vt = values.get(j).context("MATCH_RECOGNIZE: a value is missing")?;
+                match name {
+                    "min" | "max" => Typed::same(vt.clone()),
+                    "sum" => {
+                        let (arg, result) = aggregate_types(base, "sum", vt)?;
+                        let ok = match (&arg, &result) {
+                            (DataType::Int64 | DataType::UInt64 | DataType::Float64, _) => true,
+                            (DataType::Decimal128(_, s), DataType::Decimal128(_, r)) => s == r,
+                            _ => false,
+                        };
+                        if !ok {
+                            return Err(coded(
+                                "0A000",
+                                format!("sum of {arg} isn't supported in a DEFINE yet: cast the value to DOUBLE or BIGINT, as sum(CAST(a.x AS DOUBLE))"),
+                            ));
+                        }
+                        Typed { arg, result }
+                    }
+                    _ => {
+                        if matches!(vt, DataType::Decimal128(_, _) | DataType::Decimal256(_, _)) {
+                            return Err(coded(
+                                "0A000",
+                                "avg of a DECIMAL isn't supported in a DEFINE yet: cast the value to DOUBLE, as avg(CAST(a.x AS DOUBLE))",
+                            ));
+                        }
+                        Typed { arg: DataType::Float64, result: DataType::Float64 }
+                    }
+                }
+            }
+        },
+    })
+}
+
+/// The argument type DataFusion's aggregate `name` coerces a value of type `value` to, and the aggregate's result type.
+fn aggregate_types(base: &SessionState, name: &str, value: &DataType) -> Result<(DataType, DataType)> {
+    let udaf = base.udaf(name)?;
+    let field: FieldRef = Arc::new(Field::new("value", value.clone(), true));
+    let coerced = fields_with_udf(&[field], udaf.as_ref())?;
+    let arg = coerced.first().context("MATCH_RECOGNIZE: an aggregate takes no argument")?.data_type().clone();
+    let result = udaf.return_type(std::slice::from_ref(&arg))?;
+    Ok((arg, result))
+}
+
 /// The two window functions: `pondra_match` (a row's first membership) and `pondra_matches` (all of them, for matches
-/// that may share rows).
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// that may share rows). The planner is the session's snapshot; it is not part of a function's identity.
+#[derive(Debug)]
 struct Matcher {
     all: bool,
     signature: Signature,
+    planner: Arc<Planner>,
+}
+
+impl PartialEq for Matcher {
+    fn eq(&self, other: &Self) -> bool {
+        self.all == other.all && self.signature == other.signature
+    }
+}
+
+impl Eq for Matcher {}
+
+impl Hash for Matcher {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.all.hash(state);
+        self.signature.hash(state);
+    }
 }
 
 impl WindowUDFImpl for Matcher {
@@ -626,25 +1306,35 @@ impl WindowUDFImpl for Matcher {
     fn signature(&self) -> &Signature { &self.signature }
 
     fn partition_evaluator(&self, args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
-        // (the spec is a literal, as `pattern.rs` writes it: compiled here; another form is read at the first row)
-        let plan = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
-            Some(ScalarValue::Utf8(Some(text))) => Some(compile(text).map_err(external)?),
+        let types: Vec<DataType> = args.input_fields().iter().map(|f| f.data_type().clone()).collect();
+        // (the spec is a literal, as `pattern.rs` writes it: compiled and planned here; another form is read at the first row)
+        let literal = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
+            Some(ScalarValue::Utf8(Some(text))) => Some(text.clone()),
             _ => None,
         };
-        // (WITHIN's time and interval are checked here, at planning, when the spec is a literal; `run` checks the time too)
-        if let Some(p) = plan.as_ref().filter(|p| p.within) {
-            let fields = args.input_fields();
-            if let Some(time) = fields.get(p.syms.len() + 1) {
-                check_time_type(time.data_type()).map_err(external)?;
-            }
-            // a backstop for a spec written by hand: pattern.rs writes an interval literal, which is an interval type
-            if let Some(interval) = fields.get(p.syms.len() + 2) {
-                if !matches!(interval.data_type(), DataType::Interval(_)) {
-                    return Err(external(coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR")));
+        let mut evaluator = Evaluator { all: self.all, planner: self.planner.clone(), text: String::new(), plan: None, planned: None };
+        if let Some(text) = literal {
+            let plan = compile(&text).map_err(external)?;
+            // (WITHIN's time and interval are checked here, at planning; `run` checks the time too)
+            if plan.within {
+                let fields = args.input_fields();
+                if let Some(time) = fields.get(plan.syms.len() + 1) {
+                    check_time_type(time.data_type()).map_err(external)?;
+                }
+                // a backstop for a spec written by hand: pattern.rs writes an interval literal, which is an interval type
+                if let Some(interval) = fields.get(plan.syms.len() + 2) {
+                    if !matches!(interval.data_type(), DataType::Interval(_)) {
+                        return Err(external(coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR")));
+                    }
                 }
             }
+            if !plan.defines.is_empty() {
+                evaluator.planned = Some(self.planner.planned(&text, &plan, &types).map_err(external)?);
+            }
+            evaluator.text = text;
+            evaluator.plan = Some(plan);
         }
-        Ok(Box::new(Evaluator { all: self.all, plan }))
+        Ok(Box::new(evaluator))
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
@@ -654,6 +1344,17 @@ impl WindowUDFImpl for Matcher {
         };
         Ok(Arc::new(Field::new(field_args.name(), t, true)))
     }
+}
+
+/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`). A DEFINE's glue is planned
+/// against the session as it stands here, so it sees the functions registered before this call and no later one.
+pub fn register(ctx: &SessionContext) {
+    let planner = Arc::new(Planner { base: Arc::new(ctx.state()), cache: Mutex::new(HashMap::new()) });
+    for all in [false, true] {
+        let signature = Signature::variadic_any(Volatility::Immutable);
+        ctx.register_udwf(WindowUDF::from(Matcher { all, signature, planner: planner.clone() }));
+    }
+    ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
 }
 
 /// `pondra_nav(value, keep, m, first, final)`, called over one match's rows in their order: at each row, `value` at the
@@ -717,7 +1418,7 @@ fn nav(values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         };
         at.push(pick.map(|j| j as u32));
     }
-    Ok(take(values[0].as_ref(), &UInt32Array::from(at), None)?)
+    Ok(datafusion::arrow::compute::take(values[0].as_ref(), &UInt32Array::from(at), None)?)
 }
 
 /// A literal argument (the same in every row), read from its first row as a whole number.
@@ -727,13 +1428,6 @@ fn first_int(column: &ArrayRef) -> Result<i64> {
     ints.iter().next().flatten().context("MATCH_RECOGNIZE: pondra_nav's m is NULL")
 }
 
-/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`).
-pub fn register(ctx: &SessionContext) {
-    for all in [false, true] {
-        ctx.register_udwf(WindowUDF::from(Matcher { all, signature: Signature::variadic_any(Volatility::Immutable) }));
-    }
-    ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
-}
 
 /// A PATTERN's text as a pattern, and the symbols it names in the order they first appear (a symbol's number is its place
 /// here: the DEFINE columns go by it, and so do the matcher's conditions). Read here, not by sqlparser, which refuses forms
@@ -973,8 +1667,9 @@ mod tests {
     /// Each row's memberships as text: `1a2` (match 1, symbol a, place 2), `1-` for an empty match's row.
     fn shown(spec: &str, rows: &[Vec<usize>]) -> Result<Vec<String>> {
         let plan = compile(spec)?;
-        let found = partition(&plan, &conds(rows, plan.syms.len()), None, rows.len())?;
-        Ok(texts(&plan, &found))
+        let cond = conds(rows, plan.syms.len());
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP };
+        Ok(texts(&plan, &partition(&plan, &part)?))
     }
 
     /// `shown` under WITHIN: `times` are the rows' times (None is NULL), and each row must be within `interval` of its
@@ -983,9 +1678,11 @@ mod tests {
         let plan = compile(&within_spec(pattern)).unwrap();
         let low = times.iter().map(|t| t.map(|t| t - interval)).collect();
         let w = Within { time: times.to_vec(), low };
-        let found = partition(&plan, &conds(rows, plan.syms.len()), Some(&w), rows.len()).unwrap();
-        texts(&plan, &found)
+        let cond = conds(rows, plan.syms.len());
+        let part = Part { cond: &cond, within: Some(&w), n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP };
+        texts(&plan, &partition(&plan, &part).unwrap())
     }
+
 
     fn texts(plan: &Plan, found: &[Vec<Mem>]) -> Vec<String> {
         found
@@ -1294,5 +1991,188 @@ mod tests {
         let (a, b) = (within_of(&zoned, &interval).unwrap(), within_of(&utc, &interval).unwrap());
         assert_eq!(a.time, b.time);
         assert_eq!(a.low, b.low);
+    }
+
+    use datafusion::arrow::util::display::array_value_to_string;
+    use datafusion::execution::runtime_env::RuntimeEnv;
+    use datafusion::prelude::SessionConfig;
+
+    /// A query's rows as text, each row's values joined by `|`, in the order the query gives. Its MATCH_RECOGNIZE is written
+    /// as the engine's front writes it (`pattern::rewritten`), and the query runs in a session.
+    async fn rows_of(sql: &str) -> Result<Vec<String>> {
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let batches = ctx.sql(&crate::pattern::rewritten(sql)?).await?.collect().await?;
+        let mut out = vec![];
+        for b in &batches {
+            for r in 0..b.num_rows() {
+                let cells = b
+                    .columns()
+                    .iter()
+                    .map(|c| array_value_to_string(c.as_ref(), r))
+                    .collect::<std::result::Result<Vec<String>, _>>()?;
+                out.push(cells.join("|"));
+            }
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn a_define_that_counts_the_match_counts_the_row_it_tests() -> Result<()> {
+        // b counts the match with its own row in it, so (b | a) c takes b for row 1: the answer is b c, not a c
+        let rows = rows_of(
+            "WITH t(day) AS (VALUES (1), (2)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day MEASURES CLASSIFIER() AS sym \
+             ALL ROWS PER MATCH PATTERN ((b | a) c) DEFINE b AS count(*) >= 1) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows, ["1|b", "2|c"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_variable_with_no_rows_is_null_in_the_glue() -> Result<()> {
+        // when b is first tested, a has no row: a.x is NULL, COALESCE makes it 0, and b takes every row (a? first fails at row 2)
+        let rows = rows_of(
+            "WITH t(day, x) AS (VALUES (1, 1), (2, 2), (3, 3)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a? b+) DEFINE b AS COALESCE(a.x, 0) = 0) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows, ["1|b", "2|b", "3|b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_double_sum_in_a_define_is_fsums() -> Result<()> {
+        // ten 0.1s sum to 0.9999999999999999 when added one by one, and to 1 as fsum sums them: the DEFINE sees the 1
+        let rows = rows_of(
+            "WITH t(day, x) AS (VALUES (1, CAST(0.1 AS DOUBLE)), (2, CAST(0.1 AS DOUBLE)), (3, CAST(0.1 AS DOUBLE)), \
+             (4, CAST(0.1 AS DOUBLE)), (5, CAST(0.1 AS DOUBLE)), (6, CAST(0.1 AS DOUBLE)), (7, CAST(0.1 AS DOUBLE)), \
+             (8, CAST(0.1 AS DOUBLE)), (9, CAST(0.1 AS DOUBLE)), (10, CAST(0.1 AS DOUBLE)), (11, CAST(0.0 AS DOUBLE))) \
+             SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH \
+             PATTERN (a{10} b) DEFINE b AS sum(a.x) = CAST(1 AS DOUBLE)) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows.last().map(String::as_str), Some("11|b"), "{rows:?}");
+        assert_eq!(rows.len(), 11, "{rows:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn integer_and_decimal_sums_in_a_define() -> Result<()> {
+        let ints = rows_of(
+            "WITH t(day, n) AS (VALUES (1, 1), (2, 2), (3, 3), (4, 0)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a{3} b) DEFINE b AS sum(a.n) = 6) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(ints, ["1|a", "2|a", "3|a", "4|b"]);
+        let decimals = rows_of(
+            "WITH t(day, amt) AS (VALUES (1, CAST(0.10 AS DECIMAL(10,2))), (2, CAST(0.20 AS DECIMAL(10,2))), \
+             (3, CAST(0.30 AS DECIMAL(10,2))), (4, CAST(0.00 AS DECIMAL(10,2)))) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a{3} b) DEFINE b AS sum(a.amt) = 0.60) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(decimals, ["1|a", "2|a", "3|a", "4|b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn min_and_max_of_a_float_with_nan() -> Result<()> {
+        // NaN is the largest: the min of 1, NaN and 2 is 1, and the max is NaN
+        let rows = rows_of(
+            "WITH t(day, x) AS (VALUES (1, CAST(1.0 AS DOUBLE)), (2, CAST('NaN' AS DOUBLE)), (3, CAST(2.0 AS DOUBLE)), \
+             (4, CAST(0.0 AS DOUBLE))) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day MEASURES CLASSIFIER() AS sym \
+             ALL ROWS PER MATCH PATTERN (a{3} b) DEFINE b AS min(a.x) = CAST(1 AS DOUBLE) AND CAST(max(a.x) AS VARCHAR) = 'NaN') \
+             ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows, ["1|a", "2|a", "3|a", "4|b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn match_number_counts_the_matches_so_far() -> Result<()> {
+        // each row is a match of its own, and x is tested for the match number it would have, which is its day
+        let rows = rows_of(
+            "WITH t(day) AS (VALUES (1), (2), (3)) SELECT day, m FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES MATCH_NUMBER() AS m ALL ROWS PER MATCH PATTERN (x) DEFINE x AS MATCH_NUMBER() = day) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows, ["1|1", "2|2", "3|3"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_navigation_of_equal_values_on_other_rows_is_kept_apart() -> Result<()> {
+        // (d, a) and (a, d) reach the loop with LAST(a.x) = 2 on rows 2 and 1, equal values: NEXT(LAST(a.x)) is 5 after the
+        // first and 2 after the second, so the answer is a d b, and merging on the value would give none
+        let rows = rows_of(
+            "WITH t(day, x) AS (VALUES (1, 2), (2, 2), (3, 5)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN ((d | a)+ b) DEFINE b AS NEXT(LAST(a.x)) = 2) ORDER BY day",
+        )
+        .await?;
+        assert_eq!(rows, ["1|a", "2|d", "3|b"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn within_with_a_define_that_counts_the_match() -> Result<()> {
+        // a takes two days of each match: the third would make count(*) 3, and it is within the interval too
+        let rows = rows_of(
+            "WITH t(dt, n) AS (VALUES (DATE '2024-01-01', 1), (DATE '2024-01-02', 2), (DATE '2024-01-03', 3), (DATE '2024-01-04', 4)) \
+             SELECT dt, m FROM t MATCH_RECOGNIZE (ORDER BY dt MEASURES MATCH_NUMBER() AS m ALL ROWS PER MATCH PATTERN (a+) \
+             WITHIN INTERVAL '2' DAY DEFINE a AS count(*) < 3) ORDER BY dt",
+        )
+        .await?;
+        assert_eq!(rows, ["2024-01-01|1", "2024-01-02|1", "2024-01-03|2", "2024-01-04|2"]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_caps_print_with_commas() {
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(100_000), "100,000");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        let msg = cap_error(true, false, STATE_CAP).to_string();
+        assert!(msg.contains("more than 100,000 partial matches at once"), "{msg}");
+        let msg = cap_error(false, false, MAX_THREADS).to_string();
+        assert!(msg.contains("more than 1,000,000 partial matches at once"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn the_cap_refuses_a_search_past_100000_partial_matches() -> Result<()> {
+        // 600 rows: (a | b)+ c keeps a thread for each pair of counts, about i * i / 2 at row i, so past 100,000 by row 450
+        let err = rows_of(
+            "WITH t AS (SELECT value AS day FROM generate_series(1, 600)) SELECT n FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES count(*) AS n AFTER MATCH SKIP PAST LAST ROW PATTERN ((a | b)+ c) \
+             DEFINE a AS count(a.*) >= 0, b AS count(b.*) >= 0, c AS count(c.*) < 0)",
+        )
+        .await
+        .expect_err("the cap");
+        assert!(err.to_string().contains("more than 100,000 partial matches at once"), "{err}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_glue_function_the_engine_lacks_is_refused_by_name() -> Result<()> {
+        let err = rows_of(
+            "WITH t(day, x) AS (VALUES (1, 1), (2, 2)) SELECT day, sym FROM t MATCH_RECOGNIZE (ORDER BY day \
+             MEASURES CLASSIFIER() AS sym ALL ROWS PER MATCH PATTERN (a+) DEFINE a AS frobnicate(LAST(a.x)) > 0) ORDER BY day",
+        )
+        .await
+        .expect_err("a refusal");
+        assert!(err.to_string().contains("MATCH_RECOGNIZE: DEFINE a: "), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_slot_of_a_glue_reads_the_rows_of_its_variable() {
+        // a count over b's rows of a match, and a navigation of a's last row, are two slots with their own variables
+        let plan = compile(
+            r#"{"pattern":"a b","skip":{"to":"past_last"},"defines":[{"symbol":1,"glue":"(__mr_s0 > __mr_s1)","slots":[{"index":0,"kind":"agg","fun":"count","var":1,"value":null},{"index":1,"kind":"nav","var":0,"first":false,"m":0,"offset":0,"value":0}]}],"rows":0,"values":1}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.slots.len(), 2);
+        assert_eq!(plan.defines[0].slots, [0, 1]);
+        assert_eq!(plan.slots[0].var(), Some(1));
+        assert_eq!(plan.slots[1].value(), Some(0));
     }
 }

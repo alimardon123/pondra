@@ -30,7 +30,7 @@ pub fn register(ctx: &SessionContext) {
 
 /// Adds `v` to the sum `hi`, and what rounding took off it to `lo`.
 #[inline]
-fn add(hi: &mut f64, lo: &mut f64, v: f64) {
+pub(crate) fn add(hi: &mut f64, lo: &mut f64, v: f64) {
     let s = *hi + v;
     if s.is_finite() {
         let b = s - *hi;
@@ -39,7 +39,7 @@ fn add(hi: &mut f64, lo: &mut f64, v: f64) {
     *hi = s;
 }
 
-fn total(hi: f64, lo: f64) -> f64 {
+pub(crate) fn total(hi: f64, lo: f64) -> f64 {
     if hi.is_finite() { hi + lo } else { hi }
 }
 

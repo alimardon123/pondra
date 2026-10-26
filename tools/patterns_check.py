@@ -22,9 +22,10 @@ answer read from Arrow (?format=arrow), NULLs kept; the rows of ALL ROWS are com
 Sections: 2 random queries (`random_checks`), 3 fixed examples (`fixed_checks`), 4 refusals (`refusal_checks`).
 Section 5, the doors (the Postgres port, three nodes, views), is harness.py's `patterns` section.
 """
-import argparse, http.client, itertools, json, random, re, sys, time
+import argparse, http.client, itertools, json, math, operator, random, re, sys, time
 from collections import Counter
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 SYMS = ("a", "b", "c", "d")  # d has no DEFINE: always true
 
@@ -278,7 +279,7 @@ def find_matches(truth, tree, skip, budget=200_000, within=None):
     while frm < n:
         hit = None
         for start in range(frm, n):
-            found = attempt(truth, tree, start, left, within)
+            found = attempt(truth, tree, start, left, within, len(matches) + 1)
             if found is not None:
                 hit = (start,) + found
                 break
@@ -291,10 +292,11 @@ def find_matches(truth, tree, skip, budget=200_000, within=None):
     return matches
 
 
-def sym_true(truth, pos, sym, start):
-    """Whether row pos may be sym. A DEFINE that reads the match so far is a callable of the match's first row."""
+def sym_true(truth, pos, sym, path, tentative, number):
+    """Whether row pos may be sym. A DEFINE that reads the match so far is a callable of the thread's items so far (the
+    path, then the tested row tentatively) and of MATCH_NUMBER(); any other is a bool."""
     v = truth[pos].get(sym, True)
-    return v(start) if callable(v) else v
+    return v([*path, tentative], number) if callable(v) else v
 
 
 def in_time(within, start, pos):
@@ -306,8 +308,8 @@ def in_time(within, start, pos):
     return times[start] >= times[pos] - interval
 
 
-def attempt(truth, tree, start, left, within=None):
-    """The most preferred complete match that begins at start: (end, items), or None."""
+def attempt(truth, tree, start, left, within=None, number=1):
+    """The most preferred complete match that begins at start: (end, items), or None. number is MATCH_NUMBER() for it."""
     n, path, result = len(truth), [], {}
 
     def m(node, pos, excl, k):  # does node match from pos, with k(end) then succeeding?
@@ -316,7 +318,7 @@ def attempt(truth, tree, start, left, within=None):
             raise OutOfBudget()
         kind = node[0]
         if kind == "sym":
-            if pos < n and sym_true(truth, pos, node[1], start) and (within is None or in_time(within, start, pos)):
+            if pos < n and sym_true(truth, pos, node[1], path, (pos, node[1], excl), number) and (within is None or in_time(within, start, pos)):
                 path.append((pos, node[1], excl))
                 if k(pos + 1):
                     return True
@@ -383,10 +385,366 @@ def truth_of(rows, define):
     return [{s: bool(f(rows, i)) for s, f in define.items()} for i in range(len(rows))]
 
 
-def truth_of_match(rows, define):
-    """DEFINE's conditions that read the match so far (Flink's example: B.price > A.price - 10, A being the match's first
-    row): each a function of (rows, position, the match's first row), so each is a callable of that first row."""
-    return [{s: (lambda start, f=f, i=i: bool(f(rows, i, start))) for s, f in define.items()} for i in range(len(rows))]
+# ---------------------------------------------------------------- DEFINEs as SQL text: what they read, and their value
+#
+# A DEFINE is written as SQL text, the same text the query has, and read here into a tree. A condition that reads only
+# its own row (a column, PREV or NEXT of one, its own variable's column, CLASSIFIER()) is worked out per row. One that
+# reads the match so far is evaluated per thread, over `seen`: the thread's items in row order with the tested row last
+# (tentatively the symbol being defined). The rules are the design's (Semantics): a navigation sees the items of its
+# variable (every item for no variable), and the tested row only for its own variable or the universal one; excluded
+# rows count; NULL is false at the top of a condition, and a NULL navigation (no row, or outside the partition) makes
+# the glue evaluate over NULL; count(x) skips NULLs, count(*) counts rows, count over no rows is 0; sum, avg, min and max
+# over no value are NULL; MATCH_NUMBER() is the matches so far plus one; CLASSIFIER() is the symbol being defined.
+
+class ExprError(Exception):
+    """A DEFINE this reference doesn't read: a form the generator never writes, or one the design refuses."""
+
+
+EXPR_TOKEN = re.compile(r"\s*(?:(\d+\.\d+|\d+)|('(?:[^']|'')*')|([A-Za-z_][A-Za-z0-9_]*)|(<=|>=|<>|!=|[-+*/(),.=<>]))")
+KEYWORDS = {"and", "or", "not", "is", "null", "true", "false"}
+CMP = {"=": operator.eq, "<>": operator.ne, "!=": operator.ne, "<": operator.lt, "<=": operator.le,
+       ">": operator.gt, ">=": operator.ge}
+ARITH = {"+": operator.add, "-": operator.sub, "*": operator.mul}
+
+
+def expr_tokens(text):
+    out, i, text = [], 0, text.rstrip()
+    while i < len(text):
+        m = EXPR_TOKEN.match(text, i)
+        if m is None:
+            raise ExprError(f"DEFINE: unexpected {text[i:i + 12]!r}")
+        if m.group(1) is not None:
+            out.append(("num", m.group(1)))
+        elif m.group(2) is not None:
+            out.append(("str", m.group(2)[1:-1].replace("''", "'")))
+        elif m.group(3) is not None:
+            out.append(("id", m.group(3).lower()))  # identifiers are lowercased, as the parser lowercases them
+        else:
+            out.append(("op", m.group(4)))
+        i = m.end()
+    return out + [("end", None)]
+
+
+class _Expr:
+    """A recursive-descent reading of the DEFINE expressions the checks write. Trees: ("lit", v), ("ref", var, col, base,
+    m, off) where base is "cur" (the tested row), "first" or "last" (the m-th of the variable's rows, 0 is the first or
+    last), and off the physical offset of PREV (negative) or NEXT; ("agg", fun, var, col) with col None for count(*) or
+    count(v.*); ("mn",); ("class",); ("star", var); ("isnull", e, negated); ("coalesce", [e]); ("bin", op, a, b);
+    ("neg", e); ("not", e); ("and", a, b); ("or", a, b); ("call", name, [e]) for a function the reference doesn't have."""
+
+    def __init__(self, text):
+        self.t, self.i = expr_tokens(text), 0
+
+    def peek(self):
+        return self.t[self.i]
+
+    def take(self):
+        tok = self.t[self.i]
+        self.i += 1
+        return tok
+
+    def op(self, *ops):  # eats one of ops and returns it, or returns None
+        k, v = self.peek()
+        if k == "op" and v in ops:
+            self.i += 1
+            return v
+        return None
+
+    def kw(self, word):
+        k, v = self.peek()
+        if k == "id" and v == word:
+            self.i += 1
+            return True
+        return False
+
+    def need(self, what):
+        if not (self.op(what) or self.kw(what)):
+            raise ExprError(f"DEFINE: expected {what!r}, got {self.peek()[1]!r}")
+
+    def parse(self):
+        e = self.or_()
+        if self.peek()[0] != "end":
+            raise ExprError(f"DEFINE: unexpected {self.peek()[1]!r}")
+        return e
+
+    def or_(self):
+        e = self.and_()
+        while self.kw("or"):
+            e = ("or", e, self.and_())
+        return e
+
+    def and_(self):
+        e = self.not_()
+        while self.kw("and"):
+            e = ("and", e, self.not_())
+        return e
+
+    def not_(self):
+        if self.kw("not"):
+            return ("not", self.not_())
+        return self.is_()
+
+    def is_(self):
+        e = self.cmp()
+        if self.kw("is"):
+            neg = self.kw("not")
+            self.need("null")
+            return ("isnull", e, neg)
+        return e
+
+    def cmp(self):
+        e = self.add()
+        op = self.op(*CMP)
+        return ("bin", op, e, self.add()) if op else e
+
+    def add(self):
+        e = self.mul()
+        while True:
+            op = self.op("+", "-")
+            if not op:
+                return e
+            e = ("bin", op, e, self.mul())
+
+    def mul(self):
+        e = self.unary()
+        while True:
+            op = self.op("*", "/")
+            if not op:
+                return e
+            e = ("bin", op, e, self.unary())
+
+    def unary(self):
+        if self.op("-"):
+            return ("neg", self.unary())
+        return self.primary()
+
+    def primary(self):
+        k, v = self.take()
+        if k == "num":
+            return ("lit", Decimal(v) if "." in v else int(v))
+        if k == "str":
+            return ("lit", v)
+        if k == "op" and v == "(":
+            e = self.or_()
+            self.need(")")
+            return e
+        if k != "id":
+            raise ExprError(f"DEFINE: unexpected {v!r}")
+        if v == "null":
+            return ("lit", None)
+        if v in ("true", "false"):
+            return ("lit", v == "true")
+        if v in KEYWORDS:
+            raise ExprError(f"DEFINE: unexpected {v!r}")
+        if self.op("("):
+            return self.call(v)
+        if self.op("."):
+            k2, v2 = self.take()
+            if k2 == "op" and v2 == "*":
+                return ("star", v)
+            if k2 == "id":
+                return ("ref", v, v2, "last", 0, 0)  # v.col is LAST(v.col), the variable's last row
+            raise ExprError("DEFINE: a qualifier names a column")
+        return ("ref", None, v, "cur", 0, 0)  # a bare column is the tested row's
+
+    def call(self, name):
+        if name in ("match_number", "classifier"):
+            self.need(")")
+            return ("mn",) if name == "match_number" else ("class",)
+        if name in ("count", "sum", "avg", "min", "max"):
+            if self.op("*"):
+                self.need(")")
+                if name != "count":
+                    raise ExprError(f"DEFINE: {name}(*) isn't a form")
+                return ("agg", "count", None, None)
+            arg = self.or_()
+            self.need(")")
+            if arg[0] == "star":
+                if name != "count":
+                    raise ExprError(f"DEFINE: {name}(v.*) isn't a form")
+                return ("agg", "count", arg[1], None)
+            if arg[0] == "ref" and arg[3] in ("cur", "last") and arg[4] == 0 and arg[5] == 0:
+                return ("agg", name, arg[1], arg[2])
+            raise ExprError(f"DEFINE: {name} takes a column of a variable")
+        args = []
+        if not self.op(")"):
+            args.append(self.or_())
+            while self.op(","):
+                args.append(self.or_())
+            self.need(")")
+        if name == "coalesce":
+            return ("coalesce", args)
+        if name in ("first", "last", "prev", "next"):
+            if not args or len(args) > 2 or (len(args) == 2 and (args[1][0] != "lit" or not isinstance(args[1][1], int))):
+                raise ExprError(f"DEFINE: {name.upper()} takes a column, and a row count")
+            return _nav(name, args[0], args[1][1] if len(args) == 2 else None)
+        return ("call", name, args)
+
+
+def _nav(name, arg, n):
+    """FIRST, LAST, PREV or NEXT of a column (or of FIRST or LAST of one): PREV and NEXT only move, by n rows."""
+    if arg[0] != "ref":
+        raise ExprError(f"DEFINE: {name.upper()} takes a column, or FIRST or LAST of one")
+    _, var, col, base, m, off = arg
+    if name in ("first", "last"):
+        if off or base == "first" or (base == "last" and m):
+            raise ExprError("DEFINE: a navigation deeper than PREV/NEXT(FIRST/LAST)")
+        return ("ref", var, col, name, 0 if n is None else n, 0)
+    if off:
+        raise ExprError("DEFINE: a navigation deeper than PREV/NEXT(FIRST/LAST)")
+    step = 1 if n is None else n
+    return ("ref", var, col, base, m, -step if name == "prev" else step)
+
+
+def parse_expr(text):
+    return _Expr(text).parse()
+
+
+class Env:
+    """What a DEFINE sees: the partition's rows, the tested row, the symbol defined, the thread's items so far (the tested
+    row last) and MATCH_NUMBER()."""
+    __slots__ = ("rows", "pos", "sym", "seen", "number")
+
+    def __init__(self, rows, pos, sym, seen, number):
+        self.rows, self.pos, self.sym, self.seen, self.number = rows, pos, sym, seen, number
+
+
+def _positions(env, var):
+    """The rows of the match so far that a navigation or aggregate over var sees, in order (all of them for no variable)."""
+    return [p for p, s, _ in env.seen if var is None or s == var]
+
+
+def _sum(vals):  # a DOUBLE sum is the correctly rounded one (MEASURES' sum gives the same bits); DECIMAL and INT are exact
+    if any(isinstance(v, float) for v in vals):
+        return math.fsum(vals)
+    return sum(vals, Decimal(0)) if any(isinstance(v, Decimal) for v in vals) else sum(vals)
+
+
+def _fold(fun, vals):
+    """sum, avg, min or max over the non-NULL values; NULL over none."""
+    if not vals:
+        return None
+    if fun == "sum":
+        return _sum(vals)
+    if fun == "avg":
+        return sum(vals) / len(vals)
+    return min(vals) if fun == "min" else max(vals)
+
+
+def _ref(node, env):
+    _, var, col, base, m, off = node
+    if base == "cur":
+        idx = env.pos
+    else:
+        ps = _positions(env, var)
+        if len(ps) <= m:  # no such row: NULL
+            return None
+        idx = ps[m] if base == "first" else ps[-(m + 1)]
+    idx += off
+    return env.rows[idx][col] if 0 <= idx < len(env.rows) else None  # outside the partition: NULL
+
+
+def _agg(node, env):
+    _, fun, var, col = node
+    ps = _positions(env, var)
+    if fun == "count":
+        return len(ps) if col is None else sum(1 for p in ps if env.rows[p][col] is not None)
+    return _fold(fun, [env.rows[p][col] for p in ps if env.rows[p][col] is not None])
+
+
+def _eval(node, env):
+    k = node[0]
+    if k == "lit":
+        return node[1]
+    if k == "ref":
+        return _ref(node, env)
+    if k == "agg":
+        return _agg(node, env)
+    if k == "mn":
+        return env.number
+    if k == "class":
+        return env.sym
+    if k == "neg":
+        v = _eval(node[1], env)
+        return None if v is None else -v
+    if k == "not":
+        v = _eval(node[1], env)
+        return None if v is None else (not v)
+    if k == "and":
+        a, b = _eval(node[1], env), _eval(node[2], env)
+        if a is False or b is False:
+            return False
+        return None if a is None or b is None else True
+    if k == "or":
+        a, b = _eval(node[1], env), _eval(node[2], env)
+        if a is True or b is True:
+            return True
+        return None if a is None or b is None else False
+    if k == "isnull":
+        return (_eval(node[1], env) is None) != node[2]
+    if k == "coalesce":
+        for a in node[1]:
+            v = _eval(a, env)
+            if v is not None:
+                return v
+        return None
+    if k == "bin":
+        a, b = _eval(node[2], env), _eval(node[3], env)
+        if a is None or b is None:
+            return None
+        op = node[1]
+        if op in CMP:
+            if isinstance(a, float) and isinstance(b, Decimal):  # a float literal wins over a decimal one
+                b = float(b)
+            elif isinstance(b, float) and isinstance(a, Decimal):
+                a = float(a)
+            return CMP[op](a, b)
+        if op in ARITH:
+            return ARITH[op](a, b)
+        raise ExprError(f"DEFINE: the reference has no {op!r}")
+    raise ExprError(f"DEFINE: the reference doesn't evaluate {k}")
+
+
+def reads_match(node, sym):
+    """Whether a DEFINE's tree reads the match so far, for a DEFINE of sym: anything but its own row (a column, PREV or
+    NEXT of one, its own variable's LAST) and CLASSIFIER()."""
+    k = node[0]
+    if k == "ref":
+        return not (node[3] == "cur" or (node[3] == "last" and node[4] == 0 and node[1] == sym))
+    if k in ("agg", "mn", "call", "star"):
+        return True
+    if k in ("lit", "class"):
+        return False
+    if k in ("neg", "not", "isnull"):
+        return reads_match(node[1], sym)
+    if k in ("bin", "and", "or"):
+        return reads_match(node[2] if k == "bin" else node[1], sym) or reads_match(node[3] if k == "bin" else node[2], sym)
+    if k == "coalesce":
+        return any(reads_match(a, sym) for a in node[1])
+    return True
+
+
+def truth_of_text(rows, define):
+    """The DEFINEs written as SQL text ({symbol: text}, as the query has them): a condition that reads only its own row
+    is a bool per row; one that reads the match so far is a callable of (the thread's items so far, MATCH_NUMBER())."""
+    out = [{} for _ in rows]
+    for sym, text in define.items():
+        tree = parse_expr(text)
+        for i in range(len(rows)):
+            if reads_match(tree, sym):
+                out[i][sym] = (lambda seen, number, tree=tree, i=i, s=sym: _eval(tree, Env(rows, i, s, seen, number)) is True)
+            else:
+                # a condition that reads only its own row, or its own variable's LAST (the tested row is in that), sees
+                # the tested row as the match so far, so LAST(sym.col) is the tested row and PREV of it the row before
+                out[i][sym] = _eval(tree, Env(rows, i, sym, [(i, sym, False)], None)) is True
+    return out
+
+
+def truth_for(rows, ex):
+    """The truth of a fixed example's rows: its DEFINE text, or its Python functions of (rows, position)."""
+    if "define_text" in ex:
+        return truth_of_text(rows, ex["define_text"])
+    return truth_of(rows, ex["define"])
 
 
 def partitions_of(rows, partition, order):
@@ -417,7 +775,8 @@ def measure_text(item):
         expr = f"count({var}.*)" if var else "count(*)"
     else:
         prefix = f"{var}." if var else ""
-        expr = f"{'FIRST' if op == 'first' else 'LAST'}({prefix}{col})"
+        fun = {"first": "FIRST", "last": "LAST"}.get(op, op.upper())  # sum, avg, min, max: the aggregate of the column
+        expr = f"{fun}({prefix}{col})"
     return f"{qual + ' ' if qual else ''}{expr} AS {alias}"
 
 
@@ -430,6 +789,8 @@ def measure_value(m, rows, seen, op, col, var):
     picked = [pos for pos, sym, _ in seen if var is None or sym == var]
     if op == "count":
         return len(picked)
+    if op in ("sum", "avg", "min", "max"):
+        return _fold(op, [rows[p][col] for p in picked if rows[p][col] is not None])
     if not picked:
         return None
     return rows[picked[0] if op == "first" else picked[-1]][col]
@@ -494,6 +855,8 @@ def sql_value(v):
         return "TRUE" if v else "FALSE"
     if isinstance(v, int):
         return str(v)
+    if isinstance(v, (float, Decimal)):  # a number literal: a DOUBLE or DECIMAL column takes it as it is
+        return repr(v) if isinstance(v, float) else str(v)
     if isinstance(v, datetime):
         return f"TIMESTAMP '{v:%Y-%m-%d %H:%M:%S}'"
     return "'" + str(v).replace("'", "''") + "'"
@@ -607,6 +970,19 @@ TABLES = {
                        for k, (p, t) in enumerate(zip([20, 17, 18, 11, 14, 9, 15, 14, 24, 1, 19], [1, 2, 1, 3, 2, 1, 1, 2, 2, 2, 1]))]),
     # a column d and a symbol d (see the fixed example of that name)
     "dclash": ("d INT, price INT", [{"d": d, "price": p} for d, p in zip(range(1, 9), [10, 9, 8, 12, 11, 13, 12, 5])]),
+    # the three-phase counterexample's two rows
+    "pair": ("day INT", [{"day": 1}, {"day": 2}]),
+    # Trino's V-shape (its MATCH_RECOGNIZE page): one customer's order prices by day
+    "orders": ("custkey INT, orderdate INT, totalprice INT",
+               [{"custkey": 1, "orderdate": d + 1, "totalprice": p} for d, p in enumerate([100, 80, 60, 70, 90, 95, 120, 110])]),
+    # Oracle's 22-7 (Table 22-2): XYZ's four prices
+    "xyz": ("symbol TEXT, day INT, price INT", [{"symbol": "XYZ", "day": d, "price": p} for d, p in zip(range(1, 5), [10, 16, 13, 9])]),
+    # the sums: DOUBLE and DECIMAL (0.1 to 0.4; 0.10 to 0.40)
+    "dbl": ("day INT, x DOUBLE", [{"day": d, "x": v} for d, v in zip(range(1, 5), [0.1, 0.2, 0.3, 0.4])]),
+    "dec": ("day INT, amt DECIMAL(10,2)", [{"day": d, "amt": Decimal(v)} for d, v in zip(range(1, 5), ["0.10", "0.20", "0.30", "0.40"])]),
+    # 600 rows in one partition: the (a | b)+ c search is refused by the cap from row 257 on (measured on the build: 256 rows
+    # answer, 257 are refused), so 600 leaves a margin (about 16 s on the build)
+    "cap600": ("day INT", [{"day": d} for d in range(1, 601)]),
 }
 
 
@@ -664,13 +1040,29 @@ def m_excl(m, rows):
     return {**span_of(m, rows), "nb": len(pos_of(m, "b")), "fb": rows[pos_of(m, "b")[0]]["day"]}
 
 
-def m_flink(m, rows):  # dropTime: the C row's time; dropDiff: A's price less C's (A is the match's first row)
+def m_flink(m, rows):  # droptime: the C row's time; dropdiff: A's price less C's (A is the match's first row); unquoted, so lower-case
     c = pos_of(m, "c")[-1]
-    return {"symbol": rows[0]["symbol"], "dropTime": rows[c]["rowtime"], "dropDiff": rows[m.start]["price"] - rows[c]["price"]}
+    return {"symbol": rows[0]["symbol"], "droptime": rows[c]["rowtime"], "dropdiff": rows[m.start]["price"] - rows[c]["price"]}
 
 
 def m_clash(m, rows):  # FIRST(d) and LAST(d) are the column d; count(d.*) is the symbol d's rows
     return {"s": rows[m.start]["d"], "e": rows[m.end - 1]["d"], "nd": len(pos_of(m, "d"))}
+
+
+def m_trino(m, rows):  # Trino's V-shape: the first row's price, the bottom (LAST of b), the top (LAST of d, for its LAST of U)
+    return {"custkey": rows[0]["custkey"], "starting_price": rows[m.start]["totalprice"],
+            "bottom_price": rows[pos_of(m, "b")[-1]]["totalprice"], "top_price": rows[pos_of(m, "d")[-1]]["totalprice"]}
+
+
+def m_sum(col, fsum):  # the match's span, and sx: SUM(a.col) over its a rows (math.fsum for a DOUBLE column)
+    def f(m, rows):
+        vals = [rows[p][col] for p in pos_of(m, "a")]
+        return {**span_of(m, rows), "sx": math.fsum(vals) if fsum else sum(vals)}
+    return f
+
+
+def m_na(m, rows):  # the span, and the a rows (count(a.*)) and b rows (count(b.*)) of the match
+    return {**span_of(m, rows), "na": len(pos_of(m, "a")), "nb": len(pos_of(m, "b"))}
 
 
 def lo_(rows, i):  # price below the price two rows on (NEXT(price, 2)); no such row is NULL, so false
@@ -947,21 +1339,20 @@ FIXED += [
          expect=[{"symbol": "ACME", "start_day": 5, "bottom_day": 6, "end_day": 7},
                  {"symbol": "ACME", "start_day": 11, "bottom_day": 12, "end_day": 13},
                  {"symbol": "ACME", "start_day": 15, "bottom_day": 16, "end_day": 17}]),
-    # Flink's example, worked by hand. A is the match's first row; B (above A's price less 10) and C (below it) are read
-    # from the match so far, which the engine refuses (DEFINE reads the match so far), so this one is the reference's
-    # answer and the binary's refusal. Starts 10:00 (20) to 11:40 (9) have no C in their hour: from 10:00, A less 10 is
+    # Flink's example, worked by hand. A is the match's first row; B (above A's price less 10) and C (below it) read the
+    # match so far (A.price is LAST(A.price), A's one row), which the engine accepts from the next PR on, so this one is
+    # checked for its answer. Starts 10:00 (20) to 11:40 (9) have no C in their hour: from 10:00, A less 10 is
     # 10, and the rows to 11:00 (17, 18, 11) are not below it; from 11:00 (11), A less 10 is 1, and none is below that;
     # the rest likewise. Start 12:00 (15): A less 10 is 5; 12:20 (14) and 12:40 (24) are B; 13:00 (1) is C, exactly an
     # hour on, which the bound includes. One row: 13:00, 15 - 1 = 14. From 13:20 (19) there is no C.
     dict(name="Flink's WITHIN example: a drop of 10 in an hour, the bound inclusive (A B* C, DEFINE reads A), one row",
          table="flink_ticker", partition="symbol", order="rowtime", pattern="A B* C", skip="PAST LAST ROW",
-         define_start={"b": lambda rows, i, a: rows[i]["price"] > rows[a]["price"] - 10,
-                       "c": lambda rows, i, a: rows[i]["price"] < rows[a]["price"] - 10},
+         define_text={"b": "b.price > a.price - 10", "c": "c.price < a.price - 10"},
          measures=m_flink, within=timedelta(hours=1),
-         query=mr("flink_ticker", "symbol", "rowtime", "C.rowtime AS dropTime, A.price - C.price AS dropDiff", "A B* C",
-                  "B AS B.price > A.price - 10, C AS C.price < A.price - 10", "PAST LAST ROW", tail=" ORDER BY dropTime",
+         query=mr("flink_ticker", "symbol", "rowtime", "C.rowtime AS droptime, A.price - C.price AS dropdiff", "A B* C",
+                  "B AS B.price > A.price - 10, C AS C.price < A.price - 10", "PAST LAST ROW", tail=" ORDER BY droptime",
                   within="INTERVAL '1' HOUR"),
-         expect=[{"symbol": "ACME", "dropTime": datetime(2011, 4, 1, 13, 0), "dropDiff": 14}]),
+         expect=[{"symbol": "ACME", "droptime": datetime(2011, 4, 1, 13, 0), "dropdiff": 14}]),
     # A column named d and a symbol named d: ORDER BY the column, DEFINE the symbol, which reads its own row (PREV is the
     # row before). Prices on d 1-8: 10 9 8 12 11 13 12 5. d1 has no PREV, so it is no fall; d2 and d3 fall, d4 rises, d5
     # falls, d6 rises, d7 and d8 fall: runs d2-3, d5 and d7-8. FIRST(d) and LAST(d) read the column, count(d.*) the symbol.
@@ -970,6 +1361,103 @@ FIXED += [
          query=mr("dclash", None, "d", "FIRST(d) AS s, LAST(d) AS e, count(d.*) AS nd", "d+", "d AS d.price < PREV(d.price)",
                   "PAST LAST ROW", tail=" ORDER BY s"),
          expect=[{"s": 2, "e": 3, "nd": 2}, {"s": 5, "e": 5, "nd": 1}, {"s": 7, "e": 8, "nd": 2}]),
+]
+
+# DEFINEs that read the match so far (the design's Semantics). The answers the documentation publishes are said so; where a
+# page gives no result table, the answer is worked out by hand in the comment.
+FIXED += [
+    # The design's three-phase counterexample. Day 1 tries b first, and counting the row being tested (tentatively b) gives
+    # count(*) = 1, so b holds; c on day 2 takes the last row (c has no DEFINE): the match is b c. Had the tested row not
+    # been counted, count(*) would be 0, b would fail, and the match would be a c.
+    dict(name="the three-phase counterexample: PATTERN ((b | a) c), DEFINE b AS count(*) >= 1: b c", table="pair",
+         partition=None, order="day", pattern="(b | a) c", skip="PAST LAST ROW", define_text={"b": "count(*) >= 1"},
+         mode="show", spec=(("m", "mn", None, None, ""), ("c", "class", None, None, "")), pcols=(), rcols=(),
+         query=mr("pair", None, "day", "MATCH_NUMBER() AS m, CLASSIFIER() AS c", "(b | a) c", "b AS count(*) >= 1",
+                  "PAST LAST ROW", rows_per="ALL ROWS PER MATCH", tail=" ORDER BY day"),
+         expect=[{"day": 1, "m": 1, "c": "b"}, {"day": 2, "m": 1, "c": "c"}]),
+    # A variable with no rows. Flags F T T F T on days 1-5. b AS a.day IS NOT NULL AND flag: before a has a row, a.day is
+    # NULL, and IS NOT NULL makes that false (a test, not a NULL). Day 1: a fails (F) and b finds no a row. Day 2: a takes
+    # day 2 (T), and b takes day 3 (a.day is 2, flag T): the match 2-3. Day 4 is as day 1. Day 5: a takes it, and no row
+    # is left for b, and b alone has no a row: no match. One match.
+    dict(name="a variable with no rows: a.day IS NOT NULL is false before a row, so b needs an a row (PATTERN (a? b))",
+         table="flags", partition=None, order="day", pattern="a? b", skip="PAST LAST ROW",
+         define_text={"a": "flag", "b": "a.day IS NOT NULL AND flag"}, measures=m_na,
+         query=mr("flags", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n, count(a.*) AS na, count(b.*) AS nb",
+                  "a? b", "a AS flag, b AS a.day IS NOT NULL AND flag", "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 2, "e": 3, "n": 2, "na": 1, "nb": 1}]),
+    # The same flags: COALESCE(a.day, 0) < 3 is true before a has a row (COALESCE gives 0), and a.day < 3 alone would be
+    # NULL, so false. Day 1: no a row, so b takes day 1 (0 < 3): the match 1. Day 2: a takes it, and b takes day 3
+    # (2 < 3): the match 2-3. Day 4: as day 1. Day 5: as day 1 (no row is left for a's b). Four matches.
+    dict(name="a variable with no rows: COALESCE(a.day, 0) < 3 is true before a row, and a.day < 3 would be NULL (PATTERN (a? b))",
+         table="flags", partition=None, order="day", pattern="a? b", skip="PAST LAST ROW",
+         define_text={"a": "flag", "b": "COALESCE(a.day, 0) < 3"}, measures=span_of,
+         query=mr("flags", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n", "a? b",
+                  "a AS flag, b AS COALESCE(a.day, 0) < 3", "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 1, "e": 1, "n": 1}, {"s": 2, "e": 3, "n": 2}, {"s": 4, "e": 4, "n": 1}, {"s": 5, "e": 5, "n": 1}]),
+    # A DOUBLE sum in a DEFINE. fsum of 0.1, 0.2 and 0.3 is the double nearest 0.6, so sum(a.x) <= 0.6 holds for three rows
+    # (summed left to right it is 0.6000000000000001, and the match would stop at two). The fourth row, 0.4, makes 1.0 and
+    # stops a run of three; it is alone in the next match. The MEASURES sum is the same fsum: 0.6 and 0.4.
+    dict(name="a DOUBLE sum in a DEFINE, sum(a.x) <= 0.6, the same sum in MEASURES: three rows, then one", table="dbl",
+         partition=None, order="day", pattern="a+", skip="PAST LAST ROW", define_text={"a": "sum(a.x) <= 0.6"},
+         measures=m_sum("x", True),
+         query=mr("dbl", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n, SUM(a.x) AS sx", "a+",
+                  "a AS SUM(a.x) <= 0.6", "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 1, "e": 3, "n": 3, "sx": 0.6}, {"s": 4, "e": 4, "n": 1, "sx": 0.4}]),
+    # A DECIMAL sum in a DEFINE, exact: 0.10 + 0.20 + 0.30 is 0.60, so sum(a.amt) <= 0.60 holds for three rows; 0.40 is alone.
+    dict(name="a DECIMAL sum in a DEFINE, sum(a.amt) <= 0.60 (exact): three rows, then one", table="dec",
+         partition=None, order="day", pattern="a+", skip="PAST LAST ROW", define_text={"a": "sum(a.amt) <= 0.60"},
+         measures=m_sum("amt", False),
+         query=mr("dec", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n, SUM(a.amt) AS sx", "a+",
+                  "a AS SUM(a.amt) <= 0.60", "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 1, "e": 3, "n": 3, "sx": Decimal("0.60")}, {"s": 4, "e": 4, "n": 1, "sx": Decimal("0.40")}]),
+    # An INT sum in a DEFINE: prices 10 12 11 15 14 13 20 (tq). The runs whose sum stays at or below 30: days 1-2 (22),
+    # 3-4 (26), 5-6 (27), and 7 (20). Day 3's run starts after day 2's: 11 + 15 is 26, and + 14 would be 40.
+    dict(name="an INT sum in a DEFINE, sum(a.price) <= 30: four runs", table="tq", partition=None, order="day", pattern="a+",
+         skip="PAST LAST ROW", define_text={"a": "sum(a.price) <= 30"}, measures=m_sum("price", False),
+         query=mr("tq", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n, SUM(a.price) AS sx", "a+",
+                  "a AS SUM(a.price) <= 30", "PAST LAST ROW", tail=" ORDER BY s"),
+         expect=[{"s": 1, "e": 2, "n": 2, "sx": 22}, {"s": 3, "e": 4, "n": 2, "sx": 26}, {"s": 5, "e": 6, "n": 2, "sx": 27},
+                 {"s": 7, "e": 7, "n": 1, "sx": 20}]),
+    # Oracle's 22-7 (ALL ROWS PER MATCH, RUNNING and FINAL AVG): its DEFINE is A.Price >= AVG(A.Price), which reads A's own
+    # rows including the tested one. XYZ's prices 10, 16, 13, 9 (Table 22-2): day 1 is 10 >= 10; day 2 is 16 >= 13; day 3
+    # is 13 >= 13; day 4 is 9 >= 12, false in the match that starts at day 1. The match is days 1-3: the page's
+    # walkthrough covers only this first match, {R1, R2, R3}, where R4 fails (9 >= 12), and its Table 22-3 prints the
+    # three rows (running averages 10, 13, 13; final averages 13, 13, 13). With the default SKIP PAST LAST ROW the search
+    # goes on at R4, where 9 >= AVG(9) holds, so R4 is a match of its own (running and final 9): the printed table stops
+    # at the first match. This answer keeps that fourth row.
+    dict(name="Oracle's 22-7: DEFINE A AS A.price >= AVG(A.price), RUNNING and FINAL AVG (its table gives days 1-3 only)", table="xyz",
+         partition="symbol", order="day", pattern="a+", skip="PAST LAST ROW", define_text={"a": "a.price >= AVG(a.price)"}, mode="show",
+         spec=(("running_avg", "avg", "price", "a", "RUNNING"), ("final_avg", "avg", "price", "a", "FINAL")),
+         pcols=("symbol",), rcols=("price",),
+         query=mr("xyz", "symbol", "day", "RUNNING AVG(a.price) AS running_avg, FINAL AVG(a.price) AS final_avg", "a+",
+                  "a AS a.price >= AVG(a.price)", "PAST LAST ROW", rows_per="ALL ROWS PER MATCH", tail=" ORDER BY day"),
+         expect=[{"symbol": "XYZ", "day": 1, "running_avg": 10.0, "final_avg": 13.0, "price": 10},
+                 {"symbol": "XYZ", "day": 2, "running_avg": 13.0, "final_avg": 13.0, "price": 16},
+                 {"symbol": "XYZ", "day": 3, "running_avg": 13.0, "final_avg": 13.0, "price": 13},
+                 {"symbol": "XYZ", "day": 4, "running_avg": 9.0, "final_avg": 9.0, "price": 9}]),
+    # Oracle's fragment (its DEFINE list, with no published query): X AS COUNT(Y.*) > 3 on PATTERN (X+ Y+). X is tested
+    # before any Y row, so its count is 0 and it never holds: the page says no match is ever found, in any data.
+    dict(name="Oracle's fragment: PATTERN (X+ Y+) with X AS COUNT(Y.*) > 3: no match in any data", table="tq", partition=None,
+         order="day", pattern="x+ y+", skip="PAST LAST ROW", define_text={"x": "count(y.*) > 3", "y": "y.price > 10"},
+         measures=span_of, names=("s", "e", "n"), expect=[],
+         query=mr("tq", None, "day", "FIRST(day) AS s, LAST(day) AS e, count(*) AS n", "x+ y+",
+                  "x AS count(y.*) > 3, y AS y.price > 10", "PAST LAST ROW", tail=" ORDER BY s")),
+    # Trino's V-shape (its MATCH_RECOGNIZE page). Its C reads A.totalprice; the page gives the query and its intent (a match
+    # whenever a customer's orders first decrease in price) but no result table. Worked by hand: customer 1's prices
+    # 100 80 60 70 90 95 120 110 on days 1-8. A is day 1 (100). B+ takes days 2-3 (80, 60; day 4 is up). C+ takes days 4-6
+    # (70, 90, 95: each up, each at most 100); day 7 (120) is above 100, so C stops. D+ takes day 7 (120 is up) and day 8
+    # (110) is down: the match 1-7, bottom 60, top 120. The next start, day 8, has no fall. Trino's U (C and D) is LAST(d)
+    # here: SUBSET is not in Pondra.
+    dict(name="Trino's V-shape: C AS totalprice > PREV(totalprice) AND totalprice <= A.totalprice (its page, no table published)",
+         table="orders", partition="custkey", order="orderdate", pattern="a b+ c+ d+", skip="PAST LAST ROW",
+         define_text={"b": "totalprice < PREV(totalprice)", "c": "totalprice > PREV(totalprice) AND totalprice <= a.totalprice",
+                      "d": "totalprice > PREV(totalprice)"},
+         measures=m_trino,
+         query=mr("orders", "custkey", "orderdate",
+                  "a.totalprice AS starting_price, LAST(b.totalprice) AS bottom_price, LAST(d.totalprice) AS top_price",
+                  "a b+ c+ d+", "b AS totalprice < PREV(totalprice), c AS totalprice > PREV(totalprice) AND totalprice <= a.totalprice, "
+                  "d AS totalprice > PREV(totalprice)", "PAST LAST ROW", tail=" ORDER BY starting_price"),
+         expect=[{"custkey": 1, "starting_price": 100, "bottom_price": 60, "top_price": 120}]),
 ]
 
 # The ticker's ALL ROWS query (SHOW), for harness.py's doors and spreads.
@@ -982,8 +1470,7 @@ def reference_rows(ex):
     out = []
     for rows in partitions_of(TABLES[ex["table"]][1], ex.get("partition"), ex["order"]):
         within = None if ex.get("within") is None else ([r[ex["order"]] for r in rows], ex["within"])
-        truth = truth_of_match(rows, ex["define_start"]) if "define_start" in ex else truth_of(rows, ex["define"])
-        ms = find_matches(truth, parse_pattern(ex["pattern"]), parse_skip(ex["skip"]), within=within)
+        ms = find_matches(truth_for(rows, ex), parse_pattern(ex["pattern"]), parse_skip(ex["skip"]), within=within)
         out += [ex["measures"](m, rows) for m in ms]
     return out
 
@@ -997,9 +1484,9 @@ def load_tables(port):
         sql_exec(port, f"INSERT INTO {name} VALUES {vals}")
 
 
-# The fixed examples whose DEFINE reads another symbol's rows (the match so far): the reference's answer, and the engine's
-# refusal (0A000) until the next PR makes DEFINE read the match so far. That PR flips these to the answer.
-NEXT_PR_REFUSED = ("Flink's WITHIN example: a drop of 10 in an hour, the bound inclusive (A B* C, DEFINE reads A), one row",)
+# The fixed examples the engine refuses until a PR lands: none now, since a DEFINE that reads the match so far is checked
+# for its answer. An example named here is expected to be refused with 0A000 instead.
+NEXT_PR_REFUSED = ()
 
 
 def fixed_checks(port, show=True):
@@ -1016,7 +1503,7 @@ def fixed_checks(port, show=True):
                 print(f"fixed: {'REFUSED until the next PR' if ok else 'FAIL'} {ex['name']}"
                       + ("" if ok else f" (got ok={r['ok']} [{r['code']}] {r['msg'][:200]})"))
             continue
-        names = list(ex["expect"][0])
+        names = list(ex["names"]) if "names" in ex else list(ex["expect"][0])  # (an empty answer names its columns)
         want = [tuple(norm(d.get(n)) for n in names) for d in ex["expect"]]
         runs = [post_sql(port, ex["query"], arrow=True) for _ in range(ex.get("runs", 1))]
 
@@ -1043,8 +1530,6 @@ TICK_Q = lambda **kw: mr("ticker", kw.get("partition", "symbol"), "day", kw.get(
 
 # (what it is, the statement, SQLSTATE, a word the message must contain)
 REFUSED = [
-    ("a DEFINE reading another symbol", TICK_Q(pattern="a b", define="b AS b.price < a.price", measures="COUNT(*) AS n"),
-     "0A000", "reads the match so far"),
     ("a DEFINE of a symbol the PATTERN lacks", TICK_Q(pattern="strt down+", define="up AS up.price > PREV(up.price), down AS down.price < PREV(down.price)"),
      "42601", "names no symbol of PATTERN"),
     ("PARTITION BY an expression", TICK_Q(partition="upper(symbol)"), "0A000", "PARTITION BY takes columns"),
@@ -1087,6 +1572,38 @@ REFUSED = [
     ("WITHIN with a subquery, not an interval", mr("tickts", "symbol", "ts", "strt.day AS s", "strt down+ up+", TICK_DEF,
                                                   "PAST LAST ROW", within="(SELECT 1)"),
      "42601", "WITHIN takes an interval, as INTERVAL '1' HOUR"),
+    # What a DEFINE still can't do (the design's "Still refused"): each refusal names what to write. The words are
+    # provisional until the engine's messages are built: a check fails when a message drops its word, so confirm them then.
+    ("an aggregate's FILTER in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+", "a AS count(*) FILTER (WHERE a.price > 0) > 0",
+                                              "PAST LAST ROW", tail=" ORDER BY s"), "0A000", "FILTER"),
+    ("an aggregate's DISTINCT in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+", "a AS sum(DISTINCT a.price) > 0",
+                                                "PAST LAST ROW", tail=" ORDER BY s"), "0A000", "DISTINCT"),
+    ("an aggregate's own ORDER BY in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+",
+                                                    "a AS array_agg(a.price ORDER BY a.day) IS NOT NULL", "PAST LAST ROW", tail=" ORDER BY s"),
+     "0A000", "ORDER BY"),
+    ("an aggregate other than count, sum, avg, min and max, in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+",
+                                                                            "a AS stddev(a.price) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
+     "0A000", "stddev"),
+    ("avg of a DECIMAL in a DEFINE", mr("dec", None, "day", "FIRST(day) AS s", "a+", "a AS avg(a.amt) > 0", "PAST LAST ROW",
+                                         tail=" ORDER BY s"), "0A000", "decimal"),
+    ("CLASSIFIER() inside a navigation, PREV(CLASSIFIER())", mr("tq", None, "day", "FIRST(day) AS s", "a+",
+                                                              "a AS PREV(CLASSIFIER()) = 'a'", "PAST LAST ROW", tail=" ORDER BY s"),
+     "0A000", "CLASSIFIER()"),
+    ("a navigation of a navigation, FIRST(LAST(a.price))", mr("tq", None, "day", "FIRST(day) AS s", "a+",
+                                                              "a AS FIRST(LAST(a.price)) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
+     "0A000", "navigation"),
+    ("a subquery in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+", "a AS a.price > (SELECT 1)", "PAST LAST ROW",
+                                   tail=" ORDER BY s"), "0A000", "subquery"),
+    # The cap: (a | b)+ c with a and b always true holds a thread per (count of a, count of b) pair, so the threads grow about
+    # as i * i with the row i; the engine refuses from row 257 (256 rows answer). c is never true, so no match ends the search.
+    ("the 100,000 cap on partial matches, in a DEFINE that reads the match", mr("cap600", None, "day", "count(*) AS n", "(a | b)+ c",
+                                                                               "a AS count(a.*) >= 0, b AS count(b.*) >= 0, c AS count(c.*) < 0",
+                                                                               "PAST LAST ROW"), "54000", "more than 100,000 partial matches at once: make the conditions narrower"),
+    # A glue function the engine lacks, in a DEFINE that reads another symbol (so it is glue, planned with the match, and not
+    # row-only): the message starts with the symbol it is in, DEFINE b (42883 is undefined_function).
+    ("a glue function the engine lacks, in a DEFINE that reads another symbol", mr("tq", None, "day", "FIRST(day) AS s", "a+ b",
+                                                         "b AS no_such_glue_fn(a.price) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
+     "42883", "MATCH_RECOGNIZE: DEFINE b: "),
 ]
 
 
@@ -1143,14 +1660,36 @@ def random_spec(rng, mode):
     return tuple(out)
 
 
-def random_query(pattern, skip, mode, spec, order="i", within=None):
-    """The query over seqs, ORDER BY order; within (unit, amount) is WITHIN's, written after PATTERN. The DEFINEs read
-    their own rows only: a DEFINE that reads another symbol is refused by the engine until the next PR."""
+# The DEFINEs of a random query: the seqs' own booleans, or (on three queries in ten) each symbol's boolean ANDed with a
+# form that reads the match so far. The forms are the design's that can't fail at runtime: no division, no narrowing cast.
+DEFAULT_DEFINE = {"a": "ca", "b": "cb", "c": "cc"}
+MATCH_FORMS = ("i > FIRST({x}.i) + {k}", "i < LAST({x}.i, 1)", "PREV(LAST({x}.i)) < i", "count({x}.*) <= {k}",
+               "sum({x}.i) > {s}", "avg({x}.i) < {s}", "{x}.i IS NULL", "COALESCE({x}.i, 0) < i",
+               "MATCH_NUMBER() <= {m}", "CLASSIFIER() = '{y}'")
+
+
+def random_define(rng):
+    """The DEFINEs of one random query. A form reads the rows so far of any symbol (x and y, drawn from the pattern's
+    symbols), so a DEFINE may read another symbol's rows; NULL there (no row yet) makes the condition false."""
+    if rng.random() < 0.7:
+        return DEFAULT_DEFINE
+    out = {}
+    for s in "abc":
+        form = rng.choice(MATCH_FORMS).format(x=rng.choice("abc"), y=rng.choice("abc"), k=rng.randint(0, 6),
+                                              s=rng.randint(5, 60), m=rng.randint(1, 3))
+        out[s] = f"{'NOT ' if rng.random() < 0.3 else ''}c{s} AND {form}"
+    return out
+
+
+def random_query(pattern, skip, mode, spec, order="i", within=None, define=DEFAULT_DEFINE):
+    """The query over seqs, ORDER BY order; within (unit, amount) is WITHIN's, written after PATTERN; define is the
+    DEFINEs' text by symbol (random_define)."""
     measures = ", ".join(measure_text(x) for x in spec)
     clause = "" if within is None else f" WITHIN INTERVAL '{within[1]}' {within[0]}"
     final = "ORDER BY p, mn" if mode == "one" else f"ORDER BY p, {order}, mn"
+    defs = ", ".join(f"{s} AS {define[s]}" for s in "abc")
     return (f"SELECT * FROM seqs MATCH_RECOGNIZE (PARTITION BY p ORDER BY {order} MEASURES {measures} {ROWS_PER[mode]} "
-            f"AFTER MATCH SKIP {skip} PATTERN ({pattern}){clause} DEFINE a AS ca, b AS cb, c AS cc) {final}")
+            f"AFTER MATCH SKIP {skip} PATTERN ({pattern}){clause} DEFINE {defs}) {final}")
 
 
 def gen_count(rng):
@@ -1228,22 +1767,18 @@ def gen_data(rng):
 
 
 def random_parts(data, order="i"):
-    """gen_data's partitions as (rows, truth) pairs for reference_output, each sorted by the ORDER BY column (a tie keeps
-    the rows' order, which is the order the lake's _row_id gives them)."""
-    out = []
-    for _, rows in data:
-        srt = sorted(rows, key=lambda r: r[order])
-        out.append((srt, [{"a": r["ca"] is True, "b": r["cb"] is True, "c": r["cc"] is True} for r in srt]))
-    return out
+    """gen_data's partitions, each sorted by the ORDER BY column (a tie keeps the rows' order, which is the order the
+    lake's _row_id gives them)."""
+    return [sorted(rows, key=lambda r: r[order]) for _, rows in data]
 
 
-def reference_random(parts, tree, skip, mode, spec, order="i", within=None):
+def reference_random(parts, tree, skip, mode, spec, order="i", within=None, define=DEFAULT_DEFINE):
     """The random query's answer by the reference: ("rows", names, rows), or ("error", SQLSTATE, message). The other
-    columns are seqs's, in its order, less the partition and ORDER BY columns."""
+    columns are seqs's, in its order, less the partition and ORDER BY columns. The DEFINEs are read from their text."""
     rest = tuple(c for c in SEQ_COLS if c not in ("p", order))
     try:
-        names, rows = reference_output(parts, tree, skip, spec, mode, ("p",), order, rest,
-                                       None if within is None else WITHIN_UNITS[within[0]](within[1]))
+        names, rows = reference_output([(srt, truth_of_text(srt, define)) for srt in parts], tree, skip, spec, mode,
+                                       ("p",), order, rest, None if within is None else WITHIN_UNITS[within[0]](within[1]))
     except RefError as e:
         return ("error", e.sqlstate, e.message)
     return ("rows", names, rows)
@@ -1262,6 +1797,7 @@ def random_checks(port, seed=1, queries=600, show=5):
     done = agreed = both_errors = regenerated = parser_class = 0
     per_mode = {m: [0, 0] for m in MODES}  # [queries, agreed]
     within_q = [0, 0]  # the WITHIN queries (by ts or by d): [queries, agreed]
+    reads_q = [0, 0]  # the queries whose DEFINEs read the match so far: [queries, agreed]
     misses, took = [], []
     while done < queries:
         tree, text = gen_pattern(rng)
@@ -1272,14 +1808,16 @@ def random_checks(port, seed=1, queries=600, show=5):
             tree = parse_pattern(text)
         spec = random_spec(rng, mode)
         order, within = pick_within(rng)
+        define = random_define(rng)
         try:
-            expect = reference_random(parts[order], tree, parse_skip(skip), mode, spec, order, within)
+            expect = reference_random(parts[order], tree, parse_skip(skip), mode, spec, order, within, define)
         except OutOfBudget:
             regenerated += 1
             continue
         done += 1
         per_mode[mode][0] += 1
-        query = random_query(text, skip, mode, spec, order, within)
+        query = random_query(text, skip, mode, spec, order, within, define)
+        reads = define != DEFAULT_DEFINE
         r = post_sql(port, query, arrow=True)
         took.append(r["took"])
         if expect[0] == "error":
@@ -1292,16 +1830,22 @@ def random_checks(port, seed=1, queries=600, show=5):
         if within is not None:
             within_q[0] += 1
             within_q[1] += ok
+        if reads:
+            reads_q[0] += 1
+            reads_q[1] += ok
         if not ok:
             if (not r["ok"]) and r["code"] == "42601" and "Expected" in r["msg"]:
                 parser_class += 1  # a form the grammar has, refused by the parser: a bug to report (PATTERN is Pondra's to read)
             size = (len(text), len(expect[2]) if expect[0] == "rows" else 0)
             label = mode if within is None else f"{mode}, WITHIN {within[1]} {within[0]} by {order}"
+            if reads:
+                label += ", DEFINE " + ", ".join(f"{s} AS {define[s]}" for s in "abc")
             misses.append((size, text, skip, label, query, expect, r, data))
     print(f"random: {agreed} of {done} queries agree with the reference ({both_errors} answered with 22000 by both); "
           f"{regenerated} patterns regenerated (the reference's search ran past its budget)")
     print("random, by rows per match: " + ", ".join(f"{m} {per_mode[m][1]} of {per_mode[m][0]}" for m in MODES))
     print(f"random, WITHIN (by ts in minutes, or by dt in days): {within_q[1]} of {within_q[0]} agree")
+    print(f"random, DEFINEs that read the match so far: {reads_q[1]} of {reads_q[0]} agree")
     print(f"random: {len(misses)} disagree; {parser_class} of them refused with 'Expected' (42601): each a parser bug to report")
     misses.sort(key=lambda x: x[0])  # the smallest first: the shortest pattern, then the fewest rows given
     for _, text, skip, mode, query, expect, r, data_ in misses[:show]:
@@ -1315,6 +1859,7 @@ def random_checks(port, seed=1, queries=600, show=5):
     return agreed == done, {"queries": done, "agreed": agreed, "errors_both": both_errors, "regenerated": regenerated,
                             "per_mode": {m: f"{per_mode[m][1]}/{per_mode[m][0]}" for m in MODES},
                             "disagree": len(misses), "disagree_parser": parser_class, "within": f"{within_q[1]}/{within_q[0]}",
+                            "reads_match": f"{reads_q[1]}/{reads_q[0]}",
                             "slowest_ms": round(max(took, default=0) * 1000)}
 
 
@@ -1363,7 +1908,7 @@ def self_test():
 
     for ex in FIXED:
         if "spec" in ex:  # ALL ROWS: the names in order, and the rows as a multiset (the node's order is checked there)
-            parts = [(rows, truth_of(rows, ex["define"])) for rows in partitions_of(TABLES[ex["table"]][1], ex.get("partition"), ex["order"])]
+            parts = [(rows, truth_for(rows, ex)) for rows in partitions_of(TABLES[ex["table"]][1], ex.get("partition"), ex["order"])]
             names, got = reference_output(parts, P(ex["pattern"]), parse_skip(ex["skip"]), ex["spec"], ex["mode"],
                                           ex["pcols"], ex["order"], ex["rcols"])
             want_names = list(ex["expect"][0])
@@ -1409,6 +1954,57 @@ def self_test():
     check("WITHIN by a date: 1 day is in, 2 days is out",
           [(m.start, m.end) for m in find_matches(d3, P("x+"), ("past_last",), within=([date(2026, 3, 2), date(2026, 3, 3), date(2026, 3, 4)], timedelta(days=1)))] == [(0, 2), (2, 3)])
 
+    # DEFINEs that read the match so far: the parser's trees, the NULL rules, and which items a navigation sees.
+    check("parse PREV(LAST(a.price)) < price: a's last row, one row back, against the tested row",
+          parse_expr("PREV(LAST(a.price)) < price") == ("bin", "<", ("ref", "a", "price", "last", 0, -1), ("ref", None, "price", "cur", 0, 0)))
+    check("parse a.price IS NOT NULL", parse_expr("a.price IS NOT NULL") == ("isnull", ("ref", "a", "price", "last", 0, 0), True))
+    check("parse FIRST(a.x, 2) is the third a row", parse_expr("FIRST(a.x, 2)") == ("ref", "a", "x", "first", 2, 0))
+    check("parse NEXT(price, 2) is two rows on", parse_expr("NEXT(price, 2)") == ("ref", None, "price", "cur", 0, 2))
+    check("parse count(*) and count(b.*)", parse_expr("count(*)") == ("agg", "count", None, None)
+          and parse_expr("count(b.*)") == ("agg", "count", "b", None))
+    refused = []
+    for text in ("PREV(PREV(a.x))", "LAST(PREV(a.x))", "FIRST(LAST(a.x), 1, 2)", "a.x LIKE 'x'"):
+        try:
+            parse_expr(text)
+        except ExprError:
+            refused.append(text)
+    check("a navigation deeper than PREV/NEXT(FIRST/LAST), and a LIKE, are not read", len(refused) == 4, f"refused {refused}")
+
+    def ev(text, seen=(), number=1, rows=None, pos=0, sym="b"):
+        rows = rows if rows is not None else [{"v": 5, "x": None}]
+        return _eval(parse_expr(text), Env(rows, pos, sym, list(seen), number))
+
+    check("NULL rules: count over no rows is 0; sum over none is NULL; a.v IS NULL is true with no a row",
+          ev("count(a.*)") == 0 and ev("sum(a.v)") is None and ev("a.v IS NULL") is True)
+    check("NULL rules: a.v < 3 with no a row is NULL, so a condition holding it is false",
+          ev("a.v < 3") is None and not ev("a.v < 3") is True)
+    check("NULL rules: COALESCE(a.v, 7) is 7 with no a row; PREV of the first row is NULL",
+          ev("COALESCE(a.v, 7)") == 7 and ev("PREV(v)") is None)
+    check("NULL rules: count(x) skips a NULL column; count(*) counts it",
+          ev("count(x)", ((0, "b", False),)) == 0 and ev("count(*)", ((0, "b", False),)) == 1)
+    check("the tested row is in its own variable's count and in the universal one, not in another's",
+          ev("count(b.*)", ((0, "b", False),)) == 1 and ev("count(a.*)", ((0, "b", False),)) == 0
+          and ev("count(*)", ((0, "b", False),)) == 1)
+    own = [{"i": 19}, {"i": 22}]
+    check("a DEFINE's own LAST is the tested row: c.i is row i, so COALESCE(c.i, 0) < i is false; PREV(LAST(c.i)) is the row before it",
+          [t["c"] for t in truth_of_text(own, {"c": "COALESCE(c.i, 0) < i"})] == [False, False]
+          and [t["c"] for t in truth_of_text(own, {"c": "PREV(LAST(c.i)) < i"})] == [False, True])
+    check("MATCH_NUMBER() is the number given; CLASSIFIER() is the symbol defined",
+          ev("MATCH_NUMBER()", number=3) == 3 and ev("CLASSIFIER() = 'b'") is True)
+    check("sum of DOUBLEs is fsum's: sum(a.x) <= 0.6 holds for 0.1, 0.2, 0.3",
+          _eval(parse_expr("sum(a.x) <= 0.6"), Env([{"x": 0.1}, {"x": 0.2}, {"x": 0.3}], 2, "a",
+                                                    [(0, "a", False), (1, "a", False), (2, "a", False)], 1)) is True)
+    # the tested row is not in another variable's rows: y is tested at row 0 with no x rows before it, so y holds there
+    rows2 = [{"v": 1}, {"v": 2}]
+    check("a DEFINE of y that counts x's rows: the tested y row is not an x row (x* y takes row 0 as y, then 1)",
+          [(m.start, m.end) for m in find_matches(truth_of_text(rows2, {"y": "count(x.*) = 0"}), P("x* y"), ("past_last",))] == [(0, 1), (1, 2)])
+    rows4 = [{"v": i} for i in range(4)]
+    check("a DEFINE of a that counts its own rows: a+ with count(a.*) <= 2 takes 0-1 and 2-3 (the tested row counts)",
+          [(m.start, m.end) for m in find_matches(truth_of_text(rows4, {"a": "count(a.*) <= 2"}), P("a+"), ("past_last",))] == [(0, 2), (2, 4)])
+    rows3 = [{"v": i} for i in range(3)]
+    check("MATCH_NUMBER() <= 2 in a DEFINE: the first two matches (numbered in order), not a third",
+          [(m.start, m.end) for m in find_matches(truth_of_text(rows3, {"a": "MATCH_NUMBER() <= 2"}), P("a"), ("past_last",))] == [(0, 1), (1, 2)])
+
     rng = random.Random(7)
     done = hits = 0
     for _ in range(300):
@@ -1419,7 +2015,8 @@ def self_test():
                 tree = parse_pattern(render(strip_excl(tree)))
             data = gen_data(rng)
             order, within = pick_within(rng)
-            reference_random(random_parts(data, order), tree, parse_skip(gen_skip(rng)), mode, random_spec(rng, mode), order, within)
+            define = random_define(rng)
+            reference_random(random_parts(data, order), tree, parse_skip(gen_skip(rng)), mode, random_spec(rng, mode), order, within, define)
             done += 1
         except OutOfBudget:
             hits += 1

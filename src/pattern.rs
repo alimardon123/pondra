@@ -39,6 +39,9 @@ const AGGREGATES: &[&str] = &[
 /// The functions that navigate the match: they are refused where a navigation can't be taken.
 const NAVIGATIONS: &[&str] = &["first", "last", "prev", "next", "classifier", "match_number"];
 
+/// The refusal of CLASSIFIER() inside a navigation of a DEFINE, with the way to write it.
+const CLASSIFIER_IN_NAV: &str = "CLASSIFIER() inside a navigation isn't supported in a DEFINE yet: test CLASSIFIER() on its own, as CLASSIFIER() = 'b'";
+
 /// Whether `sql` may hold a `MATCH_RECOGNIZE`: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmatch_recognize\b").expect("a regex"));
@@ -358,6 +361,16 @@ struct Cx {
     nav: Vec<String>,
     frame: Option<Frame>,
     part: Vec<String>,
+    /// The columns a DEFINE that reads the match hands the matcher, as L1 columns: `rows` are the row-only parts of its
+    /// glue (`__mr_r{j}`), `values` the values its navigations and aggregates read (`__mr_v{j}`), each as its text.
+    rows: Vec<String>,
+    values: Vec<String>,
+    /// The slots numbered so far (a slot is `__mr_s{index}` in its glue), and those of the DEFINE at hand, as the spec's.
+    slots: usize,
+    defined: Vec<serde_json::Value>,
+    /// Set while a glue's aggregate values are written: a PREV or NEXT there is its window written out, since L1's own
+    /// list can't read a `__mr_n` column it names.
+    inline: bool,
 }
 
 /// One `MATCH_RECOGNIZE` as the derived table it stands for (the layers of the module doc).
@@ -420,28 +433,50 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
         order_w.push(ROW_ID.to_string());
     }
     let frame = all.then_some(Frame::Running);
-    let mut cx = Cx { syms, mode: Mode::Measure, window: over(&part_written, &order_w), nav: vec![], frame, part: part.clone() };
-    let conds = conditions(symbols, &text, &mut cx)?;
+    let mut cx = Cx {
+        syms,
+        mode: Mode::Measure,
+        window: over(&part_written, &order_w),
+        nav: vec![],
+        frame,
+        part: part.clone(),
+        rows: vec![],
+        values: vec![],
+        slots: 0,
+        defined: vec![],
+        inline: false,
+    };
+    let (conds, defines) = conditions(symbols, &text, &mut cx)?;
     let mut texts = vec![];
     for m in measures {
         texts.push(written(m.expr.clone(), &mut cx)?);
     }
 
-    // L1: the rows, with the keys, the conditions and the navigation columns
+    // L1: the rows, with the keys, the conditions, the glue's columns and the navigation columns
     let row = if has_row { ", _row_id AS __mr_row" } else { "" };
     let orders: String = order_by.iter().enumerate().map(|(i, o)| format!(", {} AS __mr_o{i}", o.expr)).collect();
     let defined: String = conds.iter().enumerate().map(|(k, c)| format!(", {c} AS __mr_d{k}")).collect();
+    let glue_rows: String = cx.rows.iter().enumerate().map(|(j, r)| format!(", {r} AS __mr_r{j}")).collect();
+    let glue_values: String = cx.values.iter().enumerate().map(|(j, v)| format!(", {v} AS __mr_v{j}")).collect();
     let navs: String = cx.nav.iter().map(|n| format!(", {n}")).collect();
-    let l1 = format!("SELECT *{row}{orders}{defined}{navs} FROM {table}");
+    let l1 = format!("SELECT *{row}{orders}{defined}{glue_rows}{glue_values}{navs} FROM {table}");
 
     // L2: the window that matches the partition (`pondra_matches` where a row may be in several matches)
     let overlap = matches!(after_match_skip, Some(AfterMatchSkip::ToNextRow | AfterMatchSkip::ToFirst(_) | AfterMatchSkip::ToLast(_)));
     let skip = skip_json(after_match_skip.as_ref(), &cx.syms)?;
-    let spec = json!({ "pattern": &text, "skip": skip, "unmatched": unmatched, "within": within.is_some() }).to_string();
+    let mut spec = json!({ "pattern": &text, "skip": skip, "unmatched": unmatched, "within": within.is_some() });
+    if !defines.is_empty() {
+        spec["defines"] = json!(defines);
+        spec["rows"] = json!(cx.rows.len());
+        spec["values"] = json!(cx.values.len());
+    }
+    let spec = spec.to_string();
     let mut call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
     if let Some(interval) = &within {
         call.push_str(&format!(", __mr_o0, {interval}"));
     }
+    call.extend((0..cx.rows.len()).map(|j| format!(", __mr_r{j}")));
+    call.extend((0..cx.values.len()).map(|j| format!(", __mr_v{j}")));
     let mut order2: Vec<String> = dirs.iter().enumerate().map(|(i, d)| format!("__mr_o{i}{d}")).collect();
     if has_row {
         order2.push("__mr_row".to_string());
@@ -506,6 +541,8 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
             }
             hidden.extend((0..order_by.len()).map(|i| format!("__mr_o{i}")));
             hidden.extend((0..cx.syms.len()).map(|k| format!("__mr_d{k}")));
+            hidden.extend((0..cx.rows.len()).map(|j| format!("__mr_r{j}")));
+            hidden.extend((0..cx.values.len()).map(|j| format!("__mr_v{j}")));
             hidden.extend((0..cx.nav.len()).map(|j| format!("__mr_n{j}")));
             hidden.extend((0..texts.len()).map(|i| format!("__mr_q{i}")));
             let mut exclude = own.clone();
@@ -520,8 +557,9 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
 }
 
 /// Each symbol's condition as SQL over the rows: its DEFINE, read as the current row's, and `true` for a symbol with
-/// none (a pattern may name a symbol that matches any row).
-fn conditions(symbols: &[SymbolDefinition], text: &str, cx: &mut Cx) -> Result<Vec<String>> {
+/// none (a pattern may name a symbol that matches any row). A DEFINE that reads the match so far gives its row-only
+/// conjuncts here and its other conjuncts as the glue the matcher evaluates (the spec's `defines`, one per such symbol).
+fn conditions(symbols: &[SymbolDefinition], text: &str, cx: &mut Cx) -> Result<(Vec<String>, Vec<serde_json::Value>)> {
     let mut defs: Vec<Option<Expr>> = vec![None; cx.syms.len()];
     for d in symbols {
         let name = ident(&d.symbol);
@@ -534,18 +572,330 @@ fn conditions(symbols: &[SymbolDefinition], text: &str, cx: &mut Cx) -> Result<V
         defs[k] = Some(d.definition.clone());
     }
     let mut out = vec![];
+    let mut glued = vec![];
     for (k, def) in defs.into_iter().enumerate() {
-        out.push(match def {
-            Some(e) => {
-                cx.mode = Mode::Define(k);
-                let text = written(e, cx);
-                cx.mode = Mode::Measure;
-                text?
-            }
-            None => "true".to_string(),
-        });
+        let Some(e) = def else {
+            out.push("true".to_string());
+            continue;
+        };
+        cx.mode = Mode::Define(k);
+        let row = one_define(e, k, cx, &mut glued);
+        cx.mode = Mode::Measure;
+        out.push(row?);
     }
-    Ok(out)
+    Ok((out, glued))
+}
+
+/// One DEFINE of symbol `k`: its row-only conjuncts as the symbol's L1 condition (`true` when there are none), and its
+/// match-reading conjuncts as one glue, pushed onto `glued` with its slots. A DEFINE that reads nothing of the match is
+/// written as it always was.
+fn one_define(e: Expr, k: usize, cx: &mut Cx, glued: &mut Vec<serde_json::Value>) -> Result<String> {
+    let mut e = e;
+    unwrap_running(&mut e)?;
+    if nav_of_classifier(&e) {
+        return Err(refuse_define(&cx.syms[k], CLASSIFIER_IN_NAV));
+    }
+    let parts = conjuncts(&e);
+    let reads: Vec<bool> = parts.iter().map(|c| reads_match(c, k, cx)).collect();
+    if !reads.contains(&true) {
+        return written(e, cx);
+    }
+    let mut rows = vec![];
+    let mut glue = vec![];
+    for (c, r) in parts.into_iter().zip(reads) {
+        match r {
+            true => glue.push(c),
+            false => rows.push(format!("({})", written(c, cx)?)),
+        }
+    }
+    let row = match rows.is_empty() {
+        true => "true".to_string(),
+        false => rows.join(" AND "),
+    };
+    let outer = std::mem::take(&mut cx.defined);
+    let mut texts = vec![];
+    for c in glue {
+        texts.push(format!("({})", glue_text(c, k, cx)?));
+    }
+    let slots = std::mem::replace(&mut cx.defined, outer);
+    glued.push(json!({ "symbol": k, "glue": texts.join(" AND "), "slots": slots }));
+    Ok(row)
+}
+
+/// Whether a PREV, NEXT, FIRST or LAST of `e` has a CLASSIFIER() anywhere in its arguments.
+fn nav_of_classifier(e: &Expr) -> bool {
+    visit_expressions(e, |x| match x {
+        Expr::Function(f) if ["first", "last", "prev", "next"].contains(&lower_name(f).as_str()) && has_classifier(x) => {
+            ControlFlow::Break(())
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// Whether `e` has a CLASSIFIER() call anywhere in it.
+fn has_classifier(e: &Expr) -> bool {
+    visit_expressions(e, |x| match x {
+        Expr::Function(f) if lower_name(f) == "classifier" => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// RUNNING takes its argument as it is (a DEFINE reads the rows so far); FINAL is for MEASURES and is refused.
+fn unwrap_running(e: &mut Expr) -> Result<()> {
+    let mut err = None;
+    let _ = visit_expressions_mut(e, |x| {
+        let replacement = match x {
+            Expr::Function(f) if lower_name(f) == "pondra_running" => match positional(f).and_then(|a| first_arg(&a, "RUNNING").cloned()) {
+                Ok(inner) => Some(inner),
+                Err(e) => {
+                    err = Some(e);
+                    return ControlFlow::Break(());
+                }
+            },
+            Expr::Function(f) if lower_name(f) == "pondra_final" => {
+                err = Some(coded("42601", "MATCH_RECOGNIZE: FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL"));
+                return ControlFlow::Break(());
+            }
+            _ => None,
+        };
+        if let Some(inner) = replacement {
+            *x = inner;
+        }
+        ControlFlow::Continue(())
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// The conjuncts of a condition: its top-level ANDs, each as an expression of its own.
+fn conjuncts(e: &Expr) -> Vec<Expr> {
+    match e {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => conjuncts(left).into_iter().chain(conjuncts(right)).collect(),
+        Expr::Nested(x) => conjuncts(x),
+        _ => vec![e.clone()],
+    }
+}
+
+/// Whether a DEFINE's expression reads the match so far: another variable's column, a navigation, an aggregate, or
+/// MATCH_NUMBER(). A PREV or NEXT of the row's own columns reads the row only, and so does CLASSIFIER().
+fn reads_match(e: &Expr, k: usize, cx: &Cx) -> bool {
+    visit_expressions(e, |x| {
+        let reads = match x {
+            Expr::CompoundIdentifier(p) => match p.as_slice() {
+                [q, _] => cx.syms.iter().position(|s| *s == ident(q)).is_some_and(|j| j != k),
+                _ => false,
+            },
+            Expr::Function(f) => {
+                let name = lower_name(f);
+                matches!(name.as_str(), "first" | "last" | "match_number") || AGGREGATES.contains(&name.as_str())
+            }
+            _ => false,
+        };
+        match reads {
+            true => ControlFlow::Break(()),
+            false => ControlFlow::Continue(()),
+        }
+    })
+    .is_break()
+}
+
+/// The glue of a match-reading conjunct, as SQL over `__mr_r{j}` and `__mr_s{index}` (see `glue_node`).
+fn glue_text(e: Expr, k: usize, cx: &mut Cx) -> Result<String> {
+    let mut x = e;
+    let mut glue = Glue { cx, k, err: None };
+    let _ = VisitMut::visit(&mut x, &mut glue);
+    if let Some(err) = glue.err {
+        return Err(err);
+    }
+    Ok(x.to_string())
+}
+
+/// Walks a glue's expression in order, putting each node `glue_node` gives a name in place of the node.
+struct Glue<'a> {
+    cx: &'a mut Cx,
+    k: usize,
+    err: Option<anyhow::Error>,
+}
+
+impl VisitorMut for Glue<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        match glue_node(&*e, self.k, &mut *self.cx) {
+            Ok(None) => ControlFlow::Continue(()),
+            Ok(Some(name)) => {
+                *e = Expr::Identifier(Ident::new(name));
+                ControlFlow::Continue(())
+            }
+            Err(err) => {
+                self.err = Some(err);
+                ControlFlow::Break(())
+            }
+        }
+    }
+}
+
+/// The glue's name for a sub-expression of a DEFINE of symbol `k`: a row-only part is `__mr_r{j}` (its text an L1 column),
+/// a navigation or an aggregate is `__mr_s{index}` (its slot), and an operator or function over those is walked into
+/// (None). A literal stays as it is in the glue.
+fn glue_node(e: &Expr, k: usize, cx: &mut Cx) -> Result<Option<String>> {
+    if matches!(e, Expr::Value(_)) {
+        return Ok(None);
+    }
+    if !reads_match(e, k, cx) {
+        return row_part(e, cx).map(Some);
+    }
+    match e {
+        Expr::CompoundIdentifier(_) => nav_slot(e, false, 0, 0, k, cx).map(Some),
+        Expr::Function(f) => function_slot(f, k, cx),
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+            Err(coded("0A000", "MATCH_RECOGNIZE: a subquery in MEASURES or DEFINE isn't supported yet"))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// A row-only part of a DEFINE's glue: its text, written as the row's own DEFINE, is the next `__mr_r` column.
+fn row_part(e: &Expr, cx: &mut Cx) -> Result<String> {
+    let text = written(e.clone(), cx)?;
+    cx.rows.push(text);
+    Ok(format!("__mr_r{}", cx.rows.len() - 1))
+}
+
+/// A function of a DEFINE's glue that reads the match: a navigation, MATCH_NUMBER or an aggregate gives its slot;
+/// anything else is walked into (None).
+fn function_slot(f: &Function, k: usize, cx: &mut Cx) -> Result<Option<String>> {
+    let name = lower_name(f);
+    Ok(Some(match name.as_str() {
+        "first" | "last" => {
+            let args = positional(f)?;
+            let base = first_arg(&args, if name == "first" { "FIRST" } else { "LAST" })?;
+            let m = whole(args.get(1).copied())?.unwrap_or(0);
+            nav_slot(base, name == "first", m, 0, k, cx)?
+        }
+        "prev" | "next" => {
+            let args = positional(f)?;
+            let e = first_arg(&args, if name == "prev" { "PREV" } else { "NEXT" })?;
+            let n = whole(args.get(1).copied())?.unwrap_or(1) as i64;
+            let offset = if name == "prev" { -n } else { n };
+            // PREV(FIRST(a.x, m), n) is the navigation of FIRST with its offset; PREV(a.x) is PREV(LAST(a.x))
+            match e {
+                Expr::Function(g) if matches!(lower_name(g).as_str(), "first" | "last") => {
+                    let inner = positional(g)?;
+                    let base = first_arg(&inner, "FIRST or LAST")?;
+                    let m = whole(inner.get(1).copied())?.unwrap_or(0);
+                    nav_slot(base, lower_name(g) == "first", m, offset, k, cx)?
+                }
+                _ => nav_slot(e, false, 0, offset, k, cx)?,
+            }
+        }
+        "match_number" => {
+            let index = cx.slots;
+            cx.slots += 1;
+            cx.defined.push(json!({ "index": index, "kind": "match_number" }));
+            format!("__mr_s{index}")
+        }
+        n if AGGREGATES.contains(&n) => agg_slot(f, n, k, cx)?,
+        _ => return Ok(None),
+    }))
+}
+
+/// The name of the first navigation or aggregate in `e` (lower case), when there is one.
+fn nested(e: &Expr) -> Option<String> {
+    let mut found = None;
+    let _ = visit_expressions(e, |x| match x {
+        Expr::Function(f) => {
+            let name = lower_name(f);
+            if NAVIGATIONS.contains(&name.as_str()) || AGGREGATES.contains(&name.as_str()) {
+                found = Some(name);
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        _ => ControlFlow::Continue(()),
+    });
+    found
+}
+
+/// A refusal of a DEFINE (SQLSTATE 0A000), named by its variable.
+fn refuse_define(sym: &str, what: impl Display) -> anyhow::Error {
+    coded("0A000", format!("MATCH_RECOGNIZE: DEFINE {sym}: {what}"))
+}
+
+/// A value a glue reads, as L1's column: its index among the `values`.
+fn value_column(cx: &mut Cx, text: String) -> usize {
+    cx.values.push(text);
+    cx.values.len() - 1
+}
+
+/// A navigation of a DEFINE's glue: the value of `base`'s column at the first (or last) m-th row of its variable, moved
+/// by `offset` physical rows (PREV is negative, NEXT positive). The slot is numbered, and its value column written.
+fn nav_slot(base: &Expr, first: bool, m: u64, offset: i64, k: usize, cx: &mut Cx) -> Result<String> {
+    let sym = cx.syms[k].clone();
+    if let Some(inner) = nested(base) {
+        let what = match inner.as_str() {
+            "classifier" => CLASSIFIER_IN_NAV.to_string(),
+            n if AGGREGATES.contains(&n) => format!("{n} inside a navigation isn't supported in a DEFINE yet: take {n} on its own, as {n}(a.x) > 2"),
+            _ => "a navigation inside a navigation isn't supported in a DEFINE yet: write PREV(LAST(a.x)) or FIRST(a.x, m), and nothing deeper".to_string(),
+        };
+        return Err(refuse_define(&sym, what));
+    }
+    let var = variable_of(base, cx)?;
+    let value = value_column(cx, plain(base));
+    let index = cx.slots;
+    cx.slots += 1;
+    cx.defined.push(json!({ "index": index, "kind": "nav", "var": var, "first": first, "m": m, "offset": offset, "value": value }));
+    Ok(format!("__mr_s{index}"))
+}
+
+/// An aggregate of a DEFINE's glue over the rows of its variable (every row of the match, when it has none): count, sum,
+/// avg, min or max, of a value the glue reads. The aggregate's own FILTER, ORDER BY and DISTINCT are refused.
+fn agg_slot(f: &Function, name: &str, k: usize, cx: &mut Cx) -> Result<String> {
+    let sym = cx.syms[k].clone();
+    if f.over.is_some() {
+        return Err(refuse_define(&sym, format!("a window ({name} … OVER) isn't supported in a DEFINE yet: write the test over the match, as {name}(a.*) > 2")));
+    }
+    if f.filter.is_some() {
+        return Err(refuse_define(&sym, format!("{name}'s FILTER isn't supported in a DEFINE yet: give those rows their own variable, and {name} that one")));
+    }
+    if has_order_by(f) || !f.within_group.is_empty() {
+        return Err(refuse_define(&sym, format!("{name}'s ORDER BY isn't supported in a DEFINE yet: drop it: the rows come in the match's order")));
+    }
+    if matches!(&f.args, FunctionArguments::List(l) if l.duplicate_treatment == Some(DuplicateTreatment::Distinct)) {
+        return Err(refuse_define(&sym, format!("{name}(DISTINCT …) isn't supported in a DEFINE yet: drop DISTINCT")));
+    }
+    if !matches!(name, "count" | "sum" | "avg" | "min" | "max") {
+        return Err(refuse_define(&sym, format!("{name} isn't supported in a DEFINE yet: use count, sum, avg, min or max over the match")));
+    }
+    let args: Vec<&FunctionArg> = match &f.args {
+        FunctionArguments::List(list) => list.args.iter().collect(),
+        _ => vec![],
+    };
+    let (var, value) = match args.as_slice() {
+        [] | [FunctionArg::Unnamed(FunctionArgExpr::Wildcard)] if name == "count" => (None, None),
+        [FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(n))] if name == "count" => (Some(symbol_named(&object(n), cx)?), None),
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(e))] => {
+            if let Some(inner) = nested(e) {
+                return Err(refuse_define(&sym, format!("{inner} inside {name} isn't supported in a DEFINE yet: take {inner} on its own")));
+            }
+            let var = variable_of(e, cx)?;
+            let saved = std::mem::replace(&mut cx.inline, true);
+            let text = inside(e.clone(), cx);
+            cx.inline = saved;
+            (var, Some(text?))
+        }
+        _ => return Err(refuse_define(&sym, format!("{name} takes one expression of the rows, as {name}(a.x)"))),
+    };
+    let value = value.map(|text| value_column(cx, text));
+    let index = cx.slots;
+    cx.slots += 1;
+    cx.defined.push(json!({ "index": index, "kind": "agg", "fun": name, "var": var, "value": value }));
+    Ok(format!("__mr_s{index}"))
 }
 
 /// A PARTITION BY item as the column it names (its last part, when it is qualified).
@@ -714,8 +1064,10 @@ fn qualified_star(f: &Function) -> Option<String> {
     })
 }
 
+/// A match-reading part of a DEFINE that reached the row's own path: `conditions` sends those to the glue, so this is
+/// only a guard against a part it missed.
 fn define_error(sym: &str, what: String) -> anyhow::Error {
-    coded("0A000", format!("MATCH_RECOGNIZE: DEFINE {sym} reads the match so far ({what}), which isn't supported yet: compare with the row before, PREV(price)"))
+    refuse_define(sym, format!("{what} reads the match so far, which this part of the DEFINE doesn't take"))
 }
 
 /// `x` as SQL, with each expression that `node` translates swapped for the translation, in parentheses (so the
@@ -806,17 +1158,10 @@ fn function(f: &Function, cx: &mut Cx) -> Result<Option<String>> {
     }
 }
 
-/// A call in a DEFINE: PREV and NEXT are the row's own lag and lead; RUNNING is its argument (a DEFINE reads the rows so
-/// far), and FINAL is refused; the match so far is refused by name.
+/// A call in a DEFINE's row-only part: PREV and NEXT are the row's own lag and lead, and CLASSIFIER() is the symbol being
+/// defined, as a literal. The calls that read the match are the glue's (`function_slot`), so they are not written here.
 fn define_call(f: &Function, name: &str, k: usize, cx: &mut Cx) -> Result<Option<String>> {
     Ok(Some(match name {
-        "pondra_running" => {
-            let args = positional(f)?;
-            written(first_arg(&args, name)?.clone(), cx)?
-        }
-        "pondra_final" => {
-            return Err(coded("42601", "MATCH_RECOGNIZE: FINAL is for MEASURES: a DEFINE reads the rows so far, so drop FINAL"))
-        }
         "prev" | "next" => {
             let args = positional(f)?;
             let e = first_arg(&args, name)?;
@@ -826,7 +1171,8 @@ fn define_call(f: &Function, name: &str, k: usize, cx: &mut Cx) -> Result<Option
             }
             format!("{}({}, {n}) {}", if name == "prev" { "lag" } else { "lead" }, plain(e), cx.window)
         }
-        "first" | "last" | "classifier" | "match_number" => return Err(define_error(&cx.syms[k], f.to_string())),
+        "classifier" => quote(&cx.syms[k]),
+        "first" | "last" | "match_number" => return Err(define_error(&cx.syms[k], f.to_string())),
         n if AGGREGATES.contains(&n) => return Err(define_error(&cx.syms[k], f.to_string())),
         _ => return Ok(None),
     }))
@@ -932,8 +1278,12 @@ fn navigation(f: &Function, first: bool, cx: &Cx) -> Result<String> {
 /// its own, so a navigation reads the one at the rows it takes.
 fn push_lag(e: &Expr, prev: bool, n: u64, cx: &mut Cx) -> String {
     let fun = if prev { "lag" } else { "lead" };
+    let window = format!("{fun}({}, {n}) {}", plain(e), cx.window);
+    if cx.inline {
+        return window; // (a glue's value: L1 can't read a column of its own list, so the window is written out)
+    }
     let col = format!("__mr_n{}", cx.nav.len());
-    cx.nav.push(format!("{fun}({}, {n}) {} AS {col}", plain(e), cx.window));
+    cx.nav.push(format!("{window} AS {col}"));
     col
 }
 
@@ -1023,6 +1373,20 @@ fn skip_json(skip: Option<&AfterMatchSkip>, syms: &[String]) -> Result<serde_jso
             json!({ "to": "last", "symbol": name })
         }
     })
+}
+
+/// A statement's text as the engine runs it, for the tests: its clauses written as their derived tables.
+#[cfg(test)]
+pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
+    let t = text(sql);
+    let mut stmts = Parser::parse_sql(&GenericDialect {}, &t)?;
+    let mut r = Rewrite { lake: &HashMap::new() };
+    for s in stmts.iter_mut() {
+        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+            return Err(e);
+        }
+    }
+    Ok(stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; "))
 }
 
 #[cfg(test)]
@@ -1151,5 +1515,164 @@ mod tests {
             let err = within_interval(text).expect_err("a refusal");
             assert_eq!(crate::codes::of(&err), "42601", "{text}");
         }
+    }
+
+    /// The clause of `sql`'s one MATCH_RECOGNIZE, as `layer` gives it.
+    fn layered(sql: &str) -> Result<TableFactor> {
+        let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
+        let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
+        let clause = s.from.remove(0).relation;
+        layer(&clause, &HashMap::new())
+    }
+
+    /// The clause of `sql` as its derived table's SQL, and the spec its matcher call carries.
+    fn derived(sql: &str) -> (String, serde_json::Value) {
+        let TableFactor::Derived { subquery, .. } = layered(sql).expect("a layer") else { panic!("a derived table") };
+        let sql = subquery.to_string();
+        let spec = spec_in(&sql);
+        (sql, spec)
+    }
+
+    /// The spec in a derived table's SQL: the JSON of its quoted literal (`''` is a quote).
+    fn spec_in(sql: &str) -> serde_json::Value {
+        let from = sql.find("'{").expect("a spec") + 1;
+        let mut out = String::new();
+        let mut chars = sql[from..].chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    out.push('\'');
+                    continue;
+                }
+                break;
+            }
+            out.push(c);
+        }
+        serde_json::from_str(&out).expect("the spec reads as JSON")
+    }
+
+    /// The refusal of `sql`'s clause: its SQLSTATE and its words.
+    fn refused_clause(sql: &str) -> (&'static str, String) {
+        let err = layered(sql).expect_err("a refusal");
+        (crate::codes::of(&err), err.to_string())
+    }
+
+    const TICK: &str = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS ";
+
+    /// The ticker's clause, whose DEFINEs read the row only: its derived table is what it was before the glue.
+    #[test]
+    fn the_ticker_clause_keeps_its_derived_text() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day \
+                   MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up \
+                   PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m";
+        let (derived_sql, spec) = derived(sql);
+        assert!(spec.get("defines").is_none());
+        assert_eq!(derived_sql, TICKER_GOLDEN);
+    }
+
+    const TICKER_GOLDEN: &str = "SELECT symbol, (last_value(day ORDER BY __mr_seq) FILTER (WHERE __mr_symbol = 'strt')) AS start_day FROM (SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM (SELECT *, pondra_matches('{\"pattern\":\"strt down+ up+\",\"skip\":{\"to\":\"last\",\"symbol\":\"up\"},\"unmatched\":false,\"within\":false}', __mr_d0, __mr_d1, __mr_d2) OVER (PARTITION BY symbol ORDER BY __mr_o0) AS __mr_ms FROM (SELECT *, day AS __mr_o0, true AS __mr_d0, (price) < (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d1, (price) > (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d2 FROM ticker) AS __mr_c) AS __mr_mm) AS __mr_u WHERE __mr_m IS NOT NULL) AS __mr_r GROUP BY symbol, __mr_match";
+
+    #[test]
+    fn a_define_against_another_variable_is_glue() {
+        let (sql, spec) = derived(&format!("{TICK}b.price < a.price) AS m"));
+        assert!(sql.contains("true AS __mr_d0"), "{sql}");
+        assert!(sql.contains("true AS __mr_d1"), "{sql}");
+        assert!(sql.contains("(price) AS __mr_r0"), "{sql}");
+        assert!(sql.contains("price AS __mr_v0"), "{sql}");
+        assert!(sql.contains("__mr_d1, __mr_r0, __mr_v0)"), "{sql}");
+        assert_eq!(
+            spec["defines"],
+            json!([{"symbol": 1, "glue": "(__mr_r0 < __mr_s0)", "slots": [{"index": 0, "kind": "nav", "var": 0, "first": false, "m": 0, "offset": 0, "value": 0}]}])
+        );
+        assert_eq!((spec["rows"].clone(), spec["values"].clone()), (json!(1), json!(1)));
+    }
+
+    #[test]
+    fn a_count_over_the_match_is_an_aggregate_slot() {
+        let (sql, spec) = derived(&format!("{TICK}count(*) > 2) AS m"));
+        assert!(sql.contains("true AS __mr_d1"), "{sql}");
+        assert_eq!(spec["defines"][0]["glue"], "(__mr_s0 > 2)");
+        assert_eq!(spec["defines"][0]["slots"], json!([{"index": 0, "kind": "agg", "fun": "count", "var": null, "value": null}]));
+        assert_eq!((spec["rows"].clone(), spec["values"].clone()), (json!(0), json!(0)));
+    }
+
+    #[test]
+    fn prev_of_a_variable_is_prev_of_its_last_row() {
+        let want = json!([{"index": 0, "kind": "nav", "var": 0, "first": false, "m": 0, "offset": -1, "value": 0}]);
+        for define in ["b.price > PREV(LAST(a.price))", "b.price > PREV(a.price)"] {
+            let (_, spec) = derived(&format!("{TICK}{define}) AS m"));
+            assert_eq!(spec["defines"][0]["glue"], "(__mr_r0 > __mr_s0)", "{define}");
+            assert_eq!(spec["defines"][0]["slots"], want, "{define}");
+        }
+        let (_, spec) = derived(&format!("{TICK}b.price > NEXT(FIRST(a.price, 1), 2)) AS m"));
+        assert_eq!(spec["defines"][0]["slots"], json!([{"index": 0, "kind": "nav", "var": 0, "first": true, "m": 1, "offset": 2, "value": 0}]));
+    }
+
+    #[test]
+    fn coalesce_of_a_variable_keeps_the_null_inside_the_glue() {
+        let (sql, spec) = derived(&format!("{TICK}COALESCE(a.x, 0) < x) AS m"));
+        assert_eq!(spec["defines"][0]["glue"], "(COALESCE(__mr_s0, 0) < __mr_r0)");
+        assert!(sql.contains("(x) AS __mr_r0"), "{sql}");
+        assert!(sql.contains("x AS __mr_v0"), "{sql}");
+        assert_eq!(spec["defines"][0]["slots"][0]["value"], 0);
+    }
+
+    #[test]
+    fn match_number_is_a_slot_with_no_value() {
+        let (sql, spec) = derived(&format!("{TICK}MATCH_NUMBER() = 2) AS m"));
+        assert_eq!(spec["defines"][0]["glue"], "(__mr_s0 = 2)");
+        assert_eq!(spec["defines"][0]["slots"], json!([{"index": 0, "kind": "match_number"}]));
+        assert!(!sql.contains("__mr_v0"), "{sql}");
+    }
+
+    #[test]
+    fn classifier_is_the_symbol_as_a_literal_and_reads_no_match() {
+        let (sql, spec) = derived(&format!("{TICK}CLASSIFIER() = 'b') AS m"));
+        assert!(sql.contains("('b') = 'b' AS __mr_d1"), "{sql}");
+        assert!(spec.get("defines").is_none(), "{spec}");
+    }
+
+    #[test]
+    fn row_conjuncts_stay_in_the_column_and_the_rest_is_glue() {
+        let (sql, spec) = derived(&format!("{TICK}b.price > 0 AND a.price < b.price) AS m"));
+        assert!(sql.contains("((price) > 0) AS __mr_d1"), "{sql}");
+        assert_eq!(spec["defines"][0]["glue"], "(__mr_s0 < __mr_r0)");
+        assert_eq!((spec["rows"].clone(), spec["values"].clone()), (json!(1), json!(1)));
+    }
+
+    #[test]
+    fn a_define_that_reads_no_match_keeps_its_text() {
+        let (sql, spec) = derived(&format!("{TICK}b.price < PREV(b.price)) AS m"));
+        assert!(sql.contains("lag(price, 1) OVER"), "{sql}");
+        assert!(spec.get("defines").is_none());
+        assert!(!sql.contains("__mr_r0"), "{sql}");
+    }
+
+    #[test]
+    fn the_refusals_say_what_to_write() {
+        let cases = [
+            ("array_agg(a.price) > 1", "array_agg isn't supported in a DEFINE yet"),
+            ("sum(a.price) FILTER (WHERE a.price > 0) > 1", "FILTER isn't supported in a DEFINE yet"),
+            ("sum(DISTINCT a.price) > 1", "DISTINCT …) isn't supported in a DEFINE yet"),
+            ("sum(a.price ORDER BY a.price) > 1", "ORDER BY isn't supported in a DEFINE yet"),
+            ("LAST(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
+            ("PREV(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
+            ("NEXT(CLASSIFIER()) = 'b'", "CLASSIFIER() inside a navigation isn't supported"),
+            ("FIRST(PREV(a.price)) > 1", "a navigation inside a navigation isn't supported"),
+            ("PREV(PREV(a.price)) > 1", "a navigation inside a navigation isn't supported"),
+            ("sum(FIRST(a.price)) > 1", "first inside sum isn't supported"),
+            ("a.price IN (SELECT 1) ", "a subquery in MEASURES or DEFINE isn't supported yet"),
+        ];
+        for (define, words) in cases {
+            let (code, msg) = refused_clause(&format!("{TICK}{define}) AS m"));
+            assert_eq!(code, "0A000", "{define}: {msg}");
+            assert!(msg.contains(words), "{define}: {msg}");
+        }
+        let (_, msg) = refused_clause(&format!("{TICK}array_agg(a.price) > 1) AS m"));
+        assert!(msg.starts_with("MATCH_RECOGNIZE: DEFINE b: "), "{msg}");
+        let (code, msg) = refused_clause(&format!("{TICK}FINAL last(a.price) > 1) AS m"));
+        assert_eq!(code, "42601", "{msg}");
+        assert!(msg.contains("FINAL is for MEASURES"), "{msg}");
     }
 }
