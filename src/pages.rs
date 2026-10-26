@@ -10,7 +10,8 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 struct Kept {
     id: String,

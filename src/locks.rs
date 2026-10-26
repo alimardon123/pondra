@@ -22,7 +22,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 /// How often a waiter looks again at its lock: a lapsed lease gives way within this.

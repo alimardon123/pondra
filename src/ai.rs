@@ -163,7 +163,7 @@ fn refused(e: &anyhow::Error) -> bool {
 fn failed(embed: bool, e: &anyhow::Error) {
     crate::per_node!(static SAID: AtomicU64 = AtomicU64::new(0));
     FAILED.fetch_add(1, Relaxed);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let now = crate::log::now_us() / 1_000_000;
     let last = SAID.load(Relaxed);
     if last + 10 <= now && SAID.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
         eprintln!("{}: {e:#} (its rows are NULL)", if embed { "ai_embed" } else { "ai_complete" });

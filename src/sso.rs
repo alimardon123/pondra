@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 /// The lake's format that knows identity providers: a node from before takes their tokens for nobody's
 /// and, on a lake with no other user, the lake for one nobody signs in to (invariant 412).
