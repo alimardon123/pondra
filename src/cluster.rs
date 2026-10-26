@@ -14,20 +14,20 @@
 //!   machines outside the cluster: a node starting on an idle lake leads at once instead of
 //!   waiting out a lease, and a `pondra sql` INSERT never deposes a leader it merely can't reach.
 //!   A claimer also holds a lock file in this machine's temp folder (named in its term record), so
-//!   a process on the same machine knows at once that a killed claimer is gone; another machine
-//!   has no file to look at and waits for the mark. A leader killed and started again takes the
-//!   next term: only its own restart takes its term back.
+//!   a process on the same machine knows at once that a killed claimer is gone. Another machine
+//!   has no file to look at: it rings the inbox's bell, which a claimer answers with a mark within
+//!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`). A leader
+//!   killed and started again takes the next term: only its own restart takes its term back.
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
-use crate::terms::{alive, claim, gone_here, latest, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, Term, HELD};
+use crate::terms::{alive, claim, deaf, gone_here, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, Term, HELD, LEASE};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const LEASE: Duration = Duration::from_secs(5);
 const STARTUP: Duration = Duration::from_secs(30); // a new leader may need this long to open the catalog
 const CUT_OFF: Duration = Duration::from_secs(15); // a leader that hasn't reached the bucket this long steps aside
 pub const CUT_OFF_HEADER: &str = "x-pondra-cut-off"; // (a heartbeat's answer from a leader cut off)
@@ -51,6 +51,7 @@ pub struct Cluster {
     /// The term was ours before this process started, and taken back (`coming_back`): its mark is as old as the
     /// restart, so `keep_alive` marks it at once.
     taken_back: bool,
+    rang: tokio::sync::watch::Sender<u64>, // leader: rings of the inbox's bell heard (`keep_alive`), which `inbox::serve` drains on
 }
 
 impl Cluster {
@@ -72,7 +73,7 @@ impl Cluster {
             };
             match latest_term {
                 Some(t) if reader => break t, // (we only read anyway)
-                None if reader => break Term { n: 0, addr: String::new(), lock: String::new() },
+                None if reader => break Term { n: 0, addr: String::new(), lock: String::new(), bell: false },
                 Some(t) if !may_lead && !t.addr.is_empty() && alive(store, &t).await => break t,
                 _ if !may_lead => {
                     // (the node that serves this store leads it: wait for it, never take its place)
@@ -94,8 +95,14 @@ impl Cluster {
                         break t; // (or someone else just did: look again)
                     }
                 }
-                Some(t) if alive(store, &t).await && !t.addr.is_empty() => break t,
-                Some(t) if alive(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
+                // (a leader elsewhere that doesn't answer from here, and didn't mark itself when we rang, is gone: the next
+                // term, below. Following it would wait for it instead)
+                Some(t) if alive(store, &t).await && !t.addr.is_empty() => {
+                    if answers(&t).await || !deaf(store, &t).await {
+                        break t;
+                    }
+                }
+                Some(t) if alive(store, &t).await && !deaf(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
                 t => {
                     if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr).await? {
                         break t; // (or someone else just did: look again)
@@ -137,12 +144,14 @@ impl Cluster {
                     if !writes {
                         return Ok(Some(made("", t, true, may_lead, false, false)));
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if !deaf(store, &t).await {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
                 // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
                 t => {
                     if !writes {
-                        return Ok(Some(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new() }), true, may_lead, false, false)));
+                        return Ok(Some(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false)));
                     }
                     if !may_lead {
                         return Err(not_led());
@@ -182,6 +191,9 @@ impl Cluster {
         self.beats.lock().unwrap().insert(addr, (Instant::now(), said.0, said.1));
         (!self.unreached()).then(|| (self.leader.n, self.nodes()))
     }
+
+    /// Leader: each ring of the inbox's bell this node hears (`inbox::serve` drains on it).
+    pub fn rings(&self) -> tokio::sync::watch::Receiver<u64> { self.rang.subscribe() }
 
     /// Leader: the live members' releases, this node's too.
     pub fn releases(&self) -> BTreeMap<String, String> {
@@ -230,9 +242,17 @@ impl Cluster {
             // (the claim marked it a moment ago: C5, a key at most once a second. A term taken back after a
             // restart was last marked before the restart, so it is marked a second in, not ten: invariant 17's
             // 30 s count from that mark)
-            let mut wait = if me.taken_back { 1 } else { 10 };
+            let (mut due, mut bell) = (Instant::now() + Duration::from_secs(if me.taken_back { 1 } else { 10 }), None);
             loop {
-                tokio::time::sleep(Duration::from_secs(wait)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                // (a ring is marked at once: a writer that can't reach us rang, and watches for the mark, `deaf`)
+                let rang = listen(&store, &mut bell).await;
+                if rang {
+                    me.rang.send_modify(|n| *n += 1); // (and the inbox is drained: `inbox::serve`)
+                }
+                if !rang && Instant::now() < due {
+                    continue;
+                }
                 let ok = mark_alive(&store, me.leader.n).await.is_ok();
                 if ok {
                     m.store(crate::log::now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -242,7 +262,7 @@ impl Cluster {
                         restart("a newer term has a leader");
                     }
                 }
-                wait = if ok { 10 } else { 1 }; // (C5: a key at most once a second)
+                due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 }); // (C5: a key at most once a second, each look)
             }
         });
         let bucket = crate::store::bucket_url(lake);
@@ -315,7 +335,7 @@ impl Cluster {
                     // A member that lost the leader takes over after the lease (if no peer still
                     // hears it). One that never reached it — say, outside the cluster's network —
                     // only once the leader is gone (`alive`): it never deposes a live one.
-                    Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await } => match latest(&store).await {
+                    Err(_) if self.may_lead && if self.heard.load(std::sync::atomic::Ordering::Relaxed) { !self.leader_ok() } else { !alive(&store, &self.leader).await || deaf(&store, &self.leader).await } => match latest(&store).await {
                         Ok(Some(t)) if t.n > self.leader.n => restart(&format!("term {} has a newer leader", t.n)), // follow it
                         Ok(_) if self.peer_sees_leader().await => {}     // only our link to the leader is down
                         Ok(_) => {
@@ -357,13 +377,7 @@ impl Cluster {
     }
 
     /// Does the leader of our term answer? (A read-only node follows its commit stream only then.)
-    pub async fn leader_alive(&self) -> bool {
-        let r = http().get(crate::tls::url(&format!("{}/cluster/leader", self.leader.addr))).timeout(Duration::from_secs(2)).send().await;
-        match r {
-            Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == self.leader.n),
-            Err(_) => false,
-        }
-    }
+    pub async fn leader_alive(&self) -> bool { answers(&self.leader).await }
 
     /// Does another member still hear our leader (same term)?
     async fn peer_sees_leader(&self) -> bool {
@@ -380,6 +394,15 @@ impl Cluster {
     }
 }
 
+/// Does term `t`'s leader answer from here, as its leader?
+async fn answers(t: &Term) -> bool {
+    let r = http().get(crate::tls::url(&format!("{}/cluster/leader", t.addr))).timeout(Duration::from_secs(2)).send().await;
+    match r {
+        Ok(r) => r.json::<(u64, bool)>().await.is_ok_and(|(term, _)| term == t.n),
+        Err(_) => false,
+    }
+}
+
 /// A cluster as a node's start decided it (`Cluster::join`, `Cluster::guest`): the term it follows or leads, and what it is.
 fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bool, taken_back: bool) -> Arc<Cluster> {
     let view = Mutex::new(vec![]); // a follower runs no shards until the leader lists it
@@ -387,7 +410,7 @@ fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bo
     // its first answer, not 30 s later, so the restart check in `follow` can fire)
     let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
     let (beats, shard_runs, heard) = (Default::default(), Default::default(), Default::default());
-    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back })
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, shard_runs, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0) })
 }
 
 /// A node that just started under a leader, reading the commit stream (its view reads no WAL):

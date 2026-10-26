@@ -2059,10 +2059,19 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
         match latest(&store).await? {
             Some(t) if alive(&store, &t).await => {
                 if t.addr.is_empty() {
-                    tokio::time::sleep(Duration::from_secs(1)).await; // another `pondra sql` is recording: wait
+                    // (another `pondra sql` is recording: wait. One elsewhere that was killed doesn't mark itself when rung)
+                    if !crate::terms::deaf(&store, &t).await {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                     continue;
                 }
-                let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
+                let Some(r) = &req else {
+                    // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
+                    if crate::terms::deaf(&store, &t).await {
+                        continue;
+                    }
+                    return Ok(j!({"duplicate": true}));
+                };
                 // (test hook PONDRA_NO_DIRECT: act as if the leader were out of reach; `through_bucket` never goes over HTTP)
                 let direct = !crate::env::is_set("PONDRA_NO_DIRECT") && BUCKET.try_with(|_| ()).is_err();
                 match if direct { Some(post(&t.addr, r).await) } else { None } {
@@ -2070,13 +2079,13 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
                     Some(Err(e)) if !unreachable(&e) => return Err(e),
                     _ => {} // this machine can't reach the leader: through the bucket
                 }
-                if let Some(v) = crate::inbox::send(&store, r, None).await? {
+                if let Some(v) = crate::inbox::send(&store, r, None, Some(&t)).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
             _ if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
-                if let Some(v) = crate::inbox::send(&store, r, Some(dir)).await? {
+                if let Some(v) = crate::inbox::send(&store, r, Some(dir), None).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }

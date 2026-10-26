@@ -11,8 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+pub(crate) const LEASE: Duration = Duration::from_secs(5);
+
+/// How long a claimer has to mark its term after its bell rang (`deaf`). It looks every second, and a mark is one
+/// request: the rest is a slow bucket's margin, as long as the lease a follower gives a leader it stopped hearing.
+const HEARD: Duration = LEASE;
 const KEEP: u64 = 16; // (the newest terms whose leadership records a lake keeps: `prune`)
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -23,6 +28,10 @@ pub struct Term {
     /// temp folder that couldn't take one): 32 hex characters, never a path.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub lock: String,
+    /// Its claimer answers the inbox's bell with a mark (`listen`), so a writer elsewhere that rang it and saw no mark
+    /// knows it is gone (`deaf`). An older release's claimer doesn't: its mark alone decides.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bell: bool,
 }
 
 /// The newest term, if any.
@@ -37,7 +46,7 @@ pub async fn latest(store: &Store) -> Result<Option<Term>> {
 pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     // (its id goes into the record: a process here can tell when we're gone; none reaches a lake in our memory)
     let lock = if crate::memory::held_in_memory(store) { None } else { new_lock() };
-    let term = Term { n, addr: addr.into(), lock: lock.as_ref().map(|(id, ..)| id.clone()).unwrap_or_default() };
+    let term = Term { n, addr: addr.into(), lock: lock.as_ref().map(|(id, ..)| id.clone()).unwrap_or_default(), bell: true };
     let lock = lock.map(|(_, path, f)| (path, f));
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
     match store.put_opts(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term)?.into(), opts).await {
@@ -115,22 +124,115 @@ pub async fn mark_alive(store: &Store, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// The leader of term `n` marks it alive every 10 s, until the task ends (`write::lead`, and a guest that leads: the
-/// node's stop ends it with its other tasks, before it gives its term back).
+/// The leader of term `n` marks it alive every 10 s, and whenever the bell rings (`listen`), until the task ends
+/// (`write::lead`, and a guest that leads: the node's stop ends it with its other tasks, before it gives its term back).
 pub fn mark_every(store: Store, n: u64) -> tokio::task::JoinHandle<()> {
     crate::panics::task(async move {
+        let (mut due, mut bell) = (Instant::now() + Duration::from_secs(10), None);
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            let _ = mark_alive(&store, n).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if listen(&store, &mut bell).await || Instant::now() >= due {
+                let ok = mark_alive(&store, n).await.is_ok();
+                due = Instant::now() + Duration::from_secs(if ok { 10 } else { 0 });
+            }
         }
     })
 }
 
+/// A claimer's ear: has the inbox's bell rung since the last look (`heard`)? One HEAD a second, a cheap request class
+/// on S3 and R2, and its own turns of the bucket (`budget::urgent`), so a node busy with a scan still hears it. A first
+/// look counts as a ring: one may have come while the claimer started, and the writer that rang waits for its mark.
+pub(crate) async fn listen(store: &Store, heard: &mut Option<Option<(chrono::DateTime<chrono::Utc>, Option<String>)>>) -> bool {
+    let bell = store.head(&Path::from(crate::inbox::BELL)).await.ok().map(|m| (m.last_modified, m.e_tag));
+    heard.replace(bell.clone()) != Some(bell)
+}
+
+crate::per_node!(
+    /// What this process heard of claimers on other machines (`deaf`): None, one that didn't mark its term when rung (gone,
+    /// whatever its mark says: `alive`); Some, when one last did (it isn't rung again for `RUNG_AGAIN`). Keyed by the
+    /// store, the term and its lock file's id.
+    static RUNG: Mutex<BTreeMap<(String, u64, String), Option<Instant>>> = Mutex::new(BTreeMap::new()));
+
+/// A claimer that answered its bell isn't rung again for this long: its mark, every 10 s, says it is alive meanwhile,
+/// and goes stale in 30 s if it isn't. (A follower outside the cluster's network rings this often, no more.)
+const RUNG_AGAIN: Duration = Duration::from_secs(30);
+
+fn rung_key(store: &Store, t: &Term) -> (String, u64, String) { (store.to_string(), t.n, t.lock.clone()) }
+
+/// A writer's watch on a claimer's mark, from the moment it rang the bell (`deaf`, `inbox::send`).
+pub struct Ear {
+    key: (String, u64, String),
+    mark: Path,
+    before: (chrono::DateTime<chrono::Utc>, Option<String>),
+    rang: tokio::time::Instant,
+}
+
+impl Ear {
+    /// Ring the inbox's bell (`id` its body), and watch whether term `t`'s claimer marks itself after it. None when its
+    /// answer can't tell (see `deaf`); the bell rings anyway.
+    pub async fn ring(store: &Store, t: Option<&Term>, id: &str) -> Option<Ear> {
+        let watch = match t {
+            Some(t) => Ear::before(store, t).await,
+            None => None,
+        };
+        crate::inbox::ring(store, id).await;
+        watch.map(|(key, mark, before)| Ear { key, mark, before, rang: tokio::time::Instant::now() })
+    }
+
+    async fn before(store: &Store, t: &Term) -> Option<((String, u64, String), Path, (chrono::DateTime<chrono::Utc>, Option<String>))> {
+        // (its own claim, or one made on this machine by this user: the lock file decides, `gone_here`. A lake in this
+        // process's memory has no claimer elsewhere)
+        let here = HELD.lock().unwrap().contains_key(&t.n) || lock_path(t).is_some_and(|p| p.exists()) || crate::memory::held_in_memory(store);
+        let key = rung_key(store, t);
+        let lately = RUNG.lock().unwrap().get(&key).copied().flatten().is_some_and(|at| at.elapsed() < RUNG_AGAIN);
+        if !t.bell || here || lately {
+            return None;
+        }
+        let mark = Path::from(format!("cluster/alive/{:020}", t.n));
+        let m = store.head(&mark).await.ok()?; // (no mark: `alive` says it's gone already)
+        Some((key, mark, (m.last_modified, m.e_tag)))
+    }
+
+    /// Since the ring: Some(true), the claimer is gone (no mark in `HEARD`); Some(false), it marked itself, or let its
+    /// term go; None, not yet.
+    pub async fn gone(&self, store: &Store) -> Option<bool> {
+        let now = match store.head(&self.mark).await {
+            Ok(m) => (m.last_modified, m.e_tag),
+            Err(_) => return Some(false), // (it let its term go, or stepped down: `alive` sees that itself)
+        };
+        let gone = match now != self.before {
+            true => false,
+            false if self.rang.elapsed() < HEARD => return None,
+            false => true,
+        };
+        RUNG.lock().unwrap().insert(self.key.clone(), (!gone).then(Instant::now));
+        Some(gone)
+    }
+}
+
+/// A writer elsewhere waits for term `t`'s claimer: is it gone, though its mark is fresh? Rings the bell, and a claimer
+/// that doesn't mark itself in `HEARD` is (killed, or its machine is gone: nothing marks its term then), and `alive` says
+/// so from then on, here (invariant 17). False at once where its answer can't tell: an older release's claimer
+/// (`Term::bell`), one on this machine (`gone_here` decides), or one that answered in the last `RUNG_AGAIN`.
+pub async fn deaf(store: &Store, t: &Term) -> bool {
+    let Some(ear) = Ear::ring(store, Some(t), &uuid::Uuid::new_v4().to_string()).await else { return false };
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Some(gone) = ear.gone(store).await {
+            return gone;
+        }
+    }
+}
+
+/// `deaf` said so of term `t`'s claimer, in this process.
+fn deaf_here(store: &Store, t: &Term) -> bool { RUNG.lock().unwrap().get(&rung_key(store, t)).is_some_and(Option::is_none) }
+
 /// Is the holder of term `t` alive? A claim made on this machine is alive while its process holds
-/// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s.
+/// its lock file; anywhere else, it is alive if it marked itself alive in the last 30 s, and didn't
+/// leave its bell unanswered when this process rang it (`deaf`).
 pub async fn alive(store: &Store, t: &Term) -> bool {
-    if gone_here(t) {
-        return false; // a claimer on this machine that ended can't be alive, whatever its mark says
+    if gone_here(t) || deaf_here(store, t) {
+        return false; // a claimer on this machine that ended can't be alive, whatever its mark says; nor one elsewhere that didn't answer
     }
     match store.head(&Path::from(format!("cluster/alive/{:020}", t.n))).await {
         // (a leader that stepped down isn't alive, whatever its mark says: its last mark, in flight
@@ -261,6 +363,38 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn elsewhere(n: u64, bell: bool) -> Term { Term { n, addr: String::new(), lock: String::new(), bell } }
+
+    #[tokio::test]
+    async fn a_claimer_that_marks_when_rung_is_alive() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let t = elsewhere(9_001, true);
+        mark_alive(&store, 9_001).await.unwrap();
+        let marks = mark_every(store.clone(), 9_001); // (its first look counts as a ring: a mark a second in)
+        assert!(!deaf(&store, &t).await);
+        assert!(alive(&store, &t).await);
+        let rang = tokio::time::Instant::now();
+        assert!(!deaf(&store, &t).await, "answered a moment ago: not rung again");
+        assert!(rang.elapsed() < Duration::from_millis(100));
+        marks.abort();
+    }
+
+    #[tokio::test]
+    async fn a_claimer_that_doesnt_mark_when_rung_is_gone() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let t = elsewhere(9_002, true);
+        mark_alive(&store, 9_002).await.unwrap(); // (fresh: its process was killed a moment after)
+        assert!(alive(&store, &t).await);
+        let rang = tokio::time::Instant::now();
+        assert!(deaf(&store, &t).await);
+        assert!(rang.elapsed() >= HEARD);
+        assert!(!alive(&store, &t).await, "gone, whatever its mark says");
+        // (an older release's claimer doesn't answer the bell: its mark alone decides)
+        let old = elsewhere(9_003, false);
+        mark_alive(&store, 9_003).await.unwrap();
+        assert!(!deaf(&store, &old).await && alive(&store, &old).await);
+    }
+
     /// The numbers of the records under `prefix`, sorted.
     async fn numbers(store: &Store, prefix: &str) -> Vec<u64> {
         let metas: Vec<_> = store.list(Some(&Path::from(prefix))).try_collect().await.unwrap();
@@ -278,7 +412,7 @@ mod tests {
         for store in [folder.clone(), memory.clone()] {
             // (40 terms; each leader marked alive and never let go, a crash's marks too; three terms stepped down)
             for n in 1..=40u64 {
-                let term = Term { n, addr: String::new(), lock: String::new() };
+                let term = Term { n, addr: String::new(), lock: String::new(), bell: false };
                 store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
                 store.put(&Path::from(format!("cluster/alive/{n:020}")), Vec::<u8>::new().into()).await.unwrap();
             }
@@ -304,7 +438,7 @@ mod tests {
     async fn a_claim_behind_a_newer_term_steps_aside() {
         let store: Store = Arc::new(object_store::memory::InMemory::new());
         for n in 30..=50u64 {
-            let term = Term { n, addr: String::new(), lock: String::new() };
+            let term = Term { n, addr: String::new(), lock: String::new(), bell: false };
             store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
         }
         assert!(claim(&store, 20, "").await.unwrap().is_none(), "term 50 is newer: a claim of 20 steps aside");

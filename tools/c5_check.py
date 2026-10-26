@@ -9,7 +9,9 @@ write a second to a key (429):
   second stay near the rate (it backs off within a second, retries and all: `budget.rs`);
 - **the bell**: four `pondra sql` writers that can't reach the leader leave their INSERTs in the
   bucket's inbox at once, each ringing `inbox/bell`; a ring refused (429) counts as rung, so
-  every one is answered.
+  every one is answered. They run as on another machine (a temp folder of their own), so each
+  watches for the leader's mark after it rang (`terms::deaf`): the leader marks in time
+  through the bucket's slow-downs, and keeps its term.
 
   c5_check.py [--bin target/release/pondra] [--rate 30] [--port 9581]
 """
@@ -90,17 +92,23 @@ try:
     # The bell: writers that can't reach the leader ring it at once.
     p, log = node("s3://c5check/lake2", "--advertise", "127.0.0.1:9")  # (nobody reaches it there)
     http(NP, "/sql", "CREATE TABLE u (id BIGINT)")
-    outs = {}
+    outs, s3 = {}, boto3.client("s3", endpoint_url=env["AWS_ENDPOINT"], region_name="us-east-1", aws_access_key_id="k", aws_secret_access_key="s")
+    terms = lambda: [o["Key"] for o in s3.list_objects_v2(Bucket="c5check", Prefix="lake2/cluster/term/").get("Contents", [])]
+    before = terms()
     def writer(i):
-        r = subprocess.run([A.bin, "sql", "--dir", "s3://c5check/lake2", f"INSERT INTO u VALUES ({i})"], env=env, capture_output=True, text=True, timeout=180)
+        other = tempfile.mkdtemp(prefix="pondra-c5-other-")  # (another machine: no lock file of the leader's here)
+        r = subprocess.run([A.bin, "sql", "--dir", "s3://c5check/lake2", f"INSERT INTO u VALUES ({i})"], env={**env, "TMPDIR": other, "TEMP": other, "TMP": other},
+                           capture_output=True, text=True, timeout=180)
         outs[i] = (r.returncode, (r.stdout + r.stderr)[-300:])
     ts = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
     [t.start() for t in ts]
     [t.join() for t in ts]
     rows = json.loads(http(NP, "/sql", "SELECT count(*) AS n FROM u"))
     stats = json.loads(http(SP, "/__sim/stats"))
-    info["bell"] = {"writers": outs, "429 in all": stats.get("TooManyRequests", 0)}
-    checks["four writers through the bucket's inbox at once: each answered, the bell's 429s counted as rung"] = all(c == 0 for c, _ in outs.values()) and rows == [{"n": 4}]
+    kept = terms() == before and "restarting" not in open(log).read()
+    info["bell"] = {"writers": outs, "429 in all": stats.get("TooManyRequests", 0), "terms": [before, terms()]}
+    checks["four writers through the bucket's inbox at once: each answered, the bell's 429s counted as rung, and the leader keeps its term"] = \
+        all(c == 0 for c, _ in outs.values()) and rows == [{"n": 4}] and kept
 finally:
     for p in reversed(procs):
         if p.poll() is None:
