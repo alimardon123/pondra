@@ -2,20 +2,68 @@
 //! this crate on wasm32 (the root `Cargo.toml` renames it), so the modules that sleep, time out and spawn build for
 //! the page unchanged. The node keeps tokio itself.
 //!
-//! What is tokio's own, re-exported: `sync`, `io`, and the macros `select!`, `join!`, `pin!` and `task_local!`. What is
-//! here instead is the clock (`time`, `clock`) and the tasks (`task`), over the browser's timers and event loop. A page
-//! has one thread and no runtime: a task is a future that `spawn_local` drives, and a sleep is a JavaScript timer. Where
-//! tokio's types are `Send`, these are too. Nothing for `net`, `fs`, `process`, `signal` or `runtime`: those stay the
-//! node's.
+//! What is tokio's own, re-exported: `sync`, `io`, and the macros `select!`, `join!`, `try_join!`, `pin!` and `task_local!`.
+//! What is here instead is the clock (`time`, `clock`) and the tasks (`task`), over the browser's timers and event loop,
+//! and the files (`fs`), which fail on a page. A page has one thread and no runtime: a task is a future that `spawn_local`
+//! drives, and a sleep is a JavaScript timer. Where tokio's types are `Send`, these are too. Nothing for `net`, `process`,
+//! `signal` or `runtime`: those stay the node's.
 
 pub use task::spawn;
-pub use tokio::{io, join, pin, select, sync, task_local};
+pub use tokio::{io, join, pin, select, sync, task_local, try_join};
 
 /// A wall clock. `SystemTime::now()` panics on wasm32-unknown-unknown, so the page reads `Date.now()`.
 pub mod clock {
     /// Milliseconds since the Unix epoch.
     pub fn now_ms() -> u64 {
         js_sys::Date::now() as u64
+    }
+}
+
+/// Files, as `std::fs` has them, async: a page has no files, so std's calls fail there with `Unsupported`; a folder
+/// lake and the disk cache are a node's by configuration.
+pub mod fs {
+    use std::io::{self, SeekFrom};
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+
+    /// A whole file's bytes, as `std::fs::read` reads them.
+    pub async fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
+    /// A file open for reading, over std's: each read and seek is std's, made when it is polled.
+    pub struct File {
+        file: std::fs::File,
+        seek: Option<SeekFrom>,
+    }
+
+    impl File {
+        /// Opens `path` for reading, as `std::fs::File::open` does.
+        pub async fn open(path: impl AsRef<Path>) -> io::Result<File> {
+            Ok(File { file: std::fs::File::open(path)?, seek: None })
+        }
+    }
+
+    impl AsyncRead for File {
+        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let n = io::Read::read(&mut self.file, buf.initialize_unfilled())?;
+            buf.advance(n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncSeek for File {
+        fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+            self.seek = Some(position);
+            Ok(())
+        }
+
+        fn poll_complete(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            let position = self.seek.take().unwrap_or(SeekFrom::Current(0));
+            Poll::Ready(io::Seek::seek(&mut self.file, position))
+        }
     }
 }
 

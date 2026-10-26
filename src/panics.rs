@@ -65,14 +65,26 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     let out = if !long {
         door(f).await
     } else {
-        let task = queries().spawn(door(f));
-        stop.1 = Some(task.abort_handle());
-        task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
+        apart(door(f), &mut stop.1).await
     };
     match out? {
         Ok(v) => Ok(v),
         Err(_stopped) => Err(crate::oom::OOM.to_string()), // (the node stopped it for memory: `stop_one`)
     }
+}
+
+/// Runs a request that has run a while (`work`) as `door` does, on the queries' runtime, with its abort handle in `stop`
+/// before it runs, so the node can stop it there. A page has no such runtime: its one loop runs the request in place.
+#[cfg(not(target_arch = "wasm32"))]
+async fn apart<T: Send + 'static>(f: impl Future<Output = Result<T, String>> + Send + 'static, stop: &mut Option<tokio::task::AbortHandle>) -> Result<T, String> {
+    let task = queries().spawn(f);
+    *stop = Some(task.abort_handle());
+    task.await.unwrap_or_else(|e| Err(format!("internal error: {e}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn apart<T>(f: impl Future<Output = Result<T, String>>, _: &mut Option<tokio::task::AbortHandle>) -> Result<T, String> {
+    f.await
 }
 
 // The requests running through [`work`], by id (ids grow with time, so the first is the oldest).
@@ -111,18 +123,28 @@ pub(crate) fn stop_one(now: std::time::Instant, margin: usize) -> bool {
 /// again) on the queries' runtime: appends and commits never wait behind it (invariant 231). A panic
 /// in it is that work's alone, as a request's is.
 pub fn aside<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    tracked(queries().spawn(f))
+    #[cfg(not(target_arch = "wasm32"))]
+    let task = queries().spawn(f);
+    #[cfg(target_arch = "wasm32")]
+    let task = tokio::task::spawn(f); // (a page has one loop, and no queries' runtime: the work runs on it)
+    tracked(task)
 }
 
 /// Start a loop that must keep its pace whatever the queries do (the memory watch) on a thread of its own: on the
 /// node's runtime, a query's partitions busy on every core held its timer back past the moment it had to look (the
 /// hot memory-line check passed its line now and then). Ended with the node, as [`task`]'s are.
 pub fn alone<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> tokio::task::JoinHandle<T> {
-    static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-    let watch = R.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).thread_name("pondra-watch").enable_all().build().expect("a runtime")
-    });
-    tracked(watch.spawn(f))
+    #[cfg(not(target_arch = "wasm32"))]
+    let task = {
+        static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let watch = R.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).thread_name("pondra-watch").enable_all().build().expect("a runtime")
+        });
+        watch.spawn(f)
+    };
+    #[cfg(target_arch = "wasm32")]
+    let task = tokio::task::spawn(f); // (a page has one loop, and the watch runs on it)
+    tracked(task)
 }
 
 /// How long a request runs before the ones after it go to the queries' runtime: under load a
@@ -130,6 +152,7 @@ pub fn alone<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
 const LONG: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The queries' runtime: made when first asked for, with a thread a core, as [`runtime`] makes them.
+#[cfg(not(target_arch = "wasm32"))]
 fn queries() -> &'static tokio::runtime::Runtime {
     static R: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
     R.get_or_init(|| {
@@ -146,6 +169,7 @@ fn queries() -> &'static tokio::runtime::Runtime {
 /// core, 16 at least, it levels off, and TPC-H reads files as fast (`harness.py memory`). Windows
 /// keeps tokio's 512: there a child's pipes are read on blocking threads (each Python worker
 /// holds one), and a cap could leave none for files.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn runtime() -> tokio::runtime::Builder {
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let most = crate::env::or("PONDRA_BLOCKING_THREADS", if cfg!(windows) { 512 } else { 16.max(4 * cores) });
@@ -208,12 +232,16 @@ fn tracked<T>(t: tokio::task::JoinHandle<T>) -> tokio::task::JoinHandle<T> {
 
 /// Ends every task this node started (`Node::stop`, before its catalog closes and its term is given
 /// back: a keep-alive left running would mark it alive again), but the one asking.
+/// (On a page a task has no id, and the one asking is the page's own call, not a task: every one ends.)
 pub fn abort_all() {
+    #[cfg(not(target_arch = "wasm32"))]
     let me = tokio::task::try_id();
     for t in std::mem::take(&mut STARTED.lock().unwrap_or_else(|e| e.into_inner()).tasks) {
-        if Some(t.id()) != me {
-            t.abort();
+        #[cfg(not(target_arch = "wasm32"))]
+        if Some(t.id()) == me {
+            continue;
         }
+        t.abort();
     }
 }
 

@@ -19,7 +19,6 @@ use anyhow::Context;
 use futures::future::ready;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
-use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, UploadPart, WriteMultipart};
@@ -118,10 +117,17 @@ struct Tally {
     sum: AtomicU64,
 }
 
+/// The store of a spill folder: a local folder's. A page has no folder, so there a `Disk` is never made (`Disk::make`).
+#[cfg(not(target_arch = "wasm32"))]
+type FolderStore = object_store::local::LocalFileSystem;
+#[cfg(target_arch = "wasm32")]
+type FolderStore = InMemory;
+
 /// The folder spilled objects go to: a `Folder` of this process's own, which goes when the lake does.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // (a page's `Disk::make` refuses: none is made there)
 #[derive(Debug)]
 struct Disk {
-    store: LocalFileSystem,
+    store: FolderStore,
     folder: Folder,
     cap: Option<u64>, // the most that may spill here (`store::spill_cap`); None where the disk's room can't be told
 }
@@ -166,6 +172,7 @@ fn already(at: &Path) -> object_store::Error { object_store::Error::AlreadyExist
 
 fn missing(at: &Path) -> object_store::Error { object_store::Error::NotFound { path: at.to_string(), source: "it is in no tier of the lake".into() } }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spill_failed(e: std::io::Error) -> object_store::Error {
     object_store::Error::Generic { store: "memory", source: format!("past its budget, a lake in memory spills to a folder on disk (PONDRA_CACHE_DIR says where), which can't be used: {e}").into() }
 }
@@ -343,11 +350,19 @@ impl Inner {
 
 impl Disk {
     /// A lake's spill folder, made on the first object that spills.
+    #[cfg(not(target_arch = "wasm32"))]
     fn make() -> object_store::Result<Disk> {
         let folder = Folder::make("memory").map_err(spill_failed)?;
-        let store = LocalFileSystem::new_with_prefix(&folder.path)?;
+        let store = FolderStore::new_with_prefix(&folder.path)?;
         let cap = crate::store::spill_cap(Some(&folder.path));
         Ok(Disk { store, folder, cap })
+    }
+
+    /// A page's lake in memory doesn't spill: it has no folder, so a write past its budget is refused here, where a node
+    /// would make its spill folder.
+    #[cfg(target_arch = "wasm32")]
+    fn make() -> object_store::Result<Disk> {
+        Err(object_store::Error::Generic { store: "memory", source: "a lake in memory doesn't spill on a page (it has no folder): a write past its budget is refused".into() })
     }
 }
 
