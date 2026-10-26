@@ -673,7 +673,7 @@ pub async fn take_on(app: &crate::app::App, owner: &str, resources: &[String], w
         take(&app.lake.url, owner, resources, wait, flight).await?;
         return Ok(app.lake.visible());
     }
-    let at = ask(&app.cluster.leader.addr, &Req::take(owner, resources, wait, flight)).await?;
+    let at = ask(&app.members.leader().addr, &Req::take(owner, resources, wait, flight)).await?;
     wait_visible(&app.lake, at).await?;
     Ok(at)
 }

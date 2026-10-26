@@ -1,7 +1,6 @@
 //! The node's lake and what runs on it: `App`, the handle every door and form takes, with its queries and the answers
 //! kept for them, tiering, and the tasks and views filled from the log. The doors (`server.rs` and the rest) hold one
 //! and call into it.
-use crate::cluster::Cluster;
 use crate::log::{Log, Sequencer};
 use crate::query::session;
 use crate::store::*;
@@ -17,7 +16,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct App {
     pub lake: Arc<Lake>,
-    pub cluster: Arc<Cluster>,
+    pub members: Arc<dyn crate::members::Members>,
     pub log: Option<Arc<Log>>,       // this node's batcher; None on read-only nodes
     pub seq: Option<Arc<Sequencer>>, // the leader's sequencer
     pub lock: Arc<Mutex<()>>,        // serialises everything that rewrites table metadata
@@ -214,10 +213,10 @@ impl App {
         let explained = crate::explain::asked(query);
         let top = top && !explained; // (an explained query's operators' rows are kept whole)
         let run = async {
-            let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.cluster.nodes() };
+            let nodes = if spread == Some("0") || self.here_only(query).await { vec![] } else { self.members.nodes() };
             // (boxed, and only with nodes to spread over: its future is 300 KB, which every query on one node carried)
             let spread_out = match nodes.len() > 1 {
-                true => Box::pin(crate::spmd::query(&self.lake, &nodes, &self.cluster.addr, query, spread == Some("1"))).await,
+                true => Box::pin(crate::spmd::query(&self.lake, &nodes, self.members.me(), query, spread == Some("1"))).await,
                 false => Ok(None),
             };
             match spread_out {
@@ -253,7 +252,7 @@ impl App {
             // quick and stays here, and the bytes it read only for one long enough to say what rate
             // this node reads at. The time is taken before they are looked up, which isn't the query.
             let took = here.elapsed(); // (an answer handed in pieces: its time includes the client's reading, so it says nothing)
-            if self.cluster.nodes().len() > 1 && crate::query::handed().is_none() {
+            if self.members.nodes().len() > 1 && crate::query::handed().is_none() {
                 let bytes = match took >= Duration::from_millis(20) {
                     true => crate::spmd::reads_sql(&self.lake, query).await.unwrap_or(0),
                     false => 0,
@@ -286,7 +285,7 @@ impl App {
     /// Record an INSERT's files: here on the leader, or forwarded to it.
     pub async fn record_files(&self, f: crate::write::Files) -> anyhow::Result<Value> {
         let Some(seq) = &self.seq else {
-            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/cluster/files", self.cluster.leader.addr))).json(&f).send().await?;
+            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/cluster/files", self.members.leader().addr))).json(&f).send().await?;
             anyhow::ensure!(r.status().is_success(), "leader: {}", r.text().await?);
             return Ok(r.json().await?);
         };
@@ -296,17 +295,17 @@ impl App {
 
     /// Another engine's append (`iceberg_rest::update`), recorded by the leader under the lake's lock.
     pub async fn record_iceberg(&self, c: Vec<crate::iceberg::Commit>) -> anyhow::Result<Value> {
-        let Some(seq) = &self.seq else { return crate::write::post(&self.cluster.leader.addr, &crate::write::Request::Iceberg(c)).await };
+        let Some(seq) = &self.seq else { return crate::write::post(&self.members.leader().addr, &crate::write::Request::Iceberg(c)).await };
         let _guard = self.lock.lock().await;
-        let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
-        crate::iceberg::record(&self.lake, seq, c, &nodes, &self.cluster.addr, self.retain_ms).await
+        let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
+        crate::iceberg::record(&self.lake, seq, c, &nodes, self.members.me(), self.retain_ms).await
     }
 
     /// Where this node gets commit numbers (`log::To::reserve`): its own sequencer, or the leader's.
     pub fn to(&self) -> crate::log::To {
         match &self.seq {
             Some(seq) => crate::log::To::Local(seq.clone()),
-            None => crate::log::To::Leader(self.cluster.leader.addr.clone()),
+            None => crate::log::To::Leader(self.members.leader().addr.clone()),
         }
     }
 
@@ -322,7 +321,7 @@ impl App {
         let hwm = *self.lake.hwm.borrow();
         let tables = self.lake.cat.scan::<TableMeta>("t/", "t0").await?;
         let backlog = crate::tier::backlog(&self.lake, tables.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm), None).await?;
-        let nodes = if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() };
+        let nodes = if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() };
         // Up to 4 tables at once: on object storage each round is a few storage round trips, so
         // tables side by side finish in the time of one (memory stays bounded: ≤4M rows a job).
         let busy: Vec<String> = tables.iter().map(|(k, _)| k[2..].to_string()).filter(|t| backlog.get(t).copied().unwrap_or(0) >= min_rows).collect();
@@ -341,7 +340,7 @@ impl App {
         let per_table: Vec<_> = busy.iter().map(|t| async move { (t, self.tier_one(t, hwm, nodes).await) }).collect();
         let rows: u64 = each(per_table, &mut failed).await.iter().sum();
         // Changed rows out of the files (published tables: before they are published).
-        let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, &self.cluster.addr, self.retain_ms, false).await) }).collect();
+        let purge: Vec<_> = changed.iter().map(|t| async move { (t, crate::tier::purge(&self.lake, t, nodes, self.members.me(), self.retain_ms, false).await) }).collect();
         each(purge, &mut failed).await;
         let tiered = start.elapsed();
         // A table whose publish fails is named by `publish_all`; it mustn't stop the merges and the
@@ -353,7 +352,7 @@ impl App {
         }
         let first_publish = start.elapsed();
         // Then merges and compactions (published too, once done).
-        let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, &self.cluster.addr, false).await) }).collect();
+        let maintain: Vec<_> = untidy.iter().map(|t| async move { (t, crate::tier::maintain(&self.lake, t, nodes, self.members.me(), false).await) }).collect();
         if each(maintain, &mut failed).await.contains(&true) {
             if let Err(e) = crate::delta::publish_all(&self.lake).await {
                 failed.push(format!("publish: {e:#}"));
@@ -381,19 +380,19 @@ impl App {
     /// work: a follower asks it).
     pub async fn checkpoint(&self) -> anyhow::Result<Value> {
         if self.seq.is_none() {
-            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/sql", self.cluster.leader.addr))).body("CHECKPOINT").send().await?;
+            let r = crate::cluster::http().post(crate::tls::url(&format!("{}/sql", self.members.leader().addr))).body("CHECKPOINT").send().await?;
             anyhow::ensure!(r.status().is_success(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
         let rows = self.tier_all(0).await?;
-        let (mut purged, nodes) = (vec![], if self.cluster.nodes().is_empty() { vec![self.cluster.addr.clone()] } else { self.cluster.nodes() });
+        let (mut purged, nodes) = (vec![], if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() });
         {
             let _guard = self.lock.lock().await;
             for (k, m) in self.lake.cat.scan::<TableMeta>("t/", "t0").await? {
                 // (changed rows out of the files; keyed tables that publish, compacted)
                 let done = match m.key.is_empty() {
-                    true => m.changed && crate::tier::purge(&self.lake, &k[2..], &nodes, &self.cluster.addr, self.retain_ms, true).await?,
-                    false => crate::tier::maintain(&self.lake, &k[2..], &nodes, &self.cluster.addr, true).await?,
+                    true => m.changed && crate::tier::purge(&self.lake, &k[2..], &nodes, self.members.me(), self.retain_ms, true).await?,
+                    false => crate::tier::maintain(&self.lake, &k[2..], &nodes, self.members.me(), true).await?,
                 };
                 if done {
                     purged.push(k[2..].to_string());
@@ -411,7 +410,7 @@ impl App {
     async fn tier_one(&self, table: &str, hwm: u64, nodes: &[String]) -> anyhow::Result<u64> {
         let mut rows = 0;
         loop {
-            let (n, done) = tier_table(&self.lake, table, hwm, nodes, &self.cluster.addr).await?;
+            let (n, done) = tier_table(&self.lake, table, hwm, nodes, self.members.me()).await?;
             rows += n;
             if done || n == 0 {
                 return Ok(rows);
@@ -423,7 +422,7 @@ impl App {
         if crate::backup::frozen(&self.lake) {
             return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
         }
-        crate::tasks::run_all(&self.lake, &self.cluster, self.log()?).await?;
+        crate::tasks::run_all(&self.lake, &*self.members, self.log()?).await?;
         match &self.seq {
             Some(seq) => {
                 crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)

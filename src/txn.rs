@@ -263,7 +263,7 @@ pub fn id() -> Option<String> { with_txn(|t| t.id.clone()) }
 pub fn touched(table: &str) -> bool { with_txn(|t| t.tables.get(table).is_some_and(pending)).unwrap_or(false) }
 
 /// The leader a transaction on this node keeps its locks at (None: this node leads).
-fn leader_of(app: &crate::app::App) -> Option<String> { app.seq.is_none().then(|| app.cluster.leader.addr.clone()) }
+fn leader_of(app: &crate::app::App) -> Option<String> { app.seq.is_none().then(|| app.members.leader().addr.clone()) }
 
 /// `SHOW` of a transaction's setting (ADR-067 §1): what the open transaction runs at (the session's default outside
 /// one), and the session's defaults. None: not one of these.
@@ -1538,7 +1538,7 @@ async fn commit(app: &crate::app::App, s: &str) -> Result<(&'static str, Option<
     let c = Commit { id: t.id.clone(), job: t.job.clone(), reads: t.reads.clone(), tables, rows };
     let sent = match &app.seq {
         Some(seq) => commit_here(&app.lake, seq, &app.lock, c).await,
-        None => crate::write::post(&app.cluster.leader.addr, &crate::write::Request::Txn(c)).await,
+        None => crate::write::post(&app.members.leader().addr, &crate::write::Request::Txn(c)).await,
     };
     if sent.is_err() {
         release_txn(&t);

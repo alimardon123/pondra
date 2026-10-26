@@ -102,10 +102,10 @@ pub fn router(app: App) -> Router {
         .route("/cluster/job", post(job))
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
-        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), app.cluster.serves_store)) // (a lake's store, for nodes on other machines: ADR-072 §8)
+        .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), crate::cluster::of(&app).is_some_and(|c| c.serves_store))) // (a lake's store, for nodes on other machines: ADR-072 §8)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
-        .route("/cluster/leader", get(|State(app): State<App>| async move { Json(app.cluster.leader_status()) }))
+        .route("/cluster/leader", get(|State(app): State<App>| async move { crate::cluster::of(&app).map(|c| Json(c.leader_status())).ok_or(StatusCode::NOT_FOUND) }))
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg_rest::rest())
@@ -292,10 +292,10 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if crate::drain::draining() && !crate::drain::still_taken(path) {
         return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], "this node is stopping: ask another").into_response(); // (`drain.rs`)
     }
-    if app.cluster.cut_off() && !crate::drain::still_taken(path) {
+    if app.members.cut_off() && !crate::drain::still_taken(path) {
         // (a leader that can't reach the bucket can't commit, and its reads may already be stale:
         // another node leads soon. The cluster's own calls and the health checks still go through.)
-        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::cluster::CUT_OFF_SAYS).into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::members::CUT_OFF_SAYS).into_response();
     }
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
@@ -355,7 +355,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(p) => p,
         None if owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
-        None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, &app.cluster.addr) {
+        None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, app.members.me()) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
             None => crate::auth::Principal::of(crate::auth::Role::Admin),
         },
@@ -467,7 +467,7 @@ fn basic_password(header: Option<&str>) -> Option<String> {
 /// `WWW-Authenticate: Bearer resource_metadata="…/.well-known/oauth-protected-resource"`.
 async fn challenge(app: &App, path: &str, headers: &axum::http::HeaderMap, mut r: Response) -> Response {
     if path.starts_with("/mcp") && crate::sso::all(&app.lake).await.is_ok_and(|p| !p.is_empty()) {
-        let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(&app.cluster.addr);
+        let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(app.members.me());
         if let Ok(v) = format!("Bearer resource_metadata=\"{}\"", crate::tls::url(&format!("{host}/.well-known/oauth-protected-resource"))).parse() {
             r.headers_mut().insert("www-authenticate", v);
         }
@@ -478,7 +478,7 @@ async fn challenge(app: &App, path: &str, headers: &axum::http::HeaderMap, mut r
 /// `GET /.well-known/oauth-protected-resource`: what MCP's clients read to sign in (RFC 9728): this
 /// node's MCP and the identity providers that sign its users in. 404 without one.
 async fn protected_resource(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
-    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(&app.cluster.addr).to_string();
+    let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or(app.members.me()).to_string();
     match crate::sso::resource(&app.lake, &crate::tls::url(&format!("{host}/mcp"))).await {
         Some(v) => Json(v).into_response(),
         None => (StatusCode::NOT_FOUND, "no identity provider signs users in here (CREATE IDENTITY PROVIDER)").into_response(),
@@ -529,10 +529,10 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
     if app.seq.is_some() {
         return next.run(req).await;
     }
-    if app.cluster.reader {
+    if app.members.reader() {
         return E(anyhow::anyhow!("read-only node")).into_response();
     }
-    proxy(&app.cluster.leader.addr, req).await.unwrap_or_else(|e| E(e).into_response())
+    proxy(&app.members.leader().addr, req).await.unwrap_or_else(|e| E(e).into_response())
 }
 
 async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
@@ -569,7 +569,8 @@ async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     let cut_off = || (StatusCode::SERVICE_UNAVAILABLE, [(crate::cluster::CUT_OFF_HEADER, "1")]).into_response(); // (its followers take over at once)
-    app.cluster.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
+    let Some(node) = crate::cluster::of(&app) else { return Err(StatusCode::NOT_FOUND.into_response()) };
+    node.beat(p.from, crate::format::said(&headers)).map(Json).ok_or_else(cut_off)
 }
 
 /// A follower's flush, to be sequenced (leader only).
@@ -627,7 +628,7 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let cat = &app.lake.cat;
     let streamed = crate::format::Streamed::to(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
-    let start = Frame::Start { term: app.cluster.leader.n, replicated: cat.replicas > 1 };
+    let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
     let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
@@ -650,7 +651,7 @@ struct AckParams {
 /// Leader: a follower holds a run of changes (replicated commits). Acks meant for another
 /// leader's term don't count.
 async fn ack(State(app): State<App>, Query(p): Query<AckParams>) -> StatusCode {
-    if !app.cluster.is_leader() || p.term != app.cluster.leader.n {
+    if !app.members.is_leader() || p.term != app.members.leader().n {
         return StatusCode::CONFLICT;
     }
     app.lake.cat.ack(&p.from, p.first, p.upto);
@@ -746,7 +747,7 @@ async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Quer
 }
 
 async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> Result<Json<Value>, E> {
-    ensure!(!app.cluster.reader, "read-only node");
+    ensure!(!app.members.reader(), "read-only node");
     if app.lake.table_meta_if(name).await?.is_none() {
         crate::auth::at_least(crate::auth::Role::Admin, "making a table")?; // (as CREATE TABLE is)
     }
@@ -785,7 +786,7 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(opt
         let _guard = app.lock.lock().await;
         crate::ddl::apply(&app.lake, d.clone()).await?
     };
-    crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (once it's filled from the rows already there)
+    crate::ddl::settle(&app.lake, &d, app.members.me()).await?; // (once it's filled from the rows already there)
     Ok(Json(out))
 }
 
@@ -824,13 +825,13 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     crate::protect::stamp(&mut d); // (who lifts a protection, when the statement doesn't say)
     let out = match &app.seq {
         Some(seq) => crate::write::ddl_here(&app.lake, seq, &app.lock, d.clone()).await?,
-        None if !app.cluster.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), bearer.as_deref())).await?, // (the leader makes it)
+        None if !app.members.is_leader() => Box::pin(crate::write::send_as(&app.lake.url, crate::write::Request::Ddl(d.clone()), bearer.as_deref())).await?, // (the leader makes it)
         None => {
             let _guard = app.lock.lock().await;
             crate::ddl::apply(&app.lake, d.clone()).await?
         }
     };
-    crate::ddl::settle(&app.lake, &d, &app.cluster.addr).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    crate::ddl::settle(&app.lake, &d, app.members.me()).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
     Ok(Json(out))
 }
 
@@ -1193,16 +1194,16 @@ async fn ready(State(app): State<App>) -> Response {
     match (crate::drain::draining(), *app.lake.caught.borrow()) {
         (true, _) => (StatusCode::SERVICE_UNAVAILABLE, "stopping").into_response(),
         (_, false) => (StatusCode::SERVICE_UNAVAILABLE, "catching up with the leader").into_response(),
-        _ if app.cluster.cut_off() => (StatusCode::SERVICE_UNAVAILABLE, "can't reach the bucket: another node leads").into_response(),
+        _ if app.members.cut_off() => (StatusCode::SERVICE_UNAVAILABLE, "can't reach the bucket: another node leads").into_response(),
         _ => "ready".into_response(),
     }
 }
 
 async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<Value> {
-    let c = &app.cluster;
-    let role = if c.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
-    let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": c.leader.addr, "term": c.leader.n, "nodes": c.nodes(),
-                    "hwm": *app.lake.hwm.borrow(), "shard_runs": c.shard_runs.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
+    let members = &app.members;
+    let role = if members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
+    let mut s = j!({"lake": crate::ddl::lake_name(&app.lake), "role": role, "leader": members.leader().addr, "term": members.leader().n, "nodes": members.nodes(),
+                    "hwm": *app.lake.hwm.borrow(), "shard_runs": crate::tasks::SHARD_RUNS.load(std::sync::atomic::Ordering::Relaxed), "python_workers": crate::python::workers(),
                     "live_queries": crate::live::OPEN.load(std::sync::atomic::Ordering::Relaxed)});
     s["version"] = j!(crate::format::VERSION);
     s["owner"] = j!(owner(&app.auth, &headers)); // (asked with its key: is this the node the asker started? `local()` on a port another node holds)
@@ -1213,8 +1214,8 @@ async fn stats(State(app): State<App>, headers: axum::http::HeaderMap) -> Json<V
     s["background_failures"] = j!(crate::metrics::failures().into_iter().filter(|(_, n)| *n > 0).collect::<std::collections::BTreeMap<_, _>>());
     s["signed"] = j!(crate::users::signed(&app.lake).await); // (served with tokens once: a node without them answers no one unsigned)
     s["move_failed"] = j!(crate::memory::MOVE_FAILED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()); // (a move that failed: the lake stays in memory, and why)
-    if c.is_leader() {
-        s["releases"] = j!(c.releases()); // (each live node's: a rolling upgrade's progress)
+    if let (true, Some(node)) = (members.is_leader(), crate::cluster::of(&app)) {
+        s["releases"] = j!(node.releases()); // (each live node's: a rolling upgrade's progress)
     }
     s["row_locks"] = j!(crate::locks::count(&app.lake.url)); // (ADR-067 §3: the row locks this lake's leader holds now)
     if let Some(seq) = &app.seq {

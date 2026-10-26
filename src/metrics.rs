@@ -92,9 +92,9 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     };
     let one = |v: f64| vec![(String::new(), v)];
     let get = |c: &AtomicU64| c.load(Relaxed) as f64;
-    let role = if app.cluster.reader { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
+    let role = if app.members.reader() { "reader" } else if app.seq.is_some() { "leader" } else { "follower" };
     metric("role", "gauge", "1 for this node's role", &[(format!("{{role=\"{role}\"}}"), 1.0)]);
-    metric("nodes", "gauge", "live nodes in the cluster", &one(app.cluster.nodes().len() as f64));
+    metric("nodes", "gauge", "live nodes in the cluster", &one(app.members.nodes().len() as f64));
     metric("visible_segment", "gauge", "newest log segment readable here", &one(app.lake.visible() as f64));
     metric("rows_in_total", "counter", "rows taken into the log here", &one(get(&ROWS_IN)));
     metric("queries_total", "counter", "SQL queries run here", &one(get(&QUERIES)));

@@ -3,6 +3,7 @@
 //! later. The bucket stays the source of truth; this only covers the window before a commit is
 //! in it. A leader that takes over first collects, from every member, the commits they hold
 //! beyond what the bucket has, and commits them again (`recover`) before it takes new writes.
+use crate::members::Members;
 use crate::store::{json, Delta, Frame, Lake};
 use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
@@ -179,11 +180,11 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
 /// the live ones. A follower is listed — in the bucket — before its acks count, and stops counting
 /// (with everything it helped commit in the bucket) before it leaves the list, so a new leader
 /// always knows everyone it has to ask.
-pub fn members(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
+pub fn members(lake: Arc<Lake>, members: Arc<dyn Members>) {
     crate::panics::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            let live: Vec<String> = cluster.nodes().into_iter().filter(|n| *n != cluster.addr).collect();
+            let live: Vec<String> = members.nodes().into_iter().filter(|n| *n != members.me()).collect();
             let listed: Vec<String> = lake.cat.get("m").await.ok().flatten().unwrap_or_default();
             if live == listed {
                 continue;

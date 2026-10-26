@@ -1198,7 +1198,7 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         _ => format!("{name} is a Python procedure"),
     })?;
     let lease = crate::auth::lend(who.role, who.files); // (ends when this does)
-    let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
+    let url = format!("http://{}", app.members.me().replace("0.0.0.0", "127.0.0.1"));
     let json: Vec<bool> = r.params.iter().map(|p| crate::text::is_json_type(p.ty.as_deref())).collect();
     let head = j!({"op": "call", "name": name, "body": r.body, "entry": r.with.entry, "params": names(r), "json": json, "url": url, "token": lease.0, "depth": who.depth, "job": job});
     let limit = r.with.timeout.and_then(|s| std::time::Duration::try_from_secs_f64(s).ok());

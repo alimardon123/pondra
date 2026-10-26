@@ -1088,13 +1088,13 @@ async fn find_coordinator(app: &App, me: &Broker, ver: i16, r: &mut Rd) -> Resul
 /// node's broker is asked of it once (`/cluster/kafka`, `null` for a node without `--kafka`)
 /// and forgotten when it leaves the live members.
 async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
-    let nodes = app.cluster.nodes();
+    let nodes = app.members.nodes();
     let known = {
         let mut peers = PEERS.lock().unwrap();
         peers.retain(|node, _| nodes.contains(node));
         peers.clone()
     };
-    let asked = nodes.iter().filter(|n| **n != app.cluster.addr && !known.contains_key(*n)).map(|n| async move {
+    let asked = nodes.iter().filter(|n| **n != app.members.me() && !known.contains_key(*n)).map(|n| async move {
         let url = crate::tls::url(&format!("{n}/cluster/kafka"));
         let answer = crate::cluster::http().get(url).timeout(Duration::from_millis(500)).send().await;
         (n.clone(), match answer.and_then(|r| r.error_for_status()) {
@@ -1118,7 +1118,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {
-    let b: Value = crate::cluster::http().get(crate::tls::url(&format!("{}/cluster/kafka", app.cluster.leader.addr))).send().await?.error_for_status()?.json().await?;
+    let b: Value = crate::cluster::http().get(crate::tls::url(&format!("{}/cluster/kafka", app.members.leader().addr))).send().await?.error_for_status()?.json().await?;
     Ok((b["id"].as_i64().ok_or_else(|| anyhow!("the leader doesn't speak Kafka"))? as i32, b["host"].as_str().unwrap_or_default().into(), b["port"].as_i64().unwrap_or(-1) as i32))
 }
 

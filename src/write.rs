@@ -919,7 +919,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
 /// Create a table (or change it: a spec sent again) from any node: the leader does it.
 pub async fn define(app: &crate::app::App, name: &str, spec: &str) -> Result<Value> {
     let out: Value = match app.seq {
-        None => post(&app.cluster.leader.addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
+        None => post(&app.members.leader().addr, &Request::Table(name.into(), spec.into())).await?, // (the leader's refusal, by name)
         Some(_) => {
             let _guard = app.lock.lock().await;
             create_table(&app.lake, name, spec).await?
@@ -1478,10 +1478,10 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
 /// its view holds everything the leader had committed once the write was done (5 s at most: a
 /// view that far behind catches up by itself).
 pub async fn seen_here(app: &crate::app::App) {
-    if app.seq.is_some() || app.cluster.reader {
+    if app.seq.is_some() || app.members.reader() {
         return;
     }
-    let url = crate::tls::url(&format!("{}/cluster/visible", app.cluster.leader.addr));
+    let url = crate::tls::url(&format!("{}/cluster/visible", app.members.leader().addr));
     let asked = async { http().get(url).timeout(std::time::Duration::from_secs(2)).send().await?.json::<u64>().await };
     let Ok(upto) = asked.await else { return };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1591,12 +1591,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     // (COPY … TO reads the lake and writes no lake: a reader may export, as Postgres's read-only transactions allow it)
     if let Stmt::CopyTo(query, to, options) = &stmt {
-        return crate::copy::copy_to(&app.lake, query, to, options, &app.cluster.nodes(), &app.cluster.addr).await; // (files outside the lake: from here, or every node its share)
+        return crate::copy::copy_to(&app.lake, query, to, options, &app.members.nodes(), app.members.me()).await; // (files outside the lake: from here, or every node its share)
     }
     // (above a view of a folder's write: a reader writes no file either)
-    ensure!(!app.cluster.reader, "read-only node");
+    ensure!(!app.members.reader(), "read-only node");
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
-        let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.cluster.nodes(), &app.cluster.addr).await?; // (a view of a folder: a new file in it)
+        let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me()).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
     }
     let stmt = match stmt {
@@ -1624,9 +1624,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             crate::branch::door(lake, &mut d).await?; // (a branch: who may make or drop one, and its owner; another database's sign-in: users::across)
             out = match &app.seq {
                 Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
-                None => post(&app.cluster.leader.addr, &Request::Ddl(d.clone())).await?,
+                None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
             };
-            crate::ddl::settle(lake, &d, &app.cluster.addr).await?; // (ATTACH, DETACH: here at once)
+            crate::ddl::settle(lake, &d, app.members.me()).await?; // (ATTACH, DETACH: here at once)
             if let Some(n) = out["notice"].as_str() {
                 crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, through this door)
             }
@@ -1670,7 +1670,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let (sql, sent) = crate::change::for_leader(lake, &target, &stmt.table(), &local, &sql, files).await?;
         let Some(o) = other else {
             crate::cluster::signed(lake).await; // (the nodes' key, before a user's change goes to the leader)
-            return post_as(&app.cluster.leader.addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
+            return post_as(&app.members.leader().addr, &Request::Change(sql, job, sent), crate::auth::as_user()).await;
         };
         let out = deliver(&o.url, Some(Request::Change(sql, job.clone(), sent)), &job, false).await?;
         seen_there(&o, Some(producer_key(&format!("sql:{job}")))).await;
@@ -1778,7 +1778,7 @@ async fn everywhere(app: &crate::app::App, table: &str, query: &str, job: &str, 
     if recorded(&app.lake, job).await? {
         return Ok(Some(None));
     }
-    match crate::spmd::insert(&app.lake, &app.cluster.nodes(), &app.cluster.addr, &query, table, stamp.map(|r| (r, to))).await {
+    match crate::spmd::insert(&app.lake, &app.members.nodes(), app.members.me(), &query, table, stamp.map(|r| (r, to))).await {
         Ok(Some((columns, files))) => Ok(Some(Some(Files { table: table.into(), job: job.into(), columns, files }))),
         Ok(None) => Ok(None),
         Err(e) => {

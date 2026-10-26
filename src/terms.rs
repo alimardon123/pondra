@@ -85,6 +85,25 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     }
 }
 
+/// The term a one-off writer claims: the next term with no address, once the newest term is not alive. While it is alive,
+/// `live` decides: an `Err` refuses (no claim is made), and an `Ok` waits a second and looks again. (A backup waits for
+/// another one-off writer this way; a page's lake alone refuses one, `members::Alone::lead`.)
+pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>) -> Result<Term> {
+    loop {
+        match latest(store).await? {
+            Some(t) if alive(store, &t).await => {
+                live(&t)?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            t => {
+                if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
+                    return Ok(term);
+                }
+            }
+        }
+    }
+}
+
 /// The numbered records under one leadership prefix (`cluster/term`, `cluster/alive` or `cluster/left`), each as its
 /// number and location. A name that isn't a number is left out.
 async fn numbered(store: &Store, prefix: &str) -> Result<Vec<(u64, Path)>> {

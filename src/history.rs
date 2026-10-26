@@ -320,7 +320,7 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
 fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     let text = |f: &dyn Fn(&Line) -> Option<String>| Arc::new(lines.iter().map(f).collect::<StringArray>()) as ArrayRef;
     let int = |f: &dyn Fn(&Line) -> Option<i64>| Arc::new(lines.iter().map(f).collect::<Int64Array>()) as ArrayRef;
-    let node = app.cluster.addr.clone();
+    let node = app.members.me().to_string();
     let arrays = vec![
         Arc::new(lines.iter().map(|l| Some(l.at as i64 * 1000)).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef,
         text(&|l| Some(l.id.clone())),

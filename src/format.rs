@@ -14,6 +14,7 @@
 //! leader keeps what its followers' heartbeats and commit streams said. In a rolling upgrade
 //! nothing that needs the new format is written until the last older node has gone; asked for
 //! before that, it is refused by name.
+use crate::members::Members;
 use crate::store::{Catalog, Lake};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -171,7 +172,7 @@ impl Drop for Streamed {
 /// has said what it knows, then looks every 10 s. A lake this process made has the mark at once,
 /// and every node knows this build's format until one says otherwise: no node older than it has
 /// read it. A migration, when a format needs one, goes in the commit that sets it.
-pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
+pub fn raise(lake: Arc<Lake>, members: Arc<dyn Members>) {
     use std::sync::atomic::Ordering::Relaxed;
     crate::panics::spawn(async move {
         let mut marked = false;
@@ -184,7 +185,7 @@ pub fn raise(lake: Arc<Lake>, cluster: Arc<crate::cluster::Cluster>) {
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
             let streamed = STREAMS.lock().unwrap().keys().next().copied();
-            let ready = [Some(known()), cluster.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
+            let ready = [Some(known()), members.least_known(), streamed].into_iter().flatten().min().unwrap_or_default();
             READY.store(ready + 2, Relaxed);
             if !marked && ready >= BASE {
                 let done = match of(&lake.cat).await {

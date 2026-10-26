@@ -199,7 +199,7 @@ async fn python_tables(session: &str, sql: &str) -> bool {
 async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, session: &str, who: Who, job: Option<String>, heard: &mut Vec<String>) -> Result<Outcome> {
     crate::python::ready(&format!("{name} is Python"))?;
     let lease = crate::auth::lend(who.role, who.files);
-    let url = format!("http://{}", app.cluster.addr.replace("0.0.0.0", "127.0.0.1"));
+    let url = format!("http://{}", app.members.me().replace("0.0.0.0", "127.0.0.1"));
     let head = j!({"op": "cell", "session": session, "name": name, "body": code, "url": url, "token": lease.0, "depth": who.depth, "job": job, "vars": vars.is_some()});
     let parts = vec![crate::answer::ipc(&[vars.cloned().unwrap_or_else(|| RecordBatch::new_empty(std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty())))])?];
     let mut notice = |n: String| {

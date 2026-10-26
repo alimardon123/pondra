@@ -147,6 +147,7 @@ mod rules;
 #[cfg(feature = "lake")] mod log;
 #[cfg(feature = "lake")] mod manifest;
 #[cfg(feature = "lake")] pub mod memory;
+#[cfg(feature = "lake")] pub mod members;
 #[cfg(feature = "lake")] pub mod node;
 #[cfg(feature = "lake")] mod objects;
 #[cfg(feature = "lake")] mod oom;
