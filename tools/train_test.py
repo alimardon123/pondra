@@ -99,7 +99,8 @@ class FakeGitHub(GitHub):
         self.prs = {}         # number -> {"title", "draft", "labels": [names], "files": [paths], "open"}
         self.comments = {}    # number -> [bodies]
         self.runs = []        # as the runs endpoint lists them, newest first
-        self.jobs = {}        # run id -> [{"name", "conclusion", "steps"}]
+        self.jobs = {}        # run id -> [{"id", "name", "conclusion", "steps"}]
+        self.logs = {}        # job id -> its log's text (none: an empty log)
         self.dispatches = []  # (ref, mode)
         self.reruns = []      # run ids
         self.cancels = []     # run ids
@@ -181,6 +182,9 @@ class FakeGitHub(GitHub):
                 pr["open"] = False
         return {}
 
+    def log(self, job_id):
+        return self.logs.get(job_id, "")
+
     def dispatch(self, ref, mode):
         self.dispatches.append((ref, mode))
 
@@ -242,15 +246,20 @@ class Scenario:
         git(self.work, "push", "-q", self.bare, "HEAD:refs/heads/main")
 
     def add_run(self, run_id, sha, *, event="workflow_dispatch", branch="train", status="completed",
-                conclusion="failure", attempt=1, failed=None, lost=()):
+                conclusion="failure", attempt=1, failed=None, lost=(), logs=None):
         """A build run as the runs endpoint lists it, with the jobs that failed in it: `failed` with a failed step
-        (by default "tests", when the run failed), `lost` with none, as when a runner is lost."""
+        (by default "tests", when the run failed), `lost` with none, as when a runner is lost. `logs` gives a job's
+        log by its name (job ids are the run's id and the job's place)."""
         failed = (("tests",) if conclusion == "failure" else ()) if failed is None else failed
         self.gh.runs.insert(0, {"id": run_id, "event": event, "head_branch": branch, "head_sha": sha,
                                 "status": status, "conclusion": conclusion, "run_attempt": attempt,
                                 "html_url": run_url(run_id)})
         self.gh.jobs[run_id] = ([{"name": name, "conclusion": "failure", "steps": [{"name": "a check", "conclusion": "failure"}]}
                                  for name in failed] + [{"name": name, "conclusion": "failure", "steps": []} for name in lost])
+        for i, job in enumerate(self.gh.jobs[run_id]):
+            job["id"] = run_id * 100 + i
+            if job["name"] in (logs or {}):
+                self.gh.logs[job["id"]] = logs[job["name"]]
 
     def step(self, dry=False):
         """One call of step. Returns the lines it printed."""
@@ -516,7 +525,7 @@ def front_car_red(path):
     """The front car fails a check that can't flake: both cars' runs stop, the front is halved, #3 waits in the queue."""
     with Scenario(path) as sc:
         stacked(sc)
-        sc.gh.jobs[9] = [{"name": "unit tests", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
+        sc.gh.jobs[9] = [{"id": 900, "name": "unit tests", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
         time.sleep(1.1)
         out = sc.step()
         expect(sorted(sc.gh.cancels) == [9, 10], f"cancels {sc.gh.cancels}")
@@ -529,7 +538,7 @@ def stacked_car_red(path):
     """The car behind fails a check that can't flake: its run stops, and once the front lands it is judged."""
     with Scenario(path) as sc:
         front = stacked(sc)
-        sc.gh.jobs[10] = [{"name": "forms", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
+        sc.gh.jobs[10] = [{"id": 1000, "name": "forms", "conclusion": "failure", "steps": [{"name": "a", "conclusion": "failure"}]}]
         out = sc.step()
         expect(sc.gh.cancels == [10] and "stopped the run of the car ending at #3: forms failed" in out, out)
         sc.gh.runs[1].update(status="completed", conclusion="success")   # (run 9)
@@ -574,6 +583,58 @@ def red_attempt_2_halves(path):
         expect(sc.labels(3) == ["train"] and sc.comments(3) == [], f"#3: {sc.labels(3)} {sc.comments(3)}")
         expect(sc.gh.dispatches == [("train", "train"), ("train", "train")], f"dispatches {sc.gh.dispatches}")
         expect("halved the train: 3 to 2" in out, out)
+
+
+UNIT_LOG = """2026-10-26T12:32:39.8004362Z warning: use of deprecated method
+2026-10-26T12:32:39.8004362Z     \x1b[1m\x1b[94m--> \x1b[0msrc/f1.rs:1048:26
+2026-10-26T12:32:39.8004362Z 
+2026-10-26T12:44:13.0298744Z failures:
+2026-10-26T12:44:13.0298744Z 
+2026-10-26T12:44:13.0299740Z ---- m::tests::a_define_sees_the_ai_functions stdout ----
+2026-10-26T12:44:13.0301645Z Error: Invalid function 'cosine_similarity'.
+2026-10-26T12:44:13.0306428Z failures:
+2026-10-26T12:44:13.0307102Z     m::tests::a_define_sees_the_ai_functions
+2026-10-26T12:44:13.0308392Z test result: FAILED. 934 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out
+"""
+
+
+@case
+def a_failed_test_tests_its_files_rider_alone(path):
+    """A unit test fails: the rider that changed its module's file is tested alone, then dropped; the others wait."""
+    with Scenario(path) as sc:
+        sc.open_pr(1, "pr 1", {"src/f1.rs": "1\n"})   # (a warning in the log points here: no blame)
+        sc.open_pr(2, "pr 2", {"src/m.rs": "2\n"})
+        sc.open_pr(3, "pr 3", {"f3.txt": "3\n"})
+        sc.step()
+        sc.add_run(9, sc.tip(), status="in_progress", conclusion=None, failed=("unit tests",), logs={"unit tests": UNIT_LOG})
+        out = sc.step()
+        expect(sc.gh.cancels == [9] and sc.train_heads() == [2], f"cancels {sc.gh.cancels}, train {sc.train_heads()}")
+        expect("unit tests failed where #2 changed: testing it alone" in out, out)
+        expect(sc.labels(1) == ["train"] and sc.labels(3) == ["train"] and sc.labels(2) == ["riding", "train"],
+               f"labels {sc.labels(1)} {sc.labels(2)} {sc.labels(3)}")
+        sc.add_run(10, sc.tip(), status="in_progress", conclusion=None, failed=("unit tests",), logs={"unit tests": UNIT_LOG})
+        out = sc.step()
+        expect("dropped #2: unit tests" in out and sc.labels(2) == [] and sc.train_heads() == [1, 3], out)
+
+
+@case
+def a_failure_that_names_no_riders_file_or_all_halves(path):
+    """A final failure whose log names no rider's file, or every rider's, halves the train as before."""
+    with Scenario(path) as sc:
+        for n in (1, 2, 3):
+            sc.open_pr(n, f"pr {n}", {f"f{n}.txt": f"{n}\n"})
+        sc.step()
+        sc.add_run(9, sc.tip(), attempt=2, failed=("unit tests",), logs={"unit tests": UNIT_LOG})
+        out = sc.step()
+        expect("halved the train: 3 to 2" in out and sc.train_heads() == [1, 2], out)
+    with Scenario(os.path.join(path, "all")) as sc:
+        sc.open_pr(1, "pr 1", {"src/a.rs": "1\n"})
+        sc.open_pr(2, "pr 2", {"src/b.rs": "2\n"})
+        sc.step()
+        both = "---- a::tests::x stdout ----\nfailures:\n---- b::tests::y stdout ----\nfailures:\n"
+        sc.add_run(9, sc.tip(), attempt=2, failed=("unit tests",), logs={"unit tests": both})
+        out = sc.step()
+        expect("halved the train: 2 to 1" in out and sc.train_heads() == [1], out)
 
 
 @case

@@ -87,6 +87,10 @@ class GitHub:
         out = self._gh(args, None if body is None else json.dumps(body))
         return json.loads(out) if out.strip() else {}
 
+    def log(self, job_id):
+        """A job's log, as text."""
+        return self._gh(["api", f"repos/{self.repo}/actions/jobs/{job_id}/logs"])
+
     def dispatch(self, ref, mode):
         self._gh(["workflow", "run", "build.yml", "--repo", self.repo, "--ref", ref, "-f", f"mode={mode}"])
 
@@ -101,6 +105,35 @@ class PR:
     title: str
     labels: set
     head: str   # the PR's head commit as GitHub lists it now
+
+
+def final(job):
+    """A failed job's failure can't flake: a step failed, in a job outside FLAKY."""
+    return not job["name"].startswith(FLAKY) and any(s.get("conclusion") in RED for s in job.get("steps") or [])
+
+
+def pointed(log):
+    """The files a job's log blames: where a compile error or a lint that failed points (`--> src/x.rs:3:5`, not a
+    warning's), where a failed unit test panicked (`panicked at src/x.rs:3:5`), and the files that hold that test's
+    module (`x::y::tests::name`: src/x/y.rs, src/x/y/mod.rs, src/x.rs)."""
+    files, block, test = set(), None, None
+    for line in re.sub(r"\x1b\[[0-9;]*m", "", log).splitlines():
+        line = re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ", "", line)   # (GitHub's timestamp on each line)
+        if m := re.match(r"(error|warning)\b", line):
+            block = m[1]
+        elif not line.strip():
+            block = None
+        if m := re.fullmatch(r"---- ([\w:]+) stdout ----", line):
+            test = m[1]
+            parts = test.split("::tests::")[0].split("::") if "::tests::" in test else test.split("::")[:-1]
+            for i in range(len(parts), 0, -1):
+                files |= {f"src/{'/'.join(parts[:i])}.rs", f"src/{'/'.join(parts[:i])}/mod.rs"}
+        elif line == "failures:":
+            test = None
+        where = re.search(r"(-->|panicked at) ((?:src|tools|tests|web)/[\w./-]+\.rs):\d", line)
+        if where and (block == "error" if where[1] == "-->" else test is not None):
+            files.add(where[2])
+    return files
 
 
 def git(*args):
@@ -173,12 +206,29 @@ class Train:
         return sum(1 for r in self.runs() if r["status"] != "completed" and r["id"] not in stopped and (
             r["event"] == "pull_request" or (r["event"] == "workflow_dispatch" and r["head_branch"] == "train")))
 
+    def jobs(self, run_id):
+        return self.gh.api("GET", f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100&filter=latest")["jobs"]
+
     def failed_jobs(self, run_id):
         """The run's failed jobs, so far, as {name: final}. A failure is final when a step failed in a job outside
         FLAKY: running it again changes nothing. A job that died with no failed step (its runner lost) may flake."""
-        jobs = self.gh.api("GET", f"repos/{self.repo}/actions/runs/{run_id}/jobs?per_page=100&filter=latest")["jobs"]
-        return {j["name"]: not j["name"].startswith(FLAKY) and any(s.get("conclusion") in RED for s in j.get("steps") or [])
-                for j in jobs if j["conclusion"] in RED}
+        return {j["name"]: final(j) for j in self.jobs(run_id) if j["conclusion"] in RED}
+
+    def blamed(self, prs, heads, run):
+        """The riders whose changes a final failure's log points at (`pointed`), when that is some of them and not
+        all: they are tested alone first, instead of the train's first half."""
+        named = set()
+        for j in self.jobs(run["id"]):
+            if j["conclusion"] in RED and final(j):
+                try:
+                    named |= pointed(self.gh.log(j["id"]))
+                except GitHubError as e:   # (a log GitHub no longer has, or won't give: no blame from it)
+                    say(f"no log of {j['name']}: {e}")
+        if not named:
+            return []
+        changed = {p.number: set(git("diff", "--name-only", f"origin/main...{heads[p.number]}").split()) for p in prs}
+        suspects = [p for p in prs if changed[p.number] & named]
+        return suspects if len(suspects) < len(prs) else []
 
     def bisecting(self, tip):
         """Whether the train's run before this one failed: then this train was cut from a red one (halved, or cut
@@ -351,7 +401,7 @@ class Train:
         if set(failed) & self.main_failed():
             # Not a wait on the train's own run: main's next run, which a merge starts, steps again when it ends.
             return say(f"waiting: main fails the same way: {', '.join(failed)}")
-        return self.halve(prs, run, failed)
+        return self.halve(prs, run, failed, heads)
 
     def going(self, merges, runs, ends, by_number, first, tip):
         """The front car's run goes with nothing final failed. A car behind it with a final failure is stopped (it is
@@ -385,11 +435,15 @@ class Train:
         say("dispatched the train again: its run was never listed")
         return self.dispatch("train", "train")
 
-    def halve(self, prs, run, failed):
+    def halve(self, prs, run, failed, heads):
         """A red train judged (on its second attempt, or at a final failure): a single PR is dropped with its failed
-        jobs; more are halved, the first half cut and tested alone, and the rest keep their train label and wait in
-        the queue."""
+        jobs; of more, those whose changes the failure's log names (`blamed`) are cut and tested alone, or else the
+        first half; the rest keep their train label and wait in the queue."""
         names = ", ".join(failed)
+        if len(prs) > 1 and (blamed := self.blamed(prs, heads, run)):
+            say(f"{names} failed where {' '.join(f'#{p.number}' for p in blamed)} changed: testing "
+                f"{'it' if len(blamed) == 1 else 'them'} alone")
+            return self.cut(blamed)
         if len(prs) == 1:
             p = prs[0]
             self.unlabel(p, "riding")
