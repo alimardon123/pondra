@@ -22943,14 +22943,16 @@ def patterns():
         pg_rows = [tuple(r) for r in cur.fetchall()]
     checks["ALL ROWS PER MATCH (the ticker, RUNNING and FINAL) over the Postgres port: the same column names and rows as HTTP's, 15 rows"] = \
         bool(answered["ok"]) and pg_names == all_names and pg_rows == all_rows and len(all_rows) == 15
-    # a DEFINE that reads the match calls the lake's own functions: a Python one here (the matcher is registered last)
+    # a DEFINE calls the lake's Python function on the row's values; one that reads the match is refused by name, since
+    # an async function runs only as a plan step of its own
     q("CREATE FUNCTION near(x INT, y INT) RETURNS BOOLEAN LANGUAGE python AS $$ return abs(x - y) <= 2 $$")
     q("CREATE TABLE near_t AS SELECT * FROM (VALUES (1, 10), (2, 11), (3, 12), (4, 20), (5, 21)) AS x(i, v)")
-    near = q("SELECT * FROM near_t MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(a.i) AS s, LAST(b.i) AS f ONE ROW PER MATCH "
-             "PATTERN (a b+) DEFINE b AS near(b.v, FIRST(a.v)))")
-    info["a DEFINE calling a Python function"] = near
-    checks["a DEFINE that reads the match calls a Python function of the lake (near(b.v, FIRST(a.v))): two matches"] = \
-        near == [{"s": 1, "f": 3}, {"s": 4, "f": 5}]
+    near_q = "SELECT * FROM near_t MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(a.i) AS s, LAST(b.i) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS {})"
+    near = q(near_q.format("near(b.v, PREV(b.v))"))
+    near_match = pc.post_sql(A.port, near_q.format("near(b.v, FIRST(a.v))"))
+    info["a DEFINE calling a Python function"] = [near, near_match]
+    checks["a DEFINE calls a Python function of the lake on the row's values (two matches), and one that reads the match is refused 0A000 by name"] = \
+        near == [{"s": 1, "f": 3}, {"s": 4, "f": 5}] and not near_match["ok"] and "0A000" in str(near_match) and "near is a Python or external function" in str(near_match)
     node.kill()
     lake = new_lake()
     nodes = [Node(lake, A.port + i, tier_secs=1).start() for i in range(3)]

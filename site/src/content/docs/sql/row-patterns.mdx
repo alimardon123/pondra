@@ -412,6 +412,7 @@ These don't run yet. Each has a way to write the same question.
 | `FIRST` or `LAST` inside an aggregate, `sum(LAST(down.price))` | refused, `0A000`: `last inside an aggregate isn't supported yet: aggregate the column over its variable instead` | aggregate the column over its variable, `sum(down.price)` |
 | `SUBSET u = (b, c)` | refused, `0A000` | a measure per symbol, as `LAST(b.price)` and `LAST(c.price)`, or one symbol whose `DEFINE` ORs the two conditions |
 | a materialized view of `MATCH_RECOGNIZE` with `EMIT FINAL` | refused, `0A000` | make the view without `EMIT FINAL`: each run matches again only the partitions that changed |
+| a Python or external function in a `DEFINE` that reads the match, `near(b.v, FIRST(a.v))` | refused, `0A000` | call it on the row's own values, `near(b.v, PREV(b.v))`; the lake's other functions, `cosine_similarity` among them, work in both |
 
 <Aside>
 A `MATCH_RECOGNIZE` query with `PARTITION BY` on a cluster is shuffled by its partition key: each node

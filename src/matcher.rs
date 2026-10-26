@@ -16,6 +16,7 @@ use datafusion::arrow::compute::kernels::numeric::sub;
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::execution::{FunctionRegistry, SessionState};
@@ -1256,6 +1257,20 @@ fn glue_expr(base: &SessionState, text: &str, frame: &DFSchema) -> Result<Arc<dy
     // The optimizer rewrites COALESCE and its kin to CASE before a plan runs; a glue has no plan, so it is simplified here.
     let info = SimplifyContext::builder().with_schema(Arc::new(frame.clone())).build();
     let expr = ExprSimplifier::new(info).simplify(expr)?;
+    // An async function (a Python or external one, file_read) runs only as a plan step of its own, which a glue hasn't.
+    let mut called = None;
+    expr.apply(|e| {
+        if let Expr::ScalarFunction(f) = e {
+            if f.func.as_async().is_some() {
+                called = Some(f.func.name().to_string());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    if let Some(name) = called {
+        return Err(coded("0A000", format!("{name} is a Python or external function, which a DEFINE that reads the match (FIRST, LAST, an aggregate) can't call yet: call it on the row's own values, as {name}(b.price, PREV(b.price))")));
+    }
     Ok(base.create_physical_expr(expr, frame)?)
 }
 
