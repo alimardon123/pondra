@@ -23681,7 +23681,7 @@ def matches():
         all([refused(label, stmt, [words]) for label, stmt, words in options])
     sources = [("a keyed table", emit("r_keyed", mr("keyed_src")), "is keyed: a new row replaces its key's row"),
                ("a history view", emit("r_hist", mr("hist_src")), "is a history view"),
-               ("a GROUP BY view's table", emit("r_gb", mr("gb_src")), "is keyed")]
+               ("a GROUP BY view's table", emit("r_gb", mr("gb_src")), "is a GROUP BY view, whose table keeps partial rows")]
     checks["refused 0A000, with its words: a plain table as the source, not keyed, not a GROUP BY view's table, not a history view"] = \
         all([refused(label, stmt, [words, "write it from a table of plain rows"]) for label, stmt, words in sources])
     checks["UPDATE and DELETE on the source are refused while the view follows it (\"can't change while these follow it\", naming late_v)"] = \
