@@ -23252,63 +23252,11 @@ def patterns():
     views_checks, views_info = pattern_views()  # the views kept by key (its own lake and node)
     checks.update(views_checks)
     info.update(views_info)
-    emit_checks, emit_info = patterns_emit_final()  # EMIT FINAL views (its own lake and node)
-    checks.update(emit_checks)
-    info.update(emit_info)
     ok = all(checks.values())
     print(json.dumps({"patterns": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"patterns: {len(pc.FIXED)} fixed examples, {len(pc.REFUSED)} refusals and 600 random queries agree with the reference; the doors agree: all {len(checks)} checks pass"
-
-
-def patterns_emit_final():
-    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `matches.rs`): a smoke check of the run. The ticker from
-    row-patterns.mdx, PARTITION BY symbol, as a materialized view WITH (lateness = '0 seconds') ... EMIT FINAL, over two
-    symbols' rows in five commits. EMIT FINAL orders by a date or a timestamp, so the rows carry `ts`, a minute past
-    2026-10-01 00:00 for each `day`. Created before the rows, it is checked after each commit: its rows are the plain
-    query's matches that are decided, those that end before their symbol's last day (the smoke form of "before each
-    key's resume point": `$resume` isn't SQL, so the resume points are not read). Then, after the last commit, the same,
-    and no match written twice. Returns (checks, info)."""
-    checks, info = {}, {}
-    lake = new_lake()
-    node = Node(lake, A.port, tier_secs=1).start()
-    q = lambda s: sql(A.port, s)
-    acme = [(1, 12), (2, 17), (3, 19), (4, 21), (5, 25), (6, 12), (7, 15), (8, 20), (9, 24), (10, 25), (11, 19), (12, 15),
-            (13, 25), (14, 25), (15, 14), (16, 12), (17, 14), (18, 24), (19, 23), (20, 22)]  # the docs' ticker, by day
-    rng = random.Random(8)
-    beta, price = [], 50
-    for day in range(1, 21):
-        price = max(1, price + rng.randint(-4, 4))
-        beta.append((day, price))
-    rows = sorted([("ACME", d, p) for d, p in acme] + [("BETA", d, p) for d, p in beta], key=lambda r: r[1])
-    chunks = [rows[i:i + 8] for i in range(0, len(rows), 8)]
-    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
-    plain_q = ("SELECT symbol, start_day, bottom_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
-               "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
-               "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
-               "up AS up.price > PREV(up.price)) ORDER BY symbol, start_day")
-    view_q = plain_q.rsplit(" ORDER BY ", 1)[0]
-    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds') AS {view_q} EMIT FINAL")
-    rows_of_view = lambda: q("SELECT * FROM dips ORDER BY symbol, start_day")
-
-    def decided():
-        last = {r["symbol"]: r["mx"] for r in q("SELECT symbol, max(day) AS mx FROM ticks GROUP BY symbol")}
-        return [r for r in q(plain_q) if r["end_day"] < last[r["symbol"]]]
-
-    got_each = []
-    for k, chunk in enumerate(chunks, 1):
-        q("INSERT INTO ticks VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in chunk))
-        want = decided()
-        got = until(rows_of_view, want, 30)
-        got_each.append(got == want)
-        info[f"commit {k}: decided, written"] = [len(want), len(got)]
-    final = rows_of_view()
-    info["matches written"] = len(final)
-    checks["EMIT FINAL: after each of five commits, the view's rows are the plain query's decided matches (those ending before their symbol's last day), and at the end each match is written once"] = \
-        all(got_each) and final == decided() and len(final) > 0 and len(final) == len({(r["symbol"], r["start_day"]) for r in final})
-    node.kill()
-    return checks, info
 
 
 # ---------------------------------------------------------------- views of a pattern, kept by key (ADR-073 step 7)
@@ -23461,6 +23409,344 @@ def pattern_views():
         all(round_same) and big_same and all(a != float("inf") and b != float("inf") for _, a, b in rounds)
     checks["10 rows into one symbol of a 1,000 x 1,000 table: the view kept by key takes at most half the time of refresh = 'full' (median of three symbols)"] = \
         key_med * 2 <= full_med
+    return checks, info
+
+
+# ---------------------------------------------------------------- EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8)
+
+MX_DEF = "DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)"
+MX_TICKER = ("SELECT symbol, start_day, bottom_day, end_day FROM {src} MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+             "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+             "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) " + MX_DEF + ")")
+
+
+def mx_within(src, interval):  # the ticker's thread with WITHIN: its matches, by their start and end times
+    return ("SELECT symbol, start_ts, end_ts FROM " + src + " MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+            "MEASURES strt.ts AS start_ts, LAST(up.ts) AS end_ts ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+            "PATTERN (strt down+ up+) WITHIN INTERVAL " + interval + " " + MX_DEF + ")")
+
+
+def _mx_us(stamp):  # a timestamp as the tables store it ('2026-10-01 00:01:00', UTC), in µs since the epoch: a watermark
+    import calendar
+    return calendar.timegm(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")) * 1_000_000
+
+
+def _mx_seq(lake, view):  # a view's watermark, as its producer's mark shows it in `pondra catalog` (None: no mark yet)
+    out = subprocess.run([BIN, "catalog", "--dir", lake, f"p/match:{view}"], capture_output=True, text=True, timeout=120).stdout
+    return next((int(line.split()[1]) for line in out.splitlines() if line.split()[:1] == [f"p/match:{view}"]), None)
+
+
+def _mx_settled(lake, view, want, secs=60):  # the view's watermark has reached `want`: the run for it has committed
+    deadline = time.time() + secs
+    while (seq := _mx_seq(lake, view)) is None or seq < want:
+        if time.time() > deadline:
+            return False
+        time.sleep(0.3)
+    return True
+
+
+def _mx_put(q, table, rows):  # (symbol, day, price) rows: day d is 2026-10-01 00:dd:00, in chunks of 1,000
+    for i in range(0, len(rows), 1000):
+        q(f"INSERT INTO {table} VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in rows[i:i + 1000]))
+
+
+def _mx_decided(q, src, query):  # the smoke rule: the matches of `query` over `src` that end before their symbol's last row
+    last = {r["symbol"]: r["mx"] for r in q(f"SELECT symbol, max(day) AS mx FROM {src} GROUP BY symbol")}
+    return [r for r in q(query.format(src=src) + " ORDER BY symbol, start_day") if r["end_day"] < last[r["symbol"]]]
+
+
+def _mx_flow(q, view):  # pondra.flows' late_rows for a view (None when the row has none: the JSON leaves a null out)
+    return next((r.get("late_rows") for r in q("SELECT name, late_rows FROM pondra.flows") if r["name"] == view), "no row")
+
+
+def matches():
+    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `src/matches.rs`): a view that writes each match once, when it is
+    decided. Its own lake and node, after the smoke check (`patterns_emit_final`). 1: the ticker over 1,000 symbols in 20
+    commits, lateness 0 s and idle 2 s: after each commit the view's producer reaches the commit's newest time, and the view
+    is the matches that end before their symbol's last row (the smoke rule: `dips$held` and `dips$resume` are not readable
+    by SQL, so the resume point itself is not read); once idle, the whole query less each symbol's undecided tail. 2: late
+    rows are counted once in pondra.flows, never matched, and the run after one doesn't read it. 3: a quiet key, whose last
+    row came before the watermark reached it (lateness 30 s), is written once the other symbol's rows move the watermark
+    past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
+    match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
+    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source."""
+    checks, info = {}, {}
+    start = {"at": time.time(), "start": time.time()}  # (the seconds of each part, in info: `lap`)
+
+    def lap(part):
+        info[f"secs: {part}"] = round(time.time() - start["at"], 1)
+        start["at"] = time.time()
+
+    smoke_checks, smoke_info = patterns_emit_final()  # (its own lake and node, killed at its end)
+    checks.update(smoke_checks)
+    info.update(smoke_info)
+    lap("the smoke check")
+    q = lambda s: sql(A.port, s)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+
+    # 1. The ticker as a stream: 1,000 symbols, two days each in 20 commits (lateness 0 s, idle 2 s)
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds', idle = '2 seconds') AS {MX_TICKER.format(src='ticks')} EMIT FINAL")
+    rng, price, stream = random.Random(8), [50] * 1000, []
+    for c in range(20):
+        rows = []
+        for day in (2 * c + 1, 2 * c + 2):
+            for s in range(1000):
+                price[s] = max(1, price[s] + rng.randint(-4, 4))
+                rows.append((f"s{s:04d}", day, price[s]))
+        _mx_put(q, "ticks", rows)
+        settled = _mx_settled(lake, "dips", _mx_us(f"2026-10-01 00:{2 * c + 2:02d}:00"))
+        want, got = _mx_decided(q, "ticks", MX_TICKER), q("SELECT * FROM dips ORDER BY symbol, start_day")
+        stream.append({"settled": settled, "same": got == want, "once": len(got) == len({(r["symbol"], r["start_day"]) for r in got}),
+                       "decided": len(want), "written": len(got)})
+    time.sleep(3)  # idle (2 s): the watermark moves with the clock, and no run commits anything
+    whole = q(MX_TICKER.format(src="ticks") + " ORDER BY symbol, start_day")
+    idle_want, idle_got = _mx_decided(q, "ticks", MX_TICKER), q("SELECT * FROM dips ORDER BY symbol, start_day")
+    info["stream: decided, written, per commit"] = [(s["decided"], s["written"]) for s in stream]
+    info["stream: the whole query's matches, and the undecided tails left out once idle"] = [len(whole), len(whole) - len(idle_want)]
+    checks["the ticker as a stream (1,000 symbols, 20 commits, lateness 0 s, idle 2 s): after each commit the producer reaches its newest time, and the view == the matches that end before their symbol's last row, each written once"] = \
+        all(s["settled"] and s["same"] and s["once"] for s in stream)
+    checks["the ticker as a stream: once idle, the view == the whole query less each symbol's first undecided search and what follows it"] = \
+        idle_got == idle_want and len(idle_got) > 0
+    lap("1, the ticker as a stream")
+
+    # 2. Late rows: a row at or before the watermark of the last run is counted once in pondra.flows and never matched;
+    # `late_ref` is the table less its late rows, the oracle
+    q("CREATE TABLE late_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE TABLE late_ref (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW late_v WITH (lateness = '0 seconds') AS {MX_TICKER.format(src='late_src')} EMIT FINAL")
+    run_a = [("ACME", 1, 100), ("ACME", 2, 90), ("ACME", 3, 95), ("ACME", 4, 96), ("ACME", 5, 80),
+             ("GAMMA", 1, 100), ("GAMMA", 2, 90), ("GAMMA", 4, 85), ("GAMMA", 5, 80)]
+    late_gamma = [("GAMMA", 3, 95)]  # behind the watermark (day 5): late. Read, it would make GAMMA's match (1, 2, 3)
+    run_b = [("BETA", 6, 10), ("BETA", 7, 11)]
+    late_helios = [("HELIOS", 1, 100), ("HELIOS", 2, 90), ("HELIOS", 3, 95), ("HELIOS", 4, 80)]  # a new key, all late
+    run_c = [("ZETA", 8, 10), ("ZETA", 9, 11)]
+    _mx_put(q, "late_src", run_a)
+    _mx_put(q, "late_ref", run_a)
+    s_a = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:05:00"))
+    seen_a, want_a = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    _mx_put(q, "late_src", late_gamma)
+    _mx_put(q, "late_src", run_b)
+    _mx_put(q, "late_ref", run_b)
+    s_b = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:07:00"))
+    seen_b, want_b = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    flows_b = _mx_flow(q, "late_v")
+    _mx_put(q, "late_src", late_helios)
+    _mx_put(q, "late_src", run_c)
+    _mx_put(q, "late_ref", run_c)
+    s_c = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:09:00"))
+    seen_c, want_c = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    flows_c = _mx_flow(q, "late_v")
+    info["late_v in pondra.flows: late_rows after GAMMA's row, then after HELIOS's four"] = [flows_b, flows_c]
+    checks["late rows: after each run the view == the table less its late rows, so a late row is never matched and the run after one doesn't read it; the view's rows don't change"] = \
+        all([s_a, s_b, s_c]) and seen_a == want_a == seen_b == want_b == seen_c == want_c
+    checks["late rows: pondra.flows counts each late row once for the view (late_rows 1 after GAMMA's row, 5 after HELIOS's four)"] = \
+        flows_b == 1 and flows_c == 5
+    lap("2, late rows")
+
+    # 3. A quiet key: its last row came before the watermark reached it (lateness 30 s); the other symbol's rows move the
+    # watermark past it, with no row of its own, and its match is written then
+    q("CREATE TABLE quiet_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE TABLE quiet_ref (symbol TEXT, day INT, ts TIMESTAMP, price INT)")  # the rows the watermark has read
+    q(f"CREATE MATERIALIZED VIEW quiet_v WITH (lateness = '30 seconds') AS {MX_TICKER.format(src='quiet_src')} EMIT FINAL")
+    quiet = [("QUIET", 1, 100), ("QUIET", 2, 90), ("QUIET", 3, 95), ("QUIET", 4, 96), ("QUIET", 5, 80)]  # its match ends day 4, decided by day 5
+    rise = [("RISE", d, 9 + d) for d in range(1, 11)]
+    ref1 = [r for r in quiet + rise[:5] if r[1] <= 4]  # newest day 5 less 30 s: rows up to day 4 are read
+    _mx_put(q, "quiet_src", quiet + rise[:5])
+    _mx_put(q, "quiet_ref", ref1)
+    s_q1 = _mx_settled(lake, "quiet_v", _mx_us("2026-10-01 00:04:30"))
+    before, want_q1 = q("SELECT * FROM quiet_v ORDER BY symbol, start_day"), _mx_decided(q, "quiet_ref", MX_TICKER)
+    _mx_put(q, "quiet_src", rise[5:])  # RISE only: newest day 10, watermark day 9.5, which passes QUIET's day 5
+    ref2 = [r for r in quiet + rise if r[1] <= 9]
+    _mx_put(q, "quiet_ref", [r for r in ref2 if r not in ref1])
+    s_q2 = _mx_settled(lake, "quiet_v", _mx_us("2026-10-01 00:09:30"))
+    after, want_q2 = q("SELECT * FROM quiet_v ORDER BY symbol, start_day"), _mx_decided(q, "quiet_ref", MX_TICKER)
+    info["quiet_v: rows before and after the watermark passes QUIET's day 5"] = [len(before), len(after)]
+    checks["a quiet key: its match is not written while the watermark is behind its last row, and is written once the other symbol's rows pass it, with no row of its own"] = \
+        s_q1 and s_q2 and before == want_q1 == [] and after == want_q2 and [r["symbol"] for r in after] == ["QUIET"]
+    lap("3, a quiet key")
+
+    # 4. WITHIN: a key with no new rows is written once the watermark passes its thread's interval (WA's thread starts at
+    # 1:00: ten minutes); under one MONTH a match started on 31 January stays open through 28 February
+    ten_minutes, one_month = "'10' MINUTE", "'1' MONTH"
+    q("CREATE TABLE win_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW win_v WITH (lateness = '0 seconds') AS {mx_within('win_src', ten_minutes)} EMIT FINAL")
+    _mx_put(q, "win_src", [("WA", 1, 100), ("WA", 2, 90), ("WA", 3, 95), ("WA", 4, 96)] + [("WB", d, 9 + d) for d in range(1, 5)])
+    s_w1 = _mx_settled(lake, "win_v", _mx_us("2026-10-01 00:04:00"))
+    win_1 = q("SELECT * FROM win_v ORDER BY symbol, start_ts")
+    _mx_put(q, "win_src", [("WB", d, 9 + d) for d in range(5, 13)])  # newest 12:00: WA's thread dies after 11:00
+    s_w2 = _mx_settled(lake, "win_v", _mx_us("2026-10-01 00:12:00"))
+    win_2, win_want = q("SELECT * FROM win_v ORDER BY symbol, start_ts"), q(mx_within("win_src", ten_minutes) + " ORDER BY symbol, start_ts")
+    q("CREATE TABLE month_src (symbol TEXT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW month_v WITH (lateness = '0 seconds') AS {mx_within('month_src', one_month)} EMIT FINAL")
+    q("INSERT INTO month_src VALUES ('MC', '2026-01-31 00:00:00', 100), ('MC', '2026-01-31 01:00:00', 90), "
+      "('MC', '2026-01-31 02:00:00', 95), ('MC', '2026-01-31 02:30:00', 96), ('MD', '2026-01-31 02:31:00', 10), ('MD', '2026-01-31 02:32:00', 11)")
+    s_m1 = _mx_settled(lake, "month_v", _mx_us("2026-01-31 02:32:00"))
+    month_1 = q("SELECT * FROM month_v ORDER BY symbol, start_ts")
+    q("INSERT INTO month_src VALUES ('MD', '2026-02-28 12:00:00', 20)")  # MC's thread is alive: 1 month from 31 January is 28 February
+    s_m2 = _mx_settled(lake, "month_v", _mx_us("2026-02-28 12:00:00"))
+    month_2 = q("SELECT * FROM month_v ORDER BY symbol, start_ts")
+    q("INSERT INTO month_src VALUES ('MD', '2026-03-01 00:00:00', 21)")  # past the end of 28 February: MC's thread dies
+    s_m3 = _mx_settled(lake, "month_v", _mx_us("2026-03-01 00:00:00"))
+    month_3, month_want = q("SELECT * FROM month_v ORDER BY symbol, start_ts"), q(mx_within("month_src", one_month) + " ORDER BY symbol, start_ts")
+    info["win_v (10 minutes) and month_v (1 month): rows after each commit"] = [len(win_1), len(win_2), len(month_1), len(month_2), len(month_3)]
+    checks["WITHIN 10 minutes: a key with no new rows is written once the watermark passes its thread's interval, not before, and the view == the whole query"] = \
+        s_w1 and s_w2 and win_1 == [] and win_2 == win_want and len(win_want) == 1
+    checks["WITHIN 1 MONTH: a match started on 31 January stays open through 28 February (not written at 28 February 12:00), and is written once the watermark passes its end"] = \
+        s_m1 and s_m2 and s_m3 and month_1 == [] and month_2 == [] and month_3 == month_want and len(month_3) == 1
+    lap("4, WITHIN")
+
+    # 6. PATTERN (a b): its rows a then b come in two commits, and the match is written once, never twice (a fixed-length
+    # pattern's match is decided by its last row, so the batch matcher's matches are the decided ones)
+    q("CREATE TABLE pair_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW pair_v WITH (lateness = '0 seconds') AS SELECT symbol, start_day, end_day FROM pair_src "
+      "MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES a.day AS start_day, b.day AS end_day ONE ROW PER MATCH "
+      "AFTER MATCH SKIP PAST LAST ROW PATTERN (a b) DEFINE a AS a.price < 50, b AS b.price >= 50) EMIT FINAL")
+    _mx_put(q, "pair_src", [("KAPPA", 1, 10), ("LAMBDA", 1, 80)])  # KAPPA's a: its b is not in yet
+    s_p1 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:01:00"))
+    pair_1 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    _mx_put(q, "pair_src", [("KAPPA", 2, 60), ("LAMBDA", 2, 70)])  # KAPPA's b: the match is complete
+    s_p2 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:02:00"))
+    pair_2 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    _mx_put(q, "pair_src", [("MU", 3, 20), ("MU", 4, 60)])  # another key's match, and KAPPA's is still once
+    s_p3 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:04:00"))
+    pair_3 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    pair_want = q("SELECT symbol, start_day, end_day FROM pair_src MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+                  "MEASURES a.day AS start_day, b.day AS end_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+                  "PATTERN (a b) DEFINE a AS a.price < 50, b AS b.price >= 50) ORDER BY symbol, start_day")
+    checks["PATTERN (a b), rows a then b in two commits: the match is written once, when its b comes, and never twice"] = \
+        all([s_p1, s_p2, s_p3]) and pair_1 == [] and pair_2 == [{"symbol": "KAPPA", "start_day": 1, "end_day": 2}] and pair_3 == pair_want \
+        and len(pair_3) == 2
+    lap("6, PATTERN (a b)")
+
+    # 9. Refusals: each item of "What it takes" is refused 0A000, with the words pattern.rs and matches.rs give; UPDATE and
+    # DELETE on a source a view follows are refused too
+    q("CREATE VIEW plain_in AS SELECT * FROM late_src")
+    q("CREATE TABLE hsrc (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE MATERIALIZED VIEW hist_src WITH (history = 'symbol, day', sequence_by = 'ts') AS SELECT symbol, day, ts, price FROM hsrc")
+    q("CREATE TABLE keyed_src (symbol TEXT, day INT, ts TIMESTAMP, price INT, PRIMARY KEY (symbol, day))")
+    q("CREATE MATERIALIZED VIEW gb_src AS SELECT symbol, ts, price, count(*) AS n FROM late_src GROUP BY symbol, ts, price")
+
+    def mr(src="late_src", sel="symbol, start_day", measures="strt.day AS start_day", order="ts", extra="ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW", pat="(strt down+ up+)", define=MX_DEF):
+        return f"SELECT {sel} FROM {src} MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY {order} MEASURES {measures} {extra} PATTERN {pat} {define})"
+
+    def refused(label, stmt, words, code="0A000"):  # refused over HTTP, with the code (None: any) and each of the words in its message
+        status, head, text = reply(A.port, "POST", "/sql", stmt.encode())
+        sqlstate = head.get("x-pondra-sqlstate")
+        info[f"refused: {label}"] = [status, sqlstate, text[:120]]
+        return status != 200 and (code is None or sqlstate == code) and all(w in text for w in words)
+
+    def emit(name, body, with_=""):
+        return f"CREATE MATERIALIZED VIEW {name} {with_}AS {body} EMIT FINAL"
+
+    checks["refused 0A000, with its words: the input is a lake table read directly (a view as the input: reads a table directly)"] = \
+        refused("a view as the input", emit("r_in", mr("plain_in")), ["reads a table directly"])
+    around = [("a GROUP BY", mr(sel="symbol, count(*) AS n") + " GROUP BY symbol", "has a GROUP BY around the pattern"),
+              ("a window", mr(sel="symbol, start_day, row_number() OVER (PARTITION BY symbol) AS rn"), "has a window around the pattern"),
+              ("an aggregate", mr(sel="count(*) AS n"), "has an aggregate around the pattern"),
+              ("a HAVING", mr() + " HAVING 1 = 1", "has a HAVING around the pattern"),
+              ("a LIMIT", mr() + " LIMIT 3", "has a LIMIT around the pattern"),
+              ("DISTINCT", mr(sel="DISTINCT symbol, start_day"), "has DISTINCT around the pattern"),
+              ("a subquery", f"SELECT * FROM ({mr()}) AS x", "has a subquery around the pattern"),
+              ("a join", "SELECT m.symbol, m.start_day, t.price FROM late_src MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+                         "MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) "
+                         + MX_DEF + ") m JOIN late_src t ON t.symbol = m.symbol", "has a join around the pattern"),
+              ("an ORDER BY", mr() + " ORDER BY 1", "has an ORDER BY around the pattern"),
+              ("a WITH", "WITH x AS (SELECT symbol FROM late_src) " + mr(), "has a WITH around the pattern")]
+    checks["refused 0A000, with its words: around the pattern, a projection and a WHERE only (a GROUP BY, a window, an aggregate, HAVING, LIMIT, DISTINCT, a subquery, a join, an ORDER BY, a WITH)"] = \
+        all([refused(f"around: {label}", emit(f"r_a{i}", body), [words]) for i, (label, body, words) in enumerate(around)])
+    volatile = [("random() in a DEFINE", mr(define="DEFINE down AS down.price < PREV(down.price) AND random() < 2, up AS up.price > PREV(up.price)"), "has random() in a DEFINE"),
+                ("random() in a measure", mr(sel="symbol, start_day, r", measures="strt.day AS start_day, random() AS r"), "has random() in a measure"),
+                ("now() in the WHERE", mr() + " WHERE now() > TIMESTAMP '2000-01-01 00:00:00'", "has now() in a WHERE")]
+    checks["refused 0A000, with its words: no volatile function in a DEFINE, a measure or the WHERE"] = \
+        all([refused(label, emit(f"r_v{i}", body), [words]) for i, (label, body, words) in enumerate(volatile)])
+    checks["refused 0A000, with its words: ORDER BY the time alone, ascending (DESC, a second key, NULLS FIRST)"] = \
+        all([refused(label, emit(f"r_o{i}", mr(order=order)), ["orders by its time alone, ascending"])
+             for i, (label, order) in enumerate([("ORDER BY ts DESC", "ts DESC"), ("ORDER BY ts, day", "ts, day"), ("ORDER BY ts NULLS FIRST", "ts NULLS FIRST")])])
+    checks["refused 0A000, with its words: ORDER BY a date or a timestamp (ORDER BY day, an integer column)"] = \
+        refused("ORDER BY day", emit("r_oi", mr(order="day")), ["takes a date or a timestamp"])
+    checks["refused 0A000, with its words: no $ and no ^ in the pattern"] = \
+        refused("$", emit("r_d", mr(pat="(strt down+ up+ $)")), ["can't have $ or ^ in its pattern"]) and \
+        refused("^", emit("r_c", mr(pat="(^ strt down+ up+)")), ["can't have $ or ^ in its pattern"])
+    checks["refused 0A000, with its words: no NEXT"] = \
+        refused("NEXT", emit("r_n", mr(define="DEFINE down AS down.price < PREV(down.price), up AS NEXT(up.price) > up.price")), ["can't have NEXT"])
+    checks["refused 0A000, with its words: no WITH UNMATCHED ROWS"] = \
+        refused("WITH UNMATCHED ROWS", emit("r_u", mr(extra="ALL ROWS PER MATCH WITH UNMATCHED ROWS AFTER MATCH SKIP PAST LAST ROW")), ["can't take WITH UNMATCHED ROWS"])
+    options = [("refresh = 'by key'", emit("r_k", mr(), "WITH (refresh = 'by key') "), "EMIT FINAL keeps each match once"),
+               ("refresh = 'full'", emit("r_f", mr(), "WITH (refresh = 'full') "), "EMIT FINAL keeps each match once"),
+               ("lag", emit("r_l", mr(), "WITH (lag = '5 seconds') "), "EMIT FINAL keeps each match once"),
+               ("EXPECT", emit("r_e", mr(), "(CONSTRAINT pos EXPECT (start_day > 0)) "), "put expectations on a view of the rows before it")]
+    checks["refused 0A000, with its words: no refresh, lag or expectations in its WITH"] = \
+        all([refused(label, stmt, [words]) for label, stmt, words in options])
+    sources = [("a keyed table", emit("r_keyed", mr("keyed_src")), "is keyed: a new row replaces its key's row"),
+               ("a history view", emit("r_hist", mr("hist_src")), "is a history view"),
+               ("a GROUP BY view's table", emit("r_gb", mr("gb_src")), "is keyed")]
+    checks["refused 0A000, with its words: a plain table as the source, not keyed, not a GROUP BY view's table, not a history view"] = \
+        all([refused(label, stmt, [words, "write it from a table of plain rows"]) for label, stmt, words in sources])
+    checks["UPDATE and DELETE on the source are refused while the view follows it (\"can't change while these follow it\", naming late_v)"] = \
+        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code=None)
+             for label, stmt in [("UPDATE", "UPDATE late_src SET price = 1 WHERE day = 1"), ("DELETE", "DELETE FROM late_src WHERE day = 1")]])
+    # (the subquery form, which the parser refuses before any of the above: recorded, not checked)
+    refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
+            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", [], code=None)
+    lap("9, the refusals")
+    info["secs: all of the section"] = round(time.time() - start["start"], 1)
+
+    node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"matches": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"matches: the ticker as a stream (20 commits, 1,000 symbols), late rows, a quiet key, WITHIN, PATTERN (a b) and the refusals: all {len(checks)} checks pass"
+
+
+def patterns_emit_final():
+    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `matches.rs`): a smoke check of the run. The ticker from
+    row-patterns.mdx, PARTITION BY symbol, as a materialized view WITH (lateness = '0 seconds') ... EMIT FINAL, over two
+    symbols' rows in five commits. EMIT FINAL orders by a date or a timestamp, so the rows carry `ts`, a minute past
+    2026-10-01 00:00 for each `day`. Created before the rows, it is checked after each commit: its rows are the plain
+    query's matches that are decided, those that end before their symbol's last day (the smoke form of "before each
+    key's resume point": `$resume` isn't SQL, so the resume points are not read). Then, after the last commit, the same,
+    and no match written twice. Returns (checks, info)."""
+    checks, info = {}, {}
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    acme = [(1, 12), (2, 17), (3, 19), (4, 21), (5, 25), (6, 12), (7, 15), (8, 20), (9, 24), (10, 25), (11, 19), (12, 15),
+            (13, 25), (14, 25), (15, 14), (16, 12), (17, 14), (18, 24), (19, 23), (20, 22)]  # the docs' ticker, by day
+    rng = random.Random(8)
+    beta, price = [], 50
+    for day in range(1, 21):
+        price = max(1, price + rng.randint(-4, 4))
+        beta.append((day, price))
+    rows = sorted([("ACME", d, p) for d, p in acme] + [("BETA", d, p) for d, p in beta], key=lambda r: r[1])
+    chunks = [rows[i:i + 8] for i in range(0, len(rows), 8)]
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    plain_q = ("SELECT symbol, start_day, bottom_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+               "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+               "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+               "up AS up.price > PREV(up.price)) ORDER BY symbol, start_day")
+    view_q = plain_q.rsplit(" ORDER BY ", 1)[0]
+    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds') AS {view_q} EMIT FINAL")
+    rows_of_view = lambda: q("SELECT * FROM dips ORDER BY symbol, start_day")
+
+    def decided():
+        last = {r["symbol"]: r["mx"] for r in q("SELECT symbol, max(day) AS mx FROM ticks GROUP BY symbol")}
+        return [r for r in q(plain_q) if r["end_day"] < last[r["symbol"]]]
+
+    got_each = []
+    for k, chunk in enumerate(chunks, 1):
+        q("INSERT INTO ticks VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in chunk))
+        want = decided()
+        got = until(rows_of_view, want, 30)
+        got_each.append(got == want)
+        info[f"commit {k}: decided, written"] = [len(want), len(got)]
+    final = rows_of_view()
+    info["matches written"] = len(final)
+    checks["EMIT FINAL: after each of five commits, the view's rows are the plain query's decided matches (those ending before their symbol's last day), and at the end each match is written once"] = \
+        all(got_each) and final == decided() and len(final) > 0 and len(final) == len({(r["symbol"], r["start_day"]) for r in final})
+    node.kill()
     return checks, info
 
 
@@ -25114,7 +25400,7 @@ def memorylake():
 # first, 40 in the second and since). `--shard K/N` deals the sections out by it, so CI runs the suite in parts side
 # by side that end together. A section not listed counts as 5 s. (Dealt by the first run's table, the second's five
 # parts took 271 to 469 s, the last of them the run's last job; by this one, 402 to 421 s.)
-SECS = {"memory": 240, "patterns": 170, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
+SECS = {"memory": 240, "patterns": 170, "matches": 24, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
         "stopped": 82, "guesses": 45, "doors": 40, "crash": 38, "functions": 37, "backpressure": 35, "served": 33,
         "server": 30, "kafkas": 29, "finals": 28, "kafka": 28, "pace": 25, "found": 24, "tails": 20, "load": 20,
         "objects": 18, "live": 17, "refreshed": 15, "clouds": 15, "answers_big": 14, "users": 14, "workspace": 14,
@@ -25127,7 +25413,7 @@ SECS = {"memory": 240, "patterns": 170, "serverless": 143, "scale": 120, "waits"
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -25159,7 +25445,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -25172,7 +25458,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
