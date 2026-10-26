@@ -594,7 +594,7 @@ impl Sequencer {
                 if let Err(e) = commit(&lake, &mut next, &mut block, &mut producers, &mut sequences, &holds, batch, &ms, slot).await {
                     // Committed or not, we can't tell: restart and reload the state from the catalog.
                     eprintln!("sequencer failed: {e:#}");
-                    crate::cluster::restart("the sequencer failed");
+                    crate::node::restart("the sequencer failed");
                 }
             }
         });

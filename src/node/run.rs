@@ -271,14 +271,14 @@ impl Node {
             Err(e) if leader => {
                 eprintln!("opening the lake as leader failed: {e:#}"); // e.g. a newer leader fenced us
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                cluster::restart("opening the lake as leader failed")
+                crate::node::restart("opening the lake as leader failed")
             }
             // A new lake whose first leader hasn't made the catalog yet (nodes started
             // together), or never will (it died first): look again, until it has or its
             // mark goes stale and this node takes over.
             Err(e) if ["failed to find latest transactional object", store::Lake::NO_LAKE].iter().any(|m| format!("{e:#}").contains(m)) => {
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                cluster::restart("the lake has no catalog yet: its leader is still making it")
+                crate::node::restart("the lake has no catalog yet: its leader is still making it")
             }
             lake => lake?,
         };
@@ -706,6 +706,47 @@ pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: boo
     let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
     ddl::attach(home, name, dir, me, follow, follow).await
+}
+
+/// The program's restart: the same binary runs again with the same arguments, in place (exec) on unix; elsewhere a
+/// new process starts and this one leaves. `carried` goes to the new process on top of what this one was given.
+pub(crate) fn exec_again(carried: &[(&str, String)]) -> ! {
+    let guest = crate::node::is_guest();
+    crate::memory::leave(); // (what this process made goes first: exec and `process::exit` run no destructor)
+    let mut args = std::env::args_os();
+    let mut cmd = std::process::Command::new(args.next().expect("argv[0]"));
+    // (a guest's rerun keeps its job, so a write it recorded once isn't recorded again by the rerun: `write::job`)
+    let mut carry = carried.to_vec();
+    if guest && !carried.iter().any(|(k, _)| *k == "PONDRA_JOB") {
+        carry.push(("PONDRA_JOB", crate::write::job().to_string()));
+        carry.push(("PONDRA_TRIES", (crate::write::tries() + 1).to_string()));
+    }
+    cmd.args(args).envs(crate::env::given()).envs(carry.iter().map(|(k, v)| (k, v)));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        panic!("restart failed: {}", cmd.exec()); // replaces this process; only returns on failure
+    }
+    #[cfg(not(unix))]
+    if crate::env::is_set("PONDRA_SUPERVISED") {
+        std::process::exit(75); // (`pondra service`'s supervisor starts it again: one node, as exec keeps it elsewhere)
+    }
+    #[cfg(not(unix))]
+    match cmd.spawn() {
+        // No exec() on Windows: start the replacement, then leave (it binds our address once we're gone).
+        Ok(_) => std::process::exit(0),
+        Err(e) => panic!("restart failed: {e}"),
+    }
+}
+
+/// Leads the lake at `dir` in a `pondra lead` process of its own, which answers the lake's inbox and ends
+/// (`node::lead_once` says why it is not the node itself).
+pub(crate) async fn lead_once(dir: &str) -> anyhow::Result<()> {
+    let out = tokio::process::Command::new(crate::node::exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
+        .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
+        .stdin(std::process::Stdio::null()).output().await?;
+    anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    Ok(())
 }
 
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period

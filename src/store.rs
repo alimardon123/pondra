@@ -905,7 +905,7 @@ pub fn reach_by(url: &str, r: Reach) {
 }
 
 /// What this process knows of how to reach other places, for a process it starts to lead one of them
-/// for a moment (`inbox::lead_once`): it holds the same keys, so a backup in another bucket is written
+/// for a moment (`node::lead_once`): it holds the same keys, so a backup in another bucket is written
 /// with the secret that reaches it (ADR-070).
 pub const REACH_VAR: &str = "PONDRA_REACH";
 
@@ -1260,7 +1260,7 @@ impl Lake {
             while let Some((handle, id)) = in_bucket.recv().await {
                 if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
-                    crate::cluster::restart("a catalog commit failed");
+                    crate::node::restart("a catalog commit failed");
                 }
                 let Some(lake) = lake.upgrade() else { return };
                 lake.cat.durable.send_replace(id);
@@ -1287,7 +1287,7 @@ impl Lake {
                     r = handle.durable() => {
                         if let Err(e) = r {
                             eprintln!("catalog commit failed: {e}");
-                            crate::cluster::restart("a catalog commit failed");
+                            crate::node::restart("a catalog commit failed");
                         }
                         break;
                     }
@@ -2722,7 +2722,7 @@ impl Catalog {
 pub(crate) fn fatal(e: kv::Error) -> anyhow::Error {
     if e.closed() {
         eprintln!("catalog closed: {e}");
-        crate::cluster::restart("the catalog was closed (fenced by a newer leader)");
+        crate::node::restart("the catalog was closed (fenced by a newer leader)");
     }
     e.into()
 }

@@ -602,7 +602,7 @@ pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
 /// Nothing there yet (no catalog): a new, empty lake is made there, as DuckDB's ATTACH makes a
 /// new database file.
 async fn lake_dir(dir: &str) -> Result<(String, bool)> {
-    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `inbox::lead_once`)
+    let dir = &crate::memory::place(dir); // (`:memory:`: a new lake in memory, which only opening makes: `node::lead_once`)
     if !dir.contains("://") {
         std::fs::create_dir_all(dir).with_context(|| format!("no folder {dir}"))?;
     }
@@ -610,7 +610,7 @@ async fn lake_dir(dir: &str) -> Result<(String, bool)> {
     if has_catalog(&dir).await? {
         return Ok((dir, false));
     }
-    crate::inbox::lead_once(&dir).await?; // (whoever leads a lake first makes it)
+    crate::node::lead_once(&dir).await?; // (whoever leads a lake first makes it)
     ensure!(has_catalog(&dir).await?, "couldn't make a lake at {dir}");
     Ok((dir, true))
 }

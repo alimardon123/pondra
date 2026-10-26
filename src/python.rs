@@ -81,7 +81,7 @@ async fn candidates() -> Vec<String> {
     out.extend(kept_choice().and_then(|f| std::fs::read_to_string(f).ok()).map(|p| p.trim().into()));
     let names: &[&str] = if cfg!(windows) { &["python.exe", "python3.exe"] } else { &["python3", "python"] };
     let bin = if cfg!(windows) { "" } else { "bin" };
-    if let Some(dir) = crate::library::exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
+    if let Some(dir) = crate::node::exe().ok().and_then(|e| Some(e.parent()?.to_path_buf())) {
         out.extend(names.iter().map(|n| dir.join(n)));
         out.extend(names.iter().filter_map(|n| Some(dir.parent()?.join(n)))); // (a Windows install's Scripts\ is beside its python.exe)
     }

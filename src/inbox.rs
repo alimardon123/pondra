@@ -27,7 +27,7 @@ pub async fn ring(store: &Store, id: &str) {
 /// Writer: leave a request and wait for the answer. None if no leader is alive any more (the
 /// caller then leads itself; the request is withdrawn, and a retry of it would be a duplicate).
 /// `wake`: nobody leads the lake at that place, so once the request is in, a process of its own
-/// leads it for a moment and answers it (`lead_once`). `holder`: the term whose leader is to answer,
+/// leads it for a moment and answers it (`node::lead_once`). `holder`: the term whose leader is to answer,
 /// which is gone if it doesn't mark itself when the bell rings (`terms::Ear`).
 pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option<&crate::terms::Term>) -> Result<Option<Value>> {
     let (kind, body) = r.inbox()?;
@@ -37,7 +37,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option
     let mut ear = crate::terms::Ear::ring(store, holder, &id.to_string()).await;
     let woke = wake.map(|dir| {
         let dir = dir.to_string();
-        crate::panics::spawn(async move { lead_once(&dir).await })
+        crate::panics::spawn(async move { crate::node::lead_once(&dir).await })
     });
     for tick in 1.. {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -75,31 +75,6 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option
         }
     }
     unreachable!()
-}
-
-/// Lead the lake at `dir` for a moment — making it, if nothing is there yet — and answer its
-/// inbox, in a `pondra lead` process of its own. A node never leads another lake itself: that
-/// lake's catalog writer would outlive the moment in the node, and a later leader of it would
-/// fence it out.
-pub async fn lead_once(dir: &str) -> Result<()> {
-    // (another process would lead a lake of its own memory, gone when it ends)
-    anyhow::ensure!(!crate::memory::in_memory(dir), "{dir} is in a process's memory, where a lake is made by opening it (pondra.open(), pondra :memory:) and led by that process alone: attach or make a database in a folder or a bucket");
-    lead_in_process(dir).await
-}
-
-/// Leads the lake at `dir` in a `pondra lead` process of its own.
-#[cfg(not(target_arch = "wasm32"))]
-async fn lead_in_process(dir: &str) -> Result<()> {
-    let out = tokio::process::Command::new(crate::library::exe()?).args(["lead", "--dir", dir]).envs(crate::env::given())
-        .env_remove("PONDRA_JOB").env_remove("PONDRA_TRIES").env(crate::store::REACH_VAR, crate::store::reaches()) // (the keys this node reaches other places with)
-        .stdin(std::process::Stdio::null()).output().await?;
-    anyhow::ensure!(out.status.success(), "couldn't lead the lake at {dir}: {}", String::from_utf8_lossy(&out.stderr).trim());
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn lead_in_process(_: &str) -> Result<()> {
-    Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
 }
 
 /// Leader: answer the inbox whenever the bell rings (the leader hears it as it marks its term:
