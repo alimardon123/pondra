@@ -107,6 +107,7 @@ mod rules;
 #[cfg(feature = "lake")] mod defaults;
 #[cfg(feature = "lake")] mod delta;
 #[cfg(feature = "lake")] mod ext;
+#[cfg(feature = "lake")] mod fetch;
 #[cfg(feature = "lake")] mod facts;
 #[cfg(feature = "lake")] mod feeds;
 #[cfg(feature = "lake")] mod files;

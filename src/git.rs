@@ -84,7 +84,7 @@ impl GitHub {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.with_context(|| format!("reaching GitHub at {}", self.api))?;
+        let resp = crate::fetch::send(req).await.with_context(|| format!("reaching GitHub at {}", self.api))?;
         let status = resp.status();
         let text = resp.text().await?;
         Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))

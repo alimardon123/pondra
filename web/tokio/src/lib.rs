@@ -434,6 +434,15 @@ pub mod runtime {
         pub fn try_current() -> Result<Handle, TryCurrentError> {
             Err(TryCurrentError(()))
         }
+
+        /// Spawns `future` as `task::spawn` does (no handle is ever given on a page, so this is for the core to name).
+        pub fn spawn<F>(&self, future: F) -> crate::task::JoinHandle<F::Output>
+        where
+            F: std::future::Future + 'static,
+            F::Output: 'static,
+        {
+            crate::task::spawn(future)
+        }
     }
 
     /// No runtime is running the current task.
