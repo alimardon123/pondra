@@ -694,9 +694,23 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
     Ok(best)
 }
 
+/// A count with its thousands set off by commas, as the cap messages print it (100000 is 100,000).
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The refusal of a search past its cap. A pattern with no DEFINE that reads the match says what it said before; one that
 /// does says to narrow the conditions, and to narrow WITHIN too when there is one.
 fn cap_error(stated: bool, within: bool, cap: usize) -> anyhow::Error {
+    let cap = thousands(cap);
     let msg = match (stated, within) {
         (false, _) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: narrow WITHIN or the conditions"),
         (true, true) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: narrow WITHIN or the conditions"),
@@ -2112,6 +2126,17 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn the_caps_print_with_commas() {
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(100_000), "100,000");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+        let msg = cap_error(true, false, STATE_CAP).to_string();
+        assert!(msg.contains("more than 100,000 partial matches at once"), "{msg}");
+        let msg = cap_error(false, false, MAX_THREADS).to_string();
+        assert!(msg.contains("more than 1,000,000 partial matches at once"), "{msg}");
+    }
+
     #[tokio::test]
     async fn the_cap_refuses_a_search_past_100000_partial_matches() -> Result<()> {
         // 600 rows: (a | b)+ c keeps a thread for each pair of counts, about i * i / 2 at row i, so past 100,000 by row 450
@@ -2122,7 +2147,7 @@ mod tests {
         )
         .await
         .expect_err("the cap");
-        assert!(err.to_string().contains("partial matches at once"), "{err}");
+        assert!(err.to_string().contains("more than 100,000 partial matches at once"), "{err}");
         Ok(())
     }
 
