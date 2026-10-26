@@ -734,7 +734,9 @@ def truth_of_text(rows, define):
             if reads_match(tree, sym):
                 out[i][sym] = (lambda seen, number, tree=tree, i=i, s=sym: _eval(tree, Env(rows, i, s, seen, number)) is True)
             else:
-                out[i][sym] = _eval(tree, Env(rows, i, sym, [], None)) is True
+                # a condition that reads only its own row, or its own variable's LAST (the tested row is in that), sees
+                # the tested row as the match so far, so LAST(sym.col) is the tested row and PREV of it the row before
+                out[i][sym] = _eval(tree, Env(rows, i, sym, [(i, sym, False)], None)) is True
     return out
 
 
@@ -978,7 +980,8 @@ TABLES = {
     # the sums: DOUBLE and DECIMAL (0.1 to 0.4; 0.10 to 0.40)
     "dbl": ("day INT, x DOUBLE", [{"day": d, "x": v} for d, v in zip(range(1, 5), [0.1, 0.2, 0.3, 0.4])]),
     "dec": ("day INT, amt DECIMAL(10,2)", [{"day": d, "amt": Decimal(v)} for d, v in zip(range(1, 5), ["0.10", "0.20", "0.30", "0.40"])]),
-    # 600 rows in one partition: the (a | b)+ c search holds more than 100,000 partial matches by the end (the cap check)
+    # 600 rows in one partition: the (a | b)+ c search is refused by the cap from row 257 on (measured on the build: 256 rows
+    # answer, 257 are refused), so 600 leaves a margin (about 16 s on the build)
     "cap600": ("day INT", [{"day": d} for d in range(1, 601)]),
 }
 
@@ -1037,9 +1040,9 @@ def m_excl(m, rows):
     return {**span_of(m, rows), "nb": len(pos_of(m, "b")), "fb": rows[pos_of(m, "b")[0]]["day"]}
 
 
-def m_flink(m, rows):  # dropTime: the C row's time; dropDiff: A's price less C's (A is the match's first row)
+def m_flink(m, rows):  # droptime: the C row's time; dropdiff: A's price less C's (A is the match's first row); unquoted, so lower-case
     c = pos_of(m, "c")[-1]
-    return {"symbol": rows[0]["symbol"], "dropTime": rows[c]["rowtime"], "dropDiff": rows[m.start]["price"] - rows[c]["price"]}
+    return {"symbol": rows[0]["symbol"], "droptime": rows[c]["rowtime"], "dropdiff": rows[m.start]["price"] - rows[c]["price"]}
 
 
 def m_clash(m, rows):  # FIRST(d) and LAST(d) are the column d; count(d.*) is the symbol d's rows
@@ -1346,10 +1349,10 @@ FIXED += [
          table="flink_ticker", partition="symbol", order="rowtime", pattern="A B* C", skip="PAST LAST ROW",
          define_text={"b": "b.price > a.price - 10", "c": "c.price < a.price - 10"},
          measures=m_flink, within=timedelta(hours=1),
-         query=mr("flink_ticker", "symbol", "rowtime", "C.rowtime AS dropTime, A.price - C.price AS dropDiff", "A B* C",
-                  "B AS B.price > A.price - 10, C AS C.price < A.price - 10", "PAST LAST ROW", tail=" ORDER BY dropTime",
+         query=mr("flink_ticker", "symbol", "rowtime", "C.rowtime AS droptime, A.price - C.price AS dropdiff", "A B* C",
+                  "B AS B.price > A.price - 10, C AS C.price < A.price - 10", "PAST LAST ROW", tail=" ORDER BY droptime",
                   within="INTERVAL '1' HOUR"),
-         expect=[{"symbol": "ACME", "dropTime": datetime(2011, 4, 1, 13, 0), "dropDiff": 14}]),
+         expect=[{"symbol": "ACME", "droptime": datetime(2011, 4, 1, 13, 0), "dropdiff": 14}]),
     # A column named d and a symbol named d: ORDER BY the column, DEFINE the symbol, which reads its own row (PREV is the
     # row before). Prices on d 1-8: 10 9 8 12 11 13 12 5. d1 has no PREV, so it is no fall; d2 and d3 fall, d4 rises, d5
     # falls, d6 rises, d7 and d8 fall: runs d2-3, d5 and d7-8. FIRST(d) and LAST(d) read the column, count(d.*) the symbol.
@@ -1591,11 +1594,11 @@ REFUSED = [
      "0A000", "navigation"),
     ("a subquery in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+", "a AS a.price > (SELECT 1)", "PAST LAST ROW",
                                    tail=" ORDER BY s"), "0A000", "subquery"),
-    # The cap: 600 rows, and (a | b)+ c with a and b always true holds a thread per (count of a, count of b) pair, about
-    # i * i / 2 at row i, so past 100,000 partial matches by row 450 or so. c is never true, so no match ever ends it.
+    # The cap: (a | b)+ c with a and b always true holds a thread per (count of a, count of b) pair, so the threads grow about
+    # as i * i with the row i; the engine refuses from row 257 (256 rows answer). c is never true, so no match ends the search.
     ("the 100,000 cap on partial matches, in a DEFINE that reads the match", mr("cap600", None, "day", "count(*) AS n", "(a | b)+ c",
                                                                                "a AS count(a.*) >= 0, b AS count(b.*) >= 0, c AS count(c.*) < 0",
-                                                                               "PAST LAST ROW"), "54000", "partial matches at once"),
+                                                                               "PAST LAST ROW"), "54000", "partial matches at once: make the conditions narrower"),
     # A glue function the engine lacks: the message starts with the symbol it is in (42883 is undefined_function).
     ("a glue function the engine lacks, in a DEFINE", mr("tq", None, "day", "FIRST(day) AS s", "a+",
                                                          "a AS no_such_glue_fn(a.price) > 0", "PAST LAST ROW", tail=" ORDER BY s"),
@@ -1981,6 +1984,10 @@ def self_test():
     check("the tested row is in its own variable's count and in the universal one, not in another's",
           ev("count(b.*)", ((0, "b", False),)) == 1 and ev("count(a.*)", ((0, "b", False),)) == 0
           and ev("count(*)", ((0, "b", False),)) == 1)
+    own = [{"i": 19}, {"i": 22}]
+    check("a DEFINE's own LAST is the tested row: c.i is row i, so COALESCE(c.i, 0) < i is false; PREV(LAST(c.i)) is the row before it",
+          [t["c"] for t in truth_of_text(own, {"c": "COALESCE(c.i, 0) < i"})] == [False, False]
+          and [t["c"] for t in truth_of_text(own, {"c": "PREV(LAST(c.i)) < i"})] == [False, True])
     check("MATCH_NUMBER() is the number given; CLASSIFIER() is the symbol defined",
           ev("MATCH_NUMBER()", number=3) == 3 and ev("CLASSIFIER() = 'b'") is True)
     check("sum of DOUBLEs is fsum's: sum(a.x) <= 0.6 holds for 0.1, 0.2, 0.3",
