@@ -917,9 +917,10 @@ async fn sql(State(app): State<App>, Query(p): Query<SqlParams>, role: axum::Ext
     let vars = crate::auth::lent_vars(token); // (Python code a run lent a connection to: the run's variables)
     let format = p.format.clone(); // (an answer handed to the door in pieces is sent in this format)
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
+    let root = app.lake.url.clone();
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement))))));
+    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::sent(root, files, crate::pg_catalog::speaking(postgres, Box::pin(statement))))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
     // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
     let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();

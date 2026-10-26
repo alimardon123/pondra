@@ -401,21 +401,34 @@ def external():
     checks["an Iceberg table in the lake's files: a non-owner is refused 42501 a manifest list or manifest it names outside them, before the node reads it, and reads one pondra wrote, moved there"] = \
         all(e.startswith("403:") and ("through a node it started itself" if not A.s3 else "no secret covers") in e for e in named_outside) \
         and anyone(f"SELECT * FROM read_iceberg('{area}ice_ok', allow_moved_paths => true)") == [{"a": 1}]
+    # Its location too: an INSERT a non-owner sends writes no file where its metadata points outside what the caller may
+    # write (here the lake's own folder beside its files), refused 42501 by name before any file is written.
+    esc = {"format-version": 2, "table-uuid": str(uuid.uuid4()), "location": f"{area[:-len('files/')]}escaped/t", "last-sequence-number": 0, "last-updated-ms": 0,
+           "last-column-id": 1, "current-schema-id": 0, "schemas": [{"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "a", "required": False, "type": "long"}]}],
+           "current-snapshot-id": -1, "snapshots": [], "default-spec-id": 0, "partition-specs": [{"spec-id": 0, "fields": []}]}
+    call(A.port, "PUT", "/files/wh_esc/s/t/metadata/v1.metadata.json", json.dumps(esc).encode(), headers=hdr)
+    call(A.port, "PUT", "/files/wh_esc/s/t/metadata/version-hint.text", b"1", headers=hdr)
+    anyone(f"ATTACH '{area}wh_esc' AS esc (TYPE iceberg)")
+    escaped = _raises_text(lambda: anyone("INSERT INTO esc.s.t VALUES (1)"))
+    anyone("DETACH esc")
+    checks["an Iceberg table in the lake's files whose location is outside them: a non-owner's INSERT is refused 42501 by name, before a file is written"] = \
+        escaped.startswith("403:") and ("through a node it started itself" if not A.s3 else "no secret covers") in escaped
     # A client that isn't the program reads a relative name as a page does: the lake's own file of that name, as PUT wrote
     # it, with the program's rows. A name no file is at answers 404, its SQLSTATE in the x-pondra-sqlstate header (the body
     # is the words alone), and its words name the file as SQL wrote it.
     theirs = anyone("SELECT * FROM 'reports/q1.csv'")
     anyone("CREATE EXTERNAL TABLE q1_ext (a BIGINT, b VARCHAR) STORED AS CSV LOCATION 'reports/q1.csv' OPTIONS ('format.has_header' 'true')")
     their_table = anyone("SELECT * FROM q1_ext")
+    owners_table = q("SELECT * FROM q1_ext")  # (stored whole: the program that started the node reads the same file, not one in its folder)
     anyone("DROP TABLE q1_ext")
     their_copy = _raises_text(lambda: anyone("COPY (SELECT 1 AS a) TO 'out.csv'"))
     conn = http.client.HTTPConnection("127.0.0.1", other.port, timeout=30)
     conn.request("POST", "/sql", b"SELECT * FROM 'nope.csv'")
     resp = conn.getresponse()
     nope_status, nope_code, nope_words = resp.status, resp.getheader("x-pondra-sqlstate"), resp.read().decode()
-    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too; a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
+    checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too (the same file for the node's own program); a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
         and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words \
-        and their_table == mine and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
+        and their_table == mine == owners_table and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]

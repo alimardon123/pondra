@@ -384,6 +384,8 @@ async fn written(lake: &Lake, spec: &crate::ext_names::Spec, df: datafusion::pre
     let format = meta["format-version"].as_i64().unwrap_or(1);
     ensure!(format == 2, "{url}: Iceberg format v{format} tables aren't written yet (v2 are)");
     let location = meta["location"].as_str().context("a table without its location")?.trim_end_matches('/').to_string();
+    // (named by the table's metadata, wherever it likes: written only where the caller may write, as its files are read)
+    crate::ext::check_urls(lake, &[format!("{location}/data/").as_str(), format!("{location}/metadata/").as_str()]).await?;
     let (schema_json, columns) = crate::read_iceberg::schema_of(&meta)?;
     let target: Vec<Field> = columns.iter().map(|(n, id, t)| Field::new(n, t.clone(), true).with_metadata([("PARQUET:field_id".to_string(), id.to_string())].into())).collect();
     let df = conform(df, &target, url)?;
