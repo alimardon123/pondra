@@ -649,8 +649,8 @@ impl Table {
     }
 }
 
-// (the node's parser, store and sequencer make the tables these compare with: server only)
-#[cfg(all(test, feature = "server"))]
+// (the node's parser, store and sequencer make the tables these compare with: the lake only)
+#[cfg(all(test, feature = "lake"))]
 mod tests {
     use super::*;
     use crate::store::{table_key, Lake, TableMeta};

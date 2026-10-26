@@ -52,7 +52,7 @@ pub trait Host: Send + Sync {
 
 /// What the host's own statements made of one: a query to run in its place, or the text to go on with.
 pub enum Own {
-    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (only a node's own statements answer: a lake-less build has none)
+    #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (only a node's own statements answer: a lake-less build has none)
     Answer(String),
     Go(String),
 }
@@ -62,7 +62,7 @@ pub enum Own {
 /// that is another, attached one (its query names that lake's tables).
 pub enum Relation<H: ?Sized> {
     Columns(crate::pg_trace::Cols),
-    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (only a node has views: a lake-less build makes none)
+    #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (only a node has views: a lake-less build makes none)
     View { sql: String, lake: Option<Arc<H>> },
 }
 

@@ -206,7 +206,7 @@ fn pending(last_stop: Option<Instant>, resident: usize, line: usize, now: Instan
 // request charged each poll's difference is charged its own memory, less what it gave back. jemalloc
 // is the node's allocator on Linux with glibc (`main.rs`); a program with another allocator, and every
 // other OS, has no counters: `thread_net` is then 0, and every request counts 0, so `pick` goes by age.
-#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))]
 mod counters {
     use std::cell::Cell;
 
@@ -244,13 +244,13 @@ mod counters {
 }
 
 /// Bytes this thread has allocated less the bytes it has freed (see above); 0 where there are no counters.
-#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))]
 fn thread_net() -> i64 {
     counters::net()
 }
 
 /// Bytes this thread has allocated less the bytes it has freed; 0 where there are no counters.
-#[cfg(not(all(feature = "server", target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(feature = "doors", target_os = "linux", target_env = "gnu")))]
 fn thread_net() -> i64 {
     0
 }
@@ -259,17 +259,17 @@ fn thread_net() -> i64 {
 /// purged, resident memory read after this says what the process holds, and the watch goes by that. Where jemalloc
 /// isn't the allocator (another OS, or a program embedding the library), there is nothing to purge, and a big free
 /// goes back at once.
-#[cfg(all(feature = "server", target_os = "linux", target_env = "gnu"))]
+#[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))]
 fn purge() {
     counters::purge()
 }
 
 // (no jemalloc to purge here: see the version above)
-#[cfg(not(all(feature = "server", target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(feature = "doors", target_os = "linux", target_env = "gnu")))]
 fn purge() {}
 
 // The tests run on jemalloc too, as the node does, so the meter has counters to read there.
-#[cfg(all(test, feature = "server", target_os = "linux", target_env = "gnu"))]
+#[cfg(all(test, feature = "doors", target_os = "linux", target_env = "gnu"))]
 #[global_allocator]
 static TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

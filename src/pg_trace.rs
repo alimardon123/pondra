@@ -66,7 +66,7 @@ pub enum Ty {
 
 impl Ty {
     /// The type a `sql_types` entry names, if the port names it (a `varchar(n)` isn't one).
-    #[cfg_attr(not(feature = "server"), allow(dead_code))] // (a stored type's name: only a node keeps them)
+    #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (a stored type's name: only a node keeps them)
     pub fn of(sql_type: &str) -> Option<Ty> {
         match sql_type {
             "uuid" => Some(Ty::Uuid),

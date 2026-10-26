@@ -511,7 +511,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "server")] // (`query::exhausted` is a node's)
+    #[cfg(feature = "lake")] // (`query::exhausted` is a node's)
     #[tokio::test]
     async fn a_streaming_window_refused_past_the_pool_is_not_retried_frugally() -> AnyResult<()> {
         let ctx = small_session()?;

@@ -2,7 +2,7 @@
 //! DEFAULT or a column a row leaves out takes (`rows_for`), and the 42601 a row of the wrong width gets (`width_refused`).
 //! A node (`write.rs`, `change.rs`, `temp.rs`) and a page (`page.rs`) write their rows by these, so they answer alike.
 //! Nothing here reads files, storage or the catalog.
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 use crate::store::TableMeta;
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast;
@@ -12,14 +12,14 @@ pub fn is_word(text: &str) -> bool { text.trim().eq_ignore_ascii_case("default")
 
 /// A column's default as SQL, for an INSERT that leaves the column out (its rows are cast to
 /// the table's types after).
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 pub(crate) fn default_sql(meta: &TableMeta, column: &str) -> Option<String> {
     Some(format!("({})", meta.defaults.get(meta.stored(column)?)?))
 }
 
 /// The SQL for a value written for `column`: the word DEFAULT is the column's default (NULL with none), as Postgres
 /// reads it in an UPDATE's SET, a MERGE's INSERT and an upsert; anything else is the value as written.
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 pub(crate) fn value(meta: &TableMeta, column: &str, text: &str) -> String {
     match is_word(text) {
         true => default_sql(meta, column).unwrap_or_else(|| "NULL".into()),
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "server")]
+    #[cfg(feature = "lake")]
     fn the_word_default_is_the_column_default() {
         // (one test of the word: a SET, a VALUES item, an upsert and a MERGE all take it from `value`)
         let meta = TableMeta { columns: vec![("n".into(), "Int32".into()), ("t".into(), "Utf8".into())], defaults: [("n".to_string(), "3".to_string())].into(), ..Default::default() };
