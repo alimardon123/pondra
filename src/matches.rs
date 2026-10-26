@@ -43,17 +43,13 @@ fn held_of(name: &str) -> String { format!("{name}$held") }
 fn resume_of(name: &str) -> String { format!("{name}$resume") }
 
 /// The producers a matches view's rows and progress are written under (what goes when it is dropped or detached): its
-/// matches, its held rows and its resume rows (with their `:deleted`, which a keyed table doesn't send), and its late rows.
+/// matches, its held rows, its resume rows and its late rows. (The state tables are keyed: their deletes are rows of theirs.)
 pub fn producers(name: &str) -> Vec<String> {
-    let (held, resume) = (format!("match:{name}$held"), format!("match:{name}$resume"));
-    vec![format!("match:{name}"), format!("{held}:deleted"), held, format!("{resume}:deleted"), resume, format!("match:{name}$late")]
+    ["", "$held", "$resume", "$late"].iter().map(|p| format!("match:{name}{p}")).collect()
 }
 
-/// The state tables a matches view keeps besides its own: its held rows and its resume rows, with their `$deleted`s.
-pub fn tables(name: &str) -> Vec<String> {
-    let (held, resume) = (held_of(name), resume_of(name));
-    vec![crate::sys::deleted(&held), held, crate::sys::deleted(&resume), resume]
-}
+/// The state tables a matches view keeps besides its own: its held rows and its resume rows.
+pub fn tables(name: &str) -> Vec<String> { vec![held_of(name), resume_of(name)] }
 
 /// `CREATE MATERIALIZED VIEW v AS SELECT … MATCH_RECOGNIZE (…) EMIT FINAL`, as `once::create` hands it over: the query
 /// without EMIT FINAL. Makes the view, `{v}$held` and `{v}$resume` in one commit.
@@ -327,7 +323,9 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let gone_held = held_rows_of(&filter_record_batch(&input, &BooleanArray::from(gone_mask))?, &cols)?;
     let resume_out = resume_batch(&markers, &part, &resume_meta)?;
     let (wv, w0v) = (w as u64, w0);
-    let mut pending = vec![Append { table: view.to_string(), src: Src { producer: producer.clone(), seq: wv, prev: Some(w0v) }, batch: view_rows, ack: tokio::sync::oneshot::channel().0 }];
+    let view_meta = Arc::new(view_meta);
+    let (view_parts, _) = crate::change::appends(lake, seq, view, &view_meta, vec![], nonempty(view_rows), &producer, false, false).await?; // (new rows: their ids)
+    let mut pending = flush_parts(view_parts, view, &view_meta, &producer, wv, w0v)?;
     let (held_parts, _) = crate::change::appends(lake, seq, &held_name, &held_meta, nonempty(gone_held), nonempty(new_held), &format!("{producer}$held"), false, false).await?;
     pending.extend(flush_parts(held_parts, &held_name, &held_meta, &format!("{producer}$held"), wv, w0v)?);
     let (resume_parts, _) = crate::change::appends(lake, seq, &resume_name, &resume_meta, vec![], nonempty(resume_out), &format!("{producer}$resume"), false, false).await?;
@@ -631,8 +629,8 @@ mod tests {
         assert_eq!(resume.key, ["symbol"]);
         assert_eq!(resume.columns.iter().map(|(c, _)| c.as_str()).collect::<Vec<_>>(), ["symbol", "k", "m", "due", "_deleted"]);
         assert!(lake.cat.get::<TableMeta>(&table_key(EXPECTED)).await?.is_some());
-        assert_eq!(producers("dips").len(), 6);
-        assert_eq!(tables("dips"), ["dips$held$deleted", "dips$held", "dips$resume$deleted", "dips$resume"].map(String::from));
+        assert_eq!(producers("dips"), ["match:dips", "match:dips$held", "match:dips$resume", "match:dips$late"].map(String::from));
+        assert_eq!(tables("dips"), ["dips$held", "dips$resume"].map(String::from));
 
         // No PARTITION BY: one key, held by a column that is always true.
         create(&lake, "all", &TICKER.replace("PARTITION BY symbol ", ""), options()).await?;
