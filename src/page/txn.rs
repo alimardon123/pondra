@@ -192,12 +192,18 @@ impl Page {
     }
 
     /// A write to `name` in an open transaction, which takes the table as it was before (`before`, `had`) the first time:
-    /// true when one is open, so the table is kept at its COMMIT and not now.
-    pub(super) fn in_txn(&self, name: &str, before: &Before, had: &Option<Ruled>) -> bool {
+    /// true when one is open, so the table is kept at its COMMIT and not now. A kept page writes one table in a transaction:
+    /// each table is its own file, and a COMMIT that kept one and then failed on the next (a full store, a closed tab) would
+    /// leave half the transaction, so a second table is refused (0A000) before it is written, until the page's catalog
+    /// commits them at once (designs/page-same-core.md P2).
+    pub(super) fn in_txn(&self, name: &str, before: &Before, had: &Option<Ruled>) -> anyhow::Result<bool> {
         let mut txn = self.txn();
-        let Some(t) = txn.as_mut() else { return false };
+        let Some(t) = txn.as_mut() else { return Ok(false) };
+        if let Some(first) = t.found.keys().find(|n| *n != name).filter(|_| self.keeps) {
+            return Err(crate::codes::coded("0A000", format!("{name}: a page that keeps its tables writes one table in a transaction, and this one has written {first} (their files can't be kept at once yet): COMMIT, then write {name}")));
+        }
         t.found.entry(name.to_string()).or_insert_with(|| (before.clone(), had.clone()));
-        true
+        Ok(true)
     }
 
     /// DDL in an open transaction, as a node's (`txn::ddl_at_once`, ADR-067 §8): it runs at once and is kept as it would be

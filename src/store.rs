@@ -2730,7 +2730,7 @@ pub(crate) fn fatal(e: kv::Error) -> anyhow::Error {
 /// that point with that probability, to prove crashes never lose or duplicate rows.
 pub fn maybe_crash(point: &str) {
     if crash_rolled(point) {
-        if crate::library::on() {
+        if crate::node::hosted() {
             panic!("PONDRA_CRASH at {point}"); // (a library's node fails, its host stays: a vital loop's panic)
         }
         eprintln!("PONDRA_CRASH: aborting at {point}");

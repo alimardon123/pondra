@@ -69,7 +69,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           the modules: the ones every build has (`finish`, `fsum`, `avg`, `casts`, `intervals`, `xlsx`, …: no lake, so a
           browser build shares them) and the rest under feature `server` (on by default: the node);
           `cli.rs` is the command line (its subcommands and what each starts) and `main.rs` sets the
-          allocator and calls it (ADR-061); `node.rs` is a node started and stopped as an object,
+          allocator and calls it (ADR-061); `node.rs` is a node's lake half (`stop`, `say`, the host's state) and
+          `node/run.rs` a node started and stopped as an object,
           `reset.rs` (`per_node!`: a node's statics set back when it stops) and `env.rs` every
           setting, from one table (ADR-061 step 2); `library.rs` a node in a host's process (its
           supervisor, restarts in place, requests to its router; ADR-061); round 25 added
@@ -2277,7 +2278,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    "a follower whose holder stops waits, and answers again once it is back", "a lake in memory started again:
    its follower shows none of the old lake's rows", "a superuser's token is refused".
 300. **A node is started and stopped as an object, and a stop at any point gives back what it took**
-   (`node.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
+   (`node/run.rs`: `Node::start`, `stop`, `Held`): its term when it leads, then its lake. Stopped once it
    serves, it drains, makes what it committed durable, checkpoints, ends what it started
    (`panics::abort_all`), closes its catalog and steps down. Stopped while it starts, it gives its
    term back without the durable wait. Either way the next node on the lake leads at once. A write
@@ -2318,7 +2319,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    halts the node and starts it again in place (`library::restart`: its lock file says
    `restarting`, then a `Restarting` unwind that `panics::spawn` lets go and a door answers as 57P03);
    a vital loop's panic, the catalog's compactor failing and a lake newer than the build stop the
-   node with the reason (`library::failed`), and every request is then 57P03 with it until it is
+   node with the reason (`node::failed`), and every request is then 57P03 with it until it is
    opened again. A supervisor thread restarts it after 0.5, 1, 2, 4 and 8 s, and gives up after five
    restarts within a minute. A process static that is a `Mutex` is read with
    `lock().unwrap_or_else(PoisonError::into_inner)`, since a restart unwinds through it.

@@ -654,7 +654,7 @@ pub fn restart_with(why: &str, carried: &[(&str, String)]) -> ! {
             held.values().for_each(|(_, f)| say(f, &format!("restarting {}", crate::log::now_ms())));
         }
     }
-    if crate::library::on() {
+    if crate::node::hosted() {
         crate::library::restart(why); // (in place: a library's host keeps its process)
     }
     crate::memory::leave(); // (what this process made goes first: exec and `process::exit` run no destructor)

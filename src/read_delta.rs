@@ -222,7 +222,10 @@ async fn last_checkpoint(reach: &impl Reach, root: &str) -> Result<Option<(i64, 
     let last: Value = serde_json::from_slice(&body).with_context(|| format!("{root}: _last_checkpoint isn't JSON"))?;
     let c = last["version"].as_i64().with_context(|| format!("{root}: _last_checkpoint without its version"))?;
     let names = match (last["v2Checkpoint"]["path"].as_str(), last["parts"].as_u64()) {
-        (Some(path), _) => vec![path.to_string()], // (v2: one file, its sidecars named in it)
+        (Some(path), _) => {
+            ensure!(!crate::lake_files::leaves(path), "{root}: _last_checkpoint names {path}, a file outside its log (a v2 checkpoint is a file of _delta_log/)");
+            vec![path.to_string()] // (v2: one file, its sidecars named in it)
+        }
         (None, Some(parts)) => (1..=parts).map(|i| format!("{c:020}.checkpoint.{i:010}.{parts:010}.parquet")).collect(),
         (None, None) => vec![format!("{c:020}.checkpoint.parquet")],
     };
@@ -598,6 +601,17 @@ mod tests {
         put(&web, &format!("{root}/_delta_log/_last_checkpoint"), br#"{"version":1}"#.to_vec()).await;
         assert_eq!(replay(&web, &root, None).await.unwrap().version, 2);
         assert_eq!(paths(&resolve(&web, &root, None).await.unwrap()), vec![format!("{root}/b.parquet"), format!("{root}/c.parquet")]);
+    }
+
+    /// A v2 checkpoint `_last_checkpoint` names is a file of the log: one named past it (`..`) is refused, never read.
+    #[tokio::test]
+    async fn a_v2_checkpoint_named_outside_the_log_is_refused() {
+        let web = web();
+        let root = format!("{ROOT}/v2");
+        put_commits(&web, &root, &[0, 1]).await;
+        put(&web, &format!("{root}/_delta_log/_last_checkpoint"), br#"{"version":1,"v2Checkpoint":{"path":"../../secret.json"}}"#.to_vec()).await;
+        let err = replay(&web, &root, None).await.err().expect("refused");
+        assert!(err.to_string().contains("outside its log"), "{err}");
     }
 
     #[tokio::test]
