@@ -1,0 +1,86 @@
+# 1.1's statements, refused by name at every form, in the same words (src/kept.rs): pipelines, dashboards, the grants on
+# them, GRANT EXECUTE, and a pipeline's STEP, PARALLEL and WAIT FOR. The words that are also names still work: a table
+# called pipeline or dashboard, and a prepared statement called pipeline.
+statement error 0A000 1\.1
+CREATE PIPELINE p AS BEGIN STEP a AS SELECT 1; END
+
+statement error 0A000 1\.1
+CREATE OR REPLACE PIPELINE p AS BEGIN STEP a AS SELECT 1; END
+
+statement error 0A000 1\.1
+ALTER PIPELINE p SUSPEND
+
+statement error 0A000 1\.1
+DROP PIPELINE p
+
+statement error 0A000 1\.1
+SHOW CREATE PIPELINE p
+
+statement error 0A000 1\.1
+SHOW PIPELINES
+
+statement error 0A000 1\.1
+EXPLAIN PIPELINE p
+
+statement error 0A000 1\.1
+COMMENT ON PIPELINE p IS 'x'
+
+statement error 0A000 1\.1
+EXECUTE PIPELINE p
+
+statement error 0A000 1\.1
+CREATE DASHBOARD d AS SELECT 1
+
+statement error 0A000 1\.1
+CREATE OR REPLACE DASHBOARD d AS SELECT 1
+
+statement error 0A000 1\.1
+ALTER DASHBOARD d RENAME TO e
+
+statement error 0A000 1\.1
+DROP DASHBOARD d
+
+statement error 0A000 1\.1
+SHOW CREATE DASHBOARD d
+
+statement error 0A000 1\.1
+SHOW DASHBOARDS
+
+statement error 0A000 1\.1
+COMMENT ON DASHBOARD d IS 'x'
+
+statement error 0A000 1\.1
+GRANT SELECT ON PIPELINE p TO r
+
+statement error 0A000 1\.1
+REVOKE SELECT ON DASHBOARD d FROM r
+
+statement error 0A000 1\.1
+GRANT EXECUTE ON PIPELINE p TO r
+
+statement error 0A000 1\.1
+REVOKE EXECUTE ON PIPELINE p FROM r
+
+statement error 0A000 1\.1
+STEP a AS SELECT 1
+
+statement error 0A000 1\.1
+PARALLEL SELECT 1
+
+statement error 0A000 1\.1
+WAIT FOR p
+
+statement error 0A000 1\.1
+CREATE PIPELINE p (day DATE) SCHEDULE '1 hour' AS BEGIN STEP a AS SELECT $day; END
+
+statement ok
+CREATE TABLE pipeline (a INT)
+
+statement ok
+CREATE TABLE dashboard (a INT)
+
+statement ok
+SELECT * FROM pipeline
+
+statement ok
+SELECT * FROM dashboard

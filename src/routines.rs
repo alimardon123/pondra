@@ -113,7 +113,8 @@ pub fn statement(sql: &str) -> Option<Stmt> {
         return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
     }
     Some(match what {
-        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE)), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        // (a refusal is said as it is, the pipeline's words; any other mistake gets the usage too)
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
@@ -423,7 +424,7 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
 /// parameters or its graph's values, bound as it runs, never as it is made.
 pub fn makes_code(sql: &str) -> bool {
-    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:task|procedure|function|macro)\b").expect("a regex"));
+    static HEAD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?is)^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:task|pipeline|procedure|function|macro)\b").expect("a regex"));
     HEAD.is_match(crate::text::first_word(sql))
 }
 

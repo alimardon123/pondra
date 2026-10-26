@@ -15,11 +15,16 @@ export function statements(text, raw) {
   const out = [], depth = s => {
     const t = s.replace(/'(?:[^']|'')*'|"[^"]*"|--.*|\/\*[\s\S]*?\*\/|\$(\w*)\$[\s\S]*?\$\1\$/g, ' x ').toLowerCase().match(/\$?\w+|[^\s\w]/g) || [];
     let d = 0;
-    const task = t[0] == 'create' && ['task', 'procedure'].some(w => t[1] == w || t[3] == w); // (CREATE TASK … AS BEGIN …, a procedure's too)
+    const task = t[0] == 'create' && ['task', 'procedure', 'pipeline'].some(w => t[1] == w || t[3] == w); // (CREATE TASK … AS BEGIN …, a procedure's and a pipeline's too)
     const close = i => { let n = 0; return t.findIndex((x, j) => j > i && !(n += (x == '(') - (x == ')'))); }; // (an IF's condition's end: `if(` before anything but THEN is the function)
+    let parens = 0, step = false, stepBlock = -1, taskBlock = -1; // (a STEP where a statement starts, until its AS outside parentheses; the word after that AS starts one; a task's or pipeline's first AS outside parentheses too)
     t.forEach((w, i) => {
-      const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin|async)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':' || task && b == 'as';
-      d += w == 'end' ? -1 : b == 'end' ? 0 : +(w == 'case' || at && (/^(while|loop)$/.test(w) || w == 'repeat' && t[i + 1] != '(' || w == 'if' && (!i || t[i + 1] != '(' || t[close(i) + 1] == 'then') || w == 'for' && /^(in|as)$/.test(t[i + 2]) || w == 'begin' && !!t[i + 1] && !/^(transaction|work|isolation|read|deferrable|not)$/.test(t[i + 1])));
+      const b = t[i - 1], at = !i || /^(then|else|do|loop|repeat|begin|async|parallel)$/.test(b) || b == ':' && /^\w/.test(t[i - 2]) && t[i - 3] != ':' || i == taskBlock || i == stepBlock;
+      if (w == 'step' && at) step = true;
+      else if (w == 'as' && step && !parens) { step = false; stepBlock = i + 1; }
+      if (task && w == 'as' && !parens && taskBlock < 0) taskBlock = i + 1; // (only the first AS: a column's `AS parallel` starts nothing)
+      d += w == 'end' ? -1 : b == 'end' ? 0 : +(w == 'case' || at && (/^(while|loop|parallel)$/.test(w) || w == 'repeat' && t[i + 1] != '(' || w == 'if' && (!i || t[i + 1] != '(' || t[close(i) + 1] == 'then') || w == 'for' && /^(in|as)$/.test(t[i + 2]) || w == 'begin' && !!t[i + 1] && !/^(transaction|work|isolation|read|deferrable|not)$/.test(t[i + 1])));
+      parens += (w == '(') - (w == ')');
     });
     return d;
   };

@@ -23,6 +23,8 @@ pub mod in_task;
 pub mod page;
 pub mod request_body;
 pub mod text;
+// The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
+mod kept;
 pub mod extension;
 pub mod ext_names;
 pub mod lake_files;
