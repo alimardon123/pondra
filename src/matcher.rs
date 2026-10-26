@@ -1484,6 +1484,8 @@ fn float_order(x: f64, y: f64) -> Ordering {
 #[derive(Debug)]
 struct Evaluator {
     all: bool,
+    /// `pondra_open`: open mode, with k, m and w after the other values.
+    open: bool,
     planner: Arc<Planner>,
     /// The spec's text, and its plan, once read.
     text: String,
@@ -1506,25 +1508,33 @@ impl PartitionEvaluator for Evaluator {
 
 impl Evaluator {
     /// The answer for `n` rows. `values[0]` is the spec, then one condition column per symbol, WITHIN's time and interval when
-    /// within, the glue's row-only columns, and its value columns.
+    /// within, the glue's row-only columns, and its value columns. `pondra_open` takes k, m and w after them, the watermark
+    /// in WITHIN's time's type, and answers in open mode (`partition_open`): the decided matches, and the marker on the last
+    /// row.
     fn run(&mut self, values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         if n == 0 {
-            return answer(&[], &[], self.all, false);
+            return match self.open {
+                true => answer_open(&[], None, &[]),
+                false => answer(&[], &[], self.all, false),
+            };
         }
         let plan = self.ready(values)?;
+        if self.open && plan.unmatched {
+            return Err(coded("0A000", "MATCH_RECOGNIZE: an open search doesn't take WITH UNMATCHED ROWS"));
+        }
         let mut cond = vec![];
         for k in 0..plan.syms.len() {
             cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
         }
         // WITHIN's time and interval come after the symbols' conditions
-        let within = match plan.within {
-            true => {
-                let time = values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?;
-                let interval = values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?;
-                Some(within_of(time, interval)?)
-            }
+        let timed_by = match plan.within {
+            true => Some((
+                values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?,
+                values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?,
+            )),
             false => None,
         };
+        let within = timed_by.map(|(time, interval)| within_of(time, interval)).transpose()?;
         // the glue's row-only columns, then its value columns
         let first = 1 + plan.syms.len() + if plan.within { 2 } else { 0 };
         let rows = values.get(first..first + plan.rows).context("MATCH_RECOGNIZE: the glue's row columns are missing")?;
@@ -1543,7 +1553,27 @@ impl Evaluator {
             reads: KEEP,
             stop: self.stop.as_deref(),
         };
-        answer(&partition(&plan, &part)?, &plan.syms, self.all, plan.unmatched)
+        if !self.open {
+            return answer(&partition(&plan, &part)?, &plan.syms, self.all, plan.unmatched);
+        }
+        // open mode's three arguments: k, m, and the watermark w (unused without WITHIN)
+        let at = first + plan.rows + plan.values;
+        let k = usize::try_from(open_int(values, at, "k")?).context("MATCH_RECOGNIZE: pondra_open's k is a count of rows")?;
+        let m = open_int(values, at + 1, "m")?;
+        if k > n {
+            return Err(coded("22000", "MATCH_RECOGNIZE: pondra_open's k is more rows than the partition has"));
+        }
+        let kernel = timed_by.map(|(time, interval)| Kernel::of(time, interval)).transpose()?;
+        let low = match &kernel {
+            Some(kn) => {
+                let w = values.get(at + 2).context("MATCH_RECOGNIZE: pondra_open has no watermark")?;
+                let tick = tick_of(w, &kn.time)?.context("MATCH_RECOGNIZE: pondra_open's watermark is NULL")?;
+                kn.low(tick.checked_add(1).context("MATCH_RECOGNIZE: pondra_open's watermark is out of range")?)?
+            }
+            None => None,
+        };
+        let (found, marker) = partition_open(&plan, &part, &OpenArgs { k, m, low, kernel })?;
+        answer_open(&found, Some(marker), &plan.syms)
     }
 
     /// The spec's plan, read from the call's first value once, and its glue planned when a DEFINE reads the match.
@@ -1561,76 +1591,6 @@ impl Evaluator {
         Ok(plan)
     }
 
-    /// `pondra_open` over `n` rows: `run`'s values, then k, m and w, the watermark (in WITHIN's time's type). It answers in
-    /// open mode (`partition_open`): the decided matches, and the marker on the last row.
-    fn run_open(&mut self, values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
-        if n == 0 {
-            return answer_open(&[], None, &[]);
-        }
-        let plan = self.ready(values)?;
-        if plan.unmatched {
-            return Err(coded("0A000", "MATCH_RECOGNIZE: an open search doesn't take WITH UNMATCHED ROWS"));
-        }
-        let mut cond = vec![];
-        for k in 0..plan.syms.len() {
-            cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
-        }
-        // WITHIN's time and interval come after the symbols' conditions
-        let (within, kernel) = match plan.within {
-            true => {
-                let time = values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?;
-                let interval = values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?;
-                (Some(within_of(time, interval)?), Some(Kernel::of(time, interval)?))
-            }
-            false => (None, None),
-        };
-        let first = 1 + plan.syms.len() + if plan.within { 2 } else { 0 };
-        let rows = values.get(first..first + plan.rows).context("MATCH_RECOGNIZE: the glue's row columns are missing")?;
-        let columns = values
-            .get(first + plan.rows..first + plan.rows + plan.values)
-            .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
-        // the last three arguments: k, m, and the watermark w (unused without WITHIN)
-        let at = first + plan.rows + plan.values;
-        let k = usize::try_from(open_int(values, at, "k")?).context("MATCH_RECOGNIZE: pondra_open's k is a count of rows")?;
-        let m = open_int(values, at + 1, "m")?;
-        if k > n {
-            return Err(coded("22000", "MATCH_RECOGNIZE: pondra_open's k is more rows than the partition has"));
-        }
-        let low = match &kernel {
-            Some(kn) => {
-                let w = values.get(at + 2).context("MATCH_RECOGNIZE: pondra_open has no watermark")?;
-                let tick = tick_of(w, &kn.time)?.context("MATCH_RECOGNIZE: pondra_open's watermark is NULL")?;
-                kn.low(tick.checked_add(1).context("MATCH_RECOGNIZE: pondra_open's watermark is out of range")?)?
-            }
-            None => None,
-        };
-        let part = Part {
-            cond: &cond,
-            within: within.as_ref(),
-            n,
-            rows,
-            values: columns,
-            planned: self.planned.as_deref(),
-            cap: STATE_CAP,
-            stop: self.stop.as_deref(),
-        };
-        let (found, marker) = partition_open(&plan, &part, &OpenArgs { k, m, low, kernel })?;
-        answer_open(&found, Some(marker), &plan.syms)
-    }
-}
-
-/// The evaluator of `pondra_open`: an `Evaluator` answered in open mode.
-#[derive(Debug)]
-struct OpenEvaluator(Evaluator);
-
-impl PartitionEvaluator for OpenEvaluator {
-    fn uses_window_frame(&self) -> bool { false }
-
-    fn supports_bounded_execution(&self) -> bool { false }
-
-    fn evaluate_all(&mut self, values: &[ArrayRef], n: usize) -> DfResult<ArrayRef> {
-        self.0.run_open(values, n).map_err(external)
-    }
 }
 
 /// Plans the glue of specs against the engine's functions, and keeps each spec's plan. `base` is the session's snapshot that
@@ -1818,6 +1778,8 @@ fn aggregate_types(base: &SessionState, name: &str, value: &DataType) -> Result<
 #[derive(Debug)]
 struct Matcher {
     all: bool,
+    /// `pondra_open` (with `all`): open mode, for an EMIT FINAL view's run.
+    open: bool,
     signature: Signature,
     planner: Arc<Planner>,
     stop: Option<Arc<AtomicBool>>,
@@ -1825,7 +1787,7 @@ struct Matcher {
 
 impl PartialEq for Matcher {
     fn eq(&self, other: &Self) -> bool {
-        self.all == other.all && self.signature == other.signature
+        (self.all, self.open) == (other.all, other.open) && self.signature == other.signature
     }
 }
 
@@ -1833,16 +1795,17 @@ impl Eq for Matcher {}
 
 impl Hash for Matcher {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.all.hash(state);
+        (self.all, self.open).hash(state);
         self.signature.hash(state);
     }
 }
 
 impl WindowUDFImpl for Matcher {
     fn name(&self) -> &str {
-        match self.all {
-            true => "pondra_matches",
-            false => "pondra_match",
+        match (self.open, self.all) {
+            (true, _) => "pondra_open",
+            (false, true) => "pondra_matches",
+            (false, false) => "pondra_match",
         }
     }
 
@@ -1856,22 +1819,23 @@ impl WindowUDFImpl for Matcher {
             return None;
         }
         let stop = statement_stop()?;
-        let (all, signature, planner) = (self.all, self.signature.clone(), self.planner.clone());
+        let (all, open, signature, planner) = (self.all, self.open, self.signature.clone(), self.planner.clone());
         Some(Box::new(move |mut wf: WindowFunction, _: &SimplifyContext| -> DfResult<Expr> {
-            let bound = Matcher { all, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
+            let bound = Matcher { all, open, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
             wf.fun = WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(bound)));
             Ok(Expr::WindowFunction(Box::new(wf)))
         }))
     }
 
     fn partition_evaluator(&self, args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
-        Ok(Box::new(evaluator_of(self.all, &self.planner, &self.stop, args)?))
+        Ok(Box::new(evaluator_of(self.all, self.open, &self.planner, &self.stop, args)?))
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
-        let t = match self.all {
-            true => DataType::List(Arc::new(Field::new("item", struct_type(), true))),
-            false => struct_type(),
+        let t = match (self.open, self.all) {
+            (true, _) => DataType::List(Arc::new(Field::new("item", open_struct_type(), true))),
+            (false, true) => DataType::List(Arc::new(Field::new("item", struct_type(), true))),
+            (false, false) => struct_type(),
         };
         Ok(Arc::new(Field::new(field_args.name(), t, true)))
     }
@@ -1879,14 +1843,14 @@ impl WindowUDFImpl for Matcher {
 
 /// The evaluator of a call of `pondra_match`, `pondra_matches` or `pondra_open`: the spec's plan and glue, planned here when the
 /// spec is a literal (so a bad one is refused at planning), and the statement's stop flag.
-fn evaluator_of(all: bool, planner: &Arc<Planner>, stop: &Option<Arc<AtomicBool>>, args: PartitionEvaluatorArgs) -> DfResult<Evaluator> {
+fn evaluator_of(all: bool, open: bool, planner: &Arc<Planner>, stop: &Option<Arc<AtomicBool>>, args: PartitionEvaluatorArgs) -> DfResult<Evaluator> {
     let types: Vec<DataType> = args.input_fields().iter().map(|f| f.data_type().clone()).collect();
     // (the spec is a literal, as `pattern.rs` writes it: planned here, from the planner's cache; another form is read at the first row)
     let literal = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
         Some(ScalarValue::Utf8(Some(text))) => Some(text.clone()),
         _ => None,
     };
-    let mut evaluator = Evaluator { all, planner: planner.clone(), text: String::new(), plan: None, planned: None, stop: stop.clone() };
+    let mut evaluator = Evaluator { all, open, planner: planner.clone(), text: String::new(), plan: None, planned: None, stop: stop.clone() };
     if let Some(text) = literal {
         let plan = planner.plan(&text).map_err(external)?;
         // (WITHIN's time and interval are checked here, at planning; `run` checks the time too)
@@ -1911,70 +1875,16 @@ fn evaluator_of(all: bool, planner: &Arc<Planner>, stop: &Option<Arc<AtomicBool>
     Ok(evaluator)
 }
 
-/// `pondra_open`: the matcher in open mode (`partition_open`). It takes `pondra_matches`' arguments, then k, m and w, and
-/// answers a list per row, the marker on the partition's last row.
-#[derive(Debug)]
-struct OpenMatcher {
-    signature: Signature,
-    planner: Arc<Planner>,
-    stop: Option<Arc<AtomicBool>>,
-}
-
-impl PartialEq for OpenMatcher {
-    fn eq(&self, other: &Self) -> bool {
-        self.signature == other.signature
-    }
-}
-
-impl Eq for OpenMatcher {}
-
-impl Hash for OpenMatcher {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.signature.hash(state);
-    }
-}
-
-impl WindowUDFImpl for OpenMatcher {
-    fn name(&self) -> &str { "pondra_open" }
-
-    fn signature(&self) -> &Signature { &self.signature }
-
-    /// Binds the statement's stop flag, as `Matcher::simplify` does.
-    fn simplify(&self) -> Option<WindowFunctionSimplification> {
-        if self.stop.is_some() {
-            return None;
-        }
-        let stop = crate::audit::stop()?;
-        let (signature, planner) = (self.signature.clone(), self.planner.clone());
-        Some(Box::new(move |mut wf: WindowFunction, _: &SimplifyContext| -> DfResult<Expr> {
-            let bound = OpenMatcher { signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
-            wf.fun = WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(bound)));
-            Ok(Expr::WindowFunction(Box::new(wf)))
-        }))
-    }
-
-    fn partition_evaluator(&self, args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
-        Ok(Box::new(OpenEvaluator(evaluator_of(true, &self.planner, &self.stop, args)?)))
-    }
-
-    fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
-        let t = DataType::List(Arc::new(Field::new("item", open_struct_type(), true)));
-        Ok(Arc::new(Field::new(field_args.name(), t, true)))
-    }
-}
-
 /// Registers `pondra_match`, `pondra_matches`, `pondra_open` and `pondra_nav` with a session (`engine::session`, for every form). A DEFINE's
 /// glue is planned against the session as it stands here, so it sees the functions registered before this call and no later
 /// one. A lake's statement that reads a pattern registers it again, last (`query::session_at`), so its DEFINEs see the AI,
 /// lake, Python and per-session functions too.
 pub fn register(ctx: &SessionContext) {
     let planner = Arc::new(Planner::new(Arc::new(ctx.state())));
-    for all in [false, true] {
+    for (all, open) in [(false, false), (true, false), (true, true)] {
         let signature = Signature::variadic_any(Volatility::Immutable);
-        ctx.register_udwf(WindowUDF::from(Matcher { all, signature, planner: planner.clone(), stop: None }));
+        ctx.register_udwf(WindowUDF::from(Matcher { all, open, signature, planner: planner.clone(), stop: None }));
     }
-    let signature = Signature::variadic_any(Volatility::Immutable);
-    ctx.register_udwf(WindowUDF::from(OpenMatcher { signature, planner: planner.clone(), stop: None }));
     ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
 }
 
@@ -2909,12 +2819,12 @@ mod tests {
         let text = spec("a", PAST);
         let values: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text.as_str()])), Arc::new(BooleanArray::from(vec![true; 3]))];
         let stop = Arc::new(AtomicBool::new(true));
-        let mut stopped = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop.clone()) };
+        let mut stopped = Evaluator { all: false, open: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop.clone()) };
         let Err(err) = stopped.run(&values, 3) else { panic!("a stopped search answered") };
         assert_eq!(crate::codes::of(&err), "57014");
         assert!(err.to_string().contains("its MATCH_RECOGNIZE search was stopped"), "{err}");
         stop.store(false, atomic::Ordering::Relaxed);
-        let mut free = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop) };
+        let mut free = Evaluator { all: false, open: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop) };
         assert!(free.run(&values, 3).is_ok());
     }
 
@@ -2953,12 +2863,12 @@ mod tests {
 
     #[tokio::test]
     async fn simplify_binds_the_statements_flag_once() {
-        let m = Matcher { all: false, signature: Signature::variadic_any(Volatility::Immutable), planner: Arc::new(planner()), stop: None };
+        let m = Matcher { all: false, open: false, signature: Signature::variadic_any(Volatility::Immutable), planner: Arc::new(planner()), stop: None };
         assert!(m.simplify().is_none(), "nothing is bound outside a statement");
         let flag = Arc::new(AtomicBool::new(false));
         crate::audit::stoppable(flag.clone(), async {
             let simplify = m.simplify().expect("a statement binds its flag");
-            let unbound = Matcher { all: false, signature: m.signature.clone(), planner: m.planner.clone(), stop: None };
+            let unbound = Matcher { all: false, open: false, signature: m.signature.clone(), planner: m.planner.clone(), stop: None };
             let call = WindowFunction::new(WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(unbound))), vec![]);
             let Expr::WindowFunction(out) = simplify(call, &SimplifyContext::builder().build()).expect("simplified") else {
                 panic!("a window function")
