@@ -12,7 +12,8 @@ use crate::store::*;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use futures::future::Either;
-use datafusion::arrow::ipc::writer::{IpcWriteOptions, StreamWriter};
+use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::ipc::writer::{write_message, DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions};
 use datafusion::arrow::ipc::{reader::StreamReader, CompressionType};
 use datafusion::arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
@@ -972,18 +973,109 @@ fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
 
 /// Batches as one Arrow IPC stream, ZSTD-compressed unless they hold under 1 KB of values: a row or
 /// two doesn't compress (Arrow then writes its buffers as they are anyway), and each stream makes a
-/// ZSTD context of its own, which cost a one-row batch 28–45 µs against 3–5 µs written plain.
+/// ZSTD context of its own, which cost a one-row batch 28–45 µs against 3–5 µs written plain. A batch
+/// is cut into a row slice per `SLICE` bytes of values, up to the node's partitions, and the slices are encoded
+/// at once: ZSTD compresses on one core (an SF1 HTTP load of 1M-row appends took 10.1–10.6 s whole and
+/// 7.8–9.0 s in slices, with the same log bytes). The slices' messages go in order, so the stream reads
+/// as if the batch were written whole.
 pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
-    let mut buf = vec![];
-    let values: usize = batches.iter().flat_map(|b| b.columns()).map(|c| c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)).fold(0, usize::saturating_add);
+    encode_sliced(batches, |values| (values / SLICE).clamp(1, slices_here()))
+}
+
+/// The bytes of values per row slice of a batch: a batch takes one slice per this many, up to `slices_here`.
+const SLICE: usize = 8 << 20;
+
+/// The most row slices a batch takes on this machine: the node's own core budget (`store::partitions`, which
+/// `PONDRA_CORES` sets, capped by memory). One on a page: a thread spawn panics on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
+fn slices_here() -> usize {
+    crate::store::partitions()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn slices_here() -> usize {
+    1
+}
+
+/// The batches as one Arrow IPC stream, each cut into `slices(values)` row slices, where `values` is the batch's bytes
+/// of values. One path for every batch, as StreamWriter does inside (the schema message, then each batch's dictionary
+/// messages and batch message, then the end-of-stream marker), so one slice writes StreamWriter's bytes. A batch's
+/// slices are encoded on scoped threads, each with a dictionary tracker and a codec context of its own, and their
+/// messages are appended in row order. A schema with a dictionary column is never cut: each slice would carry its own
+/// dictionaries, which a reader takes as replacements of the first.
+fn encode_sliced(batches: &[RecordBatch], slices: impl Fn(usize) -> usize) -> Result<Vec<u8>> {
+    let values: usize = batches.iter().map(values_of).fold(0, usize::saturating_add);
     let opts = IpcWriteOptions::default().try_with_compression((values >= 1024).then_some(CompressionType::ZSTD))?;
-    let mut w = StreamWriter::try_new_with_options(&mut buf, &batches[0].schema(), opts)?;
+    let schema = batches[0].schema();
+    let dictionaries = schema.fields().iter().any(|f| has_dictionary(f.data_type()));
+    let generator = IpcDataGenerator {};
+    let mut tracker = DictionaryTracker::new(false);
+    let mut ctx = IpcWriteContext::default();
+    let mut buf = vec![];
+    write_message(&mut buf, generator.schema_to_bytes_with_dictionary_tracker(&schema, &mut tracker, &opts), &opts)?;
     for b in batches {
-        w.write(&crate::answer::compact(b.clone()))?;
+        let b = crate::answer::compact(b.clone());
+        let n = if dictionaries { 1 } else { slices(values_of(&b)).min(b.num_rows()) };
+        if n <= 1 {
+            let (dicts, batch) = generator.encode(&b, &mut tracker, &opts, &mut ctx)?;
+            for m in dicts.into_iter().chain(std::iter::once(batch)) {
+                write_message(&mut buf, m, &opts)?;
+            }
+            continue;
+        }
+        let rows = b.num_rows();
+        // (the scoped threads block this task until they are done, as the encode on this thread did: nothing new
+        // waits on the runtime)
+        let parts = std::thread::scope(|s| {
+            let jobs: Vec<_> = (0..n)
+                .map(|i| {
+                    let part = b.slice(i * rows / n, (i + 1) * rows / n - i * rows / n);
+                    let opts = &opts;
+                    s.spawn(move || encode_slice(&part, opts))
+                })
+                .collect();
+            jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err(anyhow!("a log slice's encoder panicked")))).collect::<Result<Vec<_>>>()
+        })?;
+        for p in parts {
+            buf.extend_from_slice(&p);
+        }
     }
-    w.finish()?;
-    drop(w);
+    // The end-of-stream marker: the continuation marker, then a zero length (metadata V5, as the writer writes it).
+    buf.extend_from_slice(&[0xff; 4]);
+    buf.extend_from_slice(&0u32.to_le_bytes());
     Ok(buf)
+}
+
+/// One slice's messages: its dictionaries (none for a schema without them), then its batch, with a dictionary tracker
+/// and a codec context of its own.
+fn encode_slice(part: &RecordBatch, opts: &IpcWriteOptions) -> Result<Vec<u8>> {
+    let mut tracker = DictionaryTracker::new(false);
+    let mut ctx = IpcWriteContext::default();
+    let (dicts, batch) = IpcDataGenerator {}.encode(part, &mut tracker, opts, &mut ctx)?;
+    let mut out = vec![];
+    for m in dicts.into_iter().chain(std::iter::once(batch)) {
+        write_message(&mut out, m, opts)?;
+    }
+    Ok(out)
+}
+
+/// The bytes of a batch's values, as a batch's size is counted: each column's slice, not the buffers it shares.
+fn values_of(b: &RecordBatch) -> usize {
+    b.columns().iter().map(|c| c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)).fold(0, usize::saturating_add)
+}
+
+/// Whether a type holds a dictionary anywhere in it.
+fn has_dictionary(dt: &DataType) -> bool {
+    match dt {
+        DataType::Dictionary(..) => true,
+        DataType::Struct(fields) => fields.iter().any(|f| has_dictionary(f.data_type())),
+        DataType::Union(fields, _) => fields.iter().any(|(_, f)| has_dictionary(f.data_type())),
+        DataType::List(f) | DataType::LargeList(f) | DataType::ListView(f) | DataType::LargeListView(f) | DataType::FixedSizeList(f, _) | DataType::Map(f, _) => {
+            has_dictionary(f.data_type())
+        }
+        DataType::RunEndEncoded(_, values) => has_dictionary(values.data_type()),
+        _ => false,
+    }
 }
 
 /// The batches of one Arrow IPC stream.
@@ -1011,7 +1103,9 @@ pub fn now_us() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{ArrayRef, Int64Array, StringArray};
+    use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int64Array, StringArray};
+    use datafusion::arrow::datatypes::Int32Type;
+    use datafusion::arrow::ipc::writer::StreamWriter;
 
     #[test]
     fn a_row_or_two_is_written_plain_and_more_compressed() {
@@ -1034,6 +1128,59 @@ mod tests {
         let t1 = datafusion::common::instant::Instant::now();
         (0..1000).for_each(|_| drop(encode_ipc(std::slice::from_ref(&one))));
         eprintln!("a one-row batch: {:.1} µs with ZSTD ({} bytes), {:.1} µs as written ({} bytes)", (t1 - t0).as_secs_f64() * 1e3, zstd().len(), t1.elapsed().as_secs_f64() * 1e3, encode_ipc(std::slice::from_ref(&one)).unwrap().len());
+    }
+
+    /// The encoder as it was before `encode_sliced`: one StreamWriter, every batch written whole.
+    fn stream_writer_ipc(batches: &[RecordBatch]) -> Vec<u8> {
+        let values: usize = batches.iter().flat_map(|b| b.columns()).map(|c| c.to_data().get_slice_memory_size().unwrap_or(usize::MAX)).fold(0, usize::saturating_add);
+        let opts = IpcWriteOptions::default().try_with_compression((values >= 1024).then_some(CompressionType::ZSTD)).unwrap();
+        let mut buf = vec![];
+        let mut w = StreamWriter::try_new_with_options(&mut buf, &batches[0].schema(), opts).unwrap();
+        for b in batches {
+            w.write(&crate::answer::compact(b.clone())).unwrap();
+        }
+        w.finish().unwrap();
+        drop(w);
+        buf
+    }
+
+    /// `n` rows of an Int64, a nullable Int64 and a nullable Utf8.
+    fn mixed(n: i64) -> RecordBatch {
+        RecordBatch::try_from_iter([
+            ("k", Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef),
+            ("v", Arc::new(Int64Array::from_iter((0..n).map(|i| (i % 5 != 0).then_some(i)))) as ArrayRef),
+            ("s", Arc::new(StringArray::from_iter((0..n).map(|i| (i % 7 != 0).then(|| format!("row {i}"))))) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn one_slice_is_the_stream_writers_bytes() {
+        let b = mixed(1003);
+        let whole = vec![b.clone(), b.slice(0, 1), b.slice(500, 3)];
+        assert_eq!(encode_sliced(&whole, |_| 1).unwrap(), stream_writer_ipc(&whole));
+        let plain = vec![mixed(3)]; // under 1 KB of values: written plain
+        assert_eq!(encode_sliced(&plain, |_| 1).unwrap(), stream_writer_ipc(&plain));
+    }
+
+    #[test]
+    fn slices_read_as_the_whole() {
+        let b = mixed(1003);
+        let batches = vec![b.clone(), b.slice(0, 1), b.slice(500, 3)];
+        let whole = decode(&encode_sliced(&batches, |_| 1).unwrap()).unwrap();
+        assert_eq!(whole, batches);
+        for k in [2usize, 3, 4, 2000] {
+            let ipc = encode_sliced(&batches, |_| k).unwrap();
+            assert_eq!(&ipc[ipc.len() - 8..], &[0xffu8, 0xff, 0xff, 0xff, 0, 0, 0, 0], "{k} slices: the end of the stream");
+            assert_eq!(decode(&ipc).unwrap(), whole, "{k} slices");
+        }
+    }
+
+    #[test]
+    fn a_dictionary_is_never_cut() {
+        let keys: DictionaryArray<Int32Type> = ["a", "b", "a", "c"].iter().cycle().take(1000).map(|s| Some(*s)).collect();
+        let batches = vec![RecordBatch::try_from_iter([("d", Arc::new(keys) as ArrayRef)]).unwrap()];
+        assert_eq!(encode_sliced(&batches, |_| 4).unwrap(), encode_sliced(&batches, |_| 1).unwrap());
     }
 
     thread_local! {
