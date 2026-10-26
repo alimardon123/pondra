@@ -732,6 +732,13 @@ fn cap_error(stated: bool, within: bool, cap: usize) -> anyhow::Error {
     coded("54000", msg)
 }
 
+/// The stop flag of the statement being planned (`audit::stop`). The page has no statements, so it has none.
+#[cfg(feature = "lake")]
+fn statement_stop() -> Option<Arc<AtomicBool>> { crate::audit::stop() }
+
+#[cfg(not(feature = "lake"))]
+fn statement_stop() -> Option<Arc<AtomicBool>> { None }
+
 /// Whether the statement a search runs for has been stopped (a timeout or a cancel set its flag). Read once per row.
 fn is_stopped(part: &Part) -> bool { part.stop.is_some_and(|s| s.load(atomic::Ordering::Relaxed)) }
 
@@ -1378,7 +1385,7 @@ impl WindowUDFImpl for Matcher {
         if self.stop.is_some() {
             return None;
         }
-        let stop = crate::audit::stop()?;
+        let stop = statement_stop()?;
         let (all, signature, planner) = (self.all, self.signature.clone(), self.planner.clone());
         Some(Box::new(move |mut wf: WindowFunction, _: &SimplifyContext| -> DfResult<Expr> {
             let bound = Matcher { all, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
