@@ -3,7 +3,7 @@
 //! wire protocol Pondra's own Kafka port speaks (`kafka.rs`), the other way round, in the
 //! versions every broker since Kafka 2.1 answers and Kafka 4 still does; plain TCP or TLS, SASL
 //! PLAIN or SCRAM, from the secret covering the cluster's URL.
-use crate::kafka::{crc32c, decompress, put_nstr, put_str, put_varint, Rd, MOST};
+use crate::kafka_wire::{crc32c, decompress, put_nstr, put_str, put_varint, Rd, MOST};
 use anyhow::{bail, ensure, Context, Result};
 use bytes::{BufMut, Bytes};
 use std::collections::{BTreeMap, HashMap};

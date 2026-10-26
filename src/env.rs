@@ -341,3 +341,14 @@ mod tests {
         assert!(NAMES.iter().all(|(n, _)| n.starts_with("PONDRA_") && seen.insert(*n)), "each name once");
     }
 }
+
+/// This machine's folder for Pondra's settings (the console's, the Python chosen).
+#[cfg(feature = "lake")]
+pub fn settings_dir() -> Option<std::path::PathBuf> {
+    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    crate::env::os("PONDRA_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| match () {
+        _ if cfg!(windows) => var("APPDATA").map(|d| d.join("pondra")),
+        _ if cfg!(target_os = "macos") => var("HOME").map(|d| d.join("Library/Application Support/pondra")),
+        _ => var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|d| d.join(".config"))).map(|d| d.join("pondra")),
+    })
+}

@@ -2239,7 +2239,7 @@ async fn post_as(addr: &str, r: &Request, user: Option<String>) -> Result<Value>
 /// The error a node's answer that isn't a success is, as a client takes it: the answer's words, with the SQLSTATE its
 /// `x-pondra-sqlstate` header names (none: the words alone). Shared by a follower's forwarded write (`post_as`) and a
 /// guest's answer (cli.rs), so both give the same error.
-pub(crate) fn refusal(sqlstate: Option<&axum::http::HeaderValue>, said: String) -> anyhow::Error {
+pub(crate) fn refusal(sqlstate: Option<&http::HeaderValue>, said: String) -> anyhow::Error {
     match sqlstate.and_then(|v| v.to_str().ok()).and_then(crate::codes::received) {
         Some(code) => crate::codes::coded(code, said),
         None => anyhow::anyhow!("{said}"),

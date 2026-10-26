@@ -4,6 +4,7 @@
 //! it works offline, and no request leaves the node.
 use axum::{http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}};
 use std::{collections::HashMap, sync::LazyLock};
+use crate::env::settings_dir;
 
 /// The console's files (ADR-034): a page, its style sheet, its modules and its fonts, all built into
 /// the binary, their mark and colours from `brand/` (ADR-032). Extensions a node was given
@@ -199,15 +200,6 @@ pub async fn file(axum::extract::Path(name): axum::extract::Path<String>, header
 /// macOS `~/Library/Application Support`, else `$XDG_CONFIG_HOME` or `~/.config`), in `pondra/`.
 fn settings_file() -> Option<std::path::PathBuf> { settings_dir().map(|d| d.join("console.json")) }
 
-/// This machine's folder for Pondra's settings (the console's, the Python chosen).
-pub fn settings_dir() -> Option<std::path::PathBuf> {
-    let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    crate::env::os("PONDRA_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| match () {
-        _ if cfg!(windows) => var("APPDATA").map(|d| d.join("pondra")),
-        _ if cfg!(target_os = "macos") => var("HOME").map(|d| d.join("Library/Application Support/pondra")),
-        _ => var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|d| d.join(".config"))).map(|d| d.join("pondra")),
-    })
-}
 
 /// `GET /console/settings`: the console's settings kept on this machine (`{}` if none yet): its
 /// theme, colours, fonts and layout, the same for every lake and session opened here.

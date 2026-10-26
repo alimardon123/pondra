@@ -35,7 +35,7 @@ tokio::task_local! {
 /// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
 /// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
 /// the request in no session at all.
-pub fn of(headers: &axum::http::HeaderMap) -> anyhow::Result<Option<String>> {
+pub fn of(headers: &http::HeaderMap) -> anyhow::Result<Option<String>> {
     let named = match headers.get("x-pondra-session") {
         None => None,
         Some(v) => Some(name(v)?),
@@ -45,7 +45,7 @@ pub fn of(headers: &axum::http::HeaderMap) -> anyhow::Result<Option<String>> {
 }
 
 /// A session name `x-pondra-session` carries (see `of`): the name, or the reason it is refused (22023).
-fn name(v: &axum::http::HeaderValue) -> anyhow::Result<String> {
+fn name(v: &http::HeaderValue) -> anyhow::Result<String> {
     const SAYS: &str = "x-pondra-session: 8 to 128 letters, digits, - or _";
     let Ok(s) = v.to_str() else {
         return Err(crate::codes::coded("22023", format!("{SAYS} (got a value that isn't text)")));
