@@ -27,6 +27,9 @@ tokio::task_local! {
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
+    /// The lake a statement was sent to, its URL and a slash (`rooted`): a client's relative LOCATION is stored as a file of its own,
+    /// written whole, so every door reads the same file (`own_file`), the shell and `connect()` too.
+    static ROOT: String;
     /// The statement's listing: the files each table of files in it reads, listed once for it (planning asks
     /// several times; each node of a spread query has its coordinator's list), and the `types` each read names,
     /// parsed once. The next statement lists again: a file changed under its name is read as it is now, never by an
@@ -45,6 +48,12 @@ struct Statement {
 /// of files once.
 pub async fn scope<F: std::future::Future>(owner: bool, f: F) -> F::Output {
     OWNER.scope(owner, listing(f)).await
+}
+
+/// Run `f`, a statement sent to the lake at `url` (`ROOT`, `statement::run`).
+pub async fn rooted<F: std::future::Future>(url: &str, f: F) -> F::Output {
+    let root = format!("{}/", url.trim_end_matches('/'));
+    ROOT.scope(root, f).await
 }
 
 /// Run `f` listing each table of files once (within a statement already doing so: as it is).
@@ -207,7 +216,7 @@ fn located(l: &str) -> Result<String> {
         return Ok(l.to_string());
     }
     if let Some(relative) = crate::lake_files::relative("", l).filter(|_| !owner()) {
-        return relative.map(|_| l.to_string());
+        return relative.and_then(|_| ROOT.try_with(|root| crate::lake_files::relative(root, l)).ok().flatten().unwrap_or_else(|| Ok(l.to_string())));
     }
     let whole = crate::ddl::full(l)?;
     Ok(match l.ends_with('/') || std::path::Path::new(&whole).is_dir() {
@@ -1640,13 +1649,15 @@ mod tests {
         column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().expect("an integer").value(0)
     }
 
-    /// A client's relative LOCATION is the lake's files, as its relative names are: kept as written for `for_caller` to
-    /// read there, and refused when it leaves them. The program that started the node has its folder made whole.
+    /// A client's relative LOCATION is the lake's files, as its relative names are: stored whole, so the shell and
+    /// `connect()` read the same file (written as it was where no lake is named, for `for_caller` to read there), and
+    /// refused when it leaves them. The program that started the node has its folder made whole.
     #[tokio::test]
     async fn a_clients_relative_location_is_the_lakes_files() {
-        let made = |owner: bool, l: &'static str| scope(owner, async move { located(l) });
-        assert_eq!(made(false, "reports/q1.csv").await.unwrap(), "reports/q1.csv");
-        assert_eq!(made(false, "./ev/").await.unwrap(), "./ev/");
+        let made = |owner: bool, l: &'static str| rooted("s3://b/lake", scope(owner, async move { located(l) }));
+        assert_eq!(made(false, "reports/q1.csv").await.unwrap(), "s3://b/lake/files/reports/q1.csv");
+        assert_eq!(made(false, "./ev/").await.unwrap(), "s3://b/lake/files/ev/");
+        assert_eq!(scope(false, async { located("reports/q1.csv") }).await.unwrap(), "reports/q1.csv");
         assert_eq!(crate::codes::of(&made(false, "../x.csv").await.unwrap_err()), "0A000");
         assert_eq!(made(false, "s3://b/x.csv").await.unwrap(), "s3://b/x.csv");
         assert!(made(true, "reports/q1.csv").await.unwrap().ends_with("/reports/q1.csv"));

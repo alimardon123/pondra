@@ -362,7 +362,8 @@ impl Disk {
     /// would make its spill folder.
     #[cfg(target_arch = "wasm32")]
     fn make() -> object_store::Result<Disk> {
-        Err(object_store::Error::Generic { store: "memory", source: "a lake in memory doesn't spill on a page (it has no folder): a write past its budget is refused".into() })
+        let why = "out of memory: a lake in memory doesn't spill on a page (it has no folder), so a write past its budget is refused";
+        Err(object_store::Error::Generic { store: "memory", source: Box::new(crate::codes::Coded("53200", why.into())) })
     }
 }
 
