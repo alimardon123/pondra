@@ -136,7 +136,7 @@ pub async fn require(lake: &Lake, n: u32, what: &str) -> Result<()> {
 
 /// The newest format a node knows, from what it said (`headers`; a node that says nothing is from
 /// before formats: 0).
-pub fn said(headers: &axum::http::HeaderMap) -> (String, u32) {
+pub fn said(headers: &http::HeaderMap) -> (String, u32) {
     let get = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
     (get("x-pondra-version").unwrap_or_default(), get("x-pondra-format").and_then(|f| f.parse().ok()).unwrap_or(0))
 }

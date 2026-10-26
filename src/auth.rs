@@ -129,6 +129,7 @@ pub fn as_user() -> Option<String> { current().filter(|p| p.access.is_some()).ma
 /// elsewhere still opens the console: a page is shown in the user's tab, never to the page that
 /// linked it, and no GET changes anything. `own` is the node's address (`--advertise`). Some(why):
 /// refuse.
+#[cfg(feature = "doors")]
 pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: Option<std::net::SocketAddr>, own: &str) -> Option<String> {
     let header = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_ascii_lowercase);
     let host = header("host").unwrap_or_default();
@@ -154,6 +155,7 @@ pub fn cross_site(h: &axum::http::HeaderMap, method: &axum::http::Method, from: 
 
 /// A request from this machine by a name that isn't this machine's: a page may have pointed its name here (DNS
 /// rebinding). An address, `localhost` or this machine's own name is fine.
+#[cfg(feature = "doors")]
 fn rebinding(host: &str, from: Option<std::net::SocketAddr>, own: &str) -> Option<String> {
     let name = host.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(host, |(n, _)| n);
     let name = name.trim_start_matches('[').trim_end_matches(']');

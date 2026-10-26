@@ -413,7 +413,7 @@ async fn retyped_meta(spec: &Spec) -> Result<Option<TableMeta>> {
 async fn resolve(lake: &Lake, spec: &Spec) -> Result<TableMeta> {
     match spec.format.as_str() {
         "kafka" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::kafka_client::resolve(lake, &spec.urls[0]).await? }),
-        "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
+        "share" => return Ok(TableMeta { ext: Some(spec.clone()), ..crate::sharing_client::read(lake, spec).await? }), // (its files' links are the provider's: ADR-046)
         "delta" | "iceberg" => {
             let (mut m, d) = match spec.format.as_str() {
                 "delta" => (table_meta(crate::read_delta::resolve(lake, &crate::ddl::full(&spec.urls[0])?, crate::ext_names::version(spec)?).await?), None), // (a folder named relatively: from where the node runs)
@@ -671,7 +671,7 @@ pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTr
     ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
     let mut options = options;
     if kind == "share" {
-        options = crate::sharing::accept(lake, name, url, options).await?; // (its token kept as a secret)
+        options = crate::sharing_client::accept(lake, name, url, options).await?; // (its token kept as a secret)
     }
     let iceberg_only = ["endpoint_type", "access_delegation_mode"];
     ensure!(kind == "iceberg" || !options.keys().any(|k| iceberg_only.contains(&k.as_str())), "ENDPOINT_TYPE and ACCESS_DELEGATION_MODE are an Iceberg REST catalog's");

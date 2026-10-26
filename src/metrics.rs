@@ -1,6 +1,10 @@
-//! `GET /metrics`: this node's counters and the lake's tables, in Prometheus' text format.
+//! This node's counters, which every form keeps, and `GET /metrics` (a door: `render`), which says them and the lake's
+//! tables in Prometheus' text format.
+#[cfg(feature = "doors")]
 use crate::server::App;
+#[cfg(feature = "doors")]
 use crate::store::{table_key, TableMeta};
+#[cfg(feature = "doors")]
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -62,7 +66,7 @@ pub fn job_failed(job: &str) {
 /// jemalloc's count of what it holds, when it keeps one (built with its statistics: the `heap-profile` build), else
 /// nothing. Beside the process's resident memory it says whether the heap grew or pages were held, and how much of
 /// the process is outside jemalloc (C libraries' malloc, thread stacks): reviews/soak-heap-0fa48fb.md.
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))]
 pub fn allocator() -> Vec<(&'static str, u64)> {
     use crate::jemalloc::{read, write};
     if !write(c"epoch", 1u64) {
@@ -71,12 +75,13 @@ pub fn allocator() -> Vec<(&'static str, u64)> {
     [("allocated", c"stats.allocated"), ("active", c"stats.active"), ("resident", c"stats.resident"), ("metadata", c"stats.metadata"), ("retained", c"stats.retained")]
         .into_iter().filter_map(|(k, name)| read::<usize>(name).map(|v| (k, v as u64))).collect()
 }
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(all(feature = "doors", not(all(target_os = "linux", target_env = "gnu"))))]
 pub fn allocator() -> Vec<(&'static str, u64)> { vec![] }
 
 /// Each background job and how many times it has failed (for `/metrics` and `/stats`).
 pub fn failures() -> Vec<(&'static str, u64)> { BG_FAILS.iter().map(|(k, c)| (*k, c.load(Relaxed))).collect() }
 
+#[cfg(feature = "doors")]
 pub async fn render(app: &App) -> anyhow::Result<String> {
     let mut out = String::new();
     let mut metric = |name: &str, kind: &str, help: &str, samples: &[(String, f64)]| {

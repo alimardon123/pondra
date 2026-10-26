@@ -116,7 +116,7 @@ fn parse(w: &mut Words) -> Result<Change> {
             }
             match kind.as_str() {
                 "share" => Change::CreateShare { name, comment, if_not_exists },
-                _ => Change::CreateRecipient { name, comment, expires_secs, if_not_exists, endpoint: crate::sharing::endpoint() },
+                _ => Change::CreateRecipient { name, comment, expires_secs, if_not_exists, endpoint: crate::sharing_client::endpoint() },
             }
         }
         ("drop", _) => {
@@ -176,7 +176,7 @@ fn parse(w: &mut Words) -> Result<Change> {
             w.expect("token")?;
             let expires_secs = if w.is("expires") { w.expect("in")?; Some(span(&w.string()?)?) } else { None };
             w.done()?;
-            Change::RotateToken { name, expires_secs, endpoint: crate::sharing::endpoint() }
+            Change::RotateToken { name, expires_secs, endpoint: crate::sharing_client::endpoint() }
         }
         _ => bail!("not a statement about shares"),
     })

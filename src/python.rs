@@ -63,7 +63,7 @@ async fn exe() -> Result<String> {
 }
 
 /// Where the console's choice of Python is kept on this machine (beside its settings).
-fn kept_choice() -> Option<std::path::PathBuf> { crate::console::settings_dir().map(|d| d.join("python.txt")) }
+fn kept_choice() -> Option<std::path::PathBuf> { crate::temp::settings_dir().map(|d| d.join("python.txt")) }
 
 /// The Pythons this machine has, the likeliest first: `$PONDRA_PYTHON`, the one chosen before, the
 /// one beside this binary (pip put it there, a virtualenv's), those on the PATH, Windows' `py`

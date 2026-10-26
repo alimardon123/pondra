@@ -4,7 +4,7 @@
 //! The join order (`optimize::JoinOrder`) divides by it: a join on a key with few values multiplies rows, one on a key
 //! with many doesn't. A column's range bounded that before, which says nothing about a string, and little about a key
 //! spread over a wide range.
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 use crate::store::{DataFile, TableMeta};
 use base64::Engine;
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
@@ -57,7 +57,7 @@ fn registers(text: &str) -> Option<Vec<u8>> {
 
 /// Fold new files' sketches into their table's (the files keep none: a table's entry lists up
 /// to 128 files, and each would carry a sketch of every column).
-#[cfg(feature = "server")]
+#[cfg(feature = "lake")]
 pub fn add(meta: &mut TableMeta, files: &mut [DataFile]) {
     for f in files {
         for (column, sketch) in std::mem::take(&mut f.sketch) {
