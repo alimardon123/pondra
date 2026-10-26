@@ -334,10 +334,13 @@ fn stacked<'a>(plan: &'a LogicalPlan, nodes: &mut Vec<&'a LogicalPlan>) -> Resul
             nodes.push(plan);
             stacked(&a.input, nodes)
         }
-        LogicalPlan::Limit(_) => bail!("a LIMIT looks across every key"),
-        LogicalPlan::Sort(s) if s.fetch.is_some() => bail!("a LIMIT looks across every key"),
+        LogicalPlan::Limit(_) => bail!("a LIMIT looks across every key (ORDER BY … LIMIT keeps the first rows of all of them)"),
+        LogicalPlan::Sort(s) if s.fetch.is_some() => bail!("a LIMIT looks across every key (ORDER BY … LIMIT keeps the first rows of all of them)"),
         LogicalPlan::Sort(_) => bail!("an ORDER BY under the view's top looks across its rows"),
         LogicalPlan::Distinct(_) => bail!("DISTINCT looks across its rows"),
+        LogicalPlan::Join(_) if nodes.iter().any(|n| matches!(n, LogicalPlan::Window(_))) => {
+            bail!("it reads more than one table: windows over a join are kept by key only over tables joined on every column they partition by, with no keyed table or outer join")
+        }
         LogicalPlan::Join(_) => bail!("it reads more than one table"),
         _ => bail!("it reads its rows another way than a key's own"),
     }
