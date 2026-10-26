@@ -1503,10 +1503,15 @@ impl Lake {
     }
 
     /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions.
+    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
+    /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        functions(config, self.rt.clone())
+        let ctx = functions(config, self.rt.clone());
+        #[cfg(target_arch = "wasm32")]
+        let ctx = crate::in_task::planned(ctx);
+        ctx
     }
 
     /// Query memory in use, and the limit.
