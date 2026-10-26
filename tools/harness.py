@@ -5112,7 +5112,8 @@ def copies():
     every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
     the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
     in text and CSV; COPY TO piped back gives the rows. The end marker `\\.` ends the data in any chunk, a blank CSV
-    line is a row, and a number out of its type's range is 22003."""
+    line is a row, and a number out of its type's range is 22003. A row past 64 MB is refused (54000) as it comes, and the
+    connection goes on; 40 MB of rows in 64 KB frames loads every row."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
     lake, pg = new_lake(), A.port + 10
     node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
@@ -5227,6 +5228,38 @@ def copies():
                 cp.write(filler[i:i + (1 << 20)])
         big_rows = sorted(r[0] for r in c.execute("SELECT a FROM big").fetchall())
     big_ok = big_rows == sorted(f"row {i}" for i in range(10))
+    # A row past 64 MB is refused (54000) as the frame that passes it comes, and the connection goes on. Both cases are
+    # sent in 64 KB frames: a text line of 70 MB with no newline, then CSV with a quote opened and never closed over 70 MB
+    # of lines (no row ends inside the quotes). Then 40 MB of rows, every one of which must load.
+    frame, longs, bulk = 64 << 10, {}, {}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        cur.execute("CREATE TABLE longtext (a text)")
+        cur.execute("CREATE TABLE longcsv (a text)")
+        cur.execute("CREATE TABLE bulk40 (id BIGINT, name VARCHAR, amount DOUBLE)")
+        for key, copy_sql, data in [("text", "COPY longtext FROM STDIN", b"x" * (70 << 20)),
+                                    ("csv", "COPY longcsv FROM STDIN WITH (FORMAT csv)", b'"' + b"x,y\n" * ((70 << 20) // 4))]:
+            t0 = time.time()
+            try:
+                with cur.copy(copy_sql) as cp:
+                    for k in range(0, len(data), frame):
+                        cp.write(data[k:k + frame])
+                longs[key] = "accepted"
+            except psycopg.Error as e:
+                longs[key] = e.sqlstate
+            longs[f"{key}_secs"] = round(time.time() - t0, 2)
+            longs[f"{key}_then_select_1"] = c.execute("SELECT 1").fetchone()[0]
+        body, n = bytearray(), 0
+        while len(body) < (40 << 20):
+            body += f"{n}\tname {n}\t{n * 0.5}\n".encode()
+            n += 1
+        t0 = time.time()
+        with cur.copy("COPY bulk40 FROM STDIN") as cp:
+            for k in range(0, len(body), frame):
+                cp.write(bytes(body[k:k + frame]))
+        bulk.update(secs=round(time.time() - t0, 2), rows_sent=n, rowcount=cur.rowcount,
+                    loaded=list(c.execute("SELECT count(*), CAST(sum(id) AS BIGINT), max(id) FROM bulk40").fetchone()))
+    bulk_ok = bulk["loaded"] == [n, n * (n - 1) // 2, n - 1] and bulk["rowcount"] == n
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
@@ -5236,11 +5269,16 @@ def copies():
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
               "DECIMAL as NUMERIC, text and binary": numeric_ok,
-              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok}
+              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok,
+              "COPY FROM a row past 64 MB, text (70 MB, no newline) in 64 KB frames: refused with 54000 as it comes, and the connection runs SELECT 1 after":
+                  longs["text"] == "54000" and longs["text_then_select_1"] == 1 and longs["text_secs"] <= 10,
+              "COPY FROM a row past 64 MB, CSV (a quote open over 70 MB of lines) in 64 KB frames: refused with 54000, and the connection runs SELECT 1 after":
+                  longs["csv"] == "54000" and longs["csv_then_select_1"] == 1 and longs["csv_secs"] <= 10,
+              "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok}
     out = {"passed": all(checks.values()), "checks": checks,
            "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
                                 "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
-                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched}}
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
