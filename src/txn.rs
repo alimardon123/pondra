@@ -769,12 +769,6 @@ fn conflict(table: &str) -> anyhow::Error {
     crate::codes::coded("40001", format!("could not serialize access due to concurrent update of {table}: try the transaction again"))
 }
 
-/// The rows of an INSERT as the table takes them, worked out as of commit `at` by `query` (`write::rows_of`) and shaped once by
-/// the table's rules (NOT NULL, CHECK, the types), as `How::Load`: no key is looked at here. `stored` is the table as it is kept.
-async fn checked_rows(lake: &Lake, name: &str, stored: &Arc<TableMeta>, query: &str, at: u64, files: bool) -> Result<RecordBatch> {
-    Ok(crate::write::rows_of(lake, lake, &stored.rules()?, name, query, Some(at), files, crate::rules::How::Load).await?.into_rows())
-}
-
 /// An INSERT's rows, worked out as of a read point and, under READ COMMITTED, with the keys they write locked (ADR-067 §3).
 /// The query may have read a key another transaction changed while the lock waited (a counter's `n + 1`, an upsert's
 /// `ON CONFLICT`): then the rows are worked out again as of the commit the locks were granted at (`passes`). The rows are
@@ -835,9 +829,7 @@ async fn point(l: &Locks<'_>, key: &[String], set_to: &[(String, String)], snaps
 async fn upsert_point(l: &Locks<'_>, stored: &Arc<TableMeta>, m: &crate::change::Merge, p: &crate::change::PointUpsert, snapshot: u64) -> Result<Option<Changed>> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let Some(query) = m.upsert_query() else { return Ok(None) };
-    let files = crate::change::FILES.try_with(|f| *f).unwrap_or(false); // (as the planned MERGE reads its files: `change::session`)
-    let sql = crate::write::whole_rows_of(lake, name, stored, &p.given, query).await?;
-    let proposed = checked_rows(lake, name, stored, &sql, snapshot, files).await?;
+    let proposed = crate::change::proposed_rows(lake, name, stored, &stored.rules()?, &p.given, query, snapshot).await?;
     let inserted = inserted_row(meta, &proposed)?;
     let Ok(mut keys) = keys_of(&proposed, &meta.key) else { return Ok(None) };
     let Some(key) = keys.pop() else { return Ok(None) };

@@ -91,13 +91,6 @@ fn is_default(e: &ast::Expr) -> bool { matches!(e, ast::Expr::Identifier(i) if i
 /// `INSERT INTO t VALUES (…, DEFAULT, …)`: the query says DEFAULT somewhere.
 pub(crate) fn says_default(q: &ast::Query) -> bool { matches!(q.body.as_ref(), ast::SetExpr::Values(v) if v.rows.iter().any(|r| r.iter().any(is_default))) }
 
-/// Does this query's `VALUES` say DEFAULT somewhere (`says_default`), read from its text? False if it doesn't parse.
-pub(crate) fn says_default_text(query: &str) -> bool {
-    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
-    let Ok(q) = Parser::new(&GenericDialect {}).try_with_sql(query).and_then(|mut p| p.parse_query()) else { return false };
-    says_default(&q)
-}
-
 /// `INSERT INTO table (names) query` as a query of all its `columns`, in order (`whole_rows`; a
 /// temporary table's too, `temp.rs`).
 pub fn rows_for(table: &str, columns: &[String], names: &[String], query: &str, default: &dyn Fn(&str) -> Option<String>) -> Result<String> {
