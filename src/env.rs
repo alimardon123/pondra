@@ -217,6 +217,16 @@ pub fn parse<T: FromStr>(name: &str) -> Option<T> {
     get(name)?.trim().parse().ok()
 }
 
+/// The cores this process has: the machine's (its cgroup's, as the standard library reads them), else 2; 1 on a page, which
+/// has one thread. Every count of threads, turns or partitions starts from it (`PONDRA_CORES` is the query planner's own,
+/// `store::partitions`).
+pub fn cores() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    return 1;
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::available_parallelism().map_or(2, |n| n.get())
+}
+
 /// A setting read as a `T`, else `default`.
 pub fn or<T: FromStr>(name: &str, default: T) -> T {
     parse(name).unwrap_or(default)

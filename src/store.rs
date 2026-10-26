@@ -2787,8 +2787,13 @@ pub fn crash_rolled(point: &str) -> bool {
 pub fn partitions() -> usize {
     static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
     *PARTS.get_or_init(|| {
-        let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
-        cores.min(memory_limit() / (24 << 20)).max(2)
+        #[cfg(target_arch = "wasm32")]
+        return 1; // (a page has one thread and no runtime to start a partition's task on: `in_task.rs`)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(crate::env::cores);
+            cores.min(memory_limit() / (24 << 20)).max(2)
+        }
     })
 }
 

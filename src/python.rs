@@ -258,7 +258,6 @@ struct Pool {
 
 crate::per_node!(static POOLS: Mutex<HashMap<String, Arc<Pool>>> = Default::default());
 
-fn cores() -> usize { std::thread::available_parallelism().map_or(2, |n| n.get()) }
 
 /// The pool for these packages, installed on this node the first time they are asked for.
 async fn pool(packages: &str) -> Result<Arc<Pool>> {
@@ -270,8 +269,8 @@ async fn pool(packages: &str) -> Result<Arc<Pool>> {
         true => None,
         false => Some(install(&key).await?),
     };
-    let procedures = crate::env::or::<u64>("PONDRA_PROCEDURES", 4 * cores() as u64).max(1) as usize;
-    let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false) });
+    let procedures = crate::env::or::<u64>("PONDRA_PROCEDURES", 4 * crate::env::cores() as u64).max(1) as usize;
+    let fresh = Arc::new(Pool { path, idle: Mutex::new(vec![]), functions: Arc::new(Semaphore::new(crate::env::cores())), procedures: Arc::new(Semaphore::new(procedures)), busy: AtomicUsize::new(0), reaping: AtomicBool::new(false) });
     Ok(POOLS.lock().unwrap().entry(key).or_insert(fresh).clone())
 }
 
