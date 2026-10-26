@@ -660,6 +660,8 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
         Ok(node) => node,
         // (its leader is alive and doesn't answer from here: the write goes through the bucket's inbox)
         Err(e) if e.downcast_ref::<node::Unreached>().is_some() => return through_inbox(dir, &query, attached).await,
+        // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
+        Err(e) if write::fenced(&e) && write::tries() < 5 => run_again("fenced while starting"),
         Err(e) => return Err(e),
     };
     // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
@@ -680,14 +682,24 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())]);
+            run_again("fenced while writing");
         }
         return Err(err);
+    }
+    // (fenced out as it finished, before what it wrote was durable: run again, and the job says whether it was recorded)
+    if finished.as_ref().is_err_and(|e| write::fenced(e) && write::tries() < 5) {
+        run_again("fenced while finishing");
     }
     finished?;
     print!("{heard}");
     println!("{body}");
     Ok(())
+}
+
+/// A `pondra sql` guest fenced out by a newer writer runs again with the same job, so whoever records its write
+/// records it once (`write::deliver` does the same), one more try each time.
+fn run_again(why: &str) -> ! {
+    crate::node::restart_with(why, &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())])
 }
 
 /// A write whose lake's leader is alive but doesn't answer from this machine's guest start (`node::Unreached`): it is
