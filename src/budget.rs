@@ -9,6 +9,10 @@
 //! A branch's reads of its base's objects (ADR-047) take a turn of a share too: a quarter of the
 //! node's turns, halving when the store asks as the bucket's do. A database cloned from prod then
 //! never reads prod's files as hard as prod's own nodes may, on one server or another.
+//!
+//! A claimer's mark and the inbox's bell (`urgent`) take turns of their own, a few: a node whose
+//! turns are all out on a scan still marks its term within a second or two of a ring, so a writer
+//! elsewhere never takes it for gone (`cluster::deaf`).
 use object_store::client::{ClientOptions, HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -59,6 +63,9 @@ impl Gate {
         self.calm.store(0, Relaxed);
         let cap = self.cap.load(Relaxed);
         let less = cap - (cap / 2).max(4).min(cap);
+        if less == 0 {
+            return; // (as few as there can be: the urgent turns, `urgent_gate`, or a bucket's already down to four)
+        }
         self.cap.fetch_sub(less, Relaxed);
         let taken = self.turns.forget_permits(less); // (those free now; the rest as they come back)
         self.owed.fetch_add(less - taken, Relaxed);
@@ -91,10 +98,12 @@ impl Gate {
 pub struct Budget {
     root: String,
     gate: Arc<Gate>,
+    urgent: Arc<Gate>,
     inner: ReqwestConnector,
 }
 
 crate::per_node!(static GATES: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
+crate::per_node!(static URGENT: Mutex<HashMap<String, Arc<Gate>>> = Default::default());
 crate::per_node!(
     /// Each bucket's shares: the path of another lake in it (`a/b`), and its turns.
     static SHARES: Mutex<HashMap<String, Vec<(String, Arc<Gate>)>>> = Default::default());
@@ -144,16 +153,23 @@ pub fn turns() -> Vec<(String, String, usize, usize)> {
 /// The gate of the store at `root`: one per node, whatever opens it.
 fn gate(root: &str) -> Arc<Gate> { GATES.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(start()))).clone() }
 
+/// The turns of the store at `root` that say who is alive: a claimer's mark (`cluster/alive/…`) and the inbox's bell,
+/// rung and listened to (`cluster::listen`), at most two requests a second a lake. Four, whatever the store asks.
+fn urgent_gate(root: &str) -> Arc<Gate> { URGENT.lock().unwrap().entry(root.to_string()).or_insert_with(|| Arc::new(Gate::new(4))).clone() }
+
+/// Is this request one that says who is alive (`urgent_gate`)? Its path is the key's, under the bucket's name or not.
+fn urgent(path: &str) -> bool { path.contains("/cluster/alive/") || path.ends_with("/inbox/bell") }
+
 impl Budget {
     /// The budget of the bucket at `root` (`s3://bucket`): one per node, whatever opens it.
     pub fn of(root: &str) -> Budget {
-        Budget { root: root.to_string(), gate: gate(root), inner: ReqwestConnector::default() }
+        Budget { root: root.to_string(), gate: gate(root), urgent: urgent_gate(root), inner: ReqwestConnector::default() }
     }
 }
 
 /// An HTTP client of the store at `root` that takes its turns (a lake a node serves: `served.rs`).
 pub fn client(root: &str, inner: reqwest::Client) -> HttpClient {
-    HttpClient::new(Turns { root: root.to_string(), gate: gate(root), inner: HttpClient::new(inner) })
+    HttpClient::new(Turns { root: root.to_string(), gate: gate(root), urgent: urgent_gate(root), inner: HttpClient::new(inner) })
 }
 
 /// When the bucket at `root` last answered this node with anything but a server error (ms; 0:
@@ -164,7 +180,7 @@ pub fn answered(root: &str) -> u64 {
 
 impl HttpConnector for Budget {
     fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        Ok(HttpClient::new(Turns { root: self.root.clone(), gate: self.gate.clone(), inner: self.inner.connect(options)? }))
+        Ok(HttpClient::new(Turns { root: self.root.clone(), gate: self.gate.clone(), urgent: self.urgent.clone(), inner: self.inner.connect(options)? }))
     }
 }
 
@@ -172,6 +188,7 @@ impl HttpConnector for Budget {
 struct Turns {
     root: String,
     gate: Arc<Gate>,
+    urgent: Arc<Gate>,
     inner: HttpClient,
 }
 
@@ -179,18 +196,20 @@ struct Turns {
 impl HttpService for Turns {
     async fn call(&self, req: HttpRequest) -> Result<HttpResponse, HttpError> {
         // (the share's turn first: a request waiting on it holds none of the bucket's)
-        let share = shared(&self.root, req.uri().path());
+        let urgent = urgent(req.uri().path());
+        let share = if urgent { None } else { shared(&self.root, req.uri().path()) };
         let lent = match &share {
             Some(s) => Some(s.take().await),
             None => None,
         };
-        let turn = self.gate.take().await;
+        let gate = if urgent { &self.urgent } else { &self.gate };
+        let turn = gate.take().await;
         let answer = self.inner.execute(req).await;
-        self.gate.heard(&answer);
+        gate.heard(&answer);
         if answer.as_ref().is_ok_and(|r| !matches!(r.status().as_u16(), 500 | 502 | 504)) {
             self.gate.answered.store(crate::log::now_ms(), Relaxed);
         }
-        self.gate.hand_back(turn);
+        gate.hand_back(turn);
         if let (Some(s), Some(t)) = (&share, lent) {
             s.heard(&answer);
             s.hand_back(t);
@@ -214,6 +233,18 @@ mod tests {
             g.calm();
         }
         assert_eq!((g.cap.load(Relaxed), g.turns.available_permits()), (33, 33));
+    }
+
+    #[test]
+    fn who_is_alive_takes_turns_of_its_own() {
+        assert!(urgent("/b/lakes/prod/cluster/alive/00000000000000000003")); // (path-style)
+        assert!(urgent("/cluster/alive/00000000000000000003")); // (virtual-hosted, a lake at the bucket's root)
+        assert!(urgent("/b/lakes/prod/inbox/bell"));
+        assert!(!urgent("/b/lakes/prod/inbox/0b1c.insert") && !urgent("/b/lakes/prod/cluster/term/00000000000000000003"));
+        assert!(!urgent("/b/lakes/prod/data/t/a.parquet"));
+        let g = Gate::new(4);
+        g.slow_down(); // (a ring refused, 429, as R2 refuses a key's second write in a second: four stay)
+        assert_eq!((g.cap.load(Relaxed), g.turns.available_permits()), (4, 4));
     }
 
     #[test]

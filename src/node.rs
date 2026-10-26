@@ -551,7 +551,7 @@ impl Node {
             every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
         }
         if let (true, Some(seq)) = (lives, &app.seq) {
-            inbox::serve(lake.clone(), seq.clone(), app.lock.clone()); // writers that can't reach us
+            inbox::serve(lake.clone(), seq.clone(), app.lock.clone(), cluster.rings()); // writers that can't reach us
         }
         if leader && lives {
             // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot

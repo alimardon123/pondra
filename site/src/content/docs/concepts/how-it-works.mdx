@@ -181,7 +181,10 @@ old leader, so once it is replaced it can't write. After a full shutdown, the fi
 the lake leads at once.
 
 The leader rewrites `cluster/alive/N` every 10 seconds, so a machine outside the cluster can tell a
-live leader from a dead one.
+live leader from a dead one. A writer that can't reach the leader rings a bell in the lake, and a
+live leader rewrites its mark within a second or two. One that doesn't in 5 seconds is gone, killed
+or lost with its machine, and the writer takes over. On the leader's own machine a writer knows at
+once, from a file the leader holds open.
 
 ## Queries across nodes
 
