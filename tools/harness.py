@@ -3526,6 +3526,10 @@ def schemas():
     st, code, body = answer("INSERT INTO pondra.runs (id) VALUES (1)")
     checks["a write into pondra.runs: refused 25006, in the system's words (read-only), with no CREATE SCHEMA hint"] = \
         st != 200 and code == "25006" and "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only" in body and "CREATE SCHEMA" not in body
+    # nor a database: ATTACH … AS pondra, CREATE DATABASE pondra (a branch's too) would hide the same tables, and are refused before anything is made
+    pondra_dbs = [answer(s) for s in ("ATTACH '/tmp/pondra-harness-never-made' AS pondra", "CREATE DATABASE Pondra", "CREATE DATABASE pondra CLONE lake")]
+    checks["ATTACH … AS pondra and CREATE DATABASE pondra (CLONE too) are refused 42939; pondra.tasks still answers"] = \
+        all(st != 200 and code == "42939" and "system's schema" in body for st, code, body in pondra_dbs) and isinstance(q("SELECT * FROM pondra.tasks"), list)
     q("CREATE TABLE t (k BIGINT, v DOUBLE)", 1)
     q("CREATE TABLE dbo.t (k BIGINT, v DOUBLE)", 2)
     q("INSERT INTO t VALUES (1, 1.0), (2, 2.0)", 1)

@@ -27,6 +27,15 @@ pub const SYSTEM_SCHEMA: &str = "pondra";
 /// What a schema that is not there says (`resolve`, `new_name`): `CREATE SCHEMA` makes one, but pondra is the system's and no one
 /// makes it, so its words name its tables (a write into them is read-only). `path::schema_in` says the same for pondra, and
 /// names the database for any other schema.
+/// Refuses `name` (42939) for a schema, a database or another engine's catalog when it is the system's schema's: any of
+/// them called pondra would hide `pondra.runs` and the rest. `then` says what to do instead.
+pub(crate) fn not_system(name: &str, then: &str) -> Result<()> {
+    match name.eq_ignore_ascii_case(SYSTEM_SCHEMA) {
+        true => Err(crate::codes::coded("42939", format!("pondra is the system's schema (pondra.runs, pondra.tasks, …): {then}"))),
+        false => Ok(()),
+    }
+}
+
 pub fn no_schema(s: &str) -> String {
     match s.eq_ignore_ascii_case(SYSTEM_SCHEMA) {
         true => "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only".into(),
@@ -376,9 +385,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         }
         Ddl::CreateSchema { name, if_not_exists } => {
             check(&name)?;
-            if name.eq_ignore_ascii_case(SYSTEM_SCHEMA) {
-                return Err(crate::codes::coded("42939", "pondra is the system's schema (pondra.runs, pondra.tasks, …): name the schema another way"));
-            }
+            not_system(&name, "name the schema another way")?;
             if has_schema(lake, &name).await? {
                 ensure!(if_not_exists, "schema {name} already exists");
                 return Ok(j!({"schema": name, "unchanged": true}));
@@ -555,6 +562,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Users(c) => crate::users::apply(lake, c).await,
         Ddl::Shares(c) => crate::shares::apply(lake, c).await,
         Ddl::AttachOutside { name, url, kind, options } => {
+            not_system(&name, "attach it under another name")?;
             ensure!(!has_schema(lake, &name).await?, "a schema here is called {name}: attach under another name");
             ensure!(lake.cat.get::<Attachment>(&attachment_key(&name)).await?.is_none(), "{name} is an attached lake: attach under another name");
             crate::ext::attach(lake, &name, &url, &kind, options).await
@@ -578,6 +586,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
 /// schema's or another engine's tables'), and (`fresh`: one about to be made) no database's.
 pub async fn attachable(lake: &Lake, name: &str, fresh: bool) -> Result<()> {
     database_name(name)?;
+    not_system(name, "give the database another name")?;
     ensure!(name != lake_name(lake), "this lake is called {name}: attach the other under another name");
     ensure!(!has_schema(lake, name).await?, "a schema here is called {name}: attach the other under another name");
     ensure!(!crate::ext::is_attached(lake, name).await?, "{name} is attached already, as another engine's tables");
@@ -1612,5 +1621,10 @@ mod tests {
         assert_eq!(no_schema("sales"), "no schema sales (CREATE SCHEMA sales)");
         assert_eq!(no_schema("Pondra"), "pondra is the system's schema: its tables (pondra.runs, pondra.tasks, …) are read-only");
         assert_eq!(no_schema("PONDRA"), no_schema("pondra"));
+        // (a schema, a database or another engine's catalog called pondra would hide the system's tables)
+        for name in ["pondra", "Pondra", "PONDRA"] {
+            assert_eq!(crate::codes::of(&not_system(name, "x").unwrap_err()), "42939", "{name}");
+        }
+        not_system("pondras", "x").unwrap();
     }
 }
