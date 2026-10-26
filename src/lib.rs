@@ -184,6 +184,7 @@ mod rules;
 #[cfg(feature = "server")] mod spill;
 #[cfg(feature = "server")] mod spmd;
 #[cfg(feature = "server")] mod status;
+#[cfg(feature = "server")] mod kv;
 #[cfg(feature = "server")] mod store;
 #[cfg(feature = "server")] mod sync;
 #[cfg(feature = "server")] mod sys;

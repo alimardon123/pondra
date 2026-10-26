@@ -19,8 +19,7 @@ use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use object_store::ClientConfigKey;
 use object_store::{local::LocalFileSystem, path::Path, prefix::PrefixStore, ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use slatedb::config::{CompactorOptions, DbReaderOptions, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
-use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
+use crate::kv::{self, slate, Kv, Written};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, Weak};
@@ -1176,12 +1175,16 @@ impl Lake {
         }
         // The catalog's own files go on the SSD tier too (next to the lake's objects), so catalog
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
-        let cache = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
-        let cache = ObjectStoreCacheOptions { root_folder: cache, max_cache_size_bytes: Some(2 << 30), cache_on_flush: true, cache_on_compaction: true, ..Default::default() };
+        let cache_dir = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
-                true => Catalog::writer(store.clone(), cache, local).await?,
-                false => match Catalog::opened(store.clone(), streamed, cache, poll).await {
+                true => {
+                    let t0 = std::time::Instant::now();
+                    let kv = slate::Writer::open(store.clone(), cache_dir, local).await?;
+                    trace("the catalog's writer open", t0);
+                    Catalog::writer(Arc::new(kv), t0).await?
+                }
+                false => match Catalog::opened(store.clone(), streamed, slate::Reader::open(store.clone(), streamed, cache_dir, poll)).await {
                     Ok(cat) => cat,
                     // (no catalog at all: say so, rather than the database's own words for it)
                     Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
@@ -1216,11 +1219,11 @@ impl Lake {
     /// Both loops hold the lake weakly: the writes' sender is the lake's own (`Catalog::writes`), so
     /// a strong hold would keep a lake opened in a process (a backup taken in it) for ever.
     async fn commits(me: std::sync::Weak<Self>, mut writes: mpsc::UnboundedReceiver<Write>) {
-        let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<WriteHandle>, u64)>();
+        let (to_bucket, mut in_bucket) = mpsc::unbounded_channel::<(Arc<dyn Written>, u64)>();
         let lake = me.clone();
         crate::panics::spawn(async move {
             while let Some((handle, id)) = in_bucket.recv().await {
-                if let Err(e) = handle.await_durable().await {
+                if let Err(e) = handle.durable().await {
                     eprintln!("catalog commit failed: {e}");
                     crate::cluster::restart("a catalog commit failed");
                 }
@@ -1246,7 +1249,7 @@ impl Lake {
                     break;
                 }
                 tokio::select! {
-                    r = handle.await_durable() => {
+                    r = handle.durable() => {
                         if let Err(e) = r {
                             eprintln!("catalog commit failed: {e}");
                             crate::cluster::restart("a catalog commit failed");
@@ -1867,10 +1870,10 @@ impl Overlay {
     }
 }
 
-/// The catalog is a SlateDB key-value store inside the lake.
-/// One process holds the writer (SlateDB fences out any other); any number can read.
+/// The catalog is a key-value store inside the lake (`kv`: SlateDB on a node).
+/// One process holds the writer (the store fences out any other); any number can read.
 pub struct Catalog {
-    db: Db_,
+    kv: Arc<dyn Kv>,
     order: tokio::sync::Mutex<u64>, // leader: next commit id; held while writing, so ids follow write order
     flushed: AtomicU64,             // leader: `order` at the last memtable flush
     flushed_at: Mutex<Instant>,     // leader: when the catalog last had nothing unflushed (`checkpoint`)
@@ -1896,14 +1899,11 @@ pub struct Catalog {
     streamed: AtomicU64,          // the last commit streamed to us; with the view: the whole lake
     hold: AtomicU64,              // commits before this one never arrived: read from the view alone
     follows: bool,                // follower / read-only node that gets the commit stream
-    upkeep: Option<Upkeep>,       // leader: the catalog's compactor and collector, stopped by `close`
     mirror: AtomicBool,           // the overlay holds the whole catalog (but inline data): read only it
     loud: AtomicU64,              // the last commit a remembered answer may depend on (`quiet`, `version`)
     metas: Mutex<Parsed>,         // tables' entries as parsed (`parsed`)
     pub frozen: AtomicBool,       // a backup (ADR-070): written only by its runs (`backup::may_write`)
     closing: AtomicBool,          // its own node's stop closed it (`close`): an error from it is no fence
-    flush_now: bool,              // a local lake's writer: each write's WAL flushed at once (`write`)
-    blocks: Vec<Blocks>,          // its block caches (`blocks`), for what they hold
 }
 
 /// A scan in progress: the streamed changes it may still lay over its (older) view stay.
@@ -1922,12 +1922,7 @@ impl Drop for Pin<'_> {
 }
 
 type Recent = Arc<Mutex<(VecDeque<(Instant, Frame)>, usize)>>;
-type Write = (Arc<WriteHandle>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
-
-enum Db_ {
-    Writer(Db),
-    Reader(Arc<DbReader>), // (shared, so a catalog let go can still close it: `Drop for Catalog`)
-}
+type Write = (Arc<dyn Written>, Arc<Delta>, oneshot::Sender<()>, Instant); // (when it was handed to `commits`: `commit_stage`)
 
 /// One committed catalog write.
 pub struct Delta {
@@ -2046,15 +2041,6 @@ impl Frame {
     }
 }
 
-/// All entries of a scan.
-async fn collect(mut it: slatedb::DbIterator) -> Result<BTreeMap<String, Bytes>> {
-    let mut all = BTreeMap::new();
-    while let Some(kv) = it.next().await? {
-        all.insert(String::from_utf8(kv.key.to_vec())?, kv.value);
-    }
-    Ok(all)
-}
-
 fn next(f: &mut Bytes, n: usize) -> Result<Bytes> {
     anyhow::ensure!(f.len() >= n, "truncated frame");
     Ok(f.split_to(n))
@@ -2073,81 +2059,17 @@ pub fn trace(what: &str, since: std::time::Instant) {
 }
 
 crate::per_node!(
-    /// Has the node begun to serve? (Then the catalog's upkeep starts: `upkeep`.)
-    static SERVING: watch::Sender<bool> = watch::Sender::new(false));
+    /// Has the node begun to serve? (Then the catalog's upkeep starts: `kv::slate`.)
+    pub(crate) static SERVING: watch::Sender<bool> = watch::Sender::new(false));
 
 /// The node serves now (`main.rs`).
 pub fn serving() { SERVING.send_replace(true); }
-
-/// The catalog's blocks kept in memory: 32 MB of data and 32 MB of indexes and filters. SlateDB's
-/// own default is 512 and 128 MB, and the leader put every block it flushed in it, so a node under
-/// steady writes grew by the catalog's size until it held 640 MB for a cache it hardly reads:
-/// everything committed is in the overlay (`mirror`), and an inline segment's rows are read once
-/// and kept decoded (`Lake::tail`).
-/// The caches are moka's, as SlateDB's own are, but they say what they hold (`Catalog::cached`), so
-/// a node's own memory doesn't count them (`tools/soak.py`).
-fn blocks() -> (Arc<dyn slatedb::db_cache::DbCache>, [Blocks; 2]) {
-    let (data, meta) = (Blocks::new(32), Blocks::new(32));
-    let cache = slatedb::db_cache::SplitCache::new().with_block_cache(Some(Arc::new(data.clone()))).with_meta_cache(Some(Arc::new(meta.clone()))).build();
-    (Arc::new(cache), [data, meta])
-}
 
 /// DataFusion's caches of Parquet footers and of files' statistics (`Lake::kept`).
 type Footers = datafusion::execution::cache::default_cache::DefaultCache<object_store_df::path::Path, datafusion::execution::cache::cache_manager::CachedFileMetadataEntry>;
 type FileStatistics = datafusion::execution::cache::default_cache::DefaultCache<datafusion::execution::cache::TableScopedPath, datafusion::execution::cache::cache_manager::CachedFileMetadata>;
 
-/// One of the catalog's block caches (`blocks`): SlateDB's `MokaCache`, whose weight it can say.
-#[derive(Clone)]
-struct Blocks(moka::future::Cache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>);
-
-impl Blocks {
-    fn new(mb: u64) -> Self { Blocks(moka::future::Cache::builder().weigher(|_, v: &slatedb::db_cache::CachedEntry| v.size() as u32).max_capacity(mb << 20).build()) }
-}
-
-#[async_trait::async_trait]
-impl slatedb::db_cache::DbCache for Blocks {
-    async fn get_block(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
-    async fn get_index(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
-    async fn get_filter(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
-    async fn get_stats(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> { Ok(self.0.get(key).await) }
-    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) { self.0.insert(key, value).await }
-    async fn remove(&self, key: &slatedb::db_cache::CachedKey) { self.0.remove(key).await; }
-    fn entry_count(&self) -> u64 { self.0.entry_count() }
-}
-
-/// The catalog's compactor and garbage collector, as SlateDB runs them beside a writer, started
-/// once the node serves (or after 10 s: a `pondra sql` writer never does), so a cold start waits
-/// for neither (C5). A failure in either stops the node, as one in the writer would.
-fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) -> Upkeep {
-    let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
-    let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
-    let (c, g) = (compactor.clone(), gc.clone());
-    let started = crate::panics::spawn(async move {
-        let _ = tokio::time::timeout(Duration::from_secs(10), SERVING.subscribe().wait_for(|s| *s)).await;
-        if local {
-            crate::panics::task(unpin(store));
-        }
-        // (`try_join`, not `join`: the collector never ends, so `join` waited for it and never saw the compactor stop.
-        // The first failure of either one ends the wait here, and it takes the failure path below)
-        if let Err(e) = tokio::try_join!(c.run(), g.run()) {
-            // (a compactor fenced by a newer leader's is this node's step down, not a failure: it restarts and rejoins
-            // as a follower, as a fenced write does. Stopping there left a stale leader that woke gone: harness `fence`)
-            let e = fatal(e);
-            if crate::library::on() {
-                return crate::library::failed(format!("the catalog's compactor or garbage collector failed: {e}"));
-            }
-            eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
-            std::process::abort();
-        }
-    });
-    // (SlateDB doesn't export the collector's type, so how the two stop is kept as a future to run)
-    let stop = Box::pin(async move {
-        let _ = tokio::join!(compactor.stop(), gc.stop());
-    });
-    Upkeep(Mutex::new(Some((started, stop))))
-}
-
-/// A catalog let go stops what SlateDB runs for it: a reader's polling, a writer's flushing and its
+/// A catalog let go stops what its store runs for it: a reader's polling, a writer's flushing and its
 /// upkeep. SlateDB's tasks outlive its handles, so a lake opened for a moment (a branch's base, a
 /// lake detached, a node stopped in a host's process) went on reading its manifest four times a
 /// second for the life of the process. (`close` does the same and waits for it: `Node::stop`.)
@@ -2156,91 +2078,18 @@ impl Drop for Catalog {
         if tokio::runtime::Handle::try_current().is_err() {
             return; // (no runtime: it ended, and SlateDB's tasks with it)
         }
-        let db = match &self.db {
-            Db_::Writer(db) => Db_::Writer(db.clone()),
-            Db_::Reader(r) => Db_::Reader(r.clone()),
-        };
-        let upkeep = self.upkeep.take();
+        let kv = self.kv.clone();
         crate::panics::task(async move {
-            if let Some(upkeep) = upkeep {
-                upkeep.stop().await;
-            }
-            let _ = match db {
-                Db_::Writer(db) => db.close().await,
-                Db_::Reader(r) => r.close().await,
-            };
+            let _ = kv.close().await;
         });
     }
 }
 
-/// The catalog's upkeep, kept so a close can stop it. SlateDB runs the compactor and the collector
-/// in tasks of their own, which outlive the future that started them: stopped only with that
-/// future, they went on polling a closed lake (or one opened again) for the life of the process.
-struct Upkeep(Mutex<Option<(tokio::task::JoinHandle<()>, futures::future::BoxFuture<'static, ()>)>>);
-
-impl Upkeep {
-    /// Stops it, once: the task that starts the two first (so neither starts after this), then both.
-    async fn stop(&self) {
-        let taken = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        if let Some((started, stop)) = taken {
-            started.abort();
-            let _ = started.await;
-            stop.await;
-        }
-    }
-}
-
-/// SlateDB's compactor pins the files each compaction replaces with a checkpoint for 15 minutes
-/// (for a scan still reading them), whatever the collector is told: under a stream of small
-/// commits that is a GB of a local disk, and a small disk it filled stayed full that long. On a
-/// local disk every node polls its view every 250 ms and a scan takes far less than a minute, so
-/// such a checkpoint (unnamed, 15 minutes) goes a minute on; the collector then takes its files.
-async fn unpin(store: Store) {
-    let admin = slatedb::admin::Admin::builder("catalog", store).build();
-    loop {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let Ok(checkpoints) = admin.list_checkpoints(None).await else { continue };
-        let now = chrono::Utc::now();
-        for c in checkpoints {
-            let compactor = c.name.is_none() && c.expire_time.is_some_and(|e| e - c.create_time >= chrono::Duration::minutes(15));
-            if compactor && now - c.create_time > chrono::Duration::minutes(1) {
-                let _ = admin.delete_checkpoint(c.id).await;
-            }
-        }
-    }
-}
-
 impl Catalog {
-    async fn writer(store: Store, object_store_cache_options: ObjectStoreCacheOptions, local: bool) -> Result<Self> {
-        // Poll object storage rarely when idle (that's an idle writer's request bill), but often
-        // enough that compaction keeps up with the checkpoints.
-        let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
-        // Every commit is a write-ahead-log object: clear those, and the old manifests and compaction
-        // records, every minute once a minute old, not SlateDB's every 10 minutes — thousands would sit
-        // in the bucket. (On a bucket that is one more LIST a minute for the compaction records.)
-        // (What a reader's checkpoint still needs stays.)
-        // On a local disk, where listing costs nothing, the WAL goes every 5 s and the compactor's
-        // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
-        // commits a second), and a disk they filled had no room to flush the catalog, so nothing
-        // could ever clear it. (A follower reads the files of a manifest it polled 250 ms ago.)
-        let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
-        let gc = crate::env::parse("PONDRA_GC_SECS");
-        let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
-        let compacted = if local { every(10, 60) } else { GarbageCollectorOptions::default().compacted_options };
-        let garbage_collector_options = Some(GarbageCollectorOptions { wal_options: every(wal, wal), manifest_options: every(secs, secs), compactions_options: every(secs, secs), compacted_options: compacted, ..Default::default() });
-        // (the compactor and the garbage collector start once the node serves: their first reads
-        // were most of a cold start's, C5; `upkeep`)
-        let settings = Settings { garbage_collector_options: None, flush_interval: Some(Duration::from_millis(1)), manifest_poll_interval: Duration::from_secs(10), l0_sst_size_bytes: 16 << 20, l0_max_ssts: 64, l0_max_ssts_per_key: 32, max_unflushed_bytes: 64 << 20, compactor_options: None, object_store_cache_options, ..Default::default() };
-        let t0 = std::time::Instant::now();
-        // (a flush's blocks stay out of the cache: everything committed is in the overlay already)
-        let flushed = slatedb::BlockCachePolicy::default().with_flush_targets(&[slatedb::CacheTarget::Index, slatedb::CacheTarget::Filters]);
-        let (cache, held) = blocks();
-        let db = Db::builder("catalog", store.clone()).with_settings(settings).with_db_cache(cache).with_block_cache_policy(flushed);
-        let mut cat = Self::new(Db_::Writer(db.build().await?));
-        cat.flush_now = local;
-        cat.blocks = held.into();
-        trace("the catalog's writer open", t0);
-        cat.upkeep = Some(upkeep(store, compactor_options.unwrap_or_default(), garbage_collector_options.unwrap_or_default(), local));
+    /// The catalog as its leader opens it, on `kv` (the leader's store, `slate::Writer::open`). `since`: when its
+    /// opening began, for `PONDRA_TRACE_START`.
+    async fn writer(kv: Arc<dyn Kv>, since: Instant) -> Result<Self> {
+        let mut cat = Self::new(kv);
         cat.replicas = crate::env::or("PONDRA_REPLICAS", 1);
         cat.last_n.store(cat.get::<u64>("n").await?.unwrap_or(1), Relaxed);
         let c = cat.get::<u64>("c").await?.unwrap_or(0);
@@ -2252,10 +2101,9 @@ impl Catalog {
         // (what we inherited, replayed from the WAL, reaches every node's view at the first
         // checkpoint: right after the node serves, `main.rs`)
         // The leader too reads the catalog from memory: everything committed, nothing in flight.
-        let Db_::Writer(db) = &cat.db else { unreachable!() };
-        let mut all = collect(db.scan(b"".to_vec()..b"d/".to_vec()).await.map_err(fatal)?).await?;
-        all.extend(collect(db.scan(b"d0".to_vec()..vec![0xff]).await.map_err(fatal)?).await?);
-        trace("the catalog in memory", t0);
+        let mut all = cat.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await.map_err(fatal)?;
+        all.extend(cat.kv.scan(b"d0".to_vec()..vec![0xff], false).await.map_err(fatal)?);
+        trace("the catalog in memory", since);
         let overlay = cat.overlay.get_mut().unwrap();
         for (k, v) in all {
             overlay.set(k, (c, Some(v)));
@@ -2266,13 +2114,9 @@ impl Catalog {
         Ok(cat)
     }
 
-    async fn reader(store: Store, streamed: bool, object_store_cache_options: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
-        let opts = DbReaderOptions { manifest_poll_interval: poll, skip_wal_replay: streamed, object_store_cache_options, ..Default::default() };
-        // FollowLatest writes nothing, so readers work with read-only bucket credentials.
-        let (cache, held) = blocks();
-        let reader = DbReader::builder("catalog", store).with_reader_mode(DbReaderMode::FollowLatest).with_options(opts).with_db_cache(cache);
-        let mut cat = Self::new(Db_::Reader(Arc::new(reader.build().await?)));
-        cat.blocks = held.into();
+    /// The catalog as a follower or a reader opens it, on `kv` (`slate::Reader::open`).
+    async fn reader(kv: Arc<dyn Kv>, streamed: bool) -> Result<Self> {
+        let mut cat = Self::new(kv);
         cat.follows = streamed;
         cat.refresh().await?; // (one try at the in-memory catalog before serving; later refreshes retry)
         Ok(cat)
@@ -2281,9 +2125,10 @@ impl Catalog {
     /// A reader, or why there can't be one: SlateDB tries again for as long as the bucket says no,
     /// so a bucket that isn't there, or that refuses the credentials, left `pondra sql` waiting
     /// for ever. When opening takes a while, a listing (after the store's own retries) says
-    /// whether there is a catalog to wait for.
-    async fn opened(store: Store, streamed: bool, cache: ObjectStoreCacheOptions, poll: Duration) -> Result<Self> {
-        let open = Self::reader(store.clone(), streamed, cache, poll);
+    /// whether there is a catalog to wait for. `reader_open` is the reader's opening: this waits
+    /// for it, and for the catalog's first view of the bucket, under the one timeout.
+    async fn opened(store: Store, streamed: bool, reader_open: impl std::future::Future<Output = Result<slate::Reader, kv::Error>>) -> Result<Self> {
+        let open = async { Self::reader(Arc::new(reader_open.await?), streamed).await };
         tokio::pin!(open);
         if let Ok(cat) = tokio::time::timeout(Duration::from_secs(3), &mut open).await {
             return cat;
@@ -2295,15 +2140,15 @@ impl Catalog {
         }
     }
 
-    fn new(db: Db_) -> Self {
+    fn new(kv: Arc<dyn Kv>) -> Self {
         let (feed, order) = (broadcast::channel(4096).0, tokio::sync::Mutex::new(1));
         let (last_n, view, pruned, pins, streamed, hold, mirror, flushed, committed, loud) = Default::default();
         let (durable, acked, acks, pending, unstarted) = (watch::Sender::new(0), watch::Sender::new(()), Default::default(), Default::default(), Default::default());
-        Catalog { db, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, upkeep: None, mirror, loud, metas: Mutex::new(Parsed::new()), frozen: Default::default(), closing: Default::default(), flush_now: false, blocks: vec![] }
+        Catalog { kv, order, flushed, flushed_at: Mutex::new(Instant::now()), writes: None, unstarted, committed, durable, replicas: 1, acks, acked, pending, feed, recent: Default::default(), last_n, overlay: Default::default(), view, pruned, pins, streamed, hold, follows: false, mirror, loud, metas: Mutex::new(Parsed::new()), frozen: Default::default(), closing: Default::default() }
     }
 
     /// What the catalog's block caches hold, in bytes.
-    pub fn cached(&self) -> usize { self.blocks.iter().map(|b| b.0.weighted_size() as usize).sum() }
+    pub fn cached(&self) -> usize { self.kv.cached() }
 
     /// Leader: the recent frames plus a receiver for every frame from now on.
     pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {
@@ -2400,15 +2245,19 @@ impl Catalog {
 
     /// Our own view's commit number right now.
     async fn view_now(&self) -> Result<u64> {
-        let Db_::Reader(r) = &self.db else { return Ok(0) };
-        Ok(r.get("c").await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0))
+        if self.kv.is_writer() {
+            return Ok(0);
+        }
+        Ok(self.kv.get("c", false).await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0))
     }
 
     /// Non-leader: move our view's marks to where the reader is now. Returns its commit and the
     /// oldest commit a scan still in progress (it started from an older view) holds.
     async fn mark(&self) -> Result<(u64, u64)> {
-        let Db_::Reader(r) = &self.db else { return Ok((0, 0)) };
-        let get = |k: &'static str| async move { Ok::<u64, anyhow::Error>(r.get(k).await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0)) };
+        if self.kv.is_writer() {
+            return Ok((0, 0));
+        }
+        let get = |k: &'static str| async move { Ok::<u64, anyhow::Error>(self.kv.get(k, false).await?.map(|v| serde_json::from_slice(&v)).transpose()?.unwrap_or(0)) };
         // "n" BEFORE "c": our view only moves forward, so this `n` is one our view already had
         // at commit `c` (the other way round it could be from a newer view than `c`, and reads
         // held back to an older commit would miss segments this node thought it could read).
@@ -2434,7 +2283,9 @@ impl Catalog {
 
     /// Non-leader: how far our own catalog view is; drop the streamed changes it now has.
     async fn refresh(&self) -> Result<()> {
-        let Db_::Reader(_) = &self.db else { return Ok(()) };
+        if self.kv.is_writer() {
+            return Ok(());
+        }
         // Drop the streamed copies our view now has, except those a scan still in progress
         // (it started from an older view) may lay over its data.
         let (c, upto) = self.mark().await?;
@@ -2459,11 +2310,13 @@ impl Catalog {
     /// commit stream keeps it current and reads are answered from memory, as of the last streamed
     /// commit: the bucket is out of the query path. (Redone after a gap in the stream.)
     async fn seed(&self) -> Result<()> {
-        let Db_::Reader(r) = &self.db else { return Ok(()) };
+        if self.kv.is_writer() {
+            return Ok(());
+        }
         let _pin = self.pin(); // (the streamed changes after `before` stay while we read)
         let before = self.view_now().await?;
-        let mut all = collect(r.scan(b"".to_vec()..b"d/".to_vec()).await?).await?;
-        all.extend(collect(r.scan(b"d0".to_vec()..vec![0xff]).await?).await?);
+        let mut all = self.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await?;
+        all.extend(self.kv.scan(b"d0".to_vec()..vec![0xff], false).await?);
         let after = self.view_now().await?;
         let n = all.get("n").map_or(Ok(1), |v| serde_json::from_slice(v))?;
         let mut o = self.overlay.lock().unwrap();
@@ -2508,23 +2361,25 @@ impl Catalog {
         if self.mirror.load(Relaxed) {
             return self.last_n.load(Relaxed); // the mirror is the lake as of the last streamed commit
         }
-        match (&self.db, self.overlaid()) {
-            (Db_::Reader(_), true) => self.view.1.load(Relaxed).max(self.last_n.load(Relaxed)),
-            (Db_::Reader(_), false) => self.view.1.load(Relaxed),
-            (Db_::Writer(_), _) => self.last_n.load(Relaxed),
+        if self.kv.is_writer() {
+            return self.last_n.load(Relaxed);
+        }
+        match self.overlaid() {
+            true => self.view.1.load(Relaxed).max(self.last_n.load(Relaxed)),
+            false => self.view.1.load(Relaxed),
         }
     }
 
-    pub fn is_writer(&self) -> bool { matches!(self.db, Db_::Writer(_)) }
+    pub fn is_writer(&self) -> bool { self.kv.is_writer() }
 
     /// The catalog version every read here reflects right now — on the leader (durable commits)
     /// or a node that holds the whole catalog in memory — or `None` where reads mix our view with
     /// the stream. A read that starts after this sees at least this version (never older). Quiet
     /// commits don't count: every read but the history's is the same across them.
     pub fn version(&self) -> Option<u64> {
-        match &self.db {
-            Db_::Writer(_) => Some(self.loud.load(Relaxed).min(self.committed.load(Relaxed))), // (`apply` comes just before `committed`)
-            Db_::Reader(_) => self.mirror.load(Relaxed).then(|| self.loud.load(Relaxed)),
+        match self.kv.is_writer() {
+            true => Some(self.loud.load(Relaxed).min(self.committed.load(Relaxed))), // (`apply` comes just before `committed`)
+            false => self.mirror.load(Relaxed).then(|| self.loud.load(Relaxed)),
         }
     }
 
@@ -2558,44 +2413,44 @@ impl Catalog {
     /// before its commit stream opens, which never changes once written (the lake's own keys, which
     /// signing in to that stream takes: `users::keys`).
     pub async fn from_view(&self, key: &str) -> Result<Option<Bytes>> {
-        match &self.db {
-            Db_::Reader(r) => Ok(r.get(key).await?),
-            Db_::Writer(_) => self.get_raw(key).await,
+        match self.kv.is_writer() {
+            true => self.get_raw(key).await,
+            false => Ok(self.kv.get(key, false).await?),
         }
     }
 
     pub async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
-        Ok(match &self.db {
-            // The leader answers from its in-memory catalog: committed writes only, never ones
-            // in flight. Inline segment data is only asked for once its segment is committed.
-            Db_::Writer(db) if key.starts_with("d/") => match self.recent_inline(key) {
-                Some(bytes) => Some(bytes),
-                None => db.get(key).await.map_err(|e| self.fenced(e))?,
-            },
-            Db_::Writer(db) => match self.mirror.load(Relaxed) {
-                true => self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()),
-                false => db.get_with_options(key, &ReadOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(|e| self.fenced(e))?,
-            },
-            Db_::Reader(r) => {
-                let inline = key.starts_with("d/");
-                {
-                    let o = self.overlay.lock().unwrap();
-                    if self.mirror.load(Relaxed) && !inline {
-                        return Ok(o.get(key).and_then(|(_, v)| v.clone())); // the in-memory catalog
-                    }
-                }
-                // A streamed copy is newer than our view's (unless the view is ahead of the
-                // stream); inline segment data never changes, so its streamed copy is always good.
-                let c = if inline { 0 } else { self.view_now().await? };
-                let copy = {
-                    let o = self.overlay.lock().unwrap(); // (under the lock: see `apply`)
-                    o.get(key).filter(|_| inline || self.overlay_ok(c)).map(|(_, v)| v.clone())
-                };
-                match copy {
-                    Some(v) => v,
-                    None => r.get(key).await?, // (read after the check: at least as new)
-                }
+        if self.kv.is_writer() {
+            return Ok(match key.starts_with("d/") {
+                // The leader answers from its in-memory catalog: committed writes only, never ones
+                // in flight. Inline segment data is only asked for once its segment is committed.
+                true => match self.recent_inline(key) {
+                    Some(bytes) => Some(bytes),
+                    None => self.kv.get(key, false).await.map_err(|e| self.fenced(e))?,
+                },
+                false => match self.mirror.load(Relaxed) {
+                    true => self.overlay.lock().unwrap().get(key).and_then(|(_, v)| v.clone()),
+                    false => self.kv.get(key, true).await.map_err(|e| self.fenced(e))?,
+                },
+            });
+        }
+        let inline = key.starts_with("d/");
+        {
+            let o = self.overlay.lock().unwrap();
+            if self.mirror.load(Relaxed) && !inline {
+                return Ok(o.get(key).and_then(|(_, v)| v.clone())); // the in-memory catalog
             }
+        }
+        // A streamed copy is newer than our view's (unless the view is ahead of the
+        // stream); inline segment data never changes, so its streamed copy is always good.
+        let c = if inline { 0 } else { self.view_now().await? };
+        let copy = {
+            let o = self.overlay.lock().unwrap(); // (under the lock: see `apply`)
+            o.get(key).filter(|_| inline || self.overlay_ok(c)).map(|(_, v)| v.clone())
+        };
+        Ok(match copy {
+            Some(v) => v,
+            None => self.kv.get(key, false).await?, // (read after the check: at least as new)
         })
     }
 
@@ -2631,11 +2486,9 @@ impl Catalog {
         }
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
         let decode = |all: BTreeMap<String, Bytes>| -> Result<BTreeMap<String, Bytes>> { Ok(all) };
-        let r = match &self.db {
-            Db_::Writer(db) if !self.mirror.load(Relaxed) => return decode(collect(db.scan_with_options(range, &ScanOptions::new().with_durability_filter(DurabilityLevel::Remote)).await.map_err(|e| self.fenced(e))?).await?),
-            Db_::Writer(_) => None,
-            Db_::Reader(r) => Some(r),
-        };
+        if self.kv.is_writer() && !self.mirror.load(Relaxed) {
+            return decode(self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?);
+        }
         {
             let o = self.overlay.lock().unwrap();
             if self.mirror.load(Relaxed) {
@@ -2644,11 +2497,11 @@ impl Catalog {
                 return decode(hits.collect());
             }
         }
-        let (r, _pin) = (r.expect("a reader: the leader reads its in-memory catalog above"), self.pin());
+        let _pin = self.pin();
         loop {
             // Our view is somewhere between `before` and `after` while we read it.
             let before = self.view_now().await?;
-            let mut all = collect(r.scan(range.clone()).await?).await?;
+            let mut all = self.kv.scan(range.clone(), false).await?;
             let after = self.view_now().await?;
             // Under the lock, so the stream can't move while we decide (see `apply`).
             let streamed = {
@@ -2697,11 +2550,13 @@ impl Catalog {
     /// restart then replays only the WAL written since, and the other nodes' views — which read
     /// no WAL — catch up (a follower whose commit stream broke reads from its view until then).
     pub async fn checkpoint(&self) -> Result<()> {
-        let Db_::Writer(db) = &self.db else { return Ok(()) };
+        if !self.kv.is_writer() {
+            return Ok(());
+        }
         let next = *self.order.lock().await; // every commit before it is in the memtable
         let flushed = self.flushed.load(Relaxed);
         if flushed != next {
-            let flush = db.flush_with_options(FlushOptions { flush_type: FlushType::MemTable });
+            let flush = self.kv.checkpoint();
             tokio::pin!(flush);
             // (a flush that takes 30 s is still waited for, not dropped: the line says why it is slow)
             if tokio::time::timeout(Duration::from_secs(30), &mut flush).await.is_err() {
@@ -2731,14 +2586,7 @@ impl Catalog {
     /// reader its polling (`Node::stop`, ADR-061 §4: one process may open another lake after it).
     pub async fn close(&self) -> Result<()> {
         self.closing.store(true, Relaxed);
-        if let Some(upkeep) = &self.upkeep {
-            upkeep.stop().await;
-        }
-        match &self.db {
-            Db_::Writer(db) => db.close().await?,
-            Db_::Reader(r) => r.close().await?,
-        }
-        Ok(())
+        Ok(self.kv.close().await?)
     }
 
     /// A new branch's leader (ADR-047): its commits number after its base's, whose rows it holds
@@ -2757,38 +2605,23 @@ impl Catalog {
     /// writes commit in the order they were made, so a caller can make the next write without
     /// waiting (pipelined commits: one round trip no longer blocks the next).
     pub async fn write(&self, puts: Vec<(String, Vec<u8>)>, deletes: &[String]) -> Result<oneshot::Receiver<()>> {
-        let (Db_::Writer(db), Some(writes)) = (&self.db, &self.writes) else { bail!("read-only node") };
+        let (true, Some(writes)) = (self.kv.is_writer(), &self.writes) else { bail!("read-only node") };
         if self.frozen.load(Relaxed) && !crate::backup::may_write(puts.iter().map(|(k, _)| k).chain(deletes)) {
             return Err(crate::backup::refused(None)); // (whatever door a write came through: ADR-070)
         }
         let t0 = Instant::now();
-        let puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
-        let mut batch = WriteBatch::new();
-        for (k, v) in &puts {
-            batch.put(k, v);
-        }
-        for k in deletes {
-            batch.delete(k);
-        }
+        let mut puts: Vec<(String, Bytes)> = puts.into_iter().map(|(k, v)| (k, v.into())).collect();
         let mut id = self.order.lock().await;
         let t1 = commit_stage("order", t0);
-        let c = ("c".to_string(), Bytes::from(json(&*id)));
-        batch.put(&c.0, &c.1);
-        let handle = db.write(batch).await.map_err(|e| self.fenced(e))?;
-        let t2 = commit_stage("slatedb write", t1);
-        if self.flush_now {
-            // (its WAL written now, not at the next tick of `flush_interval`: a commit waited about a
-            // millisecond for it. On a disk a write is a file whichever way; a bucket keeps the tick,
-            // which lets writes made together share one PUT.)
-            let db = db.clone();
-            crate::panics::task(async move { let _ = db.flush_with_options(FlushOptions { flush_type: FlushType::Wal }).await; }); // (a node stopped in a process ends it: ADR-061)
-        }
+        // The commit number is the last put: the store takes the puts as they are, and the `Delta` keeps the same list.
+        puts.push(("c".to_string(), Bytes::from(json(&*id))));
+        let handle = self.kv.write(&puts, deletes).await.map_err(|e| self.fenced(e))?;
+        let t2 = commit_stage("kv write", t1);
         if let Some((_, v)) = puts.iter().find(|(k, _)| k == "n") {
             self.last_n.store(serde_json::from_slice(v)?, Relaxed);
         }
         let (done, rx) = oneshot::channel();
-        let puts = puts.into_iter().chain([c]).collect();
-        let _ = writes.send((Arc::new(handle), Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done, t2));
+        let _ = writes.send((handle, Arc::new(Delta { id: *id, puts, deletes: deletes.to_vec() }), done, t2));
         *id += 1;
         Ok(rx)
     }
@@ -2841,7 +2674,7 @@ impl Catalog {
     /// `fatal`, unless this node's own stop closed the catalog: then the write or read in flight
     /// fails and the stop goes on to give up the term. Restarting there led the term again, and its
     /// followers waited out the lease (`upgrade_check.py rolling`: a batch waited 5.8 s).
-    fn fenced(&self, e: slatedb::Error) -> anyhow::Error {
+    fn fenced(&self, e: kv::Error) -> anyhow::Error {
         if self.closing.load(Relaxed) {
             return e.into();
         }
@@ -2850,9 +2683,9 @@ impl Catalog {
 }
 
 /// A writer that was fenced out (a new leader took over) must stop at once: it restarts and
-/// rejoins the cluster as a follower.
-fn fatal(e: slatedb::Error) -> anyhow::Error {
-    if matches!(e.kind(), ErrorKind::Closed(_)) {
+/// rejoins the cluster as a follower. (The upkeep's failures take this too: `kv::slate`.)
+pub(crate) fn fatal(e: kv::Error) -> anyhow::Error {
+    if e.closed() {
         eprintln!("catalog closed: {e}");
         crate::cluster::restart("the catalog was closed (fenced by a newer leader)");
     }
@@ -2975,7 +2808,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-closed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
         let _ = cat.write(vec![("t/a".into(), b"1".to_vec())], &[]).await?;
         cat.close().await?;
         assert!(cat.write(vec![("t/b".into(), b"2".to_vec())], &[]).await.is_err());
@@ -3037,7 +2870,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-parsed-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?));
-        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
         let entry = |folder: &str| -> Result<Bytes> { Ok(Bytes::from(serde_json::to_vec(&TableMeta { folder: Some(folder.to_string()), ..Default::default() })?)) };
         let raw = entry("x")?;
         let first = cat.parsed("t/a", &raw)?;
@@ -3073,7 +2906,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-recent-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let store: Store = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir)?);
-        let cat = Catalog::writer(store, ObjectStoreCacheOptions::default(), true).await?;
+        let cat = Catalog::writer(Arc::new(slate::Writer::open(store, None, true).await?), Instant::now()).await?;
         let change = |id: u64, key: String, bytes: &'static [u8]| Frame::Change(Arc::new(Delta { id, puts: vec![(key, Bytes::from_static(bytes))], deletes: vec![] }));
         cat.send(change(1, data_key(1), b"rows"));
         assert_eq!(cat.recent_inline(&data_key(1)).as_deref(), Some(&b"rows"[..]));
