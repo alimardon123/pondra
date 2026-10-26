@@ -1637,23 +1637,15 @@ fn stopped() -> anyhow::Error {
     crate::codes::coded("53200", PAGE_OOM)
 }
 
-/// The page's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else the line its `device` has (`Options::line`), else 3 GiB
-/// (`LINE`), and None when it is 0 (the watch is off, as on a node).
+/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else 3 GiB (`LINE`).
 fn memory_line(device: Option<usize>) -> Option<usize> {
-    line_of(crate::env::gib("PONDRA_MEMORY_MAX_GB"), device)
+    crate::env::memory_line(Some(device.unwrap_or(LINE)))
 }
 
-/// `memory_line` of the line `set` and the device's line, as the setting and `Options::line` give them.
-fn line_of(set: Option<usize>, device: Option<usize>) -> Option<usize> {
-    let bytes = set.or(device).unwrap_or(LINE);
-    (bytes > 0).then_some(bytes)
-}
-
-/// The most query memory a page's pool holds: `PONDRA_MEMORY_GB`, else two thirds of the line (of the default line when the
-/// watch is off, so the pool is never empty). What DataFusion counts is the big hash tables and sort buffers, so the rest of
-/// the line is for what it doesn't count.
+/// The most query memory a page's pool holds (`env::query_memory`): its share is two thirds of the line (of the default line
+/// when the watch is off, so the pool is never empty).
 fn query_memory(device: Option<usize>) -> usize {
-    crate::env::gib("PONDRA_MEMORY_GB").unwrap_or_else(|| memory_line(device).unwrap_or(LINE) / 3 * 2)
+    crate::env::query_memory(|| memory_line(device).unwrap_or(LINE) / 3 * 2)
 }
 
 /// A table's batches, partition by partition, as its memory table holds them (`inner`); None for another provider's table.
@@ -4611,13 +4603,6 @@ mod tests {
         assert_eq!((past.status, past.header("x-pondra-sqlstate")), (503, Some("53200")));
         let words = String::from_utf8_lossy(&past.body);
         assert!(words.contains("3 MB") && words.contains("memory_max_gb"), "{words}");
-    }
-
-    /// A page's memory line is its setting's, else its device's (`Options::line`), else 3 GiB; 0 turns the watch off.
-    #[test]
-    fn a_pages_line_is_its_settings_then_its_devices() {
-        assert_eq!((line_of(None, None), line_of(None, Some(1 << 30))), (Some(LINE), Some(1 << 30)));
-        assert_eq!((line_of(Some(2 << 30), Some(1 << 30)), line_of(Some(0), Some(1 << 30))), (Some(2 << 30), None));
     }
 
     #[tokio::test]

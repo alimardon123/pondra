@@ -227,6 +227,26 @@ pub fn gib(name: &str) -> Option<usize> {
     parse::<f64>(name).map(|gb| (gb * (1u64 << 30) as f64) as usize)
 }
 
+/// The memory line in bytes, past which the watch stops the query that grew memory: `PONDRA_MEMORY_MAX_GB`, else the form's
+/// own (`own`: 85% of the machine's or container's memory on a node, its device's line on a page), and None when it is 0 (the
+/// watch is off). Every form's line is this one rule; only `own` is the form's.
+pub fn memory_line(own: Option<usize>) -> Option<usize> {
+    line_of(gib("PONDRA_MEMORY_MAX_GB"), own)
+}
+
+/// `memory_line` of the line `set` and the form's own.
+fn line_of(set: Option<usize>, own: Option<usize>) -> Option<usize> {
+    set.or(own).filter(|&bytes| bytes > 0)
+}
+
+/// How much memory queries may hold in DataFusion's pool: `PONDRA_MEMORY_GB`, else the form's share (`own`: a third of the
+/// machine's memory on a node, two thirds of its line on a page). What the pool counts is the big hash tables and sort buffers,
+/// not the decoding and the batches in flight around them, so the share leaves the rest of the line for those. Past it a
+/// node's pool spills to disk; a page's, with no disk, refuses the query.
+pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
+    gib("PONDRA_MEMORY_GB").unwrap_or_else(own)
+}
+
 /// A setting in seconds (fractions too), else `default`: one that is negative or not a number is the
 /// default too.
 pub fn secs(name: &str, default: f64) -> Duration {
@@ -319,6 +339,14 @@ mod tests {
         give([("memory_gb", "4"), ("spill_mb", "7")]).unwrap();
         let changed = give([("memory_gb", "8"), ("cache_gb", "2"), ("skew_mb", "12")]).unwrap_err().to_string();
         assert!(changed.contains("cache_gb (not set), memory_gb (4 now) can't change"), "{changed}");
+    }
+
+    /// The line is the setting's, else the form's own; 0 turns the watch off.
+    #[test]
+    fn a_line_is_the_settings_then_the_forms() {
+        assert_eq!((line_of(None, None), line_of(None, Some(1 << 30))), (None, Some(1 << 30)));
+        assert_eq!((line_of(Some(2 << 30), Some(1 << 30)), line_of(Some(0), Some(1 << 30))), (Some(2 << 30), None));
+        assert_eq!((line_of(Some(2 << 30), None), line_of(None, Some(0))), (Some(2 << 30), None));
     }
 
     #[test]
