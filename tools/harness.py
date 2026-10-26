@@ -23252,11 +23252,63 @@ def patterns():
     views_checks, views_info = pattern_views()  # the views kept by key (its own lake and node)
     checks.update(views_checks)
     info.update(views_info)
+    emit_checks, emit_info = patterns_emit_final()  # EMIT FINAL views (its own lake and node)
+    checks.update(emit_checks)
+    info.update(emit_info)
     ok = all(checks.values())
     print(json.dumps({"patterns": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
     return f"patterns: {len(pc.FIXED)} fixed examples, {len(pc.REFUSED)} refusals and 600 random queries agree with the reference; the doors agree: all {len(checks)} checks pass"
+
+
+def patterns_emit_final():
+    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `matches.rs`): a smoke check of the run. The ticker from
+    row-patterns.mdx, PARTITION BY symbol, as a materialized view WITH (lateness = '0 seconds') ... EMIT FINAL, over two
+    symbols' rows in five commits. EMIT FINAL orders by a date or a timestamp, so the rows carry `ts`, a minute past
+    2026-10-01 00:00 for each `day`. Created before the rows, it is checked after each commit: its rows are the plain
+    query's matches that are decided, those that end before their symbol's last day (the smoke form of "before each
+    key's resume point": `$resume` isn't SQL, so the resume points are not read). Then, after the last commit, the same,
+    and no match written twice. Returns (checks, info)."""
+    checks, info = {}, {}
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    acme = [(1, 12), (2, 17), (3, 19), (4, 21), (5, 25), (6, 12), (7, 15), (8, 20), (9, 24), (10, 25), (11, 19), (12, 15),
+            (13, 25), (14, 25), (15, 14), (16, 12), (17, 14), (18, 24), (19, 23), (20, 22)]  # the docs' ticker, by day
+    rng = random.Random(8)
+    beta, price = [], 50
+    for day in range(1, 21):
+        price = max(1, price + rng.randint(-4, 4))
+        beta.append((day, price))
+    rows = sorted([("ACME", d, p) for d, p in acme] + [("BETA", d, p) for d, p in beta], key=lambda r: r[1])
+    chunks = [rows[i:i + 8] for i in range(0, len(rows), 8)]
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    plain_q = ("SELECT symbol, start_day, bottom_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+               "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+               "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+               "up AS up.price > PREV(up.price)) ORDER BY symbol, start_day")
+    view_q = plain_q.rsplit(" ORDER BY ", 1)[0]
+    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds') AS {view_q} EMIT FINAL")
+    rows_of_view = lambda: q("SELECT * FROM dips ORDER BY symbol, start_day")
+
+    def decided():
+        last = {r["symbol"]: r["mx"] for r in q("SELECT symbol, max(day) AS mx FROM ticks GROUP BY symbol")}
+        return [r for r in q(plain_q) if r["end_day"] < last[r["symbol"]]]
+
+    got_each = []
+    for k, chunk in enumerate(chunks, 1):
+        q("INSERT INTO ticks VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in chunk))
+        want = decided()
+        got = until(rows_of_view, want, 30)
+        got_each.append(got == want)
+        info[f"commit {k}: decided, written"] = [len(want), len(got)]
+    final = rows_of_view()
+    info["matches written"] = len(final)
+    checks["EMIT FINAL: after each of five commits, the view's rows are the plain query's decided matches (those ending before their symbol's last day), and at the end each match is written once"] = \
+        all(got_each) and final == decided() and len(final) > 0 and len(final) == len({(r["symbol"], r["start_day"]) for r in final})
+    node.kill()
+    return checks, info
 
 
 # ---------------------------------------------------------------- views of a pattern, kept by key (ADR-073 step 7)

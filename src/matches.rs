@@ -203,9 +203,167 @@ impl Dues {
 
 crate::per_node!(static DUES: Mutex<HashMap<String, Dues>> = Default::default());
 
-/// One run of a matches view (leader only, `views::emit_all`). Part B writes the run; until then a view's run does nothing.
+/// One run of a matches view (leader only, `views::emit_all`): the watermark's new span, read at the snapshot; the keys it
+/// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
+/// producer in one flush, under the lake's lock. A run that finds nothing new commits nothing.
 pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<()> {
-    let _ = (lake, seq, lock, view, v, m);
+    let producer = format!("match:{view}");
+    let late_producer = format!("{producer}$late");
+    let w0: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
+    let Some(w) = crate::views::watermark(lake, &v.source, &m.time, m.lateness_secs, m.idle_secs).await? else { return Ok(()) };
+    if w <= w0 as i64 {
+        return Ok(());
+    }
+    let at = lake.visible();
+    let at0: u64 = lake.cat.get(&producer_key(&late_producer)).await?.unwrap_or(0);
+    let (held_name, resume_name) = (held_of(view), resume_of(view));
+    let src: TableMeta = table_meta(lake, &v.source).await?.logical();
+    let held_meta: Arc<TableMeta> = Arc::new(table_meta(lake, &held_name).await?);
+    let resume_meta: Arc<TableMeta> = Arc::new(table_meta(lake, &resume_name).await?);
+    let view_meta = table_meta(lake, view).await?;
+    let time_type = dtype(&column_type(&src, &m.time)?)?;
+    let cols: Vec<(String, DataType)> = src.columns.iter().map(|(c, t)| Ok((c.clone(), dtype(t)?))).collect::<Result<_>>()?;
+    let part: Vec<(String, DataType)> = m.part.iter().map(|p| Ok((p.clone(), dtype(&column_type(&src, p)?)?))).collect::<Result<_>>()?;
+    let stamp = |us: i64| -> Result<ScalarValue> { Ok(ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(&time_type)?) };
+    let t = ident(m.time.as_str());
+
+    // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions.
+    let names: Vec<String> = src.columns.iter().map(|(c, _)| c.clone()).collect();
+    let read = format!("SELECT {}, {ROW_ID}, {VERSION} FROM {}", crate::objects::list_sql(&names), crate::write::sql_name(&v.source));
+    let sctx = session_at(lake, &read, "", Some(at)).await?;
+    let table = sctx.table(table_ref(&v.source)).await?;
+    let mut bounds = t.clone().lt_eq(lit(stamp(w)?));
+    if w0 > 0 {
+        bounds = bounds.and(t.clone().gt(lit(stamp(w0 as i64)?)));
+    }
+    let s_batches: Vec<RecordBatch> = table.clone().filter(bounds)?.collect().await?;
+
+    // Late rows: those that came after the last run's snapshot, with a time at or before its watermark, or none.
+    let late: i64 = match w0 > 0 && at > at0 {
+        true => {
+            let version = ident(VERSION);
+            let stale = t.clone().lt_eq(lit(stamp(w0 as i64)?)).or(t.clone().is_null());
+            table.filter(version.clone().gt(lit(at0 as i64)).and(version.lt_eq(lit(at as i64))).and(stale))?.count().await? as i64
+        }
+        false => 0,
+    };
+
+    // The state as of `at`: each key's counts and dues, and the held rows.
+    let resume = resume_map(&read_state(lake, &resume_name, at).await?, &part)?;
+    let held_rows = read_state(lake, &held_name, at).await?;
+    let dkey = format!("{}|{view}|{}", lake.url, m.id);
+    let mut dues = DUES.lock().unwrap().remove(&dkey).unwrap_or_default();
+    if m.within && !dues.loaded {
+        dues.load(&resume);
+    }
+    let s_schema: SchemaRef = Arc::new(Schema::new(fields_of(&cols).chain([Field::new(ROW_ID, DataType::Int64, true)]).collect::<Vec<_>>()));
+    let s_all = rows_as(&s_schema, &s_batches)?;
+    let s_keys = keys_of(&s_all, &part)?;
+    let s_ids = ints(&s_all, ROW_ID)?;
+    let held_all = rows_as(&held_schema_of(&cols), &held_rows)?;
+    let held_keys = keys_of(&held_all, &part)?;
+
+    // K: the keys S touches, and those whose live thread is dead by W.
+    let mut touched: HashSet<Key> = s_keys.iter().cloned().collect();
+    if m.within {
+        touched.extend(dues.due_by(w));
+    }
+    if touched.is_empty() && late == 0 {
+        if m.within {
+            DUES.lock().unwrap().insert(dkey, dues);
+        }
+        return Ok(()); // (nothing new and nothing late: no run, no commit)
+    }
+    let keep_held: Vec<bool> = held_keys.iter().map(|k| touched.contains(k)).collect();
+    let held_k = filter_record_batch(&held_all, &BooleanArray::from(keep_held.clone()))?;
+    let held_keys_k: Vec<Key> = held_keys.iter().zip(&keep_held).filter(|(_, k)| **k).map(|(k, _)| k.clone()).collect();
+    let held_ids_k = ints(&held_k, "__mr_row")?;
+
+    // The input: S (new), then the held rows of K (not new), each with its key's counts and W.
+    let mut keys_in = s_keys.clone();
+    keys_in.extend(held_keys_k);
+    let mut ids_in = s_ids.clone();
+    ids_in.extend(held_ids_k.iter().copied());
+    let is_new: Vec<bool> = (0..keys_in.len()).map(|i| i < s_keys.len()).collect();
+    let counts: Vec<(i64, i64)> = keys_in.iter().map(|k| resume.get(k).map_or((0, 0), |r| (r.0, r.1))).collect();
+    let in_schema = input_schema(&cols, &time_type);
+    let input = input_of(&in_schema, &cols, &s_all, &s_ids, &held_k, &held_ids_k, &counts, &stamp(w)?)?;
+    let times_in: Vec<i64> = micros_of(&s_all, &m.time)?.into_iter().chain(micros_of(&held_k, &m.time)?).collect();
+
+    // The matcher in open mode: the matches, and the markers that say what stays held.
+    let ictx = over_ctx(lake, &v.source, in_schema.clone(), vec![input.clone()], &m.inner).await?;
+    let inner = crate::engine::sql(&ictx, &m.inner).await?;
+    let inner_schema: SchemaRef = Arc::new(inner.schema().as_arrow().clone());
+    let out: Vec<RecordBatch> = inner.collect().await?;
+    let (mut marks, mut matched) = (vec![], vec![]);
+    for b in &out {
+        let res = b.column_by_name("__mr_resume").context("no __mr_resume")?;
+        let mark: BooleanArray = (0..b.num_rows()).map(|i| Some(res.is_valid(i))).collect();
+        let rest: BooleanArray = (0..b.num_rows()).map(|i| Some(!res.is_valid(i))).collect();
+        marks.push(filter_record_batch(b, &mark)?);
+        matched.push(without(&filter_record_batch(b, &rest)?, "__mr_resume")?);
+    }
+    let markers = markers_of(&marks, &part)?;
+
+    // The view's rows: the matches, through the query's own clause when it has one.
+    let match_schema: SchemaRef = Arc::new(Schema::new(inner_schema.fields().iter().filter(|f| f.name() != "__mr_resume").map(|f| f.as_ref().clone()).collect::<Vec<_>>()));
+    let all_matches = rows_as(&match_schema, &matched)?;
+    let view_schema = crate::answer::schema(&view_meta.columns)?;
+    let view_rows = match &m.outer {
+        Some(outer) => {
+            let octx = session(lake, outer, "__matches").await?;
+            octx.register_table("__matches", Arc::new(MemTable::try_new(match_schema.clone(), vec![vec![all_matches]])?))?;
+            let rows: Vec<RecordBatch> = crate::engine::sql(&octx, outer).await?.collect().await?;
+            rows_as(&view_schema, &rows)?
+        }
+        None => rows_as(&view_schema, &[all_matches])?,
+    };
+
+    // The writes: the matches; the held delta (new rows that stay held, and held rows that no longer do); each key's
+    // resume row; and the late count. Every producer moves in one flush.
+    let keep: HashMap<Key, usize> = markers.iter().map(|(k, mk)| (k.clone(), mk.keep.max(0) as usize)).collect();
+    let (new_mask, gone_mask) = delta(&keys_in, &times_in, &ids_in, &is_new, &keep);
+    let new_held = held_rows_of(&filter_record_batch(&input, &BooleanArray::from(new_mask))?, &cols)?;
+    let gone_held = held_rows_of(&filter_record_batch(&input, &BooleanArray::from(gone_mask))?, &cols)?;
+    let resume_out = resume_batch(&markers, &part, &resume_meta)?;
+    let (wv, w0v) = (w as u64, w0);
+    let mut pending = vec![Append { table: view.to_string(), src: Src { producer: producer.clone(), seq: wv, prev: Some(w0v) }, batch: view_rows, ack: tokio::sync::oneshot::channel().0 }];
+    let (held_parts, _) = crate::change::appends(lake, seq, &held_name, &held_meta, nonempty(gone_held), nonempty(new_held), &format!("{producer}$held"), false, false).await?;
+    pending.extend(flush_parts(held_parts, &held_name, &held_meta, &format!("{producer}$held"), wv, w0v)?);
+    let (resume_parts, _) = crate::change::appends(lake, seq, &resume_name, &resume_meta, vec![], nonempty(resume_out), &format!("{producer}$resume"), false, false).await?;
+    pending.extend(flush_parts(resume_parts, &resume_name, &resume_meta, &format!("{producer}$resume"), wv, w0v)?);
+    if at > at0 {
+        let batch = match late {
+            0 => RecordBatch::new_empty(crate::answer::schema(&crate::views::expected_table(lake).columns)?),
+            n => crate::once::late_batch(view, "", n)?,
+        };
+        pending.push(Append { table: EXPECTED.into(), src: Src { producer: late_producer, seq: at, prev: Some(at0) }, batch, ack: tokio::sync::oneshot::channel().0 });
+    }
+
+    // The commit, under the lake's lock: this view still the one this run is for.
+    let guard = lock.lock().await;
+    let kept = lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|x| x.matches);
+    if kept.is_none_or(|x| x.id != m.id) {
+        return Ok(());
+    }
+    let outcome = crate::change::submit(lake, seq, &pending).await?;
+    drop(guard);
+    match outcome {
+        Outcome::Acks(acks) if acks.iter().all(|a| !(a.conflict || a.duplicate || a.refused || a.gone)) => {
+            if m.within {
+                for (key, mk) in &markers {
+                    dues.set(key, mk.due);
+                }
+                DUES.lock().unwrap().insert(dkey, dues); // (after a commit: the dues are as the writes say)
+            }
+        }
+        Outcome::Acks(acks) if acks.iter().any(|a| a.conflict) => {
+            eprintln!("materialized view {view}: another run committed first; the next one reads on from it");
+        }
+        Outcome::Acks(acks) if acks.iter().any(|a| a.refused || a.gone) => bail!("materialized view {view}: its rows were refused"),
+        Outcome::Refused(why) => bail!("materialized view {view}: {why}"),
+        _ => {} // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
+    }
     Ok(())
 }
 
