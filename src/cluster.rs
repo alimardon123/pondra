@@ -22,7 +22,7 @@ use crate::members::Members;
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
-use crate::terms::{alive, claim, deaf, gone_here, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, Term, HELD, LEASE};
+use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, Holder, Term, HELD, LEASE};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::BTreeMap;
@@ -51,6 +51,9 @@ pub struct Cluster {
     /// restart, so `keep_alive` marks it at once.
     taken_back: bool,
     rang: tokio::sync::watch::Sender<u64>, // leader: rings of the inbox's bell heard (`keep_alive`), which `inbox::serve` drains on
+    /// A guest that writes through the bucket's inbox (`inboxed`): it reads as a reader does, and its writes go to the
+    /// leader through the inbox, since the leader doesn't answer from here (`write::by_inbox`).
+    by_inbox: bool,
 }
 
 impl Cluster {
@@ -114,49 +117,49 @@ impl Cluster {
 
     /// A guest's cluster (`node.rs`: a program's node for its own statements, which ends after them). Not `join`:
     /// its "the latest term is mine" would take back another guest's stale empty-address term, and its loops restart by
-    /// exec without the job. It asks the lake's leader as `write::deliver` does. A live leader that answers is followed,
-    /// as a follower that never beats (so it is never listed, and gets no work). A live leader that doesn't answer from
-    /// here is the reads of a `Reads` guest, and `None` for a `Writes` one (the caller goes through the bucket's inbox;
-    /// `PONDRA_NO_DIRECT` makes a write take an answering leader for that). A term with no address that is alive is a
-    /// one-off writer recording: a read reads beside it, a write waits for it. With nobody alive, a read reads, and a
-    /// write claims the next term with no address and leads it (invariant 17). `may_lead` false is a store another
-    /// node serves (`pondra://`): it is never led, so a write whose holder doesn't answer is an error, not a wait.
+    /// exec without the job. A live leader that answers is followed, as a follower that never beats (so it is never
+    /// listed, and gets no work). A live leader that doesn't answer from here is the reads of a `Reads` guest; a `Writes`
+    /// one that may lead the lake reads the same way and is `by_inbox`: its writes go through the bucket's inbox
+    /// (`write::by_inbox`; `PONDRA_NO_DIRECT` makes a write take that for an answering leader too). A term with no address
+    /// that is alive is a one-off writer recording: a read reads beside it, a write waits for it. With nobody alive, a read
+    /// reads, and a write claims the next term with no address and leads it (invariant 17). `may_lead` false is a store
+    /// another node serves (`pondra://`): it is never led, so a write whose holder doesn't answer is an error, not a wait.
     /// A lake on a read-only reach (`write::across`) is refused by `Node::start` before this runs.
-    pub async fn guest(store: &Store, guest: Guest, may_lead: bool) -> Result<Option<Arc<Cluster>>> {
+    pub async fn guest(store: &Store, guest: Guest, may_lead: bool) -> Result<Arc<Cluster>> {
         let writes = guest == Guest::Writes;
         let not_led = || anyhow::anyhow!("the node that serves this store doesn't lead it or answer from here, and a write can't go another way: start it, or read");
         loop {
-            match latest(store).await? {
-                Some(t) if !t.addr.is_empty() && alive(store, &t).await => {
+            match holder(store).await? {
+                Holder::Led(t) => {
                     let follower = made("", t.clone(), false, false, false, false);
                     if (!writes || !crate::env::is_set("PONDRA_NO_DIRECT")) && follower.leader_alive().await {
-                        return Ok(Some(follower));
+                        return Ok(follower);
                     }
                     return match (writes, may_lead) {
-                        (false, _) => Ok(Some(made("", t, true, may_lead, false, false))),
+                        (false, _) => Ok(made("", t, true, may_lead, false, false)),
                         (true, false) => Err(not_led()),
-                        (true, true) => Ok(None),
+                        (true, true) => Ok(inboxed(t, may_lead)),
                     };
                 }
                 // (another one-off writer is recording: a read reads beside it, a write waits for it to finish)
-                Some(t) if alive(store, &t).await => {
+                Holder::Recording(t) => {
                     if !writes {
-                        return Ok(Some(made("", t, true, may_lead, false, false)));
+                        return Ok(made("", t, true, may_lead, false, false));
                     }
                     if !deaf(store, &t).await {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
                 // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
-                t => {
+                Holder::Free(t) => {
                     if !writes {
-                        return Ok(Some(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false)));
+                        return Ok(made("", t.unwrap_or(Term { n: 0, addr: String::new(), lock: String::new(), bell: false }), true, may_lead, false, false));
                     }
                     if !may_lead {
                         return Err(not_led());
                     }
                     if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
-                        return Ok(Some(made("", term, false, true, false, false)));
+                        return Ok(made("", term, false, true, false, false));
                     }
                     // (someone else claimed it just now: look again)
                 }
@@ -364,6 +367,7 @@ impl Members for Cluster {
     fn me(&self) -> &str { &self.addr }
     fn leader(&self) -> &Term { &self.leader }
     fn reader(&self) -> bool { self.reader }
+    fn by_inbox(&self) -> bool { self.by_inbox }
 
     /// Live members, sorted: shard `s` of a task runs on `nodes[s % nodes.len()]`.
     fn nodes(&self) -> Vec<String> {
@@ -414,7 +418,14 @@ fn made(addr: &str, leader: Term, reader: bool, may_lead: bool, serves_store: bo
     // its first answer, not 30 s later, so the restart check in `follow` can fire)
     let last_ok = Mutex::new(if may_lead { Instant::now() + STARTUP } else { Instant::now() }); // until we first hear from the leader
     let (beats, heard) = (Default::default(), Default::default());
-    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0) })
+    Arc::new(Cluster { addr: addr.into(), reader, leader, beats, view, last_ok, heard, cut_off: Default::default(), others: Default::default(), may_lead, serves_store, taken_back, rang: tokio::sync::watch::Sender::new(0), by_inbox: false })
+}
+
+/// A guest that writes through the bucket's inbox (`Cluster::guest`): it reads the lake as a `Reads` guest does, and says so.
+fn inboxed(t: Term, may_lead: bool) -> Arc<Cluster> {
+    let mut guest = made("", t, true, may_lead, false, false);
+    Arc::get_mut(&mut guest).expect("made just now: no other handle").by_inbox = true;
+    guest
 }
 
 /// A node that just started under a leader, reading the commit stream (its view reads no WAL):

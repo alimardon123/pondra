@@ -4,7 +4,7 @@
 //! to record the result: one small commit, the leader's job (`Request`, `handle`). A machine that
 //! isn't a node reaches the leader over HTTP, through the bucket when it can't (`inbox.rs`), or
 //! leads for a moment itself when nobody does.
-use crate::terms::{alive, claim, latest, release};
+use crate::terms::{alive, claim, holder, latest, release, Holder};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::session;
 use crate::answer::schema;
@@ -1591,6 +1591,12 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if let Stmt::CopyTo(query, to, options) = &stmt {
         return crate::copy::copy_to(&app.lake, query, to, options, &app.members.nodes(), app.members.me()).await; // (files outside the lake: from here, or every node its share)
     }
+    let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
+    let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
+    // (a guest whose leader doesn't answer from here writes through the bucket's inbox, one request at a time: `by_inbox`)
+    if app.members.by_inbox() {
+        return by_inbox(app, stmt, &job, files).await;
+    }
     // (above a view of a folder's write: a reader writes no file either)
     ensure!(!app.members.reader(), "read-only node");
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
@@ -1614,8 +1620,6 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
-    let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
-    let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
     if let Stmt::Ddl(ddls) = stmt {
         let mut out = j!({});
         for mut d in ddls {
@@ -1686,12 +1690,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if let Some(other) = other {
         crate::users::across_write(&other, &attached_as(&stmt), &table, &stmt).await?; // (that lake's own sign-in)
         let req = prepare(lake, &other, &table, &stmt, &job, files).await?;
-        let mark = match &req {
-            Some(Request::Files(f)) => Some(producer_key(&format!("job:{}", f.job))),
-            Some(Request::Flush(_)) => Some(producer_key(&format!("sql:{job}"))),
-            Some(Request::Table(name, _)) => Some(table_key(name)),
-            _ => None,
-        };
+        let mark = req.as_ref().and_then(|r| request_mark(r, &job));
         let out = deliver(&other.url, req, &job, false).await;
         if out.is_ok() {
             seen_there(&other, mark).await;
@@ -1793,7 +1792,7 @@ async fn everywhere(app: &crate::app::App, table: &str, query: &str, job: &str, 
     }
 }
 
-/// The identity check every SQL write meets once, however it came (`on_node_listed`, `through_bucket_statement`, and the leader's
+/// The identity check every SQL write meets once, however it came (`on_node_listed`, which a guest's inbox writes meet too, and the leader's
 /// `change::run`): an ALWAYS identity column is given no value by an INSERT (428C9), and set by no UPDATE or MERGE, unless
 /// the value is DEFAULT. What each form gives is what Postgres takes (`change::Merge::written` for a MERGE and the INSERT …
 /// ON CONFLICT and OR … forms, `rules::rows::defaulted` for the DEFAULTs in VALUES). A name no lake here holds is Ok: its own path answers.
@@ -1953,18 +1952,23 @@ pub async fn lead_only(dir: &str) -> Result<()> {
     deliver(dir, None, "", true).await.map(drop)
 }
 
-/// `pondra sql`'s write to a lake whose leader is alive but doesn't answer from the guest's start (`cli.rs`'s `through_inbox`):
-/// the statement is checked here as a node's door checks it and prepared as the leader takes it, then each request is sent as
-/// a one-off writer sends it (`deliver`): over HTTP if this machine reaches the leader after all, else through the bucket's
-/// inbox, or led here when nobody leads. Each request sets its lake's node key first (`through_bucket_one`).
-pub(crate) async fn through_bucket_statement(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
-    if let Stmt::Invalid(why) = stmt {
-        bail!(why); // (said as a node says it)
+/// A write of a guest whose lake's leader is alive but doesn't answer from this machine (`Cluster::guest`, `by_inbox`): the
+/// guest reads as a reader does, and each request of the statement goes to the leader as a one-off writer sends it
+/// (`through_bucket_one`): over HTTP if this machine reaches the leader after all, else through the bucket's inbox, where the
+/// leader records it, or this process leads for a moment. The statement has had the steps `run_listed` takes before this
+/// (the door, the identity check). What the inbox can't carry is refused by name first: a RETURNING, a COPY INTO, and a
+/// transaction (`txn::begin`). Each statement of a text has its own part of `job` (`script.rs`), so a run again with the
+/// same job records each one once.
+async fn by_inbox(app: &crate::app::App, stmt: Stmt, job: &str, files: bool) -> Result<Value> {
+    let lake = &app.lake;
+    if crate::returning::asked() {
+        return Err(crate::codes::coded("0A000", "RETURNING needs the lake's leader, which is alive but doesn't answer from here: send the write without RETURNING, and read its rows with a SELECT"));
     }
-    let stmt = crate::protect::door(lake, stmt).await?; // (a node's door too: this path never reaches `on_node_listed`)
-    identity(lake, &stmt).await?; // (as a node's: every SQL write's identity, here before `whole_rows` rewrites an INSERT INTO t (names))
+    if matches!(stmt, Stmt::CopyInto(..)) {
+        return Err(crate::codes::coded("0A000", "COPY INTO needs the lake's leader, which is alive but doesn't answer from here: load the files with INSERT INTO … SELECT … FROM '…' instead"));
+    }
     if let Some((query, to, options)) = crate::ext::view_write(lake, &stmt).await? {
-        let out = crate::copy::copy_to(lake, &query, &to, &options, &[], "").await?; // (a view of a folder: a new file in it)
+        let out = crate::copy::copy_to(lake, &query, &to, &options, &app.members.nodes(), app.members.me()).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
     }
     let stmt = match stmt {
@@ -1983,52 +1987,69 @@ pub(crate) async fn through_bucket_statement(lake: &Arc<Lake>, stmt: Stmt) -> Re
         }
     }
     match stmt {
-        Stmt::CopyTo(query, to, options) => {
-            let lake = lake.clone();
-            crate::ext::scope(true, async move { crate::copy::copy_to(&lake, &query, &to, &options, &[], "").await }).await // (its user's own machine)
-        }
         // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, each one sent through the bucket.
         Stmt::Create(c) if c.query.is_some() || c.or_replace => {
-            let owned = lake.clone();
+            let (owned, job_run) = (lake.clone(), job.to_string());
             let run = move |s: Stmt| -> futures::future::BoxFuture<'static, Result<Value>> {
-                let owned = owned.clone();
-                Box::pin(async move { through_bucket_one(&owned, s).await })
+                let (owned, job) = (owned.clone(), job_run.clone());
+                Box::pin(async move { through_bucket_one(&owned, s, &job, files).await })
             };
-            create_as(run, lake, &c, job(), true, &mut |_: &str| {}).await
+            create_as(run, lake, &c, job, files, &mut |_: &str| {}).await
         }
         Stmt::Create(c) => {
             let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
-            raced(if_not_exists, &name, through_bucket_one(lake, Stmt::Create(c)).await) // (a plain CREATE TABLE: its definition carries the job)
+            raced(if_not_exists, &name, through_bucket_one(lake, Stmt::Create(c), job, files).await) // (a plain CREATE TABLE: its definition carries the job)
         }
         Stmt::Ddl(ddls) => {
             let mut out = j!({});
-            for d in ddls {
+            for mut d in ddls {
+                crate::branch::door(lake, &mut d).await?; // (a branch: who may make or drop one, and its owner, as `run_listed` asks)
                 // (a backup or restore runs here, as the node the statement reached would run it: this process's owner, no lock (it
                 // leads nothing), the pin and the ATTACH sent to the leaders (`backup::statement`); the inbox would record it under
                 // the leader's own owner, which is none)
                 out = if matches!(d, crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) {
-                    crate::backup::statement(lake, None, d).await?
+                    crate::backup::statement(lake, None, d.clone()).await?
                 } else {
-                    through_bucket_one(lake, Stmt::Ddl(vec![d])).await?
+                    through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files).await?
                 };
+                crate::ddl::settle(lake, &d).await?; // (ATTACH, DETACH: here at once, as `run_listed` settles them)
+                if let Some(n) = out["notice"].as_str() {
+                    crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, as `run_listed` tells it)
+                }
             }
             Ok(out)
         }
-        stmt => through_bucket_one(lake, stmt).await,
+        stmt => through_bucket_one(lake, stmt, job, files).await,
     }
 }
 
-/// One request of a statement, sent as `through_bucket_statement` describes: to the lake it writes (an attached lake's leader,
-/// if the name is one), under this process's job, so a retry of it is answered as a duplicate. The node key set is the target
-/// lake's (each lake has its own), before its leader is called (`dial::signed`: a key set already is kept).
-async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt) -> Result<Value> {
+/// One request of a statement, sent as `by_inbox` describes: to the lake it writes (an attached lake's leader, if the name is
+/// one), under the statement's own part of the job (`statement_job`), so a retry of it is answered as a duplicate. The node key
+/// set is the target lake's (each lake has its own), before its leader is called (`dial::signed`: a key set already is kept).
+/// Once the leader has answered, the statement after it reads what it wrote: this view waits for the request's mark, as
+/// `run_listed`'s attached-lake path does, since this guest has no view that follows the leader.
+async fn through_bucket_one(lake: &Arc<Lake>, stmt: Stmt, statement_job: &str, files: bool) -> Result<Value> {
     let (other, table) = crate::ddl::resolve(lake, &stmt.table()).await?;
     let (stmt, target) = (stmt.on(table.clone()), other.unwrap_or_else(|| lake.clone())); // (a write to an attached lake goes to its leader)
-    let job = job().to_string();
     crate::dial::signed(&target).await;
-    match prepare(lake, &target, &table, &stmt, &job, true).await? {
-        Some(req) => deliver(&target.url, Some(req), &job, true).await,
-        None => Ok(j!({"duplicate": true})), // (a retry: the write it asks is recorded already)
+    let Some(req) = prepare(lake, &target, &table, &stmt, statement_job, files).await? else {
+        return Ok(j!({"duplicate": true})); // (a retry: the write it asks is recorded already)
+    };
+    let mark = request_mark(&req, statement_job);
+    // (the process's job, not the statement's: a run started over again keeps it, and gives each statement its part again)
+    let out = deliver(&target.url, Some(req), job(), true).await?;
+    seen_there(&target, mark).await;
+    Ok(out)
+}
+
+/// The catalog key a request leaves for the statement after it to wait for (`seen_there`): the job's files, the flush's or
+/// change's `sql:{job}`, or the table it made. None for a request that leaves no key (DDL).
+fn request_mark(req: &Request, job: &str) -> Option<String> {
+    match req {
+        Request::Files(f) => Some(producer_key(&format!("job:{}", f.job))),
+        Request::Flush(_) | Request::Change(..) => Some(producer_key(&format!("sql:{job}"))),
+        Request::Table(name, _) => Some(table_key(name)),
+        _ => None,
     }
 }
 
@@ -2068,15 +2089,14 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
     }
     let store = open_store(dir)?.1;
     loop {
-        match latest(&store).await? {
-            Some(t) if alive(&store, &t).await => {
-                if t.addr.is_empty() {
-                    // (another `pondra sql` is recording: wait. One elsewhere that was killed doesn't mark itself when rung)
-                    if !crate::terms::deaf(&store, &t).await {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                    continue;
+        match holder(&store).await? {
+            Holder::Recording(t) => {
+                // (another `pondra sql` is recording: wait. One elsewhere that was killed doesn't mark itself when rung)
+                if !crate::terms::deaf(&store, &t).await {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+            }
+            Holder::Led(t) => {
                 let Some(r) = &req else {
                     // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
                     if crate::terms::deaf(&store, &t).await {
@@ -2095,13 +2115,13 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
-            _ if !one_off => {
+            Holder::Free(_) if !one_off => {
                 let Some(r) = &req else { return Ok(j!({"duplicate": true})) };
                 if let Some(v) = crate::inbox::send(&store, r, Some(dir), None).await? {
                     return summary(matches!(r, Request::Flush(_)), v);
                 }
             }
-            t => {
+            Holder::Free(t) => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
                 return match lead(dir, &store, term.n, req).await {
                     // Another one-off writer took the catalog while this one was leading (both

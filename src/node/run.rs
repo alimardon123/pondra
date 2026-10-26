@@ -42,19 +42,6 @@ impl Options {
     }
 }
 
-/// A guest's start found its lake's leader alive but not answering from here: its write goes through the bucket's
-/// inbox instead (the program downcasts it to know so).
-#[derive(Debug)]
-pub struct Unreached;
-
-impl std::fmt::Display for Unreached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the lake's leader is alive but doesn't answer from here")
-    }
-}
-
-impl std::error::Error for Unreached {}
-
 /// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
 #[derive(Default)]
 pub(crate) struct Held {
@@ -213,11 +200,7 @@ impl Node {
         let mut beside = Beside::start(&dir, guest);
         let cluster = match guest {
             None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store).await?,
-            Some(g) => match cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))? {
-                Some(c) => c,
-                // (its leader is alive and answers nobody here: the program sends the write through the bucket's inbox)
-                None => return Err(anyhow::Error::new(Unreached)),
-            },
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -242,7 +225,8 @@ impl Node {
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         // (a guest's mode said whether its leader answers: a guest that follows one streams, and asks no more)
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || (lives && cluster.leader_alive().await));
-        // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`)
+        // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`;
+        // an inbox guest polls as a follower does: its `seen_there` waits for the leader's mark, which a snapshot never shows)
         let poll = match guest {
             Some(Guest::Reads) if !streamed => store::READER_ONE_SNAPSHOT,
             _ => store::READER_POLL,
@@ -277,8 +261,8 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
-        if guest == Some(Guest::Reads) && !streamed {
-            let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`)
+        if (guest == Some(Guest::Reads) || cluster.by_inbox()) && !streamed {
+            let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`; an inbox guest's writes are answered before it)
         }
         tr("the lake open");
         for spec in &attached {

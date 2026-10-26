@@ -14,8 +14,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[cfg(feature = "doors")] mod run;
-#[cfg(feature = "doors")] pub use run::{Node, Options, Unreached};
-#[cfg(feature = "doors")] pub(crate) use run::{attach, request, Held};
+#[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 /// What a guest is for. A guest that reads claims nothing; one that writes may record, so it leads a lake nobody leads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

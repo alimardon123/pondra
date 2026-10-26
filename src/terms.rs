@@ -368,6 +368,26 @@ pub(crate) fn gone_here(t: &Term) -> bool {
     !restarting.is_some_and(|ms| crate::log::now_ms().saturating_sub(ms) < 30_000)
 }
 
+/// Who holds a lake's leadership, as a writer or a guest reads it: the newest term when it is alive, led by a node
+/// (`Led`) or recorded by a one-off writer, which has no address (`Recording`); otherwise `Free`, with the newest term if
+/// there is one, so that the next claim numbers from it.
+pub(crate) enum Holder {
+    Led(Term),
+    Recording(Term),
+    Free(Option<Term>),
+}
+
+/// The lake's holder now (`Holder`).
+pub(crate) async fn holder(store: &Store) -> Result<Holder> {
+    Ok(match latest(store).await? {
+        Some(t) if alive(store, &t).await => match t.addr.is_empty() {
+            true => Holder::Recording(t),
+            false => Holder::Led(t),
+        },
+        t => Holder::Free(t),
+    })
+}
+
 /// The leader of term `n` stops, drained (`drain.rs`): it says so (`cluster/left/{n}`), so its
 /// followers take over at once instead of waiting out the lease, then releases its term.
 pub async fn step_down(store: &Store, n: u64) {
@@ -452,6 +472,24 @@ mod tests {
         }
         crate::memory::forget_memory(&url);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn holder_tells_a_led_a_recorded_and_a_free_lake_apart() {
+        async fn with_term(n: u64, addr: &str, marked: bool) -> Store {
+            let store: Store = Arc::new(object_store::memory::InMemory::new());
+            let term = Term { n, addr: addr.into(), lock: String::new(), bell: false };
+            store.put(&Path::from(format!("cluster/term/{n:020}")), serde_json::to_vec(&term).unwrap().into()).await.unwrap();
+            if marked {
+                mark_alive(&store, n).await.unwrap();
+            }
+            store
+        }
+        let empty: Store = Arc::new(object_store::memory::InMemory::new());
+        assert!(matches!(holder(&empty).await.unwrap(), Holder::Free(None)), "no term: free");
+        assert!(matches!(holder(&with_term(4, "10.0.0.1:9000", true).await).await.unwrap(), Holder::Led(t) if t.n == 4), "alive with an address: led");
+        assert!(matches!(holder(&with_term(5, "", true).await).await.unwrap(), Holder::Recording(t) if t.n == 5), "alive with none: recording");
+        assert!(matches!(holder(&with_term(6, "10.0.0.1:9000", false).await).await.unwrap(), Holder::Free(Some(t)) if t.n == 6), "not marked: free, numbered from it");
     }
 
     #[tokio::test]
