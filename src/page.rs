@@ -853,7 +853,7 @@ impl Page {
         };
         let before = self.before(name).await?;
         let had = self.ruled_of(name);
-        let held = note.is_none() && self.in_txn(name, &before, &had);
+        let held = note.is_none() && self.in_txn(name, &before, &had)?;
         let batches = match rows_of(ctx, plan, self.watch.as_ref()).await {
             Ok(batches) => batches,
             Err(e) => return Err(self.undone(name, before, had, e, "").await),
@@ -3280,6 +3280,28 @@ mod tests {
         drop(a);
         let b = Page::kept(&options).await.unwrap();
         assert_eq!(csv(&b, "SELECT id, v FROM t ORDER BY id").await, "id,v\n1,kept\n");
+    }
+
+    /// A kept page writes one table in a transaction (each is its own file, which a COMMIT can't keep at once): a second is
+    /// refused 0A000 before it is written, and the transaction is then a failed one. A page in memory writes any number.
+    #[tokio::test]
+    async fn a_kept_page_writes_one_table_in_a_transaction() {
+        let options = Options { store: Some(Arc::new(InMemory::new())), ..Default::default() };
+        for (page, kept) in [(Page::kept(&options).await.unwrap(), true), (Page::open(&Options::default()), false)] {
+            for sql in ["CREATE TABLE t (id INT)", "CREATE TABLE u (id INT)", "BEGIN", "INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"] {
+                ran(&page, sql).await;
+            }
+            match kept {
+                true => {
+                    assert_eq!(code(&page, "INSERT INTO u VALUES (1)").await, "0A000");
+                    assert_eq!(code(&page, "INSERT INTO t VALUES (3)").await, "25P02");
+                }
+                false => ran(&page, "INSERT INTO u VALUES (1)").await,
+            }
+            ran(&page, "COMMIT").await;
+            let want = if kept { "n\n0\n" } else { "n\n1\n" };
+            assert_eq!(csv(&page, "SELECT count(*) AS n FROM u").await, want);
+        }
     }
 
     /// A page keeps enum types as a node does: a cast to one and a column of one take its labels and refuse any other (22P02),
