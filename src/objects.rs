@@ -600,7 +600,7 @@ pub(crate) fn materialized_sql(name: &str, v: &crate::views::View, meta: Option<
         with.extend(b.lag_secs.map(|s| format!("lag = '{s} seconds'")));
     }
     let with = if with.is_empty() { String::new() } else { format!(" WITH ({})", with.join(", ")) };
-    format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{}", v.query())
+    format!("CREATE MATERIALIZED VIEW {name}{list}{with} AS\n{}", crate::views::shown(v.query()))
 }
 
 /// `CREATE FUNCTION`, `CREATE MACRO` or `CREATE PROCEDURE`, in the form it was made in.

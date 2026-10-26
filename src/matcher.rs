@@ -1413,10 +1413,10 @@ impl WindowUDFImpl for Matcher {
     }
 }
 
-/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`). A DEFINE's glue is planned
-/// against the session as it stands here, so it sees the functions registered before this call and no later one. The
-/// per-session functions (`files`, `nextval`, `secrets()`) are registered after it, so a DEFINE doesn't see them. The node's
-/// `functions` registers this again after its AI functions, so a DEFINE sees those too.
+/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`, for every form). A DEFINE's
+/// glue is planned against the session as it stands here, so it sees the functions registered before this call and no later
+/// one. A lake's statement that reads a pattern registers it again, last (`query::session_at`), so its DEFINEs see the AI,
+/// lake, Python and per-session functions too.
 pub fn register(ctx: &SessionContext) {
     let planner = Arc::new(Planner::new(Arc::new(ctx.state())));
     for all in [false, true] {
