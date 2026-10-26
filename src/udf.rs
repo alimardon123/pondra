@@ -16,6 +16,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::{exec_datafusion_err, exec_err};
 use datafusion::logical_expr::{async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl}, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility};
 use datafusion::prelude::SessionContext;
+#[cfg(not(target_arch = "wasm32"))]
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -98,6 +99,7 @@ impl AsyncScalarUDFImpl for Flighted {
 }
 
 /// One round trip: the batch out, one column back.
+#[cfg(not(target_arch = "wasm32"))]
 async fn exchange(url: &str, batch: RecordBatch) -> Result<ArrayRef> {
     use arrow_flight::encode::FlightDataEncoderBuilder;
     let schema = batch.schema();
@@ -114,7 +116,13 @@ async fn exchange(url: &str, batch: RecordBatch) -> Result<ArrayRef> {
     Ok(out)
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn exchange(_: &str, _: RecordBatch) -> Result<ArrayRef> {
+    Err(crate::codes::coded("0A000", "a page calls no function's Flight server: a browser speaks no gRPC"))
+}
+
 /// Connections are kept: one per server, shared by every query (gRPC multiplexes them).
+#[cfg(not(target_arch = "wasm32"))]
 async fn channel(url: &str) -> Result<tonic::transport::Channel> {
     crate::per_node!(static OPEN: Mutex<HashMap<String, tonic::transport::Channel>> = Default::default());
     let open = &*OPEN;
