@@ -65,6 +65,27 @@ crate::per_node!(
 /// Is the node open in this process a guest (`Options::guest`)?
 pub(crate) fn is_guest() -> bool { GUEST.load(std::sync::atomic::Ordering::SeqCst) }
 
+/// The node stops, for good, with this reason, when its own work can't go on (a vital loop's panic, the catalog's
+/// compactor, a lake a newer Pondra wrote). In a library the node stops and the host's process stays: `library::failed`
+/// says why, and this returns. In the program the process ends with status 1, as a supervisor expects of a stop and
+/// with no core: what it made goes first (an exit runs no destructor).
+pub(crate) fn stop(why: String) {
+    if crate::library::on() {
+        return crate::library::failed(why);
+    }
+    eprintln!("stopping: {why}");
+    crate::memory::leave();
+    std::process::exit(1)
+}
+
+/// A line the node says on stderr when all goes well (a node is up, a lake's format moved on). A library's host and a
+/// `pondra sql` guest's shell show only trouble, so there it is not said.
+pub(crate) fn say(line: impl std::fmt::Display) {
+    if !crate::library::on() && !is_guest() {
+        eprintln!("{line}");
+    }
+}
+
 /// A guest's start found its lake's leader alive but not answering from here: its write goes through the bucket's
 /// inbox instead (the program downcasts it to know so).
 #[derive(Debug)]
@@ -627,9 +648,7 @@ impl Node {
         }
         if lives {
             let role = if reader { "reader" } else if leader { "leader" } else { "follower" };
-            if !crate::library::on() {
-                eprintln!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n); // (a library's host hears only of trouble)
-            }
+            say(format!("pondra {role} (term {}) serving {dir} on {addr}", cluster.leader.n));
         }
         // No Nagle: a small answer goes out at once, not after the client's delayed ACK (the
         // Postgres, Kafka and Flight ports do the same).

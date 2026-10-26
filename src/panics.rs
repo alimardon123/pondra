@@ -160,16 +160,12 @@ pub fn spawn<T: Send + 'static>(f: impl Future<Output = T> + Send + 'static) -> 
         match AssertUnwindSafe(f).catch_unwind().await {
             Ok(v) => v,
             Err(p) => {
-                if crate::library::on() {
-                    // (in a library the node stops, never the host's process; a restart in place unwinds
-                    // the task that asked for it, and its supervisor has been told already)
-                    if p.downcast_ref::<crate::library::Restarting>().is_none() {
-                        crate::library::failed(format!("a panic in the node's own work: {}", said(&*p)));
-                    }
-                    std::panic::resume_unwind(p)
+                // (a library's node restarting in place unwinds the task that asked for it, and its supervisor has been told
+                // already: that is no stop. Otherwise the node stops; in a library `stop` returns and the panic unwinds on)
+                if p.downcast_ref::<crate::library::Restarting>().is_none() {
+                    crate::node::stop(format!("a panic in the node's own work: {}", said(&*p)));
                 }
-                eprintln!("stopping: a panic in the node's own work: {}", said(&*p));
-                std::process::abort()
+                std::panic::resume_unwind(p)
             }
         }
     }))

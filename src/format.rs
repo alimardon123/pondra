@@ -98,9 +98,7 @@ async fn set(lake: &Lake, to: u32) -> Result<()> {
     }
     let stamp = Stamp { format: to, by: VERSION.into() };
     lake.cat.commit(vec![(KEY.into(), serde_json::to_vec(&stamp).expect("json"))], &[]).await?;
-    if !crate::library::on() {
-        eprintln!("the lake is format {to} now (Pondra {VERSION})"); // (a library's host hears only of trouble)
-    }
+    crate::node::say(format!("the lake is format {to} now (Pondra {VERSION})"));
     Ok(())
 }
 
@@ -214,12 +212,7 @@ pub fn watch(lake: Arc<Lake>) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Err(e) = check(&lake.cat, &lake.url, false).await {
                 if e.downcast_ref::<Newer>().is_some() {
-                    if crate::library::on() {
-                        return crate::library::failed(format!("{e:#}"));
-                    }
-                    eprintln!("stopping: {e}");
-                    crate::memory::leave();
-                    std::process::exit(1);
+                    return crate::node::stop(format!("{e}"));
                 }
             }
         }

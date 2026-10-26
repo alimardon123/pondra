@@ -244,11 +244,7 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
             // (a compactor fenced by a newer leader's is this node's step down, not a failure: it restarts and rejoins
             // as a follower, as a fenced write does. Stopping there left a stale leader that woke gone: harness `fence`)
             let e = crate::store::fatal(e.into());
-            if crate::library::on() {
-                return crate::library::failed(format!("the catalog's compactor or garbage collector failed: {e}"));
-            }
-            eprintln!("stopping: the catalog's compactor or garbage collector failed: {e}");
-            std::process::abort();
+            crate::node::stop(format!("the catalog's compactor or garbage collector failed: {e}"));
         }
     });
     // (SlateDB doesn't export the collector's type, so how the two stop is kept as a future to run)
