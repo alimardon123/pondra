@@ -422,11 +422,19 @@ struct Tick {
     /// Claimed by `EXECUTE TASK`: the tasks after it run in its run, suspended ones too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     asked: bool,
+    /// Claimed by the node's owner (`EXECUTE TASK` from the owner's door): an asked run reaches the owner's disk only then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    by_owner: bool,
 }
 
 impl Tick {
     /// Ended, and well enough for what follows it.
     fn passed(&self) -> bool { self.done && matches!(self.status.as_deref(), None | Some("ok" | "skipped")) }
+
+    /// Is this run the task owner's (`ext::scope`, so a folder on the owner's disk is theirs to write)? A scheduled tick is
+    /// as its task is. An asked one is only if the owner asked too: whoever may run a task may name any folder for it, so
+    /// a superuser's ask must not reach the owner's disk through a task the owner made.
+    fn as_owner(&self, task: &Task) -> bool { task.by_owner && (!self.asked || self.by_owner) }
 }
 
 pub fn task_key(name: &str) -> String { format!("j/{name}") }
@@ -608,7 +616,8 @@ pub async fn execute_task(lake: &Lake, name: &str, params: HashMap<String, serde
         bail!("task {name} is running (run task-{name}-{}): EXECUTE TASK once it ends", t.at);
     }
     let at = now_ms().max(last.map_or(0, |t| t.at + 1));
-    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, asked: true, ..Default::default() }))], &[]).await?;
+    // (the leader's own context, as `create_task`'s: a forwarded EXECUTE is none of the owner's)
+    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, asked: true, by_owner: crate::ext::owner(), ..Default::default() }))], &[]).await?;
     WAKE.notify_one();
     Ok(serde_json::json!({"task": name, "run": format!("task-{name}-{at}")}))
 }
@@ -738,11 +747,12 @@ pub fn schedule(app: App) {
                         continue;
                     }
                 };
+                let as_owner = tick.as_owner(task);
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
                 crate::panics::task(async move {
-                    crate::ext::scope(task.by_owner, run_tick(&app, &name, &task, tick)).await; // (as the task's owner: `by_owner`)
+                    crate::ext::scope(as_owner, run_tick(&app, &name, &task, tick)).await; // (as the task's owner, an asked run only when the owner asked: `Tick::as_owner`)
                     drop(ran);
                 });
             }
@@ -827,7 +837,7 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     };
     let error = out.as_ref().err().map(|e| format!("{e:#}"));
     let _ = tokio::time::timeout(Duration::from_secs(60), run.ended(app, status, error, heard)).await; // (in the log before the tick is done)
-    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params, asked: tick.asked });
+    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params, asked: tick.asked, by_owner: tick.by_owner });
     if let Err(e) = app.lake.cat.commit(vec![(tick_key(name), done)], &[]).await {
         eprintln!("task {name}: tick {} ran, and couldn't be marked done ({e:#}): a new leader runs it again, with the same job", tick.at);
     }
@@ -886,7 +896,7 @@ async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
             if task.suspended && !b.asked {
                 return Ok(None);
             }
-            Tick { at: b.at, params: b.params, asked: b.asked, ..Default::default() }
+            Tick { at: b.at, params: b.params, asked: b.asked, by_owner: b.by_owner, ..Default::default() }
         }
     };
     lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
@@ -1212,5 +1222,19 @@ mod tests {
         let stored = lake.cat.get::<Task>(&task_key("mine")).await?.context("no task mine")?;
         assert!(stored.by_owner, "the owner's task is stamped");
         Ok(())
+    }
+
+    #[test]
+    fn an_asked_run_is_the_owners_only_when_the_owner_asked() {
+        let owned = Task { by_owner: true, ..Default::default() };
+        let theirs = Task::default();
+        let scheduled = Tick::default();
+        let asked = |by_owner: bool| Tick { asked: true, by_owner, ..Default::default() };
+        assert!(scheduled.as_owner(&owned), "a scheduled tick of the owner's task is the owner's");
+        assert!(!scheduled.as_owner(&theirs), "a scheduled tick of a task someone else made is not the owner's");
+        assert!(asked(true).as_owner(&owned), "the owner's EXECUTE TASK of the owner's task is the owner's");
+        assert!(!asked(false).as_owner(&owned), "a superuser's EXECUTE TASK of the owner's task is not: its folders are its own");
+        assert!(!asked(true).as_owner(&theirs), "the owner's EXECUTE TASK of a task someone else made is not the owner's run");
+        assert!(!asked(false).as_owner(&theirs), "a superuser's EXECUTE TASK of a task someone else made is not the owner's run");
     }
 }

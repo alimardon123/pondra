@@ -17,6 +17,8 @@ only what is new; then the source is deleted, and only the backup is read:
   - a task backs up on its schedule;
   - a task a superuser who isn't the owner made is refused a BACKUP into a folder on this machine when it
     runs: the run fails with the refusal's words, and nothing is written there;
+  - an owner's task that backs up into a folder on this machine: a superuser's EXECUTE TASK of it is refused
+    the same way (42501, nothing written there), and the owner's EXECUTE TASK of it is a backup there;
   - two nodes on one lake: the owner's BACKUP sent to the follower goes, and a superuser's is refused there
     (42501); `pondra backup` of a lake a node serves goes;
   - a table dropped and kept for UNDROP is in the backup, and comes back in the restored lake;
@@ -371,6 +373,50 @@ def task_not_the_owners(bin, work, port):
             "created": made[0], "run_error": error[-300:], "folder_written": os.path.exists(bkt)}
 
 
+def run_ended(n, task, count):
+    """The task's runs that have ended (`pondra.runs`, oldest first), once `count` of them have; else what there is."""
+    t0 = time.time()
+    while True:
+        ended = [r for r in n.q(f"SELECT status, error FROM pondra.runs WHERE routine = '{task}' ORDER BY started") if r.get("status") != "running"]
+        if len(ended) >= count or time.time() - t0 > 120:
+            return ended
+        time.sleep(0.5)
+
+
+def asked_task(bin, work, port):
+    """A task the owner made, which backs up into a folder on this machine. A superuser that isn't the owner asks for a run
+    (`EXECUTE TASK backs`): that run fails 42501 (`Tick::as_owner`: an asked run is the owner's only when the owner asked),
+    and nothing is written there. The owner asks for a run, and its backup goes there. (The folder is in the task's text: a
+    `$dir` can't bind into BACKUP's, which the binder parses as SQL and BACKUP is not.)"""
+    lake, mine = os.path.join(work, "asked", "lake"), os.path.join(work, "asked", "mine")
+    n = Node(bin, lake, port, work).start()
+    try:
+        n.q("CREATE TABLE tk (a BIGINT)")
+        n.q("INSERT INTO tk VALUES (1), (2)")
+        made = door(n, "POST", "/sql", f"CREATE TASK backs SCHEDULE '1 day' AS BACKUP DATABASE TO '{mine}'".encode())
+        asked_theirs = door(n, "POST", "/sql", b"EXECUTE TASK backs", owner=False)
+        first = run_ended(n, "backs", 1)
+        failed = bool(first) and first[0].get("status") == "failed"
+        error = (first[0].get("error") or "") if first else ""
+        written_by_theirs = os.path.exists(mine)
+        asked_mine = (0, None, "")
+        for _ in range(100):  # (a run's tick is marked done just after its line is written: EXECUTE TASK waits that out)
+            asked_mine = door(n, "POST", "/sql", b"EXECUTE TASK backs")
+            if asked_mine[0] == 200:
+                break
+            time.sleep(0.2)
+        both = run_ended(n, "backs", 2)
+        ran = len(both) == 2 and both[1].get("status") == "ok"
+        n.q("DROP TASK backs")
+    finally:
+        n.stop()
+    rows = cli_rows(bin, mine, "SELECT a FROM tk ORDER BY a") if ran else []
+    return {"ok": made[0] == 200 and asked_theirs[0] == 200 and failed and "server's own disk" in error and not written_by_theirs
+            and asked_mine[0] == 200 and rows == [("1",), ("2",)],
+            "created": made[0], "superuser_asked": asked_theirs[0], "run_error": error[-300:], "folder_written": written_by_theirs,
+            "owners_asked": asked_mine[0], "owners_run": both[-1].get("status") if both else None, "rows_in_the_backup": rows}
+
+
 def owner_through_a_follower(bin, work, port, follower_port):
     """Two nodes on one lake: a BACKUP into a folder on this machine, sent to the FOLLOWER, runs on the follower as the owner's
     request does (the statement's node decides the place): the owner's goes, and the folder is a backup of the lake; a superuser
@@ -582,6 +628,8 @@ def backup_check(bin, work, port, checks):
         c.update(scheduled_backup(bin, work, ports))
     with check(checks, "a task a superuser who isn't the owner made is refused a BACKUP into a folder on this machine") as c:
         c.update(task_not_the_owners(bin, work, next(ports)))
+    with check(checks, "an owner's task run by a superuser's EXECUTE TASK is refused a folder on this machine; the owner's EXECUTE goes") as c:
+        c.update(asked_task(bin, work, next(ports)))
     with check(checks, "two nodes on one lake: the owner's BACKUP sent to the follower goes, a superuser's is refused") as c:
         c.update(owner_through_a_follower(bin, work, next(ports), next(ports)))
     with check(checks, "pondra backup of a lake a node serves goes") as c:

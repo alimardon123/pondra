@@ -22305,12 +22305,15 @@ def doors():
         assert c.getresponse().status == 200, path
     backups = tempfile.mkdtemp(prefix="pondra-doors-backups-")  # (a backup goes in a place of its own: ADR-070)
     atexit.register(shutil.rmtree, backups, True)
-    q(f"BACKUP DATABASE TO '{backups}/read'")
-    q(f"ATTACH '{backups}/read' AS d_bk")
     def backed(place):
         return any(f.endswith(".json.zst") for f in os.listdir(os.path.join(place, "_backups")))
     DOORS = ["http", "python", "postgres", "flight", "javascript", "mcp", "cli", "console"]
     shell_dir = tempfile.mkdtemp(prefix="pondra-doors-cwd-")  # (the shell attaches the lakes beside its folder: an empty one)
+    # A backup into a folder on this machine is the node's owner's (`ext::owners_only`): this node has none, so the
+    # one the matrix reads is made by the shell, the owner of the node it starts on the lake.
+    subprocess.run([BIN, lake], input=f"BACKUP DATABASE TO '{backups}/read';\n", capture_output=True, text=True, timeout=240, cwd=shell_dir, check=True)
+    assert backed(f"{backups}/read"), "the shell's backup"
+    q(f"ATTACH '{backups}/read' AS d_bk")
     def json_made(v):
         return json.loads(v) if isinstance(v, str) else v  # (a door gives JSON as its text, or as its value)
 
@@ -22341,7 +22344,9 @@ def doors():
             "JSON made from values": (["SELECT json_agg(t) AS a FROM (SELECT id FROM d_json) t", "SELECT json_build_object('doc', doc) AS d FROM d_json WHERE id = 1"],
                                      lambda r: [json_made(r[0][0][0]), json_made(r[-1][0][0])] == [[{"id": 1}], {"doc": {"a": {"b": ["x", "y"]}, "k": 1}}]),
             "a Git folder's status": (["SELECT path, change FROM pondra.git_status('d_git')"], lambda r: r[-1] == [["a.sql", "added"]]),
-            "a backup": ([f"BACKUP DATABASE TO '{backups}/door{i}'"], lambda r: backed(f"{backups}/door{i}")),
+            # (a folder on this machine: the owner's, so the shell's, and refused by name at a door that isn't the owner's)
+            "a backup into a folder: the shell's, 42501 at the others": ([f"BACKUP DATABASE TO '{backups}/door{i}'"],
+                lambda r: backed(f"{backups}/door{i}") if DOORS[i - 1] == "cli" else r == "42501" and not os.path.exists(f"{backups}/door{i}")),
             "a write to a backup refused, 25006": ([f"INSERT INTO d_bk.d_log VALUES ('door{i}', {i})"], lambda r: r == "25006"),
             "SET LOCATION of a lake on disk, 0A000": ([f"ALTER DATABASE \"{lake_db}\" SET LOCATION '{backups}/moved{i}'"], lambda r: r == "0A000"),
             "CREATE PIPELINE, refused by name, 0A000": (["CREATE PIPELINE d_pipe AS BEGIN STEP a AS SELECT 1; END"], lambda r: r == "0A000"),
@@ -22414,7 +22419,7 @@ def doors():
                 r = json.loads(urllib.request.urlopen(urllib.request.Request(mcp, data=body, headers={"content-type": "application/json", "mcp-session-id": sid}), timeout=60).read())["result"]
                 text = r["content"][0]["text"]
                 if r["isError"]:
-                    code = next((c for c in re.findall(r"\b([0-9][0-9A-Z]{4})\b", text) if c in ("23514", "42P01", "40001", "25P02", "25006", "0A000")), None)
+                    code = next((c for c in re.findall(r"\b([0-9][0-9A-Z]{4})\b", text) if c in ("23514", "42P01", "40001", "25P02", "25006", "0A000", "42501")), None)
                     return code or "refused: " + text[:160]
                 got = json.loads(text)
                 out.append(rows_of(got["rows"]) if isinstance(got, dict) and "rows" in got else None)
@@ -24530,6 +24535,20 @@ def pkey():
     return f"{sum(checks.values())} of {len(checks)} PRIMARY KEY checks"
 
 
+MEMORY_OWNER, MEMORY_ADMIN = "memorylake-owner-key-0123456789", "memorylake-admin-token"  # (the program that starts memorylake's nodes, and a superuser that isn't it)
+
+
+def program(port, method, path, body=b"", timeout=30, headers=None):
+    """`call` as the program that started the node makes it, with its key (an owned node answers no one else), unless
+    `headers` say otherwise: a superuser's token, without the key."""
+    return call(port, method, path, body, timeout, headers or {"x-pondra-owner": MEMORY_OWNER})
+
+
+def program_reply(port, method, path, body=b"", headers=None):
+    """`reply` as the program that started the node makes it (`program`)."""
+    return reply(port, method, path, body, headers or {"x-pondra-owner": MEMORY_OWNER})
+
+
 def memorylake():
     """A lake held in this process's memory moves to a folder and goes on there (`memory.rs`, the design's
     l2-memory-spill-and-save §2): `ALTER DATABASE <name> SET LOCATION '<place>'`, and `db.save(target)` in
@@ -24539,19 +24558,23 @@ def memorylake():
     none is lost or doubled. The lake's objects are at the target, where another node opens them. The lake
     spills to disk past a 10 KB budget here, so its spilled files move too. Refused by name: a database
     that isn't this one, a folder holding other things (nothing of the lake is written there), a lake on
-    disk (0A000). The library's `pondra.connect()` in this process is moved the same way when it is built. A
-    published Iceberg table is published again at the new place; a move whose second pass fails leaves the lake
+    disk (0A000), and a move into a folder here by a superuser that isn't the node's owner (42501). The library's
+    `pondra.connect()` in this process is moved the same way when it is built. A published Iceberg table is published again at the new place; a move whose second pass fails leaves the lake
     in memory with every row (and says so in /stats and to db.save); BACKUP of a lake in memory runs here."""
     import pathlib
     P, nodes, checks = A.port, [], {}
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
     env = {"PONDRA_MEMORY_LAKE_GB": "0.00001"}  # (about 10 KB: past it a lake's files spill to a folder, and move too)
     acked, errors, quit_writing = [], [], threading.Event()
+    owned = {**env, "PONDRA_OWNER_KEY": MEMORY_OWNER}  # (an owned node answers only the program that started it: every request below is its own)
+
+    def sql(port, q):
+        return program(port, "POST", "/sql", q.encode())
 
     def lake_now(port):
         """The lake a node serves (`/stats`), or None while no node answers."""
         try:
-            return call(port, "GET", "/stats", timeout=2)["lake"]
+            return program(port, "GET", "/stats", timeout=2)["lake"]
         except Exception:
             return None
 
@@ -24561,7 +24584,7 @@ def memorylake():
             "orders": sql(port, "SELECT _row_id, _version, k, n FROM orders WHERE k <> 'w' ORDER BY _row_id, n"),
             "big": sql(port, "SELECT k, n FROM big WHERE k <> 'w' ORDER BY n, k"),
             "totals": sql(port, "SELECT k, c, s FROM totals WHERE k <> 'w' ORDER BY k"),
-            "file": call(port, "GET", "/files/notes/a.txt"),
+            "file": program(port, "GET", "/files/notes/a.txt"),
         }
 
     def pub_metadata(folder):
@@ -24602,7 +24625,7 @@ def memorylake():
 
     def writer():
         """One client writing a row every 5 ms, through the move: each acknowledged row is kept."""
-        db = _client(P)
+        db = _client(P, owner=MEMORY_OWNER)
         i = 0
         while not quit_writing.is_set():
             try:
@@ -24614,14 +24637,14 @@ def memorylake():
             time.sleep(0.005)
 
     try:
-        node = Node(":memory:", P, env=env).start()
+        node = Node(":memory:", P, env=owned, admin_token=MEMORY_ADMIN).start()  # (a token too: the superuser refused below signs in with it)
         nodes.append(node)
-        name = call(P, "GET", "/stats")["lake"]  # (a lake in memory is named by its id)
+        name = program(P, "GET", "/stats")["lake"]  # (a lake in memory is named by its id)
         sql(P, "CREATE TABLE orders (k VARCHAR, n BIGINT)")
         for i in range(30):
             sql(P, f"INSERT INTO orders VALUES ('{'ab'[i % 2]}', {i})")
         sql(P, "UPDATE orders SET n = 100 WHERE n = 4")
-        call(P, "POST", "/tier", timeout=600)  # (tiered: the lake holds files, which spill past the budget)
+        program(P, "POST", "/tier", timeout=600)  # (tiered: the lake holds files, which spill past the budget)
         sql(P, "INSERT INTO orders VALUES ('c', 31)")
         sql(P, "CREATE VIEW big AS SELECT k, n FROM orders WHERE n > 5")
         sql(P, "CREATE MATERIALIZED VIEW totals AS SELECT k, count(*) AS c, sum(n) AS s FROM orders GROUP BY k")
@@ -24629,29 +24652,36 @@ def memorylake():
         sql(P, "CREATE TABLE ticks (at TIMESTAMP)")
         sql(P, "CREATE TABLE pub (id BIGINT, v VARCHAR) WITH (publish = 'iceberg')")
         sql(P, "INSERT INTO pub VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
-        call(P, "POST", "/tier", timeout=600)  # (tiered and published: its Iceberg metadata names the lake's place now)
+        program(P, "POST", "/tier", timeout=600)  # (tiered and published: its Iceberg metadata names the lake's place now)
         sql(P, "CREATE PROCEDURE mark() LANGUAGE sql AS $$ INSERT INTO ticks SELECT now() $$")
         sql(P, "CREATE TASK tick SCHEDULE '1 second' AS CALL mark()")
-        call(P, "PUT", "/files/notes/a.txt", b"hello lake\n")
+        program(P, "PUT", "/files/notes/a.txt", b"hello lake\n")
         time.sleep(2)
         before = answers(P)
         seq_before = sql(P, "SELECT nextval('ids') AS v")[0]["v"]
         ticks_before = sql(P, "SELECT count(*) AS n FROM ticks")[0]["n"]
 
         # Refusals, before anything moves.
-        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE nosuchdb SET LOCATION '{new_lake()}'".encode())
+        status, _, text = program_reply(P, "POST", "/sql", f"ALTER DATABASE nosuchdb SET LOCATION '{new_lake()}'".encode())
         checks["a database that isn't this one is refused, and the answer names this one"] = status != 200 and name in text
         busy = new_lake()
         put_object(busy, "notes.txt", b"not a lake")
-        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
+        status, _, text = program_reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{busy}'".encode())
         checks["a folder holding other things is refused, and no part of the lake is written there"] = (
             status != 200 and "holds other things" in text and not lake_objects(busy, "catalog/") and not lake_objects(busy, "data/"))
+        # A superuser that isn't the owner (signed in with the admin token, without the program's key) is refused a move into
+        # a folder here (42501): a folder on this machine is the owner's to move a lake into, and the lake stays in memory.
+        not_owner = new_lake()
+        status, hdrs, text = program_reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{not_owner}'".encode(), headers={"Authorization": f"Bearer {MEMORY_ADMIN}"})
+        checks["a superuser who isn't the owner is refused a move into a folder here (42501), and the lake stays in memory"] = (
+            status != 200 and hdrs.get("x-pondra-sqlstate") == "42501" and "server's own disk" in text and lake_now(P) == name
+            and not lake_objects(not_owner, "catalog/") and not lake_objects(not_owner, "data/"))
         # A place a move didn't finish (its _moving mark is there, written first) is refused by name, by SET LOCATION
         # and by a node opening it: a copy that stopped half way never looks like a lake.
         torn_place = new_lake()
         put_object(torn_place, "_moving", b'{"from": "memory://torn", "pid": 1, "started_ms": 0}')
         put_object(torn_place, "catalog/x", b"half a copy")
-        status, hdrs, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{torn_place}'".encode())
+        status, hdrs, text = program_reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{torn_place}'".encode())
         torn_node = Node(torn_place, P + 6)
         try:
             torn_node.start(tries=1)
@@ -24671,7 +24701,7 @@ def memorylake():
         target = new_lake()
         target_name = os.path.basename(target.rstrip("/")).lower()  # (the lake's name in a folder: its last part)
         t0 = time.time()
-        status, _, text = reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{target}'".encode())
+        status, _, text = program_reply(P, "POST", "/sql", f"ALTER DATABASE {name} SET LOCATION '{target}'".encode())
         moved = status == 200 and '"moving"' in text
         served = until(lambda: lake_now(P), target_name, 60)  # the same port serves the target once the node starts again
         downtime = time.time() - t0
@@ -24694,7 +24724,7 @@ def memorylake():
         checks["the lake's objects are at the target: catalog, tiered files and the file"] = (
             bool(lake_objects(target, "catalog/")) and any(k.endswith(".parquet") for k in lake_objects(target, "data/orders/"))
             and bool(lake_objects(target, "files/notes/")) and not os.path.exists(os.path.join(target, "_moving")))
-        status, hdrs, _ = reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
+        status, hdrs, _ = program_reply(P, "POST", "/sql", f"ALTER DATABASE {target_name} SET LOCATION '{new_lake()}'".encode())
         checks["a lake on disk is not moved this way (0A000)"] = status != 200 and hdrs.get("x-pondra-sqlstate") == "0A000"
         # The Iceberg table is published again where the lake is now: its newest metadata names the target, no
         # memory:// path is left in it, and PyIceberg reads its rows there.
@@ -24706,16 +24736,16 @@ def memorylake():
         final = answers(P)
         node.p.send_signal(signal.SIGTERM)
         stopped_ok = node.p.wait(60) == 0
-        reopened = Node(target, P + 1).start()
+        reopened = Node(target, P + 1, env={"PONDRA_OWNER_KEY": MEMORY_OWNER}, admin_token=MEMORY_ADMIN).start()  # (the lake was served with tokens here: its node says so, so it is owned and has them too)
         nodes.append(reopened)
         stored_again = [r["n"] for r in sql(P + 1, "SELECT n FROM orders WHERE k = 'w' ORDER BY n")]
         checks["stopped, and opened again from the target: the same rows, files and writes"] = (
             stopped_ok and answers(P + 1) == final and stored_again == sorted(acked))
 
         # Python: db.save(target) on a memory node of its own.
-        py = Node(":memory:", P + 2, env=env).start()
+        py = Node(":memory:", P + 2, env=owned).start()
         nodes.append(py)
-        db = _client(P + 2)
+        db = _client(P + 2, owner=MEMORY_OWNER)
         db.sql("CREATE TABLE pts (v BIGINT)")
         db.sql("INSERT INTO pts VALUES (1), (2), (3)")
         # BACKUP of a lake in memory runs in this process: the backup reads back its rows (ADR-070, invariant 62).
@@ -24734,17 +24764,17 @@ def memorylake():
 
         # A move whose second pass fails (PONDRA_CRASH=move_settle:1, a full disk's stand-in): the lake stays in memory,
         # whole, says why in /stats, and the target is left empty; db.save says so too.
-        bad = Node(":memory:", P + 4, pg=f"127.0.0.1:{P + 14}", env={**env, "PONDRA_CRASH": "move_settle:1"}).start()
+        bad = Node(":memory:", P + 4, pg=f"127.0.0.1:{P + 14}", env={**owned, "PONDRA_CRASH": "move_settle:1"}).start()
         nodes.append(bad)
         sql(P + 4, "CREATE TABLE kept (v BIGINT)")
         sql(P + 4, "INSERT INTO kept VALUES (1), (2), (3)")
-        bad_name = call(P + 4, "GET", "/stats")["lake"]
+        bad_name = program(P + 4, "GET", "/stats")["lake"]
         bad_target = new_lake()
-        reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
+        program_reply(P + 4, "POST", "/sql", f"ALTER DATABASE \"{bad_name}\" SET LOCATION '{bad_target}'".encode())
         def failed_why():
             """Why the move failed, once the node serves again and says so (/stats), else None."""
             try:
-                return call(P + 4, "GET", "/stats", timeout=2).get("move_failed")
+                return program(P + 4, "GET", "/stats", timeout=2).get("move_failed")
             except Exception:
                 return None
         why = until(lambda: bool(failed_why()), True, 60) and failed_why()
@@ -24756,12 +24786,12 @@ def memorylake():
         # pondra.databases.move_failed says why at every door (M12): the same text over HTTP and over Postgres.
         import psycopg
         over_http = [r["move_failed"] for r in sql(P + 4, f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'")]
-        with psycopg.connect(f"host=127.0.0.1 port={P + 14} user=admin dbname=lake", autocommit=True) as c:  # (an open node: no password)
+        with psycopg.connect(f"host=127.0.0.1 port={P + 14} user=admin password={MEMORY_OWNER} dbname=lake", autocommit=True) as c:  # (the key is the admin's password: no admin token here)
             over_pg = [r[0] for r in c.execute(f"SELECT move_failed FROM pondra.databases WHERE name = '{bad_name}'").fetchall()]
         checks["a failed move: pondra.databases.move_failed says the same over HTTP and Postgres"] = over_http == [why] and over_pg == [why]
         said = ""
         try:
-            _client(P + 4).save(new_lake())
+            _client(P + 4, owner=MEMORY_OWNER).save(new_lake())
         except Exception as e:
             said = str(e)
         checks["…and db.save raises, saying so"] = "stays in memory" in said
@@ -24770,7 +24800,7 @@ def memorylake():
         if not shutil.which("node"):
             checks["(skipped: node isn't on PATH, so the JavaScript check didn't run)"] = True
         if shutil.which("node"):
-            js_node = Node(":memory:", P + 3, env=env).start()
+            js_node = Node(":memory:", P + 3, env=owned).start()
             nodes.append(js_node)
             sql(P + 3, "CREATE TABLE js (v BIGINT)")
             sql(P + 3, "INSERT INTO js VALUES (7)")
@@ -24779,6 +24809,7 @@ def memorylake():
             code = "\n".join([
                 f"import {{ connect }} from {json.dumps(module)};",
                 f"const db = connect({json.dumps(f'http://127.0.0.1:{P + 3}')});",
+                f"db.owner = {json.dumps(MEMORY_OWNER)};",
                 f"await db.save({json.dumps(t4)});",
                 'console.log(JSON.stringify(await db.sql("SELECT v FROM js")));',
                 "process.exit(0);",
@@ -24848,11 +24879,11 @@ def memorylake():
         # Past its spill cap (PONDRA_SPILL_GB=2 MB) a lake in memory refuses a load by name (53100: the disk takes what
         # it may and no more), leaves no table behind (invariant 420), and answers after.
         capped_dir = new_lake()
-        capped = Node(":memory:", P + 5, env={**env, "PONDRA_SPILL_GB": "0.002", "PONDRA_SPILL_DIR": capped_dir}).start()
+        capped = Node(":memory:", P + 5, env={**owned, "PONDRA_SPILL_GB": "0.002", "PONDRA_SPILL_DIR": capped_dir}).start()
         nodes.append(capped)
-        status, hdrs, text = reply(P + 5, "POST", "/sql", b"CREATE TABLE big AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(400000)")
+        status, hdrs, text = program_reply(P + 5, "POST", "/sql", b"CREATE TABLE big AS SELECT value AS n, md5(value::VARCHAR) AS s FROM range(400000)")
         refused = status != 200 and hdrs.get("x-pondra-sqlstate") == "53100" and "PONDRA_SPILL_GB" in text
-        gone = reply(P + 5, "POST", "/sql", b"SELECT count(*) AS n FROM big")[1].get("x-pondra-sqlstate") == "42P01"
+        gone = program_reply(P + 5, "POST", "/sql", b"SELECT count(*) AS n FROM big")[1].get("x-pondra-sqlstate") == "42P01"
         answers = sql(P + 5, "SELECT 1 AS one") == [{"one": 1}]
         sql(P + 5, "CREATE TABLE small (n INT)")
         sql(P + 5, "INSERT INTO small VALUES (1)")

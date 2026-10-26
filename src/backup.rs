@@ -147,9 +147,9 @@ pub async fn statement(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Dd
         Ddl::BackupDatabase { database, to, retention_days } => backup(lake, lock, database.as_deref(), &to, retention_days).await,
         Ddl::RestoreDatabase { name, from, dir, at } => {
             crate::ddl::attachable(lake, &name, true).await?; // (before anything is copied)
-            owners_only(&from, format!("RESTORE … FROM {from}: a path on the server's own disk, which only the node's owner restores from (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore from a bucket (s3://, gs://, az://)"))?;
+            crate::ext::owners_only(&from, format!("RESTORE … FROM {from}: a path on the server's own disk, which only the node's owner restores from (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore from a bucket (s3://, gs://, az://)"))?;
             if let Some(d) = &dir {
-                owners_only(d, format!("RESTORE … LOCATION {d}: a path on the server's own disk, which only the node's owner restores into (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore into a bucket (s3://, gs://, az://), or leave LOCATION out to restore beside this database"))?;
+                crate::ext::owners_only(d, format!("RESTORE … LOCATION {d}: a path on the server's own disk, which only the node's owner restores into (the `pondra` shell, `pondra sql`, `connect()` of a lake): restore into a bucket (s3://, gs://, az://), or leave LOCATION out to restore beside this database"))?;
             }
             let to = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, &name)))?;
             apart(lake, &to)?;
@@ -187,13 +187,6 @@ pub(crate) fn apart(lake: &Lake, to: &str) -> Result<()> {
     Ok(())
 }
 
-/// A place on this machine's own disk is the node's owner's to use, as COPY's is (`ext::on_disk`, `ext::owner`): `words`
-/// is the refusal a client gets for it, saying what it may do instead.
-fn owners_only(place: &str, words: String) -> Result<()> {
-    ensure!(crate::ext::owner() || !crate::ext::on_disk(place), crate::codes::coded("42501", words));
-    Ok(())
-}
-
 /// `BACKUP DATABASE [name] TO 'url'`: the database pinned (by its leader: this one, or an attached
 /// database's), the run asked of the backup's leader, the pin let go.
 async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Option<&str>, to: &str, retention_days: Option<u64>) -> Result<Value> {
@@ -210,7 +203,7 @@ async fn backup(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, database: Op
     ensure!(crate::store::reach_of(&source.url).is_none(), "{} is on another server: back it up from there", source.url);
     ensure!(retention_days.is_none_or(|d| d > 0), "retention_days is at least 1");
     let to = crate::ddl::full(to)?;
-    owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
+    crate::ext::owners_only(&to, format!("BACKUP … TO {to}: a path on the server's own disk, which only the node's owner backs up into (the `pondra` shell, `pondra sql`, `connect()` of a lake): back up to a bucket (s3://, gs://, az://)"))?;
     apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (another bucket or provider: the secret whose SCOPE covers it)
     let fresh = empty(&to).await?; // (nothing there yet: this run makes the lake)
