@@ -2,7 +2,6 @@
 //! model's endpoint), through reqwest: on a node over its own sockets, on a page over the browser's fetch. A page's fetch
 //! futures and answers aren't `Send`, while the lake's tasks and DataFusion's traits want `Send`, so a caller sends here
 //! and reads the answer here, the same on both. (The cluster's own calls are the cluster's.)
-use bytes::Bytes;
 use std::future::Future;
 use std::time::Duration;
 
@@ -46,10 +45,6 @@ impl Response {
     /// This answer, or reqwest's error for a 4xx or 5xx status.
     pub fn error_for_status(self) -> reqwest::Result<Self> {
         self.0.error_for_status().map(Response)
-    }
-
-    pub fn bytes(self) -> impl Future<Output = reqwest::Result<Bytes>> + Send {
-        sent(self.0.bytes())
     }
 
     pub fn text(self) -> impl Future<Output = reqwest::Result<String>> + Send {
