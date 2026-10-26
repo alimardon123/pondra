@@ -508,11 +508,15 @@ fn input_part(schema: &SchemaRef, cols: &[(String, DataType)], rows: &RecordBatc
     Ok(RecordBatch::try_new(schema.clone(), out)?)
 }
 
-/// Input rows as held rows: the source's columns, and the source row's id as `__mr_row`.
+/// Input rows as held rows to write: the source's columns, the source row's id as `__mr_row`, and `_deleted` (false: a
+/// keyed table's change marks the rows that go).
 fn held_rows_of(b: &RecordBatch, cols: &[(String, DataType)]) -> Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = cols.iter().map(|(c, _)| Ok(b.column_by_name(c).with_context(|| format!("no column {c}"))?.clone())).collect::<Result<_>>()?;
     arrays.push(Arc::new(Int64Array::from(ints(b, ROW_ID)?)));
-    Ok(RecordBatch::try_new(held_schema_of(cols), arrays)?)
+    arrays.push(Arc::new(BooleanArray::from(vec![false; b.num_rows()])));
+    let mut fields: Vec<Field> = held_schema_of(cols).fields().iter().map(|f| f.as_ref().clone()).collect();
+    fields.push(Field::new("_deleted", DataType::Boolean, true));
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
 }
 
 /// `$resume`'s rows for the keys with a marker: the key's columns, `k`, `m` (the marker's `next_m`) and `due`.
