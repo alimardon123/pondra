@@ -10286,7 +10286,8 @@ def guarded():
         and until(lambda: ask(P, "SELECT id, amount FROM stock ORDER BY id", auth=boss), [{"id": 1, "amount": 9.0}], 15) == [{"id": 1, "amount": 9.0}] \
         and until(lambda: ask(P, "SELECT count(*) AS n FROM ice", auth=boss), [{"n": 3}], 15) == [{"n": 3}]
     # (the REST catalog's listing shows a user only the tables it may read, as SQL's listings do: S27)
-    listed = {u: sorted(".".join(t) for t in iceberg(u).list_tables("default")) for u in ("boss", "bob")}
+    lister = lambda u: load_catalog(f"ls_{u}", type="rest", uri=f"http://127.0.0.1:{P}", token=ask(P, f"CREATE TOKEN ls_{u} FOR USER {u}", auth=boss)["token"])
+    listed = {u: sorted(".".join(t) for t in lister(u).list_tables("default")) for u in ("boss", "bob")}
     info["iceberg listing"] = listed
     checks["the Iceberg REST catalog lists a user only the tables it may read (S27)"] = "default.ice" in listed["boss"] and "default.ice" not in listed["bob"]
     a.kill(), b.kill()
