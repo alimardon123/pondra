@@ -21,6 +21,7 @@
 //!   the token (what ADBC and pyarrow's `authenticate_basic_token` send).
 use crate::auth::Role;
 use crate::app::App;
+use crate::statement::{self, Answer, How, Wire};
 use crate::store::{table_key, TableMeta};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -34,6 +35,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tonic::{Request, Response, Status, Streaming};
@@ -325,19 +327,76 @@ fn conform(schema: &SchemaRef, batches: Vec<RecordBatch>) -> anyhow::Result<Vec<
         .collect()
 }
 
-/// Run a query (spread over the cluster when it pays), with its schema. The batches take that schema,
-/// so the stream says what its header and the flight's info say.
-async fn query(app: &App, sql: &str) -> anyhow::Result<(SchemaRef, Vec<RecordBatch>)> {
-    let sql = &crate::routines::expand(&app.lake, sql).await?; // (macros: ADR-023)
-    let batches = crate::audit::statement(app, sql, app.query(sql, None)).await?;
-    let schema = Arc::new(if batches.is_empty() { planned(app, sql).await? } else { first_announced(&batches) });
-    let batches = conform(&schema, batches)?;
+/// Run a query as every door runs a statement (`statement::run`, with `FlightWire`): its `$name`s, its macros, a
+/// script, and its answer kept for the next asker of the same query. The batches take the schema the info
+/// announced (an empty answer, the planned one), so the stream says what its header and the flight's info say.
+async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+    if statement::is_write(sql) {
+        return Err(refused("25006", "this changes data or a transaction: a query's ticket reads only (CommandStatementUpdate writes)"));
+    }
+    let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
+    let how = How { job: None, spread: None, after: None, stale: None };
+    let batches = rows_of(statement::run(app, req, how, who, &FlightWire).await.map_err(status)?)?;
+    let schema = match batches.is_empty() {
+        false => first_announced(&batches),
+        true => match statement::plain_of(app, sql).await.map_err(status)? {
+            Some((_, one)) => planned(app, &one).await.map_err(status)?,
+            None => Schema::empty(),
+        },
+    };
+    let schema = Arc::new(schema);
+    let batches = conform(&schema, batches).map_err(status)?;
     Ok((schema, batches))
 }
 
-/// The columns a query will answer with, for its flight's info: expanded as every door expands SQL
-/// (macros, `FROM t`, `pondra.git_status`), then planned, not run.
-async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, sql).await?).await }
+/// Flight's wire. A query's answer is kept as Arrow IPC under `arrow`, HTTP's `?format=arrow` key, so the bytes are
+/// HTTP's bytes for the same query (`answer::ipc`, as `answer::render`'s arrow arm makes them). Kept only when it has
+/// rows and is up to 1 MB (an empty answer's IPC has no columns; `Results` keeps no more, as Postgres's answer doesn't).
+struct FlightWire;
+
+impl Wire for FlightWire {
+    type Own = Vec<RecordBatch>;
+    fn kept_as(&self) -> Option<Cow<'_, str>> { Some(Cow::Borrowed("arrow")) }
+    fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Vec<RecordBatch>)> {
+        let small = !rows.is_empty() && rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST;
+        let keep = small.then(|| crate::answer::ipc(&rows).map(bytes::Bytes::from)).transpose()?;
+        Ok((keep, rows))
+    }
+}
+
+/// A statement's answer as the batches Flight streams: a query's rows, a kept answer read back, or, for a statement
+/// with no rows (`Done`), one row of `rows` 0, as a CALL's answer is.
+fn rows_of(got: Answer<Vec<RecordBatch>>) -> Result<Vec<RecordBatch>, Status> {
+    match got {
+        Answer::Own(batches) | Answer::Rows(batches) => Ok(batches),
+        Answer::Kept(bytes) => crate::query::read_ipc(&bytes).map_err(status),
+        Answer::Done(_) => Ok(vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?]),
+        Answer::Sent => Err(refused("XX000", "an answer sent in pieces: Flight takes its batches whole")),
+    }
+}
+
+/// A script, a CALL or a write with RETURNING, as a statement's info: run now, as every door runs a statement, and its
+/// answer kept for the ticket to read back (`kept:`, ten minutes: `KEPT`). The info's schema is the answer's.
+async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
+    let (app, sql) = (app.clone(), sql.to_string());
+    let batches = worked(txn, async move {
+        let req = crate::routines::Request { sql, ..Default::default() };
+        let how = How { job: None, spread: None, after: None, stale: None };
+        rows_of(statement::run(&app, req, how, who, &FlightWire).await.map_err(status)?)
+    })
+    .await?;
+    let schema = first_announced(&batches);
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut held = KEPT.lock().unwrap();
+    held.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
+    held.insert(id.clone(), (batches, std::time::Instant::now()));
+    let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
+    info(&schema, ticket.as_any().encode_to_vec(), descriptor)
+}
+
+/// The columns a query will answer with, for its flight's info: bound and expanded as every door does (`$name`s from
+/// the session, macros, `FROM t`, `pondra.git_status`), then planned, not run.
+async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?).await?).await }
 
 async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
@@ -348,9 +407,9 @@ async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
 /// A write's answer, as its ticket and its flight's info give it: one row, `rows`, the count written.
 fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64, false)]) }
 
-/// A statement's answer, as its ticket names it: a CALL's kept answer, a write's row count, or a
-/// query run now.
-async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+/// A statement's answer, as its ticket names it: a script's or CALL's kept answer, a write's row count, or a
+/// query run now, as `who`.
+async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
         let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
         let schema = Arc::new(first_announced(&batches));
@@ -361,7 +420,7 @@ async fn answer(app: &App, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), S
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![n]))]).map_err(status)?;
         return Ok((schema, vec![batch]));
     }
-    query(app, sql).await.map_err(status)
+    query(app, sql, who).await
 }
 
 /// A statement's work, as a request's: in the transaction the call names (`txn`, checked first), as its
@@ -386,7 +445,7 @@ async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Futu
 }
 
 crate::per_node!(
-    /// A CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
+    /// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
     static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>> = Default::default());
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
@@ -669,22 +728,10 @@ impl FlightSqlService for Sql {
         let role = allowed(&self.0, &req, Role::Read)?;
         no_sql_transaction(&q.query)?;
         let txn = q.transaction_id.as_deref(); // (the transaction the statement runs in, if it names one)
+        let who = crate::routines::Who { role, files: false, depth: 0 };
         if crate::routines::runs_procedure(&q.query) || crate::returning::of(&q.query).is_some() {
             // A CALL (or DO), or a write with RETURNING: run now, as every door runs one; the ticket reads back what it answered.
-            let who = crate::routines::Who { role, files: false, depth: 0 };
-            let (app, sql) = (self.0.clone(), q.query.clone());
-            let out = worked(txn, async move { crate::routines::one(&app, &sql, who, None).await.map_err(status) }).await?;
-            let batches = match out {
-                crate::routines::Outcome::Rows(b) => b,
-                crate::routines::Outcome::Done(_) => vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?],
-            };
-            let schema = first_announced(&batches);
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            let mut kept = KEPT.lock().unwrap();
-            kept.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
-            kept.insert(id.clone(), (batches, std::time::Instant::now()));
-            let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
-            return info(&schema, ticket.as_any().encode_to_vec(), req.into_inner());
+            return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
         }
         if crate::write::parse(&q.query).is_some() {
             // A write sent as a query (DB-API's `execute`): done now; the ticket reads back the count.
@@ -693,17 +740,22 @@ impl FlightSqlService for Sql {
             let ticket = TicketStatementQuery { statement_handle: format!("rows:{rows}").into_bytes().into() };
             return info(&announced(&rows_schema()), ticket.as_any().encode_to_vec(), req.into_inner());
         }
-        let schema = within(txn, async { plan_schema(&self.0, &q.query).await.map_err(status) }).await?;
+        // A query is planned here and run by its ticket; a script (several statements) can't be planned, so it runs now, as a CALL does.
+        let Some((_, one)) = within(txn, async { statement::plain_of(&self.0, &q.query).await.map_err(status) }).await? else {
+            return kept(&self.0, &q.query, who, txn, req.into_inner()).await;
+        };
+        let schema = within(txn, async { planned(&self.0, &one).await.map_err(status) }).await?;
         let ticket = TicketStatementQuery { statement_handle: handle(&q.query, txn).into() };
         info(&schema, ticket.as_any().encode_to_vec(), req.into_inner())
     }
 
     async fn do_get_statement(&self, t: TicketStatementQuery, req: Request<Ticket>) -> Result<Response<Out<FlightData>>, Status> {
-        allowed(&self.0, &req, Role::Read)?;
+        let role = allowed(&self.0, &req, Role::Read)?;
         let (txn, sql) = unhandle(&t.statement_handle);
         let sql = String::from_utf8(sql.to_vec()).map_err(status)?;
         let app = self.0.clone();
-        let (schema, batches) = worked(txn, async move { answer(&app, &sql).await }).await?;
+        let who = crate::routines::Who { role, files: false, depth: 0 };
+        let (schema, batches) = worked(txn, async move { answer(&app, &sql, who).await }).await?;
         Ok(Response::new(send(schema, batches)))
     }
 
@@ -952,11 +1004,12 @@ impl FlightService for Door {
         crate::auth::WHO.scope(who, async move {
             let Some(json) = Json::parse(&req.get_ref().ticket) else { return coded_stream(self.0.do_get(req).await) };
             let app = &self.0 .0;
-            allowed(app, &req, Role::Read)?;
+            let role = allowed(app, &req, Role::Read)?;
             match (json.sql, json.table) {
                 (Some(sql), _) => {
                     let app = app.clone();
-                    let (schema, batches) = worked(None, async move { query(&app, &sql).await.map_err(status) }).await?;
+                    let who = crate::routines::Who { role, files: false, depth: 0 };
+                    let (schema, batches) = worked(None, async move { query(&app, &sql, who).await }).await?;
                     Ok(Response::new(send(schema, batches)))
                 }
                 (None, Some(table)) => {

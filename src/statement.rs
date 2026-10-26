@@ -59,11 +59,12 @@ pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire:
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
     }
-    if let (Some(sent), true, true, true) = (single_statement(&req.sql), req.params.is_empty(), req.tables.is_empty(), req.views.is_empty()) {
-        let one = routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
-        if plain_statement(&one) && !crate::txn::open() {
-            crate::query::mark("request read and checked");
-            return audit::statement(app, &sent, query(app, &one, &how, who.files, wire)).await; // (the audit log and history keep it as it was sent)
+    if req.params.is_empty() && req.tables.is_empty() && req.views.is_empty() {
+        if let Some((sent, one)) = plain_of(app, &req.sql).await? {
+            if !crate::txn::open() {
+                crate::query::mark("request read and checked");
+                return audit::statement(app, &sent, query(app, &one, &how, who.files, wire)).await; // (the audit log and history keep it as it was sent)
+            }
         }
     }
     // A script sent without a session is one of its own while it runs: its SET, PREPARE, BEGIN
@@ -94,6 +95,23 @@ pub(crate) fn single_statement(sql: &str) -> Option<String> {
 /// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
 pub(crate) fn plain_statement(one: &str) -> bool {
     !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
+}
+
+/// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
+/// `expand`): the pair when `sql` is one plain statement (`single_statement`, `plain_statement`); None for a script, a
+/// change or a write, which `run` runs whole. Flight plans a query from the second half without running it.
+pub(crate) async fn plain_of(app: &App, sql: &str) -> Result<Option<(String, String)>> {
+    let Some(sent) = single_statement(sql) else { return Ok(None) };
+    let one = routines::expand(&app.lake, &crate::vars::bound(&sent)?).await?; // (`$name`: the session's variables)
+    Ok(plain_statement(&one).then_some((sent, one)))
+}
+
+/// Changes data, the lake or a transaction (INSERT, CREATE, CALL, EXECUTE TASK, CHECKPOINT, BEGIN…) in any of `sql`'s
+/// statements: anything but a query, or a setting or variable of the session's own. A read door (MCP's query tool, a
+/// Flight ticket) refuses it by name, as Postgres's read-only transaction does. (What it takes is listed, not what it
+/// refuses, so a statement kind added later is refused until it is called a read.)
+pub(crate) fn is_write(sql: &str) -> bool {
+    routines::split(sql).iter().any(|one| !(plain_statement(one) || crate::settings::is(one) || crate::vars::change(one).is_some()))
 }
 
 /// Step 2's inside, on a statement already expanded (`run` makes it, inside `audit::statement`): the key lookup, the

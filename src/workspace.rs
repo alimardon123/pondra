@@ -211,7 +211,7 @@ async fn python(app: &App, name: &str, code: &str, vars: Option<&RecordBatch>, s
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("images") => Ok(Outcome::Done(j!({"ran": name, "images": answer["images"]}))),
-        Some("sql") => Box::pin(crate::routines::one(app, answer["sql"].as_str().unwrap_or_default(), who, None)).await,
+        Some("sql") => Box::pin(crate::routines::script(app, answer["sql"].as_str().unwrap_or_default(), &HashMap::new(), &HashMap::new(), who, None)).await, // (a frame's SQL, as a SQL cell runs: its `$name`s and the front's expansion, as line 175)
         _ => Ok(Outcome::Done(j!({"ran": name}))),
     }
 }
