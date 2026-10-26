@@ -128,7 +128,7 @@ impl Spill {
     }
 
     /// The next `n` pieces of a stream that carries several buckets one after another.
-    pub async fn take(dir: PathBuf, name: String, frames: &mut Frames<impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin>, n: usize) -> Result<Spill> {
+    pub async fn take(dir: PathBuf, name: String, frames: &mut Frames<impl futures::Stream<Item = Result<bytes::Bytes>> + Unpin>, n: usize) -> Result<Spill> {
         let mut spill = Spill::new(dir, name);
         for _ in 0..n {
             spill.keep(&frames.next().await?.context("the stream ended early")?)?;
@@ -178,7 +178,7 @@ pub struct Frames<S> {
     buf: Vec<u8>,
 }
 
-impl<S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin> Frames<S> {
+impl<S: futures::Stream<Item = Result<bytes::Bytes>> + Unpin> Frames<S> {
     pub fn new(body: S) -> Frames<S> {
         Frames { body, buf: vec![] }
     }

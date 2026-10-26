@@ -292,18 +292,18 @@ impl Node {
             attach(&lake, spec, &addr, lives).await?;
         }
         if let Some(folder) = &attach_found {
-            let found = ddl::attach_found(&lake, folder, &addr).await;
+            let found = ddl::attach_found(&lake, folder).await;
             if !found.is_empty() {
                 eprintln!("attached the lakes in {folder}: {}", found.join(", "));
             }
         }
         // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
         tr("lakes attached");
-        let (l, me) = (lake.clone(), addr.clone());
-        ddl::sync(&l, &me, lives).await?;
+        let l = lake.clone();
+        ddl::sync(&l, lives).await?;
         tr("attachments synced");
         if lives {
-            every(Duration::from_secs(1), move || { let (l, me) = (l.clone(), me.clone()); async move { ddl::sync(&l, &me, true).await } });
+            every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
             let l = lake.clone();
             crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
         }
@@ -706,7 +706,16 @@ pub(crate) fn request(method: &str, path: &str, headers: &[(String, String)], bo
 pub(crate) async fn attach(home: &store::Lake, spec: &str, me: &str, follow: bool) -> anyhow::Result<()> {
     let (name, dir) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--attach takes name=dir"))?;
     ddl::database_name(name)?; // (the names the catalog attached keep working; a new `--attach _x=` is refused)
-    ddl::attach(home, name, dir, me, follow, follow).await
+    let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
+    let live = match (&leader, follow) {
+        (Some(a), true) => crate::dial::call(a, crate::dial::Call::get("/cluster/leader").timeout(Duration::from_secs(2))).await.is_ok(),
+        _ => false,
+    };
+    let other = ddl::attach(home, name, dir, follow, live).await?;
+    if let (true, Some(a)) = (live, leader) {
+        cluster::mirror(other, a, me.to_string(), None);
+    }
+    Ok(())
 }
 
 /// The program's restart: the same binary runs again with the same arguments, in place (exec) on unix; elsewhere a

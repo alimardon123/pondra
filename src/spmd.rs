@@ -249,8 +249,8 @@ async fn writers<'a>(lake: &Lake, nodes: &'a [String], me: &str, sql: &str) -> R
 
 /// A share sent to the node that writes it (`/cluster/{what}`), and its answer.
 async fn ask<A: Serialize, R: serde::de::DeserializeOwned>(node: &str, what: &str, body: &A) -> Result<R> {
-    let res = crate::cluster::http().post(crate::tls::url(&format!("{node}/cluster/{what}"))).json(body).send().await?;
-    ensure!(res.status().is_success(), "{node}: {}", res.text().await?);
+    let res = crate::dial::call(node, crate::dial::Call::json(format!("/cluster/{what}"), body)?).await?;
+    ensure!(res.ok(), "{node}: {}", res.text().await?);
     Ok(res.json::<R>().await?)
 }
 
@@ -447,11 +447,11 @@ async fn timed<T>(what: impl Into<String>, node: &str, f: impl std::future::Futu
 /// Another node's share, streamed onto this node's disk piece by piece: the plan's shape first,
 /// then how many buckets follow, then each bucket's piece count and its pieces.
 async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
-    let res = crate::cluster::http().post(crate::tls::url(&format!("{node}/cluster/stage"))).json(s).send().await?;
-    if !res.status().is_success() {
+    let res = crate::dial::call(node, crate::dial::Call::json("/cluster/stage", s)?).await?;
+    if !res.ok() {
         // (the node's SQLSTATE is kept, as the leader's is for a follower's write: a step out of disk (53100) is told
         // apart from one that failed, and is not run again)
-        let code = res.headers().get("x-pondra-sqlstate").and_then(|v| v.to_str().ok()).and_then(crate::codes::received);
+        let code = res.sqlstate.as_deref().and_then(crate::codes::received);
         let said = format!("{node}: {}", res.text().await?);
         return Err(match code {
             Some(code) => crate::codes::coded(code, said),
@@ -462,8 +462,8 @@ async fn remote(node: &str, s: &Slice) -> Result<(String, Vec<Spill>)> {
 }
 
 /// A `reply` read back onto this node's disk, a piece at a time.
-async fn read_reply(res: reqwest::Response, job: &str, name: &str) -> Result<(String, Vec<Spill>)> {
-    let mut frames = crate::spill::Frames::new(res.bytes_stream());
+async fn read_reply(res: crate::dial::Reply, job: &str, name: &str) -> Result<(String, Vec<Spill>)> {
+    let mut frames = crate::spill::Frames::new(res.stream());
     let shape = String::from_utf8(frames.next().await?.context("an empty reply")?)?;
     let (dir, mut parts) = (crate::spill::dir(job)?, vec![]);
     for p in 0..frames.count().await? {
@@ -614,7 +614,7 @@ async fn shuffle(lake: &Lake, nodes: &[String], me: &str, sql: &str, tables: &[S
 /// let them go now. `run` calls it for every shuffle that fails, with that shuffle's own id.
 async fn abandon(nodes: &[String], me: &str, id: &str) {
     forget(id);
-    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::cluster::http().get(crate::tls::url(&format!("{n}/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))).send());
+    let asks = nodes.iter().filter(|n| *n != me).map(|n| crate::dial::call(n, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange=0&to=0&drop=true"))));
     futures::future::join_all(asks).await;
 }
 
@@ -1429,8 +1429,8 @@ async fn fetch(job: &Job, id: &str, from: &str, local: bool, k: usize, to: usize
         return Ok(one(kept(job, k, to)?, part));
     }
     let only = part.map(|q| format!("&part={q}")).unwrap_or_default();
-    let res = crate::cluster::http().get(crate::tls::url(&format!("{from}/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).send().await?;
-    ensure!(res.status().is_success(), "{from}: {}", res.text().await?);
+    let res = crate::dial::call(from, crate::dial::Call::get(format!("/cluster/shuffle?id={id}&exchange={k}&to={to}{only}"))).await?;
+    ensure!(res.ok(), "{from}: {}", res.text().await?);
     let name = format!("in-{k}{r}-{to}-{}{}", from.replace(':', "_"), part.map(|q| format!("-p{q}")).unwrap_or_default());
     Ok(read_reply(res, id, &name).await?.1)
 }
