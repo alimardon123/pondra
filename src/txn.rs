@@ -812,10 +812,10 @@ async fn insert_rows(l: &Locks<'_>, stored: &Arc<TableMeta>, query: &str, snapsh
 
 /// An UPDATE, DELETE or MERGE that works its rows out from a read point (ADR-067 §3): the rows it would change are locked,
 /// and if one of them moved since, the rows are worked out again as of the commit the locks were granted at.
-async fn changing(l: &Locks<'_>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
+async fn changing(l: &Locks<'_>, rules: &Arc<crate::rules::Table>, stmt: &Stmt, snapshot: u64) -> Result<Changed> {
     let (lake, name, meta) = (&l.app.lake, l.name, l.meta);
     let ((old, new), at, keys) = passes(l, snapshot, |at| async move {
-        let (old, new) = crate::change::rows_of(lake, name, meta, stmt, at).await?;
+        let (old, new) = crate::change::rows_of(lake, name, meta, rules, stmt, at).await?;
         let mut keys = write_keys(meta, &old, &new)?;
         if let (true, Stmt::Merge(m)) = (meta.key.is_empty(), stmt) {
             // (an INSERT … ON CONFLICT on an append table locks the values of its conflict target it writes: a second one for
@@ -908,11 +908,11 @@ async fn change(l: &Locks<'_>, stored: &Arc<TableMeta>, stmt: &Stmt, snapshot: u
         },
         _ => None,
     };
+    let rules = stored.rules()?;
     let mut changed = match hit {
         Some(c) => c,
-        None => changing(l, stmt, snapshot).await?,
+        None => changing(l, &rules, stmt, snapshot).await?,
     };
-    let rules = stored.rules()?;
     let host = crate::defaults::Node(&l.app.lake);
     for b in changed.1.iter_mut().filter(|b| b.num_rows() > 0) {
         *b = crate::rules::shape(&rules, l.name, crate::rules::Rows::Whole(b.clone()), crate::rules::How::Change, &host).await?.into_rows(); // (every batch of the new rows: as the table holds them)
@@ -1070,7 +1070,9 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
     }
     crate::returning::wrote(&old, &new);
     let out = tally(&old, &new);
-    let Some(batch) = crate::change::upserts(&stored, &old, &new)? else {
+    // (the new rows `change` shaped for the table's rules, which these are: the markers go through them too, `rules::with_markers`)
+    let rules = stored.rules()?;
+    let Some(rows) = crate::change::upserts_shaped(&stored, &rules, &old, &new)? else {
         // (no row matched: a MERGE's answer is `change::run`'s, which has no counts; an UPDATE or DELETE's has them)
         return Ok(if upsert { j!({"rows": 0}) } else { j!({"rows": 0, "updated": 0, "deleted": 0, "inserted": 0}) });
     };
@@ -1078,7 +1080,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
     let src = crate::log::Src { producer: format!("sql:{job}"), seq: 1, prev: None };
     let log = app.log()?;
     hold.sending(); // (from here its locks go with its answer, not before: the next writer must see this append)
-    let ack = match log.append(name.clone(), src, batch).await {
+    let ack = match log.append_shaped(name.clone(), src, rows).await {
         Ok(ack) => ack,
         Err(e) => {
             if crate::log::unanswered(&e) {

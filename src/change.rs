@@ -551,7 +551,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
             let query = crate::write::whole_rows(lake, t, names, query).await?;
             (vec![], vec![inserted(lake, &table, &stored, &query, upto).await?])
         }
-        (None, _) => rows_of(lake, &table, &meta, &stmt, upto).await?,
+        (None, _) => rows_of(lake, &table, &meta, &stored.rules()?, &stmt, upto).await?,
     };
     // Only a change that takes rows back asks what follows the table: one of no rows is answered as
     // Postgres does (DELETE 0), and one that only adds rows (an INSERT, a MERGE that matched none)
@@ -595,15 +595,16 @@ async fn inserted(lake: &Lake, table: &str, stored: &std::sync::Arc<TableMeta>, 
 
 /// What an UPDATE, DELETE or MERGE of `table` changes, as of commit `upto`: the old versions of
 /// the rows it replaces (with their `_row_id`, `_created_at` and `_version`), and the new versions
-/// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`).
-pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, stmt: &crate::write::Stmt, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+/// (keeping their `_row_id` and `_created_at`) and new rows. A temporary table's too (`temp.rs`). `rules` are the table's,
+/// as its entry gives them (`TableMeta::rules`): a MERGE's proposed rows are shaped for them.
+pub async fn rows_of(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, stmt: &crate::write::Stmt, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     Ok(match stmt {
         crate::write::Stmt::Update(_, set, cond) => {
             crate::txn::refuse_change(lake, table, meta, stmt).await?;
             update(lake, table, meta, set, cond, upto).await?
         }
         crate::write::Stmt::Delete(_, cond) => (select(lake, table, meta, &[], &format!("FROM {} {}", from(table), filter(cond)), upto).await?.0, vec![]),
-        crate::write::Stmt::Merge(m) => merge(lake, table, meta, m, upto).await?,
+        crate::write::Stmt::Merge(m) => merge(lake, table, meta, rules, m, upto).await?,
         _ => bail!("not an UPDATE, DELETE or MERGE"),
     })
 }
@@ -673,7 +674,7 @@ fn part(all: &RecordBatch, meta: &TableMeta, prefix: &str, ids: bool) -> Result<
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?)
 }
 
-async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
+async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::rules::Table>, m: &Merge, upto: u64) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let what = if m.upsert.is_some() { "INSERT … ON CONFLICT" } else { "MERGE" };
     // (read from the statement before `m` is rebound to the MERGE it becomes below, whose `upsert` is None)
     let upsert = m.upsert.is_some();
@@ -684,7 +685,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, m: &Merge, upto: u64)
         Some(u) => {
             let given = u.given(meta, &m.target)?; // (its width and conflict columns are checked before its rows are worked out)
             let on = u.on_columns(meta, &m.target)?;
-            let mut rows = proposed_rows(lake, table, meta, &Arc::new(meta.to_rules()?), &given, &u.query, upto).await?;
+            let mut rows = proposed_rows(lake, table, meta, rules, &given, &u.query, upto).await?;
             // (one row of VALUES, an ORM's upsert, can't repeat a key: its rows aren't looked at for one)
             if !crate::rules::rows::one_row(&u.query) && crate::rules::keys::twice(&rows, &on, &[])?.is_some() {
                 // A DO UPDATE refuses a key a second time, as Postgres does; Postgres lets a second row through when the first
@@ -863,10 +864,30 @@ pub async fn appends(lake: &Lake, seq: &Sequencer, table: &str, meta: &Arc<Table
 
 /// A keyed table's change as one batch for the log: its new versions, and the old rows whose key no new version has, marked
 /// deleted (`_deleted`, without `_version`). Under SQL's names, with `_row_id` and `_created_at`. None when no row
-/// is in either. Used by `appends` and by an autocommitted UPDATE, DELETE or INSERT (`txn::autocommit`). By key, not by
-/// `_row_id`: an UPDATE that moves a key frees the old one (its row keeps its id), and a DELETE and an INSERT of one key
-/// in one change leave the key to the new row.
+/// is in either. Used by `appends`, whose rows are checked as they are (`upserts_shaped` is an autocommitted change's).
+/// By key, not by `_row_id`: an UPDATE that moves a key frees the old one (its row keeps its id), and a DELETE and an INSERT
+/// of one key in one change leave the key to the new row.
 pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Option<RecordBatch>> {
+    let (mut all, gone) = marked(meta, old, new)?;
+    all.extend(gone);
+    let Some(s) = all.first().map(|b| b.schema()) else { return Ok(None) };
+    Ok(Some(concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?))
+}
+
+/// `upserts` for an autocommitted UPDATE, DELETE or MERGE (`txn::autocommit_as`), whose new rows `txn::change` shaped for
+/// `rules`, the table's rules as `stored.rules()` gives them: they go in as shaped, and the marked old rows through
+/// `rules::with_markers`, which writes them as the table holds them. None when no row is in either, as `upserts`.
+pub fn upserts_shaped(meta: &TableMeta, rules: &Arc<crate::rules::Table>, old: &[RecordBatch], new: &[RecordBatch]) -> Result<Option<crate::rules::Shaped>> {
+    let (new, gone) = marked(meta, old, new)?;
+    if new.is_empty() && gone.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(crate::rules::with_markers(rules, new, gone)?))
+}
+
+/// `upserts`' two parts: the new rows (none empty, under SQL's names with their ids), and, per old batch that keeps any,
+/// the rows its key's new versions don't replace, marked deleted (`mark_deleted`, `_version` taken out).
+fn marked(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Result<(Vec<RecordBatch>, Vec<RecordBatch>)> {
     let ids = with_ids(&crate::answer::schema(&meta.logical_columns())?);
     let new: Vec<RecordBatch> = new.iter().filter(|b| b.num_rows() > 0).map(|b| crate::query::conform(b, &ids)).collect::<Result<_>>()?;
     let key: Vec<String> = meta.key.iter().map(|c| meta.name_of(c).to_string()).collect(); // (the rows' SQL names)
@@ -875,19 +896,18 @@ pub fn upserts(meta: &TableMeta, old: &[RecordBatch], new: &[RecordBatch]) -> Re
         true => None,
         false => Some(concat_batches(&ids, &new)?),
     };
-    let mut all = new;
+    let mut gone = vec![];
     for o in old.iter().filter(|o| o.num_rows() > 0) {
         let keep = match &among {
             Some(n) => crate::constraints::absent(o, n, &key)?,
             None => BooleanArray::from(vec![true; o.num_rows()]),
         };
-        let gone = datafusion::arrow::compute::filter_record_batch(o, &keep)?;
-        if gone.num_rows() > 0 {
-            all.push(without(&mark_deleted(&gone)?, crate::text::VERSION)?);
+        let dropped = datafusion::arrow::compute::filter_record_batch(o, &keep)?; // (the rows no new version replaces: `absent`'s keep)
+        if dropped.num_rows() > 0 {
+            gone.push(without(&mark_deleted(&dropped)?, crate::text::VERSION)?);
         }
     }
-    let Some(s) = all.first().map(|b| b.schema()) else { return Ok(None) };
-    Ok(Some(concat_batches(&s, &all.iter().map(|b| crate::query::conform(b, &s)).collect::<Result<Vec<_>>>()?)?))
+    Ok((new, gone))
 }
 
 /// A table's columns with the ids a changed row keeps (`_row_id`, `_created_at`).
