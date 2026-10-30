@@ -83,7 +83,7 @@ pub fn listed() -> (Vec<(String, TableMeta)>, Vec<(String, String)>) {
 pub fn made(name: &str) -> Option<(&'static str, String)> {
     use crate::objects::{ident, table_sql};
     peek(&current()?, |x| match (x.views.get(name), x.tables.get(name)) {
-        (Some(sql), _) => Some(("view", format!("CREATE TEMPORARY VIEW {} AS {sql}", ident(name)))),
+        (Some(sql), _) => Some(("view", format!("CREATE TEMPORARY VIEW {} AS {}", ident(name), crate::views::shown(sql)))),
         (None, Some(t)) => Some(("table", table_sql(&ident(name), &t.meta).replacen("CREATE TABLE", "CREATE TEMPORARY TABLE", 1))),
         _ => None,
     })

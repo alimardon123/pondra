@@ -6,8 +6,11 @@
 //! state), a host's state (`hosted`, `host`, the supervisor's events), and what a node does to start again
 //! (`restart`, `restart_with`), the program's own path (`exe`) and the lead of a lake nobody leads (`lead_once`).
 //! The doors half is `node/run.rs`.
+use crate::{app, backup, branch, ddl, ext, feeds, format, learned, log, panics, python, replica, runs, spmd, store, terms, users, views};
+use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
+use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 #[cfg(feature = "doors")] mod run;
@@ -34,6 +37,27 @@ pub(crate) fn is_guest() -> bool { GUEST.load(std::sync::atomic::Ordering::SeqCs
 /// Marks the node being started a guest or not (`Node::start`).
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (only the doors half starts a node)
 pub(crate) fn set_guest(on: bool) { GUEST.store(on, std::sync::atomic::Ordering::SeqCst) }
+
+/// What a member's start takes besides its lake: `pondra serve`'s flags for the lake (the node's `Options` holds one),
+/// a library's, a guest's.
+#[derive(Clone)]
+pub struct Start {
+    pub(crate) reader: bool,
+    pub(crate) flush_ms: u64,
+    pub(crate) tier_secs: f64,
+    pub(crate) task_ms: u64,
+    pub(crate) retain_secs: u64,
+    pub(crate) backlog: u64,
+    pub(crate) python: Option<String>,
+    pub(crate) auth: std::sync::Arc<crate::auth::Auth>,
+}
+
+impl Default for Start {
+    /// `pondra serve`'s defaults: its flags read them (`cli.rs`).
+    fn default() -> Start {
+        Start { reader: false, flush_ms: 0, tier_secs: 10.0, task_ms: 1000, retain_secs: 60, backlog: 10_000_000, python: None, auth: Arc::new(crate::auth::Auth::new(None, None, None)) }
+    }
+}
 
 /// The node stops, for good, with this reason, when its own work can't go on (a vital loop's panic, the catalog's
 /// compactor, a lake a newer Pondra wrote). In a library the node stops and the host's process stays: `failed`
@@ -223,4 +247,298 @@ pub async fn lead_once(dir: &str) -> anyhow::Result<()> {
 #[cfg(not(feature = "doors"))]
 pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
     Err(crate::codes::coded("0A000", "a page leads no lake: a browser starts no processes (a node leads one in a process of its own)"))
+}
+
+/// The member's App over its opened lake (`Node::start`, and a page's open): its SQL attachments synced, the
+/// followers' changes a leader inherits recovered, its sequencer and log started, its first user made. `replica` is
+/// what this follower holds for its leader (a node's folder; None elsewhere).
+pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::members::Members>, replica: Option<Arc<crate::replica::ReplicaLog>>, s: &Start) -> anyhow::Result<crate::app::App> {
+    let lives = !is_guest();
+    let leader = members.is_leader();
+    let term = members.leader().n;
+    let reader = s.reader || members.reader();
+    let (addr, dir) = (members.me(), lake.url.as_str()); // (what the first user's message names: this member, and its lake)
+    let l = lake.clone();
+    ddl::sync(&l, lives).await?;
+    crate::store::trace("attachments synced");
+    if lives {
+        every(Duration::from_secs(1), move || { let l = l.clone(); async move { ddl::sync(&l, true).await } });
+        let l = lake.clone();
+        crate::panics::task(async move { l.warm().await.map_err(|e| eprintln!("warming the SSD tier: {e:#}")) });
+    }
+    // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
+    // a new leader first commits what they hold from the previous one.
+    crate::store::trace("warming");
+    if let (true, Some(own)) = (leader, &replica) {
+        // (the members are asked with the nodes' key: one that just restarted holds an
+        // unsigned call until it has caught up, and it catches up from this leader)
+        if crate::dial::node_key().is_none() {
+            if let Some(k) = users::node_key_made(&lake).await {
+                crate::dial::set_node_key(k);
+            }
+        }
+        replica::recover(&lake, &addr, term, Some(own)).await?;
+    } else if leader && !lives {
+        // (a guest that leads recovers as `write::lead` does: no followers' changes to hold, and no key to ask for)
+        replica::recover(&lake, "", term, None).await?;
+    }
+    crate::store::trace("followers' changes recovered");
+    let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
+    let pace = (s.tier_secs > 0.0).then(|| log::Pace { rows: s.backlog, lock: lock.clone() }); // rows waiting to be tiered
+    let seq = if leader { Some(log::Sequencer::start(lake.clone(), pace).await?) } else { None };
+    let to = match &seq {
+        Some(s) => log::To::Local(s.clone()),
+        None => log::To::Leader(members.leader().addr.clone()),
+    };
+    let _ = lake.to.set(to.clone()); // (a follower's sequences' values: the leader's sequencer)
+    let log = (!reader).then(|| Arc::new(log::Log::start(lake.clone(), Duration::from_millis(s.flush_ms), to)));
+    crate::store::trace("the sequencer");
+    python::init(s.python.clone());
+    let app = app::App { lake: lake.clone(), members: members.clone(), log, seq, lock, retain_ms: s.retain_secs * 1000, results: Default::default(), replica: replica.clone(), auth: s.auth.clone() };
+    crate::constraints::share_lock(&app.lake, app.lock.clone()); // a checked append of this lake takes this lock (`constraints::leader`); the Log is reachable only through the App
+    learned::start(&lake); // (the history this node's planner learns from: nothing is read until a query is planned)
+    // (a lake served with tokens is not one a node may make a first user of: an accidental node with none must
+    // not write to it, and is refused by `server.rs` instead)
+    if leader && app.auth.network() && !app.auth.on() && !users::signed(&app.lake).await {
+        // (on the network with no token nobody could sign in: the lake's first user is made before
+        // anyone is served, and its token said once. A failure stops the node; a restart tries again.)
+        let _guard = app.lock.lock().await;
+        match users::first_user(&app.lake).await {
+            Ok(Some(token)) => eprintln!(
+                "This lake now asks everyone to sign in: it is served on {addr} with no token.\n\
+                 Its first user is pondra, a superuser. Its token (shown once, kept only as a hash):\n  {token}\n\
+                 The console: http://{addr}/ (Sign in, with the token). Postgres: user pondra, the token as its password.\n\
+                 Another token: pondra token --dir {dir}. Or set --admin-token on every node."),
+            Ok(None) => {}
+            Err(e) => {
+                terms::release(&lake.store, term).await; // (another node may lead it: not one with no first user)
+                return Err(e.context("a node on the network with no token makes the lake's first user before it serves, and that failed: set --admin-token, or listen on 127.0.0.1"));
+            }
+        }
+    }
+    Ok(app)
+}
+
+/// The member's own loops over its App, each as a node that lives keeps it (none for a guest): the leader's keys,
+/// tasks, tiering, checkpoints and emission, a follower's catalog refresh, streaming tasks, the store's upkeep.
+pub fn keep(app: &crate::app::App, s: &Start) {
+    let lives = !is_guest();
+    let leader = app.seq.is_some();
+    let reader = s.reader || app.members.reader();
+    let lake = app.lake.clone();
+    if leader && lives {
+        let (l, c, tokens) = (app.lake.clone(), app.members.clone(), app.auth.on()); // (beside serving, not before it: C5)
+        panics::spawn(async move {
+            let made = users::kept(&l).await == "none";
+            match users::make_keys(&l).await {
+                Err(e) => eprintln!("the lake's keys (sessions', the nodes'): {e:#}"), // (sessions' signing key, and the nodes' own: `users.rs`)
+                // (into every node's view at once: a node restarted before the next checkpoint
+                // couldn't check the nodes' key, and held its new leader's calls 10 s)
+                Ok(()) if made => l.cat.checkpoint().await.unwrap_or_else(|e| eprintln!("checkpoint: {e:#}")),
+                Ok(()) => {}
+            }
+            if backup::frozen(&l) {
+                return; // (a backup's secrets and keys stay as its runs wrote them: ADR-070)
+            }
+            if tokens {
+                // (once, and for good: a node started by hand without them is then never open: `users::signed`)
+                if let Err(e) = users::mark_signed(&l).await {
+                    eprintln!("the lake's tokens aren't remembered: {e:#}");
+                }
+            }
+            match ext::rewrap(&l).await {
+                Ok(0) => {}
+                Ok(n) => eprintln!("rewrapped {n} secret{} with the master key in use now", if n == 1 { "" } else { "s" }),
+                Err(e) => eprintln!("secrets not rewrapped: {e:#}"),
+            }
+            // (sealed once every node can read them sealed: tried each minute until then)
+            let mut said = false;
+            while let Err(e) = async { users::seal_keys(&l).await?; branch::seal_keys(&l).await }.await {
+                if !c.is_leader() {
+                    break;
+                }
+                if !std::mem::replace(&mut said, true) {
+                    eprintln!("the lake's keys stay as they are for now: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        let (l, c) = (app.lake.clone(), app.members.clone());
+        panics::spawn(async move {
+            // (a branch's pins in bases on other servers, renewed while it is used here: `branch::lapse`)
+            while c.is_leader() {
+                branch::renew(&l).await;
+                tokio::time::sleep(branch::renew_every()).await;
+            }
+        });
+    }
+    if lives {
+        let l = app.lake.clone();
+        panics::spawn(async move {
+            // (a follower's catalog shows the leader's keys once the leader has flushed them)
+            let mut said = false;
+            for _ in 0..600 {
+                match users::node_key(&l).await {
+                    Ok(k) => {
+                        crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
+                        return;
+                    }
+                    Err(e) if !said && format!("{e:#}").contains("master key") => {
+                        said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
+                        eprintln!("{e:#}");
+                    }
+                    Err(_) => {}
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            eprintln!("the lake's key for its nodes isn't readable here: with users and no --admin-token, this node can't call the others");
+        });
+    }
+    if app.members.is_leader() && !app.members.reader() && lives {
+        runs::schedule(app.clone()); // (tasks: the leader runs their ticks)
+    }
+    if app.members.is_leader() && !app.members.reader() && lives && !backup::frozen(&lake) {
+        // (a lake opened somewhere it didn't publish from — moved by SET LOCATION, or copied — publishes its
+        // Iceberg tables here at once: `iceberg::Published::location`. Only then: the pass loads every
+        // published table's manifests, and a lake that stayed where it was has nothing new for it)
+        let (a, l) = (app.clone(), lake.clone());
+        panics::task(async move {
+            if !crate::iceberg::elsewhere(&l).await {
+                return;
+            }
+            let _lock = a.lock.lock().await; // (the lock tiering publishes under: `app::App::tier_all`)
+            if let Err(e) = crate::delta::publish_all(&l).await {
+                eprintln!("publishing at start: {e:#}");
+            }
+        });
+    }
+    if lives && app.log.is_some() {
+        feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
+    }
+    if let (true, Some(_), Some(log)) = (lives, &app.seq, &app.log) {
+        let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
+        panics::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Err(e) = views::emit_all(&lake, &log).await {
+                    eprintln!("emission: {e:#}");
+                }
+            }
+        });
+    }
+    // Finished shuffles are forgotten here, and what they spilled deleted.
+    if lives {
+        every(Duration::from_secs(30), || async { spmd::gc(); Ok(()) });
+    }
+    if leader && lives {
+        // The leader's SSD tier learns of objects other nodes wrote from its own commits (and its hot
+        // columns of the files they replaced).
+        let l = lake.clone();
+        panics::spawn(async move {
+            let (_, mut commits) = l.cat.subscribe();
+            loop {
+                match commits.recv().await {
+                    Ok(store::Frame::Change(d)) => l.arrived(&d),
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, // (just fewer prefetches)
+                    Err(_) => break,
+                }
+            }
+        });
+        // Tier as soon as new rows commit — other engines see them in the Delta log a moment
+        // later — but at most once every `tier_secs`, and at least every 5 × that (bulk
+        // inserts, compaction, retention). Only a loud commit wakes it (`store::quiet`): the
+        // statements' history commits every second while anyone queries, and the round each
+        // one woke set a pace that held the lake's next write back up to `tier_secs`
+        // (freshness.py: Delta and Iceberg 1 s after the ack instead of 30 ms). So did the
+        // round's own commit, so what it waits past is the version the round left.
+        if s.tier_secs > 0.0 {
+            let (a, mut hwm, period) = (app.clone(), lake.hwm.subscribe(), Duration::from_secs_f64(s.tier_secs));
+            panics::spawn(async move {
+                loop {
+                    let (start, before) = (tokio::time::Instant::now(), *hwm.borrow_and_update());
+                    let failed = a.tier_all(0).await.inspect_err(|e| eprintln!("background job failed: {e:#}")).is_err();
+                    // (rows that came while it ran may be loud ones it didn't take: they go at
+                    // the round's pace, as any commit did)
+                    let seen = (*hwm.borrow() == before).then(|| a.lake.cat.version()).flatten();
+                    tokio::time::sleep_until(start + period).await;
+                    // (right away if rows came meanwhile; a round that failed, say on a full
+                    // disk, is tried again then too, not only once more rows come)
+                    if !failed {
+                        let loud = async { while hwm.changed().await.is_ok() && seen.is_some() && a.lake.cat.version() == seen {} };
+                        let _ = tokio::time::timeout(period * 4, loud).await;
+                    }
+                }
+            });
+        }
+        // …and any table as soon as a million rows wait in the log (bounds memory and read cost).
+        let a = app.clone();
+        every(if s.tier_secs == 0.0 { Duration::ZERO } else { Duration::from_secs(1) }, move || { let a = a.clone(); async move { a.tier_all(1_000_000).await.map(|_| ()) } });
+        // Persist the catalog's memtable every few seconds when something changed, so a
+        // restart (or a new leader, reader or `pondra sql`) replays only a few seconds of
+        // catalog WAL. Not more often: each is a level-0 file that SlateDB's compactor
+        // has to keep up with, and writes stall when too many pile up.
+        let l = lake.clone();
+        every(Duration::from_secs(5), move || { let l = l.clone(); async move { l.cat.checkpoint().await } });
+        if lake.cat.replicas > 1 {
+            replica::members(lake.clone(), app.members.clone());
+        }
+        format::raise(lake.clone(), app.members.clone()); // (once every node knows this build's format: ADR-039)
+    }
+    if !leader {
+        if lives {
+            format::watch(lake.clone());
+        }
+        // How far our own catalog view is: all a reader has, and a follower's fallback.
+        if lives {
+            let l = lake.clone();
+            every(Duration::from_millis(250), move || { let l = l.clone(); async move { l.refresh().await } });
+        }
+    }
+    if !reader && lives {
+        let (a, max_wait) = (app.clone(), Duration::from_millis(s.task_ms));
+        panics::spawn(async move {
+            let mut commits = a.lake.hwm.subscribe();
+            loop {
+                let _ = tokio::time::timeout(max_wait, commits.changed()).await; // new rows, or time's up
+                if let Err(e) = a.run_tasks().await {
+                    eprintln!("streaming tasks failed: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        });
+    }
+    if lives {
+        store::serving(); // (the catalog's compactor and garbage collector start now: C5)
+    }
+    crate::oom::start(); // (the memory line: a query that grows the node past it is stopped, not the node: `oom.rs`)
+    if lives {
+        runs::mark_stopped(app.clone()); // (runs whose node stopped under them: `stopped`)
+        if leader {
+            let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
+            crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
+        }
+    }
+}
+
+/// Run `job` forever, starting every `period` (right away if a run took longer; a zero period
+/// disables it).
+fn every<F, Fut>(period: Duration, job: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send,
+{
+    if period.is_zero() {
+        return;
+    }
+    panics::spawn(async move {
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticks.tick().await;
+            if let Err(e) = job().await {
+                eprintln!("background job failed: {e:#}");
+            }
+        }
+    });
 }

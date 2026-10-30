@@ -826,7 +826,7 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     let k = match found {
         Some(Kept::Clear(k)) => k,
         Some(Kept::Sealed { sealed, key }) => {
-            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
+            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY, PONDRA_ADMIN_TOKEN or PONDRA_SHARED_KEY_FILE (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
             serde_json::from_slice(&plain)?
         }
         None => {

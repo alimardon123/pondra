@@ -530,12 +530,6 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
     });
 }
 
-/// An HTTP client that carries no token of its own: the process serving a folder of databases (`dbserver.rs`) passes each client's on.
-pub fn http_bare() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| reqwest::Client::builder().build().unwrap_or_default())
-}
-
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's
 /// token: a node's is the admin token, else the lake's own key for its nodes (`users::node_key`,
 /// known once the lake is open: the client is made again then); a `pondra sql` writer's is

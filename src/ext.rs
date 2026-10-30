@@ -23,7 +23,7 @@ use crate::ext_names::{quoted, scheme};
 use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
-    /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
+    /// The caller is the program that started this node (the shell, `connect()` of a lake: `statement::owner`),
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
@@ -67,6 +67,18 @@ pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 }
 
 pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
+
+/// Is a place on this machine's own disk (no scheme, or `file://`), rather than a bucket or a server's (`s3://`, `https://`,
+/// `kafka://`)? A client may name only the places its secrets reach: a folder here is the node's owner's (`owner`). A scheme
+/// `scheme` doesn't name, such as `memory://`, counts as this machine's too, as COPY has always had it.
+pub(crate) fn on_disk(place: &str) -> bool { scheme(place).is_none_or(|s| s == "file") }
+
+/// A place on this machine's own disk is the node's owner's to use, as COPY's is (`on_disk`, `owner`): `words` is the
+/// refusal a client gets for it, saying what it may do instead. BACKUP, RESTORE and SET LOCATION all say it this way.
+pub(crate) fn owners_only(place: &str, words: String) -> Result<()> {
+    ensure!(owner() || !on_disk(place), crate::codes::coded("42501", words));
+    Ok(())
+}
 
 // ---------------------------------------------------------------- what a query reads
 
@@ -747,6 +759,18 @@ pub fn web() -> &'static reqwest::Client {
     CLIENT.get_or_init(client)
 }
 
+/// A client with no token of its own, and no time limit. It is a second client only because it differs
+/// from `web()` in one thing, which is `web()`'s 60 s timeout: dbserver streams whole answers through it,
+/// and ai.rs sets its own timeout per request.
+pub fn bare() -> &'static reqwest::Client {
+    static BARE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let client = || reqwest::Client::builder().build().unwrap_or_default();
+    #[cfg(target_arch = "wasm32")]
+    let client = reqwest::Client::new; // (as `web()`: a page's fetch keeps the browser's own time limits)
+    BARE.get_or_init(client)
+}
+
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
 pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
     let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| s.kind == "share").collect();
@@ -1295,7 +1319,7 @@ pub(crate) fn reveal_secret(name: &str, s: &Secret) -> Result<BTreeMap<String, S
 
 /// A secret's values: its data key unwrapped by the master key, then its values opened with it.
 fn open(name: &str, s: &Secret) -> Result<BTreeMap<String, String>> {
-    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY or PONDRA_ADMIN_TOKEN (or PONDRA_KMS_COMMAND)");
+    let damaged = || anyhow!("secret {name} was sealed with another master key: every node needs the same PONDRA_SECRET_KEY, PONDRA_ADMIN_TOKEN or PONDRA_SHARED_KEY_FILE (or PONDRA_KMS_COMMAND)");
     let plain = match &s.key {
         Some(wrapped) => {
             let key = unwrap_key(wrapped).map_err(|e| anyhow!("{}: {e:#}", damaged()))?;
@@ -1375,10 +1399,10 @@ fn kms_run(cmd: &str, what: &str, input: &str) -> Result<String> {
 }
 
 /// Is the master key one every node can have: `PONDRA_SECRET_KEY`, the admin token (every node of a
-/// cluster with one has the same), or a key service? Never only this machine's own
-/// (`~/.pondra/secret.key`), which a node on another machine couldn't open with.
+/// cluster with one has the same), a key service, or a file every node is given (`PONDRA_SHARED_KEY_FILE`)?
+/// Never only this machine's own (`~/.pondra/secret.key`), which a node on another machine couldn't open with.
 pub fn shared_master() -> bool {
-    kms().is_some() || crate::env::is_set("PONDRA_SECRET_KEY") || crate::env::is_set("PONDRA_ADMIN_TOKEN")
+    kms().is_some() || ["PONDRA_SECRET_KEY", "PONDRA_ADMIN_TOKEN", "PONDRA_SHARED_KEY_FILE"].iter().any(|v| crate::env::is_set(v))
 }
 
 /// `plain` sealed with a data key of its own, which the master key wraps: (the sealed bytes, the
@@ -1423,8 +1447,9 @@ pub async fn rewrap(lake: &Lake) -> Result<usize> {
 }
 
 /// The master key, when no key service is set: `PONDRA_SECRET_KEY` (the same on every node of a
-/// cluster), else the admin token's (`admin_key`: every node of a cluster with one has it), else one
-/// made for this machine (`~/.pondra/secret.key`), enough for nodes that share it.
+/// cluster), else the admin token's (`admin_key`: every node of a cluster with one has it), else the
+/// key in `PONDRA_SHARED_KEY_FILE` (a volume every node mounts: Compose's), else one made for this
+/// machine (`~/.pondra/secret.key`), enough for nodes that share it.
 fn master() -> Result<[u8; 32]> {
     if let Some(k) = crate::env::get("PONDRA_SECRET_KEY") {
         if k.chars().count() < 16 {
@@ -1438,6 +1463,9 @@ fn master() -> Result<[u8; 32]> {
     }
     if let Some(t) = crate::env::get("PONDRA_ADMIN_TOKEN") {
         return Ok(admin_key(&t));
+    }
+    if let Some(file) = crate::env::os("PONDRA_SHARED_KEY_FILE") {
+        return Ok(sha256_of(&key_file(std::path::Path::new(&file))?));
     }
     Ok(sha256_of(&machine_key()?))
 }
@@ -1498,17 +1526,21 @@ fn is_key(k: &str) -> bool { k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdi
 
 fn machine_key() -> Result<String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).context("secrets need a key: set PONDRA_SECRET_KEY")?;
-    let path = std::path::PathBuf::from(home).join(".pondra").join("secret.key");
-    if let Ok(k) = std::fs::read_to_string(&path) {
-        return checked_key(&path, &k);
+    key_file(&std::path::PathBuf::from(home).join(".pondra").join("secret.key"))
+}
+
+/// The key in `path`, made there if there is none yet: the machine's, or the one the nodes share.
+fn key_file(path: &std::path::Path) -> Result<String> {
+    if let Ok(k) = std::fs::read_to_string(path) {
+        return checked_key(path, &k);
     }
-    std::fs::create_dir_all(path.parent().expect("a folder"))?;
+    std::fs::create_dir_all(path.parent().context("a key file's folder")?)?;
     let mut bytes = [0u8; 32];
     crate::crypto::random(&mut bytes)?;
     let key: String = crate::text::hex(&bytes);
-    match link_key(&key, &path) {
+    match link_key(&key, path) {
         Ok(()) => Ok(key),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => checked_key(&path, &std::fs::read_to_string(&path)?), // (another node, at once: a file is linked only once whole)
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => checked_key(path, &std::fs::read_to_string(path)?), // (another node, at once: a file is linked only once whole)
         Err(e) => Err(e.into()),
     }
 }
@@ -1605,6 +1637,9 @@ mod tests {
         link_key(&key, &path).unwrap();
         assert!(link_key(&"cd".repeat(32), &path).is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), key);
+        let shared = dir.join("shared").join("secret.key"); // (PONDRA_SHARED_KEY_FILE's: made by the first node, read by the others)
+        let made = key_file(&shared).unwrap();
+        assert!(is_key(&made) && key_file(&shared).unwrap() == made);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

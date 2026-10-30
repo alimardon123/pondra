@@ -17,6 +17,7 @@ use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use std::future::Future;
 use crate::reset::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use datafusion::common::instant::Instant;
 use std::time::Duration;
@@ -163,6 +164,37 @@ tokio::task_local! {
     static INSIDE: (); // (a statement's own statements, a procedure's: the call is what is written)
 }
 
+tokio::task_local! {
+    static STOP: Arc<AtomicBool>; // (a statement's stop flag: set when the statement is dropped before its work ends)
+}
+
+/// The stop flag of the statement this task runs, for the work it hands on (a MATCH_RECOGNIZE search, which runs after
+/// the statement's planning, bound to it). None outside a statement.
+pub fn stop() -> Option<Arc<AtomicBool>> { STOP.try_with(|s| s.clone()).ok() }
+
+/// Sets its flag when dropped before `done` is set: the statement's future was dropped (a timeout, a Stop, a closed tab).
+struct SetOnDrop {
+    flag: Arc<AtomicBool>,
+    done: bool,
+}
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        if !self.done {
+            self.flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `f`, with `flag` as its statement's stop flag (`stop`). The flag is set if `f` is dropped before it finishes. A `f` that
+/// finishes leaves it unset, because a door may stream the rows the statement made after `statement` returns.
+pub(crate) async fn stoppable<T>(flag: Arc<AtomicBool>, f: impl Future<Output = T>) -> T {
+    let mut guard = SetOnDrop { flag: flag.clone(), done: false };
+    let out = STOP.scope(flag, f).await;
+    guard.done = true;
+    out
+}
+
 /// An error a door says: an error of its own kind (`code`: Postgres's SQLSTATE).
 pub trait Refusal {
     fn refusal(code: &str, message: String) -> Self;
@@ -211,12 +243,13 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     let mut stopped = Stopped(Some((app, class, sql, start)));
     let (out, note) = crate::history::noted(INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
+        let flag = Arc::new(AtomicBool::new(false)); // (set if the work is dropped first: a timeout drops it, inside the timeout)
         match quota.timeout {
-            Some(t) => tokio::time::timeout(t, f).await.unwrap_or_else(|_| Err(E::refusal("57014", match quota.by_session {
+            Some(t) => tokio::time::timeout(t, stoppable(flag, f)).await.unwrap_or_else(|_| Err(E::refusal("57014", match quota.by_session {
                 true => "canceling statement due to statement timeout".to_string(), // (Postgres's own words: a client matches them)
                 false => format!("quota: {}'s statements run at most {} s (STATEMENT_TIMEOUT); this one was stopped", quota.user, t.as_secs()),
             }))),
-            None => f.await,
+            None => stoppable(flag, f).await,
         }
     }))
     .await;
@@ -372,6 +405,19 @@ mod tests {
         assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
         assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
+    }
+
+    #[tokio::test]
+    async fn a_statements_flag_is_set_only_when_its_work_is_dropped() {
+        assert!(stop().is_none(), "no flag outside a statement");
+        let done = Arc::new(AtomicBool::new(false));
+        let seen = stoppable(done.clone(), async { stop().expect("the statement's flag") }).await;
+        assert!(Arc::ptr_eq(&seen, &done), "the work sees its statement's flag");
+        assert!(!done.load(Ordering::Relaxed), "a statement whose work finishes leaves its flag unset");
+        let early = Arc::new(AtomicBool::new(false));
+        let cut = tokio::time::timeout(Duration::from_millis(10), stoppable(early.clone(), std::future::pending::<()>())).await;
+        assert!(cut.is_err());
+        assert!(early.load(Ordering::Relaxed), "a statement its timeout drops sets its flag");
     }
 
     #[test]

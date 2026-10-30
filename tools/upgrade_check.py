@@ -857,8 +857,8 @@ def drain_check(new_bin, work, port):
     info["seconds to stop with PONDRA_DRAIN_SECS=1 and a longer query"] = round(took, 1)
     checks["…but for PONDRA_DRAIN_SECS at most"] = took < 4
     # An answer sent in pieces when its node is told to stop is sent whole, then the node stops. Two shapes: a plan's
-    # pieces (`server::sql`'s handed answer), and an answer collected whole before it is sent (`?catalog=postgres` with
-    # a `pg_` name: `server::stream`, `query::hand_out`).
+    # pieces (`statement::sql`'s handed answer), and an answer collected whole before it is sent (`?catalog=postgres` with
+    # a `pg_` name: `statement::answer`, `query::hand_out`).
     N = 1_250_000  # (about 40 MB of JSON)
     piecewise = {
         "/sql": ("value", f"SELECT value, 'x' || value AS s FROM range(0, {N})"),

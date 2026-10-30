@@ -61,7 +61,8 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
     let r = crate::fetch::send(crate::ext::web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask)).await.with_context(|| format!("reaching {endpoint}"))?;
     let status = r.status();
     let delta = r.headers().get("delta-sharing-capabilities").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("responseformat=delta"));
-    let text = r.text().await?;
+    // (an answer lists a table's files, a line each: one past ANSWER_MOST is refused, not read whole into memory)
+    let text = r.body_within(ANSWER_MOST).await?.map(String::from_utf8).transpose()?.with_context(|| format!("{}.{}.{} at {endpoint}: an answer over {} MB", o("share"), o("schema"), o("table"), ANSWER_MOST >> 20))?;
     ensure!(status.is_success(), "{}.{}.{} at {endpoint}: {status} {}", o("share"), o("schema"), o("table"), serde_json::from_str::<Value>(&text).ok().and_then(|e| e["message"].as_str().map(str::to_string)).unwrap_or(text));
     let lines: Vec<Value> = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<_, _>>()?;
     ensure!(lines.len() >= 2, "{at}: an answer without its protocol and metadata");
@@ -108,6 +109,12 @@ impl std::fmt::Display for Links {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("a share's links") }
 }
 
+/// The most a share's query answer may be: its file list, a line a file.
+const ANSWER_MOST: usize = 64 << 20;
+
+/// The most a link read with no end (`Offset`) may send: a whole file of a share, as DataFusion never asks for one.
+const LINK_MOST: u64 = 1 << 30;
+
 fn links_error(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> object_store_df::Error { object_store_df::Error::Generic { store: "share", source: e.into() } }
 
 /// DataFusion's object_store is another crate's copy of this one's, so its ranges are written out as ours.
@@ -146,7 +153,18 @@ impl object_store_df::ObjectStore for Links {
         let answer = r.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(byte_range::answered);
         let start = answer.as_ref().map_or(0, |(span, _)| span.start);
         let total = answer.and_then(|(_, size)| size);
-        let bytes = if options.head { bytes::Bytes::new() } else { r.bytes().await.map_err(links_error)? };
+        // (no more than was asked: a 206's range, or for a whole file (200) the bytes up to the range's end; a provider
+        // that ignores Range is refused past that, not read into memory whole)
+        let most = match (&want, r.status().as_u16()) {
+            (object_store::GetRange::Bounded(b), 206) => b.end - b.start,
+            (object_store::GetRange::Bounded(b), _) => b.end,
+            (object_store::GetRange::Suffix(n), _) => *n,
+            (object_store::GetRange::Offset(_), _) => LINK_MOST,
+        };
+        let bytes = match options.head {
+            true => bytes::Bytes::new(),
+            false => r.body_within(most as usize).await.map_err(links_error)?.map(bytes::Bytes::from).ok_or_else(|| links_error(format!("the provider's link sent more than the {most} bytes asked (one that ignores Range is refused)")))?,
+        };
         let size = total.unwrap_or(start + bytes.len() as u64);
         let meta = object_store_df::ObjectMeta { location: location.clone(), last_modified: chrono::DateTime::UNIX_EPOCH, size, e_tag: None, version: None };
         let range = if options.head { 0..size } else { start..start + bytes.len() as u64 };

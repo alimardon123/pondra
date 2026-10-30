@@ -351,7 +351,7 @@ async fn route(s: &Server, name: &str, path: &str, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let query = parts.uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let url = format!("http://127.0.0.1:{http}{path}{query}");
-    let mut out = crate::cluster::http_bare().request(parts.method, url).body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let mut out = crate::ext::bare().request(parts.method, url).body(reqwest::Body::wrap_stream(body.into_data_stream()));
     for (k, v) in parts.headers.iter().filter(|(k, _)| !matches!(k.as_str(), "host" | "content-length" | "transfer-encoding" | "connection")) {
         out = out.header(k, v);
     }

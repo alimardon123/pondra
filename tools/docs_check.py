@@ -16,6 +16,8 @@ Then its blocks run:
   bash/sh  in bash, from the page's own folder, with `pondra` on PATH.
 A `python cell` block is a console's Python cell: it runs on the node, as `DO LANGUAGE python`, in
 the page's session (a page's cells share their variables, as a console's do).
+A `sql owner` block is the node's owner's, as a backup into a folder is (`ext::owners_only`): it runs
+in `pondra sql` on the page's lake, from the page's own folder, as a reader types it there.
 A block whose info string says `norun` is shown but not run: things that can't run here (a real
 cluster, Windows, credentials, a command that serves until stopped). Other languages (text,
 json, toml, yaml, …) are never run.
@@ -114,6 +116,16 @@ def sql(q, timeout=120, session=None):
         raise RuntimeError(e.read().decode(errors="replace")[:2000])
 
 
+
+def owner_sql(code, work, env):
+    """A `sql owner` block: in `pondra sql` on the page's lake, the owner of the node it starts there (a folder on
+    this machine is the owner's), from the page's folder; its answer as `pondra sql` prints it."""
+    r = subprocess.run([BIN, "sql", "--dir", os.path.join(work, "lake"), code], cwd=work, env=env, capture_output=True, text=True, timeout=BLOCK_SECS)
+    if r.returncode:
+        raise RuntimeError((r.stderr or r.stdout)[-2000:])
+    return r.stdout
+
+
 def js_env(work):
     """A folder where `import … from 'pondra'` finds this repo's client."""
     mods = os.path.join(work, "node_modules")
@@ -171,7 +183,9 @@ def check_page(path, verbose):
         for lang, info, code, line in runnable:
             where = f"{os.path.relpath(path, ROOT)}:{line}"
             try:
-                if lang == "sql":
+                if lang == "sql" and "owner" in info.split():
+                    out = owner_sql(code, work, env)
+                elif lang == "sql":
                     out = sql(code)
                 elif lang in ("python", "py") and "cell" in info.split():
                     out = sql(f"DO LANGUAGE python $pondra$\n{code}\n$pondra$", session=f"docs-page-{os.getpid()}")  # (a console's Python cell: on the node, in the page's session, as the console runs it: a cell sees what the ones before it made)

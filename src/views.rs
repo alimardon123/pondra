@@ -205,6 +205,10 @@ impl View {
     pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() }
 }
 
+/// A view's stored text as it was written, with the measures' and MATCH_RECOGNIZE's rewrites taken back
+/// (`measures::written`, `pattern::shown`): what every door that shows a definition shows.
+pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
+
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
     let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
@@ -1555,7 +1559,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("reads", s(&|_, (_, v)| reads(v))),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
-        ("definition", s(&|_, (_, v)| Some(v.query().to_string()))),
+        ("definition", s(&|_, (_, v)| Some(shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;

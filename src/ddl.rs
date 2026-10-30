@@ -146,7 +146,7 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
             let (schema, view) = split(&k[2..]);
-            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::measures::written(&v.sql).into_owned()) });
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::views::shown(&v.sql)) });
         }
     }
     if let Some(a) = crate::auth::limited() {
@@ -260,7 +260,7 @@ pub enum Ddl {
     Unpin { lake: String },
     Refresh { database: Option<String>, tables: Vec<String> }, // ALTER DATABASE b REFRESH t, …: b's leader (ADR-047)
     SetLocation { database: String, to: String }, // ALTER DATABASE m SET LOCATION 'dir': a lake in memory moved there (memory.rs)
-    BackupDatabase { database: Option<String>, to: String, #[serde(default, skip_serializing_if = "Option::is_none")] retention_days: Option<u64> }, // BACKUP DATABASE [b] TO 'url': this lake's leader, beside its lock (ADR-070, `backup.rs`)
+    BackupDatabase { database: Option<String>, to: String, #[serde(default, skip_serializing_if = "Option::is_none")] retention_days: Option<u64> }, // BACKUP DATABASE [b] TO 'url': run on the node the statement reaches, as its owner (ADR-070, `backup.rs`)
     RestoreDatabase { name: String, from: String, #[serde(default, skip_serializing_if = "Option::is_none")] dir: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] at: Option<u64> }, // RESTORE DATABASE b FROM 'url': a new lake, attached
     Backup(crate::backup::Take), // the backup's (or the restored lake's) leader: a run
     Protect { database: String, on: bool, #[serde(default)] by: String }, // ALTER DATABASE b SET (protected = …): b's leader (ADR-058, `protect.rs`)
@@ -494,7 +494,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::Unpin { lake: branch } => crate::branch::unpin(lake, &branch).await,
         Ddl::Refresh { .. } => bail!("ALTER DATABASE … REFRESH is done by its database's leader (write::handle)"),
         Ddl::SetLocation { .. } => bail!("ALTER DATABASE … SET LOCATION is done by its database's leader (memory::set_location)"),
-        Ddl::BackupDatabase { .. } | Ddl::RestoreDatabase { .. } => bail!("BACKUP and RESTORE DATABASE are run by the leader beside its lock (write::ddl_here)"),
+        Ddl::BackupDatabase { .. } | Ddl::RestoreDatabase { .. } => bail!("BACKUP and RESTORE DATABASE are run on the node the statement reaches (backup::statement), not recorded as DDL"),
         Ddl::Backup(t) => crate::backup::take(lake, t).await,
         Ddl::Protect { database, on, by } => crate::protect::set(lake, &database, on, &by).await,
         Ddl::Apply { claim, after, record } => crate::apply::keep(lake, claim, after, &record).await,
@@ -523,8 +523,8 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
             }
             let dropped = match (crate::env::get("PONDRA_SERVER_URL"), &bases, &target) {
                 (Some(server), ..) => {
-                    let r = crate::cluster::http().delete(format!("{server}/databases/{name}?if_exists={if_exists}")).send().await?;
-                    let (ok, text) = (r.status().is_success(), r.text().await?);
+                    let r = crate::dial::call(&server, crate::dial::Call::delete(format!("/databases/{name}?if_exists={if_exists}"))).await?;
+                    let (ok, text) = (r.ok(), r.text().await?);
                     ensure!(ok, "{text}");
                     serde_json::from_str(&text)?
                 }
@@ -697,18 +697,10 @@ pub fn beside(url: &str, name: &str) -> String {
     }
 }
 
-/// Attach lake `dir` as `name` here. A node (`follow`) keeps it fresh from its catalog, until it
-/// is detached; `stream` also follows its leader's commit stream (`--attach`: for good).
-pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, stream: bool) -> Result<()> {
-    let leader = crate::terms::latest(&crate::store::open_store(dir)?.1).await?.map(|t| t.addr).filter(|a| !a.is_empty());
-    let live = match (&leader, stream) {
-        (Some(a), true) => crate::cluster::http().get(crate::tls::url(&format!("{a}/cluster/leader"))).timeout(std::time::Duration::from_secs(2)).send().await.is_ok(),
-        _ => false,
-    };
+/// Attach lake `dir` as `name` here, and return it. A node (`follow`) keeps it fresh from its catalog, until it
+/// is detached; `live` opens it to follow its leader's commit stream too (`--attach`: for good, `node::attach`).
+pub async fn attach(home: &Lake, name: &str, dir: &str, follow: bool, live: bool) -> Result<Arc<Lake>> {
     let other = Lake::open(dir, false, live).await?;
-    if let (true, Some(a)) = (live, leader) {
-        crate::cluster::mirror(other.clone(), a, me.to_string(), None);
-    }
     if follow {
         let (home, weak) = (Arc::downgrade(&home.arc()), Arc::downgrade(&other));
         crate::panics::spawn(async move {
@@ -724,7 +716,8 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, 
             }
         });
     }
-    home.attach(name, other)
+    home.attach(name, other.clone())?;
+    Ok(other)
 }
 
 /// The lakes in `folder` (its subfolders that hold one), attached under their folder names for as
@@ -732,7 +725,7 @@ pub async fn attach(home: &Lake, name: &str, dir: &str, me: &str, follow: bool, 
 /// a database server's are (ADR-024). Nothing is written to the catalog. Left out: this lake, a
 /// name the catalog attaches (that ATTACH says where), a schema's name here, and a lake that won't
 /// open (said on the log). The names attached.
-pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
+pub async fn attach_found(home: &Lake, folder: &str) -> Vec<String> {
     let lakes = lakes_in(folder).await.unwrap_or_else(|e| {
         eprintln!("listing the lakes in {folder}: {e:#}");
         vec![]
@@ -747,8 +740,8 @@ pub async fn attach_found(home: &Lake, folder: &str, me: &str) -> Vec<String> {
         if taken || !has_catalog(&dir).await.unwrap_or(false) {
             continue;
         }
-        match attach(home, &name, &dir, me, true, false).await {
-            Ok(()) => {
+        match attach(home, &name, &dir, true, false).await {
+            Ok(_) => {
                 if name.starts_with('_') {
                     eprintln!("database {name} in {folder} starts with _, a name a new database may not take (database_name): it was made before that rule, and stays attached");
                 }
@@ -767,7 +760,7 @@ crate::per_node!(
 /// Attach here the lakes the catalog lists (`ATTACH`), and let go of those it no longer does
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and
 /// tried again next time).
-pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
+pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
     let listed = lake.cat.scan::<Attachment>("a/", "a0").await?;
     for (key, a) in &listed {
         let name = &key[2..];
@@ -780,8 +773,8 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
                 continue;
             }
         }
-        match attach(lake, name, &a.dir, me, follow, false).await {
-            Ok(()) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),
+        match attach(lake, name, &a.dir, follow, false).await {
+            Ok(_) => FROM_SQL.lock().unwrap().push((lake.url.clone(), name.to_string())),
             Err(e) => eprintln!("attaching {name} ({}): {e:#}", a.dir),
         }
     }
@@ -795,13 +788,13 @@ pub async fn sync(lake: &Lake, me: &str, follow: bool) -> Result<()> {
 
 /// After this node sent an `ATTACH` or `DETACH`: once its catalog shows it, as it does here. After
 /// `CREATE MATERIALIZED VIEW`: once it is filled from the rows already there (`views::fill_all`).
-pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
+pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
     match d {
         // (CREATE OR REPLACE makes what it says, so it is waited for as when made plainly; IF NOT
         // EXISTS a materialized view only: one there already was filled when it was made, and a
         // routine there already may differ from the one asked for)
-        Ddl::Replacing { then, .. } => return Box::pin(settle(lake, then, me)).await,
-        Ddl::Unless { then, .. } if matches!(**then, Ddl::CreateMaterialized { .. }) => return Box::pin(settle(lake, then, me)).await,
+        Ddl::Replacing { then, .. } => return Box::pin(settle(lake, then)).await,
+        Ddl::Unless { then, .. } if matches!(**then, Ddl::CreateMaterialized { .. }) => return Box::pin(settle(lake, then)).await,
         _ => {}
     }
     if let Ddl::CreateMaterialized { name, .. } = d {
@@ -868,7 +861,7 @@ pub async fn settle(lake: &Lake, d: &Ddl, me: &str) -> Result<()> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    sync(lake, me, true).await
+    sync(lake, true).await
 }
 
 /// `CREATE VIEW` (and CREATE EXTERNAL TABLE's view of files): a query by name, planned once here

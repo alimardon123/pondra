@@ -149,8 +149,10 @@ Node 1 is on the ports you know, and the others are shifted so all three fit on 
 | `node3` | 8082 | 5434 | 8817 | 9094 |
 
 The lake is a volume the three nodes share. Each node also has a volume of its own for `/data`, and the
-key that seals secrets is on a shared volume, so every node opens a secret any of them made. The nodes
-find each other by name on Compose's network (`--advertise node1:8080`).
+key that seals secrets is on a shared volume (`PONDRA_SHARED_KEY_FILE`), so every node opens a secret any
+of them made, and the lake's own keys are sealed with it: whoever reads the lake alone can't sign in.
+Keep that volume with the lake, as `down -v` deletes them together. The nodes find each other by name
+on Compose's network (`--advertise node1:8080`).
 
 These variables, set in your shell or in a `.env` file beside the compose file, change it:
 

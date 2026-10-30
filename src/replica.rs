@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use datafusion::common::instant::Instant;
+use std::time::Duration;
 
 /// A follower's copies of the leader's changes that aren't in the bucket yet: in memory, and in
 /// files under `dir` so they survive a restart (every leader change restarts the followers).
@@ -147,9 +148,8 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
     merge(&own.map(|o| o.serve(term, in_bucket)).unwrap_or_default())?;
     let deadline = Instant::now() + Duration::from_secs(20);
     for peer in members.iter().filter(|p| *p != me) {
-        let url = crate::tls::url(&format!("{peer}/cluster/replica?after={in_bucket}&term={term}"));
         loop {
-            match crate::cluster::http().get(&url).timeout(Duration::from_secs(5)).send().await.and_then(|r| r.error_for_status()) {
+            match crate::dial::call(peer, crate::dial::Call::get(format!("/cluster/replica?after={in_bucket}&term={term}")).timeout(Duration::from_secs(5))).await.and_then(crate::dial::Reply::checked) {
                 Ok(r) => break merge(&r.bytes().await?).context("replica from a peer")?,
                 Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(250)).await,
                 Err(e) => break eprintln!("recovering without {peer}: {e}"), // (then only it held what it held)

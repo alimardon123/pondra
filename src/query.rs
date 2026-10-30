@@ -908,18 +908,18 @@ pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
 
 tokio::task_local! {
     /// The memory of the last answer a request collected (`collect`), counted until the request's body
-    /// is sent: an answer sent in pieces (`server::Rendered`) takes it over. Only the last one is kept:
+    /// is sent: an answer sent in pieces (`statement::Rendered`) takes it over. Only the last one is kept:
     /// an earlier statement's batches were dropped when that statement ended.
     pub static HELD: std::cell::RefCell<Option<MemoryReservation>>;
 }
 
 tokio::task_local! {
-    /// The pieces the one query a door sends may hand its answer to the door in (`server::sql`): once an
+    /// The pieces the one query a door sends may hand its answer to the door in (`statement::sql`): once an
     /// answer reaches `stream_bytes()`, it goes to the door as its plan makes it (`collect_or_send`).
     pub static PIECES: Arc<Pieces>;
 }
 
-/// A request's way to hand its door an answer in pieces (`server::sql`).
+/// A request's way to hand its door an answer in pieces (`statement::sql`).
 pub struct Pieces {
     /// Some(format) while a query may send its answer this way (`arm`).
     armed: std::sync::Mutex<Option<Option<String>>>,
@@ -1000,9 +1000,9 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
     let mut stream = datafusion::physical_plan::execute_stream(plan, task)?;
     let mut out = vec![];
     while let Some(batch) = stream.try_next().await? {
-        // (compacted before it is counted when it may be handed over: the hand-off measures what `big` measures, so
-        // a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
-        let batch = if send.is_some() { compact(batch) } else { batch };
+        // (made what its door sends (`answer::as_sent`) before it is counted when it may be handed over: the hand-off measures
+        // what `big` measures, so a small answer whose strings were other rows' is not sent in pieces, nor left out of `Results`)
+        let batch = match &send { Some(format) => crate::answer::as_sent(batch, format.as_deref()), None => batch };
         if held.try_grow(counted.count_batch(&batch)).is_err() {
             return Err(too_big());
         }
@@ -1042,7 +1042,7 @@ fn set_sent(rows: Option<u64>) {
 /// reads it (two at a time), and each batch is counted only while it is written.
 async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan::SendableRecordBatchStream, mut held: MemoryReservation, format: Option<&str>) -> Result<Vec<RecordBatch>> {
     let mut enc = crate::answer::Encoding::new(format);
-    let mut prefix: std::collections::VecDeque<RecordBatch> = out.into_iter().map(compact).flat_map(|b| crate::answer::piece_rows(&b)).collect();
+    let mut prefix: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(out.into_iter().map(|b| enc.lean(b))).into();
     let (mut rows, mut first) = (0u64, vec![]);
     if let Some(piece) = prefix.pop_front() {
         first = enc.step(Some(&piece))?;
@@ -1069,12 +1069,12 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
     }
 }
 
-/// An answer already whole, sent in pieces as `send_rest` sends a plan's (`server::stream`): its first piece is written
+/// An answer already whole, sent in pieces as `send_rest` sends a plan's (`statement::answer`): its first piece is written
 /// now, the rest on the queries' runtime as its client reads them. `held`'s memory goes when the last piece is written,
 /// or when the client goes (the body that holds the pieces counts the request for a node told to stop: `server::pieces`).
 pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> Result<Handed> {
     let mut enc = crate::answer::Encoding::new(format);
-    let mut parts: std::collections::VecDeque<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).collect();
+    let mut parts: std::collections::VecDeque<RecordBatch> = crate::answer::pieces(batches.into_iter().map(|b| enc.lean(b))).into();
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
     let Some(piece) = parts.pop_front() else {
@@ -1122,14 +1122,33 @@ async fn pour(enc: &mut crate::answer::Encoding, tx: &tokio::sync::mpsc::Sender<
             () = tx.closed() => return Err(gone()), // (the client went: the plan is let go now, not at its next send)
         };
         let Some(batch) = next else { break };
-        let batch = compact(batch);
-        let size = batch.get_array_memory_size();
+        // (with the batches the plan already has ready, up to a piece: a message for each of them would be one per 8,192 rows)
+        let (mut ready, mut ended) = (vec![enc.lean(batch)], false);
+        let mut size = ready[0].get_array_memory_size();
+        while size < crate::answer::PIECE {
+            match futures::FutureExt::now_or_never(stream.try_next()) {
+                Some(Ok(Some(more))) => {
+                    let more = enc.lean(more);
+                    size += more.get_array_memory_size();
+                    ready.push(more);
+                }
+                Some(Ok(None)) => {
+                    ended = true;
+                    break;
+                }
+                Some(Err(e)) => return Err(e.into()),
+                None => break, // (none is ready: what is goes now)
+            }
+        }
         held.try_grow(size).map_err(|_| too_big())?;
-        for piece in crate::answer::piece_rows(&batch) {
+        for piece in crate::answer::pieces(ready) {
             rows += piece.num_rows() as u64;
             step_to(enc, tx, Some(&piece)).await?;
         }
         held.shrink(size);
+        if ended {
+            break;
+        }
     }
     step_to(enc, tx, None).await?; // (the end)
     Ok(rows)
@@ -1158,7 +1177,7 @@ fn keep_held(held: MemoryReservation) {
     let _ = HELD.try_with(|h| *h.borrow_mut() = held.take());
 }
 
-/// The memory of the answer a request kept, for the body that sends it (`server::answer`).
+/// The memory of the answer a request kept, for the body that sends it (`statement::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
 tokio::task_local! {
@@ -1214,7 +1233,7 @@ pub fn mark(stage: &'static str) {
     let _ = TRACE.try_with(|t| t.borrow_mut().as_mut().map(|t| t.mark(stage)));
 }
 
-use crate::answer::{compact, schema};
+use crate::answer::schema;
 use crate::engine::sql;
 
 /// An Arrow IPC stream's batches (none for no bytes).
@@ -1271,6 +1290,9 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
+    if crate::pattern::wanted(&text) || text.contains("pondra_match") {
+        crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
+    }
     let named_sys = crate::sys::mentioned(&text); // (named: the tables get their system columns)
     let default = ctx.catalog(&crate::ddl::lake_name(lake)).expect("the lake's catalog"); // (`lake.schema.table`)
     for s in crate::ddl::schemas(lake).await?.into_iter().filter(|s| s != PUBLIC) {
