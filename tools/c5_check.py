@@ -8,10 +8,10 @@ write a second to a key (429):
   the node says it slowed down, and once the store first refused, the writes it is sent each
   second stay near the rate (it backs off within a second, retries and all: `budget.rs`);
 - **the bell**: four `pondra sql` writers that can't reach the leader leave their INSERTs in the
-  bucket's inbox at once, each ringing `inbox/bell`; a ring refused (429) counts as rung, so
-  every one is answered. They run as on another machine (a temp folder of their own), so each
-  watches for the leader's mark after it rang (`terms::deaf`): the leader marks in time
-  through the bucket's slow-downs, and keeps its term.
+  bucket's inbox at once, each ringing `inbox/bell`; a ring refused (429) means another just
+  rang, so every one is answered. They run as on another machine (a temp folder of their own),
+  so each whose ring went watches for the leader's mark after it (`terms::Ear`; a refused one
+  watches nothing): the leader marks in time through the bucket's slow-downs, and keeps its term.
 
   c5_check.py [--bin target/release/pondra] [--rate 30] [--port 9581]
 """
@@ -107,7 +107,7 @@ try:
     stats = json.loads(http(SP, "/__sim/stats"))
     kept = terms() == before and "restarting" not in open(log).read()
     info["bell"] = {"writers": outs, "429 in all": stats.get("TooManyRequests", 0), "terms": [before, terms()]}
-    checks["four writers through the bucket's inbox at once: each answered, the bell's 429s counted as rung, and the leader keeps its term"] = \
+    checks["four writers through the bucket's inbox at once: each answered through the bell's 429s, and the leader keeps its term"] = \
         all(c == 0 for c, _ in outs.values()) and rows == [{"n": 4}] and kept
 finally:
     for p in reversed(procs):

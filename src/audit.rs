@@ -284,46 +284,89 @@ pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std
     }
 }
 
-/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement). Anyone may
-/// knock, so an address's refusals past `KNOCKS` a minute aren't written: the last one written says so.
+/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement), from `from`. Its
+/// client is the connection's: `refused_by` names another (behind a proxy, `Peer::client`).
 pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
+    refused_by(app, user, door, from, from.map(|a| a.ip()), what, message)
+}
+
+/// `refused`, counted by `client`. One that names a user is always written. Anyone may knock with none, so past `KNOCKS`
+/// a minute from one client (an IPv6 one's /64) those aren't written one by one: a row says how many weren't, once
+/// their minute has ended (at the next refusal).
+pub fn refused_by(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, client: Option<std::net::IpAddr>, what: &str, message: &str) {
     if !on() {
         return;
     }
-    let message = match knocked(from.map(|a| a.ip()), crate::log::now_ms()) {
+    let now = crate::log::now_ms();
+    let (written, uncounted) = knocked(user.is_empty().then_some(client), now);
+    for (range, since, n) in uncounted {
+        let since = chrono::DateTime::from_timestamp_millis(since as i64).map(|t| t.to_rfc3339()).unwrap_or_default();
+        let message = format!("{n} more refusals naming no user from {range} in the minute from {since} weren't written one by one");
+        write(app, Line { at: now, user: String::new(), door: "node", from: Some(range), class: "access", statement: "refusals".into(), outcome: "refused", message: Some(message), ms: None });
+    }
+    let message = match written {
         Some(false) => message.to_string(),
-        Some(true) => format!("{message} (this address's refusals past {KNOCKS} a minute aren't written until its minute ends)"),
+        Some(true) => format!("{message} (this client's refusals naming no user past {KNOCKS} a minute are counted, not written one by one, until its minute ends)"),
         None => return,
     };
-    write(app, Line { at: crate::log::now_ms(), user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
+    write(app, Line { at: now, user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
 }
 
-/// Refusals written a minute from one address (security pass 2: 400 anonymous `/sso/…` calls wrote 400 rows).
+/// Refusals naming no user written a minute from one client (security pass 2: 400 anonymous `/sso/…` calls wrote 400 rows).
 const KNOCKS: u32 = 60;
-const ADDRESSES: usize = 10_000; // (the addresses held at once: when full, those whose minute ended go, or all)
+const CLIENTS: usize = 10_000; // (the clients counted at once: when full, newcomers count together, and no count starts over)
 
-crate::per_node!(static KNOCKED: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u64, u32)>> = std::sync::Mutex::new(std::collections::HashMap::new()));
+#[derive(Default)]
+struct Knocks {
+    by: std::collections::HashMap<std::net::IpAddr, (u64, u32)>, // client's range -> its minute's start, refusals in it
+    swept: u64,                                                  // (when the minutes that ended were last counted out)
+}
 
-/// Is a refusal from `ip` at `now_ms` written: Some(false) yes, Some(true) yes and it is the last this minute,
-/// None no. (No address: a door that can't tell, counted under 0.0.0.0.)
-fn knocked(ip: Option<std::net::IpAddr>, now_ms: u64) -> Option<bool> {
-    let mut all = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if all.len() >= ADDRESSES {
-        all.retain(|_, (since, _)| now_ms.saturating_sub(*since) < 60_000);
-        if all.len() >= ADDRESSES {
-            all.clear();
-        }
+crate::per_node!(static KNOCKED: std::sync::Mutex<Knocks> = std::sync::Mutex::new(Knocks::default()));
+
+/// The range a client's refusals are counted under: its address, an IPv6 one's /64 (what a network hands one machine).
+fn range(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(a) => std::net::IpAddr::V6((u128::from(a) & !(u64::MAX as u128)).into()),
+        v4 => v4,
     }
-    let (since, n) = all.entry(ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))).or_insert((now_ms, 0));
+}
+
+/// Is a refusal at `now_ms` written: Some(false) yes, Some(true) yes and the last one written this minute, None no. Only
+/// those naming no user are counted (`client` Some: its address, None when the door can't tell, counted under 0.0.0.0).
+/// With it, the minutes that ended with refusals not written: (range, its minute's start, how many).
+fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<bool>, Vec<(String, u64, u32)>) {
+    let Some(client) = client else { return (Some(false), vec![]) };
+    let mut k = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut ended = vec![];
+    let shown = |ip: &std::net::IpAddr| if ip.is_ipv6() { format!("{ip}/64") } else { ip.to_string() };
+    if now_ms.saturating_sub(k.swept) >= 60_000 || k.by.len() >= CLIENTS {
+        k.swept = now_ms;
+        k.by.retain(|ip, (since, n)| {
+            let over = now_ms.saturating_sub(*since) >= 60_000;
+            if over && *n > KNOCKS {
+                ended.push((shown(ip), *since, *n - KNOCKS));
+            }
+            !over
+        });
+    }
+    let unspecified = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    let key = client.map_or(unspecified, range);
+    let key = if k.by.len() >= CLIENTS && !k.by.contains_key(&key) { unspecified } else { key };
+    let (since, n) = k.by.entry(key).or_insert((now_ms, 0));
     if now_ms.saturating_sub(*since) >= 60_000 {
+        if *n > KNOCKS {
+            ended.push((shown(&key), *since, *n - KNOCKS));
+        }
         (*since, *n) = (now_ms, 0);
     }
     *n += 1;
-    match *n {
+    let written = match *n {
         n if n < KNOCKS => Some(false),
         n if n == KNOCKS => Some(true),
         _ => None,
-    }
+    };
+    (written, ended)
 }
 
 /// A request at the sharing door (`sharing.rs`), by a recipient: always written, as refusals are.
@@ -421,13 +464,22 @@ mod tests {
     }
 
     #[test]
-    fn an_address_has_its_refusals_written_up_to_sixty_a_minute() {
+    fn a_client_has_its_refusals_naming_no_user_written_up_to_sixty_a_minute_and_the_rest_counted() {
         let (ip, other) = (Some("203.0.113.7".parse().unwrap()), Some("203.0.113.8".parse().unwrap()));
-        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(ip, 1_000)).collect();
+        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(Some(ip), 1_000).0).collect();
         assert!(said[..KNOCKS as usize - 1].iter().all(|s| *s == Some(false)), "the first 59 written");
-        assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest aren't");
+        assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest are counted");
         assert!(said[KNOCKS as usize..].iter().all(Option::is_none), "the rest of the minute not written");
-        assert_eq!(knocked(other, 1_000), Some(false), "another address counts apart");
-        assert_eq!(knocked(ip, 61_000), Some(false), "a new minute, written again");
+        assert_eq!(knocked(Some(other), 1_000).0, Some(false), "another client counts apart");
+        assert_eq!(knocked(None, 1_000).0, Some(false), "one that names a user is always written");
+        let (written, counted) = knocked(Some(ip), 61_000);
+        assert_eq!(written, Some(false), "a new minute, written again");
+        assert_eq!(counted, vec![("203.0.113.7".to_string(), 1_000, 5)], "the minute that ended: a count of the 5 not written");
+        let v6 = |s: &str| Some(s.parse().unwrap());
+        for _ in 0..KNOCKS {
+            knocked(Some(v6("2001:db8:0:1::1")), 1_000);
+        }
+        assert_eq!(knocked(Some(v6("2001:db8:0:1:ffff::2")), 1_000).0, None, "an IPv6 client's /64 counts as one");
+        assert_eq!(knocked(Some(v6("2001:db8:0:2::1")), 1_000).0, Some(false), "the next /64 apart");
     }
 }

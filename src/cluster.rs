@@ -16,7 +16,8 @@
 //!   A claimer also holds a lock file in this machine's temp folder (named in its term record), so
 //!   a process on the same machine knows at once that a killed claimer is gone. Another machine
 //!   has no file to look at: it rings the inbox's bell, which a claimer answers with a mark within
-//!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`). A leader
+//!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
+//!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
 use crate::members::Members;
 use crate::node::Guest;

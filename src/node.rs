@@ -277,7 +277,15 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
                 crate::dial::set_node_key(k);
             }
         }
-        replica::recover(&lake, &addr, term, Some(own)).await?;
+        match replica::recover(&lake, &addr, term, Some(own)).await {
+            // (a node outside the members that can't reach them: it let its term go, and they lead; it follows them)
+            Err(e) if e.downcast_ref::<replica::Unreached>().is_some() => {
+                eprintln!("{e:#}");
+                crate::terms::newer_claimed(&lake.store, term).await;
+                restart("not leading past members this node can't reach")
+            }
+            r => r?,
+        };
     } else if leader && !lives {
         // (a guest that leads recovers as `write::lead` does: no followers' changes to hold, and no key to ask for)
         replica::recover(&lake, "", term, None).await?;

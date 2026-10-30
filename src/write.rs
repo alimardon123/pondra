@@ -2062,7 +2062,7 @@ pub async fn through_bucket(dir: &str, req: Request) -> Result<Value> {
 /// can't be reached, or, when nobody leads, by leading for a moment: here (`one_off`: a `pondra
 /// sql` process, which ends right after), or, from a node, in a `pondra sql` of its own. `req` None is
 /// nothing to record (`lead_only`): the lake is led for the moment, and its inbox answered.
-async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> Result<Value> {
+async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool) -> Result<Value> {
     if let Some(r) = crate::store::reach_of(dir).filter(|r| r.read_only) {
         return across(dir, &r, req).await; // (a lake on another server: ADR-058)
     }
@@ -2103,11 +2103,17 @@ async fn deliver(dir: &str, req: Option<Request>, job: &str, one_off: bool) -> R
             }
             t => {
                 let Some(term) = claim(&store, t.map_or(1, |t| t.n + 1), "").await? else { continue };
-                return match lead(dir, &store, term.n, req).await {
+                return match lead(dir, &store, term.n, &mut req).await {
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
                     Err(e) if fenced(&e) && tries() < 5 => crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
+                    // (members this machine can't reach hold acknowledged changes: they choose a leader, and the write goes to it)
+                    Err(e) if e.downcast_ref::<crate::replica::Unreached>().is_some() => {
+                        eprintln!("{e:#}");
+                        crate::terms::newer_claimed(&store, term.n).await;
+                        continue;
+                    }
                     r => r,
                 };
             }
@@ -2300,14 +2306,24 @@ pub(crate) fn job() -> &'static str {
     JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
 }
 
-/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go. `req` None records
-/// nothing (`lead_only`).
-async fn lead(dir: &str, store: &Store, term: u64, req: Option<Request>) -> Result<Value> {
+/// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go, however it ends.
+/// `req` None records nothing (`lead_only`); it is taken once the lake is ours (left for another leader if it isn't).
+async fn lead(dir: &str, store: &Store, term: u64, req: &mut Option<Request>) -> Result<Value> {
     let marks = crate::terms::mark_every(store.clone(), term);
+    let out = led(dir, term, req).await;
+    marks.abort(); // (its mark stops before the term is let go, so no mark lands after it)
+    release(store, term).await; // the next writer or node doesn't have to wait
+    out
+}
+
+async fn led(dir: &str, term: u64, req: &mut Option<Request>) -> Result<Value> {
     let lake = Lake::open(dir, true, false).await?; // (the catalog's writer: fences any older one)
-    crate::replica::recover(&lake, "", term, None).await?;
+    if let Err(e) = crate::replica::recover(&lake, "", term, None).await {
+        let _ = lake.cat.close().await; // (refused, it leads nothing: no writer of ours stays for the next leader to fence)
+        return Err(e);
+    }
     let (seq, lock) = (Sequencer::start(lake.clone(), None).await?, Mutex::new(()));
-    let out = match req {
+    let out = match req.take() {
         Some(r) => {
             let flush = matches!(r, Request::Flush(_));
             summary(flush, handle(&lake, &seq, &lock, r).await?)?
@@ -2316,8 +2332,6 @@ async fn lead(dir: &str, store: &Store, term: u64, req: Option<Request>) -> Resu
     };
     crate::inbox::drain(&lake, &seq, &lock).await?; // others who couldn't reach a leader
     lake.cat.checkpoint().await?; // (so every node's view has it without replaying the WAL)
-    marks.abort();
-    release(store, term).await; // the next writer or node doesn't have to wait
     Ok(out)
 }
 
