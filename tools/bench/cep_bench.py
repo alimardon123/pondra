@@ -8,19 +8,18 @@ loads them with one statement before its clock starts (CREATE TABLE … AS SELEC
 lake: a node reads no local paths over HTTP), then takes them into `ticks` in 10 commits in time order. Flink reads them
 with the filesystem connector, in flink_cep.py, its own Python.
 
-The query is the same text in both:
-  SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES … PATTERN (strt down+ up+) DEFINE …)
-Flink 2.3 refuses it as written: `PREV` ("Flink does not support physical offsets within partition"), and a greedy
-quantifier last in the pattern ("Greedy quantifiers are not allowed as the last element of a Pattern yet"), which the
-same condition spelled with LAST(var, 1) runs into. Flink's record of that refusal is in the JSON, with nothing measured
-on its side.
+The query is the same text in both (MATCH): PATTERN (strt down+ up), the rising row last, which Flink 2.3 accepts;
+Flink has no PREV, so its LAST(var, 1) stands for it. The first pattern, ending in a greedy up+, is refused by Flink
+(a greedy quantifier last), and is not run here. MATCH_PREV is the PREV form, for Pondra's cross-check (--prev-check).
 
+  pondra_query  the plain query over the whole table, counted: SELECT count(*) FROM (query), median of three. Its matches
+                are the target of the view.
   pondra_view   dips: that query WITH (lateness = '0 seconds') … EMIT FINAL, fed by the 10 commits. Timed from the first
-                commit until its count has not moved for 3 s, less those 3 s.
-  pondra_query  the plain query over the whole table, counted: SELECT count(*) FROM (query), median of three.
+                commit until its count equals the plain query's, polled every 0.2 s, 300 s at most.
   flink         the query into a blackhole sink, submit to end (median of three), and into a CSV folder, whose rows are
                 the matches: their count, and the comparison.
-  compare       the matches as sets of (symbol, start_ts, end_ts). Each engine runs alone, with a node or a JVM of its own.
+  compare       the matches as sets of (symbol, start_ts, end_ts): the view, the plain query, a scan of the rows (model),
+                and Flink. Each engine runs alone, with a node or a JVM of its own.
 
 Runs: each timing is the median of three where one run is under a minute, else one run. Prints one JSON object.
 
@@ -36,11 +35,21 @@ FILES = 4          # ticks-K.csv: each a run of whole seconds, so each Flink sou
 SEED = 2026
 BASE = datetime.datetime(2026, 10, 30)  # (the stream's first second)
 COMMITS = 10
+# The pattern ends in a single row, which Flink 2.3 accepts (a greedy quantifier last is refused). Flink has no PREV: its
+# LAST(var, 1) is the row before, when the variable matched it, so a run's first row is compared with strt. Both engines
+# run this text. MATCH_PREV is the PREV form, for Pondra alone: a cross-check at one N.
 MATCH = """SELECT * FROM ticks MATCH_RECOGNIZE (
   PARTITION BY symbol ORDER BY ts
   MEASURES FIRST(strt.ts) AS start_ts, LAST(down.ts) AS bottom_ts, LAST(up.ts) AS end_ts
   ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
-  PATTERN (strt down+ up+)
+  PATTERN (strt down+ up)
+  DEFINE down AS (LAST(down.price, 1) IS NULL AND down.price < strt.price) OR down.price < LAST(down.price, 1),
+         up AS up.price > LAST(down.price))"""
+MATCH_PREV = """SELECT * FROM ticks MATCH_RECOGNIZE (
+  PARTITION BY symbol ORDER BY ts
+  MEASURES FIRST(strt.ts) AS start_ts, LAST(down.ts) AS bottom_ts, LAST(up.ts) AS end_ts
+  ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW
+  PATTERN (strt down+ up)
   DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price))"""
 
 
@@ -52,7 +61,7 @@ def ticks(folder, n):
     """The rows, written once: `ticks-K.csv`, each file a run of whole seconds, every symbol's row each second. Written
     again only when the folder doesn't hold this N (`rows.txt` is written last)."""
     files = [os.path.join(folder, f"ticks-{k}.csv") for k in range(FILES)]
-    marker = os.path.join(folder, "rows.txt")
+    marker = os.path.join(folder, ".rows.txt")  # (a dot-file: Flink's file source reads every other file in the folder)
     if os.path.exists(marker) and open(marker).read() == str(n):
         return files
     assert n % SYMBOLS == 0, "N is whole seconds: a multiple of 1,000"
@@ -151,8 +160,9 @@ def pondra_lake(files):
     return lake
 
 
-def pondra_view(n, files, port):
-    """dips: the view fed by the commits. Its node's peak RSS and the matches it wrote."""
+def pondra_view(n, files, port, target):
+    """dips: the view fed by the commits. Its time: from the first commit until its count is `target` (the plain query's
+    count), polled every 0.2 s for 300 s at most. Its node's peak RSS and the matches it wrote."""
     import harness
     q = lambda s: harness.sql(port, s)
     seq = itertools.count()
@@ -168,24 +178,26 @@ def pondra_view(n, files, port):
             c = time.time()
             q(f"INSERT INTO ticks SELECT symbol, ts, price FROM ticks_src WHERE ts >= TIMESTAMP '{cut(k)}' AND ts < TIMESTAMP '{cut(k + 1)}'")
             commits.append(round(time.time() - c, 3))
-        last, moved = None, t0
-        while True:  # (until the count hasn't moved for 3 s: the time to the last move is the answer)
+        reached, count, deadline = None, None, time.time() + 300
+        while True:
             count = next(iter(q(f"SELECT count(*) AS n{next(seq)} FROM dips")[0].values()))  # (a new alias: not a remembered answer)
             now = time.time()
-            if count != last:
-                last, moved = count, now
-            elif now - moved >= 3:
+            if count == target:
+                reached = now
+                break
+            if now > deadline:
                 break
             time.sleep(0.2)
         matches = q("SELECT symbol, start_ts, end_ts FROM dips")
         peak = status(node.p.pid)[1] / 1024
-        return {"secs": round(moved - t0, 3), "commit_s": commits, "peak_rss_mb": round(peak, 1), "matches": matches}
+        return {"secs": round(reached - t0, 3) if reached else None, "reached": reached is not None, "count": count, "target": target,
+                "difference": target - count, "commit_s": commits, "peak_rss_mb": round(peak, 1), "matches": matches}
     finally:
         node.kill()
         shutil.rmtree(lake, ignore_errors=True)
 
 
-def pondra_query(n, files, port):
+def pondra_query(n, files, port, sql=MATCH):
     """The plain query over the whole table: its time (median of three), its matches, its node's peak RSS."""
     import harness
     q = lambda s: harness.sql(port, s)
@@ -198,11 +210,11 @@ def pondra_query(n, files, port):
 
         def run():
             t = time.time()
-            q(f"SELECT count(*) AS n{next(seq)} FROM ({MATCH}) m")  # (a new alias each run: the result cache answers a repeated text)
+            q(f"SELECT count(*) AS n{next(seq)} FROM ({sql}) m")  # (a new alias each run: the result cache answers a repeated text)
             return round(time.time() - t, 3)
 
         runs, med = median_of_three(run)
-        matches = q(f"SELECT symbol, start_ts, end_ts FROM ({MATCH}) m")
+        matches = q(f"SELECT symbol, start_ts, end_ts FROM ({sql}) m")
         peak = status(node.p.pid)[1] / 1024
         return {"secs": runs, "median_s": med, "peak_rss_mb": round(peak, 1), "matches": matches}
     finally:
@@ -210,31 +222,31 @@ def pondra_query(n, files, port):
         shutil.rmtree(lake, ignore_errors=True)
 
 
-def flink(n, files, folder, python):
-    """flink_cep.py in its own Python, JVM outside the timings: its JSON line, and the JVM's peak RSS."""
+def flink(n, files, folder, python, state="rocksdb"):
+    """flink_cep.py in its own Python, JVM outside the timings: its JSON line, and the JVM's peak RSS. Its state: RocksDB
+    (nexmark.py's default: its managed memory a third of the machine's, the JVM's heap a third) or the heap (two thirds,
+    as nexmark.py's --flink-state heap). JVM_ARGS overrides the heap."""
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flink_cep.py")
-    out_dir = os.path.join(folder, "flink-matches")
-    shutil.rmtree(out_dir, ignore_errors=True)
-    # Flink's settings, as nexmark.py's Flink side: RocksDB state, its managed memory a third of the machine's, the JVM's
-    # heap a third (JVM_ARGS overrides it).
-    spec = {"dir": os.path.dirname(files[0]), "out": out_dir, "query": MATCH, "parallelism": os.cpu_count() or 4,
+    out_file = folder + f"-flink-matches-{state}.csv"  # (beside the ticks, not in them: Flink's source reads its folder)
+    if os.path.exists(out_file):
+        os.unlink(out_file)
+    spec = {"dir": os.path.dirname(files[0]), "out": out_file, "query": MATCH, "parallelism": os.cpu_count() or 4, "state": state,
             "managed": f"{max(ram_gb() // 3, 1)}g"}
-    jvm = os.environ.get("JVM_ARGS") or f"-Xmx{max(ram_gb() // 3, 1)}g"
+    jvm = os.environ.get("JVM_ARGS") or f"-Xmx{max(ram_gb() * (2 if state == 'heap' else 1) // 3, 1)}g"
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(spec, f)
     p = subprocess.Popen([python, here, f.name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          env={**os.environ, "JVM_ARGS": jvm})
     peak = Peak(p.pid)
     peak.start()
-    stdout, stderr = p.communicate(timeout=7200)
+    stdout, stderr = p.communicate(timeout=6 * 3600)
     mem = peak.finish()
     os.unlink(f.name)
     lines = [l for l in stdout.splitlines() if l.startswith("{")]
     res = json.loads(lines[-1]) if lines else {"engine": "flink", "failed": stderr[-2000:]}
     res.update(mem)
-    if os.path.isdir(out_dir):
-        res["matches"] = [row for name in sorted(os.listdir(out_dir)) if not name.startswith(".")
-                          for row in csv.reader(open(os.path.join(out_dir, name)))]
+    if os.path.exists(out_file):
+        res["matches"] = list(csv.reader(open(out_file)))
     return res
 
 
@@ -262,8 +274,8 @@ def differ(a, b, last):
 
 def model(files):
     """The plain query's matches by a scan of the rows, the pattern's semantics written out: from each row as strt, a run
-    of falling prices, then a run of rising ones (greedy: the runs are as long as they go), then the search goes on past
-    the last row. Per symbol, as the query partitions it."""
+    of falling prices (as long as it goes), then one row that rises on the run's last price; the search goes on past that
+    row. Per symbol, as the query partitions it."""
     rows = {}
     for path in files:
         for sym, ts, price in csv.reader(open(path)):
@@ -277,11 +289,8 @@ def model(files):
                 while j < m and p[j] < p[j - 1]:
                     j += 1
                 if j < m and p[j] > p[j - 1]:
-                    k = j
-                    while k < m and p[k] > p[k - 1]:
-                        k += 1
-                    out.add((sym, t[i], t[k - 1]))
-                    i = k
+                    out.add((sym, t[i], t[j]))
+                    i = j + 1
                     continue
             i += 1
     return out
@@ -306,6 +315,8 @@ def main(argv):
     ap.add_argument("--engines", default="pondra,flink")
     ap.add_argument("--flink-python", default=os.environ.get("FLINK_PYTHON", "/home/claude/venv-flink/bin/python"))
     ap.add_argument("--port", type=int, default=8391)
+    ap.add_argument("--prev-check", action="store_true", help="Pondra alone: the PREV form's plain matches against the LAST form's")
+    ap.add_argument("--flink-state", default="rocksdb", choices=["rocksdb", "heap"], help="where Flink keeps its state")
     a = ap.parse_args(argv)
     engines = a.engines.split(",")
     result = {"machine": {"nproc": os.cpu_count(), "ram_gb": ram_gb()}, "runs": []}
@@ -316,15 +327,21 @@ def main(argv):
         one = {"n": n, "span_s": n // SYMBOLS, "rows": n, "loadavg_before": {}}
         view = query = fl = None
         if "pondra" in engines:
-            one["loadavg_before"]["pondra"] = loadavg()
-            view = pondra_view(n, files, a.port)
+            # (the plain query first: its count is the view's target)
             one["loadavg_before"]["pondra_query"] = loadavg()
             query = pondra_query(n, files, a.port)
-            one["pondra_view"] = {k: v for k, v in view.items() if k != "matches"} | {"rows_per_s": round(n / view["secs"]), "matches": len(view["matches"])}
+            one["loadavg_before"]["pondra_view"] = loadavg()
+            view = pondra_view(n, files, a.port, target=len(query["matches"]))
+            one["pondra_view"] = {k: v for k, v in view.items() if k != "matches"} | {"matches": len(view["matches"])} | (
+                {"rows_per_s": round(n / view["secs"])} if view["secs"] else {})
             one["pondra_query"] = {k: v for k, v in query.items() if k != "matches"} | {"rows_per_s": round(n / query["median_s"]), "matches": len(query["matches"])}
+            if a.prev_check:
+                prev = pondra_query(n, files, a.port, MATCH_PREV)
+                one["pondra_prev_form"] = {k: v for k, v in prev.items() if k != "matches"} | {"matches": len(prev["matches"]),
+                                                                                             "same_as_last_form": keys(prev["matches"]) == keys(query["matches"])}
         if "flink" in engines:
             one["loadavg_before"]["flink"] = loadavg()
-            fl = flink(n, files, folder, a.flink_python)
+            fl = flink(n, files, folder, a.flink_python, a.flink_state)
             one["flink"] = {k: v for k, v in fl.items() if k != "matches"}
             if "matches" in fl:
                 one["flink"]["matches"] = len(fl["matches"])

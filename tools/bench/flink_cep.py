@@ -1,30 +1,32 @@
 """Flink's side of `cep_bench.py` (PyFlink, a local MiniCluster, streaming mode): the ticks from their CSV files (the
 filesystem connector), the match query into a blackhole sink, each run timed from submit to the job's end (one run, or
-three when one takes under a minute), then the same query into a CSV folder, whose rows are the matches. Prints one JSON line.
+three when one takes under a minute), then the query's rows, collected into a CSV file (the matches, for the comparison).
+Prints one JSON line.
   flink_cep.py SPEC_JSON"""
-import json, os, sys, time
+import csv, json, os, sys, time
 t0 = time.time()
 from pyflink.table import EnvironmentSettings, TableEnvironment
 spec = json.load(open(sys.argv[1]))
 env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
 conf = env.get_config()
 conf.set("parallelism.default", str(spec["parallelism"]))
-# (State as nexmark.py sets it: RocksDB, with its managed memory a third of the machine's. The JVM's heap is JVM_ARGS's
-# -Xmx, which cep_bench.py sets the same way.)
-conf.set("state.backend.type", "rocksdb")
-conf.set("taskmanager.memory.managed.size", spec["managed"])
+# (State as cep_bench.py sets it, with nexmark.py's convention: RocksDB with its managed memory a third of the machine's,
+# or the heap. The JVM's heap is JVM_ARGS's -Xmx, which cep_bench.py sets.)
+conf.set("state.backend.type", spec["state"])
+if spec["state"] == "rocksdb":
+    conf.set("taskmanager.memory.managed.size", spec["managed"])
 conf.set("table.local-time-zone", "UTC")
 env.execute_sql("SELECT 1").wait()  # (the JVM and the MiniCluster start outside the timings)
 env.execute_sql(f"CREATE TABLE ticks (symbol STRING, ts TIMESTAMP(3), price INT, WATERMARK FOR ts AS ts) "
                 f"WITH ('connector'='filesystem', 'path'='{spec['dir']}', 'format'='csv')")
 
 
-def sink(name, sql, with_clause):
-    """A table with the query's columns (its time attributes as plain timestamps), written by `with_clause`."""
+def sink(name, sql):
+    """A blackhole table with the query's columns (its time attributes as plain timestamps)."""
     schema = env.sql_query(sql).get_schema()
     cols = ", ".join(f"`{c}` {str(t).replace(' *ROWTIME*', '').replace(' *PROCTIME*', '').replace('LOCALZONEDTIMESTAMP', 'TIMESTAMP_LTZ')}"
                      for c, t in zip(schema.get_field_names(), schema.get_field_data_types()))
-    env.execute_sql(f"CREATE TABLE {name} ({cols}) WITH ({with_clause})")
+    env.execute_sql(f"CREATE TABLE {name} ({cols}) WITH ('connector'='blackhole')")
 
 
 def timed(sql):
@@ -41,20 +43,24 @@ def why(e):
 
 
 q = spec["query"]
-out = {"engine": "flink", "parallelism": spec["parallelism"], "state": "rocksdb", "jvm_args": os.environ.get("JVM_ARGS", ""),
+out = {"engine": "flink", "parallelism": spec["parallelism"], "state": spec["state"], "jvm_args": os.environ.get("JVM_ARGS", ""),
        "startup_s": round(time.time() - t0, 2), "blackhole_s": [], "failed": None}
 try:
-    sink("match_blackhole", q, "'connector'='blackhole'")
+    sink("match_blackhole", q)
     first = timed(f"INSERT INTO match_blackhole {q}")
     out["blackhole_s"] = [first] + ([timed(f"INSERT INTO match_blackhole {q}") for _ in range(2)] if first < 60 else [])
 except Exception as e:
     out["failed"] = f"blackhole: {why(e)}"
 if out["failed"] is None:
-    # (the filesystem sink commits its files at a checkpoint: the bounded job's last one comes at its end)
-    conf.set("execution.checkpointing.interval", "1 s")
+    # (collected, not written by a filesystem sink: that sink commits its files at checkpoints, and at a 1 s interval over
+    # RocksDB state the checkpoints at 1M rows never finished)
     try:
-        sink("matches", q, f"'connector'='filesystem', 'path'='{spec['out']}', 'format'='csv'")
-        out["matches_csv_s"] = timed(f"INSERT INTO matches {q}")
+        t = time.time()
+        with open(spec["out"], "w", newline="") as f:
+            writer = csv.writer(f)
+            for row in env.execute_sql(q).collect():
+                writer.writerow(list(row))
+        out["collect_s"] = round(time.time() - t, 3)
     except Exception as e:
-        out["failed"] = f"matches: {why(e)}"
+        out["failed"] = f"collect: {why(e)}"
 print(json.dumps(out), flush=True)
