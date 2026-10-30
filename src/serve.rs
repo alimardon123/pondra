@@ -36,7 +36,7 @@ impl Groups {
 }
 
 /// The newest row of `key` (comma-separated values, in key order) in upsert table `meta`, if it
-/// exists and isn't deleted. Table metadata first, then the log: one consistent snapshot.
+/// exists, isn't deleted and isn't past the table's TTL. Table metadata first, then the log: one consistent snapshot.
 pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Result<Option<RecordBatch>> {
     let types: HashMap<&str, &str> = meta.columns.iter().map(|(c, t)| (c.as_str(), t.as_str())).collect();
     let keys: Vec<(&str, ScalarValue)> = meta.key.iter().zip(key.split(',')).map(|(c, v)| {
@@ -49,7 +49,9 @@ pub async fn lookup(lake: &Lake, table: &str, meta: &TableMeta, key: &str) -> Re
     };
     // (a live row's `_deleted` is NULL, whose value bit is whatever the decoder left: check it's valid)
     let deleted = |r: &RecordBatch| r.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<BooleanArray>().map(|b| b.is_valid(0) && b.value(0)));
-    Ok(row.filter(|r| deleted(r) != Some(true)))
+    let Some(r) = row else { return Ok(None) };
+    let now = crate::log::now_us() as i64;
+    Ok((deleted(&r) != Some(true) && !meta.past_ttl(&r, now)?).then_some(r))
 }
 
 /// A SQL point query: exactly `SELECT <columns or *> FROM <upsert table> WHERE <key> = <value>
@@ -166,7 +168,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     cols.sort();
     let mut key: Vec<&String> = meta.key.iter().collect();
     key.sort();
-    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || meta.order.is_some() { // (renamed columns, event-time order: SQL answers it)
+    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || meta.order.is_some() || meta.ttl.is_some() { // (renamed columns, event-time order, a TTL: SQL answers it)
         return Ok(None);
     }
     let names: Vec<String> = match s.projection.as_slice() {
@@ -292,8 +294,9 @@ async fn newest_in_log(lake: &Lake, table: &str, meta: &TableMeta, keys: &[(&str
 }
 
 /// `lookup`, with the row's `_version` (the commit that wrote it) and `_created_at` (µs): what a
-/// transaction's change of one key needs (`txn::point_change`). None: no such row, or one from
-/// before rows had their system columns in files.
+/// transaction's change of one key needs (`txn::point_change`), and the 23505 check of a key (`constraints::held`). None: no
+/// such row, a deleted one, one past the TTL (gone, as a statement sees it), or one from before rows had their system columns
+/// in files.
 pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &[String]) -> Result<Option<(RecordBatch, u64, Option<i64>)>> {
     use datafusion::arrow::array::AsArray;
     use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit, TimestampMicrosecondType};
@@ -305,15 +308,16 @@ pub async fn lookup_versioned(lake: &Lake, table: &str, meta: &TableMeta, key: &
         Ok(Some(cast(c, &DataType::Timestamp(TimeUnit::Microsecond, None))?.as_primitive::<TimestampMicrosecondType>().value(0)))
     };
     let deleted = |r: &RecordBatch| r.column_by_name("_deleted").and_then(|c| c.as_any().downcast_ref::<BooleanArray>().map(|b| b.is_valid(0) && b.value(0))) == Some(true);
+    let now = crate::log::now_us() as i64;
     if let Some((r, n, ts)) = newest_in_log(lake, table, meta, &keys).await? {
         let at = created(&r)?.unwrap_or(ts as i64 * 1000); // (a new row's: its commit's time)
-        return Ok((!deleted(&r)).then_some((r, n, Some(at))));
+        return Ok((!deleted(&r) && !meta.past_ttl(&r, now)?).then_some((r, n, Some(at))));
     }
     let Some(r) = newest_in_files(lake, meta, &keys).await? else { return Ok(None) };
     let Some(v) = r.column_by_name(crate::text::VERSION).filter(|c| c.is_valid(0)).map(|c| cast(c, &DataType::Int64)).transpose()? else { return Ok(None) };
     let v = v.as_primitive::<Int64Type>().value(0) as u64;
     let at = created(&r)?;
-    Ok((!deleted(&r)).then_some((r, v, at)))
+    Ok((!deleted(&r) && !meta.past_ttl(&r, now)?).then_some((r, v, at)))
 }
 
 /// The files, newest first (each holds one row per key).

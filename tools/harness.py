@@ -6948,13 +6948,15 @@ def upserts():
     round, its older versions and delete markers positions (not only after a compaction); another
     engine's append to it is upserts, its delete (copy-on-write) delete markers, an equality delete
     on the key a marker too; each arrives in the change feed; a table that combines its rows
-    (`order_by`) refuses them by name."""
+    (`order_by`) refuses them by name. A table with a TTL hides a row past it from every statement,
+    as if deleted: a key read, an UPDATE or DELETE by key, an INSERT of the key (23505 is for a live
+    row only), ON CONFLICT and MERGE, in a transaction too, over Postgres, HTTP and a follower."""
     import duckdb, glob, site, pyarrow as pa, pyarrow.parquet as pq, polars as pl
     from pyiceberg.catalog import load_catalog
     from pyiceberg.manifest import ManifestWriterV2, ManifestContent, DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus, write_manifest_list
     from pyiceberg.typedef import Record
     lake = new_lake()
-    a = Node(lake, A.port, tier_secs=1, changelog_secs=600).start()
+    a = Node(lake, A.port, tier_secs=1, changelog_secs=600, pg=f"127.0.0.1:{A.port + 10}").start()
     b = Node(lake, A.port + 1, tier_secs=1).start()
     q = lambda s: sql(A.port, s)
     io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
@@ -7038,6 +7040,59 @@ def upserts():
     until(lambda: _try(lambda: cat.load_table("default.latest")) is not None, True, 30)
     refused = _raises_text(lambda: cat.load_table("default.latest").append(pa.table({"k": [1], "ts": [5], "v": ["old"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("ts", pa.int64()), pa.field("v", pa.string())]))))
     checks["a table that combines each key's rows (order_by) refuses another engine's change by name"] = "combines each key's rows" in refused or refused
+    # A TTL (`seen + INTERVAL '1 hour'`): a row past it is gone for every statement, as if deleted, and the key paths agree with SQL
+    # (a key read, an UPDATE or DELETE of one key, the 23505 check of an INSERT, ON CONFLICT and MERGE; in a transaction too).
+    import psycopg
+    pgc = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True)
+    def pg(s):  # a SELECT's rows, a change's row count, or the SQLSTATE of a refusal
+        try:
+            cur = pgc.execute(s)
+            return cur.fetchall() if cur.description else cur.rowcount
+        except psycopg.Error as e:
+            return e.sqlstate
+    old = "now() - INTERVAL '2 hours'"
+    q("CREATE TABLE seen_kv (k BIGINT PRIMARY KEY, seen TIMESTAMP, v VARCHAR) TTL seen + INTERVAL '1 hour'")
+    q("INSERT INTO seen_kv VALUES (2, now(), 'fresh'), " + ", ".join(f"({k}, {old}, 'old')" for k in range(1, 16) if k != 2))
+    live = lambda port=A.port: sorted(r["k"] for r in sql(port, "SELECT k FROM seen_kv"))
+    read = {"pg": pg("SELECT * FROM seen_kv WHERE k = 1"), "http": sql(A.port, "SELECT * FROM seen_kv WHERE k = 1"),
+            "fresh": sql(A.port, "SELECT * FROM seen_kv WHERE k = 2"), "all": live()}
+    checks["a TTL table: a key read of the row past the TTL gives no row (Postgres, HTTP), SELECT * leaves it out, a fresh key's read gives its row"] = \
+        (read["pg"], read["http"], [r["k"] for r in read["fresh"]], read["all"]) == ([], [], [2], [2]) or read
+    upd = (pg("UPDATE seen_kv SET v = 'x' WHERE k = 3"), sql(A.port, "UPDATE seen_kv SET v = 'x' WHERE k = 3")["rows"], pg("UPDATE seen_kv SET v = 'x' WHERE k = 2"))
+    pg("BEGIN")
+    txn_upd = pg("UPDATE seen_kv SET v = 'x' WHERE k = 4")
+    pg("COMMIT")
+    dele = pg("DELETE FROM seen_kv WHERE k = 5")
+    checks["an UPDATE or DELETE by an expired key counts 0 (Postgres, HTTP, in a transaction) and writes nothing, a fresh key's UPDATE counts 1"] = \
+        (upd[0], upd[1], txn_upd, dele, upd[2]) == (0, 0, 0, 0, 1) and live() == [2] and sql(A.port, "SELECT * FROM seen_kv WHERE k = 3") == [] or (upd, txn_upd, dele)
+    ins = {"pg": pg("INSERT INTO seen_kv VALUES (6, now(), 'new6')"), "http": sql(A.port, "INSERT INTO seen_kv VALUES (8, now(), 'h8')")["rows"]}
+    pg("BEGIN")
+    ins["txn"] = pg("INSERT INTO seen_kv VALUES (7, now(), 'txn7')")
+    ins["txn_commit"] = pg("COMMIT")
+    ins["dup"] = pg("INSERT INTO seen_kv VALUES (2, now(), 'again')")
+    checks["an INSERT of an expired key goes in as a new row (Postgres, HTTP, in a transaction); a key held by a fresh row is still refused (23505)"] = \
+        (ins["pg"], ins["http"], ins["txn"], ins["txn_commit"], ins["dup"]) == (1, 1, 1, -1, "23505") and pg("SELECT v FROM seen_kv WHERE k = 6") == [("new6",)] and \
+        sql(A.port, "SELECT v FROM seen_kv WHERE k = 7") == [{"v": "txn7"}] or (ins,)
+    ups = {"on_conflict": pg("INSERT INTO seen_kv VALUES (9, now(), 'up9') ON CONFLICT (k) DO UPDATE SET v = excluded.v"),
+           "returning": pg("INSERT INTO seen_kv VALUES (10, now(), 'r10') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v"),
+           "nothing": pg("INSERT INTO seen_kv VALUES (15, now(), 'n15') ON CONFLICT (k) DO NOTHING")}
+    merge = {"autocommit": pg("MERGE INTO seen_kv t USING (VALUES (11, now(), 'm11')) AS s(k, seen, v) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, seen, v) VALUES (s.k, s.seen, s.v)")}
+    pg("BEGIN")
+    merge["txn"] = pg("MERGE INTO seen_kv t USING (VALUES (12, now(), 'm12')) AS s(k, seen, v) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, seen, v) VALUES (s.k, s.seen, s.v)")
+    merge["txn_commit"] = pg("COMMIT")
+    pg("BEGIN")
+    ups["txn"] = pg("INSERT INTO seen_kv VALUES (13, now(), 'up13') ON CONFLICT (k) DO UPDATE SET v = excluded.v")
+    ups["txn_commit"] = pg("COMMIT")
+    pg("BEGIN")
+    txn_read = pg("SELECT * FROM seen_kv WHERE k = 14")
+    pg("COMMIT")
+    checks["ON CONFLICT and MERGE on an expired key insert its new row, in a transaction too (COMMIT checks it again), RETURNING answers the new row"] = \
+        (ups["on_conflict"], ups["returning"], ups["nothing"], merge["autocommit"], merge["txn"], merge["txn_commit"], ups["txn"], ups["txn_commit"], txn_read) == \
+        (1, [(10, "r10")], 1, 1, 1, -1, 1, -1, []) or (ups, merge, txn_read)
+    want = [2, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+    checks["after all of it, SELECT * holds exactly the fresh row and the new rows; the expired rows stay gone (Postgres, HTTP, a follower)"] = \
+        live() == want and until(lambda: live(A.port + 1), want, 30) == want and sql(A.port + 1, "SELECT * FROM seen_kv WHERE k = 1") == [] or (live(), live(A.port + 1))
+    pgc.close()
     [x.kill() for x in (a, b)]
     ok = all(v is True for v in checks.values())
     print(json.dumps({"upserts": checks, "ok": ok}, indent=1, default=str))
