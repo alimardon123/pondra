@@ -711,7 +711,7 @@ async fn through_inbox(dir: &str, query: &str, attached: &[String]) -> anyhow::R
     for spec in attached {
         node::attach(&lake, spec, "", false).await?;
     }
-    ddl::sync(&lake, "", false).await?;
+    ddl::sync(&lake, false).await?;
     // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then a write.
     let query = routines::expand(&lake, query).await?;
     let Some(stmt) = write::parse(&query) else {

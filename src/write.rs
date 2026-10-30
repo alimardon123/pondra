@@ -1631,7 +1631,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
                     None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
                 },
             };
-            crate::ddl::settle(lake, &d, app.members.me()).await?; // (ATTACH, DETACH: here at once)
+            crate::ddl::settle(lake, &d).await?; // (ATTACH, DETACH: here at once)
             if let Some(n) = out["notice"].as_str() {
                 crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, through this door)
             }

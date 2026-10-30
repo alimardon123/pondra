@@ -1102,9 +1102,8 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
         peers.clone()
     };
     let asked = nodes.iter().filter(|n| **n != app.members.me() && !known.contains_key(*n)).map(|n| async move {
-        let url = crate::tls::url(&format!("{n}/cluster/kafka"));
-        let answer = crate::cluster::http().get(url).timeout(Duration::from_millis(500)).send().await;
-        (n.clone(), match answer.and_then(|r| r.error_for_status()) {
+        let answer = crate::dial::call(n, crate::dial::Call::get("/cluster/kafka").timeout(Duration::from_millis(500))).await;
+        (n.clone(), match answer.and_then(crate::dial::Reply::checked) {
             Ok(r) => r.json::<Value>().await.ok(),
             Err(_) => None, // (not cached: asked again next time)
         })
@@ -1125,7 +1124,7 @@ async fn brokers(app: &App, me: &Broker) -> Vec<(i32, String, i32)> {
 }
 
 async fn leader_broker(app: &App) -> Result<(i32, String, i32)> {
-    let b: Value = crate::cluster::http().get(crate::tls::url(&format!("{}/cluster/kafka", app.members.leader().addr))).send().await?.error_for_status()?.json().await?;
+    let b: Value = crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/kafka")).await?.checked()?.json().await?;
     Ok((b["id"].as_i64().ok_or_else(|| anyhow!("the leader doesn't speak Kafka"))? as i32, b["host"].as_str().unwrap_or_default().into(), b["port"].as_i64().unwrap_or(-1) as i32))
 }
 

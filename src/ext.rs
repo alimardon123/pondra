@@ -759,6 +759,18 @@ pub fn web() -> &'static reqwest::Client {
     CLIENT.get_or_init(client)
 }
 
+/// A client with no token of its own, and no time limit. It is a second client only because it differs
+/// from `web()` in one thing, which is `web()`'s 60 s timeout: dbserver streams whole answers through it,
+/// and ai.rs sets its own timeout per request.
+pub fn bare() -> &'static reqwest::Client {
+    static BARE: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    #[cfg(not(target_arch = "wasm32"))]
+    let client = || reqwest::Client::builder().build().unwrap_or_default();
+    #[cfg(target_arch = "wasm32")]
+    let client = reqwest::Client::new; // (as `web()`: a page's fetch keeps the browser's own time limits)
+    BARE.get_or_init(client)
+}
+
 /// A recipient's token for a Delta Sharing server, from the secret of TYPE share covering it.
 pub async fn share_token(lake: &Lake, endpoint: &str) -> Result<Option<String>> {
     let all: Vec<(String, Secret)> = list(lake).await?.into_iter().filter(|(_, s)| s.kind == "share").collect();
