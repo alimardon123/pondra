@@ -4540,6 +4540,51 @@ def flight():
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
     checks.update(_flight_announced(client, opts))  # (list_flights' schema is the one its ticket streams)
+    # A script's answer is kept for its ticket and counts in the query memory while it is kept: the gauge rises by the answer's
+    # 5 MB at GetFlightInfo (no DoGet), and falls back once the ticket reads it.
+    gauge = lambda: metrics_of(port, headers={"authorization": "Bearer a"})["pondra_memory_reserved_bytes"]
+    kept_script = "SET x = 1; SELECT repeat('a', 1000) AS s FROM generate_series(1, 5000)"
+    def pb_varint(n):
+        out = bytearray()
+        while n > 0x7F:
+            out.append((n & 0x7F) | 0x80)
+            n >>= 7
+        return bytes(out + bytes([n]))
+    pb_ld = lambda num, data: pb_varint(num << 3 | 2) + pb_varint(len(data)) + data
+    # Flight SQL's CommandStatementQuery, packed in an Any, as ADBC sends it: the JSON command takes one statement only.
+    statement_cmd = pb_ld(1, b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery") + pb_ld(2, pb_ld(1, kept_script.encode()))
+    gauge_before = gauge()
+    kept_info = client.get_flight_info(fl.FlightDescriptor.for_command(statement_cmd), opts("r"))
+    kept_rise = gauge() - gauge_before
+    kept_rows = client.do_get(kept_info.endpoints[0].ticket, options=opts("r")).read_all()
+    kept_back = gauge() - gauge_before
+    checks["a script's answer counts in the query memory while kept (the gauge rises by its 5 MB at GetFlightInfo, with no DoGet), and falls back once its ticket reads it"] = \
+        kept_rise >= 5_000_000 and kept_rows.num_rows == 5000 and kept_back < 1 << 20
+    # A script's COMMIT is refused as SQL, with or without a transaction (no transaction: the first check).
+    def sqlstate_of(run):
+        try:
+            run()
+        except Exception as e:  # (ADBC's error carries the status's metadata, as via_flight reads it)
+            meta = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in (getattr(e, "details", None) or [])}
+            return meta.get("x-pondra-sqlstate") or "refused: " + str(e).splitlines()[0][:160]
+        return None
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=True)
+    plain_commit = sqlstate_of(lambda: conn.cursor().execute("SELECT 1; COMMIT"))
+    conn.close()
+    # Inside a transaction the protocol began, a transaction word run as SQL is refused too: in a script, a block, a procedure's
+    # COMMIT (CALL) and a savepoint. Each runs in its own transaction, since a refused statement fails the one it is in.
+    q("CREATE PROCEDURE commits() AS BEGIN INSERT INTO ev VALUES ('proc', 1, TIMESTAMP '2026-09-22 10:00:00'); COMMIT; END")
+    rows_before_txn = count()["n"]
+    txn_refused = {}
+    for name, stmt in [("script", "SELECT 1; COMMIT"), ("block", "BEGIN SELECT 1; COMMIT; END"), ("CALL", "CALL commits()"), ("savepoint", "BEGIN SAVEPOINT s; END")]:
+        conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=False)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ev VALUES ('txn', 1, TIMESTAMP '2026-09-22 10:00:00')")
+        txn_refused[name] = sqlstate_of(lambda: cur.execute(stmt))
+        conn.rollback()
+        conn.close()
+    checks["a transaction word run as SQL is refused over Flight SQL (0A000): a script's COMMIT, a block's, a CALL's and a savepoint's, in a transaction the protocol began, and the rows of those transactions are rolled back, not committed"] = \
+        plain_commit == "0A000" and all(v == "0A000" for v in txn_refused.values()) and count()["n"] == rows_before_txn
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
@@ -4567,7 +4612,7 @@ def flight():
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
-    print(json.dumps({"flight": checks, "follow_ms": follow_ms, "ok": ok}, indent=1))
+    print(json.dumps({"flight": checks, "follow_ms": follow_ms, "kept_gauge": {"before": gauge_before, "at_getflightinfo": gauge_before + kept_rise, "after_doget": gauge_before + kept_back}, "ok": ok}, indent=1))
     if not ok:
         print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total)
         sys.exit(1)

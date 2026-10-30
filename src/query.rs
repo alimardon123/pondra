@@ -12,7 +12,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
 use datafusion::common::utils::memory::RecordBatchMemoryCounter;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
@@ -1019,8 +1019,17 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
     Ok(out)
 }
 
+/// The memory an answer kept for a ticket to read back holds in `pool` (Flight's `kept`): its batches counted as `gather`
+/// counts them, each buffer once. None when it doesn't fit: the caller refuses it with `too_big`, and keeps nothing.
+pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Option<MemoryReservation> {
+    let held = MemoryConsumer::new("a Flight answer kept for its ticket").register(pool);
+    let mut counted = RecordBatchMemoryCounter::new();
+    batches.iter().try_for_each(|b| held.try_grow(counted.count_batch(b))).ok()?;
+    Some(held)
+}
+
 /// The refusal of an answer bigger than the query memory (53200), with the way out.
-fn too_big() -> anyhow::Error {
+pub(crate) fn too_big() -> anyhow::Error {
     crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
 }
 
