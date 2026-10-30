@@ -294,7 +294,8 @@ def external():
     tier = os.path.join(here, "tier")
     node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here, **({"cache_dir": tier} if A.s3 else {})).start()
     # A node on the same lake that no program started for itself: a non-owner's requests go to it.
-    other = Node(lake, A.port + 2, env={"PONDRA_OWNER_KEY": ""}, cwd=here, **({"cache_dir": tier + "3"} if A.s3 else {})).start()
+    other = Node(lake, A.port + 2, env={"PONDRA_OWNER_KEY": ""}, cwd=here, pg=f"127.0.0.1:{A.port + 12}", flight=f"127.0.0.1:{A.port + 32}",
+                 **({"cache_dir": tier + "3"} if A.s3 else {})).start()
     hdr = {"x-pondra-owner": owner}  # (the node answers only its program: its requests carry this)
     def q(s):
         return call(A.port, "POST", "/sql", s.encode(), headers=hdr)
@@ -429,6 +430,23 @@ def external():
     checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too (the same file for the node's own program); a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
         and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words \
         and their_table == mine == owners_table and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
+    # The same LOCATION through the other doors a client writes by (the 10-30 audit's H2): each stores it whole, as the
+    # lake's file, so the node's own program reads that file's rows from each table, not a file in its folder.
+    import psycopg, adbc_driver_flightsql.dbapi as adbc
+    made = "CREATE EXTERNAL TABLE {} (a BIGINT, b VARCHAR) STORED AS CSV LOCATION 'reports/q1.csv' OPTIONS ('format.has_header' 'true')"
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 12} user=pondra dbname=pondra", autocommit=True) as c:
+        c.execute(made.format("q1_pg"))
+    flight = adbc.connect(f"grpc://127.0.0.1:{A.port + 32}", autocommit=True)
+    fcur = flight.cursor(); fcur.execute(made.format("q1_flight")); fcur.close(); flight.close()
+    def read(name):
+        try:
+            return q(f"SELECT * FROM {name}")
+        except Exception as e:
+            return str(e)  # (stored as written: the program reads a file of that name in its own folder, which has none)
+    by_door = {d: read(f"q1_{d}") for d in ("pg", "flight")}
+    [anyone(f"DROP TABLE q1_{d}") for d in by_door]
+    checks["a relative LOCATION sent through Postgres and Flight SQL is the lake's file too: the node's own program reads its rows from each"] = \
+        all(rows == mine for rows in by_door.values())
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]

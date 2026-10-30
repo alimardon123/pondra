@@ -231,7 +231,9 @@ impl Drop for Stopped<'_> {
 fn refusal(m: &str) -> bool { ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)) }
 
 /// Run one statement a door was sent, within its user's quota (`users::Quota`), writing what
-/// came of it when its class is written (and a refusal always).
+/// came of it when its class is written (and a refusal always). The lake it was sent to is in
+/// scope while it runs (`ext::rooted`): every door's statement passes here, so each stores a
+/// client's relative LOCATION as the same file of the lake's.
 pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
     if INSIDE.try_with(|_| ()).is_ok() {
         return f.await;
@@ -241,7 +243,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
     let mut stopped = Stopped(Some((app, class, sql, start)));
-    let (out, note) = crate::history::noted(INSIDE.scope((), async {
+    let (out, note) = crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         let flag = Arc::new(AtomicBool::new(false)); // (set if the work is dropped first: a timeout drops it, inside the timeout)
         match quota.timeout {
@@ -251,7 +253,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
             }))),
             None => stoppable(flag, f).await,
         }
-    }))
+    })))
     .await;
     stopped.0 = None;
     let took = start.elapsed();
