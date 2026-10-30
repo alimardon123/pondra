@@ -23140,10 +23140,11 @@ def ef_when(s):
     return datetime.fromisoformat(s)
 
 
-def ef_watch(port, name, after=0, secs=0.5, partial=False):
+def ef_watch(port, name, after=0, secs=0.5, partial=False, marks=None):
     """The rows of a hidden table (`{v}$held`, `{v}$resume`) as the node streams them, in the order each version was
     written. A table with no rows after `after` answers nothing, so the wait of `secs` is its empty answer. With `partial`, the
-    rows read before a timeout are returned, for a poll that looks for one row."""
+    rows read before a timeout are returned, for a poll that looks for one row. `marks`, when given, gets the version the
+    rows were read up to (the `_after` line), to read on from."""
     import socket
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=secs)
     out = []
@@ -23155,6 +23156,8 @@ def ef_watch(port, name, after=0, secs=0.5, partial=False):
         while (line := r.readline()):
             row = json.loads(line)
             if "_after" in row:
+                if marks is not None:
+                    marks.append(row["_after"])
                 break
             out.append(row)
     except socket.timeout:
@@ -23165,15 +23168,28 @@ def ef_watch(port, name, after=0, secs=0.5, partial=False):
     return out
 
 
-def ef_state(port, view, keys, secs=0.5):
+EF_SEEN = {}  # (port, hidden table): the version ef_since last read it up to, and its rows by key then
+
+
+def ef_since(port, name, key_of, secs=1):
+    """A hidden table's rows now, each key's last version, as `port` serves them. A read asks only for the versions
+    since the last one's mark and adds them to what was read before: a replay from 0 reads the lake's whole log, which
+    took 8 to 20 s a table by the tenth commit, past any short wait. No new version by `secs` leaves the rows as they
+    were (a slow answer is read again by the next pass). A section clears EF_SEEN when it starts a lake."""
+    mark, rows = EF_SEEN.get((port, name), (0, {}))
+    got = []
+    for r in ef_watch(port, name, after=mark, secs=secs, marks=got):
+        rows[key_of(r)] = r
+    EF_SEEN[(port, name)] = (got[-1] if got else mark, rows)
+    return rows
+
+
+def ef_state(port, view, keys, secs=1):
     """A view's state in the lake: each key's k (`{v}$resume`), and each key's held rows as (time, row id), in order
     (`{v}$held`). Each row's last version wins, and a deleted one is gone."""
-    resume = {}
-    for r in ef_watch(port, f"{view}$resume", secs=secs):
-        resume[tuple(r[c] for c in keys)] = None if r.get("_deleted") else r["k"]
-    last = {}
-    for r in ef_watch(port, f"{view}$held", secs=secs):
-        last[r["__mr_row"]] = None if r.get("_deleted") else r
+    resume = {k: None if r.get("_deleted") else r["k"]
+              for k, r in ef_since(port, f"{view}$resume", lambda r: tuple(r[c] for c in keys), secs).items()}
+    last = {i: None if r.get("_deleted") else r for i, r in ef_since(port, f"{view}$held", lambda r: r["__mr_row"], secs).items()}
     held = {}
     for r in last.values():
         if r is not None:
@@ -23242,12 +23258,14 @@ def ef_pass(port, views, view_ports=None, tabs=None):
     """Each view, once, against the lake as it is now: its rows, read through each of `view_ports` (the state through
     `port`), equal the expected rows as multisets, and its MATCH_NUMBER()s run 1 to n with no gap per key. Returns
     {name: {ok, gaps, want, got, missing, extra}}, with at most three examples of a miss. `tabs` caches the source
-    tables and the plain queries, which do not change while one settle runs."""
+    tables and the plain queries, which do not change while one settle runs. The views are read eight at a time: a state
+    table with no new version answers only when ef_since's wait ends."""
     import patterns_check as pc
     from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
     tabs = {} if tabs is None else tabs
-    out = {}
-    for v in views:
+
+    def one(v):
         t0 = time.time()
         want, held, resume = ef_expect(port, v, tabs)
         wc = Counter(pc.canon(r) for r in want)
@@ -23263,13 +23281,14 @@ def ef_pass(port, views, view_ports=None, tabs=None):
                 res["got"], res["gaps"] = len(got), mn_gaps(got, v["keys"])
         res["ok"] = res["ok"] and res["gaps"] == 0
         res["secs"] = round(time.time() - t0, 2)
-        out[v["name"]] = res
-    return out
+        return v["name"], res
+    with ThreadPoolExecutor(8) as pool:
+        return dict(pool.map(one, views))
 
 
-def ef_settle(port, views, view_ports=None, secs=60, quiet=5):
-    """Each view checked after a commit. The node is left alone for `quiet` seconds (no reads: reads made while the views
-    emit were seen to stall them, see the report), then one pass reads every view's rows and state. A view still wrong
+def ef_settle(port, views, view_ports=None, secs=60, quiet=1):
+    """Each view checked after a commit. The node is left alone for `quiet` seconds, then one pass reads every view's rows
+    and state (the state's new versions only: ef_since). A view still wrong
     gets another quiet wait and pass, until all are right or `secs` have passed: then the last pass, and the views
     still wrong go to stderr. The source does not change during one settle, so its tables and plain queries are read once."""
     t0, deadline, passes, tabs = time.time(), time.time() + secs, 0, {}
@@ -23309,6 +23328,7 @@ def matches_random():
     from datetime import datetime, timedelta
     checks, info = {}, {}
     lake = new_lake()
+    EF_SEEN.clear()
     port = A.port
     node = Node(lake, port, tier_secs=1).start()
     q = lambda s: sql(port, s)
@@ -23443,6 +23463,7 @@ def matches_restart():
     from collections import Counter
     checks, info = {}, {}
     lake = new_lake()
+    EF_SEEN.clear()
     port = A.port
     node = Node(lake, port, tier_secs=1).start()
     q = lambda s: sql(port, s)
@@ -23515,6 +23536,7 @@ def matches_restart():
 
     # three nodes on one lake: the same commits, each written through a node in turn
     lake3 = new_lake()
+    EF_SEEN.clear()
     ports3 = [port + 1 + i for i in range(3)]
     nodes3 = [Node(lake3, p, tier_secs=1).start() for p in ports3]
     q3 = lambda s: sql(ports3[0], s)
@@ -23560,6 +23582,7 @@ def matches_cost(sizes=(10_000, 100_000, 1_000_000), samples=3, keys_small=10, k
     Returns (checks, info)."""
     checks, info = {}, {}
     lake = new_lake()
+    EF_SEEN.clear()
     port = A.port
     node = Node(lake, port, tier_secs=1).start()
     q = lambda s: sql(port, s)
@@ -23584,7 +23607,7 @@ def matches_cost(sizes=(10_000, 100_000, 1_000_000), samples=3, keys_small=10, k
               "FIRST(day) AS s ONE ROW PER MATCH PATTERN (strt up+) DEFINE up AS up.price > PREV(up.price)) EMIT FINAL")
     cases = [("hist2", "hist_zig", "100 + 10 * (value % 2)", "decided history, one search open at the tail", sizes, samples, True),
              ("hist", "hist_open", "value", "open from its first row, rising prices (measured, not checked; the 1,000,000 "
-              "step is left out: its run alone is minutes)", sizes[:2], 1, False)]
+              "step is left out, as the open rows are all read again each run: 100,000 take about 1 s)", sizes[:2], 1, False)]
     results = {}
     for table, view, price, what, case_sizes, runs_per_size, checked in cases:
         q(f"CREATE TABLE {table} (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
@@ -24050,7 +24073,9 @@ def matches():
     row came before the watermark reached it (lateness 30 s), is written once the other symbol's rows move the watermark
     past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
-    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source."""
+    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source. 5, 7 and 8
+    (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
+    ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
     start = {"at": time.time(), "start": time.time()}  # (the seconds of each part, in info: `lap`)
 
@@ -24272,14 +24297,20 @@ def matches():
     refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
             f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", [], code=None)
     lap("9, the refusals")
-    info["secs: all of the section"] = round(time.time() - start["start"], 1)
-
     node.kill()
+
+    # 5, 7 and 8: every skip rule and the generator's queries, a restart and three nodes, and a run's cost (each its own lake)
+    for part, run in (("5, every skip rule", matches_random), ("7, a restart and three nodes", matches_restart), ("8, the cost", matches_cost)):
+        part_checks, info[part] = run()
+        checks.update(part_checks)
+        lap(part)
+    info["secs: all of the section"] = round(time.time() - start["start"], 1)
     ok = all(checks.values())
     print(json.dumps({"matches": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:
         sys.exit(1)
-    return f"matches: the ticker as a stream (20 commits, 1,000 symbols), late rows, a quiet key, WITHIN, PATTERN (a b) and the refusals: all {len(checks)} checks pass"
+    return (f"matches: the ticker as a stream (20 commits, 1,000 symbols), late rows, a quiet key, WITHIN, PATTERN (a b), the refusals, "
+            f"every skip rule, a restart, three nodes and the cost: all {len(checks)} checks pass")
 
 
 def patterns_emit_final():
@@ -25981,7 +26012,7 @@ def memorylake():
 # first, 40 in the second and since). `--shard K/N` deals the sections out by it, so CI runs the suite in parts side
 # by side that end together. A section not listed counts as 5 s. (Dealt by the first run's table, the second's five
 # parts took 271 to 469 s, the last of them the run's last job; by this one, 402 to 421 s.)
-SECS = {"memory": 240, "patterns": 170, "matches": 24, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
+SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
         "stopped": 82, "guesses": 45, "doors": 40, "crash": 38, "functions": 37, "backpressure": 35, "served": 33,
         "server": 30, "kafkas": 29, "finals": 28, "kafka": 28, "pace": 25, "found": 24, "tails": 20, "load": 20,
         "objects": 18, "live": 17, "refreshed": 15, "clouds": 15, "answers_big": 14, "users": 14, "workspace": 14,
