@@ -132,9 +132,9 @@ until curl -sf localhost:8080/ready; do sleep 1; done
 ```
 
 ### Backups
-`BACKUP DATABASE TO 'place'` copies the whole database to another folder or bucket as of one moment, and run again copies only what changed; `RESTORE DATABASE` brings back any run it kept. [Backups](/pondra/guides/backups/)
+`BACKUP DATABASE TO 'place'` copies the whole database to another bucket, or a folder from the `pondra` shell or `pondra sql` (the node's owner), as of one moment, and run again copies only what changed; `RESTORE DATABASE` brings back any run it kept. [Backups](/pondra/guides/backups/)
 
-```sql
+```sql owner
 CREATE TABLE pantry (item VARCHAR, qty INT);
 INSERT INTO pantry VALUES ('tea', 12);
 BACKUP DATABASE TO 'backups/features';
