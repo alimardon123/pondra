@@ -477,6 +477,13 @@ impl Page {
     /// door's: the same body, status and content type, with `x-pondra-session` and `x-pondra-notices` as HTTP adds them.
     #[cfg(feature = "lake")]
     async fn lake_sql(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
+        self.lake_said(query, headers, body).await
+    }
+
+    /// One `/sql` request on the page's member, as `lake_sql` answers it: the page's own requests (a kept page's import, the
+    /// rows it sends its node) go through it too, so each is the core's statement path.
+    #[cfg(feature = "lake")]
+    async fn lake_said(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
         let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
         // (the query read as the HTTP door's `Query` reads it: decoded, and a number that doesn't parse refused 400)
         let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
