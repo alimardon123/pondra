@@ -1981,7 +1981,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
-   `write::by_inbox`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   which an inbox guest's statements pass before `write::by_inbox`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
    to anything a project's last finished apply declared (`apply::declared`), unless
    `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
