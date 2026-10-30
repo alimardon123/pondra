@@ -16,8 +16,8 @@
 //!
 //! Bytes are `BINARY` columns: `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`
 //! and `substr` (`engine.rs`: DataFusion's own takes only text) work on them.
-use crate::lake_files::under_files;
-use crate::store::Lake;
+use crate::lake_files::{self, under_files, Filed};
+use crate::store::{Changed, Lake};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{MemTable, Session, TableFunctionImpl, TableProvider};
@@ -150,6 +150,90 @@ impl AsyncScalarUDFImpl for FileRead {
             out.append_option(b);
         }
         Ok(ColumnarValue::Array(Arc::new(out.finish())))
+    }
+}
+
+// ---------------------------------------------------------------- the four `/files` requests (ADR-061's contract)
+
+/// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model, a SQL
+/// file — for `files('…')` to list and `file_read(path)` to read. A path that exists is refused (409),
+/// unless `if_match` names the version `GET` gave: then it is replaced, if nobody replaced it meanwhile
+/// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). Both doors call it.
+pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes) -> anyhow::Result<Filed> {
+    let (path, bytes) = (under_files(path)?, body.len());
+    let expect = if_match.map(|v| v.trim_matches('"').to_string());
+    let done = match &expect {
+        Some(v) => lake.replace(&path, body.to_vec(), v).await,
+        None => match lake.put(&path, body.to_vec()).await {
+            Ok(()) => lake.version(&path).await,
+            Err(e) => Err(e),
+        },
+    };
+    match done {
+        Ok(version) => {
+            if let Err(e) = keep(lake, &path, &body).await {
+                eprintln!("{path}: saved, but not kept as a version: {e:#}");
+            }
+            Ok(Filed::json(serde_json::json!({"path": path, "bytes": bytes, "version": version})))
+        }
+        Err(e) if e.is::<Changed>() => Ok(Filed::text(412, lake_files::changed(&path))),
+        Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") => Ok(Filed::text(409, lake_files::there_already(&path))),
+        Err(e) => Err(e),
+    }
+}
+
+/// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content type by its
+/// name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes. Both doors call it.
+pub async fn get(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    if q.contains_key("versions") {
+        let all = versions(lake, &path).await?;
+        return Ok(Filed::json(serde_json::Value::Array(all.iter().map(|v| serde_json::json!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect())));
+    }
+    let found = match q.get("version") {
+        Some(id) => match version(lake, &path, id).await {
+            Ok(b) => Ok((b, id.clone())),
+            Err(e) => return Ok(Filed::text(404, crate::ext::said(&e))), // (not one of its versions, or gone)
+        },
+        None => lake.file(&path).await,
+    };
+    let (body, tag) = match found {
+        Ok(found) => found,
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            return Ok(Filed::text(404, lake_files::not_found(&path)));
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Filed { status: 200, content_type: lake_files::content_type(&path), etag: Some(tag), body })
+}
+
+/// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest). Without
+/// `restore` it is refused by name. Both doors call it.
+pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    let id = q.get("restore").ok_or_else(|| anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)"))?;
+    let bytes = version(lake, &path, id).await?;
+    let now = match lake.version(&path).await {
+        Ok(now) => lake.replace(&path, bytes.to_vec(), &now).await?,
+        Err(_) => {
+            lake.put(&path, bytes.to_vec()).await?; // (deleted since: back again)
+            lake.version(&path).await?
+        }
+    };
+    keep(lake, &path, &bytes).await?;
+    Ok(Filed::json(serde_json::json!({"path": path, "version": now, "restored": id})))
+}
+
+/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at:
+/// 404. Both doors call it.
+pub async fn remove(lake: &Lake, path: &str) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    match lake.remove_file(&path).await {
+        Ok(()) => Ok(Filed::json(serde_json::json!({"removed": path}))),
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            Ok(Filed::text(404, lake_files::not_found(&path)))
+        }
+        Err(e) => Err(e),
     }
 }
 

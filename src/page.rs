@@ -256,6 +256,24 @@ fn refused(status: u16, words: String) -> Answer {
     Answer { status, headers: vec![("content-type", TEXT.to_string())], body: words.into() }
 }
 
+/// A `files` answer (`lake_files::Filed`) as the page's answer: the node's status and content type, and when it is a
+/// file's bytes, its `etag` (quoted) and `cache-control: no-store`, as the node's HTTP sends them.
+#[cfg(feature = "lake")]
+fn filed_answer(f: crate::lake_files::Filed) -> Answer {
+    let mut headers = vec![("content-type", f.content_type.to_string())];
+    if let Some(version) = f.etag {
+        headers.push(("etag", quoted(&version)));
+        headers.push(("cache-control", "no-store".to_string()));
+    }
+    Answer { status: f.status, headers, body: f.body }
+}
+
+/// The principal a page's member runs its requests as: this process's admin, as the page's own door (`lake_sql`, `lake_files`).
+#[cfg(feature = "lake")]
+fn lake_principal() -> crate::auth::Principal {
+    crate::auth::Principal::token(crate::auth::Role::Admin).at("page", None)
+}
+
 /// An answer `statement::sql` handed in pieces (`Rendered::Pieces`), as one body: its first piece, then each piece the rest
 /// sends, in order. A piece that fails, or a channel that closes before the answer's end, fails the answer.
 #[cfg(feature = "lake")]
@@ -416,6 +434,8 @@ impl Page {
             ("GET", "/ready") => return Answer::ok(TEXT, "ready"),
             #[cfg(feature = "lake")]
             ("POST", "/sql") if self.paged.is_some() => return self.lake_sql(query, headers, body).await,
+            #[cfg(feature = "lake")]
+            ("PUT" | "GET" | "DELETE" | "POST", _) if self.paged.is_some() && route.starts_with(FILES) => return self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
             ("POST", "/sql") => match std::str::from_utf8(&body) {
                 Ok(text) => self.sql(text, param(query, "format")).await,
                 Err(e) => Err(crate::codes::coded("22P02", format!("the request's body can't be read: {e}"))),
@@ -457,7 +477,7 @@ impl Page {
                 map.append(name, value);
             }
         }
-        let who = crate::auth::Principal::token(crate::auth::Role::Admin).at("page", None);
+        let who = lake_principal();
         let format = p.format.clone();
         let said = crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body))).await;
         let content = crate::answer::content_type(format.as_deref());
@@ -479,6 +499,29 @@ impl Page {
             answer = answer.with("x-pondra-notices", notices);
         }
         answer
+    }
+
+    /// `PUT`, `GET`, `DELETE` and `POST` `/files/{path}` on the page's member (`open_lake`): the node's four requests as
+    /// `files.rs` answers them on the core's lake (`files::put`, `get`, `restore`, `remove`), run as the owner, so SQL on
+    /// the lake reads a file the page was given. Its answer has the node's status and headers (`filed_answer`).
+    #[cfg(feature = "lake")]
+    async fn lake_files(&self, method: &str, name: &str, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
+        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let if_match = request_header(headers, "if-match");
+        let lake = &paged.app.lake;
+        let done = crate::auth::WHO.scope(lake_principal(), Box::pin(async move {
+            match method {
+                "PUT" => crate::files::put(lake, name, if_match, body).await,
+                "GET" => crate::files::get(lake, name, &q).await,
+                "POST" => crate::files::restore(lake, name, &q).await,
+                _ => crate::files::remove(lake, name).await, // (DELETE)
+            }
+        })).await;
+        match done {
+            Ok(f) => filed_answer(f),
+            Err(e) => failed(e),
+        }
     }
 
     /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`planned`), then the

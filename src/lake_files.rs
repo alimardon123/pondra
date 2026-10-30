@@ -76,6 +76,27 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// What a `/files` request answers on any door (the node's HTTP, a page): its status, its content type, the file's
+/// version when the answer is the file's bytes (sent as `etag`, quoted, with `cache-control: no-store`), and its body.
+pub struct Filed {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub etag: Option<String>,
+    pub body: bytes::Bytes,
+}
+
+impl Filed {
+    /// An answer of 200 with `v` as its JSON body.
+    pub fn json(v: serde_json::Value) -> Filed {
+        Filed { status: 200, content_type: "application/json", etag: None, body: serde_json::to_vec(&v).unwrap_or_default().into() }
+    }
+
+    /// An answer of `status` with `words` as its plain-text body (as axum sends a `(StatusCode, String)`).
+    pub fn text(status: u16, words: String) -> Filed {
+        Filed { status, content_type: "text/plain; charset=utf-8", etag: None, body: words.into() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::under_files;
