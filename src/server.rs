@@ -89,7 +89,7 @@ pub fn router(app: App) -> Router {
                 None => crate::apply::export_here(&app.lake).await?,
             }))
         }))
-        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
+        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))

@@ -87,6 +87,10 @@ pub struct Options {
     /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
     /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
+    /// The store a page's member on the core's lake keeps its lake in (`open_lake`): a browser gives its private folder (OPFS), so
+    /// the page's tables are there again after a reload. None: memory. (Until P3's switch, `store` is the page's own engine's.)
+    #[cfg(feature = "lake")]
+    pub lake_store: Option<crate::store::Store>,
 }
 
 /// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
@@ -134,7 +138,16 @@ pub struct Sent {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { partitions: 1, store: None, web: None, node: None, memory: None, line: None }
+        Options {
+            partitions: 1,
+            store: None,
+            web: None,
+            node: None,
+            memory: None,
+            line: None,
+            #[cfg(feature = "lake")]
+            lake_store: None,
+        }
     }
 }
 
@@ -357,7 +370,7 @@ impl Page {
     #[cfg(feature = "lake")]
     pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
         let mut page = Page::open(options);
-        page.paged = Some(crate::node::open_page(options.line).await?);
+        page.paged = Some(crate::node::open_page(options.lake_store.clone(), options.line).await?);
         Ok(page)
     }
 
@@ -436,6 +449,8 @@ impl Page {
             ("POST", "/sql") if self.paged.is_some() => return self.lake_sql(query, headers, body).await,
             #[cfg(feature = "lake")]
             ("PUT" | "GET" | "DELETE" | "POST", _) if self.paged.is_some() && route.starts_with(FILES) => return self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
+            #[cfg(feature = "lake")]
+            ("GET", "/objects") if self.paged.is_some() => return self.lake_objects().await,
             ("POST", "/sql") => match std::str::from_utf8(&body) {
                 Ok(text) => self.sql(text, param(query, "format")).await,
                 Err(e) => Err(crate::codes::coded("22P02", format!("the request's body can't be read: {e}"))),
@@ -520,6 +535,21 @@ impl Page {
         })).await;
         match done {
             Ok(f) => filed_answer(f),
+            Err(e) => failed(e),
+        }
+    }
+
+    /// `GET /objects` on the page's member (`open_lake`): the lake's listing as the HTTP door answers it (`objects::listed`),
+    /// run as the owner, as `lake_files` runs its requests. Its answer is JSON, or the listing's error.
+    #[cfg(feature = "lake")]
+    async fn lake_objects(&self) -> Answer {
+        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let listed = crate::auth::WHO.scope(lake_principal(), Box::pin(crate::objects::listed(&paged.app.lake))).await;
+        match listed {
+            Ok(v) => match serde_json::to_vec(&v) {
+                Ok(b) => Answer::ok(JSON, b),
+                Err(e) => failed(e.into()),
+            },
             Err(e) => failed(e),
         }
     }
