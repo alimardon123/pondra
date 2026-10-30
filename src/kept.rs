@@ -3,6 +3,16 @@
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
+//! The names kept free for later (`CREATE TABLE … USING x`, `VECTOR(n)`) are refused here too, by name, and only a
+//! statement that spells one of them is tokenised.
+
+use crate::text::contains_ci;
+use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+
+/// What a table's `USING x` says, where a table is made; `{}` is the format named.
+const USING: &str = "CREATE TABLE … USING {}: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)";
+/// What a `VECTOR(n)` type says: a vector is FLOAT[] until vector indexes come.
+const VECTOR: &str = "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then";
 
 /// What a pipeline's statements say; `{}` is the statement's words.
 const PIPELINE: &str = "{}: pipelines come in 1.1; until then, tasks that follow others run statements in order (CREATE TASK … AFTER …)";
@@ -54,6 +64,9 @@ pub fn refusal(sql: &str) -> Option<String> {
         let next = crate::text::first_words(sql, 2).into_iter().nth(1);
         return pipeline_part(&first, next.as_deref()).map(str::to_string); // (a page has no scripts: it reads these here)
     }
+    if let Some(why) = type_kept(sql, &first) {
+        return Some(why);
+    }
     if !HEADS.contains(&first.as_str()) {
         return None;
     }
@@ -65,6 +78,48 @@ pub fn refusal(sql: &str) -> Option<String> {
         None => grant_on(&words).or_else(|| execute_pipeline(&words)),
     }
 }
+
+/// The names kept free for later, refused where a statement spells one: `VECTOR(n)` anywhere (a column's or a cast's type),
+/// and `CREATE TABLE … USING x` (`head` is the statement's first word). Read from the tokens, so a string or a join's
+/// `USING (id)` is not one. A statement that spells neither, the common case, is not tokenised.
+fn type_kept(sql: &str, head: &str) -> Option<String> {
+    let vector = contains_ci(sql, "vector");
+    let using = head == "create" && contains_ci(sql, "using");
+    if !vector && !using {
+        return None;
+    }
+    let tokens: Vec<Token> = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    if let Some(format) = table_using(&tokens) {
+        return Some(USING.replace("{}", &format));
+    }
+    let vector_type = tokens.windows(2).any(|w| is_word(&w[0], "vector") && matches!(w[1], Token::LParen));
+    vector_type.then(|| VECTOR.to_string())
+}
+
+/// The format a `CREATE TABLE … USING x` names (`x`): a USING in the table's header, which ends at an AS, a SELECT or a VALUES
+/// outside the columns' parentheses. A join's `USING (id)` after that is another statement's, and None.
+fn table_using(tokens: &[Token]) -> Option<String> {
+    let (mut depth, mut table) = (0, false);
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ if depth > 0 => {}
+            _ if is_word(t, "table") => table = true,
+            _ if is_word(t, "as") || is_word(t, "select") || is_word(t, "values") => return None,
+            _ if is_word(t, "using") && table => {
+                if let Some(Token::Word(format)) = tokens.get(i + 1) {
+                    return Some(format.value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Is `t` the unquoted word `name`, in any case.
+fn is_word(t: &Token, name: &str) -> bool { matches!(t, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(name)) }
 
 /// A name: a word that starts with a letter, `_` or `"`, and is not `TO` or `FROM` (what a grant says after its object).
 fn is_name(word: &str) -> bool {
@@ -167,6 +222,32 @@ mod tests {
             "WAIT 5",
         ] {
             assert!(refusal(sql).is_none(), "{sql}");
+        }
+    }
+
+    /// `CREATE TABLE … USING x` names the format a table is kept in, and `VECTOR(n)` a column's or a cast's type: both
+    /// refused by name, with the words that say when they come.
+    #[test]
+    fn names_the_types_kept_free() {
+        let using = "CREATE TABLE … USING delta: tables kept in another format come with extensions (1.2)";
+        assert!(refusal("CREATE TABLE t (id INT, name VARCHAR) USING delta").unwrap().starts_with(using));
+        assert!(refusal("create or replace table if not exists t (a int) using Lance").unwrap().starts_with("CREATE TABLE … USING Lance: tables kept"));
+        assert!(refusal("CREATE TABLE t USING parquet AS SELECT 1 AS a").unwrap().starts_with("CREATE TABLE … USING parquet: tables kept"));
+        assert!(refusal("CREATE TABLE t (a INT) USING delta").unwrap().ends_with("published as Delta or Iceberg with WITH (publish = …)"));
+        let vector = "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then";
+        assert_eq!(refusal("CREATE TABLE t (id INT, v VECTOR(3))").as_deref(), Some(vector));
+        assert_eq!(refusal("ALTER TABLE t ADD COLUMN v VECTOR(3)").as_deref(), Some(vector));
+        assert_eq!(refusal("SELECT CAST(x AS VECTOR(FLOAT, 3)) FROM t").as_deref(), Some(vector));
+        for sql in [
+            "CREATE TABLE t AS SELECT * FROM a JOIN b USING (id)",
+            "CREATE TABLE t (a INT) WITH (publish = 'delta')",
+            "SELECT * FROM a JOIN b USING (id)",
+            "SELECT 'VECTOR(3)' AS s",
+            "SELECT vector FROM t",
+            "CREATE INDEX i ON t USING hnsw (v)",
+        ] {
+            let refused = refusal(sql);
+            assert!(refused.as_deref().is_none_or(|w| !w.contains("1.2") && !w.contains("ADR-051")), "{sql}: {refused:?}");
         }
     }
 }

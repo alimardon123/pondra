@@ -329,6 +329,26 @@ def external():
     open(os.path.join(here, "j.json"), "w").write('{"a": 1, "b": "x", "extra": true}\n{"a": 2, "b": "y"}\n')
     q(f"COPY (SELECT 1 AS id, 'a' AS name, 10 AS n) TO '{here}/dir/one.parquet'")
     q(f"COPY (SELECT 2 AS id, 'b' AS name, 20 AS n) TO '{here}/dir/two.parquet'")
+    # Compressed CSV and JSON, as the same rows as the plain files: gzip, bzip2 and xz from Python's standard library, zstd when
+    # the zstandard package is there (tools/requirements.txt doesn't pin it: the zstd cases are skipped without it).
+    import gzip, bz2, lzma
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    packs = {"gz": gzip.compress, "bz2": bz2.compress, "xz": lambda b: lzma.compress(b, format=lzma.FORMAT_XZ)}
+    if zstandard is not None:
+        packs["zst"] = zstandard.ZstdCompressor().compress
+    csv_text, json_text = open(os.path.join(here, "a.csv"), "rb").read(), open(os.path.join(here, "j.json"), "rb").read()
+    for end, pack in packs.items():
+        open(os.path.join(here, f"a.csv.{end}"), "wb").write(pack(csv_text))
+        open(os.path.join(here, f"j.json.{end}"), "wb").write(pack(json_text))
+        open(os.path.join(here, f"j.jsonl.{end}"), "wb").write(pack(json_text))
+    os.makedirs(os.path.join(here, "cdir"))
+    for name in ("one.csv.gz", "two.csv.gz"):
+        open(os.path.join(here, "cdir", name), "wb").write(gzip.compress(csv_text))
+    open(os.path.join(here, "cdir", "plain.csv"), "wb").write(csv_text)  # (a folder read as gzip takes its .csv.gz files, not this)
+    open(os.path.join(here, "named.dat"), "wb").write(gzip.compress(csv_text))  # (a name that doesn't say its compression: read_csv's compression => 'gzip')
     checks = {}
     q("CREATE EXTERNAL TABLE c1 (a INT, b VARCHAR, c DATE) STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.has_header' 'true')")
     checks["CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs"] = q("SELECT a, b, CAST(c AS VARCHAR) AS c FROM c1 ORDER BY a") == [{"a": 1, "b": "hello", "c": "2024-01-02"}, {"a": 2, "b": "world", "c": "2024-02-03"}]
@@ -336,6 +356,75 @@ def external():
     checks["Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)"] = q("SELECT name, id, n FROM p2 WHERE missing IS NULL AND n > 15") == [{"name": "b", "id": 2, "n": 20.0}]
     q("CREATE EXTERNAL TABLE j1 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json'")
     checks["JSON: declared columns by name, others left out"] = q("SELECT * FROM j1 ORDER BY a") == [{"b": "x", "a": 1}, {"b": "y", "a": 2}]
+    # Compressed CSV and JSON (ADR-032): a name's ending is its compression and the name before it its format, at every door.
+    # The rows are the plain files' rows in each codec here (zstd only when the zstandard package is there), and each file is
+    # read back by Python's decoder: the write side is checked by bytes, not by Pondra alone.
+    def refused(s):  # (status, SQLSTATE, words) of a statement the node refuses by name
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+        c.request("POST", "/sql", s.encode(), hdr)
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    rd = lambda name: open(os.path.join(here, name), "rb").read()
+    decode = {"gz": gzip.decompress, "bz2": bz2.decompress, "xz": lzma.decompress}
+    if zstandard is not None:
+        decode["zst"] = lambda data: zstandard.ZstdDecompressor().decompressobj().decompress(data)  # (a stream frame: Pondra's writer keeps no content size)
+    checks["compressed CSV and JSON by name (FROM, read_csv, read_json, a .jsonl name), in each codec: the plain files' rows"] = all(
+        q(f"SELECT sum(x) AS s, count(*) AS n FROM '{here}/a.csv.{e}'") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(x) AS s, count(*) AS n FROM read_csv('{here}/a.csv.{e}')") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(a) AS s, count(*) AS n FROM read_json('{here}/j.json.{e}')") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(a) AS s, count(*) AS n FROM '{here}/j.jsonl.{e}'") == [{"s": 3, "n": 2}]
+        for e in decode)
+    checks["a name that doesn't say its compression (named.dat): read as gzip with compression => 'gzip'; read without it, refused"] = \
+        q(f"SELECT sum(x) AS s, count(*) AS n FROM read_csv('{here}/named.dat', compression => 'gzip')") == [{"s": 3, "n": 2}] \
+        and err(f"SELECT sum(x) AS s FROM read_csv('{here}/named.dat')") != ""
+    checks["a folder read with compression => 'gzip' takes its .csv.gz files (plain.csv left out), and a glob takes the same four rows"] = \
+        q(f"SELECT count(*) AS n, sum(x) AS s FROM read_csv('{here}/cdir/', compression => 'gzip')") == [{"n": 4, "s": 6}] \
+        and q(f"SELECT count(*) AS n FROM '{here}/cdir/*.csv.gz'") == [{"n": 4}]
+    q("CREATE EXTERNAL TABLE ce1 (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'cdir/' OPTIONS ('format.has_header' 'true', 'format.compression' 'gzip')")
+    q("CREATE EXTERNAL TABLE ce2 (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'a.csv.xz' OPTIONS ('format.has_header' 'true')")
+    q("CREATE EXTERNAL TABLE ce3 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json.bz2'")
+    checks["external tables of compressed files: a folder with 'format.compression' 'gzip' (4 rows), a name's own compression with no option (2 rows), JSON's too"] = \
+        q("SELECT count(*) AS n, sum(x) AS s FROM ce1") == [{"n": 4, "s": 6}] and q("SELECT count(*) AS n, sum(x) AS s FROM ce2") == [{"n": 2, "s": 3}] \
+        and q("SELECT sum(a) AS s FROM ce3") == [{"s": 3}]
+    for t in ("ce1", "ce2", "ce3"):
+        q(f"DROP TABLE {t}")
+    q("CREATE TABLE ci (x BIGINT, y VARCHAR, z VARCHAR)")
+    q(f"COPY INTO ci FROM '{here}/cdir/*.csv.gz' (FORMAT csv, HEADER true)")
+    q(f"COPY INTO ci FROM '{here}/a.csv.xz' (FORMAT csv, HEADER true)")
+    checks["COPY INTO loads a glob of .csv.gz files, then one .csv.xz by its name: six rows, the sum of both"] = q("SELECT count(*) AS n, sum(x) AS s FROM ci") == [{"n": 6, "s": 9}]
+    q("DROP TABLE ci")
+    q("CREATE EXTERNAL TABLE cw (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'cw/' OPTIONS ('format.has_header' 'false', 'format.compression' 'gzip')")
+    q("INSERT INTO cw VALUES (7, 'q', 'r')")
+    written = os.listdir(os.path.join(here, "cw"))
+    checks["INSERT into a view of a compressed folder writes one .csv.gz file, and its view reads it back"] = len(written) == 1 and written[0].endswith(".csv.gz") \
+        and q("SELECT sum(x) AS s FROM cw") == [{"s": 7}]
+    q("DROP TABLE cw")
+    back = {}
+    for e in decode:
+        q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/out.csv.{e}'")
+        q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/out.json.{e}'")
+        back[e] = decode[e](rd(f"out.csv.{e}")).decode().splitlines() == ["a,b", "1,x"] \
+            and [json.loads(line) for line in decode[e](rd(f"out.json.{e}")).decode().splitlines()] == [{"a": 1, "b": "x"}] \
+            and q(f"SELECT a, b FROM '{here}/out.csv.{e}'") == [{"a": 1, "b": "x"}] and q(f"SELECT a, b FROM '{here}/out.json.{e}'") == [{"a": 1, "b": "x"}]
+    checks["COPY TO a name ending .csv or .json and a codec: each file holds the rows, read back by Python and by Pondra"] = all(back.values())
+    q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/opt.csv' (FORMAT csv, COMPRESSION bzip2)")
+    checks["COPY TO with COMPRESSION bzip2: the file is bzip2 under its plain name, and Python reads its rows"] = \
+        bz2.decompress(rd("opt.csv")).decode().splitlines() == ["a,b", "1,x"]
+    os.makedirs(os.path.join(here, "outdir"))
+    q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/outdir/' (FORMAT csv, COMPRESSION gzip)")
+    outs = os.listdir(os.path.join(here, "outdir"))
+    checks["COPY TO a folder with COMPRESSION gzip: its file is .csv.gz, read back by Python and by read_csv with compression => 'gzip'"] = \
+        len(outs) == 1 and outs[0].endswith(".csv.gz") and gzip.decompress(open(os.path.join(here, "outdir", outs[0]), "rb").read()).decode().splitlines() == ["a,b", "1,x"] \
+        and q(f"SELECT count(*) AS n FROM read_csv('{here}/outdir/', compression => 'gzip')") == [{"n": 1}]
+    refusal = {"parquet": err(f"SELECT * FROM '{here}/dir/one.parquet.gz'"), "option": err(f"SELECT * FROM read_parquet('{here}/dir/', compression => 'gzip')"),
+               "codec": err(f"COPY (SELECT 1 AS a) TO '{here}/lz.csv' (FORMAT csv, COMPRESSION lz4)"), "arrow": err(f"COPY (SELECT 1 AS a) TO '{here}/a.arrow' (FORMAT arrow, COMPRESSION gzip)")}
+    checks["a compression refused by name: a Parquet name's .gz (compressed inside the file), read_parquet's compression, COPY COMPRESSION lz4, COMPRESSION on Arrow"] = \
+        "compressed inside the file" in refusal["parquet"] and "parquet has no option compression" in refusal["option"] \
+        and "compression lz4" in refusal["codec"] and "COMPRESSION and ROW_GROUP_SIZE are Parquet's" in refusal["arrow"]
+    using, vector = refused("CREATE TABLE ut (a BIGINT) USING delta"), refused("CREATE TABLE vt (v VECTOR(3))")
+    checks["CREATE TABLE … USING delta and VECTOR(3) are refused by name with SQLSTATE 0A000, and no table is made"] = \
+        using[0] != 200 and using[1] == "0A000" and "USING delta" in using[2] and vector[0] != 200 and vector[1] == "0A000" and "VECTOR(n)" in vector[2] \
+        and "not found" in err("SELECT * FROM ut") and "not found" in err("SELECT * FROM vt")
     # The program that started the node has its answers remembered too (apart from anyone else's),
     # but never a statement that reads files: a file here changes on its own.
     import re
@@ -372,12 +461,12 @@ def external():
     q("DROP TABLE c1")
     checks["DROP TABLE drops it; its file stays"] = "not found" in err("SELECT * FROM c1") and os.path.exists(os.path.join(here, "a.csv"))
     said = {"one file": err("INSERT INTO j1 VALUES ('z', 3)"), "update": err("UPDATE ev SET name = 'x'"), "avro": err("CREATE EXTERNAL TABLE b1 STORED AS AVRO LOCATION 'x.avro'"),
-            "gzip": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'gzip')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
+            "codec": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'lz4')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
             "temp": err("CREATE TEMPORARY EXTERNAL TABLE b4 STORED AS CSV LOCATION 'a.csv'"), "option": err("CREATE EXTERNAL TABLE b5 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.null_regex' 'x')"),
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
             "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", f"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION '{here}/dir/'".encode()))}  # (a path on the server's disk: a client's relative name is the lake's files, below)
-    checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
-        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no file matches" in said["none"] \
+    checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, a compression Pondra doesn't have, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
+        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "compression lz4" in said["codec"] and "no file matches" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
     # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
     # a DELETE of an attached Delta table read "no table" with its path.
@@ -890,7 +979,7 @@ def outside():
     checks["a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now"] = (before == [{"s": 13}] and q(total) == [{"s": 50}]
         and small == [{"n": 3, "m": 3, "s": 6}] and more == [{"n": 5003, "m": 4999, "s": 12497506}] and _try(lambda: q(xs, 1)) == [{"n": 5003, "m": 4999, "s": 12497524}])
     checks["refused by name: an unknown option, a compressed file, an unknown format"] = all(w in refused(s, owner=True) for s, w in [
-        ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.csv.gz'", "compressed"), ("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
+        ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.parquet.gz'", "compressed inside the file"),("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
     # COPY … TO: files out, in each format, read back by pyarrow and by Pondra.
     got = lambda key: s3.get_object(Bucket="ext", Key=key)["Body"].read()
     keys = lambda prefix: sorted(o["Key"] for o in s3.list_objects_v2(Bucket="ext", Prefix=prefix).get("Contents", []))

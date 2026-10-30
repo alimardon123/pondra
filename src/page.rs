@@ -1312,7 +1312,7 @@ impl Page {
         }
         // (the declared types of the formats whose files they type: a node's `columns` and `hive_types`, as a node reads them)
         let declares = ["csv", "json", "parquet"].contains(&spec.format.as_str());
-        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version") || (declares && (k == "columns" || k == "hive_types"));
+        let takes = |k: &str| k == "hive_partitioning" || (spec.format == "csv" && CSV_OPTIONS.contains(&k)) || (spec.format == "delta" && k == "version") || (declares && (k == "columns" || k == "hive_types")) || (["csv", "json"].contains(&spec.format.as_str()) && k == "compression"); // (a compressed one is refused by `file_format`, by name)
         if let Some(k) = spec.options.keys().find(|k| !takes(k)) {
             return Err(crate::codes::coded("0A000", format!("a page doesn't take {k} yet")));
         }
@@ -1325,6 +1325,7 @@ impl Page {
         if spec.format == "delta" {
             return self.delta(overlay, name, &given).await;
         }
+        crate::ext_names::file_format(&given, &state)?; // (a file's format and compression a page can't read: refused before any file is listed)
         // The declared types are read in a copy of the page's session, so their dialect is the page's, as a node's is its
         // own. (Its scratch table needs the default catalog, which the page's own session registers itself.)
         let session = || SessionContext::new_with_config(self.ctx.copied_config().with_create_default_catalog_and_schema(true));

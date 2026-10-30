@@ -10,7 +10,9 @@ publish = false # (not on crates.io yet: pip and npm carry the binary)
 [features]
 default = ["server"]
 # A node: the lake and its doors. Without it the library is the parts a browser build shares (`src/lib.rs`).
-server = ["lake", "doors"]
+# DataFusion's decoders and encoders for compressed CSV and JSON (gzip, zstd, bzip2, xz) are a node's: a page has none,
+# and refuses a compressed file by name (`ext_names::compression`).
+server = ["lake", "doors", "datafusion/compression"]
 # What answers a statement: the store, catalog, log, writes, DDL, transactions, queries, views and the rest
 # (designs/page-same-core.md §1). A page is to build it too: the deps here that a page can't build (SlateDB, moka,
 # aws-lc-rs, sysinfo, libc, tonic, tokio-rustls) go behind the platform layer, and `cargo check --no-default-features

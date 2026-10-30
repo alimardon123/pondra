@@ -164,6 +164,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("come in 1.1") || has("comes in 1.1") || has("coming in 1.1") => "0A000", // feature_not_supported (a statement 1.1 brings, refused by name where it is read as text: `kept.rs`)
+        _ if has("come with extensions") || has("comes with vector indexes") => "0A000", // feature_not_supported (a table's format or a vector's type, kept free for 1.2 and after 1.0: `kept.rs`)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
         _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
@@ -254,6 +255,8 @@ mod tests {
         assert_eq!(of("constraint \"c\" of relation \"t\" does not exist"), "42704");
         assert_eq!(of("t already has a column w"), "42701");
         assert_eq!(of("key is t's key column: it stays"), "0A000");
+        assert_eq!(of("CREATE TABLE … USING lance: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)"), "0A000");
+        assert_eq!(of("VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"), "0A000");
         assert_eq!(of("a is t's last column (DROP TABLE t)"), "0A000");
         assert_eq!(of("ALTER TABLE t ADD COLUMN d … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE t SET d = …)"), "0A000");
         assert_eq!(of("v is a view: write to the tables it reads"), "42809");
