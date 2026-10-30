@@ -831,10 +831,20 @@ pub fn resident() -> Option<usize> {
     })
 }
 
-/// A page's resident memory is not asked of an OS: it has none, and its memory is its line (`page.rs`).
+// A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
+#[cfg(target_arch = "wasm32")]
+static READER: std::sync::OnceLock<crate::page::Memory> = std::sync::OnceLock::new();
+
+/// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_resident_with(reading: crate::page::Memory) {
+    let _ = READER.set(reading);
+}
+
+/// A page's resident memory is the bytes its program reads (`read_resident_with`), and none until one is given.
 #[cfg(target_arch = "wasm32")]
 pub fn resident() -> Option<usize> {
-    None
+    READER.get().map(|reading| reading())
 }
 
 /// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds

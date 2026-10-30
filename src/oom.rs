@@ -48,6 +48,10 @@ crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); 
 /// The node's memory line in bytes: `PONDRA_MEMORY_MAX_GB`, else 85% of the machine's or container's
 /// memory. None when it is 0 (off), or in a host's process, where the memory is the host's.
 pub fn line() -> Option<usize> {
+    // (a page's line is its device's, and it has one only where its memory is read: `store::resident`)
+    if cfg!(target_arch = "wasm32") {
+        return crate::store::resident().and_then(|_| crate::page::memory_line(crate::env::device_line()));
+    }
     if crate::node::hosted() {
         return None;
     }
@@ -108,6 +112,10 @@ fn givers() -> Vec<Arc<crate::hot::Hot>> {
 /// back (`trim_line`). The line is checked only where there is one (a node's own process). It runs on a thread of
 /// its own (`panics::alone`), which a node stopped ends, as its other loops end.
 pub fn start() {
+    // (a page's one thread can't run this loop beside a query: a page's requests are watched at each poll instead, `panics::work`)
+    if cfg!(target_arch = "wasm32") {
+        return;
+    }
     let Some(trim) = trim_line() else { return };
     if crate::store::resident().is_none() {
         return;
