@@ -33,7 +33,7 @@ stop, and a 24-hour soak (C4). Where things stood:
    a lake opens it through `Lake::open`, which **refuses a newer lake by name** before its tables
    are read: "… is a lake of format 2, written by Pondra X; this is Pondra Y, which knows formats
    up to 1: run Pondra X or newer here". A node that would lead one gives the term back
-   (`cluster::release`) and exits, so the next node leads at once instead of after 30 s; a running
+   (`terms::release`) and exits, so the next node leads at once instead of after 30 s; a running
    node whose lake moves past it stops (`format::watch`).
 2. **The leader moves the format, once every node knows it.** Every node says its release and the
    newest format it knows on every call to another (`x-pondra-version`, `x-pondra-format` on
