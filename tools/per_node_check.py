@@ -112,6 +112,7 @@ PROCESS = {
     "store.rs:UPDATES": LOCK,
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",
+    "store.rs:READER": "a page's reading of its live bytes, the program's (`read_resident_with`): set once a process, as its allocator is (`main.rs:ALLOC`)",
     "store.rs:SPILLS": "the process's own spill folder, made by the first spill and held until the program ends: `memory::leave` removes it then, or where it can't (Windows, lock open) the next process's sweep does (memory::sweep)",
     "store.rs:SPILLERS": "the spill disk is the machine's: every lake's spills in this process share its room (held weakly, a lake's goes with it)",
     "store.rs:START": "the clock the spill disk's last look is measured from: the disk is the machine's",

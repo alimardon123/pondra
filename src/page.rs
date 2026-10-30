@@ -66,7 +66,7 @@ const COUNTERS_KEY: &str = "pondra.counters";
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
 /// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
-const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
+pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
 /// How a page's session is made: its target partitions (a page in a browser has one), where it keeps its files and its
 /// tables, how it reaches the web, and how it watches its memory.
@@ -356,6 +356,10 @@ impl Page {
     /// `/sql` is answered by `statement::sql` as the owner's, as the HTTP door answers a node's.
     #[cfg(feature = "lake")]
     pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(live) = &options.memory {
+            crate::store::read_resident_with(live.clone()); // (the core's watch reads the page's memory as this page's program does)
+        }
         let mut page = Page::open(options);
         page.paged = Some(crate::node::open_page(options.line).await?);
         Ok(page)
@@ -479,7 +483,16 @@ impl Page {
         }
         let who = lake_principal();
         let format = p.format.clone();
-        let said = crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body))).await;
+        let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
+        let said = match crate::panics::work(true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body)))).await {
+            Ok(said) => said,
+            Err(words) => {
+                if words == crate::oom::OOM || words == PAGE_OOM {
+                    crate::statement::failed_for_memory(lake_principal(), &asked);
+                }
+                return failed(anyhow::anyhow!(words));
+            }
+        };
         let content = crate::answer::content_type(format.as_deref());
         let mut answer = match said.reply {
             Ok(crate::statement::Reply::Rendered(crate::statement::Rendered::Whole(b))) => Answer::ok(content, b),
@@ -1771,20 +1784,27 @@ async fn rows_of(ctx: &SessionContext, plan: LogicalPlan, watch: Option<&Watch>)
 /// `inner` runs as it is.
 async fn watched<T>(watch: Option<&Watch>, inner: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     let Some(watch) = watch else { return inner.await };
-    let margin = watch.line / 10; // (`oom::pick`'s margin, a node's)
-    let mut inner = Some(Box::pin(inner));
+    polled(|| (watch.live)(), watch.line, inner).await.unwrap_or_else(|()| Err(stopped()))
+}
+
+/// A request watched at each of its polls, where no watch loop can run beside it (a page's one thread): before each poll,
+/// past `line` by `reading` and grown by its own polls by a tenth of the line (`oom::pick`'s margin), it is stopped: its
+/// future dropped, its memory let go, and `Err(())` answered (the caller says why).
+pub(crate) async fn polled<T>(reading: impl Fn() -> usize, line: usize, f: impl Future<Output = T>) -> Result<T, ()> {
+    let margin = line / 10; // (`oom::pick`'s margin, a node's)
+    let mut inner = Some(Box::pin(f));
     let mut grown = 0usize; // (what this query's polls grew the page by, less what they let go)
     std::future::poll_fn(move |cx| {
-        let now = (watch.live)();
-        if now >= watch.line && grown >= margin {
+        let now = reading();
+        if now >= line && grown >= margin {
             inner = None; // (the query's memory goes with its future, before anything else is read)
-            return Poll::Ready(Err(stopped()));
+            return Poll::Ready(Err(()));
         }
-        let Some(future) = inner.as_mut() else { return Poll::Ready(Err(stopped())) }; // (never polled once it has answered: an answer is the stop's)
-        let polled = future.as_mut().poll(cx);
-        let after = (watch.live)();
+        let Some(future) = inner.as_mut() else { return Poll::Ready(Err(())) }; // (never polled once it has answered: an answer is the stop's)
+        let out = future.as_mut().poll(cx);
+        let after = reading();
         grown = grown.saturating_add(after.saturating_sub(now)).saturating_sub(now.saturating_sub(after));
-        polled
+        out.map(Ok)
     })
     .await
 }
@@ -1796,7 +1816,7 @@ fn stopped() -> anyhow::Error {
 
 /// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else
 /// `env::PAGE_LINE`.
-fn memory_line(device: Option<usize>) -> Option<usize> {
+pub(crate) fn memory_line(device: Option<usize>) -> Option<usize> {
     crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
 }
 
