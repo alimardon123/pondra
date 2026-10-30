@@ -100,6 +100,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_SERVE_STORE", Node),
     ("PONDRA_SESSION_HOURS", Node),
     ("PONDRA_SESSION_IDLE_SECS", Node),
+    ("PONDRA_SHARED_KEY_FILE", Node),
     ("PONDRA_SHARE_FILES_PER_MINUTE", Node),
     ("PONDRA_SHARE_URL_SECS", Node),
     ("PONDRA_SHARING_URL", Node),

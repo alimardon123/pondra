@@ -24882,20 +24882,20 @@ def memorylake():
             print(f"memorylake: {name_}: {'OK' if good else 'FAIL'}")
 
 
-# About how long each section of `all` takes, in seconds, on CI's runner (the train's green run 40287278434,
-# 2026-10-26: `all` prints each one's time as it goes): `--shard K/N` deals the sections out by it, so CI runs
-# the suite in parts side by side that end together. A section not listed counts as 5 s. (Dealt by 10-25's table,
-# that run's five parts took 352 to 485 s, doors, patterns and serverless having grown since; by this one, about
-# 426 s each.)
-SECS = {"memory": 240, "doors": 205, "patterns": 169, "serverless": 142, "scale": 104, "waits": 91, "sso": 90,
-        "hot": 87, "stopped": 77, "guesses": 45, "backpressure": 37, "functions": 36, "server": 35, "served": 33,
-        "crash": 30, "kafka": 29, "finals": 28, "kafkas": 27, "pace": 25, "found": 23, "clouds": 23, "tails": 20,
-        "load": 20, "live": 17, "refreshed": 15, "objects": 15, "workspace": 14, "users": 14, "sso_flow": 14,
-        "reader": 14, "procedures": 12, "cursors": 12, "clients": 12, "sessions": 11, "sealed": 11, "lateral": 11,
-        "history": 11, "guarded": 10, "followers": 10, "flows": 10, "files": 10, "columns": 10, "answers_big": 10,
-        "alter": 10, "temps": 9, "catalogs": 9, "begin": 9, "schemas": 8, "outside": 8, "find": 8, "fills": 8,
-        "windows": 7, "tiering": 7, "safety": 7, "guard": 7, "fence": 7, "bykey": 7, "sequences": 6, "plans": 6,
-        "memorylake": 6, "loads": 6, "friendly": 6, "dedup": 6, "clusters": 6}
+# About how long each section of `all` takes, in seconds, on CI's runner: the mean of two green runs, 40287278434
+# and 40308046188 (2026-10-26; `all` prints each one's time as it goes), doors from the second alone (205 s in the
+# first, 40 in the second and since). `--shard K/N` deals the sections out by it, so CI runs the suite in parts side
+# by side that end together. A section not listed counts as 5 s. (Dealt by the first run's table, the second's five
+# parts took 271 to 469 s, the last of them the run's last job; by this one, 402 to 421 s.)
+SECS = {"memory": 240, "patterns": 170, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
+        "stopped": 82, "guesses": 45, "doors": 40, "crash": 38, "functions": 37, "backpressure": 35, "served": 33,
+        "server": 30, "kafkas": 29, "finals": 28, "kafka": 28, "pace": 25, "found": 24, "tails": 20, "load": 20,
+        "objects": 18, "live": 17, "refreshed": 15, "clouds": 15, "answers_big": 14, "users": 14, "workspace": 14,
+        "sso_flow": 14, "reader": 14, "lateral": 13, "catalogs": 12, "sealed": 12, "procedures": 12, "history": 12,
+        "sessions": 11, "clients": 11, "guard": 10, "followers": 10, "guarded": 10, "flows": 10, "files": 10,
+        "begin": 10, "cursors": 10, "columns": 10, "temps": 9, "alter": 9, "schemas": 8, "find": 8, "fills": 8,
+        "outside": 8, "clusters": 7, "windows": 7, "tiering": 7, "safety": 7, "fence": 7, "bykey": 7, "sequences": 6,
+        "plans": 6, "unique_doors": 6, "pkey": 6, "loads": 6, "ids": 6, "friendly": 6, "dedup": 6, "memorylake": 6}
 
 
 def all_tests():
