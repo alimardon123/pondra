@@ -1163,16 +1163,63 @@ mod tests {
         assert_eq!(encode_sliced(&plain, |_| 1).unwrap(), stream_writer_ipc(&plain));
     }
 
+    /// A stream's rows as one batch (a cut batch reads back as one batch a slice).
+    fn rows_in(ipc: &[u8]) -> RecordBatch {
+        let batches = decode(ipc).unwrap();
+        datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
     #[test]
     fn slices_read_as_the_whole() {
         let b = mixed(1003);
         let batches = vec![b.clone(), b.slice(0, 1), b.slice(500, 3)];
-        let whole = decode(&encode_sliced(&batches, |_| 1).unwrap()).unwrap();
-        assert_eq!(whole, batches);
+        let one = encode_sliced(&batches, |_| 1).unwrap();
+        assert_eq!(decode(&one).unwrap(), batches);
         for k in [2usize, 3, 4, 2000] {
             let ipc = encode_sliced(&batches, |_| k).unwrap();
             assert_eq!(&ipc[ipc.len() - 8..], &[0xffu8, 0xff, 0xff, 0xff, 0, 0, 0, 0], "{k} slices: the end of the stream");
-            assert_eq!(decode(&ipc).unwrap(), whole, "{k} slices");
+            assert_eq!(decode(&ipc).unwrap().len(), batches.iter().map(|b| k.min(b.num_rows())).sum::<usize>(), "{k} slices: a batch a slice");
+            assert_eq!(rows_in(&ipc), rows_in(&one), "{k} slices");
+        }
+    }
+
+    /// Nested columns cut into slices read back as the whole and take about its bytes: arrow-ipc writes a sliced list's,
+    /// map's or struct's children for the slice's rows only, not whole in every slice (n times the log's bytes, with
+    /// nothing in the decode to show it).
+    #[test]
+    fn nested_slices_take_their_own_rows() {
+        use datafusion::arrow::array::{Int64Builder, ListBuilder, MapBuilder, StringBuilder, StructArray};
+        let n = 20_000;
+        let mut list = ListBuilder::new(StringBuilder::new());
+        let mut map = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        for i in 0..n {
+            match i % 9 {
+                0 => list.append_null(),
+                _ => {
+                    list.values().append_value(format!("a{i}"));
+                    list.values().append_value(format!("b{}", i * 7));
+                    list.append(true);
+                }
+            }
+            map.keys().append_value(format!("k{}", i % 13));
+            map.values().append_value(i);
+            map.append(true).unwrap();
+        }
+        let field = Arc::new(datafusion::arrow::datatypes::Field::new("s", DataType::Utf8, true));
+        let inner = Arc::new(StringArray::from_iter((0..n).map(|i| (i % 4 != 0).then(|| format!("in {i}"))))) as ArrayRef;
+        let b = RecordBatch::try_from_iter([
+            ("l", Arc::new(list.finish()) as ArrayRef),
+            ("st", Arc::new(StructArray::from(vec![(field, inner)])) as ArrayRef),
+            ("m", Arc::new(map.finish()) as ArrayRef),
+        ])
+        .unwrap();
+        let batches = vec![b];
+        let one = encode_sliced(&batches, |_| 1).unwrap();
+        assert_eq!(decode(&one).unwrap(), batches);
+        for k in [2usize, 3, 4] {
+            let ipc = encode_sliced(&batches, |_| k).unwrap();
+            assert_eq!(rows_in(&ipc), rows_in(&one), "{k} slices");
+            assert!(ipc.len() * 10 <= one.len() * 11, "{k} slices: {} bytes, whole {}", ipc.len(), one.len());
         }
     }
 
