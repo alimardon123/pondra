@@ -133,30 +133,62 @@ fn unescape(raw: &[u8], out: &mut Vec<u8>) {
 /// Whether the byte at `at` is not escaped: an even run of backslashes right before it.
 fn unescaped(data: &[u8], at: usize) -> bool { data[..at].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0 }
 
-/// Where the last whole row of `data` ends, just after its last newline that doesn't end a row's data: in text
-/// format one that no backslash escapes, in CSV one outside quotes (an even number of `"` before it); 0 when there is none.
-pub(crate) fn rows_end(data: &[u8], csv: bool) -> usize {
-    if csv {
-        // (the quotes before each newline, counted back from the end a stretch at a time: each byte is counted once)
-        let mut quotes = data.iter().filter(|&&b| b == b'"').count();
-        let mut stretch = data.len();
-        while let Some(i) = data[..stretch].iter().rposition(|&b| b == b'\n') {
-            quotes -= data[i..stretch].iter().filter(|&&b| b == b'"').count();
-            stretch = i;
-            if quotes % 2 == 0 {
-                return i + 1;
+/// Where the whole rows of a COPY's data end, found as the data comes: each byte is looked at once. A row ends after
+/// a newline that ends no row's data: in text format one that no backslash escapes, in CSV one outside quotes (an
+/// even number of `"` before it). `scanned` bytes of the data have been looked at, `end` is where the last whole row
+/// ends (0 when none), and `escaped` or `quoted` is the state at `scanned`.
+#[derive(Default)]
+pub(crate) struct RowEnds {
+    scanned: usize,
+    end: usize,
+    quoted: bool,
+    escaped: bool,
+}
+
+impl RowEnds {
+    /// The end of the last whole row in `data` (0 when none), scanning only the bytes after the last call's.
+    pub(crate) fn end(&mut self, data: &[u8], csv: bool) -> usize {
+        let mut at = self.scanned;
+        if csv {
+            while let Some(p) = data[at..].iter().position(|&b| b == b'"' || b == b'\n') {
+                let i = at + p;
+                if data[i] == b'"' {
+                    self.quoted = !self.quoted;
+                } else if !self.quoted {
+                    self.end = i + 1;
+                }
+                at = i + 1;
+            }
+        } else {
+            while let Some(p) = data[at..].iter().position(|&b| b == b'\\' || b == b'\n') {
+                let i = at + p;
+                if i > at {
+                    self.escaped = false; // (the bytes between are neither, and each one clears an escape)
+                }
+                if data[i] == b'\\' {
+                    self.escaped = !self.escaped;
+                } else {
+                    if !self.escaped {
+                        self.end = i + 1;
+                    }
+                    self.escaped = false;
+                }
+                at = i + 1;
+            }
+            if at < data.len() {
+                self.escaped = false; // (the bytes after the last of those are neither either)
             }
         }
-        return 0;
+        self.scanned = data.len();
+        self.end
     }
-    let mut at = data.len();
-    while let Some(i) = data[..at].iter().rposition(|&b| b == b'\n') {
-        if unescaped(data, i) {
-            return i + 1;
-        }
-        at = i; // (the newline is a row's data: look for the row's end before it)
+
+    /// The first `n` bytes, whole rows, were taken from the front of the data: what follows is a row's start, and
+    /// what was scanned of it keeps its state. (`all` takes everything, scanned or not: the rest is none.)
+    pub(crate) fn taken(&mut self, n: usize) {
+        self.scanned = self.scanned.saturating_sub(n);
+        self.end = self.end.saturating_sub(n);
     }
-    0
 }
 
 /// The first `\.` in `data` at or after `from`, at its backslash.
@@ -351,22 +383,73 @@ b
         assert_eq!(got[1], sv(&[Some("a\nb"), Some("c")]));
     }
 
+    /// Where the whole rows of `data` end, as one scan of all of it gives it.
+    fn scan(data: &[u8], csv: bool) -> usize { RowEnds::default().end(data, csv) }
+
+    /// `data` loaded as frames of the given sizes (cycled), each as `load` cuts it: the cut is checked against one
+    /// scan of what is kept, and the rows taken from the front are what comes back.
+    fn load_in_frames(data: &[u8], csv: bool, sizes: &[usize]) -> Vec<u8> {
+        let (mut ends, mut kept, mut taken, mut at) = (RowEnds::default(), Vec::new(), Vec::new(), 0usize);
+        for size in sizes.iter().cycle() {
+            if at >= data.len() {
+                break;
+            }
+            let to = (at + *size).min(data.len());
+            kept.extend_from_slice(&data[at..to]);
+            at = to;
+            let cut = ends.end(&kept, csv);
+            assert_eq!(cut, scan(&kept, csv), "the cut after {at} bytes");
+            taken.extend(kept.drain(..cut));
+            ends.taken(cut);
+        }
+        taken
+    }
+
+    #[test]
+    fn row_ends_in_frames_are_the_one_scans() {
+        // (text with escaped newlines and backslash runs, odd and even; CSV with quoted newlines and doubled quotes)
+        let samples: [(&[u8], bool); 2] = [
+            (b"1\tx\\\n2\ty\n\\\\\n3\tz\\\\\\\n4\tw", false),
+            (b"\"a\nb\"\"c\"\n1,\"x\ny\"\n2,z", true),
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for (data, csv) in samples {
+            let whole = scan(data, csv);
+            assert!(whole > 0 && whole < data.len());
+            assert_eq!(load_in_frames(data, csv, &[1]), &data[..whole]); // (one byte at a time)
+            for split in 1..data.len() {
+                assert_eq!(load_in_frames(data, csv, &[split, data.len()]), &data[..whole], "split at {split}");
+            }
+            for _ in 0..50 {
+                let sizes: Vec<usize> = (0..16).map(|_| 1 + (xorshift(&mut seed) % 9) as usize).collect();
+                assert_eq!(load_in_frames(data, csv, &sizes), &data[..whole], "frames {sizes:?}");
+            }
+        }
+    }
+
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
     #[test]
     fn rows_end_is_after_the_last_row_a_newline_ends() {
-        assert_eq!(rows_end(b"1\tx\n2\ty", false), 4);
-        assert_eq!(rows_end(br"1	x\
+        assert_eq!(scan(b"1\tx\n2\ty", false), 4);
+        assert_eq!(scan(br"1	x\
 ", false), 0);
         let data = br"1	x\\
 ";
-        assert_eq!(rows_end(data, false), data.len());
-        assert_eq!(rows_end(b"1\tx", false), 0);
+        assert_eq!(scan(data, false), data.len());
+        assert_eq!(scan(b"1\tx", false), 0);
     }
 
     #[test]
     fn csv_rows_end_is_after_the_last_newline_outside_quotes() {
-        assert_eq!(rows_end(b"\"a\nb\"\nc", true), 6);
-        assert_eq!(rows_end(b"\"a\nb\nc", true), 0);
-        assert_eq!(rows_end(b"1,x\n2,\"y\n", true), 4);
+        assert_eq!(scan(b"\"a\nb\"\nc", true), 6);
+        assert_eq!(scan(b"\"a\nb\nc", true), 0);
+        assert_eq!(scan(b"1,x\n2,\"y\n", true), 4);
     }
 
     #[test]
@@ -410,9 +493,9 @@ b
 
     #[test]
     fn csv_rows_end_counts_quotes_from_the_end() {
-        assert_eq!(rows_end(b"\"a\nb\"\nc\n\"x\n", true), 8);
-        assert_eq!(rows_end(b"a\n\"b\nc\n", true), 2);
-        assert_eq!(rows_end(b"a\n\"b\nc\"\n", true), 8);
+        assert_eq!(scan(b"\"a\nb\"\nc\n\"x\n", true), 8);
+        assert_eq!(scan(b"a\n\"b\nc\n", true), 2);
+        assert_eq!(scan(b"a\n\"b\nc\"\n", true), 8);
     }
 
     #[test]

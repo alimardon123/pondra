@@ -306,8 +306,8 @@ impl Merge {
     /// Is this a one-row upsert of one key that `txn` works out from the key's row (ADR-036 §6), and with what: the columns
     /// its row gives (`given`) and its SET (`update`). `name` is the table as its lake names it (`ddl::resolve`), `stored` its
     /// stored meta; the statement's database being this one is the caller's to say. None: the planned MERGE answers it, as
-    /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a row past it is hidden from reads, and not
-    /// from the key's lookup), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
+    /// it always has. Its conditions: a table `txn::point_table` takes, no ttl (a table with a TTL takes no key fast path: SQL
+    /// answers its upsert), with the ids a change keeps, no enforced UNIQUE, and no sign-in with limited access (a
     /// point read gives up for those too); a conflict target that is the key; one row of values that read no table
     /// (`rules::rows::constant_row`: the row is worked out before the key's lock); a row the table's columns and no system
     /// name, with the key in it, as wide as the statement's columns; and a SET of columns the table has, but not the key,
