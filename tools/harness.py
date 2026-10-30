@@ -22982,7 +22982,7 @@ def patterns():
     # an async function runs only as a plan step of its own
     q("CREATE FUNCTION near(x INT, y INT) RETURNS BOOLEAN LANGUAGE python AS $$ return x is not None and y is not None and abs(x - y) <= 2 $$")
     q("CREATE TABLE near_t AS SELECT * FROM (VALUES (1, 10), (2, 11), (3, 12), (4, 20), (5, 21)) AS x(i, v)")
-    near_q = "SELECT * FROM near_t MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(a.i) AS s, LAST(b.i) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS {})"
+    near_q = "SELECT * FROM near_t MATCH_RECOGNIZE (ORDER BY i MEASURES FIRST(a.i) AS s, LAST(b.i) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS {}) ORDER BY s"
     near = q(near_q.format("near(b.v, PREV(b.v))"))
     near_match = pc.post_sql(A.port, near_q.format("near(b.v, FIRST(a.v))"))
     info["a DEFINE calling a Python function"] = [near, near_match]
