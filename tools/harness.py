@@ -123,6 +123,25 @@ def new_lake():
     return lake
 
 
+def chromium(pw):
+    """Playwright's Chromium, launched; installed first when it isn't there. Chromium alone: the runners'
+    image has the libraries it needs, and `--with-deps`' apt mirror once took 16 min. Its libraries only
+    when a launch says they're missing."""
+    try:
+        return pw.chromium.launch()
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, stdout=subprocess.DEVNULL)
+    try:
+        return pw.chromium.launch()
+    except Exception as e:
+        if "missing dependencies" not in str(e):
+            raise
+    subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True, stdout=subprocess.DEVNULL)
+    return pw.chromium.launch()
+
+
 @atexit.register
 def clean_up():
     """Stop the nodes this run started and delete its lakes (buckets have size limits: R2's free tier is 10 GB)."""
@@ -22388,7 +22407,7 @@ def doors():
     (its run in headless Chromium, one tab per feature). Each cell is right, or refused by name where the
     door can't (a USE needs a session, which Flight SQL has none of; a transaction is a session's on
     Postgres, HTTP, MCP, and a transaction id's on Flight SQL). The table is printed; every cell must be
-    one of the two. Needs playwright, and installs its Chromium when it isn't there."""
+    one of the two. Needs playwright, and installs its Chromium when it isn't there (`chromium`)."""
     import re, psycopg, adbc_driver_flightsql.dbapi as adbc
     from playwright.sync_api import sync_playwright
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
@@ -22606,13 +22625,7 @@ finally {{ await db.close?.(); }}"""
             return got["answers"]
         return got["sqlstate"] or "refused: " + got["message"][:160]
     pw = sync_playwright().start()
-    try:
-        browser = pw.chromium.launch()
-    except Exception as e:  # (CI's harness runners have no Chromium: only the console's job installs it)
-        if "Executable doesn't exist" not in str(e):
-            raise
-        subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"], check=True, stdout=subprocess.DEVNULL)
-        browser = pw.chromium.launch()
+    browser = chromium(pw)
     via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp, "cli": via_cli, "console": via_console}
     matrix, checks = {}, {}
     no_session = {"USE a schema": {"flight"}}  # (USE needs a session: Flight SQL has none, so it's refused by name there)
