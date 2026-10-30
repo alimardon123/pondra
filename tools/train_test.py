@@ -246,14 +246,15 @@ class Scenario:
         git(self.work, "push", "-q", self.bare, "HEAD:refs/heads/main")
 
     def add_run(self, run_id, sha, *, event="workflow_dispatch", branch="train", status="completed",
-                conclusion="failure", attempt=1, failed=None, lost=(), logs=None):
+                conclusion="failure", attempt=1, failed=None, lost=(), logs=None, created=None):
         """A build run as the runs endpoint lists it, with the jobs that failed in it: `failed` with a failed step
         (by default "tests", when the run failed), `lost` with none, as when a runner is lost. `logs` gives a job's
-        log by its name (job ids are the run's id and the job's place)."""
+        log by its name (job ids are the run's id and the job's place). `created` is when it began (by default now)."""
         failed = (("tests",) if conclusion == "failure" else ()) if failed is None else failed
         self.gh.runs.insert(0, {"id": run_id, "event": event, "head_branch": branch, "head_sha": sha,
                                 "status": status, "conclusion": conclusion, "run_attempt": attempt,
-                                "html_url": run_url(run_id)})
+                                "html_url": run_url(run_id),
+                                "created_at": created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         self.gh.jobs[run_id] = ([{"name": name, "conclusion": "failure", "steps": [{"name": "a check", "conclusion": "failure"}]}
                                  for name in failed] + [{"name": name, "conclusion": "failure", "steps": []} for name in lost])
         for i, job in enumerate(self.gh.jobs[run_id]):
@@ -663,6 +664,38 @@ def red_same_as_main(path):
         out = sc.step()
         expect(sc.state() == before and len(sc.gh.writes) == writes, "a step changed state for main's failure")
         expect("waiting: main fails the same way: lint" in out, out)
+
+
+@case
+def red_partly_as_main(path):
+    """Red in a job main fails too and in one it doesn't: the train is judged (halved), not left waiting on main."""
+    with Scenario(path) as sc:
+        for n in (1, 2, 3):
+            sc.open_pr(n, f"pr {n}", {f"f{n}.txt": f"{n}\n"})
+        sc.step()
+        sc.add_run(9, sc.tip(), attempt=2, failed=("suite (frames)", "suite (harness, 2 of 5)"))
+        sc.add_run(3, sc.main_sha(), event="workflow_dispatch", branch="main", failed=("suite (frames)", "deploy"))
+        out = sc.step()
+        expect("halved the train: 3 to 2" in out and sc.train_heads() == [1, 2], out)
+
+
+@case
+def red_as_main_from_before_the_cut(path):
+    """Red only where main's run from before the cut was: main's run is started again, once, and the train waits."""
+    with Scenario(path) as sc:
+        sc.riders()
+        sc.add_run(9, sc.tip(), attempt=2, failed=("lint",))
+        sc.add_run(3, sc.main_sha(), event="push", branch="main", failed=("lint",), created="2026-10-26T12:03:44Z")
+        out = sc.step()
+        expect(sc.gh.dispatches[-1] == ("main", "main") and "started main's run again" in out, out)
+        expect("waiting: main fails the same way: lint" in out and sc.train_heads() == [1, 2], out)
+        sc.add_run(4, sc.main_sha(), status="in_progress", conclusion=None, branch="main")
+        dispatches = list(sc.gh.dispatches)
+        out = sc.step()   # (main's new run goes: no other)
+        expect(sc.gh.dispatches == dispatches and "waiting: main fails the same way: lint" in out, out)
+        sc.gh.runs[0].update(status="completed", conclusion="success")
+        out = sc.step()   # (green: the failure is the train's)
+        expect("halved the train: 2 to 1" in out, out)
 
 
 @case

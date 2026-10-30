@@ -31,6 +31,7 @@ the train. --dry-run prints each write it would make (labels, comments, the PATC
 reruns) and makes none, and steps once. tools/train_test.py runs these rules against a fake GitHub.
 """
 import argparse
+import datetime
 import json
 import math
 import os
@@ -105,6 +106,11 @@ class PR:
     title: str
     labels: set
     head: str   # the PR's head commit as GitHub lists it now
+
+
+def stamp(iso):
+    """GitHub's time (2026-10-30T16:06:57Z) in seconds since 1970."""
+    return int(datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
 
 
 def final(job):
@@ -239,11 +245,21 @@ class Train:
             return False
         return prev["conclusion"] in ("failure", "timed_out") or any(self.failed_jobs(prev["id"]).values())
 
-    def main_failed(self):
-        """The jobs that failed in main's latest run that ran. A red train that fails the same way isn't the train's."""
-        run = next((r for r in self.runs() if r["head_branch"] == "main" and r["status"] == "completed"
+    def as_main(self, failed, tip):
+        """Whether main's latest run that ran failed every one of these jobs too: then they aren't the train's, and it
+        waits for main's next run. A job that fails in the train alone is the train's, judged now. Main's next run comes
+        with a landing, and none comes while the train waits, so a red run of main's older than the cut is started
+        again, once: green, the train is judged; red again, main needs a fix of its own (which rides the train)."""
+        runs = self.runs()
+        ran = next((r for r in runs if r["head_branch"] == "main" and r["status"] == "completed"
                     and r["conclusion"] not in ("cancelled", "skipped")), None)
-        return set(self.failed_jobs(run["id"])) if run else set()
+        if ran is None or not set(failed) <= set(self.failed_jobs(ran["id"])):
+            return False
+        newest = next(r for r in runs if r["head_branch"] == "main")
+        if newest["status"] == "completed" and stamp(newest["created_at"]) < int(git("log", "-1", "--format=%ct", tip)):
+            self.dispatch("main", "main")
+            say(f"started main's run again: its last ({ran['html_url']}) is older than the train and fails the same way")
+        return True
 
     def fetch_train(self):
         """origin/train's tip after a fetch, or None when GitHub has no train branch (it may not exist yet)."""
@@ -385,7 +401,7 @@ class Train:
         if run["status"] != "completed":
             if not final:
                 return self.going(merges, runs, ends, by_number, first, tip)
-            if set(final) & self.main_failed():
+            if self.as_main(final, tip):
                 return say(f"waiting: main fails the same way: {', '.join(final)}")
             # A check that can't flake failed: the rest of the run changes nothing, so it stops and is judged now.
             self.cancel(run)
@@ -398,8 +414,8 @@ class Train:
             self.write("POST", f"repos/{self.repo}/actions/runs/{run['id']}/rerun-failed-jobs")
             self.waiting = True
             return say(f"rerun the train's failed jobs: {', '.join(failed)}")
-        if set(failed) & self.main_failed():
-            # Not a wait on the train's own run: main's next run, which a merge starts, steps again when it ends.
+        if self.as_main(failed, tip):
+            # Not a wait on the train's own run: main's next run, a landing's or as_main's, steps again when it ends.
             return say(f"waiting: main fails the same way: {', '.join(failed)}")
         return self.halve(prs, run, failed, heads)
 
