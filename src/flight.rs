@@ -550,9 +550,10 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
         crate::routines::one(app, sql, who, None).await.map_err(status)?;
         return Ok(0);
     }
-    let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
-    let stmt = crate::write::parse(&sql).ok_or_else(|| refused("22023", "not a write statement"))?;
-    let done = crate::audit::statement(app, &sql, async {
+    // (read inside the audited statement, as every door's is: its lake is in scope, so a relative LOCATION is its file)
+    let done = crate::audit::statement(app, sql, async {
+        let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
+        let stmt = crate::write::parse(&sql).ok_or_else(|| refused("22023", "not a write statement"))?;
         app.auth.allows(role, &stmt).map_err(denied)?;
         crate::write::on_node(app, stmt, None).await.map_err(status)
     });
