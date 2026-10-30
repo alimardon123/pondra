@@ -470,17 +470,17 @@ where
     })
 }
 
-/// A statement's whole answer as Flight data, encoded as the client reads it: each batch's pieces (`piece_rows`) through one
+/// A statement's whole answer as Flight data, encoded as the client reads it: its pieces (`answer::pieces`) through one
 /// Arrow encoder on `schema` (`answer::Encoding::with_schema`), each step's messages as the step is written. With no batches,
 /// the schema and the end. An encoding error ends the stream with its status.
 fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
-    let mut few: Vec<RecordBatch> = batches.iter().flat_map(crate::answer::piece_rows).take(2).collect();
-    if few.len() <= 1 {
+    let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));
+    if pieces.len() <= 1 {
         let mut enc = crate::answer::Encoding::with_schema(schema);
         let mut steps = vec![];
-        if let Some(piece) = few.pop() {
+        if let Some(piece) = pieces.pop() {
             steps.push(enc.step(Some(&piece)));
         }
         steps.push(enc.step(None));
@@ -496,7 +496,7 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
         }
         return Box::pin(futures::stream::iter(out));
     }
-    let pieces = batches.into_iter().flat_map(|b| crate::answer::piece_rows(&b));
+    let pieces = pieces.into_iter();
     let steps = futures::stream::try_unfold(Some((crate::answer::Encoding::with_schema(schema), pieces)), |state| async move {
         let Some((mut enc, mut pieces)) = state else { return Ok::<_, Status>(None) };
         let (step, next) = match pieces.next() {
@@ -1140,7 +1140,7 @@ mod tests {
 
     fn dictionary() -> DataType { DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)) }
 
-    /// `rows` rows: an integer, and a text of about 40 bytes, so a batch of a few MB of Arrow.
+    /// `rows` rows: an integer, and a text of about 40 bytes, so a batch of several pieces of Arrow.
     fn wide(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false), Field::new("s", DataType::Utf8, true)]));
         let ints: ArrayRef = Arc::new(datafusion::arrow::array::Int64Array::from_iter_values(0..rows as i64));
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn messages_of_the_pieces_are_the_answer() -> anyhow::Result<()> {
-        let batch = wide(100_000);
+        let batch = wide(300_000);
         let pieces = crate::answer::piece_rows(&batch);
         assert!(pieces.len() > 1, "a few MB of Arrow: {} pieces", pieces.len());
         let mut enc = crate::answer::Encoding::new(Some("arrow"));

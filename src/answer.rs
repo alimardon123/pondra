@@ -31,11 +31,16 @@ pub fn content_type(format: Option<&str>) -> &'static str {
 /// answer, a Parquet or an Excel file is one thing to the reader).
 pub fn streams(format: Option<&str>) -> bool { !matches!(format, Some("table" | "typed" | "parquet" | "xlsx")) }
 
-/// A batch cut into pieces of about 1 MB of Arrow (by its rows' average size). An empty batch is one
+/// About how much Arrow a door sends at a time: at SF1, lineitem over HTTP comes in 0.98 s in pieces of 4 MB that take
+/// the batches a plan has ready together (`pieces`), against 1.22 s in pieces of 4 MB alone and 1.94 s in pieces of 1 MB.
+/// What an answer holds as it goes is bounded by it, whatever the answer's size: about 50 MB over a fetch of SF1
+/// lineitem over HTTP (6M rows), against about 17 MB in pieces of 1 MB.
+pub const PIECE: usize = 4 << 20;
+
+/// A batch cut into pieces of about `PIECE` of Arrow (by its rows' average size). An empty batch is one
 /// empty piece, so that CSV's header comes with the first piece, as `render` writes it; so is a batch of
 /// one row, whatever its size (a piece is at least a row, and a row's average is the whole batch).
 pub fn piece_rows(b: &RecordBatch) -> Vec<RecordBatch> {
-    const PIECE: usize = 1 << 20;
     let rows = b.num_rows();
     if rows <= 1 {
         return vec![b.clone()];
@@ -43,6 +48,42 @@ pub fn piece_rows(b: &RecordBatch) -> Vec<RecordBatch> {
     let per_row = (b.get_array_memory_size() / rows).max(1);
     let step = (PIECE / per_row).max(1);
     (0..rows).step_by(step).map(|at| b.slice(at, step.min(rows - at))).collect()
+}
+
+/// The bytes a batch's rows take — not the buffers they sit in, which a batch cut from a bigger
+/// one shares with it, and a builder leaves half empty.
+pub fn size(b: &RecordBatch) -> usize {
+    use datafusion::arrow::array::Array;
+    b.columns().iter().map(|c| c.to_data().get_slice_memory_size().unwrap_or_else(|_| c.get_array_memory_size())).sum()
+}
+
+/// Batches as the pieces a door sends them in: small ones next to each other as one, up to about `PIECE` (a plan's batches
+/// are 8,192 rows, so a narrow answer would otherwise be a message every 100 KB), and big ones cut (`piece_rows`).
+pub fn pieces(batches: impl IntoIterator<Item = RecordBatch>) -> Vec<RecordBatch> {
+    let (mut out, mut run, mut size) = (vec![], vec![], 0);
+    for b in batches {
+        let s = b.get_array_memory_size();
+        if size + s > PIECE {
+            out.extend(together(std::mem::take(&mut run)));
+            size = 0;
+        }
+        size += s;
+        run.push(b);
+    }
+    out.extend(together(run));
+    out
+}
+
+/// Batches of one answer as one batch's pieces (each batch's own when their schemas differ).
+fn together(run: Vec<RecordBatch>) -> Vec<RecordBatch> {
+    match run.as_slice() {
+        [one] => piece_rows(one),
+        [first, rest @ ..] if rest.iter().all(|b| b.schema_ref() == first.schema_ref()) => match datafusion::arrow::compute::concat_batches(first.schema_ref(), &run) {
+            Ok(b) => piece_rows(&b),
+            Err(_) => run.iter().flat_map(piece_rows).collect(),
+        },
+        _ => run.iter().flat_map(piece_rows).collect(),
+    }
 }
 
 /// The pieces of one answer in one format. Written together they are what `render` writes for the
@@ -72,6 +113,14 @@ impl Encoding {
             _ => Shape::Json, // (as `render`: any other format is JSON)
         };
         Encoding { shape, begun: false, rows: 0, arrow: None }
+    }
+
+    /// A batch as this encoding sends it (`as_sent`).
+    pub fn lean(&self, b: RecordBatch) -> RecordBatch {
+        match self.shape {
+            Shape::Arrow => as_sent(b, Some("arrow")),
+            _ => compact(b),
+        }
     }
 
     /// The Arrow form, its stream written with `schema` (an `arrow_schema`) from the start: a whole answer whose schema is
@@ -111,7 +160,11 @@ impl Encoding {
                         (StreamWriter::try_new(Vec::new(), &schema)?, schema)
                     }
                 };
-                w.write(&arrow_batch(&schema, compact(b.clone()))?)?;
+                let b = arrow_batch(&schema, b.clone())?; // (no view is sent: the cast copies out only its rows' strings)
+                // (the piece's bytes go into a Vec reserved for their size once, not grown a copy at a time: its rows' bytes,
+                // and room for the message's header and each buffer's padding)
+                w.get_mut().reserve(size(&b) + 64 * 3 * b.num_columns() + 4096);
+                w.write(&b)?;
                 let out = std::mem::take(w.get_mut());
                 self.arrow = Some((w, schema));
                 Ok(out)
@@ -188,7 +241,7 @@ pub fn render(batches: &[RecordBatch], format: Option<&str>, keep: Keep) -> anyh
             // (the pieces a door sends an answer in, one after another: the same bytes as they make)
             let mut enc = Encoding::new(Some("arrow"));
             let mut out = vec![];
-            for piece in batches.iter().flat_map(piece_rows) {
+            for piece in pieces(batches.iter().map(|b| enc.lean(b.clone()))) {
                 out = joined(out, enc.step(Some(&piece))?);
             }
             joined(out, enc.step(None)?)
@@ -290,12 +343,15 @@ pub fn arrow_schema(schema: &Schema) -> Schema {
 }
 
 /// A field as the encoder sends it (arrow-flight's `prepare_field_for_flight`, in its default, hydrated form):
-/// a dictionary is its values' type, at any depth. Its name, nullability and metadata stay as they are.
+/// a dictionary is its values' type, and a string or binary view its string or binary type, at any depth. Its name,
+/// nullability and metadata stay as they are.
 fn sent_field(f: &Field) -> Field { Field::new(f.name(), sent_type(f.data_type()), f.is_nullable()).with_metadata(f.metadata().clone()) }
 
 fn sent_type(t: &DataType) -> DataType {
     match t {
         DataType::Dictionary(_, values) => sent_type(values),
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
         DataType::List(f) => DataType::List(Arc::new(sent_field(f))),
         DataType::LargeList(f) => DataType::LargeList(Arc::new(sent_field(f))),
         DataType::ListView(f) => DataType::ListView(Arc::new(sent_field(f))),
@@ -311,7 +367,8 @@ fn sent_type(t: &DataType) -> DataType {
 
 /// `b` taken to `schema` (an `arrow_schema`): as it is when the schema is a looser one than its own (`contains`: the same
 /// fields with the same types, only nullable where the batch's may not be), else each column as it is when its type is
-/// its field's, or cast to the field's type (a dictionary to its values), so the batch says what the stream says.
+/// its field's, or cast to the field's type (a dictionary to its values, a view to its string), so the batch says what
+/// the stream says.
 pub fn arrow_batch(schema: &SchemaRef, b: RecordBatch) -> anyhow::Result<RecordBatch> {
     if schema.contains(b.schema_ref()) {
         return Ok(b.with_schema(schema.clone())?);
@@ -326,6 +383,18 @@ pub fn arrow_batch(schema: &SchemaRef, b: RecordBatch) -> anyhow::Result<RecordB
         })
         .collect::<Result<Vec<ArrayRef>, _>>()?;
     Ok(RecordBatch::try_new_with_options(schema.clone(), columns, &datafusion::arrow::array::RecordBatchOptions::new().with_row_count(Some(b.num_rows())))?)
+}
+
+/// A batch as a door sends it in `format`, for counting before it is written: an Arrow answer's batch with a top-level
+/// view taken to its `arrow_schema` (the cast copies out only its rows' strings, so nothing is left to compact), any
+/// other batch `compact`ed.
+pub fn as_sent(b: RecordBatch, format: Option<&str>) -> RecordBatch {
+    let view = |f: &Arc<Field>| matches!(f.data_type(), DataType::Utf8View | DataType::BinaryView);
+    if format != Some("arrow") || !b.schema_ref().fields().iter().any(view) {
+        return compact(b);
+    }
+    let schema = Arc::new(arrow_schema(b.schema_ref()));
+    arrow_batch(&schema, b.clone()).unwrap_or_else(|_| compact(b))
 }
 
 /// A batch whose string and binary views are copied out of buffers that mostly hold other rows'
@@ -460,19 +529,21 @@ mod tests {
 
     #[test]
     fn pieces_are_the_whole() {
-        let batch = sample(200_000);
-        let pieces = piece_rows(&batch);
-        assert!(pieces.len() > 1, "a piece is about 1 MB of Arrow: {} pieces", pieces.len());
+        let batch = sample(400_000);
         for f in [None, Some("csv"), Some("tsv"), Some("ndjson"), Some("arrow")] {
+            // (cut as a door cuts them: the batch as its format sends it, in `pieces`)
+            let parts = pieces([Encoding::new(f).lean(batch.clone())]);
+            assert!(parts.len() > 1, "{f:?}: a piece is about PIECE of Arrow: {} pieces", parts.len());
             let whole = render(&[batch.clone()], f, |_| None).unwrap();
-            assert!(written(f, &pieces) == whole.as_ref(), "{f:?}: the pieces are not the answer render writes");
+            assert!(written(f, &parts) == whole.as_ref(), "{f:?}: the pieces are not the answer render writes");
         }
-        // Arrow: the pieces and the whole decode to the same rows.
+        // Arrow: the pieces and the whole decode to the rows as they are sent (a view as its string).
+        let sent = as_sent(batch.clone(), Some("arrow"));
         let decoded = |bytes: &[u8]| -> Vec<RecordBatch> { StreamReader::try_new(Cursor::new(bytes), None).unwrap().map(|b| b.unwrap()).collect() };
-        let same = |bs: &[RecordBatch]| concat_batches(&batch.schema(), bs).unwrap();
+        let same = |bs: &[RecordBatch]| concat_batches(&sent.schema(), bs).unwrap();
         let whole = render(&[batch.clone()], Some("arrow"), |_| None).unwrap();
-        assert_eq!(same(&decoded(&written(Some("arrow"), &pieces))), batch);
-        assert_eq!(same(&decoded(&whole)), batch);
+        assert_eq!(same(&decoded(&written(Some("arrow"), &pieces([sent.clone()])))), sent);
+        assert_eq!(same(&decoded(&whole)), sent);
         // An empty batch: JSON's [] and CSV's header alone, whole or in pieces.
         let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true), Field::new("b", DataType::Utf8, true)])));
         assert_eq!(render(&[empty.clone()], None, |_| None).unwrap().as_ref(), b"[]");
@@ -491,12 +562,14 @@ mod tests {
             Field::new("l", DataType::List(Arc::new(Field::new("item", dict.clone(), false))), false),
             Field::new("s", DataType::Struct(Fields::from(vec![Field::new("k", dict.clone(), true)])), false),
             Field::new("v", DataType::Utf8View, true),
+            Field::new("b", DataType::BinaryView, true),
         ]);
         let out = arrow_schema(&schema);
         assert_eq!(out.field(0), &Field::new("d", DataType::Utf8, true));
         assert_eq!(out.field(1), &Field::new("l", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), true));
         assert_eq!(out.field(2), &Field::new("s", DataType::Struct(Fields::from(vec![Field::new("k", DataType::Utf8, true)])), true));
-        assert_eq!(out.field(3), &Field::new("v", DataType::Utf8View, true));
+        assert_eq!(out.field(3), &Field::new("v", DataType::Utf8, true));
+        assert_eq!(out.field(4), &Field::new("b", DataType::Binary, true));
     }
 
     #[test]
@@ -521,20 +594,36 @@ mod tests {
     }
 
     #[test]
-    fn arrow_batch_of_a_batch_with_no_dictionary_keeps_its_columns() -> anyhow::Result<()> {
+    fn arrow_batch_keeps_the_columns_it_need_not_cast_and_sends_a_view_as_its_string() -> anyhow::Result<()> {
         let batch = sample(10);
         let schema = Arc::new(arrow_schema(&batch.schema()));
         let out = arrow_batch(&schema, batch.clone())?;
         assert_eq!(out.schema().as_ref(), schema.as_ref());
         for (a, b) in out.columns().iter().zip(batch.columns()) {
-            assert!(Arc::ptr_eq(a, b));
+            match b.data_type() {
+                DataType::Utf8View => assert_eq!(a.as_ref(), cast(b, &DataType::Utf8)?.as_ref()),
+                _ => assert!(Arc::ptr_eq(a, b)),
+            }
         }
         Ok(())
     }
 
     #[test]
+    fn small_batches_go_together_and_big_ones_are_cut() {
+        let small: Vec<RecordBatch> = (0..10).map(|_| sample(8_192)).collect();
+        let together = pieces(small.clone());
+        assert_eq!(together, vec![concat_batches(&small[0].schema(), &small).unwrap()], "ten batches of 8,192 rows are one piece");
+        let big = sample(400_000);
+        let cut = pieces([sample(10), big.clone()]);
+        assert!(cut.len() > 2, "a batch of {} MB is cut: {} pieces", big.get_array_memory_size() >> 20, cut.len());
+        assert_eq!(concat_batches(&big.schema(), &cut).unwrap().num_rows(), 400_010);
+        let apart = pieces([sample(10), sample(10).project(&[0]).unwrap()]);
+        assert_eq!(apart.len(), 2, "batches of two schemas stay apart");
+    }
+
+    #[test]
     fn a_one_row_batch_is_one_piece_whatever_its_size() {
-        let text = "x".repeat(3 << 20);
+        let text = "x".repeat(PIECE + (1 << 20));
         let schema = Schema::new(vec![Field::new("s", DataType::Utf8, false)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(StringArray::from(vec![text.as_str()])) as ArrayRef]).unwrap();
         assert_eq!(piece_rows(&batch), vec![batch.clone()]);
