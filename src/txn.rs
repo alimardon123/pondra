@@ -51,11 +51,12 @@ struct Changes {
 /// A keyed table's kept rows by key, as text (`key_texts`): how many of the transaction's own rows hold each key (`live`, over
 /// `Changes::new`), and the keys of the table's rows it replaced or deleted (`gone`, over `Changes::old`). `rows` holds, for each
 /// key in `live`, the newest of its own rows as the batch it came in (one `Arc` per batch, shared by its keys) and its index. It is
-/// None until the transaction first reads or updates one of its own keys, when it is made from the rows it keeps; `keep` forgets it
-/// when it filters rows out of a kept batch, so a replaced batch isn't held, and it is made again on the next ask. `keep` keeps the
-/// rest as it keeps the rows, and ROLLBACK TO makes it again from the rows it puts back (a savepoint holds rows only, so taking one
-/// costs what it did). A plain INSERT's check and a read's overlay ask it rather than go over every row kept: when the check did, a
-/// transaction of 2,000 one-row INSERTs took 4.9 ms an INSERT by its end, against 0.9 ms at its start.
+/// None until the transaction first reads or updates one of its own keys, when it is made from the rows it keeps. `keep` keeps it as it
+/// filters rows out of a kept batch: the entries that point into a batch it replaces follow the batch to its filtered rows (`shrunk`),
+/// and it is made again on the next ask only when one of a key's own rows goes while another of its own rows still holds the key.
+/// ROLLBACK TO makes it again from the rows it puts back (a savepoint holds rows only, so taking one costs what it did). A plain
+/// INSERT's check and a read's overlay ask it rather than go over every row kept: when the check did, a transaction of 2,000
+/// one-row INSERTs took 4.9 ms an INSERT by its end, against 0.9 ms at its start.
 #[derive(Default)]
 struct ByKey {
     key: Vec<String>, // (SQL's names)
@@ -93,7 +94,8 @@ impl ByKey {
         Ok(())
     }
 
-    /// The transaction's own rows `b` are replaced (by a new version, or deleted).
+    /// The transaction's own rows `b` are replaced (by a new version, or deleted). A key that keeps another of its own rows makes
+    /// `rows` None: its entry may be the row that went, and which of its rows it points at is not known here.
     fn dropped(&mut self, b: &RecordBatch) -> Result<()> {
         for k in key_texts(b, &self.key)? {
             if let Some(n) = self.live.get_mut(&k) {
@@ -103,6 +105,8 @@ impl ByKey {
                     if let Some(rows) = self.rows.as_mut() {
                         rows.remove(&k);
                     }
+                } else {
+                    self.rows = None;
                 }
             }
         }
@@ -136,6 +140,26 @@ impl ByKey {
             Some(row) => Some(Some(row)),
             None => self.gone.contains(key).then_some(None),
         })
+    }
+
+    /// `old`, a kept batch (`Changes::new`), is replaced by `new`, its rows without the ones `drop_rows` takes out. An entry that points
+    /// into `old` (its batch is the one holding `old`'s row ids array: `drop_rows` makes one per batch, so no other batch does) follows the
+    /// batch to `new`, at the key's last row there. An entry of a later batch that holds the key too is left as it is, as the newer row.
+    /// Nothing is left pointing at a row that went: a key whose row went is removed from `rows`, or `rows` is made again (`dropped`).
+    fn shrunk(&mut self, old: &RecordBatch, new: &RecordBatch) -> Result<()> {
+        let Some(rows) = self.rows.as_mut() else { return Ok(()) };
+        let id = old.column_by_name(crate::text::ROW_ID).context("old rows' ids")?;
+        let texts = key_texts(new, &self.key)?;
+        let batch = Arc::new(new.clone());
+        // (from its last row back: a key's entry is `old`'s until its newest row here sets it, and then the earlier rows of the key pass)
+        for (i, k) in texts.iter().enumerate().rev() {
+            if let Some(entry) = rows.get_mut(k) {
+                if entry.0.column_by_name(crate::text::ROW_ID).is_some_and(|c| Arc::ptr_eq(c, id)) {
+                    *entry = (batch.clone(), i);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1118,6 +1142,26 @@ async fn pause_for_tests() {
     }
 }
 
+/// Takes the rows whose ids are `mine` (the transaction's own rows a statement replaces) out of the kept batches `new`. A batch that
+/// loses rows is replaced by its rows as they are kept, and `by` follows it (`ByKey::shrunk`); a batch with none of them is left as it is.
+fn drop_rows(new: &mut [RecordBatch], mine: &HashSet<i64>, mut by: Option<&mut ByKey>) -> Result<()> {
+    for b in new.iter_mut().filter(|b| b.num_rows() > 0) {
+        let ids = b.column_by_name(crate::text::ROW_ID).context("new rows' ids")?.as_primitive::<Int64Type>().clone();
+        if !ids.iter().flatten().any(|i| mine.contains(&i)) {
+            continue;
+        }
+        let keep = BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| mine.contains(&i)))).collect::<Vec<_>>());
+        let filtered = datafusion::arrow::compute::filter_record_batch(b, &keep)?;
+        if filtered.num_rows() < b.num_rows() {
+            if let Some(by) = by.as_deref_mut() {
+                by.shrunk(b, &filtered)?;
+            }
+            *b = filtered;
+        }
+    }
+    Ok(())
+}
+
 /// Keeps a statement's writes in its transaction. A statement that outlived its transaction (the id it captured is not the
 /// open one's) is refused (25000), never written into the next one (ADR-067 §1).
 fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch>, at: u64, keys: Option<Keys>, id: &str) -> Result<()> {
@@ -1143,20 +1187,7 @@ fn keep(table: &str, key: &[String], old: Vec<RecordBatch>, new: Vec<RecordBatch
         c.old.push(taken);
     }
     if !mine.is_empty() {
-        let mut lost = false;
-        for b in c.new.iter_mut() {
-            if b.num_rows() == 0 {
-                continue;
-            }
-            let ids = b.column_by_name(crate::text::ROW_ID).context("new rows' ids")?.as_primitive::<Int64Type>().clone();
-            let keep = BooleanArray::from(ids.iter().map(|id| Some(!id.is_some_and(|i| mine.contains(&i)))).collect::<Vec<_>>());
-            let filtered = datafusion::arrow::compute::filter_record_batch(b, &keep)?;
-            lost |= filtered.num_rows() < b.num_rows();
-            *b = filtered;
-        }
-        if let Some(by) = by.as_mut().filter(|_| lost) {
-            by.rows = None; // (a batch it held lost rows: its rows are made again on the next ask)
-        }
+        drop_rows(&mut c.new, &mine, by.as_deref_mut())?;
     }
     for b in new.into_iter().filter(|b| b.num_rows() > 0) {
         let given = b.column_by_name(crate::text::ROW_ID).map(|c| datafusion::arrow::compute::cast(c, &DataType::Int64)).transpose()?;
@@ -1921,7 +1952,7 @@ mod tests {
         assert!(by.rows.is_some(), "asked, its rows are made from the rows it keeps");
         assert_eq!(v_of(by.own(&text(3, "c"), &kept)), Some(None), "the key it took away, and none of its own");
         assert_eq!(v_of(by.own(&text(4, "a"), &kept)), None, "a key neither holds");
-        // (keep forgets the rows when it filters a kept batch: made again on the next ask, the answers are the same)
+        // (made again, as `dropped` leaves it when a key keeps another of its own rows: the answers are the same)
         by.rows = None;
         assert_eq!(v_of(by.own(&text(1, "a"), &kept)), Some(Some(11)));
         assert_eq!(v_of(by.own(&text(3, "c"), &kept)), Some(None));
@@ -1938,6 +1969,52 @@ mod tests {
         assert_eq!(v_of(by.own(&text(1, "a"), &c.new)), Some(Some(11)));
         assert_eq!(sorted(again.rows.as_ref().expect("made")), sorted(by.rows.as_ref().expect("made")), "the same keys have rows");
         assert_eq!((again.live, again.gone), (by.live, by.gone));
+
+        // Kept batches, one shrunk by a row it replaces: the index follows the batch and is not made again. Own rows come as `keep`
+        // holds them, with row ids of their own (the array `shrunk` tells a batch by).
+        let own_rows = |ids: &[i64], names: &[&str], vs: &[i64], row_ids: &[i64]| {
+            set(&rows(ids, names, vs), crate::text::ROW_ID, Arc::new(Int64Array::from(row_ids.to_vec()))).expect("a batch of own rows")
+        };
+        let mut by2 = ByKey { key: key.clone(), ..Default::default() };
+        let mut kept2 = vec![own_rows(&[1, 2], &["a", "b"], &[10, 20], &[-1, -2]), own_rows(&[3, 4], &["c", "d"], &[30, 40], &[-3, -4])];
+        for b in &kept2 {
+            by2.added(b).expect("added");
+        }
+        assert_eq!(v_of(by2.own(&text(1, "a"), &kept2)), Some(Some(10)));
+        assert!(by2.rows.is_some());
+        // A later batch holds `b` too, so the first batch's row of it is not the newest. Then the first batch loses the row of `a`,
+        // which its new version (in a batch of its own) replaces.
+        let later = own_rows(&[2], &["b"], &[25], &[-5]);
+        by2.added(&later).expect("added");
+        kept2.push(later);
+        by2.dropped(&own_rows(&[1], &["a"], &[10], &[-1])).expect("dropped");
+        drop_rows(&mut kept2, &HashSet::from([-1i64]), Some(&mut by2)).expect("dropped rows");
+        let newer = own_rows(&[1], &["a"], &[11], &[-6]);
+        by2.added(&newer).expect("added");
+        kept2.push(newer);
+        assert!(by2.rows.is_some(), "a batch shrunk by a row it replaces keeps the index");
+        assert_eq!(v_of(by2.own(&text(2, "b"), &kept2)), Some(Some(25)), "the later batch's row of a key the shrunk batch holds too");
+        assert_eq!(v_of(by2.own(&text(1, "a"), &kept2)), Some(Some(11)), "the replaced key's new version");
+        assert_eq!(v_of(by2.own(&text(4, "d"), &kept2)), Some(Some(40)), "a key of an untouched batch");
+        // Deleting the row of `c` shrinks the second batch to `d`, which the index points at.
+        by2.dropped(&own_rows(&[3], &["c"], &[30], &[-3])).expect("dropped");
+        drop_rows(&mut kept2, &HashSet::from([-3i64]), Some(&mut by2)).expect("dropped rows");
+        assert!(by2.rows.is_some(), "a shrunk batch keeps the index");
+        let mut fresh = ByKey::of(&key, Some(&Changes { new: kept2.clone(), ..Default::default() })).expect("made");
+        for (id, name) in [(1i64, "a"), (2, "b"), (3, "c"), (4, "d")] {
+            assert_eq!(v_of(by2.own(&text(id, name), &kept2)), v_of(fresh.own(&text(id, name), &kept2)), "{name}: as when it is made again");
+        }
+        assert_eq!(v_of(by2.own(&text(4, "d"), &kept2)), Some(Some(40)), "a key that survived a shrunk batch");
+        assert_eq!(v_of(by2.own(&text(3, "c"), &kept2)), None, "a deleted own row frees its key");
+        // `a` has a second row of its own, in a batch of its own, and that row goes: which of its rows the index points at is not
+        // known, so it is made again on the next ask, and the answer is the other row.
+        let extra = own_rows(&[1], &["a"], &[12], &[-7]);
+        by2.added(&extra).expect("added");
+        kept2.push(extra);
+        by2.dropped(&own_rows(&[1], &["a"], &[12], &[-7])).expect("dropped");
+        drop_rows(&mut kept2, &HashSet::from([-7i64]), Some(&mut by2)).expect("dropped rows");
+        assert!(by2.rows.is_none(), "a key with another of its own rows: made again");
+        assert_eq!(v_of(by2.own(&text(1, "a"), &kept2)), Some(Some(11)), "the other row of its own");
     }
 
     #[test]
