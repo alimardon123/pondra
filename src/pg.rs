@@ -668,9 +668,9 @@ impl Backend {
         let Some(version) = version else { return self.app.query(sql, None).await };
         let run = || async {
             let batches = self.app.query(sql, None).await?;
-            let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
+            let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST {
                 true => Some(crate::answer::ipc(&batches)?.into()),
-                false => None, // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
+                false => None, // (a big answer: `Results` keeps none past `Results::BIGGEST`, nor encodes it to find out)
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
