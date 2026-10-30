@@ -265,9 +265,24 @@ pub const PAGE_LINE: usize = 3 << 30;
 
 /// The most query memory a page holds (`query_memory`): two thirds of its line (`memory_line` of its device's, else
 /// `PAGE_LINE`; of `PAGE_LINE` when the watch is off, so the pool is never empty). The page's own pool takes it with its
-/// device's line, and a page's lake (`store::memory_limit`) with none.
+/// device's line, and a page's lake (`store::memory_limit`) with the one its member was opened with (`device_line`).
 pub fn page_query_memory(device: Option<usize>) -> usize {
     query_memory(|| memory_line(Some(device.unwrap_or(PAGE_LINE))).unwrap_or(PAGE_LINE) / 3 * 2)
+}
+
+crate::per_node!(
+    /// The line a page's device has (`page::Options::line`), in bytes, which its member's lake holds to as the page's own
+    /// pool does (`store::memory_limit`); 0: its device didn't say. Set as the member opens (`node::open_page`).
+    static DEVICE_LINE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0));
+
+/// Says the line a page's device has (`DEVICE_LINE`), or that it said none.
+pub fn set_device_line(line: Option<usize>) {
+    DEVICE_LINE.store(line.unwrap_or(0), std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The line a page's device has, as its member was opened with; None: its device didn't say (`PAGE_LINE`).
+pub fn device_line() -> Option<usize> {
+    Some(DEVICE_LINE.load(std::sync::atomic::Ordering::Relaxed)).filter(|&line| line > 0)
 }
 
 /// A setting in seconds (fractions too), else `default`: one that is negative or not a number is the

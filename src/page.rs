@@ -339,7 +339,7 @@ impl Page {
     #[cfg(feature = "lake")]
     pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
         let mut page = Page::open(options);
-        page.paged = Some(crate::node::open_page().await?);
+        page.paged = Some(crate::node::open_page(options.line).await?);
         Ok(page)
     }
 

@@ -773,10 +773,10 @@ pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
 
-/// A page's lake holds what the page's own pool does (`env::page_query_memory`): its memory is its line, not a machine's
-/// (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
+/// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
+/// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
 #[cfg(target_arch = "wasm32")]
-pub fn memory_limit() -> usize { crate::env::page_query_memory(None) }
+pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
 /// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
