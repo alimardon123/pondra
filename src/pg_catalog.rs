@@ -377,7 +377,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::measures::written(&v.sql).into_owned()), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::views::shown(&v.sql)), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its

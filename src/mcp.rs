@@ -249,7 +249,7 @@ async fn list(app: &App) -> Result<Value> {
             if !may_see(&prefix, &key[2..]) {
                 continue;
             }
-            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": v.sql})); // (CREATE VIEW: run when read)
+            tables.push(json!({"table": format!("{prefix}{}", &key[2..]), "kind": "view", "view": crate::views::shown(&v.sql)})); // (CREATE VIEW: run when read)
         }
     }
     Ok(json!({"tables": tables}))

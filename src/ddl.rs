@@ -146,7 +146,7 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
             let (schema, view) = split(&k[2..]);
-            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::measures::written(&v.sql).into_owned()) });
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::views::shown(&v.sql)) });
         }
     }
     if let Some(a) = crate::auth::limited() {
