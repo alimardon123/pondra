@@ -908,18 +908,18 @@ pub fn sent() -> bool { SENT.try_with(|t| !t.is_empty()).unwrap_or(false) }
 
 tokio::task_local! {
     /// The memory of the last answer a request collected (`collect`), counted until the request's body
-    /// is sent: an answer sent in pieces (`server::Rendered`) takes it over. Only the last one is kept:
+    /// is sent: an answer sent in pieces (`statement::Rendered`) takes it over. Only the last one is kept:
     /// an earlier statement's batches were dropped when that statement ended.
     pub static HELD: std::cell::RefCell<Option<MemoryReservation>>;
 }
 
 tokio::task_local! {
-    /// The pieces the one query a door sends may hand its answer to the door in (`server::sql`): once an
+    /// The pieces the one query a door sends may hand its answer to the door in (`statement::sql`): once an
     /// answer reaches `stream_bytes()`, it goes to the door as its plan makes it (`collect_or_send`).
     pub static PIECES: Arc<Pieces>;
 }
 
-/// A request's way to hand its door an answer in pieces (`server::sql`).
+/// A request's way to hand its door an answer in pieces (`statement::sql`).
 pub struct Pieces {
     /// Some(format) while a query may send its answer this way (`arm`).
     armed: std::sync::Mutex<Option<Option<String>>>,
@@ -1069,7 +1069,7 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
     }
 }
 
-/// An answer already whole, sent in pieces as `send_rest` sends a plan's (`server::stream`): its first piece is written
+/// An answer already whole, sent in pieces as `send_rest` sends a plan's (`statement::answer`): its first piece is written
 /// now, the rest on the queries' runtime as its client reads them. `held`'s memory goes when the last piece is written,
 /// or when the client goes (the body that holds the pieces counts the request for a node told to stop: `server::pieces`).
 pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<MemoryReservation>) -> Result<Handed> {
@@ -1177,7 +1177,7 @@ fn keep_held(held: MemoryReservation) {
     let _ = HELD.try_with(|h| *h.borrow_mut() = held.take());
 }
 
-/// The memory of the answer a request kept, for the body that sends it (`server::answer`).
+/// The memory of the answer a request kept, for the body that sends it (`statement::answer`).
 pub fn take_held() -> Option<MemoryReservation> { HELD.try_with(|h| h.borrow_mut().take()).ok().flatten() }
 
 tokio::task_local! {

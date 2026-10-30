@@ -23798,7 +23798,7 @@ def vm_hwm(pid):
 
 
 def answers_big():
-    """An answer too big to hold as one body is sent in pieces (`server::stream`), and its bytes are
+    """An answer too big to hold as one body is sent in pieces (`statement::answer`), and its bytes are
     the whole answer's: a node with PONDRA_STREAM_MB=0 (every answer in pieces) answers what the
     default node does, in JSON, CSV, TSV, NDJSON and Arrow (Arrow as tables). An answer counts in
     the node's query memory (`query::collect`): 3M rows of json over a 0.25 GB node come back whole,

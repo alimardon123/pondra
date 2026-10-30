@@ -59,24 +59,24 @@ pub(crate) enum Cmd {
         serve_store: bool,
         /// Minimum milliseconds between a node's flushes. 0: flush as soon as the previous flush
         /// is committed (what queued up meanwhile goes together), for the lowest latency.
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = node::Start::default().flush_ms)]
         flush_ms: u64,
         /// Tiering starts as soon as rows commit, at most once per this many seconds (fractions
         /// allowed): how soon new rows are Parquet, and a Delta or Iceberg version other engines
         /// can read (Pondra's own reads see every commit at once). Each run costs a few
         /// object-store writes per busy table, so not more often than that by default; a table
         /// with a million rows waiting is tiered within a second anyway (0 = only via POST /tier).
-        #[arg(long, default_value_t = 10.0)]
+        #[arg(long, default_value_t = node::Start::default().tier_secs)]
         tier_secs: f64,
         /// Streaming tasks run as soon as new rows commit, and at least this often (milliseconds).
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, default_value_t = node::Start::default().task_ms)]
         task_ms: u64,
         /// Memory for queries, in GB (also PONDRA_MEMORY_GB; default: a third of the machine's).
         /// Sorts, joins and aggregations that need more spill to the temp dir.
         #[arg(long)]
         memory_gb: Option<f64>,
         /// Seconds to keep consumed log segments and replaced files before deleting them.
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = node::Start::default().retain_secs)]
         retain_secs: u64,
         /// Keep the log this many seconds as a change feed: `/watch/{t}?after=N` replays every
         /// change since N (upserts and deletes of keyed tables included). 0: only `--retain-secs`.
@@ -84,7 +84,7 @@ pub(crate) enum Cmd {
         changelog_secs: u64,
         /// Rows allowed to wait in the log for tiering before commits pause (backpressure).
         /// Lower it for less memory, raise it to absorb longer bursts.
-        #[arg(long, default_value_t = 10_000_000)]
+        #[arg(long, default_value_t = node::Start::default().backlog)]
         backlog: u64,
         /// Lakes on object storage: where this node keeps its local SSD copy of recent objects
         /// (default: <temp dir>/pondra-cache).
@@ -524,7 +524,7 @@ async fn run() -> anyhow::Result<()> {
             // starts again, so the selects below poll this one alone)
             let mut stop = Box::pin(stopped(stop_with_stdin));
             let mut moves = node::mover(); // (a lake moving to another place: `memory::set_location`)
-            let mut options = node::Options { dir, listen: addr, advertise, reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, python, auth, guest: None };
+            let mut options = node::Options { dir, listen: addr, advertise, start: node::Start { reader, flush_ms, tier_secs, task_ms, retain_secs, backlog, python, auth }, pg, kafka, kafka_advertise, flight, attach: attached, attach_found, guest: None };
             loop {
                 let held = Arc::new(node::Held::default()); // (what the start takes, given back by a stop: `node.rs`)
                 let mut node = tokio::select! {
@@ -660,6 +660,8 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
         Ok(node) => node,
         // (its leader is alive and doesn't answer from here: the write goes through the bucket's inbox)
         Err(e) if e.downcast_ref::<node::Unreached>().is_some() => return through_inbox(dir, &query, attached).await,
+        // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
+        Err(e) if write::fenced(&e) && write::tries() < 5 => run_again("fenced while starting"),
         Err(e) => return Err(e),
     };
     // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
@@ -680,14 +682,24 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())]);
+            run_again("fenced while writing");
         }
         return Err(err);
+    }
+    // (fenced out as it finished, before what it wrote was durable: run again, and the job says whether it was recorded)
+    if finished.as_ref().is_err_and(|e| write::fenced(e) && write::tries() < 5) {
+        run_again("fenced while finishing");
     }
     finished?;
     print!("{heard}");
     println!("{body}");
     Ok(())
+}
+
+/// A `pondra sql` guest fenced out by a newer writer runs again with the same job, so whoever records its write
+/// records it once (`write::deliver` does the same), one more try each time.
+fn run_again(why: &str) -> ! {
+    crate::node::restart_with(why, &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())])
 }
 
 /// A write whose lake's leader is alive but doesn't answer from this machine's guest start (`node::Unreached`): it is

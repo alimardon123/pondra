@@ -1221,7 +1221,7 @@ impl Lake {
                 true => {
                     let t0 = datafusion::common::instant::Instant::now();
                     let kv = kv::writer(store.clone(), cache_dir, local).await?;
-                    trace("the catalog's writer open", t0);
+                    trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0).await?
                 }
                 false => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
@@ -2091,8 +2091,24 @@ fn field(f: &mut Bytes) -> Result<Bytes> {
     next(f, n)
 }
 
-/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5).
-pub fn trace(what: &str, since: datafusion::common::instant::Instant) {
+crate::per_node!(
+    /// When the node open now began its start (`trace_from_now`): what `trace`'s times count from.
+    static TRACED_FROM: std::sync::Mutex<Option<datafusion::common::instant::Instant>> = std::sync::Mutex::new(None));
+
+/// The node's start begins now, for `trace` (`Node::start`).
+pub fn trace_from_now() { *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(datafusion::common::instant::Instant::now()); }
+
+/// A cold start's steps and their times, with `PONDRA_TRACE_START` (`tools/cold_trace.sh`, C5): since the node's start
+/// began (`trace_from_now`), nothing before it.
+pub fn trace(what: &str) {
+    let from = *TRACED_FROM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let (Some(since), true) = (from, crate::env::is_set("PONDRA_TRACE_START")) {
+        eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
+    }
+}
+
+/// `trace`'s line, timed from `since`: the catalog's open times its own steps.
+pub fn trace_since(what: &str, since: datafusion::common::instant::Instant) {
     if crate::env::is_set("PONDRA_TRACE_START") {
         eprintln!("start: {what} {:.2} s", since.elapsed().as_secs_f64());
     }
@@ -2143,7 +2159,7 @@ impl Catalog {
         // The leader too reads the catalog from memory: everything committed, nothing in flight.
         let mut all = cat.kv.scan(b"".to_vec()..b"d/".to_vec(), false).await.map_err(fatal)?;
         all.extend(cat.kv.scan(b"d0".to_vec()..vec![0xff], false).await.map_err(fatal)?);
-        trace("the catalog in memory", since);
+        trace_since("the catalog in memory", since);
         let overlay = cat.overlay.get_mut().unwrap();
         for (k, v) in all {
             overlay.set(k, (c, Some(v)));

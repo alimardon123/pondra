@@ -23,7 +23,7 @@ use crate::ext_names::{quoted, scheme};
 use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
-    /// The caller is the program that started this node (the shell, `connect()` of a lake: `server::owner`),
+    /// The caller is the program that started this node (the shell, `connect()` of a lake: `statement::owner`),
     /// or another node running its share of a query its coordinator checked: this machine's files,
     /// and URLs no secret covers, read with the node's own credentials.
     static OWNER: bool;
