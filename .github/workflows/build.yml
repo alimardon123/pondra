@@ -84,6 +84,7 @@ jobs:
       site: ${{ steps.plan.outputs.site }}
       web: ${{ steps.plan.outputs.web }}
       forms: ${{ steps.plan.outputs.forms }}
+      lake: ${{ steps.plan.outputs.lake }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -197,6 +198,9 @@ jobs:
           # (and a pull request's, or a train's, when the module itself, the core's list of modules or its
           # dependencies change: the unit tests compile the core without the server feature, but not for wasm32)
           if [ "$event" = pull_request ] && has '^(web/|tools/web_|src/lib\.rs$|Cargo\.toml$)'; then web=true; fi
+          # (the page on the core's lake, web-lake: on web's own rule, not on every change the forms check below
+          # takes, for its 18-minute link; every run takes it once the page is switched to it, designs/page-same-core.md P3)
+          lake=$web
           # (one set of SQL cases on every form, tools/forms_check.py: whenever a form or the cases change, so the page's
           # module is built for it too, beside linux-x64's build)
           forms=false
@@ -216,10 +220,10 @@ jobs:
           binary=false
           if [ "$event" != pull_request ] || [ "$docs" = true ] || [ "$deploy" = true ] || [ "$upgrade" = true ] || [ "$resilience" = true ] || [ "$sharing" = true ] || [ "$sso" = true ] || [ "$forms" = true ]; then binary=true; fi
           suite=$(jq -nc --argjson h "$harness" --argjson d "$docs" '{include: ((if $h then [range(1; 6) | {part: "harness, \(.) of 5", shard: "\(.)/5"}] else [] end) + (if $d then [{part: "frames, console, docs, failover"}] else [] end))}')
-          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
-            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
+          printf 'binary=%s\nunit=%s\ndocs=%s\nsuite=%s\nsite=%s\nweb=%s\nforms=%s\nlake=%s\ndeploy=%s\nfull=%s\nupgrade=%s\nresilience=%s\nsharing=%s\nsso=%s\n' \
+            "$binary" "$unit" "$docs" "$suite" "$site" "$web" "$forms" "$lake" "$deploy" "$full" "$upgrade" "$resilience" "$sharing" "$sso" >> "$GITHUB_OUTPUT"
           runs=
-          for k in binary full unit harness docs site web forms upgrade resilience sharing sso deploy; do
+          for k in binary full unit harness docs site web forms lake upgrade resilience sharing sso deploy; do
             if [ "${!k}" = true ]; then runs="$runs $k"; fi
           done
           echo "Runs:${runs:- nothing (no check reads what this changes)}$([ "$files" != ALL ] || echo ' (everything: started by hand, or no passed run of main found)')." >> "$GITHUB_STEP_SUMMARY"
@@ -278,7 +282,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - &wasm_toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: stable
           targets: wasm32-unknown-unknown
@@ -291,7 +296,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - name: wasm-bindgen's command line, at web/Cargo.lock's version
+      - &wasm_bindgen # (web-lake's too)
+        name: wasm-bindgen's command line, at web/Cargo.lock's version
         run: |
           v=$(grep -A1 '^name = "wasm-bindgen"$' web/Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
           [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" = "$v" ] || cargo install wasm-bindgen-cli --version "$v" --locked
@@ -303,6 +309,42 @@ jobs:
           path: |
             web/pkg/pondra_web.js
             web/pkg/pondra_web_bg.wasm
+
+  # The page on the core's lake (designs/page-same-core.md P2): web/ built with `--features lake` (tools/web_build.sh
+  # --lake, thin LTO: fat needs more than a runner's 16 GB) into web/pkg-lake/, then the forms check's SQL cases on it
+  # in Node (`--form page-lake`), in the same job: it needs no node, so neither linux-x64's build nor an artifact.
+  # Its own cache: the lake feature compiles the core apart from web's. P3 makes this module the page's, and folds this
+  # job into web and forms.
+  web-lake:
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.wait != 'true' && needs.plan.outputs.lake == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v5
+      - *wasm_toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: web
+          shared-key: web-lake
+          cache-on-failure: true
+          save-if: ${{ needs.plan.outputs.event != 'pull_request' }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - *wasm_bindgen
+      - run: bash tools/web_build.sh --lake
+      - run: pip install pyarrow==25.0.1 numpy # (tools/requirements.txt's pyarrow: slt_check.py reads the answers with it)
+      - run: python3 tools/forms_check.py --form page-lake --out forms-lake.json
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: forms-lake-failures
+          path: forms-lake.json
+          if-no-files-found: ignore
 
   # linux-x64 first, on its own: the suite and the tests after the build need its packages alone,
   # so they start once it is built, never waiting for the slowest platform.
@@ -628,7 +670,7 @@ jobs:
   # its lane looks, so a platform that only main builds (the pull request merged on Linux alone) is
   # fixed at once, by whoever merged it. Also in the run's summary, and as an error.
   red:
-    needs: [plan, site, web, forms, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
+    needs: [plan, site, web, web-lake, forms, linux, build, unit, host, suite, resilience, upgrade, sharing, sso, deploy]
     if: ${{ always() && needs.plan.outputs.event == 'push' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     permissions:
