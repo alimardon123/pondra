@@ -2039,9 +2039,10 @@ mod tests {
     #[test]
     fn a_long_greedy_match_is_built_once() {
         // a+ reaches its match on every row: built once, when the search returns, 200,000 rows take well under a second
+        // (built on every row, they took hours; the bound leaves room for CI, which runs the tests side by side)
         let (rows, took) = greedy_run(200_000);
         assert!(one_match(&rows));
-        assert!(took < Duration::from_secs(1), "took {took:?}");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
     }
 
     #[test]
@@ -2053,7 +2054,8 @@ mod tests {
     #[test]
     fn overlapping_matches_hit_the_kept_rows_budget() {
         // a+ with SKIP TO NEXT ROW over 10,000 rows of a: each search's match is every row from its start, so the kept rows
-        // pass n + KEEP after about 840 searches, and the refusal comes in well under 2 s
+        // pass n + KEEP after about 840 searches, and the refusal comes in about a second (it ran for minutes before; the
+        // bound leaves room for CI, which runs the tests side by side)
         let plan = compile(&spec("a+", NEXT)).unwrap();
         let n = 10_000;
         let cond = vec![vec![true; n]];
@@ -2063,7 +2065,7 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(crate::codes::of(&err), "54000");
         assert!(err.to_string().contains("keeps more than 8,010,000 rows of matches and partial matches"), "{err}");
-        assert!(took < Duration::from_secs(2), "refused in {took:?}");
+        assert!(took < Duration::from_secs(10), "refused in {took:?}");
     }
 
     #[test]
@@ -2079,7 +2081,7 @@ mod tests {
         let took = started.elapsed();
         assert_eq!(crate::codes::of(&err), "54000");
         assert!(err.to_string().contains("the searches read more than 8,320,000 rows"), "{err}");
-        assert!(took < Duration::from_secs(2), "refused in {took:?}");
+        assert!(took < Duration::from_secs(10), "refused in {took:?}"); // (as the kept rows' test: room for CI)
     }
 
     #[test]
