@@ -71,6 +71,9 @@ const NODE_ROWS: &str = "the node's rows";
 /// a node's table (`page_names`). A fill may not name its target `NODE_ROWS` (`node_rows_taken`).
 const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node";
 const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
+/// The name a kept table's rows have in the requests that import it (`import_table`): a request's table, as `sent_for` names one.
+#[cfg(feature = "lake")]
+const KEPT_ROWS: &str = "the kept rows";
 /// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
 pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
@@ -315,6 +318,56 @@ async fn collected(mut h: crate::query::Handed, content: &'static str) -> Answer
     Answer::ok(content, body)
 }
 
+/// The kinds of kept file `import_kept` imports after the types: a table, or a view.
+#[cfg(feature = "lake")]
+#[derive(Clone, Copy)]
+enum Kept {
+    Table,
+    View,
+}
+
+/// The kept files under `folder` whose names end `ext`, as the lake's store lists them (`import_kept`).
+#[cfg(feature = "lake")]
+async fn kept_files(store: &crate::store::Store, folder: &str, ext: &str) -> anyhow::Result<Vec<object_store::path::Path>> {
+    let listed = store.list(Some(&object_store::path::Path::from(folder))).try_collect::<Vec<_>>().await?;
+    Ok(listed.into_iter().map(|o| o.location).filter(|at| at.as_ref().ends_with(ext)).collect())
+}
+
+/// A kept file's bytes, read from the lake's store (object_store 0.14, whose `get` is on its ext trait).
+#[cfg(feature = "lake")]
+async fn kept_bytes(store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<bytes::Bytes> {
+    use object_store::ObjectStoreExt as _;
+    Ok(store.get(at).await?.bytes().await?)
+}
+
+/// Deletes a kept file the import has imported (object_store 0.14, as `kept_bytes`); a file already gone is deleted.
+#[cfg(feature = "lake")]
+async fn forgotten(store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
+    use object_store::ObjectStoreExt as _;
+    match store.delete(at).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The words of a statement's answer that failed, as a file that doesn't import is listed with them (its body as text).
+#[cfg(feature = "lake")]
+fn answered_words(answer: &Answer) -> anyhow::Error {
+    anyhow::anyhow!("{}", String::from_utf8_lossy(&answer.body))
+}
+
+/// Whether a statement's answer is 42P07: the name it makes is there already.
+#[cfg(feature = "lake")]
+fn already_there(answer: &Answer) -> bool {
+    answer.header("x-pondra-sqlstate") == Some("42P07")
+}
+
+/// The sequence a DEFAULT `nextval('s')` counts in, as `rules::create::identity_default` writes it; None for any other DEFAULT.
+#[cfg(feature = "lake")]
+fn sequence_of(default: &str) -> Option<String> {
+    Some(default.strip_prefix("nextval('")?.strip_suffix("')")?.replace("''", "'"))
+}
+
 /// An entity tag as HTTP sends it: quoted.
 fn quoted(e_tag: &str) -> String {
     format!("\"{e_tag}\"")
@@ -372,7 +425,8 @@ impl Page {
     }
 
     /// `open`, with the page's member on the core's lake (`node::open_page`, behind the `lake` feature until P3): its
-    /// `/sql` is answered by `statement::sql` as the owner's, as the HTTP door answers a node's.
+    /// `/sql` is answered by `statement::sql` as the owner's, as the HTTP door answers a node's. A folder kept by 0.35/0.36 in
+    /// `lake_store` is imported into the lake once (`import_kept`).
     #[cfg(feature = "lake")]
     pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
         #[cfg(target_arch = "wasm32")]
@@ -381,6 +435,12 @@ impl Page {
         }
         let mut page = Page::open(options);
         page.paged = Some(crate::node::open_page(options.lake_store.clone(), options.line).await?);
+        if let Some(store) = &options.lake_store {
+            if let Err(e) = page.import_kept(store).await {
+                page.close().await; // (a page that fails to open closes its member: the module's one page is free again, not 55006)
+                return Err(e);
+            }
+        }
         Ok(page)
     }
 
@@ -668,6 +728,193 @@ impl Page {
             },
             Err(e) => failed(e),
         }
+    }
+
+    /// A kept folder of 0.35/0.36 (`types/`, `tables/`, `views/`), imported once into the page's lake through the core's own
+    /// statements (`imported_said`): types first, then tables and views in passes until a pass imports nothing, since a table may
+    /// name a table or a view listed later, and a view another view. A file goes from the store once its statements answered 200.
+    /// A file that doesn't import stays where it is, listed by `unread` with its words, so the next open tries it again. Only a
+    /// listing that fails is the open's error (`open_lake` closes the page then).
+    #[cfg(feature = "lake")]
+    async fn import_kept(&mut self, store: &crate::store::Store) -> anyhow::Result<()> {
+        for at in kept_files(store, "types", ".json").await? {
+            if let Err(e) = self.import_type(store, &at).await {
+                self.unread.push((at.to_string(), crate::codes::words(&e)));
+            }
+        }
+        let mut pending: Vec<(object_store::path::Path, Kept)> = kept_files(store, TABLES, ".arrow").await?.into_iter().map(|at| (at, Kept::Table)).collect();
+        pending.extend(kept_files(store, VIEWS, ".json").await?.into_iter().map(|at| (at, Kept::View)));
+        loop {
+            let count = pending.len();
+            let mut failed = vec![];
+            for (at, kind) in std::mem::take(&mut pending) {
+                let done = match kind {
+                    Kept::Table => self.import_table(store, &at).await,
+                    Kept::View => self.import_view(store, &at).await,
+                };
+                if let Err(e) = done {
+                    failed.push((at, kind, crate::codes::words(&e)));
+                }
+            }
+            // (a pass that imported nothing is the last: what it left is unread)
+            if failed.is_empty() || failed.len() == count {
+                for (at, _, words) in failed {
+                    self.unread.push((at.to_string(), words));
+                }
+                return Ok(());
+            }
+            pending = failed.into_iter().map(|(at, kind, _)| (at, kind)).collect();
+        }
+    }
+
+    /// A kept type, made again as `CREATE TYPE … AS ENUM` with its labels (`make_kept`).
+    #[cfg(feature = "lake")]
+    async fn import_type(&self, store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
+        let kept: serde_json::Value = serde_json::from_slice(&kept_bytes(store, at).await?).context("it is not a kept type")?;
+        let (Some(name), Some(labels)) = (kept["name"].as_str(), kept["labels"].as_array()) else { anyhow::bail!("it has no name and labels, so it is not a kept type") };
+        let labels = labels.iter().map(|l| l.as_str().map(crate::pg_text::quote_literal)).collect::<Option<Vec<String>>>().context("its labels are not text")?;
+        self.make_kept(&format!("CREATE TYPE {} AS ENUM ({})", crate::ext_names::quoted(name), labels.join(", ")), store, at).await
+    }
+
+    /// A kept view, made again as `CREATE VIEW` with its query (`make_kept`).
+    #[cfg(feature = "lake")]
+    async fn import_view(&self, store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
+        let kept: serde_json::Value = serde_json::from_slice(&kept_bytes(store, at).await?).context("it is not a kept view")?;
+        let (Some(name), Some(query)) = (kept["name"].as_str(), kept["query"].as_str()) else { anyhow::bail!("it has no name and query, so it is not a kept view") };
+        self.make_kept(&format!("CREATE VIEW {} AS {query}", crate::ext_names::quoted(name)), store, at).await
+    }
+
+    /// A kept type or view, made by its statement, and then its file goes. A statement that finds the name there (42P07) was
+    /// answered by an open that made it from this file before that open stopped, so the file goes too.
+    #[cfg(feature = "lake")]
+    async fn make_kept(&self, sql: &str, store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
+        match self.imported_said(sql, None).await {
+            Ok(()) => {}
+            Err(answer) if already_there(&answer) => {}
+            Err(answer) => return Err(answered_words(&answer)),
+        }
+        forgotten(store, at).await
+    }
+
+    /// A kept table, imported: made by its CREATE text as the core takes it (`imported_create`), or, with no CREATE text (no column
+    /// of it had rules), as a `CREATE TABLE … AS` of its rows; with the rows in by an INSERT; then its counters and defaults
+    /// (`restored`). A table this import made is dropped again if the rest of its import fails, so the next open starts from the
+    /// file. A CREATE that finds a table of the name there is `table_there`'s.
+    #[cfg(feature = "lake")]
+    async fn import_table(&mut self, store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
+        let reader = FileReader::try_new(std::io::Cursor::new(kept_bytes(store, at).await?), None)?;
+        let kept = reader.schema();
+        let name = kept.metadata().get(TABLE_KEY).cloned().ok_or_else(|| anyhow::anyhow!("it has no {TABLE_KEY} note, so it is not a kept table"))?;
+        let batches = reader.collect::<Result<Vec<_>, _>>()?;
+        let counted: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let rows = stream_of(&table_schema(&kept), &batches)?;
+        let table = crate::ext_names::quoted(&name);
+        let from_rows = format!("SELECT * FROM {}", crate::ext_names::quoted(KEPT_ROWS));
+        let create = match kept.metadata().get(CREATE_KEY) {
+            Some(text) => Some(self.imported_create(text, &name)?),
+            None => None,
+        };
+        let made = match &create {
+            Some(create) => self.imported_said(create, None).await,
+            None => self.imported_said(&format!("CREATE TABLE {table} AS {from_rows}"), Some(rows.as_slice())).await,
+        };
+        match made {
+            Ok(()) => {}
+            Err(answer) if already_there(&answer) => return self.table_there(store, at, &name, &kept, counted).await,
+            Err(answer) => return Err(answered_words(&answer)),
+        }
+        let filled = async {
+            if create.is_some() {
+                self.imported_said(&format!("INSERT INTO {table} {from_rows}"), Some(rows.as_slice())).await.map_err(|answer| answered_words(&answer))?;
+            }
+            self.restored(at, &name, &kept, create.is_none()).await
+        }
+        .await;
+        if let Err(e) = filled {
+            let _ = self.imported_said(&format!("DROP TABLE {table}"), None).await;
+            return Err(e);
+        }
+        forgotten(store, at).await
+    }
+
+    /// A kept table whose CREATE found a table of its name there (42P07): an open that made the table from this file stopped before
+    /// the file went. The file goes once the table holds the file's rows, with its counters and defaults set again. A table of other
+    /// rows is someone else's, and is listed with the words of why.
+    #[cfg(feature = "lake")]
+    async fn table_there(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, counted: usize) -> anyhow::Result<()> {
+        let answer = self.lake_said("format=csv", &[], bytes::Bytes::from(format!("SELECT count(*) FROM {}", crate::ext_names::quoted(name)))).await;
+        if answer.status != 200 {
+            return Err(answered_words(&answer));
+        }
+        let holds: usize = String::from_utf8_lossy(&answer.body).lines().nth(1).and_then(|n| n.parse().ok()).context("its row count is not a number")?;
+        anyhow::ensure!(holds == counted, "{name}: a table of this name is there already, with {holds} rows where its file has {counted}");
+        self.restored(at, name, kept, kept.metadata().get(CREATE_KEY).is_none()).await?;
+        forgotten(store, at).await
+    }
+
+    /// A kept table's counters and defaults, set once its rows are in. A column whose DEFAULT is `nextval('s')` counts in `s`, the
+    /// sequence its counter is kept under (`pondra.counters`), so the lake's sequence of that column is restarted at the counter's
+    /// next value. A table with no CREATE text (`plain`) gets its other DEFAULTs back (`ALTER TABLE … SET DEFAULT`); one the core
+    /// refuses is listed by `unread`, and the table is imported all the same.
+    #[cfg(feature = "lake")]
+    async fn restored(&mut self, at: &object_store::path::Path, name: &str, kept: &Schema, plain: bool) -> anyhow::Result<()> {
+        let counted: BTreeMap<String, counters::Counter> = match kept.metadata().get(COUNTERS_KEY) {
+            Some(json) => serde_json::from_str(json).with_context(|| format!("its {COUNTERS_KEY} note is not a table's counters"))?,
+            None => BTreeMap::new(),
+        };
+        for field in kept.fields() {
+            let Some(default) = field.metadata().get(DEFAULT_KEY) else { continue };
+            if let Some(sequence) = sequence_of(default) {
+                let Some(next) = counted.get(&sequence).and_then(counters::Counter::next) else { continue };
+                let lake = &self.paged.as_ref().context("the page's member on the core's lake is not open")?.app.lake;
+                let lake_sequence = lake.table_meta_if(name).await?.and_then(|m| m.identity.get(field.name()).map(|i| i.sequence.clone()));
+                let lake_sequence = lake_sequence.with_context(|| format!("{name}: its column {} is no identity column", field.name()))?;
+                self.imported_said(&format!("ALTER SEQUENCE {} RESTART WITH {next}", crate::ext_names::quoted(&lake_sequence)), None).await.map_err(|answer| answered_words(&answer))?;
+            } else if plain {
+                let set = format!("ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {default}", crate::ext_names::quoted(name), crate::ext_names::quoted(field.name()));
+                if let Err(answer) = self.imported_said(&set, None).await {
+                    self.unread.push((at.to_string(), format!("its column defaults were not kept (DEFAULT of {}: {})", field.name(), String::from_utf8_lossy(&answer.body))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A kept table's CREATE TABLE text, as the core takes it: named as the file names the table (`pondra.table`: a RENAME keeps
+    /// the name its text had), without OR REPLACE or IF NOT EXISTS, and an ALWAYS identity as BY DEFAULT. The kept rows carry the
+    /// values the identity counted, which ALWAYS refuses (428C9), and the core has no OVERRIDING SYSTEM VALUE to give them.
+    #[cfg(feature = "lake")]
+    fn imported_create(&self, text: &str, name: &str) -> anyhow::Result<String> {
+        use datafusion::sql::sqlparser::ast::GeneratedAs;
+        let DfStatement::Statement(s) = parsed(&self.ctx.state(), text)? else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
+        let SqlStatement::CreateTable(mut c) = *s else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
+        c.name = ObjectName::from(vec![Ident::with_quote('"', name)]);
+        c.or_replace = false;
+        c.if_not_exists = false;
+        for option in c.columns.iter_mut().flat_map(|column| column.options.iter_mut()) {
+            if let ColumnOption::Generated { generated_as, .. } = &mut option.option {
+                if matches!(generated_as, GeneratedAs::Always) {
+                    *generated_as = GeneratedAs::ByDefault;
+                }
+            }
+        }
+        Ok(SqlStatement::CreateTable(c).to_string())
+    }
+
+    /// One statement of an import, through the core's statement path (`lake_said`): `sql` alone, or with `rows` (an Arrow stream
+    /// of the kept rows) as the request's table `KEPT_ROWS`, which the statement reads by name. Its answer, when it isn't 200, is
+    /// the `Err` for the caller to read: the SQLSTATE it failed with, and its words.
+    #[cfg(feature = "lake")]
+    async fn imported_said(&self, sql: &str, rows: Option<&[u8]>) -> Result<(), Answer> {
+        let answer = match rows {
+            Some(rows) => {
+                let head = json!({"sql": sql, "tables": [crate::ext_names::quoted(KEPT_ROWS)]}).to_string();
+                let body = request_body::write(head.as_bytes(), &[rows]);
+                self.lake_said("", &[("content-type".to_string(), request_body::CONTENT_TYPE.to_string())], body).await
+            }
+            None => self.lake_said("", &[], bytes::Bytes::copy_from_slice(sql.as_bytes())).await,
+        };
+        if answer.status == 200 { Ok(()) } else { Err(answer) }
     }
 
     /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`planned`), then the
