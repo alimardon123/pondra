@@ -1216,7 +1216,8 @@ mod tests {
         a.delete(&Path::from("data/t/a")).await.unwrap(); // gives its 10 bytes back to b
         b.put(&Path::from("data/t/b"), bytes(2)).await.unwrap(); // lands now
         b.delete(&Path::from("data/t/b")).await.unwrap();
-        let (x, y) = tokio::join!(a.put(&Path::from("data/t/x"), bytes(3)), b.put(&Path::from("data/t/y"), bytes(4)));
+        let (px, py) = (Path::from("data/t/x"), Path::from("data/t/y")); // (the puts borrow their paths while they race)
+        let (x, y) = tokio::join!(a.put(&px, bytes(3)), b.put(&py, bytes(4)));
         assert_eq!([x.is_ok(), y.is_ok()].iter().filter(|ok| **ok).count(), 1, "racing for the last of the room, one lands");
         assert_eq!(shared.total(), 10, "and the two lakes hold what landed");
     }
