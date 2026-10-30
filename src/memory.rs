@@ -765,6 +765,7 @@ pub async fn set_location(lake: &Lake, database: &str, to: &str) -> anyhow::Resu
     anyhow::ensure!(crate::branch::pins(lake).await?.is_none(), "a branch is made from this database and keeps its files: it moves once no branch is made from it");
     anyhow::ensure!(crate::node::movable(), "this node can't move its lake: it was started without a host that restarts it");
     let to = crate::ddl::full(to)?;
+    crate::ext::owners_only(&to, format!("ALTER DATABASE … SET LOCATION {to}: a path on the server's own disk, which only the node's owner moves a lake into (the `pondra` shell, `pondra sql`, `connect()` of a lake): move it to a bucket (s3://, gs://, az://)"))?; // (the asker's context: `ddl_here` runs in the request)
     crate::backup::apart(lake, &to)?;
     crate::ext::reach_place(lake, &to).await?; // (a bucket: the secret whose scope covers it)
     let dest = crate::store::open_store(&to)?.1;

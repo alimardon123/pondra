@@ -17,10 +17,13 @@ can't undo: a deleted folder, an emptied bucket, a closed account, a region that
 `BACKUP DATABASE TO 'place'` copies this database to `place`, a folder (relative to where the node
 runs) or a URL such as `s3://other-bucket/backups/shop`. The place must be outside the database's
 own folder, and empty the first time: a backup never writes over a folder or a lake of anything else.
-It is an admin's statement, and it works from every door: SQL over HTTP, the Postgres
-port, the clients and the command line.
+Into a bucket it is an admin's statement, and it works from every door: SQL over HTTP, the Postgres
+port, the clients and the command line. A folder is on the node's own disk, so only the node's owner
+backs up into it, as only the owner reads its files: the `pondra` shell, `pondra sql` and `connect()`
+of a lake, which start the node they talk to. Elsewhere it is refused with SQLSTATE `42501`. The
+examples on this page run in `pondra sql`.
 
-```sql
+```sql owner
 CREATE TABLE orders (id BIGINT, item VARCHAR, qty INT);
 INSERT INTO orders VALUES (1, 'tea', 2), (2, 'cake', 1);
 BACKUP DATABASE TO 'backups/shop';
@@ -53,7 +56,7 @@ BACKUP DATABASE TO 's3://acme-backups/shop';
 A second backup to the same place copies only the files written since the first. Files never change
 under their names, so nothing already there is read again.
 
-```sql
+```sql owner
 INSERT INTO orders VALUES (3, 'scone', 4);
 BACKUP DATABASE TO 'backups/shop';
 ```
@@ -62,15 +65,20 @@ Its answer says `"runs": 2`, and `copied` counts only the new objects.
 
 ## Every night
 
-A task runs it on a schedule, like any other statement ([tasks](/pondra/guides/tasks/)):
+A task runs it on a schedule, like any other statement ([tasks](/pondra/guides/tasks/)), as whoever
+made the task: one the owner made backs up into a folder.
 
-<Ways sql={`CREATE TASK nightly_backup SCHEDULE 'cron 0 3 * * * UTC' AS BACKUP DATABASE TO 'backups/shop';`} />
+```sql owner
+CREATE TASK nightly_backup SCHEDULE 'cron 0 3 * * * UTC' AS BACKUP DATABASE TO 'backups/shop';
+```
 
 A backup keeps each run restorable for seven days. Say how long with `WITH (retention_days = n)`; the
 backup keeps the last number it was given. Files no run within that time needs are deleted from the
 backup by a later run.
 
-<Ways sql={`BACKUP DATABASE TO 'backups/shop' WITH (retention_days = 30);`} />
+```sql owner
+BACKUP DATABASE TO 'backups/shop' WITH (retention_days = 30);
+```
 
 ## Read a backup
 
@@ -97,9 +105,11 @@ shop_backup` makes a database you can write, with nothing copied ([branches](/po
 
 `RESTORE DATABASE name FROM 'place'` copies the backup's newest run into a new database, beside this
 one (or at `LOCATION 'dir'`), and attaches it as `name`. `AT (TIMESTAMP => '…')` restores the newest
-run at or before that time, in UTC, instead.
+run at or before that time, in UTC, instead. From a folder it is the owner's, as a backup into one is.
 
-<Ways sql={`RESTORE DATABASE shop_restored FROM 'backups/shop';`} />
+```sql owner
+RESTORE DATABASE shop_restored FROM 'backups/shop';
+```
 
 <Ways sql={`SELECT count(*) AS orders FROM shop_restored.orders;`} />
 
