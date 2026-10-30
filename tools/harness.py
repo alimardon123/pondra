@@ -10390,21 +10390,22 @@ def guarded():
     ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
     ask(P + 2, "CREATE USER chief PASSWORD 'chief-password-1' SUPERUSER", auth="Bearer adm")
     w = "Bearer w"
-    # (x-pondra-as, a forwarded change's user, only narrows: a read or write token acting as a superuser keeps its own role)
+    # (x-pondra-as, a forwarded change's user, is the nodes' alone and only to /cluster/*: any other caller is itself, never
+    # acting or recorded as a user; and it only narrows)
     chief = {"x-pondra-as": "chief"}
     acting = {
         "a read token as a superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer rd", headers=chief),
         "…making a superuser": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth="Bearer rd", headers=chief),
         "a write token as a superuser, making one": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth=w, headers=chief),
         "…its writes still made": ask(P + 2, "INSERT INTO t VALUES (2)", auth=w, headers=chief),
-        "the admin token as the superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
+        "the admin token as the superuser, off /cluster/*": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
     }
     info["acting as"] = acting
-    checks["a token acting as a user (x-pondra-as) keeps its own role: a read or write token never makes a superuser"] = \
-        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" \
+    checks["x-pondra-as is the nodes' alone, to /cluster/*: a read or write token is itself (never a superuser, never named as one), and the admin token elsewhere"] = \
+        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" and acting["a read token as a superuser"].get("user") == "reader" \
         and "ERROR" in str(acting["…making a superuser"]) and "ERROR" in str(acting["a write token as a superuser, making one"]) \
         and not str(acting["…its writes still made"]).startswith("ERROR") \
-        and isinstance(acting["the admin token as the superuser"], dict) and acting["the admin token as the superuser"].get("superuser") is True
+        and isinstance(acting["the admin token as the superuser, off /cluster/*"], dict) and acting["the admin token as the superuser, off /cluster/*"].get("user") == "admin"
     said = {
         "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
         "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),

@@ -257,15 +257,7 @@ async fn take_here(to: &str, t: Take) -> Result<Value> {
         Ok(())
     })
     .await?;
-    let marks = Marks(crate::panics::task({
-        let (store, n) = (store.clone(), term.n);
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let _ = crate::terms::mark_alive(&store, n).await;
-            }
-        }
-    }));
+    let marks = Marks(crate::terms::mark_every(store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
     let out = match Lake::open(to, true, false).await {
         Ok(lake) => {
             let run = AssertUnwindSafe(take_led(&lake, t, term.n)).catch_unwind().await;

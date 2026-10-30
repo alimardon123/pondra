@@ -115,7 +115,7 @@ crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomi
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
-/// cluster's own calls may say it (`Principal::operator`), and it only narrows what they may do.
+/// cluster's own calls may say it (the nodes' key or the admin token, to `/cluster/*`), and it only narrows what they may do.
 pub const AS_USER: &str = "x-pondra-as";
 
 /// The user the request being served is for, when its work goes on elsewhere (None: not a user's).

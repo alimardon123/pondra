@@ -47,6 +47,9 @@ fn unsnappy(data: &[u8], most: u64) -> Result<Vec<u8>> {
 
 // ---------------------------------------------------------------- encoding
 
+/// The most entries a request's (or a response's) array may have (`Rd::len`).
+pub(crate) const ENTRIES: usize = 100_000;
+
 pub(crate) struct Rd {
     pub(crate) b: Bytes,
     pub(crate) at: usize,
@@ -62,8 +65,14 @@ impl Rd {
     pub(crate) fn i16(&mut self) -> Result<i16> { Ok(i16::from_be_bytes(self.take(2)?.try_into()?)) }
     pub(crate) fn i32(&mut self) -> Result<i32> { Ok(i32::from_be_bytes(self.take(4)?.try_into()?)) }
     pub(crate) fn i64(&mut self) -> Result<i64> { Ok(i64::from_be_bytes(self.take(8)?.try_into()?)) }
-    /// An array's length (a null array reads as empty).
-    pub(crate) fn len(&mut self) -> Result<usize> { Ok(self.i32()?.max(0) as usize) }
+    /// An array's length (a null array reads as empty): at most `ENTRIES`, and never more entries than bytes left, so
+    /// what a request's arrays make is as big as the request at most, however they nest (a 128 MB frame of names made
+    /// a gigabyte: the 10-30 audit).
+    pub(crate) fn len(&mut self) -> Result<usize> {
+        let n = self.i32()?.max(0) as usize;
+        ensure!(n <= ENTRIES && n <= self.b.len() - self.at, "an array of {n} entries (at most {ENTRIES}, and what the request holds)");
+        Ok(n)
+    }
     pub(crate) fn nstr(&mut self) -> Result<Option<String>> {
         let n = self.i16()?;
         Ok(if n < 0 { None } else { Some(String::from_utf8(self.take(n as usize)?.to_vec())?) })
@@ -140,3 +149,21 @@ pub(crate) fn put_uvarint(w: &mut Vec<u8>, mut v: u64) {
 pub(crate) fn put_varint(w: &mut Vec<u8>, v: i64) { put_uvarint(w, ((v << 1) ^ (v >> 63)) as u64) }
 
 pub(crate) fn crc32c(data: &[u8]) -> u32 { crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, data) as u32 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_arrays_count_is_bounded_by_what_follows_and_by_entries() {
+        let rd = |n: i32, rest: usize| {
+            let mut b = n.to_be_bytes().to_vec();
+            b.extend(vec![0u8; rest]);
+            Rd { b: b.into(), at: 0 }
+        };
+        assert_eq!(rd(3, 12).len().unwrap(), 3);
+        assert_eq!(rd(-1, 0).len().unwrap(), 0, "a null array");
+        assert!(rd(22_000_000, 100).len().is_err(), "more entries than bytes left");
+        assert!(rd(ENTRIES as i32 + 1, ENTRIES + 1).len().is_err(), "past the limit");
+    }
+}
