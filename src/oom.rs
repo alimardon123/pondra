@@ -26,9 +26,9 @@ pub const OOM: &str = "out of memory: the node was nearly out of memory and stop
 /// What a query the page's watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory"): the page's words, as `OOM` is the node's.
 pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
-/// How long a stop holds the watch: the node's allocator gives freed pages back over about ten
-/// seconds (`main.rs`), so resident memory falls after a stop, and a second stop would be for memory
-/// the first one already let go.
+/// How long a stop holds the watch while the node stays over its line: the node's allocator gives freed
+/// pages back over about ten seconds (`main.rs`), so resident memory falls after a stop, and a second stop
+/// would be for memory the first one already let go. Once under the line, nothing holds.
 const HOLD: Duration = Duration::from_secs(10);
 
 /// How long a request must have run to be stopped: one that has only just started did not grow the
@@ -189,8 +189,20 @@ pub fn start() {
                 }
             }
             if let Some(line) = line {
+                if pending(last_stop, felt, line, now) {
+                    // A stopped query's memory goes back to the allocator as its tasks drop, and from there to the system
+                    // over ten seconds: handed back now, the node is under its line again before the next query comes
+                    // (stopped median, then string_agg at once: killed with the stop's memory still resident, B50 10-31).
+                    purge();
+                    felt = crate::store::resident().unwrap_or(felt);
+                    SEEN.store(felt, Relaxed);
+                    crate::panics::note(felt);
+                }
                 if felt < line {
                     said = false;
+                    // (under the line, the stop's memory has gone: a query that passes it now grew it, and is stopped,
+                    // though the stop was under ten seconds ago; held, the next heavy query was killed, B50 10-31)
+                    last_stop = None;
                 }
                 if due(last_stop, felt, line, now) {
                     let mb = |bytes: usize| bytes >> 20;

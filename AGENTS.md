@@ -2842,7 +2842,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
    the oldest. `oom::Meter` reads jemalloc's own thread counters around each poll, and DataFusion's spawned tasks are
    metered too (its join-set tracer, `oom::start`), so nothing is counted per allocation. Its future is dropped, it
-   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s while the node stays past its line, and at each look then the freed pages go back to the system at once; under the line nothing holds (held 10 s whatever came next, the next heavy query was killed: `logs/round36/bigger-than-memory/` `watch.py`). A group's `string_agg` tells the pool what its string holds and is refused by name past an eighth of a partition's share (`string_agg.rs`). The cluster's own
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
