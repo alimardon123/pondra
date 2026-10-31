@@ -144,6 +144,13 @@ impl Exact {
         for &v in rest {
             add(&mut hi[0], &mut lo[0], sign * v);
         }
+        if hi.iter().any(|h| !h.is_finite()) {
+            // (a lane went past f64's range where adding in order may not, as 1e308, -1e308 twice: the values again, in order)
+            for &v in values {
+                add(&mut self.hi, &mut self.lo, sign * v);
+            }
+            return;
+        }
         for (&h, &l) in hi.iter().zip(&lo) {
             add_partial(&mut self.hi, &mut self.lo, h, l);
         }
@@ -347,6 +354,7 @@ mod tests {
             ("overflow in one lane, 64 values", overflow64),
             ("one inf among finite values", inf_in_middle),
             ("inf and -inf", vec![INF, 1.0, -INF]),
+            ("lanes past the range, in order within it", [1e308, -1e308, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].repeat(2)),
         ];
         for (name, values) in cases {
             let expect = one_by_one(&values);
