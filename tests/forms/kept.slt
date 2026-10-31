@@ -88,6 +88,19 @@ WAIT FOR p
 statement error 0A000 1\.1
 CREATE PIPELINE p (day DATE) SCHEDULE '1 hour' AS BEGIN STEP a AS SELECT $day; END
 
+# The AI types kept free for after 1.0 (designs/ai-data-plan.md): a vector is FLOAT[] until then.
+statement error 0A000 after 1\.0
+CREATE TABLE v (e VECTOR(3))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (e HALFVEC(768))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (e SPARSEVEC(30000))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (x TENSOR(FLOAT, 3, 224, 224))
+
 statement ok
 CREATE TABLE pipeline (a INT)
 
