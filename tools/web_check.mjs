@@ -1036,12 +1036,8 @@ async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
 
 // A CORS preflight, which a browser sends before a request CORS doesn't let through alone (a suffix Range is one).
 function answerPreflight(res, cors) {
-  // (If-Match: a read of the lake's files by the page's member sends it, and a browser's preflight asks leave for it.
-  // This server doesn't compare it: it answers the file's bytes whatever the etag. PROPFIND and Depth are a folder's
-  // listing, which a browser asks leave for too: this server answers it 405, as it does in Node, where no preflight is sent.)
-  res.writeHead(204, {
-    ...cors, 'Access-Control-Allow-Methods': 'GET, HEAD, PROPFIND', 'Access-Control-Allow-Headers': 'Range, If-Match, Depth',
-  });
+  // (The page's reads are a GET or HEAD with a Range, as fetch.rs makes them: nothing else crosses the origin.)
+  res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, HEAD', 'Access-Control-Allow-Headers': 'Range' });
   res.end();
 }
 
