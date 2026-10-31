@@ -1347,6 +1347,7 @@
    "reads Utf8",
    "expectations Int64",
    "late_rows Int64",
+   "error Utf8",
    "definition Utf8"
   ],
   "pondra.grants": [

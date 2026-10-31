@@ -131,6 +131,8 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_TXN_IDLE_SECS", Node),
     ("PONDRA_USER_QUERIES", Node),
     ("PONDRA_USER_TIMEOUT", Node),
+    ("PONDRA_VIEW_RUNS", Node),
+    ("PONDRA_VIEW_RUN_SECS", Node),
     ("PONDRA_WEB_ORIGINS", Node),
     ("PONDRA_WEB_SEND_MB", Node),
     ("PONDRA_WORKER_IDLE_SECS", Node),
