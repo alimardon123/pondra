@@ -189,7 +189,9 @@ pub fn start() {
                 }
             }
             if let Some(line) = line {
-                if pending(last_stop, felt, line, now) {
+                // (a request stopped and not gone yet is still letting its memory go: no other is stopped for that memory)
+                let winding = crate::panics::stopping();
+                if pending(last_stop, felt, line, now) || winding {
                     // A stopped query's memory goes back to the allocator as its tasks drop, and from there to the system
                     // over ten seconds: handed back now, the node is under its line again before the next query comes
                     // (stopped median, then string_agg at once: killed with the stop's memory still resident, B50 10-31).
@@ -210,7 +212,7 @@ pub fn start() {
                         crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
                         eprintln!("stopped a query: the node held {} MB, its line {} MB (PONDRA_MEMORY_MAX_GB)", mb(felt), mb(line));
                         last_stop = Some(now);
-                    } else if !std::mem::replace(&mut said, true) {
+                    } else if !winding && !std::mem::replace(&mut said, true) {
                         // (nothing to stop yet: a request old enough that grew the node is stopped at a later look,
                         // so no hold starts here; the line is said once per stretch over the line)
                         eprintln!("the node holds {} MB, past its line {} MB, and no query grew it", mb(felt), mb(line));
@@ -425,8 +427,14 @@ impl Running {
 /// most, if that is at least `margin`: the request that grew the node. Otherwise the oldest, as before: the
 /// growth was elsewhere (an operator that doesn't count what it holds, or no counters at all), and age is
 /// then all there is to go on. None when no request qualifies. Of requests that tie, the lower id (the
-/// map's first) is the older, and is taken.
+/// map's first) is the older, and is taken. None too while a request stopped before is still running: it goes
+/// at its next poll, and until then it may still be growing the node (its answer's last steps run in one poll),
+/// so the memory over the line is still its own. (Under the line for a moment after its stop and over it again
+/// before it had gone, the watch stopped the older cheap request beside it, by age: CI, 10-31.)
 pub fn pick(running: &std::collections::BTreeMap<u64, Running>, now: Instant, resident: usize, margin: usize) -> Option<u64> {
+    if running.values().any(|r| r.stopped) {
+        return None;
+    }
     let fit: Vec<(&u64, &Running)> = running
         .iter()
         .filter(|(_, r)| r.stop.is_some() && !r.stopped)
@@ -516,8 +524,10 @@ mod tests {
         let now = start + Duration::from_secs(5);
         let young = req(now - Duration::from_millis(150), 0);
         assert_eq!(pick(&runs(vec![(1, young)]), now, LINE, MARGIN), None, "just started");
-        let stopped = Running { stopped: true, ..req(start, 0) };
-        assert_eq!(pick(&runs(vec![(2, stopped)]), now, LINE, MARGIN), None, "already stopped");
+        let stopped = || Running { stopped: true, ..req(start, 0) };
+        assert_eq!(pick(&runs(vec![(2, stopped())]), now, LINE, MARGIN), None, "already stopped");
+        let cheap = req(start, 0); // (the oldest, which age alone would pick)
+        assert_eq!(pick(&runs(vec![(1, cheap), (2, stopped())]), now, LINE, MARGIN), None, "one stopped is still going: its memory, not another's");
         let not = Running { stop: None, ..req(start, 0) };
         assert_eq!(pick(&runs(vec![(3, not)]), now, LINE, MARGIN), None, "not stoppable");
         let near = || (4, req(start, LINE - MARGIN / 2));
