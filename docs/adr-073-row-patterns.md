@@ -157,6 +157,9 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
    - The view takes a lake table read directly, with a projection and a `WHERE` around the
      pattern, one ascending time column in `ORDER BY`, and no `$`, `^`, `NEXT`, `WITH UNMATCHED
      ROWS` or volatile function; anything else is refused `0A000` with what to write.
+   - A search that never ends: without `WITHIN`, a search a row can always extend (as `(a b* c)` with no `c`) holds its
+     key's rows until it is decided; past `PONDRA_MATCH_HELD_ROWS` (1,000,000) rows of one key the view stops with 54000,
+     and the node's log names the key. Give the pattern a `WITHIN`.
 
 9. **Per-partition watermarks** come with L4's Kafka partitions (round 36). A feed commits each
    partition's newest event time with its offsets (`feeds::shard`), and `views::newest` takes the
