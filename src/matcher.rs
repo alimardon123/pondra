@@ -2973,7 +2973,7 @@ mod tests {
     fn open_of(spec: &str, rows: &[Vec<usize>], k: usize, m: i64) -> Result<(Vec<String>, Marker)> {
         let plan = compile(spec)?;
         let cond = conds(rows, plan.syms.len());
-        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
         let (found, marker) = partition_open(&plan, &part, &OpenArgs { k, m, low: None, kernel: None })?;
         Ok((texts(&plan, &found), marker))
     }
@@ -3068,7 +3068,7 @@ mod tests {
         let args = OpenArgs { k: 0, m: 0, low: kernel.low(watermark + 1)?, kernel: Some(kernel) };
         let cond = vec![vec![true, false], vec![false, true]];
         let within = within_of(&time, &interval)?;
-        let part = Part { cond: &cond, within: Some(&within), n: 2, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &cond, within: Some(&within), n: 2, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
         let (_, marker) = partition_open(&plan, &part, &args)?;
         assert_eq!(marker, Marker { keep: 2, k: 0, next_m: 0, due: Some(micros(2026, 3, 1, 0, 0) - 1) });
         Ok(())
@@ -3212,14 +3212,14 @@ mod tests {
         };
         let plain_cond = cond(0, n);
         let plain_within = within(0, n)?;
-        let part = Part { cond: &plain_cond, within: plain_within.as_ref(), n, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &plain_cond, within: plain_within.as_ref(), n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
         let Ok(plain) = partition(&plan, &part) else { return Ok(None) };
         let mut checked = 0;
         for c in 1..n {
             // the first run sees rows 0..c; every later row is after the watermark, which is one tick before row c
             let first_cond = cond(0, c);
             let first_within = within(0, c)?;
-            let first_part = Part { cond: &first_cond, within: first_within.as_ref(), n: c, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+            let first_part = Part { cond: &first_cond, within: first_within.as_ref(), n: c, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
             let first_args = OpenArgs { k: 0, m: 0, low: low(times[c] - 1)?, kernel: kernel.clone() };
             let (first, marker) = partition_open(&plan, &first_part, &first_args)?;
             // the second run sees the rows the first keeps, then rows c..n, from the marker's look-back and match count
@@ -3227,7 +3227,7 @@ mod tests {
             let len = n - base;
             let second_cond = cond(base, n);
             let second_within = within(base, n)?;
-            let second_part = Part { cond: &second_cond, within: second_within.as_ref(), n: len, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+            let second_part = Part { cond: &second_cond, within: second_within.as_ref(), n: len, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
             let second_args = OpenArgs { k: marker.k as usize, m: marker.next_m, low: low(times[n - 1])?, kernel: kernel.clone() };
             let (second, end) = partition_open(&plan, &second_part, &second_args)?;
             // the second run's resume point, in the partition's rows: its look-back start plus the rows before its look-back
