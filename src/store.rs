@@ -1244,6 +1244,18 @@ impl Lake {
 
     /// `open`, a reader polling the bucket every `poll` (`READER_POLL`, or `READER_ONE_SNAPSHOT` for a guest's one statement).
     pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration) -> Result<Arc<Lake>> {
+        Self::open_with(url, writer, streamed, poll, None).await
+    }
+
+    /// A reader of the lake at `url` (a memory URL whose store is given: `memory::give`) whose catalog is `kv`, a node's
+    /// over `kv::remote` for a joined page (designs/l2-page-joins-cluster.md, J5). Nothing polls `kv`, and the lake's torn
+    /// move is not checked here: the node that serves the catalog checks it.
+    pub(crate) async fn open_on(url: &str, streamed: bool, kv: Arc<dyn Kv>) -> Result<Arc<Lake>> {
+        Self::open_with(url, false, streamed, READER_POLL, Some(kv)).await
+    }
+
+    /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
+    async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
@@ -1269,6 +1281,7 @@ impl Lake {
         // The catalog's own files go on the SSD tier too (next to the lake's objects), so catalog
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
         let cache_dir = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
+        let check_torn = given.is_none();
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
@@ -1277,19 +1290,24 @@ impl Lake {
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0).await?
                 }
-                false => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
-                    Ok(cat) => cat,
-                    // (no catalog at all: say so, rather than the database's own words for it)
-                    Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
-                        None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
-                        Some(_) => return Err(e),
+                // (a given catalog is a node's: no bucket to wait for, and the store a page holds lists nothing under `catalog/`,
+                // so `opened`'s listing after 3 s would fail a slow open)
+                false => match given {
+                    Some(kv) => Catalog::reader(kv, streamed).await?,
+                    None => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
+                        Ok(cat) => cat,
+                        // (no catalog at all: say so, rather than the database's own words for it)
+                        Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+                            None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
+                            Some(_) => return Err(e),
+                        },
                     },
                 },
             })
         };
         // (the place's torn check runs beside the catalog's opening, so a bucket pays no extra round trip; `join`
         // and not `try_join`: a failure of one must not drop the other half way, with SlateDB's tasks still running)
-        let (torn, cat) = tokio::join!(crate::memory::refuse_torn(&store, &url), opening);
+        let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
@@ -3084,6 +3102,54 @@ mod tests {
         }
         assert!(gone.upgrade().is_none(), "the lake is still held");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A joined page's reader (`open_on`): its catalog is the kv it is given (a node's, over `kv::remote`), and its tables
+    /// are listed from that. Here the kv holds a folder lake's catalog as the writer sees it, and the folder is the files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_on_lists_the_tables_of_the_catalog_it_is_given() -> Result<()> {
+        /// A catalog that holds what it was given and takes no writes, as a node's catalog reads to a joined page.
+        struct Given(BTreeMap<String, Bytes>);
+        #[async_trait::async_trait]
+        impl Kv for Given {
+            async fn get(&self, key: &str, _: bool) -> Result<Option<Bytes>, kv::Error> {
+                Ok(self.0.get(key).cloned())
+            }
+            async fn scan(&self, range: std::ops::Range<Vec<u8>>, _: bool) -> Result<BTreeMap<String, Bytes>, kv::Error> {
+                Ok(self.0.iter().filter(|(k, _)| range.contains(&k.as_bytes().to_vec())).map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
+            fn is_writer(&self) -> bool {
+                false
+            }
+            async fn write(&self, _: &[(String, Bytes)], _: &[String]) -> Result<Arc<dyn Written>, kv::Error> {
+                Err(kv::Error::new(false, "a joined page's catalog takes no writes"))
+            }
+            async fn checkpoint(&self) -> Result<(), kv::Error> {
+                Ok(())
+            }
+            async fn close(&self) -> Result<(), kv::Error> {
+                Ok(())
+            }
+            fn cached(&self) -> usize {
+                0
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
+        let folder = dir.to_str().unwrap().to_string();
+        let writer = Lake::open(&folder, true, false).await?;
+        crate::write::create_table(&writer, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
+        let copied = writer.cat.kv.scan(b"".to_vec()..vec![0xff], false).await?;
+        assert!(copied.contains_key(&table_key("t")), "the writer's catalog holds its table");
+
+        let reader = Lake::open_on(&folder, false, Arc::new(Given(copied))).await?;
+        let tables = reader.cat.scan::<TableMeta>("t/", "t0").await?;
+        assert_eq!(tables.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec![table_key("t").as_str()]);
+
+        reader.cat.close().await?;
+        writer.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

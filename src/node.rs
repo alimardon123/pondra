@@ -576,14 +576,14 @@ pub fn unclaim_page() {
 }
 
 /// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
-/// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it.
+/// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it. `term` is the
+/// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
 pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()> }
 
-/// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
-/// queries holding the page's share of its device's `line` (`env::device_line`). A freed page's member may still be closing in
-/// the background, which sets PAGED back when it has ended: then this waits for it, 10 ms at a time, for 30 s at most, and is
-/// refused 55006 after that. Set back if the open fails.
-pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
+/// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
+/// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
+/// it, 10 ms at a time, for 30 s at most, and is refused 55006 after that.
+async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
     // (`swap` checks and sets at once, so two opens can't both take it)
     let mut sleeps = 0;
     while PAGED.swap(true, SeqCst) {
@@ -594,6 +594,13 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
+    Ok(())
+}
+
+/// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
+/// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
+    claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
     let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
@@ -639,10 +646,75 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, lake: Option<Arc<crate::st
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
     }
-    crate::terms::release(store, term).await;
+    if term > 0 {
+        crate::terms::release(store, term).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
+    }
     crate::memory::forget_memory(url);
     crate::reset::reset();
     PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
+}
+
+/// Opens a joined page's member (`Paged`): a read-only follower of the lake the cluster at `node` leads (designs/
+/// l2-page-joins-cluster.md, J5). Its catalog is the node's (`kv::remote`, under the sign-in `auth`), its files are read from
+/// `store` (the node's lake files through its door), and its commit stream is followed (`members::follow`), with a refresh every
+/// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
+/// it changes nothing there.
+#[allow(dead_code)] // (J5b's `Page.join` is the first to call it)
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
+    claim_paged(line).await?;
+    let url = crate::memory::place(":memory:");
+    crate::memory::give(&url, store);
+    let store = crate::memory::store(&url);
+    let node = node.trim_end_matches('/').to_string();
+    let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));
+    let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
+    let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
+    let start = Start::default();
+    let mut lake = None;
+    let made = async {
+        let l = crate::store::Lake::open_on(&url, true, kv).await?;
+        lake = Some(l.clone());
+        start_app(l, members, None, &start).await
+    }
+    .await;
+    match made {
+        Ok(app) => {
+            let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
+            let (http, auth) = (reqwest::Client::new(), auth.to_string());
+            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
+            let said = ended.clone();
+            let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
+                let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
+                Box::pin(async move {
+                    match crate::fetch::send(http.get(url).header(reqwest::header::AUTHORIZATION, auth)).await {
+                        Ok(r) if r.status().is_success() => Ok(r),
+                        // (the sign-in ended: the stream is not followed again)
+                        Ok(r) if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status());
+                            said.store(true, SeqCst);
+                            Err(crate::members::Open::Stop)
+                        }
+                        _ => Err(crate::members::Open::Retry),
+                    }
+                })
+            };
+            panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}));
+            panics::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let Some(live) = refreshing.upgrade().filter(|_| !ended.load(SeqCst)) else { return };
+                    if let Err(e) = live.refresh().await {
+                        eprintln!("refreshing the joined lake's catalog: {e:#}");
+                    }
+                }
+            });
+            Ok(Paged { app, url, term: 0, marks })
+        }
+        Err(e) => {
+            end_page(marks, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
+            Err(e)
+        }
+    }
 }
 
 impl Paged {
