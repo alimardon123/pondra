@@ -421,7 +421,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
 /// UPDATE, DELETE or MERGE: what changes, worked out as for a lake table, shaped for the table's rules, applied here.
 async fn change(app: &App, s: &str, name: &str, stmt: &Stmt) -> Result<Value> {
     let (meta, rules) = SESSIONS.lock().unwrap().get(s).and_then(|x| x.tables.get(name)).map(|t| (t.meta.clone(), t.rules.clone())).with_context(|| format!("no temporary table {name}"))?; // (its key: an ON CONFLICT without a column list is on it)
-    let (old, new) = crate::change::rows_of(&app.lake, name, &meta, stmt, app.lake.visible()).await?;
+    let (old, new) = crate::change::rows_of(&app.lake, name, &meta, &rules, stmt, app.lake.visible()).await?;
     let count = |b: &[RecordBatch]| b.iter().map(|b| b.num_rows()).sum::<usize>();
     let inserted: usize = new.iter().map(|b| b.column_by_name(crate::text::ROW_ID).map_or(b.num_rows(), |c| c.null_count())).sum();
     let (replaced, added) = (count(&old), count(&new));

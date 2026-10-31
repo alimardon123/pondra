@@ -268,6 +268,23 @@ pub async fn shape<H: Host>(t: &Arc<Table>, name: &str, rows: Rows, how: How, ho
     Ok(Shaped { rows, table: t.clone() })
 }
 
+/// A keyed table's change as `Shaped` rows: `rows`, which `shape` made for `t` (a change's new rows, `How::Change`), and `gone`,
+/// the old rows the change marks deleted, which `shape` never saw (`change::upserts_shaped`). Each `gone` batch is written
+/// through `typed::as_held`, as `shape` writes a row's held forms, so the log holds the markers as the table would. No marker
+/// is exempt from it, though `checks` exempts markers from NOT NULL and CHECK: a row written before 6abfd77 keeps its jsonb
+/// text as it was written, so a marker can hold a form that `as_held` would change, or refuse. Only the markers' jsonb columns
+/// are rewritten; the new rows are as `shape` left them. Batches conform to the first one's schema, as `change::upserts` makes them.
+#[cfg(feature = "lake")]
+pub(crate) fn with_markers(t: &Arc<Table>, rows: Vec<RecordBatch>, gone: Vec<RecordBatch>) -> Result<Shaped> {
+    let mut all = rows;
+    for g in gone {
+        all.push(typed::as_held(t, g, true)?);
+    }
+    let Some(s) = all.first().map(|b| b.schema()) else { bail!("a change with no rows") };
+    let conformed = all.iter().map(|b| fit::conform(b, &s)).collect::<Result<Vec<_>>>()?;
+    Ok(Shaped { rows: datafusion::arrow::compute::concat_batches(&s, &conformed)?, table: t.clone() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,5 +549,33 @@ mod tests {
         let err = checks(&t, "s.t", &stored(vec![None]), false, &base).err().expect("NOT NULL");
         assert_eq!(crate::codes::of(&err), "23502");
         assert_eq!(crate::codes::words(&err), "s.t.n is NOT NULL, and a row gives it no value");
+    }
+
+    #[cfg(feature = "lake")]
+    #[test]
+    fn a_marker_is_written_as_held_and_the_rows_beside_it_are_as_shaped() {
+        let j = Column { held: Some("jsonb".into()), ..plain("j") };
+        let t = Arc::new(table(&["id"], vec![(plain("id"), DataType::Int64), (j, DataType::Utf8)], &[]));
+        let rows = batch(vec![("id", ints(&[Some(1)])), ("j", texts(&[Some(r#"{"a": 1, "b": 2}"#)])), ("_deleted", bools(&[false]))]);
+        // (a row written before 6abfd77: its jsonb text is not the form jsonb writes)
+        let gone = batch(vec![("id", ints(&[Some(2)])), ("j", texts(&[Some(r#"{"b":2,"a":1}"#)])), ("_deleted", bools(&[true]))]);
+        let out = with_markers(&t, vec![rows], vec![gone]).unwrap();
+        assert!(Arc::ptr_eq(out.table(), &t), "the rows are shaped for the table they went in with");
+        assert_eq!(out.rows().num_rows(), 2);
+        let j = out.rows().column_by_name("j").unwrap().as_string::<i32>();
+        assert_eq!(j.iter().collect::<Vec<_>>(), vec![Some(r#"{"a": 1, "b": 2}"#), Some(r#"{"a": 1, "b": 2}"#)]);
+        let deleted = out.rows().column_by_name("_deleted").unwrap().as_boolean();
+        assert_eq!(deleted.iter().collect::<Vec<_>>(), vec![Some(false), Some(true)]);
+    }
+
+    #[cfg(feature = "lake")]
+    #[test]
+    fn a_marker_holding_what_jsonb_refuses_is_refused_as_a_row_is() {
+        let j = Column { held: Some("jsonb".into()), ..plain("j") };
+        let t = Arc::new(table(&["id"], vec![(plain("id"), DataType::Int64), (j, DataType::Utf8)], &[]));
+        let gone = batch(vec![("id", ints(&[Some(2)])), ("j", texts(&[Some(r#"{"a":"#)])), ("_deleted", bools(&[true]))]);
+        let err = with_markers(&t, vec![], vec![gone]).err().expect("a marker's jsonb that is not JSON");
+        assert_eq!(crate::codes::of(&err), "22P02");
+        assert!(crate::codes::words(&err).contains("(column j holds jsonb)"), "{}", crate::codes::words(&err));
     }
 }
