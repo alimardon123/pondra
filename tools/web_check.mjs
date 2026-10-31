@@ -625,6 +625,18 @@ async function keptChecks(page, lake) {
   const noFile = await ask('kept: PUT with If-Match on a missing file', 'PUT', '/files/nothere.csv', { 'If-Match': '"v"' }, 'x\n', 'kept');
   if (noFile) judge('kept: PUT with If-Match on a missing file', noFile, { status: 412, sqlstate: null, type: TEXT });
 
+  // (b2) Two creates of one new file at once: the second finds the first's file, so one answers 200 and the other 409, and
+  // the file is the 200's body. The page's lock on the object makes the check and the write one step.
+  const raced = ['id\n1\n', 'id\n2\n'];
+  const race = await page.evaluate(async (bodies) => {
+    const enc = new TextEncoder();
+    const outs = await Promise.all(bodies.map((text) => window.kept.request('PUT', '/files/race.csv', {}, enc.encode(text))));
+    const got = await window.kept.request('GET', '/files/race.csv', {}, null);
+    return { statuses: outs.map((out) => out.status), text: new TextDecoder().decode(got.body) };
+  }, raced);
+  same('kept: two creates of one file at once', JSON.stringify(race.statuses.slice().sort((a, b) => a - b)), '[200,409]');
+  same('kept: the create that answered 200 is the file', race.text, raced[race.statuses.indexOf(200)]);
+
   // (c) A reload: the page's script runs again, and the kept page is made again from its folder.
   await page.reload({ waitUntil: 'commit' });
   await untilStarted(page);
