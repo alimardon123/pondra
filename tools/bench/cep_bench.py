@@ -18,8 +18,8 @@ Flink has no PREV, so its LAST(var, 1) stands for it. The first pattern, ending 
                 are the target of the view.
   pondra_view   dips: that query WITH (lateness = '0 seconds') … EMIT FINAL, fed by the 10 commits. Timed from the first
                 commit until its count equals the plain query's, polled every 0.2 s, 300 s at most.
-  flink         the query into a blackhole sink, submit to end (median of three), and into a CSV folder, whose rows are
-                the matches: their count, and the comparison.
+  flink         the query into a blackhole sink, submit to end (median of three), and its rows collected into a CSV
+                file, which are the matches: their count, and the comparison (PyFlink's collect is slow, ~300 rows/s).
   flink.scan_s  Flink's read alone: the same ticks table into a blackhole with no pattern, timed the same way (the time
                 Flink takes to read the file, of the flink time above).
   compare       the matches as sets of (symbol, start_ts, end_ts): the view, the plain query, a scan of the rows (model),
