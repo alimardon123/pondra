@@ -923,11 +923,12 @@ fn failing_of(key: &(String, String), of: &str) -> Option<String> {
     RUNS.lock().unwrap().get(key).filter(|run| run.of == of).and_then(|run| run.failed.failing())
 }
 
-/// Which view of its name `v` is: the id it was made with (its pattern's, its rerun's or its fill's), else its query (a
-/// session view, a stream join, a view made before Pondra 0.21: none has an id). A view made again under the same name has
-/// another, unless it is one without an id made again with the same query, which may keep the old one's failures.
+/// Which view of its name `v` is: the id it was made with (its rerun's first, as rerun's runs know it by: `rerun::turn`;
+/// else its pattern's or its fill's), else its query (a session view, a stream join, a view made before Pondra 0.21: none
+/// has an id). A view made again under the same name has another, unless it is one without an id made again with the same
+/// query, which may keep the old one's failures.
 pub(crate) fn identity(v: &View) -> &str {
-    v.matches.as_ref().map(|m| m.id.as_str()).or(v.rerun.as_ref().map(|r| r.id.as_str())).or(v.fill.as_ref().map(|f| f.id.as_str())).unwrap_or(v.sql.as_str())
+    v.rerun.as_ref().map(|r| r.id.as_str()).or(v.matches.as_ref().map(|m| m.id.as_str())).or(v.fill.as_ref().map(|f| f.id.as_str())).unwrap_or(v.sql.as_str())
 }
 
 /// Why view `view`'s runs on `lake` keep failing, if they do: `pondra.flows`' `error`. `of`: the view's `identity`.

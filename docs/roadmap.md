@@ -96,7 +96,8 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
 - **F, streaming and flows:** timers, Top-N per key,
   as-of joins in views that wait for the looked-up table, a view's state split by key ranges;
   `avg`, `count(DISTINCT)`, outer joins kept up in flows, and views refreshed whole when they can't
-  be (`WITH (refresh = …)`).
+  be (`WITH (refresh = …)`); a pattern view that resumes a search held open from its saved threads, so a run
+  reads the new rows only, not the search's held rows again.
 - **F, distributed and storage:** adaptive stages, raced stragglers, a `LIMIT` in a subquery,
   order-keeping shuffles, hot keys on both sides, keyed compaction by key range.
 - **I1:** extensions (ADR-075, accepted; replaces ADR-031 and ADR-035 §6): one `INSTALL` line,
