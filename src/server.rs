@@ -365,7 +365,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     // tables, acks and beats). Checked before `AS_USER`, which makes a node's call its user's)
     if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) {
         let why = "this route is the nodes' own: a user's sign-in, a superuser's too, reaches the cluster's routes only for a branch's pin";
-        crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await;
+        crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await; // (audited, as every refusal is)
         return (StatusCode::FORBIDDEN, why).into_response();
     }
     // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. Only from the nodes (their key, the
