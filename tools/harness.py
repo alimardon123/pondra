@@ -10071,15 +10071,45 @@ def _lake_keys():
     before = stats(A.port).get("format")
     session = login(A.port)
     seen = until(lambda: in_files(lake2), True, 15) if os.path.isdir(lake2) else True  # (the catalog's files show them: the look works; a local lake's only)
+    old_key = next(iter(sorted(set(re.findall(rb'"node":"(pn_[A-Za-z0-9_-]+)"', b"".join(open(os.path.join(d, f), "rb").read() for d, _, fs in os.walk(lake2) for f in fs))))), b"").decode() if os.path.isdir(lake2) else ""
+    old_signed = as_(A.port, "Bearer " + old_key, "SELECT count(*) AS n FROM t")  # (from this machine, while in the clear)
     n.kill()
     n = Node(lake2, A.port, env=k1).start()
     kept = until(lambda: stats(A.port).get("keys"), "sealed", 20)
     still = as_(A.port, "Bearer " + session["token"], "SELECT count(*) AS n FROM t") if isinstance(session, dict) else session
+    again = login(A.port)
+    again = as_(A.port, "Bearer " + again["token"], "SELECT count(*) AS n FROM t") if isinstance(again, dict) else again
+    old_after = as_(A.port, "Bearer " + old_key, "SELECT count(*) AS n FROM t")
     after = stats(A.port).get("format")
     n.kill()
-    info["sealed later"] = {"clear": clear, "format before": before, "seen in files": seen, "kept": kept, "format after": after, "a session from before": still}
-    checks["a lake whose keys are in the clear (no shared master key: its files show them) has them sealed when its leader starts with one; the same keys: a session from before still signs in"] = \
-        clear == "clear" and seen is True and isinstance(before, int) and before < 3 and kept == "sealed" and after == 3 and still == [{"n": 1}] and '"sealed"' in z_of(lake2, k1)
+    info["sealed later"] = {"clear": clear, "format before": before, "seen in files": seen, "kept": kept, "format after": after, "a session from before": str(still)[:120],
+                            "signed in again": again, "the old nodes' key, before and after": [old_signed, str(old_after)[:120]]}
+    checks["a lake whose keys are in the clear (no shared master key: its files show them) has them sealed when its leader starts with one, made new: the old nodes' key and a session from before, readable from the bucket, sign in no more, and a new sign-in does"] = \
+        clear == "clear" and seen is True and isinstance(before, int) and before < 3 and kept == "sealed" and after == 3 and '"sealed"' in z_of(lake2, k1) \
+        and str(still).startswith("ERROR 401") and again == [{"n": 1}] and old_signed == [{"n": 1}] and str(old_after).startswith("ERROR 401")
+    # Followers that knew the nodes' key in the clear: the leader (no master key) goes, one of them takes over and seals a
+    # new one, and the other, its calls refused with the old key, takes the new one from the bucket and writes again
+    lake3 = new_lake()
+    n = Node(lake3, A.port, env=none).start()
+    as_(A.port, None, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+    as_(A.port, basic, "CREATE TABLE t (x BIGINT)")
+    pair = [Node(lake3, A.port + i, env=k1).start() for i in (1, 2)]
+    joined = [until(lambda i=i: as_(A.port + i, basic, "INSERT INTO t VALUES (%d)" % i), {"rows": 1}, 20) for i in (1, 2)]
+    n.kill()
+    def role(port):
+        try:
+            return stats(port).get("role")
+        except Exception:
+            return None  # (restarting to rejoin: a moment)
+    led = until(lambda: any(role(A.port + i) == "leader" for i in (1, 2)), True, 40)
+    wrote = [until(lambda i=i: as_(A.port + i, basic, "INSERT INTO t VALUES (%d)" % (i + 10)), {"rows": 1}, 60) for i in (1, 2)]
+    logs = [open(f.log).read() for f in pair]
+    for f in pair:
+        f.kill()
+    info["followers"] = {"joined": joined, "a follower took over": led, "wrote after": wrote, "logs": [l[-300:] for l in logs]}
+    checks["followers that knew the lake's keys in the clear: the one that takes over seals new ones, and the other takes them from the bucket and writes through it"] = \
+        joined == [{"rows": 1}] * 2 and led is True and wrote == [{"rows": 1}] * 2 \
+        and sum("made new (the ones in the clear" in l for l in logs) == 1 and sum("took the lake's new keys from the bucket" in l for l in logs) == 1
     return checks, info
 
 
@@ -11322,6 +11352,7 @@ def guesses():
         svc_pg = [pg_said("svc", f"pt_c3Zj_wrong-{i}") for i in range(11)]
         svc_fl = [fl_said("svc", f"pt_c3Zj_wrong-{i}") for i in range(11)]
         svc_right = [pg_said("svc", svc_token), fl_said("svc", svc_token)]
+        made_up = [pg_said(f"nobody-{i}", "a-guess") for i in range(70)]  # (names that are no user of the lake: counted as anonymous knocks are)
         logged = []
         for _ in range(40):  # (written a moment later, in batches)
             logged = call(P + 3, "POST", "/sql", b"SELECT door, \"user\", message FROM pondra.audit WHERE outcome = 'refused' ORDER BY at", headers=bearer)
@@ -11344,6 +11375,10 @@ def guesses():
             all('uthentication failed for user "svc"' in w for w in svc_pg) and all("wrong user name or password" in w for w in svc_fl) and svc_right == ["ok", "ok"]
         checks["each refusal is audited: postgres dana and flight fran, the eleventh and the right password (pondra.audit)"] = \
             audited == [("flight", "fran"), ("flight", "fran"), ("postgres", "dana"), ("postgres", "dana")]
+        nobody = [r for r in logged if (r["user"] or "").startswith("nobody-")]
+        info["made-up names"] = {"refused": made_up[0][:140], "written": len(nobody)}
+        checks["seventy sign-ins with made-up user names from one client are refused, and no more than sixty are written one by one (the rest counted, as anonymous ones are)"] = \
+            all("FATAL" in m for m in made_up) and len(nobody) <= 60
         # A name and password sent with any Flight call count the same, not only with the handshake: ten wrong
         # passwords for gil sent with DoGet itself, then the right one is refused saying why; eli's right one answers.
         import pyarrow as pa, pyarrow.flight as fl

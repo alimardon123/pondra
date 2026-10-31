@@ -311,33 +311,35 @@ pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std
 
 /// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement), from `from`. Its
 /// client is the connection's: `refused_by` names another (behind a proxy, `Peer::client`).
-pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
-    refused_by(app, user, door, from, from.map(|a| a.ip()), what, message)
+pub async fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
+    refused_by(app, user, door, from, from.map(|a| a.ip()), what, message).await
 }
 
-/// `refused`, counted by `client`. One that names a user is always written. Anyone may knock with none, so past `KNOCKS`
-/// a minute from one client (an IPv6 one's /64) those aren't written one by one: a row says how many weren't, once
-/// their minute has ended (at the next refusal).
-pub fn refused_by(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, client: Option<std::net::IpAddr>, what: &str, message: &str) {
+/// `refused`, counted by `client`. One that names a user of the lake is always written. Anyone may knock with no
+/// user, or with a name that is none of its users, so past `KNOCKS` a minute from one client (an IPv6 one's /64)
+/// those aren't written one by one: a row says how many weren't, once their minute has ended (at the next refusal).
+pub async fn refused_by(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, client: Option<std::net::IpAddr>, what: &str, message: &str) {
     if !on() {
         return;
     }
+    let known = !user.is_empty() && app.lake.cat.get::<crate::users::User>(&crate::users::user_key(user)).await.ok().flatten().is_some();
     let now = crate::log::now_ms();
-    let (written, uncounted) = knocked(user.is_empty().then_some(client), now);
+    let (written, uncounted) = knocked((!known).then_some(client), now);
     for (range, since, n) in uncounted {
         let since = chrono::DateTime::from_timestamp_millis(since as i64).map(|t| t.to_rfc3339()).unwrap_or_default();
-        let message = format!("{n} more refusals naming no user from {range} in the minute from {since} weren't written one by one");
+        let message = format!("{n} more refusals naming no user of the lake from {range} in the minute from {since} weren't written one by one");
         write(app, Line { at: now, user: String::new(), door: "node", from: Some(range), class: "access", statement: "refusals".into(), outcome: "refused", message: Some(message), ms: None });
     }
     let message = match written {
         Some(false) => message.to_string(),
-        Some(true) => format!("{message} (this client's refusals naming no user past {KNOCKS} a minute are counted, not written one by one, until its minute ends)"),
+        Some(true) => format!("{message} (this client's refusals naming no user of the lake past {KNOCKS} a minute are counted, not written one by one, until its minute ends)"),
         None => return,
     };
     write(app, Line { at: now, user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
 }
 
-/// Refusals naming no user written a minute from one client (security pass 2: 400 anonymous `/sso/…` calls wrote 400 rows).
+/// Refusals naming no user of the lake written a minute from one client (security pass 2: 400 anonymous `/sso/…` calls
+/// wrote 400 rows; audit 10-31 M6: as many with made-up user names did too).
 const KNOCKS: u32 = 60;
 const CLIENTS: usize = 10_000; // (the clients counted at once: when full, newcomers count together, and no count starts over)
 
@@ -358,7 +360,7 @@ fn range(ip: std::net::IpAddr) -> std::net::IpAddr {
 }
 
 /// Is a refusal at `now_ms` written: Some(false) yes, Some(true) yes and the last one written this minute, None no. Only
-/// those naming no user are counted (`client` Some: its address, None when the door can't tell, counted under 0.0.0.0).
+/// those naming no user of the lake are counted (`client` Some: its address, None when the door can't tell, counted under 0.0.0.0).
 /// With it, the minutes that ended with refusals not written: (range, its minute's start, how many).
 fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<bool>, Vec<(String, u64, u32)>) {
     let Some(client) = client else { return (Some(false), vec![]) };

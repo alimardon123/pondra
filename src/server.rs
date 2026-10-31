@@ -301,7 +301,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
             let why = crate::auth::guessing_says(name, wait);
-            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
         }
@@ -328,7 +328,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 None => None,
             };
             let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
-            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
         }
@@ -348,7 +348,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                     true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
                     false => "this needs more rights than this token's or user's",
                 };
-                crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why);
+                crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await;
                 (StatusCode::FORBIDDEN, why).into_response()
             }
         };
@@ -451,13 +451,13 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     let ip = Some(peer.client(&headers));
     if let Some(wait) = crate::auth::guessing(ip, user) {
         let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why);
+        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why).await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
     }
     if !crate::users::password_ok(&app.lake, user, password).await {
         crate::auth::guessed(ip, user);
-        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password");
+        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password").await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
     }

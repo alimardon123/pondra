@@ -273,26 +273,33 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
     crate::store::trace("warming");
-    if let (true, Some(own)) = (leader, &replica) {
-        // (the members are asked with the nodes' key: one that just restarted holds an
-        // unsigned call until it has caught up, and it catches up from this leader)
-        if crate::dial::node_key().is_none() {
-            if let Some(k) = users::node_key_made(&lake).await {
-                crate::dial::set_node_key(k);
+    let recovered = match (leader, &replica) {
+        (true, Some(own)) => {
+            // (the members are asked with the nodes' key: one that just restarted holds an
+            // unsigned call until it has caught up, and it catches up from this leader)
+            if crate::dial::node_key().is_none() {
+                if let Some(k) = users::node_key_made(&lake).await {
+                    crate::dial::set_node_key(k);
+                }
             }
+            Some(replica::recover(&lake, &addr, term, Some(own)).await)
         }
-        match replica::recover(&lake, &addr, term, Some(own)).await {
-            // (a node outside the members that can't reach them: it let its term go, and they lead; it follows them)
-            Err(e) if e.downcast_ref::<replica::Unreached>().is_some() => {
-                eprintln!("{e:#}");
-                crate::terms::newer_claimed(&lake.store, term).await;
-                restart("not leading past members this node can't reach")
-            }
-            r => r?,
-        };
-    } else if leader && !lives {
         // (a guest that leads recovers as `write::lead` does: no followers' changes to hold, and no key to ask for)
-        replica::recover(&lake, "", term, None).await?;
+        (true, None) if !lives => Some(replica::recover(&lake, "", term, None).await),
+        _ => None,
+    };
+    match recovered {
+        // (a node outside the members that can't reach them: it let its term go, and they lead; it follows them, and a
+        // guest starts over through them, as `write::deliver` does: audit 10-31 L11)
+        Some(Err(e)) if e.downcast_ref::<replica::Unreached>().is_some() => {
+            eprintln!("{e:#}");
+            crate::terms::newer_claimed(&lake.store, term).await;
+            restart("not leading past members this node can't reach")
+        }
+        Some(r) => {
+            r?;
+        }
+        None => {}
     }
     crate::store::trace("followers' changes recovered");
     let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
@@ -386,6 +393,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if lives {
         let l = app.lake.clone();
+        let closing = crate::drain::closing();
         panics::spawn(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
             let mut said = false;
@@ -393,7 +401,18 @@ pub fn keep(app: &crate::app::App, s: &Start) {
                 match users::node_key(&l).await {
                     Ok(k) => {
                         crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
-                        return;
+                        // (and a new one when a leader seals keys that were in the clear: `users::seal_keys`)
+                        tokio::pin!(closing);
+                        loop {
+                            tokio::select! {
+                                () = &mut closing => return,
+                                () = tokio::time::sleep(users::NODE_KEY_LOOK) => {}
+                            }
+                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key().as_deref() != Some(k)) {
+                                crate::dial::set_node_key(k);
+                                eprintln!("this node took the lake's new keys from the bucket");
+                            }
+                        }
                     }
                     Err(e) if !said && format!("{e:#}").contains("master key") => {
                         said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
