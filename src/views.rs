@@ -429,6 +429,98 @@ pub(crate) fn kept_by_key(source: &str, name: &str, what: &str) -> anyhow::Error
     coded("0A000", format!("{source} is kept by key: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {source}'s own source"))
 }
 
+/// A view's query with its CTEs (`WITH t AS (…) … FROM t`) and the plain views it reads (`CREATE VIEW`) written in where
+/// they are read, as subqueries `(…) AS t`: the form a view follows its table through (`first_table`), and that its
+/// rows are kept by, as Postgres, Databricks and Snowflake take both. A plain view is read as it is now: the view keeps
+/// that text. A recursive CTE stays as written (a view can't follow one), and so does a query that isn't one SELECT; a
+/// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000).
+pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
+    use datafusion::sql::sqlparser::ast::{Query, Statement, TableAlias, TableFactor, VisitorMut};
+    use std::collections::HashMap;
+    use std::ops::ControlFlow;
+    let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok(sql.to_string()) };
+    let [Statement::Query(q)] = &mut parsed[..] else { return Ok(sql.to_string()) };
+    let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false).await?.into_iter().collect();
+    if q.with.is_none() && views.is_empty() {
+        return Ok(sql.to_string()); // (nothing to write in: the text as written)
+    }
+    /// The CTEs in scope (innermost last), each its query (written in already) and its columns' names; the plain views by
+    /// name; and, for each query entered, whether it opened a scope.
+    struct In<'a> {
+        scopes: Vec<HashMap<String, (Query, Vec<datafusion::sql::sqlparser::ast::TableAliasColumnDef>)>>,
+        opened: Vec<bool>,
+        views: &'a HashMap<String, String>,
+        depth: usize,
+    }
+    impl VisitorMut for In<'_> {
+        type Break = anyhow::Error;
+        fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<anyhow::Error> {
+            // (a write in a WITH runs once, as a statement: a view that reruns its query can't hold one)
+            if let Some((cte, write)) = q.with.as_ref().and_then(|w| w.cte_tables.iter().find_map(|c| crate::text::write_of(&c.query).map(|w| (c, w)))) {
+                let name = crate::text::ident(&cte.alias.name);
+                return ControlFlow::Break(coded("0A000", format!("WITH {name} AS ({write} …): a view can't hold a write, which runs once: run it in a statement of its own, and make the view over the table it writes")));
+            }
+            let open = q.with.as_ref().is_some_and(|w| !w.recursive);
+            if let Some(with) = q.with.take_if(|w| !w.recursive) {
+                let mut scope = HashMap::new();
+                for cte in with.cte_tables {
+                    let mut body = *cte.query;
+                    self.scopes.push(scope.clone()); // (a CTE reads those before it)
+                    let walked = crate::walk::visit_mut(&mut body, self);
+                    self.scopes.pop();
+                    walked?;
+                    scope.insert(crate::text::ident(&cte.alias.name), (body, cte.alias.columns));
+                }
+                self.scopes.push(scope);
+            }
+            self.opened.push(open);
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<anyhow::Error> {
+            if self.opened.pop() == Some(true) {
+                self.scopes.pop();
+            }
+            ControlFlow::Continue(())
+        }
+        // (after its children: what it is replaced by is walked already, so a table inside a CTE that has the CTE's name is the table)
+        fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<anyhow::Error> {
+            let TableFactor::Table { name, alias, args: None, .. } = t else { return ControlFlow::Continue(()) };
+            let n = crate::text::object(name);
+            let shown = || name.0.last().and_then(|p| p.as_ident()).map_or_else(|| n.clone(), crate::text::ident);
+            let cte = (name.0.len() == 1).then(|| self.scopes.iter().rev().find_map(|s| s.get(&n))).flatten();
+            let (q, columns) = match cte {
+                Some((q, columns)) => (q.clone(), columns.clone()),
+                None => {
+                    let Some(text) = self.views.get(&n).or_else(|| self.views.get(n.strip_prefix("public.").unwrap_or(&n))) else { return ControlFlow::Continue(()) };
+                    if self.depth > 16 {
+                        return ControlFlow::Break(anyhow::anyhow!("{n}: views read each other more than 16 deep"));
+                    }
+                    let mut q = match crate::expander::parse_query(text) {
+                        Ok(q) => q,
+                        Err(e) => return ControlFlow::Break(e.context(format!("the view {n}"))),
+                    };
+                    // (a plain view sees no CTE of the query that reads it)
+                    let mut inner = In { scopes: vec![], opened: vec![], views: self.views, depth: self.depth + 1 };
+                    crate::walk::visit_mut(&mut q, &mut inner)?;
+                    (q, vec![])
+                }
+            };
+            // (a CTE's own column names, `WITH t(a, b) AS …`, go with it under whatever name it is read by)
+            let alias = match alias.clone() {
+                Some(a) if a.columns.is_empty() => Some(TableAlias { columns, ..a }),
+                Some(a) => Some(a),
+                None => Some(TableAlias { explicit: true, name: datafusion::sql::sqlparser::ast::Ident::new(shown()), columns, at: None }),
+            };
+            *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
+            ControlFlow::Continue(())
+        }
+    }
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(q.as_mut(), &mut In { scopes: vec![], opened: vec![], views: &views, depth: 0 }) {
+        return Err(e);
+    }
+    Ok(q.to_string())
+}
+
 /// The table a view follows, by its name in this lake (`ddl::resolve`): refused 0A000 when it names another lake's.
 pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
     let (other, source) = crate::ddl::resolve(lake, table).await?;
@@ -441,6 +533,8 @@ pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+    let written_in = written_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
+    let sql = written_in.as_str();
     if o.once {
         return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
     }
@@ -1830,6 +1924,34 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
 mod tests {
     use super::*;
     use crate::auth::{Principal, Role, WHO};
+
+    /// A view's CTEs and the plain views it reads are written in as subqueries, so it follows their table: a CTE read by
+    /// another, its column names under any alias, a table inside a CTE that has the CTE's name, a plain view over a plain
+    /// view; a recursive CTE and a query with neither stay as written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_views_ctes_and_plain_views_are_written_in() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-written-in-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![] });
+        lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
+        let w = |sql: &'static str| written_in(&lake, sql);
+        assert_eq!(w("SELECT x FROM a").await?, "SELECT x FROM a");
+        assert_eq!(w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?, "SELECT count(*) AS n FROM (SELECT x FROM a) AS t");
+        assert_eq!(first_table(&w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?)?, "a");
+        assert_eq!(w("WITH t AS (SELECT x FROM a), u AS (SELECT x FROM t) SELECT x FROM u").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a) AS t) AS u");
+        assert_eq!(w("WITH t (y) AS (SELECT x FROM a) SELECT y FROM t AS s").await?, "SELECT y FROM (SELECT x FROM a) AS s (y)");
+        assert_eq!(w("WITH a AS (SELECT x FROM a) SELECT x FROM a").await?, "SELECT x FROM (SELECT x FROM a) AS a", "inside it, a is the table");
+        assert_eq!(w("SELECT x FROM vy").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a WHERE x > 1) AS vx) AS vy");
+        assert_eq!(first_table(&w("SELECT x FROM vy").await?)?, "a");
+        let recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
+        assert_eq!(w(recursive).await?, recursive);
+        let write = w("WITH m AS (DELETE FROM a WHERE x > 1 RETURNING *) SELECT x FROM m").await.unwrap_err();
+        assert_eq!(crate::codes::of(&write), "0A000", "{write:#}");
+        assert!(write.to_string().starts_with("WITH m AS (DELETE …): a view can't hold a write"), "{write:#}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
