@@ -108,6 +108,8 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `[x * 2 FOR x IN l IF x > 0]`, `list_transform(l, x -> x + 1)`, `LAMBDA x: x + 1` | list comprehensions and lambdas (`list_filter`, `array_any_match` and the others take them too) |
 | `max_by(x, y)`, `arg_max`, `min_by`, `arg_min`, `list(x)`, `string_split(s, ',')` | DuckDB's names (`max_by` leaves out rows whose `y` is NULL) |
 | `json_extract(j, '$.a.b[0]')`, `json_extract_string(…)`, `x::JSON` | JSON as text: a path written as a literal |
+| `string_agg(x, ', ') WITHIN GROUP (ORDER BY y)`, `listagg(x, ', ') WITHIN GROUP (ORDER BY y)` | SQL Server's and Snowflake's spelling of `string_agg(x, ', ' ORDER BY y)` |
+| `SELECT @@VERSION` | SQL Server's `version()`; another `@@name` is refused (`0A000`) with `SHOW name` |
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
@@ -515,10 +517,10 @@ SELECT count(*) AS n FROM kid;
 
 | Statement | Syntax |
 |---|---|
-| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …] [READ ONLY \| READ WRITE]`, `START TRANSACTION` |
+| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …] [READ ONLY \| READ WRITE]`, `START TRANSACTION`, SQL Server's `BEGIN TRAN [name]` (the name labels nothing) |
 | Set the level | `SET TRANSACTION ISOLATION LEVEL READ COMMITTED \| REPEATABLE READ`, before the first statement; `SET SESSION CHARACTERISTICS AS TRANSACTION …` for the session |
-| Commit | `COMMIT`, `END` |
-| Roll back | `ROLLBACK`, `ABORT` |
+| Commit | `COMMIT`, `END`, `COMMIT TRAN [name]` |
+| Roll back | `ROLLBACK`, `ABORT`, `ROLLBACK TRAN` |
 | Savepoint | `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, `ROLLBACK [WORK \| TRANSACTION] TO [SAVEPOINT] name` |
 
 The statements between `BEGIN` and `COMMIT` are one commit, and they read their own writes. A transaction
@@ -849,7 +851,7 @@ their values.
 | Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER] [MAX_QUERIES n] [STATEMENT_TIMEOUT '5 minutes']`, `CREATE ROLE name` |
 | Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…'` (`0`: no limit); `ALTER ROLE` takes the same words |
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
-| Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
+| Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` (Snowflake's `TO ROLE name` is the same) |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
 | Let someone branch a database | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: a user makes branches of it, and owns each (it or an admin drops it); another server's token pins a branch of those schemas and does nothing else |
 | Let a user apply a project | `GRANT APPLY ON DATABASE d TO name, …`: applies to the database (`pondra apply`, `CALL apply`) without being an admin; on a protected database, only a holder or the node's operator may apply ([protected production](/pondra/guides/projects/#protected-production)) |
