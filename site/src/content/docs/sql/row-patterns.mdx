@@ -381,6 +381,52 @@ belong to are matched again, and the view always equals its query, late rows and
 row from one partition to another matches both again. `pondra.flows` lists such a view as `by key`. Without a `PARTITION BY`
 the rows are one sequence, so the view runs whole on each change.
 
+### Each match once: EMIT FINAL
+
+With `EMIT FINAL`, the view writes each match once, when nothing that comes later can change it. Its rows are only ever
+added, so what reads it, a view or a client, takes each match once, as Flink's CEP gives them:
+
+```sql
+CREATE MATERIALIZED VIEW dips WITH (lateness = '10 seconds', idle = '1 minute') AS
+  SELECT * FROM ticker_ts MATCH_RECOGNIZE (
+    PARTITION BY symbol ORDER BY ts
+    MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day
+    ONE ROW PER MATCH
+    PATTERN (strt down+ up+) WITHIN INTERVAL '4' HOUR
+    DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)
+  ) EMIT FINAL;
+```
+
+- **What a run reads.** The rows up to the watermark: the `ORDER BY` column's newest time less `lateness`, as for the other
+  `EMIT FINAL` views. A run reads the rows that came since the last one, and the rows each of their keys still holds for a
+  match not yet decided. So its cost follows the new rows, not each key's history.
+- **When a match is decided.** When its key has a later row that none of the search's partial matches can take, or, with
+  `WITHIN`, once the watermark is past the interval. The ticker's last match ends in `up+`, which a next rise would extend,
+  so it waits for the symbol's next row. With `WITHIN` it is written once the four hours have passed, and `idle` moves the
+  watermark on with the clock when no rows come. Give a pattern that ends in a repetition a `WITHIN`.
+- **Late rows.** A row is late when its time is at or before the watermark of a run that read before the row came, or when
+  its time is NULL. It stays in its table, is counted in `pondra.flows`' `late_rows`, and is never matched: a match
+  already written may have read past its place.
+- **The answer.** Each match the view writes is the match the query gives over the table less its late rows, with the same
+  key and start. `MATCH_NUMBER()` counts on across runs.
+- **The source.** `UPDATE`, `DELETE` and `MERGE` on it are refused while the view follows it, as for the other `EMIT FINAL`
+  views. `DROP MATERIALIZED VIEW` drops what the view holds; `ALTER MATERIALIZED VIEW dips DETACH` keeps its matches as a
+  table.
+
+What the view takes. Each of these is refused `0A000`, and the refusal says what to write:
+
+| The view has | What to write instead |
+|---|---|
+| a subquery, a CTE or a view as the input of `MATCH_RECOGNIZE` | read the table directly, or make it a plain view, or `WITH (refresh = 'by key')` |
+| a keyed table, a `GROUP BY` view's table or a history view as the input | a table of plain rows |
+| a `GROUP BY`, a window, a join, `DISTINCT`, an `ORDER BY` or a `LIMIT` around the pattern | a view over this view: around the pattern, a projection and a `WHERE` |
+| an `ORDER BY` other than one date or timestamp column, ascending | order by the time alone; a plain view orders by more |
+| `$` or `^` in the pattern | a plain view, or `WITH (refresh = 'by key')` |
+| `NEXT` | the condition with `PREV` |
+| `WITH UNMATCHED ROWS` | a plain view |
+| a volatile or stable function, such as `now()` or `random()`, in a `DEFINE`, a measure or the `WHERE` | a plain view: a run matches some rows again, and must answer the same |
+| `refresh`, `lag` or expectations in its `WITH` | expectations on a view of the rows before it |
+
 ## What's refused
 
 These are refused by the standard or by how the answer is shaped. Each refusal says what to write.
@@ -414,7 +460,6 @@ These don't run yet. Each has a way to write the same question.
 | a window function in a measure | refused, `0A000` | compute the window in a subquery, and read its column in the measure |
 | `FIRST` or `LAST` inside an aggregate, `sum(LAST(down.price))` | refused, `0A000`: `last inside an aggregate isn't supported yet: aggregate the column over its variable instead` | aggregate the column over its variable, `sum(down.price)` |
 | `SUBSET u = (b, c)` | refused, `0A000` | a measure per symbol, as `LAST(b.price)` and `LAST(c.price)`, or one symbol whose `DEFINE` ORs the two conditions |
-| a materialized view of `MATCH_RECOGNIZE` with `EMIT FINAL` | refused, `0A000` | make the view without `EMIT FINAL`: each run matches again only the partitions that changed |
 | a Python or external function in a `DEFINE` that reads the match, `near(b.v, FIRST(a.v))` | refused, `0A000` | call it on the row's own values, `near(b.v, PREV(b.v))`; the lake's other functions, `cosine_similarity` among them, work in both |
 
 <Aside>

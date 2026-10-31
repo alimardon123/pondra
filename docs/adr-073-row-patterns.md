@@ -139,12 +139,20 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
    - A match is decided when no thread could still extend or replace it, or `WITHIN` has passed.
    - Only rows up to the watermark are matched (ADR-052).
    - Each key keeps a resume point, in a hidden keyed table `{v}$resume`: the first row an
-     undecided match could start at, less the rows `PREV` looks back.
-   - A run reads each touched key's rows from its resume point, appends the matches decided since,
-     and moves the resume points, in one commit with the producer `match:{v}` (seq the watermark,
-     `prev` the last one: invariant 24's mechanism).
-   - A row behind its key's resume point is late: it stays in its table, and counts as the view's
-     `$late` (ADR-052 §4).
+     undecided match could start at, less the rows `PREV` looks back. The rows from it on are
+     held in `{v}$held`, keyed by their `_row_id`.
+   - A run reads the rows in the watermark's new span and the held rows of the keys they touch
+     (with `WITHIN`, also of the keys whose live thread the watermark has passed). It appends the
+     matches decided since, and moves the held rows and the resume points, in one commit with the
+     producer `match:{v}` (seq the watermark, `prev` the last one: invariant 24's mechanism).
+   - A row is late when its time is at or before the watermark of a run that read before the row
+     came, or when its time is NULL: it stays in its table, is never matched, and counts as the
+     view's `$late` (ADR-052 §4). (This was "a row behind its key's resume point". That rule let a
+     late row into a run whose earlier matches had already read past its place, so a match
+     written once could differ from the query's.)
+   - The view takes a lake table read directly, with a projection and a `WHERE` around the
+     pattern, one ascending time column in `ORDER BY`, and no `$`, `^`, `NEXT`, `WITH UNMATCHED
+     ROWS` or volatile function; anything else is refused `0A000` with what to write.
 
 9. **Per-partition watermarks** come with L4's Kafka partitions (round 36). A feed commits each
    partition's newest event time with its offsets (`feeds::shard`), and `views::newest` takes the

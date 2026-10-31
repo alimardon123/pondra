@@ -10,11 +10,11 @@
 use crate::codes::coded;
 use crate::fsum;
 use anyhow::{anyhow, bail, Context, Result};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray, UInt32Array};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, IntervalMonthDayNanoArray, ListArray, StringArray, StructArray, UInt32Array};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::kernels::numeric::sub;
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, IntervalMonthDayNanoType, IntervalUnit, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
@@ -61,6 +61,9 @@ struct Spec {
     /// WITHIN: each row is within the interval of its match's first row, by the first ORDER BY key (the time argument).
     #[serde(default)]
     within: bool,
+    /// Open mode: the most rows any PREV reaches back (`pattern.rs` computes it). It sets how many rows a run keeps.
+    #[serde(default)]
+    look: usize,
     #[serde(default)]
     defines: Vec<DefineSpec>,
     #[serde(default)]
@@ -126,6 +129,7 @@ struct Plan {
     slots: Vec<SlotSpec>,
     rows: usize,
     values: usize,
+    look: usize,
 }
 
 /// A DEFINE of symbol `symbol` that reads the match: its glue, and the indices of its slots.
@@ -154,6 +158,7 @@ fn compile(text: &str) -> Result<Plan> {
         slots,
         rows: spec.rows,
         values: spec.values,
+        look: spec.look,
     })
 }
 
@@ -662,6 +667,20 @@ fn take(state: &State, plan: &Plan, part: &Part, k: usize, i: usize) -> Result<S
     Ok(out)
 }
 
+/// How a search ends: `Closed` answers its match, as `pondra_match` takes it. `Open` (open mode) also finds a search that a
+/// later row could still change, and carries WITHIN's bound for the watermark (`low`, None when NULL).
+#[derive(Clone, Copy)]
+enum Ending {
+    Closed,
+    Open { low: Option<i64> },
+}
+
+/// A search's answer: its match, when it is decided, and the resume start of the search when it is open (`open_end`).
+struct Searched {
+    found: Option<Found>,
+    resume: Option<usize>,
+}
+
 /// The most preferred match that starts at or after `from`: the Pike VM's leftmost answer. A row's threads run in
 /// priority order; a match cuts the threads after it, and a higher-priority thread that matches later replaces it.
 /// No new thread starts once a match is found.
@@ -670,7 +689,7 @@ fn take(state: &State, plan: &Plan, part: &Part, k: usize, i: usize) -> Result<S
 /// A row is taken in three phases: each thread at a symbol takes the row and decides its row-only conditions (phase 1);
 /// each glue is evaluated once over its batch (phase 2); and the passing threads go on, in the order they came (phase 3).
 /// `m` is MATCH_NUMBER(): the matches so far, plus one. `room` is the partition's budgets, which each row draws on (`Part`).
-fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut usize, m: i64, room: &mut Room) -> Result<Option<Found>> {
+fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut usize, m: i64, ending: Ending, room: &mut Room) -> Result<Searched> {
     let code = &plan.code;
     let (n, w) = (part.n, part.within);
     let stated = !plan.defines.is_empty();
@@ -774,7 +793,13 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
         i += 1;
     }
     *last = gen + 1;
-    Ok(best.map(|(start, end, path)| Found::of(start, end, path)))
+    // open mode: at the partition's end, a search with a thread still alive can change, so it is open rather than decided
+    let resume = match ending {
+        Ending::Open { low } if i == n => open_end(&plan.code, part, &now, low),
+        _ => None,
+    };
+    let found = if resume.is_some() { None } else { best.map(|(start, end, path)| Found::of(start, end, path)) };
+    Ok(Searched { found, resume })
 }
 
 /// A count with its thousands set off by commas, as the cap messages print it (100000 is 100,000).
@@ -867,21 +892,288 @@ fn partition(plan: &Plan, part: &Part) -> Result<Vec<Vec<Mem>>> {
             return Err(stopped());
         }
         // (MATCH_NUMBER is the matches so far, plus one: the one this search finds)
-        let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1, &mut room)? else { break };
+        let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1, Ending::Closed, &mut room)?.found else { break };
         m += 1;
-        if f.start == f.end {
-            rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
-            room.keep = room.keep.saturating_sub(1);
-            from = f.start + 1;
-        } else {
-            room.keep = room.keep.saturating_sub(f.steps.len());
-            for (j, &(sym, excluded)) in f.steps.iter().enumerate() {
-                rows[f.start + j].push(Mem { m, sym: Some(sym), seq: Some(j as i64 + 1), excluded });
-            }
-            from = skip(plan, &f, m)?;
-        }
+        from = record(plan, &mut rows, &f, m, &mut room)?;
     }
     Ok(rows)
+}
+
+/// Writes a found match's memberships into `rows`: one for each row of the match, or one for an empty match's row. Returns
+/// where the search goes on, by the skip rule. Each membership is taken from the kept-rows budget (`room.keep`).
+fn record(plan: &Plan, rows: &mut [Vec<Mem>], f: &Found, m: i64, room: &mut Room) -> Result<usize> {
+    if f.start == f.end {
+        rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
+        room.keep = room.keep.saturating_sub(1);
+        return Ok(f.start + 1);
+    }
+    room.keep = room.keep.saturating_sub(f.steps.len());
+    for (j, &(sym, excluded)) in f.steps.iter().enumerate() {
+        rows[f.start + j].push(Mem { m, sym: Some(sym), seq: Some(j as i64 + 1), excluded });
+    }
+    skip(plan, f, m)
+}
+
+/// Open mode's inputs for one partition: its look-back rows (`k`), the matches the key found in earlier runs (`m`), and,
+/// under WITHIN, the watermark's bound (`low`: WITHIN's low for W + 1 tick, None when NULL) and the kernel that subtracts
+/// the interval (`kernel`).
+struct OpenArgs {
+    k: usize,
+    m: i64,
+    low: Option<i64>,
+    kernel: Option<Kernel>,
+}
+
+/// Open mode's marker, the extra item on a partition's last row: how many of the last rows the next run keeps, how many of
+/// those are look-back rows, the match count, and under WITHIN the least watermark at which the open search dies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Marker {
+    keep: i64,
+    k: i64,
+    next_m: i64,
+    due: Option<i64>,
+}
+
+/// Open mode for one partition. Decided matches are written, and the first open search stops the loop, so nothing from its
+/// resume start on gets a membership. A decided search with no match ends the loop too: the next run starts at the end.
+/// Returns each row's memberships, and the marker.
+fn partition_open(plan: &Plan, part: &Part, args: &OpenArgs) -> Result<(Vec<Vec<Mem>>, Marker)> {
+    let n = part.n;
+    let mut rows: Vec<Vec<Mem>> = vec![Vec::new(); n];
+    let (mut from, mut m) = (args.k, args.m);
+    let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
+    let mut room = Room { live: live_steps(), keep: n + part.keep, reads: READS_PER_ROW * n + part.reads };
+    let mut resume = None;
+    while from < n {
+        if is_stopped(part) {
+            return Err(stopped());
+        }
+        let s = search(plan, part, from, &mut stamp, &mut gen, m + 1, Ending::Open { low: args.low }, &mut room)?;
+        if s.resume.is_some() {
+            resume = s.resume;
+            break;
+        }
+        let Some(f) = s.found else { break };
+        m += 1;
+        from = record(plan, &mut rows, &f, m, &mut room)?;
+    }
+    // the resume point is the open search's, or the end of the partition when no search is open
+    let r = resume.unwrap_or(n);
+    let keep_from = r.saturating_sub(plan.look);
+    let due = match (resume, part.within) {
+        (Some(s), Some(w)) => match w.time[s] {
+            Some(t) => Some(due_of(args.kernel.as_ref().context("MATCH_RECOGNIZE: open mode's WITHIN has no kernel")?, t)?),
+            None => None,
+        },
+        _ => None,
+    };
+    let marker = Marker { keep: (n - keep_from) as i64, k: (r - keep_from) as i64, next_m: m, due };
+    Ok((rows, marker))
+}
+
+/// WITHIN's subtraction for one partition, as `within_of` runs it: the time column's type (a date's is a timestamp of
+/// microseconds), the interval (one row, of its own type), and the interval's months, days and nanoseconds, which bound the
+/// search `due_of` makes.
+#[derive(Clone)]
+struct Kernel {
+    time: DataType,
+    interval: ArrayRef,
+    months: i32,
+    days: i32,
+    nanos: i64,
+}
+
+impl Kernel {
+    /// The kernel for a WITHIN's time and interval columns (the first row of the interval, which is the same on every row).
+    fn of(time: &ArrayRef, interval: &ArrayRef) -> Result<Kernel> {
+        let time = timed(time)?.data_type().clone();
+        let interval = interval.slice(0, 1);
+        let (months, days, nanos) = interval_parts(&interval)?;
+        Ok(Kernel { time, interval, months, days, nanos })
+    }
+
+    /// WITHIN's low for a time of `tick` ticks: the same subtraction `within_of` makes.
+    fn low(&self, tick: i64) -> Result<Option<i64>> {
+        let at = cast(&Int64Array::from(vec![tick]), &self.time)?;
+        let low = sub(&at.as_ref(), &self.interval.as_ref())?;
+        Ok(ticks(&low)?[0])
+    }
+}
+
+/// Whether a thread that started at row `start` is alive at the partition's end: under WITHIN its start's time is no earlier
+/// than `low`. A NULL time, or a NULL `low`, is never alive.
+fn alive(part: &Part, start: usize, low: Option<i64>) -> bool {
+    match part.within {
+        None => true,
+        Some(w) => matches!((w.time[start], low), (Some(t), Some(l)) if t >= l),
+    }
+}
+
+/// Open mode's test at a search's end: the search is open when a thread that waits at a symbol is alive and comes before the
+/// first match, or, with no match, when any alive thread is left. Returns the resume start: the least start of those threads.
+fn open_end(code: &[Inst], part: &Part, now: &[Thread], low: Option<i64>) -> Option<usize> {
+    let mut resume: Option<usize> = None;
+    for t in now {
+        match code[t.pc] {
+            Inst::Match => break,
+            Inst::Sym(..) if alive(part, t.start, low) => resume = Some(resume.map_or(t.start, |r| r.min(t.start))),
+            _ => {}
+        }
+    }
+    resume
+}
+
+/// `due`: the least watermark at which a thread that started at time `t` is dead. It is dead at W when `t` is before
+/// `low(W + 1 tick)`, which only moves on, so the least is found by bisection on the tick. The bisection starts from `t`
+/// (alive, for an interval of a tick or more) and runs up to a bound surely dead: a month is 31 days, a day 25 hours, the
+/// nanoseconds as they are, and a day more.
+fn due_of(kernel: &Kernel, t: i64) -> Result<i64> {
+    let dead = |w: i128| -> Result<bool> {
+        let tick = i64::try_from(w + 1).context("MATCH_RECOGNIZE: WITHIN's watermark is out of range")?;
+        Ok(kernel.low(tick)?.is_none_or(|low| t < low))
+    };
+    let start = t as i128;
+    if dead(start)? {
+        return Ok(t);
+    }
+    const DAY_NS: i128 = 86_400_000_000_000;
+    const HOUR_NS: i128 = 3_600_000_000_000;
+    let bound_ns = kernel.months.unsigned_abs() as i128 * 31 * DAY_NS
+        + kernel.days.unsigned_abs() as i128 * 25 * HOUR_NS
+        + (kernel.nanos as i128).abs()
+        + DAY_NS;
+    let tick_ns = ns_per_tick(&kernel.time)?;
+    let mut step = (bound_ns + tick_ns - 1) / tick_ns;
+    let mut hi = start + step;
+    let mut tries = 0;
+    while !dead(hi)? {
+        tries += 1;
+        if tries > 64 {
+            bail!("MATCH_RECOGNIZE: WITHIN's death point isn't found within 64 doublings");
+        }
+        step *= 2;
+        hi = start + step;
+    }
+    let mut lo = start;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if dead(mid)? {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Ok(hi as i64)
+}
+
+/// Nanoseconds in one tick of a time type (its timestamp unit).
+fn ns_per_tick(time: &DataType) -> Result<i128> {
+    Ok(match time {
+        DataType::Timestamp(TimeUnit::Second, _) => 1_000_000_000,
+        DataType::Timestamp(TimeUnit::Millisecond, _) => 1_000_000,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => 1_000,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => 1,
+        other => bail!("MATCH_RECOGNIZE: WITHIN's time is {other}, which has no tick"),
+    })
+}
+
+/// An interval's months, days and nanoseconds, from its first row (zeros when it is NULL there).
+fn interval_parts(interval: &ArrayRef) -> Result<(i32, i32, i64)> {
+    if interval.is_empty() || interval.is_null(0) {
+        return Ok((0, 0, 0));
+    }
+    let month_day_nano = cast(interval, &DataType::Interval(IntervalUnit::MonthDayNano))?;
+    let values = month_day_nano
+        .as_any()
+        .downcast_ref::<IntervalMonthDayNanoArray>()
+        .context("MATCH_RECOGNIZE: WITHIN's interval isn't an interval")?;
+    Ok(IntervalMonthDayNanoType::to_parts(values.value(0)))
+}
+
+/// A WITHIN time column as its ticks' type: a date becomes a timestamp of microseconds, and a timestamp keeps its unit and zone.
+fn timed(time: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match time.data_type() {
+        DataType::Date32 | DataType::Date64 => cast(time, &DataType::Timestamp(TimeUnit::Microsecond, None))?,
+        _ => time.clone(),
+    })
+}
+
+/// The first row's time of a column, in the ticks of `like` (the time's type), None when it is NULL there.
+fn tick_of(column: &ArrayRef, like: &DataType) -> Result<Option<i64>> {
+    let at = timed(&cast(column, like)?)?;
+    Ok(ticks(&at)?.first().copied().flatten())
+}
+
+/// An open-mode argument that is a whole number (k or m), read from its first row: the same on every row.
+fn open_int(values: &[ArrayRef], at: usize, name: &str) -> Result<i64> {
+    let column = values.get(at).with_context(|| format!("MATCH_RECOGNIZE: pondra_open has no {name}"))?;
+    let ints = cast(column, &DataType::Int64)?;
+    let ints = ints.as_any().downcast_ref::<Int64Array>().context("MATCH_RECOGNIZE: pondra_open's arguments are whole numbers")?;
+    ints.iter().next().flatten().with_context(|| format!("MATCH_RECOGNIZE: pondra_open's {name} is NULL"))
+}
+
+/// The struct fields of an open-mode answer: a match's four, then the marker's four (NULL on a membership).
+fn open_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("match", DataType::Int64, true),
+        Field::new("symbol", DataType::Utf8, true),
+        Field::new("seq", DataType::Int64, true),
+        Field::new("excluded", DataType::Boolean, true),
+        Field::new("keep", DataType::Int64, true),
+        Field::new("k", DataType::Int64, true),
+        Field::new("next_m", DataType::Int64, true),
+        Field::new("due", DataType::Int64, true),
+    ])
+}
+
+fn open_struct_type() -> DataType { DataType::Struct(open_fields()) }
+
+/// Open mode's items as a struct column: a membership (its marker fields NULL), the marker (its match, symbol and excluded
+/// NULL, its seq -1), or nothing (a NULL struct, which `answer_open` never makes).
+fn structs_open(items: &[(Option<Mem>, Option<Marker>)], syms: &[String]) -> Result<StructArray> {
+    let valid = NullBuffer::from(items.iter().map(|(x, mk)| x.is_some() || mk.is_some()).collect::<Vec<bool>>());
+    let m: Int64Array = items.iter().map(|(x, _)| x.map(|x| x.m)).collect();
+    let sym: StringArray = items.iter().map(|(x, _)| x.and_then(|x| x.sym).map(|k| syms[k].as_str())).collect();
+    let seq: Int64Array = items
+        .iter()
+        .map(|(x, mk)| match mk {
+            Some(_) => Some(-1),
+            None => x.and_then(|x| x.seq),
+        })
+        .collect();
+    let excluded: BooleanArray = items.iter().map(|(x, _)| x.map(|x| x.excluded)).collect();
+    let keep: Int64Array = items.iter().map(|(_, mk)| mk.map(|mk| mk.keep)).collect();
+    let k: Int64Array = items.iter().map(|(_, mk)| mk.map(|mk| mk.k)).collect();
+    let next_m: Int64Array = items.iter().map(|(_, mk)| mk.map(|mk| mk.next_m)).collect();
+    let due: Int64Array = items.iter().map(|(_, mk)| mk.and_then(|mk| mk.due)).collect();
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(m),
+        Arc::new(sym),
+        Arc::new(seq),
+        Arc::new(excluded),
+        Arc::new(keep),
+        Arc::new(k),
+        Arc::new(next_m),
+        Arc::new(due),
+    ];
+    Ok(StructArray::try_new(open_fields(), arrays, Some(valid))?)
+}
+
+/// Open mode's answer: each row's memberships, and on the partition's last row the marker after them.
+fn answer_open(rows: &[Vec<Mem>], marker: Option<Marker>, syms: &[String]) -> Result<ArrayRef> {
+    let mut items: Vec<(Option<Mem>, Option<Marker>)> = vec![];
+    let mut lens = vec![];
+    for (i, r) in rows.iter().enumerate() {
+        let before = items.len();
+        items.extend(r.iter().map(|m| (Some(*m), None)));
+        if i + 1 == rows.len() {
+            items.extend(marker.map(|mk| (None, Some(mk))));
+        }
+        lens.push(items.len() - before);
+    }
+    let item = Arc::new(Field::new("item", open_struct_type(), true));
+    let values: ArrayRef = Arc::new(structs_open(&items, syms)?);
+    Ok(Arc::new(ListArray::try_new(item, OffsetBuffer::from_lengths(lens), values, None)?) as ArrayRef)
 }
 
 /// A match: its rows `start..end`, and each row's symbol and excluded flag in order.
@@ -1041,10 +1333,7 @@ fn check_time_type(t: &DataType) -> Result<()> {
 /// interval of months stays exact.
 fn within_of(time: &ArrayRef, interval: &ArrayRef) -> Result<Within> {
     check_time_type(time.data_type())?;
-    let time: ArrayRef = match time.data_type() {
-        DataType::Date32 | DataType::Date64 => cast(time, &DataType::Timestamp(TimeUnit::Microsecond, None))?,
-        _ => time.clone(),
-    };
+    let time = timed(time)?;
     let low = sub(&time.as_ref(), &interval.as_ref())?;
     Ok(Within { time: ticks(&time)?, low: ticks(&low)? })
 }
@@ -1195,6 +1484,8 @@ fn float_order(x: f64, y: f64) -> Ordering {
 #[derive(Debug)]
 struct Evaluator {
     all: bool,
+    /// `pondra_open`: open mode, with k, m and w after the other values.
+    open: bool,
     planner: Arc<Planner>,
     /// The spec's text, and its plan, once read.
     text: String,
@@ -1217,34 +1508,33 @@ impl PartitionEvaluator for Evaluator {
 
 impl Evaluator {
     /// The answer for `n` rows. `values[0]` is the spec, then one condition column per symbol, WITHIN's time and interval when
-    /// within, the glue's row-only columns, and its value columns.
+    /// within, the glue's row-only columns, and its value columns. `pondra_open` takes k, m and w after them, the watermark
+    /// in WITHIN's time's type, and answers in open mode (`partition_open`): the decided matches, and the marker on the last
+    /// row.
     fn run(&mut self, values: &[ArrayRef], n: usize) -> Result<ArrayRef> {
         if n == 0 {
-            return answer(&[], &[], self.all, false);
+            return match self.open {
+                true => answer_open(&[], None, &[]),
+                false => answer(&[], &[], self.all, false),
+            };
         }
-        if self.plan.is_none() {
-            let text = spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?;
-            self.plan = Some(self.planner.plan(&text)?);
-            self.text = text;
-        }
-        let plan = self.plan.as_ref().context("MATCH_RECOGNIZE: no plan")?;
-        if !plan.defines.is_empty() && self.planned.is_none() {
-            let types: Vec<DataType> = values.iter().map(|v| v.data_type().clone()).collect();
-            self.planned = Some(self.planner.planned(&self.text, plan, &types)?);
+        let plan = self.ready(values)?;
+        if self.open && plan.unmatched {
+            return Err(coded("0A000", "MATCH_RECOGNIZE: an open search doesn't take WITH UNMATCHED ROWS"));
         }
         let mut cond = vec![];
         for k in 0..plan.syms.len() {
             cond.push(bools(values.get(k + 1).context("MATCH_RECOGNIZE: a symbol without its condition")?)?);
         }
         // WITHIN's time and interval come after the symbols' conditions
-        let within = match plan.within {
-            true => {
-                let time = values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?;
-                let interval = values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?;
-                Some(within_of(time, interval)?)
-            }
+        let timed_by = match plan.within {
+            true => Some((
+                values.get(plan.syms.len() + 1).context("MATCH_RECOGNIZE: WITHIN has no time")?,
+                values.get(plan.syms.len() + 2).context("MATCH_RECOGNIZE: WITHIN has no interval")?,
+            )),
             false => None,
         };
+        let within = timed_by.map(|(time, interval)| within_of(time, interval)).transpose()?;
         // the glue's row-only columns, then its value columns
         let first = 1 + plan.syms.len() + if plan.within { 2 } else { 0 };
         let rows = values.get(first..first + plan.rows).context("MATCH_RECOGNIZE: the glue's row columns are missing")?;
@@ -1263,8 +1553,44 @@ impl Evaluator {
             reads: KEEP,
             stop: self.stop.as_deref(),
         };
-        answer(&partition(plan, &part)?, &plan.syms, self.all, plan.unmatched)
+        if !self.open {
+            return answer(&partition(&plan, &part)?, &plan.syms, self.all, plan.unmatched);
+        }
+        // open mode's three arguments: k, m, and the watermark w (unused without WITHIN)
+        let at = first + plan.rows + plan.values;
+        let k = usize::try_from(open_int(values, at, "k")?).context("MATCH_RECOGNIZE: pondra_open's k is a count of rows")?;
+        let m = open_int(values, at + 1, "m")?;
+        if k > n {
+            return Err(coded("22000", "MATCH_RECOGNIZE: pondra_open's k is more rows than the partition has"));
+        }
+        let kernel = timed_by.map(|(time, interval)| Kernel::of(time, interval)).transpose()?;
+        let low = match &kernel {
+            Some(kn) => {
+                let w = values.get(at + 2).context("MATCH_RECOGNIZE: pondra_open has no watermark")?;
+                let tick = tick_of(w, &kn.time)?.context("MATCH_RECOGNIZE: pondra_open's watermark is NULL")?;
+                kn.low(tick.checked_add(1).context("MATCH_RECOGNIZE: pondra_open's watermark is out of range")?)?
+            }
+            None => None,
+        };
+        let (found, marker) = partition_open(&plan, &part, &OpenArgs { k, m, low, kernel })?;
+        answer_open(&found, Some(marker), &plan.syms)
     }
+
+    /// The spec's plan, read from the call's first value once, and its glue planned when a DEFINE reads the match.
+    fn ready(&mut self, values: &[ArrayRef]) -> Result<Arc<Plan>> {
+        if self.plan.is_none() {
+            let text = spec_text(values.first().context("MATCH_RECOGNIZE: no spec")?)?;
+            self.plan = Some(self.planner.plan(&text)?);
+            self.text = text;
+        }
+        let plan = self.plan.clone().context("MATCH_RECOGNIZE: no plan")?;
+        if !plan.defines.is_empty() && self.planned.is_none() {
+            let types: Vec<DataType> = values.iter().map(|v| v.data_type().clone()).collect();
+            self.planned = Some(self.planner.planned(&self.text, &plan, &types)?);
+        }
+        Ok(plan)
+    }
+
 }
 
 /// Plans the glue of specs against the engine's functions, and keeps each spec's plan. `base` is the session's snapshot that
@@ -1452,6 +1778,8 @@ fn aggregate_types(base: &SessionState, name: &str, value: &DataType) -> Result<
 #[derive(Debug)]
 struct Matcher {
     all: bool,
+    /// `pondra_open` (with `all`): open mode, for an EMIT FINAL view's run.
+    open: bool,
     signature: Signature,
     planner: Arc<Planner>,
     stop: Option<Arc<AtomicBool>>,
@@ -1459,7 +1787,7 @@ struct Matcher {
 
 impl PartialEq for Matcher {
     fn eq(&self, other: &Self) -> bool {
-        self.all == other.all && self.signature == other.signature
+        (self.all, self.open) == (other.all, other.open) && self.signature == other.signature
     }
 }
 
@@ -1467,16 +1795,17 @@ impl Eq for Matcher {}
 
 impl Hash for Matcher {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.all.hash(state);
+        (self.all, self.open).hash(state);
         self.signature.hash(state);
     }
 }
 
 impl WindowUDFImpl for Matcher {
     fn name(&self) -> &str {
-        match self.all {
-            true => "pondra_matches",
-            false => "pondra_match",
+        match (self.open, self.all) {
+            (true, _) => "pondra_open",
+            (false, true) => "pondra_matches",
+            (false, false) => "pondra_match",
         }
     }
 
@@ -1490,64 +1819,71 @@ impl WindowUDFImpl for Matcher {
             return None;
         }
         let stop = statement_stop()?;
-        let (all, signature, planner) = (self.all, self.signature.clone(), self.planner.clone());
+        let (all, open, signature, planner) = (self.all, self.open, self.signature.clone(), self.planner.clone());
         Some(Box::new(move |mut wf: WindowFunction, _: &SimplifyContext| -> DfResult<Expr> {
-            let bound = Matcher { all, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
+            let bound = Matcher { all, open, signature: signature.clone(), planner: planner.clone(), stop: Some(stop.clone()) };
             wf.fun = WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(bound)));
             Ok(Expr::WindowFunction(Box::new(wf)))
         }))
     }
 
     fn partition_evaluator(&self, args: PartitionEvaluatorArgs) -> DfResult<Box<dyn PartitionEvaluator>> {
-        let types: Vec<DataType> = args.input_fields().iter().map(|f| f.data_type().clone()).collect();
-        // (the spec is a literal, as `pattern.rs` writes it: planned here, from the planner's cache; another form is read at the first row)
-        let literal = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
-            Some(ScalarValue::Utf8(Some(text))) => Some(text.clone()),
-            _ => None,
-        };
-        let mut evaluator = Evaluator { all: self.all, planner: self.planner.clone(), text: String::new(), plan: None, planned: None, stop: self.stop.clone() };
-        if let Some(text) = literal {
-            let plan = self.planner.plan(&text).map_err(external)?;
-            // (WITHIN's time and interval are checked here, at planning; `run` checks the time too)
-            if plan.within {
-                let fields = args.input_fields();
-                if let Some(time) = fields.get(plan.syms.len() + 1) {
-                    check_time_type(time.data_type()).map_err(external)?;
-                }
-                // a backstop for a spec written by hand: pattern.rs writes an interval literal, which is an interval type
-                if let Some(interval) = fields.get(plan.syms.len() + 2) {
-                    if !matches!(interval.data_type(), DataType::Interval(_)) {
-                        return Err(external(coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR")));
-                    }
-                }
-            }
-            if !plan.defines.is_empty() {
-                evaluator.planned = Some(self.planner.planned(&text, &plan, &types).map_err(external)?);
-            }
-            evaluator.text = text;
-            evaluator.plan = Some(plan);
-        }
-        Ok(Box::new(evaluator))
+        Ok(Box::new(evaluator_of(self.all, self.open, &self.planner, &self.stop, args)?))
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> DfResult<FieldRef> {
-        let t = match self.all {
-            true => DataType::List(Arc::new(Field::new("item", struct_type(), true))),
-            false => struct_type(),
+        let t = match (self.open, self.all) {
+            (true, _) => DataType::List(Arc::new(Field::new("item", open_struct_type(), true))),
+            (false, true) => DataType::List(Arc::new(Field::new("item", struct_type(), true))),
+            (false, false) => struct_type(),
         };
         Ok(Arc::new(Field::new(field_args.name(), t, true)))
     }
 }
 
-/// Registers `pondra_match`, `pondra_matches` and `pondra_nav` with a session (`engine::session`, for every form). A DEFINE's
+/// The evaluator of a call of `pondra_match`, `pondra_matches` or `pondra_open`: the spec's plan and glue, planned here when the
+/// spec is a literal (so a bad one is refused at planning), and the statement's stop flag.
+fn evaluator_of(all: bool, open: bool, planner: &Arc<Planner>, stop: &Option<Arc<AtomicBool>>, args: PartitionEvaluatorArgs) -> DfResult<Evaluator> {
+    let types: Vec<DataType> = args.input_fields().iter().map(|f| f.data_type().clone()).collect();
+    // (the spec is a literal, as `pattern.rs` writes it: planned here, from the planner's cache; another form is read at the first row)
+    let literal = match args.input_exprs().first().and_then(|e| e.downcast_ref::<Literal>()).map(|l| l.value()) {
+        Some(ScalarValue::Utf8(Some(text))) => Some(text.clone()),
+        _ => None,
+    };
+    let mut evaluator = Evaluator { all, open, planner: planner.clone(), text: String::new(), plan: None, planned: None, stop: stop.clone() };
+    if let Some(text) = literal {
+        let plan = planner.plan(&text).map_err(external)?;
+        // (WITHIN's time and interval are checked here, at planning; `run` checks the time too)
+        if plan.within {
+            let fields = args.input_fields();
+            if let Some(time) = fields.get(plan.syms.len() + 1) {
+                check_time_type(time.data_type()).map_err(external)?;
+            }
+            // a backstop for a spec written by hand: pattern.rs writes an interval literal, which is an interval type
+            if let Some(interval) = fields.get(plan.syms.len() + 2) {
+                if !matches!(interval.data_type(), DataType::Interval(_)) {
+                    return Err(external(coded("42601", "MATCH_RECOGNIZE: WITHIN takes an interval, as INTERVAL '1' HOUR")));
+                }
+            }
+        }
+        if !plan.defines.is_empty() {
+            evaluator.planned = Some(planner.planned(&text, &plan, &types).map_err(external)?);
+        }
+        evaluator.text = text;
+        evaluator.plan = Some(plan);
+    }
+    Ok(evaluator)
+}
+
+/// Registers `pondra_match`, `pondra_matches`, `pondra_open` and `pondra_nav` with a session (`engine::session`, for every form). A DEFINE's
 /// glue is planned against the session as it stands here, so it sees the functions registered before this call and no later
 /// one. A lake's statement that reads a pattern registers it again, last (`query::session_at`), so its DEFINEs see the AI,
 /// lake, Python and per-session functions too.
 pub fn register(ctx: &SessionContext) {
     let planner = Arc::new(Planner::new(Arc::new(ctx.state())));
-    for all in [false, true] {
+    for (all, open) in [(false, false), (true, false), (true, true)] {
         let signature = Signature::variadic_any(Volatility::Immutable);
-        ctx.register_udwf(WindowUDF::from(Matcher { all, signature, planner: planner.clone(), stop: None }));
+        ctx.register_udwf(WindowUDF::from(Matcher { all, open, signature, planner: planner.clone(), stop: None }));
     }
     ctx.register_udwf(WindowUDF::from(Navigate { signature: Signature::any(5, Volatility::Immutable) }));
 }
@@ -2483,12 +2819,12 @@ mod tests {
         let text = spec("a", PAST);
         let values: Vec<ArrayRef> = vec![Arc::new(StringArray::from(vec![text.as_str()])), Arc::new(BooleanArray::from(vec![true; 3]))];
         let stop = Arc::new(AtomicBool::new(true));
-        let mut stopped = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop.clone()) };
+        let mut stopped = Evaluator { all: false, open: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop.clone()) };
         let Err(err) = stopped.run(&values, 3) else { panic!("a stopped search answered") };
         assert_eq!(crate::codes::of(&err), "57014");
         assert!(err.to_string().contains("its MATCH_RECOGNIZE search was stopped"), "{err}");
         stop.store(false, atomic::Ordering::Relaxed);
-        let mut free = Evaluator { all: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop) };
+        let mut free = Evaluator { all: false, open: false, planner: Arc::new(planner()), text: String::new(), plan: None, planned: None, stop: Some(stop) };
         assert!(free.run(&values, 3).is_ok());
     }
 
@@ -2527,12 +2863,12 @@ mod tests {
 
     #[tokio::test]
     async fn simplify_binds_the_statements_flag_once() {
-        let m = Matcher { all: false, signature: Signature::variadic_any(Volatility::Immutable), planner: Arc::new(planner()), stop: None };
+        let m = Matcher { all: false, open: false, signature: Signature::variadic_any(Volatility::Immutable), planner: Arc::new(planner()), stop: None };
         assert!(m.simplify().is_none(), "nothing is bound outside a statement");
         let flag = Arc::new(AtomicBool::new(false));
         crate::audit::stoppable(flag.clone(), async {
             let simplify = m.simplify().expect("a statement binds its flag");
-            let unbound = Matcher { all: false, signature: m.signature.clone(), planner: m.planner.clone(), stop: None };
+            let unbound = Matcher { all: false, open: false, signature: m.signature.clone(), planner: m.planner.clone(), stop: None };
             let call = WindowFunction::new(WindowFunctionDefinition::WindowUDF(Arc::new(WindowUDF::from(unbound))), vec![]);
             let Expr::WindowFunction(out) = simplify(call, &SimplifyContext::builder().build()).expect("simplified") else {
                 panic!("a window function")
@@ -2614,6 +2950,397 @@ mod tests {
              ORDER BY day",
         )?;
         assert_eq!(rows_in(&ctx, &sql).await?, ["1|a", "2|b"]);
+        Ok(())
+    }
+
+    // Open mode (ADR-073 step 8a): the decided rule, the marker, WITHIN's death rule, and the cut property.
+
+    use datafusion::arrow::array::TimestampMicrosecondArray;
+    use datafusion::arrow::datatypes::IntervalMonthDayNano;
+
+    /// A (row's symbols, its members) key of a membership: the match, the row, the symbol, the place and `excluded`.
+    type Key = (i64, usize, Option<usize>, Option<i64>, bool);
+
+    fn key_of(m: &Mem, row: usize) -> Key { (m.m, row, m.sym, m.seq, m.excluded) }
+
+    /// A spec in open mode: `pattern` with `skip` (JSON), and a look-back of `look` rows.
+    fn open_spec(pattern: &str, skip: &str, look: usize) -> String {
+        format!(r#"{{"pattern":"{pattern}","skip":{skip},"look":{look}}}"#)
+    }
+
+    /// Open mode over `rows` (each row's symbols), from `k` look-back rows and `m` matches before: each row's memberships
+    /// as text, and the marker.
+    fn open_of(spec: &str, rows: &[Vec<usize>], k: usize, m: i64) -> Result<(Vec<String>, Marker)> {
+        let plan = compile(spec)?;
+        let cond = conds(rows, plan.syms.len());
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
+        let (found, marker) = partition_open(&plan, &part, &OpenArgs { k, m, low: None, kernel: None })?;
+        Ok((texts(&plan, &found), marker))
+    }
+
+    /// The microseconds of a UTC date and time, which is a timestamp's ticks.
+    fn micros(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap().and_utc().timestamp_micros()
+    }
+
+    /// A kernel for one interval (`value`) over a microsecond time with `zone` (None: no zone).
+    fn kernel_for(zone: Option<&str>, value: IntervalMonthDayNano) -> Kernel {
+        let time: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0i64]).with_timezone_opt(zone));
+        let interval: ArrayRef = Arc::new(IntervalMonthDayNanoArray::from(vec![value]));
+        Kernel::of(&time, &interval).expect("a kernel")
+    }
+
+    /// Whether a thread that started at time `t` is dead at watermark `w` (WITHIN's death rule).
+    fn dead_at(kernel: &Kernel, t: i64, w: i64) -> bool {
+        kernel.low(w + 1).expect("a low").is_none_or(|low| t < low)
+    }
+
+    #[test]
+    fn open_a_b_plus_ending_on_a_b_is_open() -> Result<()> {
+        // the thread in b+ may take one more row, so nothing is written and the resume is row 0
+        let (rows, marker) = open_of(&open_spec("a b+", PAST, 0), &[vec![0], vec![1], vec![1]], 0, 0)?;
+        assert_eq!(rows, ["", "", ""]);
+        assert_eq!(marker, Marker { keep: 3, k: 0, next_m: 0, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_a_reluctant_b_plus_ending_on_a_b_is_decided() -> Result<()> {
+        // b+? prefers to stop, so a b is decided at row 1 and written, and nothing is left open
+        let (rows, marker) = open_of(&open_spec("a b+?", PAST, 0), &[vec![0], vec![1]], 0, 0)?;
+        assert_eq!(rows, ["1a1", "1b2"]);
+        assert_eq!(marker, Marker { keep: 0, k: 0, next_m: 1, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_an_alternation_ending_on_a_waits_for_the_preferred_match() -> Result<()> {
+        // (a b | a) on a: the preferred a b may still match, so the search is open and its match is not written
+        let (rows, marker) = open_of(&open_spec("(a b | a)", PAST, 0), &[vec![0]], 0, 0)?;
+        assert_eq!(rows, [""]);
+        assert_eq!(marker, Marker { keep: 1, k: 0, next_m: 0, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_a_star_with_a_false_row_is_decided_as_an_empty_match() -> Result<()> {
+        let (rows, marker) = open_of(&open_spec("a*", PAST, 0), &[vec![]], 0, 0)?;
+        assert_eq!(rows, ["1-"]);
+        assert_eq!(marker, Marker { keep: 0, k: 0, next_m: 1, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_no_match_and_no_thread_left_is_decided_with_the_resume_at_the_end() -> Result<()> {
+        let (rows, marker) = open_of(&open_spec("a", PAST, 0), &[vec![1]], 0, 0)?;
+        assert_eq!(rows, [""]);
+        assert_eq!(marker, Marker { keep: 0, k: 0, next_m: 0, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_the_marker_keeps_the_look_back_rows_when_everything_is_decided() -> Result<()> {
+        // two matches of one row each, and a look-back of two: the resume is the end, so the next run keeps the last two rows
+        let (rows, marker) = open_of(&open_spec("a", PAST, 2), &[vec![0], vec![0], vec![1]], 0, 0)?;
+        assert_eq!(rows, ["1a1", "2a1", ""]);
+        assert_eq!(marker, Marker { keep: 2, k: 2, next_m: 2, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_the_marker_keeps_the_rows_from_the_look_back_before_an_open_search() -> Result<()> {
+        // a b+ with a look-back of one: the search from row 0 dies at row 1, and the one from row 1 is alive at the end
+        let (rows, marker) = open_of(&open_spec("a b+", PAST, 1), &[vec![0], vec![0], vec![1], vec![1]], 0, 0)?;
+        assert_eq!(rows, ["", "", "", ""]);
+        assert_eq!(marker, Marker { keep: 4, k: 1, next_m: 0, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_the_marker_carries_the_watermark_at_which_the_open_thread_dies() -> Result<()> {
+        // a b+ within INTERVAL '1' MONTH: the thread from Jan 31 is alive at a watermark of Feb 1 noon, and dies at Mar 1
+        let spec = format!(r#"{{"pattern":"a b+","skip":{PAST},"within":true}}"#);
+        let plan = compile(&spec)?;
+        let time: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![micros(2026, 1, 31, 0, 0), micros(2026, 2, 1, 0, 0)]));
+        let interval: ArrayRef = Arc::new(IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNanoType::make_value(1, 0, 0); 2]));
+        let kernel = Kernel::of(&time, &interval)?;
+        let watermark = micros(2026, 2, 1, 12, 0);
+        let args = OpenArgs { k: 0, m: 0, low: kernel.low(watermark + 1)?, kernel: Some(kernel) };
+        let cond = vec![vec![true, false], vec![false, true]];
+        let within = within_of(&time, &interval)?;
+        let part = Part { cond: &cond, within: Some(&within), n: 2, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
+        let (_, marker) = partition_open(&plan, &part, &args)?;
+        assert_eq!(marker, Marker { keep: 2, k: 0, next_m: 0, due: Some(micros(2026, 3, 1, 0, 0) - 1) });
+        Ok(())
+    }
+
+    #[test]
+    fn open_rows_before_k_start_no_search_and_matches_count_from_m_plus_one() -> Result<()> {
+        // rows 0 and 1 are look-back rows: no search starts on them, so the first match is row 2's, and it is match 1
+        let (rows, marker) = open_of(&open_spec("a", PAST, 0), &[vec![0], vec![0], vec![0]], 2, 0)?;
+        assert_eq!(rows, ["", "", "1a1"]);
+        assert_eq!(marker, Marker { keep: 0, k: 0, next_m: 1, due: None });
+        // the matches the key found before number on from m + 1
+        let (rows, marker) = open_of(&open_spec("a", PAST, 0), &[vec![0], vec![0]], 0, 5)?;
+        assert_eq!(rows, ["6a1", "7a1"]);
+        assert_eq!(marker, Marker { keep: 0, k: 0, next_m: 7, due: None });
+        Ok(())
+    }
+
+    #[test]
+    fn open_a_month_from_jan_31_is_alive_in_feb_and_dead_from_march_first() {
+        // Feb 28 noon less a month is Jan 28, before Jan 31, so the thread lives; Mar 1 less a month is Feb 1, after it
+        let kernel = kernel_for(None, IntervalMonthDayNanoType::make_value(1, 0, 0));
+        let start = micros(2026, 1, 31, 0, 0);
+        assert!(!dead_at(&kernel, start, micros(2026, 2, 28, 12, 0)));
+        assert!(dead_at(&kernel, start, micros(2026, 3, 1, 0, 0)));
+    }
+
+    #[test]
+    fn open_a_day_across_the_new_york_dst_change_is_23_hours() -> Result<()> {
+        // on 2026-03-08 the clocks go forward: midnight on March 9 (EDT) less a day is midnight on March 8 (EST), 23 hours back
+        let kernel = kernel_for(Some("America/New_York"), IntervalMonthDayNanoType::make_value(0, 1, 0));
+        let march_9 = micros(2026, 3, 9, 4, 0);
+        let start = micros(2026, 3, 8, 5, 0);
+        assert_eq!(kernel.low(march_9)?, Some(start));
+        assert_eq!(march_9 - start, 23 * 3_600_000_000);
+        // the thread from that midnight dies at the midnight that starts March 9
+        assert_eq!(due_of(&kernel, start)?, march_9);
+        Ok(())
+    }
+
+    #[test]
+    fn open_due_is_the_least_watermark_where_the_thread_dies() -> Result<()> {
+        let cases = [
+            (kernel_for(None, IntervalMonthDayNanoType::make_value(1, 0, 0)), micros(2026, 1, 31, 0, 0)),
+            (kernel_for(Some("America/New_York"), IntervalMonthDayNanoType::make_value(0, 1, 0)), micros(2026, 3, 8, 5, 0)),
+            (kernel_for(None, IntervalMonthDayNanoType::make_value(0, 2, 90_000_000_000)), micros(2026, 2, 27, 23, 0)),
+        ];
+        for (kernel, start) in &cases {
+            let due = due_of(kernel, *start)?;
+            assert!(dead_at(kernel, *start, due), "dead at its due {due}");
+            assert!(!dead_at(kernel, *start, due - 1), "alive just before its due {due}");
+            assert!(dead_at(kernel, *start, due + 1), "dead after its due {due}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn open_due_without_months_or_zone_is_the_start_plus_the_interval() -> Result<()> {
+        // an interval of a day and 1.5 seconds, over a time with no zone: the thread dies exactly that long after its start
+        let kernel = kernel_for(None, IntervalMonthDayNanoType::make_value(0, 1, 1_500_000_000));
+        for start in [micros(2026, 1, 1, 0, 0), micros(2026, 3, 8, 5, 0)] {
+            assert_eq!(due_of(&kernel, start)?, start + 86_400_000_000 + 1_500_000);
+        }
+        Ok(())
+    }
+
+    /// The xorshift step, so the same partitions come every run (as fsum's and json_rows' tests draw theirs).
+    fn xorshift(x: &mut u64) -> u64 {
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        *x
+    }
+
+    /// A random row: each of the symbols a, b and c, met with two chances in three.
+    fn random_row(x: &mut u64) -> [bool; 3] {
+        let a = xorshift(x) % 3 != 0;
+        let b = xorshift(x) % 3 != 0;
+        let c = xorshift(x) % 3 != 0;
+        [a, b, c]
+    }
+
+    fn random_quantifier(x: &mut u64) -> &'static str {
+        ["", "", "", "*", "+", "?", "*?", "+?", "{2}", "{1,2}", "{0,2}?", "{2,}"][(xorshift(x) % 12) as usize]
+    }
+
+    /// A random pattern over the symbols a, b and c: a symbol, a sequence, an alternation, a group with a quantifier, an
+    /// exclusion or a PERMUTE, nested `depth` deep.
+    fn random_pattern(x: &mut u64, depth: u32) -> String {
+        let pick = xorshift(x) % 10;
+        if depth == 0 || pick < 3 {
+            let sym = ["a", "b", "c"][(xorshift(x) % 3) as usize];
+            return format!("{sym}{}", random_quantifier(x));
+        }
+        let left = random_pattern(x, depth - 1);
+        let right = random_pattern(x, depth - 1);
+        match pick {
+            3 | 4 => format!("{left} {right}"),
+            5 => format!("({left} | {right})"),
+            6 | 7 => format!("({left}){}", random_quantifier(x)),
+            8 => format!("{{- {left} -}}"),
+            _ => format!("PERMUTE({left}, {right})"),
+        }
+    }
+
+    /// The cut property (the brief's core check) for one partition, at every cut: open mode over rows 0..c, then over the rows
+    /// the first run keeps and rows c..n, writes the plain matcher's matches that start before the second run's resume point,
+    /// each once, with the same MATCH_NUMBERs. Returns the cuts checked, or None when the plain matcher refuses the partition.
+    fn cut_property(spec: &str, rows: &[[bool; 3]], times: &[i64], interval: i64) -> Result<Option<usize>> {
+        let plan = compile(spec)?;
+        let n = rows.len();
+        let time: ArrayRef = Arc::new(TimestampMicrosecondArray::from(times.to_vec()));
+        let interval_of = |len: usize| -> ArrayRef {
+            Arc::new(IntervalMonthDayNanoArray::from(vec![IntervalMonthDayNanoType::make_value(0, 0, interval * 1_000); len]))
+        };
+        let kernel = match plan.within {
+            true => Some(Kernel::of(&time, &interval_of(n))?),
+            false => None,
+        };
+        // WITHIN's low for a watermark: the bound is for W + 1 tick
+        let low = |w: i64| -> Result<Option<i64>> {
+            match &kernel {
+                Some(k) => k.low(w + 1),
+                None => Ok(None),
+            }
+        };
+        let cond = |a: usize, b: usize| -> Vec<Vec<bool>> {
+            plan.syms
+                .iter()
+                .map(|s| {
+                    let col = (s.as_bytes()[0] - b'a') as usize;
+                    rows[a..b].iter().map(|r| r[col]).collect()
+                })
+                .collect()
+        };
+        let within = |a: usize, b: usize| -> Result<Option<Within>> {
+            match plan.within {
+                true => Ok(Some(within_of(&time.slice(a, b - a), &interval_of(b - a))?)),
+                false => Ok(None),
+            }
+        };
+        let plain_cond = cond(0, n);
+        let plain_within = within(0, n)?;
+        let part = Part { cond: &plain_cond, within: plain_within.as_ref(), n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
+        let Ok(plain) = partition(&plan, &part) else { return Ok(None) };
+        let mut checked = 0;
+        for c in 1..n {
+            // the first run sees rows 0..c; every later row is after the watermark, which is one tick before row c
+            let first_cond = cond(0, c);
+            let first_within = within(0, c)?;
+            let first_part = Part { cond: &first_cond, within: first_within.as_ref(), n: c, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
+            let first_args = OpenArgs { k: 0, m: 0, low: low(times[c] - 1)?, kernel: kernel.clone() };
+            let (first, marker) = partition_open(&plan, &first_part, &first_args)?;
+            // the second run sees the rows the first keeps, then rows c..n, from the marker's look-back and match count
+            let base = c - marker.keep as usize;
+            let len = n - base;
+            let second_cond = cond(base, n);
+            let second_within = within(base, n)?;
+            let second_part = Part { cond: &second_cond, within: second_within.as_ref(), n: len, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: crate::matcher::KEEP, reads: crate::matcher::KEEP, stop: None };
+            let second_args = OpenArgs { k: marker.k as usize, m: marker.next_m, low: low(times[n - 1])?, kernel: kernel.clone() };
+            let (second, end) = partition_open(&plan, &second_part, &second_args)?;
+            // the second run's resume point, in the partition's rows: its look-back start plus the rows before its look-back
+            let resume = base + (end.k + (len as i64 - end.keep)) as usize;
+            let mut got: Vec<Key> = vec![];
+            for (j, mems) in first.iter().enumerate() {
+                got.extend(mems.iter().map(|m| key_of(m, j)));
+            }
+            for (j, mems) in second.iter().enumerate() {
+                got.extend(mems.iter().map(|m| key_of(m, base + j)));
+            }
+            let mut want: Vec<Key> = vec![];
+            for (i, mems) in plain.iter().enumerate() {
+                for m in mems {
+                    let start = match m.seq {
+                        Some(s) => i + 1 - s as usize,
+                        None => i,
+                    };
+                    if start < resume {
+                        want.push(key_of(m, i));
+                    }
+                }
+            }
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "spec {spec}: rows {rows:?}, times {times:?}, cut {c}");
+            checked += 1;
+        }
+        Ok(Some(checked))
+    }
+
+    #[test]
+    fn open_the_cut_property_holds_for_every_cut_and_skip_rule() -> Result<()> {
+        // random partitions of up to 25 rows, half under WITHIN, every cut of each, for each skip rule and ALL ROWS. A skip rule
+        // that the partition refuses (TO FIRST and TO LAST need their symbol after the match's first row) draws again, until
+        // it has 200 checked; the draws are the same for every rule.
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut checked = [0usize; 4];
+        let mut partitions = 0;
+        while checked.iter().any(|&c| c < 200) {
+            partitions += 1;
+            assert!(partitions <= 2000, "partitions checked per skip rule: {checked:?}");
+            let depth = 1 + (xorshift(&mut x) % 3) as u32;
+            let pattern = random_pattern(&mut x, depth);
+            let syms = names(&pattern);
+            let n = 1 + (xorshift(&mut x) % 25) as usize;
+            let rows: Vec<[bool; 3]> = (0..n).map(|_| random_row(&mut x)).collect();
+            let mut t = 0i64;
+            let times: Vec<i64> = (0..n)
+                .map(|_| {
+                    t += (xorshift(&mut x) % 3) as i64;
+                    t
+                })
+                .collect();
+            let interval = 1 + (xorshift(&mut x) % 4) as i64;
+            let within = xorshift(&mut x) % 2 == 0;
+            let look = (xorshift(&mut x) % 3) as usize;
+            let target = syms[(xorshift(&mut x) % syms.len() as u64) as usize].clone();
+            let skips = [
+                r#"{"to":"past_last"}"#.to_string(),
+                r#"{"to":"next_row"}"#.to_string(),
+                format!(r#"{{"to":"first","symbol":"{target}"}}"#),
+                format!(r#"{{"to":"last","symbol":"{target}"}}"#),
+            ];
+            for (kind, skip) in skips.iter().enumerate() {
+                if checked[kind] >= 200 {
+                    continue;
+                }
+                let spec = format!(r#"{{"pattern":"{pattern}","skip":{skip},"within":{within},"look":{look}}}"#);
+                if cut_property(&spec, &rows, &times, interval)?.is_some() {
+                    checked[kind] += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pondra_open_counts_match_numbers_from_m_plus_one() -> Result<()> {
+        // each row is a match of its own, and x is tested for MATCH_NUMBER() = day: with m = 5 the rows are matches 6, 7 and 8
+        let spec = r#"{"pattern":"x","skip":{"to":"past_last"},"defines":[{"symbol":0,"glue":"(__mr_s0 = __mr_r0)","slots":[{"index":0,"kind":"match_number"}]}],"rows":1}"#;
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let sql = format!(
+            "WITH t(day) AS (VALUES (6), (7), (8)) SELECT day, m['match'] AS mn FROM \
+             (SELECT day, unnest(ms) AS m FROM (SELECT day, pondra_open('{spec}', true, day, 0, 5, day) OVER (ORDER BY day) AS ms FROM t)) \
+             WHERE m['match'] IS NOT NULL ORDER BY day"
+        );
+        assert_eq!(rows_in(&ctx, &sql).await?, ["6|6", "7|7", "8|8"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pondra_open_returns_eight_fields_with_the_marker_last_on_the_last_row() -> Result<()> {
+        // day 3 is in match 2 and carries the marker after it, with seq -1 and its match NULL
+        let spec = r#"{"pattern":"a","skip":{"to":"past_last"}}"#;
+        let ctx = crate::engine::session(SessionConfig::new(), Arc::new(RuntimeEnv::default()));
+        let sql = format!(
+            "WITH t(day, a) AS (VALUES (1, true), (2, false), (3, true)) \
+             SELECT day, pondra_open('{spec}', a, 0, 0, day) OVER (ORDER BY day) AS ms FROM t ORDER BY day"
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let batch = &batches[0];
+        let DataType::List(item) = batch.schema().field(1).data_type().clone() else { panic!("a list of structs") };
+        let DataType::Struct(fields) = item.data_type() else { panic!("a list of structs") };
+        assert_eq!(fields.len(), 8);
+        let lists = batch.column(1).as_any().downcast_ref::<ListArray>().expect("a list column");
+        assert_eq!(lists.value(1).len(), 0);
+        let last = lists.value(2);
+        let items = last.as_any().downcast_ref::<StructArray>().expect("structs");
+        assert_eq!(items.len(), 2);
+        let seq = items.column(2).as_any().downcast_ref::<Int64Array>().expect("seq");
+        assert_eq!((seq.value(0), seq.value(1)), (1, -1));
+        assert!(items.column(0).is_null(1));
         Ok(())
     }
 }
