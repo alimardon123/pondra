@@ -1,7 +1,7 @@
-//! What the page's stores and its node share (`fetch.rs` and `node.rs` over `fetch`, `opfs.rs` over the origin's private
-//! file system): JavaScript calls and properties, the one way to call `fetch`, promises awaited, a failure's words, the
-//! task a store's work runs as, what a read of an object asks for, and the Web Lock a kept folder is held by (`lock`).
-//! Both stores read an object the same way (an empty range, and a HEAD, want the meta and no body).
+//! What the page's store and its node share (`node.rs` over `fetch`, `opfs.rs` over the origin's private file system):
+//! JavaScript calls and properties, the one way to call `fetch`, promises awaited, a failure's words, the task a store's
+//! work runs as, what a read of an object asks for, and the Web Lock a kept folder is held by (`lock`). An empty range,
+//! and a HEAD, want the meta and no body (`read_of`).
 
 use futures::channel::oneshot;
 use object_store::{GetOptions, GetRange};

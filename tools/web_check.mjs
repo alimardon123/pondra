@@ -13,6 +13,8 @@
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
 // (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name, and a page past its
 // memory line is checked in a child process of its own (`memoryChecks`).
+// A module holds one page at a time, so each check frees the page it made before the next makes one. A check that needs a
+// page while another lives has a tab of its own, on the bare page (`/?bare`: the module with no page of its own).
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
@@ -105,7 +107,7 @@ async function openInNode() {
   const t0 = performance.now();
   const page = new Page();
   const open_ms = Number((performance.now() - t0).toFixed(1));
-  const pages = new Map([['pondra', page]]); // (the pages by the name `on` gives: `withNode` adds one of its own)
+  const pages = new Map([['pondra', page]]); // (the pages by the name `on` gives: `withNode` makes one of its own, in place of this)
   return {
     open_ms,
     Page,
@@ -114,10 +116,34 @@ async function openInNode() {
       if (!chosen) throw new Error(`Node has no page ${on}: a kept page is in a browser`);
       return chosen.request(method, path, headers, body);
     },
+    // A module has one page: the page before is closed and freed, and nothing after `withNode` asks for it.
     withNode: async (name, url) => {
+      for (const before of pages.values()) {
+        await before.close();
+        before.free();
+      }
+      pages.clear();
       pages.set(name, new Page({ node: url }));
     },
-    close: async () => {},
+    // The page `oneAtATime` makes is the module's one page: a second `new Page()` while it lives is refused (`refused`, the
+    // words), and the first is freed (not closed: its member ends in the background), after which a page is made (`reopened`).
+    oneAtATime: async () => {
+      let refused = null;
+      try {
+        new Page();
+      } catch (e) {
+        refused = String(e);
+      }
+      pages.get('pondra').free();
+      pages.set('pondra', new Page());
+      return { refused, reopened: pages.get('pondra') instanceof Page };
+    },
+    close: async () => {
+      for (const last of pages.values()) {
+        await last.close();
+        last.free();
+      }
+    },
   };
 }
 
@@ -140,19 +166,50 @@ async function openInBrowser() {
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    // One context for the checks' tabs: they share its origin's private file system and Web Locks. (`newPage` of a context
+    // made by `browser.newPage()` is refused, so the context is made here.)
+    const context = await browser.newContext();
+    const page = await context.newPage();
     watch(page);
-    await page.goto(`http://127.0.0.1:${site.port}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
+    const origin = `http://127.0.0.1:${site.port}`; // (the origin a node names for this page, in PONDRA_WEB_ORIGINS)
+    await page.goto(`${origin}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
     await untilStarted(page);
+    // The tab each page object lives in, by the name `on` gives it: `pondra` is the page's own, and each other is in a tab
+    // of its own (`tab`), since a module has one page.
+    const tabs = new Map([['pondra', page]]);
+    // A tab of the page's context on the bare page, registered as `name`, which the checks then call by that name.
+    const tab = async (name) => {
+      const made = await openBare(context, origin);
+      tabs.set(name, made);
+      return made;
+    };
     return {
       browser, // (kept for check 5's tab of the same browser)
       version: browser.version(),
       port: site.port,
-      origin: `http://127.0.0.1:${site.port}`, // (the origin a node names for this page, in PONDRA_WEB_ORIGINS)
+      origin,
       page,
       open_ms: await page.evaluate(() => window.open_ms),
-      request: (method, path, headers, body, on) => requestInBrowser(page, method, path, headers, body, on),
-      withNode: (name, url) => pageWithNode(page, name, url),
+      request: (method, path, headers, body, on = 'pondra') => {
+        const chosen = tabs.get(on);
+        if (!chosen) throw new Error(`the browser has no page ${on}: a check makes it first`);
+        return requestInBrowser(chosen, method, path, headers, body, on);
+      },
+      tab,
+      withNode: async (name, url) => pageWithNode(await tab(name), name, url),
+      // The same check as Node's `oneAtATime`, on the page's own tab: the module's one page is freed (not closed: its member ends
+      // in the background), and a page is made after it.
+      oneAtATime: () => page.evaluate(() => {
+        let refused = null;
+        try {
+          new window.Page();
+        } catch (e) {
+          refused = String(e);
+        }
+        window.pondra.free();
+        window.pondra = new window.Page();
+        return { refused, reopened: window.pondra instanceof window.Page };
+      }),
       close: () => closeAll(browser, site),
     };
   } catch (e) {
@@ -183,6 +240,17 @@ function pageWithNode(page, name, url) {
   }, { name, url });
 }
 
+// A tab of `context` on the site's bare page (`/?bare`), started when this returns. The context is the one a check's other
+// tabs are in, so they share its origin's private file system and Web Locks (`page.context()`, not `browser.newPage()`,
+// which makes a context of its own).
+async function openBare(context, origin) {
+  const tab = await context.newPage();
+  watch(tab);
+  await tab.goto(`${origin}/?bare`, { waitUntil: 'commit' });
+  await untilStarted(tab);
+  return tab;
+}
+
 async function closeAll(browser, site) {
   try {
     await browser?.close();
@@ -209,7 +277,10 @@ async function playwrightChromium() {
 // The page the browser opens. Its module is the one under /pkg/, made and timed as Node makes and times it; a failure to
 // start is kept for the run to say, rather than left to a page error and a timeout.
 const MODULE_TYPES = { '.js': 'text/javascript; charset=utf-8', '.wasm': 'application/wasm' };
-const PAGE = `<!doctype html>
+// `/` is the module with its one page (`window.pondra`); `/?bare` is the module with none, for a check that makes the page it
+// needs (a kept page, a node's page). Either way the module is started and timed here.
+function pageHtml(bare) {
+  return `<!doctype html>
 <meta charset="utf-8">
 <title>pondra web check</title>
 <script type="module">
@@ -218,7 +289,7 @@ const PAGE = `<!doctype html>
     await init();
     window.Page = Page; // (for the kept checks: Page.kept is made in the page)
     const t0 = performance.now();
-    window.pondra = new Page();
+    ${bare ? '' : 'window.pondra = new Page();'}
     window.open_ms = Number((performance.now() - t0).toFixed(1));
     window.ready = true;
   } catch (e) {
@@ -226,6 +297,9 @@ const PAGE = `<!doctype html>
   }
 </script>
 `;
+}
+const PAGE = pageHtml(false);
+const PAGE_BARE = pageHtml(true);
 
 // The page's server on 127.0.0.1: the page at `/`, and the --pkg folder's files under `/pkg/`. The .wasm goes as
 // `application/wasm`, which a browser needs to compile it while it streams in.
@@ -248,8 +322,9 @@ async function serveSite() {
 }
 
 async function servePage(req, res) {
-  const { pathname } = new URL(req.url, 'http://127.0.0.1');
-  if (pathname === '/') return send(res, 200, 'text/html; charset=utf-8', PAGE);
+  const url = new URL(req.url, 'http://127.0.0.1');
+  const { pathname } = url;
+  if (pathname === '/') return send(res, 200, 'text/html; charset=utf-8', url.searchParams.has('bare') ? PAGE_BARE : PAGE);
   if (pathname === '/demo/' || pathname === '/demo/index.html') {
     return send(res, 200, 'text/html; charset=utf-8', await readFile(DEMO, 'utf8'));
   }
@@ -366,6 +441,25 @@ async function versionChecks(on, path) {
   }
 }
 
+// One page to a module: a second `new Page()` while one lives is refused by its words (55006), and a page is made once the
+// first is freed. Checked where the module has its one page (`target.oneAtATime`), in Node and in Chromium alike.
+async function onePageCheck(target) {
+  let result;
+  try {
+    result = await target.oneAtATime();
+  } catch (e) {
+    failed.push('one page to a module');
+    console.error(`one page to a module: threw ${e}`);
+    return;
+  }
+  const { refused, reopened } = result;
+  if (refused?.includes('a page is open in this module already') && reopened === true) passed++;
+  else {
+    failed.push('one page to a module');
+    console.error(`one page to a module: refused ${refused ?? 'not refused'}, reopened ${reopened}`);
+  }
+}
+
 // In Node there is no origin's private file system, so `Page.kept` is refused by name: the kept checks are left out.
 async function keptRefused(Page) {
   const refused = await Page.kept().then(() => null, (e) => String(e));
@@ -472,9 +566,9 @@ function asJudged(a) {
   return { status: a.status, headers: a.headers, body: enc.encode(a.text) };
 }
 
-// The kept page in Chromium (`Page.kept`): its files and tables are kept in the origin's private file system, so they are
-// there after a reload, and a large file is read by ranges, not whole. It runs last among the checks: a reload runs the
-// page's script again, so `window.pondra` is then a new memory page.
+// The kept page in Chromium (`Page.kept`), in `page`, a tab on the bare page (`tab('kept')`): its files and tables are kept in
+// the origin's private file system, so they are there after a reload, and a large file is read by ranges, not whole. A
+// reload runs the tab's script again, and `window.kept` is made again from its folder.
 async function keptChecks(page, lake) {
   const expected = await expectedOf(lake);
   // (a folder left by an earlier run is removed first)
@@ -493,7 +587,7 @@ async function keptChecks(page, lake) {
   for (const [name, text] of [
     ['kept: CREATE TABLE k AS FROM k.csv', "CREATE TABLE k AS FROM 'k.csv'"],
     ['kept: INSERT INTO k', "INSERT INTO k VALUES (9, 'z')"],
-    ['kept: CREATE TABLE "a{b}"', 'CREATE TABLE "a{b}" AS SELECT 1 AS x'],
+    ['kept: CREATE TABLE "a-b"', 'CREATE TABLE "a-b" AS SELECT 1 AS x'],
   ]) {
     const made = await ask(name, 'POST', '/sql', undefined, text, 'kept');
     if (made) judge(name, made, { status: 200, sqlstate: null });
@@ -535,12 +629,12 @@ async function keptChecks(page, lake) {
   if (!(await openKept(page, 'pondra-check'))) return;
   const after = await ask('kept after reload: SELECT * FROM k', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM k ORDER BY id', 'kept');
   if (after && before) judge('kept after reload: SELECT * FROM k', after, { status: 200, sqlstate: null, out: dec.decode(before.body) });
-  const letters = await ask('kept after reload: FROM "a{b}"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a{b}"', 'kept');
-  if (letters) judge('kept after reload: FROM "a{b}"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
+  const letters = await ask('kept after reload: FROM "a-b"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a-b"', 'kept');
+  if (letters) judge('kept after reload: FROM "a-b"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
   const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
   if (listed) {
     judge('kept after reload: GET /objects', listed, {
-      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}', 'k'], { k: 4 }),
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 4 }),
     });
   }
   if (expected) {
@@ -591,7 +685,7 @@ async function keptChecks(page, lake) {
   if (!(await openKept(page, 'pondra-check'))) return;
   const droppedList = await ask('kept after the drop: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
   if (droppedList) {
-    judge('kept after the drop: GET /objects', droppedList, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}']) });
+    judge('kept after the drop: GET /objects', droppedList, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b']) });
   }
   const gone = await ask('kept after the drop: GET /files/k.csv', 'GET', '/files/k.csv', undefined, undefined, 'kept');
   if (gone) judge('kept after the drop: GET /files/k.csv', gone, { status: 404, sqlstate: null, type: TEXT, out: 'no such file: files/k.csv' });
@@ -614,24 +708,29 @@ async function keptChecks(page, lake) {
   }
 
   // (g) A folder is one page's at a time: while a kept page holds it, a second page given it is refused by name, and once
-  // that page is freed the folder opens again. The folder is one of its own (`pondra-lock`, removed first), and no page a
-  // later check uses is freed here.
-  const held = await page.evaluate(async () => {
+  // that page is freed the folder opens again. The holder and the second page are tabs of their own, in this context (the
+  // same origin's folders and Web Locks, one module each), so the second is refused by the folder's name, not by the
+  // module's one page. The folder is one of its own (`pondra-lock`, removed first), and no page a later check uses is freed.
+  const origin = new URL(page.url()).origin;
+  const holder = await openBare(page.context(), origin);
+  const second = await openBare(page.context(), origin);
+  await holder.evaluate(async () => {
     try {
       await (await navigator.storage.getDirectory()).removeEntry('pondra-lock', { recursive: true });
     } catch (e) {
       if (e.name !== 'NotFoundError') throw e;
     }
-    const first = await window.Page.kept('pondra-lock');
-    const refused = await window.Page.kept('pondra-lock').then(() => null, (e) => String(e));
-    first.free();
-    const reopened = await window.Page.kept('pondra-lock').then((again) => { again.free(); return true; }, (e) => String(e));
-    return { refused, reopened };
+    window.heldLock = await window.Page.kept('pondra-lock');
   });
-  if (held.refused?.includes('pondra-lock') && held.reopened === true) passed++;
+  const refused = await second.evaluate(() => window.Page.kept('pondra-lock').then(() => null, (e) => String(e)));
+  await holder.evaluate(() => window.heldLock.free());
+  const reopened = await second.evaluate(() => window.Page.kept('pondra-lock').then((again) => { again.free(); return true; }, (e) => String(e)));
+  await holder.close();
+  await second.close();
+  if (refused?.includes('pondra-lock') && reopened === true) passed++;
   else {
     failed.push("Page.kept('pondra-lock') while another page holds it");
-    console.error(`Page.kept('pondra-lock'): refused ${held.refused ?? 'not refused'}, reopened ${held.reopened}`);
+    console.error(`Page.kept('pondra-lock'): refused ${refused ?? 'not refused'}, reopened ${reopened}`);
   }
 }
 
@@ -817,8 +916,10 @@ const CASES = [
   ['window', 'POST', '/sql?format=csv', 'SELECT id, sum(qty) OVER (ORDER BY id) AS run FROM orders', 200, null,
     'id,run\n1,5\n2,12\n3,21\n'],
   ['syntax error', 'POST', '/sql', 'SELEC 1', 400, '42601', undefined],
-  ['CREATE EXTERNAL TABLE refused', 'POST', '/sql', "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'orders.csv'", 501, '0A000', undefined],
-  ['AT refused', 'POST', '/sql', 'FROM orders AT (VERSION => 1)', 501, '0A000', undefined],
+  // The core answers these (a node does too, forms.json names no page refusal for them), so they are answered, not refused.
+  // The external table is ext, not t: the checks below make t, and an external table over a file takes no INSERT.
+  ['CREATE EXTERNAL TABLE', 'POST', '/sql', "CREATE EXTERNAL TABLE ext STORED AS CSV LOCATION 'orders.csv'", 200, null, undefined],
+  ['AT', 'POST', '/sql', 'FROM orders AT (VERSION => 1)', 200, null, undefined],
   ['a file by name', 'POST', '/sql?format=csv', "SELECT sum(qty) AS s FROM 'orders.csv'", 200, null, 's\n21\n'],
   ['a file by its files/ path', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'files/orders.csv'", 200, null, 'n\n3\n'],
   ['a glob', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'order*.csv'", 200, null, 'n\n3\n'],
@@ -832,14 +933,17 @@ for (const [name, method, path, send, status, sqlstate, out] of CASES) {
   const answer = await ask(name, method, path, undefined, send);
   if (answer) judge(name, answer, { status, sqlstate, out });
 }
+const droppedExt = await ask('DROP TABLE ext', 'POST', '/sql', undefined, 'DROP TABLE ext');
+if (droppedExt) judge('DROP TABLE ext', droppedExt, { status: 200, sqlstate: null });
 
 // A file a client reads back is the bytes it put, with its etag and its content type by name (GET).
 const got = await ask('GET /files/orders.csv', 'GET', '/files/orders.csv');
 if (got) judge('GET /files/orders.csv', got, { status: 200, sqlstate: null, type: 'text/csv; charset=utf-8', etag: true, out: ORDERS });
 const missing = await ask('GET a missing file', 'GET', '/files/nope.csv');
 if (missing) judge('GET a missing file', missing, { status: 404, sqlstate: null, type: TEXT, out: 'no such file: files/nope.csv' });
-const versions = await ask('GET ?versions refused', 'GET', '/files/orders.csv?versions');
-if (versions) judge('GET ?versions refused', versions, { status: 501, sqlstate: '0A000' });
+// The versions of a file are answered as a JSON list, one version a row (the core's, as a node answers it).
+const versions = await ask('GET ?versions', 'GET', '/files/orders.csv?versions');
+if (versions) judge('GET ?versions', versions, { status: 200, sqlstate: null, type: JSON_TYPE });
 
 // The version checks of orders.csv, put above, on the memory page (`versionChecks`, below).
 await versionChecks('pondra', 'orders.csv');
@@ -871,7 +975,9 @@ if (objects) {
       const names = (j.objects ?? []).map((o) => o.name);
       const problems = [];
       if (JSON.stringify(names) !== JSON.stringify(['names', 'orders', 't'])) problems.push(`objects ${JSON.stringify(names)}`);
-      if (j.files !== 'mem:///files/') problems.push(`files ${j.files}`);
+      // Where SQL reads a relative file from: the page's files folder in its own memory store (memory://<id>/files/),
+      // or a node's real folder (<folder>/files/). Its exact URL is the store's, so only its last part is checked.
+      if (typeof j.files !== 'string' || !j.files.endsWith('/files/')) problems.push(`files ${j.files}`);
       return problems;
     },
   });
@@ -1055,7 +1161,7 @@ async function lakeChecks(dir) {
     if (answer) judge(name, answer, want);
   }
   // The latest version again, from the server that hides its Content-Range: another origin, so nothing the page kept is
-  // reused, and each read takes the range it asked for (`unranged` in web/src/fetch.rs).
+  // reused.
   const hiddenAt = `http://127.0.0.1:${hidden.port}/orders`;
   const hiddenRead = await ask('lake latest, its Content-Range hidden', 'POST', '/sql?format=csv', undefined,
     `SELECT * FROM read_delta('${hiddenAt}') ORDER BY id`);
@@ -1156,7 +1262,7 @@ async function otherOriginCheck(target, node) {
   const tab = await target.browser.newPage();
   try {
     watch(tab);
-    await tab.goto(`http://localhost:${target.port}/`, { waitUntil: 'commit' });
+    await tab.goto(`http://localhost:${target.port}/?bare`, { waitUntil: 'commit' });
     await untilStarted(tab);
     await pageWithNode(tab, 'other', node.url);
     const from = { request: (method, path, headers, body, on) => requestInBrowser(tab, method, path, headers, body, on) };
@@ -1248,8 +1354,9 @@ async function stopProcess(child) {
 
 try {
   await lakeChecks(lake);
+  await onePageCheck(target);
   if (IN_BROWSER) {
-    await keptChecks(target.page, lake);
+    await keptChecks(await target.tab('kept'), lake);
     await demoChecks(target.page);
   } else {
     await keptRefused(target.Page);
