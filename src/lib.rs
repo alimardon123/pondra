@@ -169,6 +169,7 @@ mod rules;
 #[cfg(feature = "lake")] mod txn;
 #[cfg(feature = "lake")] mod returning;
 #[cfg(feature = "lake")] mod with_writes;
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))] mod wasm; // (extensions' WebAssembly parts: a page has no host before 1.1)
 #[cfg(feature = "doors")] mod mcp;
 #[cfg(feature = "doors")] mod pg;
 #[cfg(feature = "lake")] mod past;
