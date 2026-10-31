@@ -102,8 +102,11 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   WebAssembly components built once for every version and form. Before 1.0, only DuckDB's
   `INSTALL`/`LOAD` of what is built in.
 - **J1:** the server's catalog (ADR-032 §9). **J3, J6:** reports and dashboards of Pondra's own,
-  snappy at any scale. **J4:** connections (`CREATE CONNECTION`). **J5, J7:** a workspace exported
-  whole, and ETL as code, a canvas and YAML over one definition, as plugins.
+  snappy at any scale. **J4:** connections (`CREATE CONNECTION`, `designs/etl-and-bi-tools.md` §3.7): a
+  connection says where a source is and a secret who may reach it; one definition in Git for every
+  environment, parameterized as Data Factory's linked services are, with `ATTACH` its one-line form and
+  table macros its datasets. **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
+  over one definition, as plugins.
 - **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
 - **Governance** (the owner, 2026-10-13, after single sign-on by the freeze; `reviews/platform-comparison.md`'s
   governance row): row filters and column masks, as Databricks' Unity Catalog and Snowflake's Horizon have them.

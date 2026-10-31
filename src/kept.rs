@@ -1,5 +1,5 @@
-//! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines and dashboards, the
-//! grants on them, and `GRANT EXECUTE`. One list, read at the front (`front::expand`, which every node door and the
+//! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines, dashboards and
+//! connections, the grants on them, and `GRANT EXECUTE`. One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
@@ -15,10 +15,13 @@ const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1
 /// A pipeline's WAIT FOR, where a script's statement starts.
 const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
+/// What a connection's statements say; `{}` is the statement's words.
+const CONNECTION: &str = "{}: connections come in 1.1; until then, ATTACH '…' AS name says where a source is, and CREATE SECRET who reads it";
 
-/// A task's `AFTER … FAILED` or `AFTER … ALWAYS` (`runs::task`): a pipeline's step, not a task's.
+/// A step's `ON FAILURE [OF step]` or `ALWAYS` in a task's head (`runs::task`), or the older `AFTER … FAILED`: a pipeline
+/// step's, not a task's.
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
-pub(crate) const AFTER_FAILED: &str = "AFTER … FAILED and AFTER … ALWAYS are a pipeline step's, coming in 1.1: a task after others runs when they all succeeded";
+pub(crate) const ON_FAILURE: &str = "ON FAILURE [OF step] and ALWAYS are a pipeline step's, coming in 1.1: a task after others runs when they all succeeded";
 /// A task's `ON FILES` or `ON CHANGE OF`, where a task's SCHEDULE or AFTER goes (`runs::task`).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))]
 pub(crate) const ON_FILES: &str = "ON FILES and ON CHANGE OF start a pipeline, coming in 1.1: a task runs on SCHEDULE '…' or AFTER task";
@@ -40,6 +43,13 @@ const REFUSED: &[(&[&str], &str)] = &[
     (&["SHOW", "CREATE", "DASHBOARD"], DASHBOARD),
     (&["SHOW", "DASHBOARDS"], DASHBOARD),
     (&["COMMENT", "ON", "DASHBOARD"], DASHBOARD),
+    (&["CREATE", "CONNECTION"], CONNECTION),
+    (&["CREATE", "OR", "REPLACE", "CONNECTION"], CONNECTION),
+    (&["ALTER", "CONNECTION"], CONNECTION),
+    (&["DROP", "CONNECTION"], CONNECTION),
+    (&["SHOW", "CREATE", "CONNECTION"], CONNECTION),
+    (&["SHOW", "CONNECTIONS"], CONNECTION),
+    (&["COMMENT", "ON", "CONNECTION"], CONNECTION),
     (&["GRANT", "EXECUTE", "ON"], GRANT_EXECUTE), // (a bare `GRANT execute TO u` grants a role, as it did)
     (&["REVOKE", "EXECUTE", "ON"], GRANT_EXECUTE),
 ];
@@ -71,8 +81,8 @@ fn is_name(word: &str) -> bool {
     !matches!(word, "TO" | "FROM") && word.starts_with(|c: char| c.is_alphabetic() || c == '_' || c == '"')
 }
 
-/// `GRANT` or `REVOKE` … ON PIPELINE name, or … ON DASHBOARD name, where the name follows the first ON. `GRANT SELECT ON
-/// pipeline TO r` is a table's grant, as it was.
+/// `GRANT` or `REVOKE` … ON PIPELINE name, … ON DASHBOARD name or … ON CONNECTION name, where the name follows the first
+/// ON. `GRANT SELECT ON pipeline TO r` is a table's grant, as it was.
 fn grant_on(words: &[String]) -> Option<String> {
     let verb = words.first()?;
     if verb != "GRANT" && verb != "REVOKE" {
@@ -83,6 +93,7 @@ fn grant_on(words: &[String]) -> Option<String> {
     match words.get(at + 1)?.as_str() {
         "PIPELINE" if named => Some(PIPELINE.replace("{}", &format!("{verb} ON PIPELINE"))),
         "DASHBOARD" if named => Some(DASHBOARD.replace("{}", &format!("{verb} ON DASHBOARD"))),
+        "CONNECTION" if named => Some(CONNECTION.replace("{}", &format!("{verb} ON CONNECTION"))),
         _ => None,
     }
 }
@@ -132,6 +143,10 @@ mod tests {
         assert!(refusal("REVOKE EXECUTE ON FUNCTION f FROM r").unwrap().starts_with("GRANT EXECUTE comes in 1.1"));
         assert!(refusal("EXECUTE PIPELINE sales.orders (day => 1)").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
         assert!(refusal("EXECUTE PIPELINE nightly").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
+        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION: connections come in 1.1"));
+        assert!(refusal("show connections").unwrap().starts_with("SHOW CONNECTIONS: connections come in 1.1"));
+        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION: connections come in 1.1"));
+        assert_eq!(refusal("GRANT SELECT ON connection TO r"), None); // (a table called connection)
         assert_eq!(refusal("STEP a AS SELECT 1").as_deref(), Some(STEP));
         assert_eq!(refusal("parallel SELECT 1").as_deref(), Some(PARALLEL));
         assert_eq!(refusal("WAIT FOR p").as_deref(), Some(WAIT_FOR));
