@@ -22696,6 +22696,7 @@ def friendly():
     nodes = [Node(lake, A.port + i, tier_secs=1, **({"pg": f"127.0.0.1:{A.port + 10}"} if i == 0 else {})).start() for i in range(3)]
     time.sleep(1)
     duck = duckdb.connect()
+    duck.execute("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'")  # (DuckDB 2.0 takes `lambda y: …` alone unless asked; Pondra's lambdas are `y -> …`)
     t0 = datetime.datetime(2026, 1, 1)
     def row(i):
         n = "NULL" if i % 5 == 0 else str(i / 2)
