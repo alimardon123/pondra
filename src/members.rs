@@ -138,6 +138,28 @@ impl Members for Alone {
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
+/// A page that joined a cluster (`node::open_joined`): a reader that never leads, runs tasks or takes writes. Its leader is
+/// the node it joined, at term 0 (a term it claims nothing of: the cluster's terms start at 1), so it follows that node's
+/// commit stream rather than a term's.
+pub struct Joined {
+    term: Term,
+}
+
+impl Joined {
+    /// The member of the lake the cluster at `node` leads (its URL, as `https://host:7000`).
+    pub fn new(node: &str) -> Joined {
+        Joined { term: Term { n: 0, addr: node.trim_end_matches('/').to_string(), lock: String::new(), bell: false } }
+    }
+}
+
+impl Members for Joined {
+    fn me(&self) -> &str { "" }
+    fn leader(&self) -> &Term { &self.term }
+    fn reader(&self) -> bool { true }
+    fn nodes(&self) -> Vec<String> { vec![] }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
