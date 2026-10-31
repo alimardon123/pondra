@@ -25,11 +25,11 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::results::{CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::store::PortalStore;
+use pgwire::api::store::{Entry, PortalStore};
 use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
-use pgwire::messages::extendedquery::{Describe, Execute, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Parse, ParseComplete, TARGET_TYPE_BYTE_PORTAL};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
@@ -1233,6 +1233,66 @@ impl CopyHandler for Backend {
     }
 }
 
+/// The client as Parse, Bind, Describe and Execute write to it: their messages wait in its buffer, and the socket is written
+/// at Sync (`on_sync`) or Flush, as Postgres writes it, not after each message. pgwire sends each of ParseComplete,
+/// BindComplete, a portal's RowDescription and CommandComplete on its own: a prepared key lookup took four writes to the
+/// socket where a simple query takes one, and the client as many wake-ups (2,000 lookups: 8,004 `sendto` to 2,002). A
+/// COPY's start is written at once, since the client answers it before it sends a Sync; a full buffer is written anyway
+/// (the codec's own limit), so a long answer still streams.
+struct Corked<'a, C> {
+    c: &'a mut C,
+    now: bool, // (a COPY began: write as asked from here)
+}
+
+impl<'a, C> Corked<'a, C> {
+    fn new(c: &'a mut C) -> Self { Corked { c, now: false } }
+}
+
+impl<C: Sink<PgWireBackendMessage> + Unpin> Sink<PgWireBackendMessage> for Corked<'_, C> {
+    type Error = C::Error;
+    fn poll_ready(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut *self.c).poll_ready(cx)
+    }
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: PgWireBackendMessage) -> Result<(), Self::Error> {
+        if matches!(item, PgWireBackendMessage::CopyInResponse(_) | PgWireBackendMessage::CopyOutResponse(_) | PgWireBackendMessage::CopyBothResponse(_)) {
+            self.now = true;
+        }
+        std::pin::Pin::new(&mut *self.c).start_send(item)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.now {
+            true => std::pin::Pin::new(&mut *self.c).poll_flush(cx),
+            false => std::task::Poll::Ready(Ok(())),
+        }
+    }
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut *self.c).poll_close(cx)
+    }
+}
+
+impl<C: ClientPortalStore> ClientPortalStore for Corked<'_, C> {
+    type PortalStore = C::PortalStore;
+    fn portal_store(&self) -> &Self::PortalStore { self.c.portal_store() }
+}
+
+impl<C: ClientInfo> ClientInfo for Corked<'_, C> {
+    fn socket_addr(&self) -> std::net::SocketAddr { self.c.socket_addr() }
+    fn is_secure(&self) -> bool { self.c.is_secure() }
+    fn protocol_version(&self) -> pgwire::messages::ProtocolVersion { self.c.protocol_version() }
+    fn set_protocol_version(&mut self, v: pgwire::messages::ProtocolVersion) { self.c.set_protocol_version(v) }
+    fn pid_and_secret_key(&self) -> (i32, pgwire::messages::startup::SecretKey) { self.c.pid_and_secret_key() }
+    fn set_pid_and_secret_key(&mut self, pid: i32, key: pgwire::messages::startup::SecretKey) { self.c.set_pid_and_secret_key(pid, key) }
+    fn state(&self) -> pgwire::api::PgWireConnectionState { self.c.state() }
+    fn set_state(&mut self, s: pgwire::api::PgWireConnectionState) { self.c.set_state(s) }
+    fn transaction_status(&self) -> pgwire::messages::response::TransactionStatus { self.c.transaction_status() }
+    fn set_transaction_status(&mut self, s: pgwire::messages::response::TransactionStatus) { self.c.set_transaction_status(s) }
+    fn metadata(&self) -> &std::collections::HashMap<String, String> { self.c.metadata() }
+    fn metadata_mut(&mut self) -> &mut std::collections::HashMap<String, String> { self.c.metadata_mut() }
+    fn session_extensions(&self) -> &pgwire::api::SessionExtensions { self.c.session_extensions() }
+    fn sni_server_name(&self) -> Option<&str> { self.c.sni_server_name() }
+    fn client_certificates<'b>(&self) -> Option<&[tokio_rustls::rustls::pki_types::CertificateDer<'b>]> { self.c.client_certificates() }
+}
+
 /// A statement as Parse gave it, and what was found of it once. Postgres settles a prepared statement's
 /// parameter types, and its columns, when it is prepared. Finding them here plans the query, and libpq's
 /// drivers (psycopg) bind, describe and execute a prepared statement every time it runs: each run
@@ -1405,7 +1465,10 @@ impl ExtendedQueryHandler for Backend {
     {
         // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
         let _busy = crate::drain::Busy::new();
-        let out = self._on_execute(client, message).await;
+        let out = self._on_execute(&mut Corked::new(client), message).await;
+        if crate::drain::draining() {
+            client.flush().await?; // (a node stopping writes the rows now, while the drain still counts this call)
+        }
         self.cancelled(&out);
         out
     }
@@ -1425,7 +1488,46 @@ impl ExtendedQueryHandler for Backend {
                 crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
             }
         }
-        self._on_describe(client, message).await
+        self._on_describe(&mut Corked::new(client), message).await
+    }
+
+    // (pgwire's own Parse and Bind, their answers written at the Sync with the rest: `Corked`)
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.clone().unwrap_or_else(|| pgwire::api::DEFAULT_NAME.to_owned());
+        match StoredStatement::parse(client, &message, self.query_parser()).await? {
+            Some(stmt) => client.portal_store().put_statement(Arc::new(stmt)),
+            None => client.portal_store().put_empty_statement(&name),
+        }
+        client.feed(PgWireBackendMessage::ParseComplete(ParseComplete::new())).await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let statement_name = message.statement_name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        let portal_name = message.portal_name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match client.portal_store().get_statement(statement_name) {
+            Some(Entry::Value(statement)) => client.portal_store().put_portal(Arc::new(Portal::try_new(&message, statement)?)),
+            Some(Entry::Empty) if !message.parameters.is_empty() => {
+                let why = format!("bind message supplies {} parameters, but prepared statement {statement_name:?} requires 0", message.parameters.len());
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_owned(), "08P01".to_owned(), why))));
+            }
+            Some(Entry::Empty) => client.portal_store().put_empty_portal(portal_name),
+            None => return Err(PgWireError::StatementNotFound(statement_name.to_owned())),
+        }
+        client.feed(PgWireBackendMessage::BindComplete(BindComplete::new())).await?;
+        Ok(())
     }
 
     async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, _max_rows: usize) -> PgWireResult<Response>
