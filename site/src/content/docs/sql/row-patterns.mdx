@@ -52,6 +52,8 @@ next match starts: from the last row that `up` matched, so day 10 is in two matc
 
 ## The clauses
 
+The rows can come from a table, a CTE or a subquery: `FROM (SELECT * FROM ticker WHERE day > 0) t MATCH_RECOGNIZE (…) m` matches over the subquery's rows, as `FROM ticker MATCH_RECOGNIZE` matches over the table's. A materialized view reads a table by its name: `FROM ticker MATCH_RECOGNIZE (…)`.
+
 | Clause | What it does |
 |---|---|
 | `PARTITION BY` | splits the rows by these columns; each part is matched on its own. Columns only: compute anything else in a subquery |

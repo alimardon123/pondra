@@ -69,7 +69,7 @@ pub enum Relation<H: ?Sized> {
 /// The front:
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     crate::kept::refused(sql)?; // (1.1's statements, refused by name at every door in the same words: `kept.rs`)
-    crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, refused by name with what to write: `pattern.rs`)
+    crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, and a materialized view over one of a subquery: refused by name with what to write, `pattern.rs`)
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),
         Own::Go(sql) => sql,
@@ -82,7 +82,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past_names::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
-    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse)
+    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse; a subquery before MATCH_RECOGNIZE: as a CTE)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;
     let all = host.routines().await?;
