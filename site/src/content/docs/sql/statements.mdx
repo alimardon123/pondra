@@ -836,7 +836,7 @@ SELECT taxed(100) AS t;
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
-| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly file, kept in the lake by its SHA-256 |
+| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly component, kept in the lake by its SHA-256; `VERSION` must be the one the file says |
 | List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
@@ -849,8 +849,12 @@ their values.
 Only an admin installs an extension, and a node takes one only when it runs with
 `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
 the node that got the statement (a path on its machine from the program that started it, or a URL a
-secret covers), and every node sees the record; a branch and a backup carry the file with it. This
-release keeps the file and runs none of its functions yet.
+secret covers), and every node sees the record; a branch and a backup carry the file with it. The
+file says its version and its functions, which a query then calls by name in every session, on every
+node; a name another function has already is refused at `INSTALL` (`42723`). Each call runs in a
+sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
+past it) and `PONDRA_EXTENSION_SECS` for a batch (`57014`); the function's own error is `38000`, and
+the node goes on.
 
 ## Users and grants
 

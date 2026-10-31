@@ -36,6 +36,8 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_AUDIT_DAYS` | `90` | how many days `pondra.audit` keeps. Read when the log is first made |
 | `PONDRA_ALLOW_UNSIGNED_EXTENSIONS` | off | `true`: this node may install an extension whose file no one signed (`INSTALL name FROM 'file or URL'`). Every extension is unsigned until 1.0, so an admin starts the node with it to try one. Off, the install is refused by name |
 | `PONDRA_EXTENSION_FILE_MB` | `64` | the most a `.wasm` extension file may be when it is installed |
+| `PONDRA_EXTENSION_MB` | `256` | the most memory one call of an extension's function may take; past it the call fails with `53200` and the node goes on |
+| `PONDRA_EXTENSION_SECS` | `30` | the longest one batch of an extension's function may run; past it the call fails with `57014` and the node goes on |
 | `PONDRA_HISTORY` | on | `off`: this node writes nothing to `pondra.history`, the row every statement leaves |
 | `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node in `pondra.history`; past it, fast statements that went well are counted in one row (`class = 'skipped'`). Slow and failed ones are always written |
 | `PONDRA_HISTORY_DAYS` | `7` | how many days `pondra.history` keeps. Read when it is first made |

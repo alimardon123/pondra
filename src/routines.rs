@@ -1242,6 +1242,10 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
 /// be remembered)? In a view it reads too.
 pub async fn volatile(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| f.volatile).await {
+        return true; // (an extension's function that says it may answer the same arguments differently: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return true };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
 }

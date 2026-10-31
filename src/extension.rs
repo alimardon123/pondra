@@ -53,6 +53,20 @@ pub struct Installed {
     pub from: String,
     pub by: String,
     pub at_ms: u64,
+    /// Its functions, as its `describe()` said when it was installed: a session registers those its query names.
+    #[serde(default)]
+    pub functions: Vec<Described>,
+}
+
+/// One of an extension's functions as its record keeps it: its name, its arguments' and answer's types as Arrow writes them
+/// (`Utf8`, `Int64`), and whether it may answer the same arguments differently.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct Described {
+    pub name: String,
+    pub arguments: Vec<String>,
+    pub returns: String,
+    #[serde(default)]
+    pub volatile: bool,
 }
 
 /// What a statement does with a name.
@@ -204,7 +218,7 @@ fn answer(ask: &Ask, installed: bool) -> Result<Said> {
         return Ok(Said { tag, notice: format!("{name} is built into Pondra: nothing to {step}") });
     }
     if ask.verb == Verb::Load && installed {
-        return Ok(Said { tag, notice: format!("{name} is installed: this release keeps its file and runs none of its functions yet") });
+        return Ok(Said { tag, notice: format!("{name} is installed: its functions are on in every session") });
     }
     let built: Vec<&str> = BUILT_IN.iter().map(|(n, _)| *n).collect();
     Err(coded("0A000", format!("{name} isn't built into Pondra: install a Pondra extension from its file, INSTALL {name} FROM 'path or URL' (ADR-075); the DuckDB extensions built in are {}", built.join(", "))))
@@ -303,16 +317,25 @@ async fn bytes_of(lake: &Lake, from: &str, max: u64) -> Result<Vec<u8>> {
     Ok(got.bytes().await?.to_vec())
 }
 
-/// Checks the file's bytes and keeps them at `ext/<name>/<version>/<sha256>.wasm` (content-addressed: a file already there is
-/// kept already), and makes the record of them. A file that isn't WebAssembly is refused by its name.
-#[cfg(feature = "lake")]
+/// Checks the file's bytes, loads them (`wasm::load`: compiled, and asked what it has), and keeps them at
+/// `ext/<name>/<version>/<sha256>.wasm` (content-addressed: a file already there is kept already); then makes the record of
+/// them, its version and functions as the file says. A file that isn't WebAssembly is refused by its name, one that isn't a
+/// component Pondra can load saying why, a `VERSION` the file doesn't say by both versions, and a function whose name another
+/// function has by that name (`clash`).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
 pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, bytes: Vec<u8>) -> Result<Installed> {
     let file = file_of(from);
     if !bytes.starts_with(b"\0asm") {
         return Err(coded("22023", format!("{file} is not a WebAssembly file")));
     }
-    let version = version.or_else(|| version_in(name, &file)).unwrap_or_else(|| "0".to_string());
     let sha256 = crate::text::hex(&crate::crypto::sha256(&bytes));
+    let part = part_of(bytes.clone(), &sha256).await?;
+    if let Some(asked) = version.filter(|v| *v != part.version) {
+        return Err(coded("22023", format!("{file} is {} {}, not {asked}", part.name, part.version)));
+    }
+    let version = part.version.clone();
+    let functions: Vec<Described> = part.functions.iter().map(|f| Described { name: f.name.clone(), arguments: f.arguments.iter().map(ToString::to_string).collect(), returns: f.returns.to_string(), volatile: f.volatile }).collect();
+    clash(lake, name, &functions).await?;
     let size = bytes.len() as u64;
     match lake.put(&file_key(name, &version, &sha256), bytes).await {
         Ok(()) => {}
@@ -326,7 +349,161 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
         from: from.to_string(),
         by: crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "admin".to_string()),
         at_ms: crate::log::now_ms(),
+        functions,
     })
+}
+
+/// A page has no host for an extension's part (X3 in the plan: after 1.0); `fetch` refuses before this.
+#[cfg(all(feature = "lake", target_arch = "wasm32"))]
+pub async fn keep(_: &Lake, name: &str, _: &str, _: Option<String>, _: Vec<u8>) -> Result<Installed> {
+    Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")))
+}
+
+/// Refuses functions whose names are taken: by the engine's own functions (`upper`), the lake's routines, or another
+/// installed extension's (an extension installed again over itself takes its own names back). A function's name is a
+/// plain lower-case word, so a query names it as it names any function.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+async fn clash(lake: &Lake, name: &str, functions: &[Described]) -> Result<()> {
+    let state = lake.session().state();
+    let routines = crate::routines::listed(lake).await?;
+    let others = listed(lake).await?;
+    for f in functions {
+        let n = f.name.as_str();
+        if n.is_empty() || !n.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') || !n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(coded("42602", format!("{name}'s function {n}: a function's name is lower-case letters, digits and _")));
+        }
+        if state.scalar_functions().contains_key(n) || state.aggregate_functions().contains_key(n) || state.window_functions().contains_key(n) {
+            return Err(coded("42723", format!("{name}'s function {n}: Pondra has a function {n} already")));
+        }
+        if routines.iter().any(|(r, _)| r == n) {
+            return Err(coded("42723", format!("{name}'s function {n}: the routine {n} has that name; drop it or install another file")));
+        }
+        if let Some((other, _)) = others.iter().find(|(o, r)| o != name && r.functions.iter().any(|g| g.name == n)) {
+            return Err(coded("42723", format!("{name}'s function {n}: the extension {other} has a function {n} already")));
+        }
+    }
+    Ok(())
+}
+
+/// The parts loaded in this process, by their file's SHA-256: a part holds no lake's state and its file never changes under
+/// its hash, so one serves every lake and node in the process. (Kept until the process ends: an extension installed again is
+/// a new file, a new entry.)
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+static PARTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::wasm::Loaded>>>> = std::sync::LazyLock::new(Default::default);
+
+/// A part from its bytes, compiled off the async threads (a megabyte takes Cranelift a second the first time; the disk cache
+/// makes it milliseconds after) and kept in `PARTS`.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+async fn part_of(bytes: Vec<u8>, sha256: &str) -> Result<Arc<crate::wasm::Loaded>> {
+    if let Some(p) = PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha256) {
+        return Ok(p.clone());
+    }
+    let sha = sha256.to_string();
+    let part = Arc::new(tokio::task::spawn_blocking(move || crate::wasm::load(&bytes, &sha)).await??);
+    PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(sha256.to_string(), part.clone());
+    Ok(part)
+}
+
+/// An installed extension's part: from `PARTS`, else its file read from the lake its record is in.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+async fn part(lake: &Lake, name: &str, r: &Installed) -> Result<Arc<crate::wasm::Loaded>> {
+    if let Some(p) = PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&r.sha256) {
+        return Ok(p.clone());
+    }
+    let bytes = lake.object(&file_key(name, &r.version, &r.sha256)).await.with_context(|| format!("reading the file of the extension {name}"))?;
+    part_of(bytes.to_vec(), &r.sha256).await
+}
+
+/// The functions of the lake's installed extensions that `text` names (the query and the views it reads), in its session
+/// (`query::session_at`): each a scalar function by its own name, run by its extension's part. An extension no query names
+/// is never loaded, so one whose file can't be read fails only the queries that call it. On every node a spread query
+/// reaches, its session registers the same, from the same records.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, text: &str) -> Result<()> {
+    let installed = listed(lake).await?;
+    if installed.is_empty() {
+        return Ok(());
+    }
+    let text = text.to_lowercase();
+    let words: std::collections::HashSet<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+    for (name, r) in installed.iter().filter(|(_, r)| r.functions.iter().any(|f| words.contains(f.name.as_str()))) {
+        let part = part(lake, name, r).await?;
+        for f in &part.functions {
+            ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(Call::new(part.clone(), f)));
+        }
+    }
+    Ok(())
+}
+
+/// Does `sql`, or a view it reads, call one of the installed extensions' functions that `which` picks? The views are read
+/// only when an extension has such a function and `sql` alone doesn't name it (most lakes have no extension).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+pub async fn calls(lake: &Lake, sql: &str, which: impl Fn(&Described) -> bool) -> bool {
+    let Ok(installed) = listed(lake).await else { return true };
+    let names: Vec<&str> = installed.iter().flat_map(|(_, r)| &r.functions).filter(|f| which(f)).map(|f| f.name.as_str()).collect();
+    if names.is_empty() || names.iter().any(|n| crate::text::mentions(sql, n)) {
+        return !names.is_empty();
+    }
+    match crate::routines::with_views(lake, sql).await {
+        Ok(text) => names.iter().any(|n| crate::text::mentions(&text, n)),
+        Err(_) => true,
+    }
+}
+
+/// One of an extension's functions in a session: its batches go to the part, a fresh instance for each (`wasm::Loaded::call`).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+struct Call {
+    function: String,
+    returns: datafusion::arrow::datatypes::DataType,
+    signature: datafusion::logical_expr::Signature,
+    part: Arc<crate::wasm::Loaded>,
+}
+
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl Call {
+    fn new(part: Arc<crate::wasm::Loaded>, f: &crate::wasm::Function) -> Self {
+        use datafusion::logical_expr::{Signature, Volatility};
+        let volatility = if f.volatile { Volatility::Volatile } else { Volatility::Immutable };
+        let signature = if f.arguments.is_empty() { Signature::nullary(volatility) } else { Signature::exact(f.arguments.clone(), volatility) };
+        Call { function: f.name.clone(), returns: f.returns.clone(), signature, part }
+    }
+}
+
+// (one function of one file: the same name and hash is the same function)
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl PartialEq for Call {
+    fn eq(&self, other: &Self) -> bool { self.function == other.function && Arc::ptr_eq(&self.part, &other.part) }
+}
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl Eq for Call {}
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl std::hash::Hash for Call {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) { (&self.function, Arc::as_ptr(&self.part)).hash(h) }
+}
+
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl datafusion::logical_expr::ScalarUDFImpl for Call {
+    fn name(&self) -> &str { &self.function }
+    fn signature(&self) -> &datafusion::logical_expr::Signature { &self.signature }
+    fn return_type(&self, _: &[datafusion::arrow::datatypes::DataType]) -> datafusion::error::Result<datafusion::arrow::datatypes::DataType> { Ok(self.returns.clone()) }
+
+    fn invoke_with_args(&self, args: datafusion::logical_expr::ScalarFunctionArgs) -> datafusion::error::Result<datafusion::logical_expr::ColumnarValue> {
+        use datafusion::logical_expr::ColumnarValue;
+        let rows = args.number_rows;
+        let columns = args.args.iter().map(|a| match a {
+            ColumnarValue::Array(a) => Ok(a.clone()),
+            ColumnarValue::Scalar(s) => s.to_array_of_size(rows),
+        }).collect::<datafusion::error::Result<Vec<_>>>()?;
+        match self.part.call(&self.function, &columns, rows) {
+            Ok(column) => Ok(ColumnarValue::Array(column)),
+            // (its code goes with it: a function's own error is 38000 at every door)
+            Err(e) => Err(match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+                Some(c) => datafusion::error::DataFusionError::External(Box::new(crate::codes::Coded(c.0, c.1.clone()))),
+                None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
+            }),
+        }
+    }
 }
 
 /// The leader keeps a record (`Ddl::InstallExtension`): the same file already installed is answered "unchanged"; any other
@@ -375,14 +552,9 @@ pub async fn listed(lake: &Lake) -> Result<Vec<(String, Installed)>> {
     Ok(lake.cat.scan::<Installed>("xt/", "xt0").await?.into_iter().map(|(k, v)| (k["xt/".len()..].to_string(), v)).collect())
 }
 
-/// The file's own name, which carries its version (`words-0.1.wasm`): the part after its last `/`, before any `?` or `#`.
+/// The file's own name (`words-0.1.wasm`), for what is said of it: the part after its last `/`, before any `?` or `#`.
 fn file_of(from: &str) -> String {
     from.split(['?', '#']).next().unwrap_or(from).rsplit('/').next().unwrap_or(from).to_string()
-}
-
-/// The version a file name carries for `name`: `words-0.1.wasm` is `0.1` for `words`. A name without one is None.
-fn version_in(name: &str, file: &str) -> Option<String> {
-    file.strip_suffix(".wasm")?.strip_prefix(name)?.strip_prefix('-').filter(|v| !v.is_empty()).map(str::to_string)
 }
 
 /// `extensions()`: each extension's name, version, file's hash and size, where it came from, who installed it and when, and
@@ -569,46 +741,87 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_the_files_or_none() {
+    fn a_file_is_named_by_its_last_part() {
         assert_eq!(file_of("https://x.org/a/words-0.2.wasm?sig=1"), "words-0.2.wasm");
         assert_eq!(file_of("/data/words-0.1.wasm"), "words-0.1.wasm");
-        assert_eq!(version_in("words", "words-0.1.wasm").as_deref(), Some("0.1"));
-        assert_eq!(version_in("words", "words.wasm"), None);
-        assert_eq!(version_in("words", "other-0.1.wasm"), None);
-        assert_eq!(version_in("words", "words-.wasm"), None);
         assert!(valid("words") && valid("my-ext_2") && !valid("a/b") && !valid("") && !valid("Words"));
     }
 
-    /// The record and the bytes: kept under their hash, a second copy kept already, a file that isn't WebAssembly refused by
-    /// its name, and the record's replacing or unchanged, and dropping it, as the leader does them.
+    /// `tests/extensions/words` (tools/extension_fixture.sh): word_count, shout and boom.
+    #[cfg(feature = "lake")]
+    const WORDS: &[u8] = include_bytes!("../tests/fixtures/extensions/words-0.1.wasm");
+
+    /// The record and the bytes: the file loaded and asked what it has, kept under its hash, a second copy kept already;
+    /// a file that isn't WebAssembly, or isn't a component, refused by its name; a VERSION the file doesn't say, and functions
+    /// another extension has, refused; the record's replacing or unchanged, and dropping it, as the leader does them.
     #[cfg(feature = "lake")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_installed_extension_is_kept_until_uninstalled() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
-        let wasm = b"\0asm\x01\0\0\0".to_vec();
         let e = keep(&lake, "words", "/data/words-0.1.txt", None, b"text".to_vec()).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words-0.1.txt is not a WebAssembly file".to_string()));
+        let e = keep(&lake, "words", "/data/module.wasm", None, b"\0asm\x01\0\0\0".to_vec()).await.err().unwrap();
+        assert!(crate::codes::of(&e) == "22023" && format!("{e:#}").contains("not a WebAssembly component"), "{e:#}");
 
-        let first = keep(&lake, "words", "/data/words-0.1.wasm", None, wasm.clone()).await?;
-        assert_eq!((first.version.as_str(), first.bytes), ("0.1", 8));
-        let again = keep(&lake, "words", "https://x.org/words.wasm", Some("0.1".into()), wasm.clone()).await?;
+        let first = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
+        assert_eq!((first.version.as_str(), first.bytes as usize), ("0.1", WORDS.len()), "the version is the file's own");
+        assert_eq!(first.functions[0], Described { name: "word_count".into(), arguments: vec!["Utf8".into()], returns: "Int64".into(), volatile: false });
+        let e = keep(&lake, "words", "/data/words.wasm", Some("0.2".into()), WORDS.to_vec()).await.err().unwrap();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words.wasm is words 0.1, not 0.2".to_string()));
+        let again = keep(&lake, "words", "https://x.org/words.wasm", Some("0.1".into()), WORDS.to_vec()).await?;
         assert_eq!(again.sha256, first.sha256, "the same bytes are kept once");
         let out = install(&lake, "words", first.clone()).await?;
         assert_eq!(out["sha256"], serde_json::json!(first.sha256));
         assert_eq!(install(&lake, "words", again).await?["unchanged"], true, "the same file is unchanged");
         let names: Vec<String> = listed(&lake).await?.into_iter().map(|(n, _)| n).collect();
         assert_eq!(names, ["words"]);
+        assert!(keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.is_ok(), "installed again over itself: its own names");
+        let e = keep(&lake, "words2", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.err().unwrap();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42723", "words2's function word_count: the extension words has a function word_count already".to_string()));
+        let upper = Described { name: "upper".into(), arguments: vec!["Utf8".into()], returns: "Utf8".into(), volatile: false };
+        let e = clash(&lake, "mine", &[upper]).await.err().unwrap();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42723", "mine's function upper: Pondra has a function upper already".to_string()));
         // (a branch copies the file each record names: there it is)
         let named = files(&lake.cat.scan_raw("", "\x7f").await?);
         assert_eq!(named, [format!("ext/words/0.1/{}.wasm", first.sha256)]);
-        assert_eq!(lake.object(&named[0]).await?.to_vec(), wasm, "the file is kept where its record says");
+        assert_eq!(lake.object(&named[0]).await?.to_vec(), WORDS, "the file is kept where its record says");
 
         assert_eq!(uninstall(&lake, "words", false).await?["removed"], true);
         assert!(listed(&lake).await?.is_empty());
         let e = uninstall(&lake, "words", false).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42704", "extension words is not installed".to_string()));
         assert_eq!(uninstall(&lake, "words", true).await?["removed"], false, "IF EXISTS takes nothing and says so");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// In a query: an installed extension's functions answer by their own names, over a column of strings as a table reads
+    /// it (a view of strings, cast to the type describe() gave), for each row and its NULLs; its own error is 38000 in its
+    /// words; and once uninstalled, its names are no function.
+    #[cfg(feature = "lake")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_installed_extensions_functions_answer_in_a_query() -> Result<()> {
+        use datafusion::arrow::array::{AsArray, Int64Array};
+        let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
+        install(&lake, "words", record).await?;
+        let run = |sql: &'static str| {
+            let lake = &lake;
+            async move {
+                let ctx = crate::query::session(lake, sql, "").await?;
+                anyhow::Ok(ctx.sql(sql).await?.collect().await?)
+            }
+        };
+        let got = run("SELECT word_count(t) AS n, shout(t) AS s FROM (VALUES (arrow_cast('a quick test', 'Utf8View')), (NULL), ('')) AS v(t)").await?;
+        assert_eq!(got[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>(), &Int64Array::from(vec![Some(3), None, Some(0)]));
+        assert_eq!(got[0].column(1).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("A QUICK TEST"), None, Some("")]);
+        let e = run("SELECT boom(1)").await.err().unwrap();
+        assert_eq!((crate::codes::of(&e), crate::codes::words(&e)), ("38000", "words's boom: boom always fails".to_string()));
+        uninstall(&lake, "words", false).await?;
+        assert!(run("SELECT word_count('a b')").await.is_err(), "uninstalled: no such function");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

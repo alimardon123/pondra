@@ -62,6 +62,8 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_DRAIN_SECS", Node),
     ("PONDRA_EMBED_MODEL", Node),
     ("PONDRA_EXTENSION_FILE_MB", Node),
+    ("PONDRA_EXTENSION_MB", Node),
+    ("PONDRA_EXTENSION_SECS", Node),
     ("PONDRA_FILES_CACHE_MB", Node),
     ("PONDRA_FILE_VERSIONS", Node),
     ("PONDRA_FILE_VERSIONS_DAYS", Node),

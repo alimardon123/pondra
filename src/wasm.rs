@@ -3,7 +3,6 @@
 //! by its SHA-256 (`compiled`), and each call runs in a store of its own, so no call sees another's memory and a part holds
 //! nothing between batches. A part imports nothing yet: one that imports what this Pondra doesn't offer is refused by the
 //! import's name when it is loaded (ADR-075 §3). Arguments and answers cross as Arrow IPC.
-#![cfg_attr(not(test), allow(dead_code))] // (E2b registers its functions in every session; until then its tests call it)
 use crate::codes::coded;
 use anyhow::{bail, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef};
@@ -31,21 +30,87 @@ pub struct Loaded {
     pub name: String,
     pub version: String,
     pub functions: Vec<Function>,
-    pre: ExtensionPre<()>,
+    pre: ExtensionPre<Held>,
 }
 
 impl std::fmt::Debug for Loaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{} {}", self.name, self.version) }
 }
 
-/// The process's Wasmtime: compiled code is the engine's, so one is shared by every node in a process.
+/// How often the engine's epoch ticks: a call past its time is stopped within a tick of it, at its next loop or call.
+const TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The process's Wasmtime: compiled code is the engine's, so one is shared by every node in a process. Its epoch ticks on a
+/// thread of its own (`TICK`), which is how a call that runs past its time is stopped (epoch interruption, E2c).
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        Engine::new(&config).expect("Wasmtime's engine")
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).expect("Wasmtime's engine");
+        let ticking = engine.weak();
+        std::thread::Builder::new()
+            .name("pondra-wasm-epoch".into())
+            .spawn(move || {
+                while let Some(engine) = ticking.upgrade() {
+                    engine.increment_epoch();
+                    drop(engine);
+                    std::thread::sleep(TICK);
+                }
+            })
+            .expect("the extensions' clock thread");
+        engine
     })
+}
+
+/// A call's limits: its part's memory (`PONDRA_EXTENSION_MB`, 256), and its time for one batch (`PONDRA_EXTENSION_SECS`, 30),
+/// each the node's admin's, read when the call starts (`now`).
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub mb: usize,
+    pub secs: u64,
+}
+
+impl Limits {
+    pub fn now() -> Self { Limits { mb: crate::env::or("PONDRA_EXTENSION_MB", 256usize), secs: crate::env::or("PONDRA_EXTENSION_SECS", 30u64).max(1) } }
+}
+
+/// What a call's store holds: its memory's limit, and whether the call reached it.
+struct Held {
+    max_bytes: usize,
+    full: bool,
+}
+
+impl wasmtime::ResourceLimiter for Held {
+    fn memory_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        if desired > self.max_bytes {
+            self.full = true; // (said by `stopped`: the call fails, the node goes on)
+            wasmtime::bail!("an extension's memory past {} MB", self.max_bytes >> 20);
+        }
+        Ok(true)
+    }
+    fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> { Ok(desired <= 1 << 20) }
+}
+
+/// A store for one call: nothing kept from another, its limits set.
+fn store(limits: Limits) -> Store<Held> {
+    let mut store = Store::new(engine(), Held { max_bytes: limits.mb << 20, full: false });
+    store.limiter(|held| held);
+    store.set_epoch_deadline(limits.secs * 1000 / TICK.as_millis() as u64);
+    store
+}
+
+/// A call that stopped, said by why: past its time (57014, as a cancelled statement is), past its memory (53200, out of
+/// memory), or a trap of its own (38000, as its own error is).
+fn stopped(store: &Store<Held>, limits: Limits, name: &str, function: &str, e: wasmtime::Error) -> anyhow::Error {
+    if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+        return coded("57014", format!("{name}'s {function} ran past {} s, its time for one batch (PONDRA_EXTENSION_SECS)", limits.secs));
+    }
+    if store.data().full {
+        return coded("53200", format!("{name}'s {function} passed {} MB, an extension's memory (PONDRA_EXTENSION_MB)", limits.mb));
+    }
+    coded("38000", format!("{name}'s {function} stopped: {e:#}"))
 }
 
 /// Where compiled parts are kept: `PONDRA_CACHE_DIR`, else the user's cache folder; in a folder per Wasmtime release, whose
@@ -89,14 +154,18 @@ fn compiled(bytes: &[u8], sha256: &str) -> Result<Component> {
 /// is refused saying why.
 pub fn load(bytes: &[u8], sha256: &str) -> Result<Loaded> {
     let component = compiled(bytes, sha256)?;
-    let linker: Linker<()> = Linker::new(engine()); // (no imports yet: `log@1` and `clock@1` come in E5)
+    let linker: Linker<Held> = Linker::new(engine()); // (no imports yet: `log@1` and `clock@1` come in E5)
     let ty = component.component_type();
     if let Some((import, _)) = ty.imports(engine()).next() {
         return Err(coded("0A000", format!("the extension needs {import}, which this Pondra doesn't offer")));
     }
     let pre = ExtensionPre::new(linker.instantiate_pre(&component)?)?;
-    let mut store = Store::new(engine(), ());
-    let said = pre.instantiate(&mut store)?.call_describe(&mut store)?;
+    let limits = Limits::now();
+    let mut store = store(limits);
+    let said = match pre.instantiate(&mut store).and_then(|i| i.call_describe(&mut store)) {
+        Ok(said) => said,
+        Err(e) => return Err(stopped(&store, limits, "the extension", "describe()", e)),
+    };
     let (name, version, functions) = described(&said)?;
     Ok(Loaded { name, version, functions, pre })
 }
@@ -122,7 +191,10 @@ impl Loaded {
     /// Calls `function` over `columns`, one per argument, cast to the types `describe()` gave: its one column of answers, as
     /// many as the rows. The function's own error, a trap or an answer of the wrong type or length fails the call with its
     /// words.
-    pub fn call(&self, function: &str, columns: &[ArrayRef], rows: usize) -> Result<ArrayRef> {
+    pub fn call(&self, function: &str, columns: &[ArrayRef], rows: usize) -> Result<ArrayRef> { self.call_with(function, columns, rows, Limits::now()) }
+
+    /// `call`, within `limits`.
+    pub fn call_with(&self, function: &str, columns: &[ArrayRef], rows: usize, limits: Limits) -> Result<ArrayRef> {
         let f = self.functions.iter().find(|f| f.name == function).with_context(|| format!("{} has no function {function}", self.name))?;
         if columns.len() != f.arguments.len() {
             bail!("{function} takes {} arguments, not {}", f.arguments.len(), columns.len());
@@ -130,9 +202,12 @@ impl Loaded {
         let cast = columns.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
         let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
         let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(rows)))?;
-        let mut store = Store::new(engine(), ());
-        let instance = self.pre.instantiate(&mut store)?;
-        let out = instance.call_call(&mut store, function, &ipc(&batch)?).map_err(|e| anyhow::anyhow!("{}'s {function} stopped: {e:#}", self.name))?;
+        let mut store = store(limits);
+        let batch = ipc(&batch)?;
+        let out = match self.pre.instantiate(&mut store).and_then(|i| i.call_call(&mut store, function, &batch)) {
+            Ok(out) => out,
+            Err(e) => return Err(stopped(&store, limits, &self.name, function, e)),
+        };
         let out = out.map_err(|said| coded("38000", format!("{}'s {function}: {said}", self.name)))?;
         let column = StreamReader::try_new(out.as_slice(), None)?.next().context("an answer with no batch")??.columns().first().cloned().context("an answer with no column")?;
         if column.len() != rows || column.data_type() != &f.returns {
@@ -192,6 +267,24 @@ mod tests {
         assert!(w.call("nope", &[], 0).unwrap_err().to_string().contains("words has no function nope"));
         let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
         assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "a failed call leaves nothing behind");
+    }
+
+    /// A runaway call is stopped at its time, and one that takes too much memory at its limit, each failing alone with its
+    /// code; the part answers the next call.
+    #[test]
+    fn a_runaway_or_a_hog_fails_alone() {
+        let w = words();
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let started = std::time::Instant::now();
+        let e = w.call_with("spin", &[n.clone()], 1, Limits { mb: 256, secs: 1 }).unwrap_err();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("57014", "words's spin ran past 1 s, its time for one batch (PONDRA_EXTENSION_SECS)".to_string()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its time: {:?}", started.elapsed());
+        let big: ArrayRef = Arc::new(Int64Array::from(vec![64]));
+        let e = w.call_with("hog", &[big.clone()], 1, Limits { mb: 32, secs: 30 }).unwrap_err();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("53200", "words's hog passed 32 MB, an extension's memory (PONDRA_EXTENSION_MB)".to_string()));
+        assert_eq!(w.call("hog", &[big], 1).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().value(0), 64 << 20, "under the default 256 MB it answers");
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
+        assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "the part goes on");
     }
 
     #[test]
