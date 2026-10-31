@@ -118,6 +118,9 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   and adding-up views; `VARIANT` as a real type with its paths as columns (Parquet's shredding) and a
   text index.
 - ADR-051 phase 2 right after 1.0: vector and text indexes (`CREATE INDEX … USING hnsw | bm25`, `search()`), `VARIANT` stored shredded, `MAP`; trained models in SQL (E15); a managed service.
+- **Agents as a door** (the owner, 2026-10-31: after 1.0; `reviews/linkedin-posts-2026-10-30.md` A6): an agent
+  mode for `pondra sql` and the MCP tools, as DuckDB 2.0's command line has one: a compact table, errors as JSON, a
+  row cap, and an estimate before a long query from ADR-050's plans.
 
 **One ecosystem (the owner, 2026-10-03).** Every object SQL makes is a catalog entry that every
 other part (the console, the clients, the HTTP API, the tools still to come) reads through the same
