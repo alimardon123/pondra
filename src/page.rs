@@ -4,6 +4,8 @@
 //! A statement the lake can't answer because a table it names is a node's goes to the page's node (`lake_outgoing`, B5).
 //! `web/` wraps it for a browser.
 
+#[cfg(target_arch = "wasm32")]
+pub use crate::ext::{web_with, Web}; // (a page gives its store of a web origin: its browser's fetch)
 use crate::request_body;
 use anyhow::Context;
 use futures::TryStreamExt;
