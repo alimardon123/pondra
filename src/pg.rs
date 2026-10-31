@@ -17,6 +17,7 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, ExactNumberInfo, Expr, UnaryOperator, Value};
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::portal::{Format, Portal};
@@ -33,6 +34,7 @@ use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Par
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// Accept Postgres clients on `addr`.
@@ -1635,6 +1637,9 @@ impl Backend {
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::TEXT; n]; // (text when the query doesn't say, as the doc above has it)
+        if n > 0 {
+            arithmetic_types(sql, &mut types); // (an operand of + - * / %: the other operand's type, as Postgres gives it; the plan below still wins)
+        }
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
@@ -1731,6 +1736,131 @@ impl Backend {
     }
 }
 
+/// Where an unknown parameter is an operand of `+ - * / %` (`$1 * 1000000000000000 + $2`), its type as Postgres gives it: the
+/// other operand's. A client that sends text (pgbench, node-postgres, psycopg's str) then lands as that number, not as text.
+/// Written into `types`, which holds TEXT where nothing says. A parameter whose other operand is a column or a function is
+/// UNKNOWN, which `pg_values::literal` writes as a number when it reads as one. A parse and a walk, with no plan, so a write
+/// takes it too (`INSERT … VALUES ($1 * …)`).
+fn arithmetic_types(sql: &str, types: &mut [Type]) {
+    let Some(statement) = crate::pg_types::one(sql) else { return };
+    let mut typed: Vec<Option<Type>> = vec![None; types.len()];
+    // (a parameter can wait on another's type: the walk runs again until nothing changes, four passes at most)
+    for _ in 0..4 {
+        let mut changed = false;
+        arithmetic_params(&statement, |i, other| {
+            if i < typed.len() && typed[i].is_none() {
+                if let Some(t) = numeric_type(other, &typed) {
+                    typed[i] = Some(t);
+                    changed = true;
+                }
+            }
+        });
+        if !changed {
+            break;
+        }
+    }
+    // (what is left has an other operand that is a column, a function or another unknown parameter)
+    let mut unknown = Vec::new();
+    arithmetic_params(&statement, |i, other| {
+        if i < typed.len() && typed[i].is_none() && numeric_type(other, &typed).is_none() {
+            unknown.push(i);
+        }
+    });
+    for i in unknown {
+        typed[i] = Some(Type::UNKNOWN);
+    }
+    for (t, found) in types.iter_mut().zip(typed) {
+        if let Some(found) = found {
+            *t = found;
+        }
+    }
+}
+
+/// Each parameter that is an operand of `+ - * / %` in `statement`, with the other operand (`$1 + col` gives `$1` and
+/// `col`). `f` sees them in the statement's order, through `walk`, the one walk of the tree.
+fn arithmetic_params(statement: &ast::Statement, mut f: impl FnMut(usize, &Expr)) {
+    let _ = crate::walk::visit_expressions(statement, |e| {
+        if let Expr::BinaryOp { left, op, right } = e {
+            if is_arithmetic(op) {
+                for (operand, other) in [(left, right), (right, left)] {
+                    if let Some(i) = crate::pg_trace::param(operand) {
+                        f(i, other);
+                    }
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Is `op` one of the operators whose operands Postgres types alike: `+ - * / %`.
+fn is_arithmetic(op: &BinaryOperator) -> bool {
+    matches!(op, BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo)
+}
+
+/// The numeric type of `e` where it reads without its column: a number literal, a parameter `typed` has a numeric type for,
+/// a CAST, a sign on one of those, or an arithmetic operator on two of them. None for a column, a function, a string, or a
+/// parameter not typed yet.
+fn numeric_type(e: &Expr, typed: &[Option<Type>]) -> Option<Type> {
+    if let Some(i) = crate::pg_trace::param(e) {
+        return typed.get(i).cloned().flatten();
+    }
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => Some(number_type(n)),
+            _ => None,
+        },
+        Expr::Nested(inner) | Expr::UnaryOp { op: UnaryOperator::Plus | UnaryOperator::Minus, expr: inner } => numeric_type(inner, typed),
+        Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => cast_type(data_type),
+        Expr::BinaryOp { left, op, right } if is_arithmetic(op) => Some(wider(numeric_type(left, typed)?, numeric_type(right, typed)?)),
+        _ => None,
+    }
+}
+
+/// The type of a number literal as Postgres reads it: int4 if it fits, int8 if it fits a bigint, else numeric; a point or
+/// an exponent makes it numeric.
+fn number_type(n: &str) -> Type {
+    if n.contains(['.', 'e', 'E']) {
+        Type::NUMERIC
+    } else if n.parse::<i32>().is_ok() {
+        Type::INT4
+    } else if n.parse::<i64>().is_ok() {
+        Type::INT8
+    } else {
+        Type::NUMERIC
+    }
+}
+
+/// The numeric type a CAST names, as Postgres's casts give it: BIGINT is int8, DOUBLE PRECISION float8, and FLOAT(p) is
+/// real up to 24 digits of precision. None for any other type.
+fn cast_type(t: &ast::DataType) -> Option<Type> {
+    Some(match t {
+        ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Type::INT2,
+        ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => Type::INT4,
+        ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Type::INT8,
+        ast::DataType::Numeric(_) | ast::DataType::Decimal(_) => Type::NUMERIC,
+        ast::DataType::Real | ast::DataType::Float4 => Type::FLOAT4,
+        ast::DataType::Float(ExactNumberInfo::Precision(p)) if *p <= 24 => Type::FLOAT4,
+        ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => Type::FLOAT8,
+        _ => return None,
+    })
+}
+
+/// The wider of two numeric types, in the order arithmetic widens them: int2, int4, int8, numeric, float4, float8.
+fn wider(a: Type, b: Type) -> Type {
+    fn rank(t: &Type) -> u8 {
+        match *t {
+            Type::INT2 => 0,
+            Type::INT4 => 1,
+            Type::INT8 => 2,
+            Type::NUMERIC => 3,
+            Type::FLOAT4 => 4,
+            _ => 5,
+        }
+    }
+    if rank(&b) > rank(&a) { b } else { a }
+}
+
 /// A DECLARE that ran makes a portal of the cursor's name, as Postgres does: psycopg describes it right
 /// after DECLARE to learn a named cursor's columns, and pgwire answers only for a portal it holds. The
 /// portal's statement is the cursor's own FETCH, which Describe answers with the cursor's columns, so it
@@ -1757,4 +1887,42 @@ fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
 fn trace() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_PG"));
     *ON
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The types of `n` parameters of `sql`, as `arithmetic_types` leaves them (TEXT where nothing says).
+    fn typed(sql: &str, n: usize) -> Vec<Type> {
+        let mut types = vec![Type::TEXT; n];
+        arithmetic_types(sql, &mut types);
+        types
+    }
+
+    /// An unknown parameter that is an operand of arithmetic takes the other operand's type, as Postgres gives it; beside a
+    /// column it is unknown; and anywhere else it stays text, as it was.
+    #[test]
+    fn arithmetic_gives_the_other_operands_type() {
+        assert_eq!(typed("SELECT $1 * 1000000000000000 + $2", 2), [Type::INT8, Type::INT8]);
+        assert_eq!(typed("INSERT INTO kv (id, v) VALUES ($1 * 1000000000000000 + $2, 'x')", 2), [Type::INT8, Type::INT8]);
+        assert_eq!(typed("SELECT $1 + 1", 1), [Type::INT4]);
+        assert_eq!(typed("SELECT $1 * 2.5", 1), [Type::NUMERIC]);
+        assert_eq!(typed("SELECT $1 * -3", 1), [Type::INT4]);
+        assert_eq!(typed("SELECT $1 + 4000000000", 1), [Type::INT8]);
+        assert_eq!(typed("UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2", 2), [Type::UNKNOWN, Type::TEXT]);
+        assert_eq!(typed("SELECT $1 || 'x'", 1), [Type::TEXT]);
+        assert_eq!(typed("SELECT id FROM t WHERE a = $1", 1), [Type::TEXT]);
+        assert_eq!(typed("SELECT CAST($2 AS BIGINT) + $1", 2), [Type::INT8, Type::TEXT]);
+        assert_eq!(typed("SELECT $2::BIGINT + $1", 2), [Type::INT8, Type::TEXT]);
+        assert_eq!(typed("SELECT $1 + $2", 2), [Type::UNKNOWN, Type::UNKNOWN]);
+        assert_eq!(typed("SELECT $1 + 1 + abalance * $2", 2), [Type::INT4, Type::UNKNOWN]);
+    }
+
+    /// A statement that doesn't parse as one, or has no arithmetic on a parameter, leaves every type as it was.
+    #[test]
+    fn arithmetic_leaves_what_it_cannot_read() {
+        assert_eq!(typed("SELECT $1 + 1; SELECT 2", 1), [Type::TEXT]);
+        assert_eq!(typed("NOT SQL $1 +", 1), [Type::TEXT]);
+    }
 }

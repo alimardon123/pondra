@@ -22233,8 +22233,9 @@ def prepared():
     answer as the statements sent whole, in text and binary, NULLs and key lookups among them; a query
     whose table gains a column is refused once with Postgres's 0A000, then answered with it (and a key
     looked up whose row predates the column has it NULL, at every door); a FETCH is
-    described by its cursor each time; and a prepared query with a parameter takes about what the
-    statement sent whole takes (planned once a run, not three times)."""
+    described by its cursor each time; a prepared query with a parameter takes about what the
+    statement sent whole takes (planned once a run, not three times); and an untyped parameter in
+    arithmetic is a number, as psycopg's str and pgbench's variables need (`arithmetic_types`)."""
     import psycopg, statistics
     lake = new_lake()
     pg = A.port + 50
@@ -22246,6 +22247,7 @@ def prepared():
         sql(A.port, "INSERT INTO t SELECT value, chr(97 + CAST(value % 5 AS INT)) FROM range(1, 1001)")
         sql(A.port, "CREATE TABLE k (id BIGINT PRIMARY KEY, name TEXT, score DOUBLE)")
         sql(A.port, "INSERT INTO k VALUES (1, 'ann', 1.5), (2, 'bo', 2.5), (3, NULL, NULL)")
+        sql(A.port, "CREATE TABLE kv (id BIGINT PRIMARY KEY, n BIGINT)")
         queries = [
             ("SELECT id, v FROM t WHERE id = %s", [(3,), (500,), (2000,)]),
             ("SELECT count(*) AS n FROM t WHERE v = %s", [("b",), ("e",), ("z",)]),
@@ -22330,6 +22332,34 @@ def prepared():
                 c.execute("CLOSE m")
             c.rollback()
             checks["a prepared FETCH is described by its cursor each time (another DECLARE, other columns)"] = fetched == [(["id"], [(1,)]), (["id", "v"], [(1, "b")])]
+
+        # psycopg sends a str parameter untyped, and pgbench sends its variables as text: an unknown parameter in arithmetic takes
+        # the other operand's type, as Postgres's does (pg.rs `arithmetic_types`), so each is a number and not text.
+        with psycopg.connect(url, autocommit=True) as c:
+            add = "SELECT %s * 1000000000000000 + %s AS k"
+            summed = [c.execute(add, ("3", "7")).fetchone()[0], c.execute(add, ("3", "7"), prepare=True).fetchone()[0]]
+            c.execute("INSERT INTO kv VALUES (%s * 1000000000000000 + %s, 0)", ("2", "5"))
+            landed = c.execute("SELECT id FROM kv").fetchall()
+            c.execute("UPDATE kv SET n = n + %s WHERE id = %s", ("4", "2000000000000005"))
+            n = c.execute("SELECT n FROM kv WHERE id = 2000000000000005").fetchone()[0]
+        checks["an untyped str in arithmetic takes the other operand's type: SELECT %s * 1000000000000000 + %s is 3000000000000007, plain and prepared"] = summed == [3000000000000007, 3000000000000007]
+        checks["INSERT … VALUES (%s * 1000000000000000 + %s, 0) with str parameters lands id 2000000000000005"] = landed == [(2000000000000005,)]
+        checks["UPDATE kv SET n = n + %s WHERE id = %s with str parameters gives n = 4"] = n == 4
+
+        # pgbench, prepared and then extended: its script's variables in the same sum, 20 transactions into kv.
+        if shutil.which("pgbench"):
+            script = os.path.join(tempfile.mkdtemp(), "kv.sql")
+            with open(script, "w") as f:
+                f.write("\\set id random(1, 900000)\n"
+                        "INSERT INTO kv (id, n) VALUES (:client_id * 1000000000000000 + :id, 0) ON CONFLICT (id) DO NOTHING;\n")
+            for mode in ("prepared", "extended"):
+                r = subprocess.run(["pgbench", "-n", "-M", mode, "-c", "1", "-t", "20", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "lake", "-f", script],
+                                   capture_output=True, text=True, timeout=300)
+                info[f"pgbench -M {mode}"] = {"code": r.returncode, "out": r.stdout[-400:], "err": r.stderr[-400:]}
+                checks[f"pgbench -M {mode}: its script's variables in arithmetic run, 20 of 20 transactions, no failed transaction"] = (
+                    r.returncode == 0 and "processed: 20/20" in r.stdout and "failed transactions: 0" in r.stdout and "error" not in r.stderr.lower())
+        else:
+            info["pgbench"] = "not installed: not run"
 
         # What it costs: a prepared query with a parameter against the statement sent whole, taking turns.
         with psycopg.connect(url, autocommit=True) as c:
