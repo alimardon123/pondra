@@ -772,9 +772,10 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
                 Stmt::Ddl(vec![Ddl::Object(Op::OrAlterTable { name: crate::text::object(&t.name), sql: plain })])
             }
             Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+            Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
             _ => Stmt::Invalid("CREATE OR ALTER TABLE takes the table's columns (… AS SELECT makes it anew: CREATE OR REPLACE TABLE)".into()),
         }),
-        w => Some(Stmt::Invalid(format!("CREATE OR ALTER {w}: tables and views (CREATE OR REPLACE {w} makes one anew)"))),
+        w => Some(Stmt::Refused("0A000", format!("CREATE OR ALTER takes a table or a view; a {} is made anew with CREATE OR REPLACE {w}", w.to_lowercase()))),
     }
 }
 
@@ -1199,7 +1200,7 @@ mod tests {
     fn statements_and_names() {
         let ddl = |s: &str| match statement(s) {
             Some(crate::write::Stmt::Ddl(d)) => serde_json::to_value(&d[0]).unwrap(),
-            Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
+            Some(crate::write::Stmt::Invalid(e) | crate::write::Stmt::Refused(_, e)) => j!({"error": e}),
             _ => j!(null),
         };
         assert_eq!(ddl("COMMENT ON TABLE sales.Orders IS 'one row per order'")["text"], "one row per order");

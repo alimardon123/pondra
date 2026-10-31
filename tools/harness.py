@@ -6024,7 +6024,7 @@ $$""")
     q("DROP SCHEMA ops CASCADE")
     checks["…go with it (DROP SCHEMA … CASCADE)"] = "ops" not in json.dumps(call(A.port, "GET", "/routines", headers={"authorization": "Bearer r-tok"}))
     q("DROP MACRO big"); q("DROP PROCEDURE twice")
-    checks["DROP MACRO, DROP PROCEDURE"] = err("CALL twice(1)").endswith("no procedure twice'") or "no procedure twice" in err("CALL twice(1)")
+    checks["DROP MACRO, DROP PROCEDURE"] = "procedure twice does not exist" in err("CALL twice(1)") # (42883, as Postgres says it)
     # DO (ADR-030): a console's Python cell, from every door, as an admin. What it prints comes
     # back as notices; its last expression, a frame here, as rows; an error at the code's line.
     import urllib.request
@@ -23781,8 +23781,8 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
-    XX000 = 24  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 14, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 12}
+    XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)

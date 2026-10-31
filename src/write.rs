@@ -278,6 +278,7 @@ pub enum Stmt {
     Ddl(Vec<crate::ddl::Ddl>),                            // schemas, views, drops: the leader's (`ddl.rs`)
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
     Invalid(String),                                      // CREATE PROCEDURE or DROP MACRO, written wrong: why
+    Refused(&'static str, String),                        // as Invalid, with the SQLSTATE its error gave (`codes::coded`): the answer names it
     CopyTo(String, String, std::collections::BTreeMap<String, String>), // COPY (query) TO 'url' (options): files outside the lake (`ext.rs`)
     CopyInto(String, crate::copy::Source, std::collections::BTreeMap<String, String>), // COPY INTO t FROM 'path' (options): each file loaded once a version (`copy.rs`)
     TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
@@ -285,12 +286,20 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    /// A refusal of `e`'s words `said`: `Refused` with the SQLSTATE `e` gives (`codes::coded`, anywhere in its chain), else `Invalid`.
+    pub(crate) fn of_error(e: &anyhow::Error, said: String) -> Stmt {
+        match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+            Some(c) => Stmt::Refused(c.0, said),
+            None => Stmt::Invalid(said),
+        }
+    }
+
     /// The table it writes.
     pub fn table(&self) -> String {
         match self {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
-            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) => String::new(),
+            Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) => String::new(),
             Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
@@ -514,6 +523,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 false => wrong(),
             },
             Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+            Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
             _ => wrong(),
         });
     }
@@ -634,7 +644,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     let laid = if matches!(head.as_str(), "create" | "alter") { crate::layout::clauses(sql) } else { Ok(std::borrow::Cow::Borrowed(sql)) };
     let sql = &match laid {
         Ok(sql) => sql,
-        Err(e) => return Some(Stmt::Invalid(format!("{e:#}"))),
+        Err(e) => return Some(Stmt::of_error(&e, format!("{e:#}"))),
     };
     let parsed = Parser::parse_sql(&GenericDialect {}, sql).or_else(|e| crate::settings::dialect().map_or(Err(e), |d| Parser::parse_sql(d.as_ref(), sql))); // (DuckDB's STRUCT(a INT), …: the session's dialect)
     let parsed = match parsed {
@@ -644,14 +654,14 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     // Postgres's UPDATE … FROM and DELETE … USING read one more relation: a table or a subquery.
     let one = |f: &[ast::TableWithJoins], what: &str| match f {
         [t] if t.joins.is_empty() => Ok(t.relation.clone()),
-        _ => Err(Stmt::Invalid(format!("{what} takes one table or subquery: join several in a subquery, (SELECT … FROM a JOIN b ON …) AS s"))),
+        _ => Err(Stmt::Refused("0A000", format!("{what} takes one table or subquery: join several in a subquery, (SELECT … FROM a JOIN b ON …) AS s"))),
     };
     let text = parsed.to_string();
     Some(match parsed {
         // A lake's tables keep their files in the lake: LOCATION and Hive's STORED AS were read and
         // dropped, and the table made in the lake as if they weren't there.
         Statement::CreateTable(c) if c.location.is_some() || c.file_format.is_some() || c.hive_formats.as_ref().is_some_and(|h| h.location.is_some() || h.storage.is_some() || h.row_format.is_some() || h.serde_properties.is_some()) => {
-            Stmt::Invalid("CREATE TABLE … LOCATION / STORED AS: a lake's tables keep their files in the lake; files elsewhere are CREATE EXTERNAL TABLE t … STORED AS PARQUET LOCATION '…' (a view of them), and a Delta or Iceberg table elsewhere is ATTACH 'url' AS name (TYPE delta | iceberg)".into())
+            Stmt::Refused("0A000", "CREATE TABLE … LOCATION / STORED AS: a lake's tables keep their files in the lake; files elsewhere are CREATE EXTERNAL TABLE t … STORED AS PARQUET LOCATION '…' (a view of them), and a Delta or Iceberg table elsewhere is ATTACH 'url' AS name (TYPE delta | iceberg)".into())
         }
         Statement::CreateTable(c) => Stmt::Create(Box::new(c)),
         // What a write may say that Pondra doesn't do is refused by name, never read and dropped:
@@ -1016,7 +1026,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
     }
 }
 
@@ -1584,6 +1594,9 @@ async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, 
 async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, files: bool) -> Result<Value> {
     if let Stmt::Invalid(why) = stmt {
         bail!(why);
+    }
+    if let Stmt::Refused(code, why) = stmt {
+        return Err(crate::codes::coded(code, why));
     }
     // (a backup is read, and backed up itself; COPY … TO writes outside it: ADR-070)
     if crate::backup::frozen(&app.lake) && !crate::backup::reads_only(&stmt) {

@@ -114,14 +114,14 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     }
     Some(match what {
         // (a refusal is said as it is, the pipeline's words; any other mistake gets the usage too)
-        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| { let said = if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }; Stmt::of_error(&e, said) }, |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
                 true => "CREATE PROCEDURE name($p TYPE [= …], …) AS BEGIN … END, or LANGUAGE python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
+            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::of_error(&e, format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
         }
     })
 }
@@ -215,12 +215,14 @@ fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routin
         }
     }
     let t = if rest { Token::EOF } else { p.next_token().token };
-    ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
+    if !matches!(t, Token::EOF | Token::SemiColon) {
+        return Err(crate::codes::coded("42601", format!("unexpected {t}")));
+    }
     r.body = body.context("no body: AS $$ … $$, or RETURN expression")?;
     r.language = match r.language.as_str() {
         "" | "sql" => "sql".into(),
         "python" | "python3" | "plpython3u" | "plpythonu" | "plpython" => "python".into(),
-        l => bail!("LANGUAGE sql or python, not {l}"),
+        l => return Err(crate::codes::coded("0A000", format!("LANGUAGE sql or python, not {l}"))),
     };
     ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
     ensure!(!rest || r.language == "sql", "a Python procedure's body is a string: LANGUAGE python AS $$ … $$");
@@ -879,6 +881,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
     for (part, _) in &parts {
         match crate::write::parse(part) {
             Some(Stmt::Invalid(why)) => bail!("{why}"),
+            Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
                 app.auth.allows(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
@@ -1065,8 +1068,9 @@ pub fn do_of(sql: &str) -> Option<(String, String)> {
 /// every statement), cast to their parameters' types.
 async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Result<(String, Routine, RecordBatch)> {
     ensure!(who.depth < 16, "{name}: procedures calling procedures 16 deep (a loop?)");
-    let local = crate::ddl::local(&app.lake, name).with_context(|| format!("no procedure {name}"))?;
-    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().with_context(|| format!("no procedure {name}"))?;
+    let missing = || crate::codes::coded("42883", format!("procedure {name} does not exist"));
+    let local = crate::ddl::local(&app.lake, name).ok_or_else(missing)?;
+    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().ok_or_else(missing)?;
     let values = arguments(name, &r, args)?;
     let select = r.params.iter().map(|p| match &p.ty {
         Some(t) if !crate::text::loose(Some(t)) => format!("CAST(({}) AS {t}) AS \"{}\"", values[&p.name], p.name),

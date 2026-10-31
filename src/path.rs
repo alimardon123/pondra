@@ -105,7 +105,11 @@ pub fn is_use(sql: &str) -> bool {
 /// a schema here is refused by name, and so is one that is both.
 pub async fn use_of(lake: &Lake, sql: &str) -> Result<String> {
     static USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?is)^\s*use\s+(?:(database|catalog|schema)\s+)?({NAME})(?:\s*\.\s*({NAME}))?\s*;?\s*$")).expect("a regex"));
-    let m = USE.captures(sql).context("USE takes a database, a schema or database.schema (USE crm; USE DATABASE dev)")?;
+    static WAREHOUSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*use\s+warehouse\s+\S").expect("a regex"));
+    if WAREHOUSE.is_match(sql) {
+        return Err(crate::codes::coded("0A000", "USE WAREHOUSE is Snowflake's: a Pondra node is its own compute; USE takes a database, a schema or database.schema"));
+    }
+    let m = USE.captures(sql).ok_or_else(|| crate::codes::coded("42601", "USE takes a database, a schema or database.schema (USE crm; USE DATABASE dev)"))?;
     let kw = m.get(1).map(|k| k.as_str().to_lowercase());
     let first = name_parts(&m[2]).into_iter().next().unwrap_or_default();
     let second = m.get(3).map(|s| name_parts(s.as_str()).into_iter().next().unwrap_or_default());

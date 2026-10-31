@@ -648,7 +648,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
             Some(Ddl::AlterColumn { .. } | Ddl::RenameTable { .. } | Ddl::Swap { .. } | Ddl::Constraint { .. }) => "ALTER TABLE",
             _ => "DDL",
         },
-        Stmt::Invalid(_) => "DDL",
+        Stmt::Invalid(_) | Stmt::Refused(..) => "DDL",
     }
 }
 

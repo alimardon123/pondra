@@ -453,7 +453,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     };
     let get = |n: &str| { let k = user_key(n); async move { lake.cat.get::<User>(&k).await } };
     let put = |n: &str, u: &User| (user_key(n), json(u));
-    let must = |n: &str, u: Option<User>| u.ok_or_else(|| anyhow!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})"));
+    let must = |n: &str, u: Option<User>| u.ok_or_else(|| crate::codes::coded("42704", format!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})")));
     let mut out = match c {
         Change::Create { name, login, if_not_exists, verifier, superuser, limits } => {
             if get(&name).await?.is_some() {
@@ -484,7 +484,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
         Change::Drop { name, if_exists } => {
             if get(&name).await?.is_none() {
-                ensure!(if_exists, "no user or role {name}");
+                if !if_exists {
+                    return Err(crate::codes::coded("42704", format!("no user or role {name}")));
+                }
                 return Ok(j!({"user": name, "dropped": false}));
             }
             // (out of every role it was in, and every member of it out of it)
@@ -638,7 +640,7 @@ async fn grantee(lake: &Lake, name: &str) -> Result<User> {
     match lake.cat.get::<User>(&user_key(name)).await? {
         Some(u) => Ok(u),
         None if name == "public" => Ok(User::default()),
-        None => bail!("no user or role {name} (CREATE ROLE {name})"),
+        None => Err(crate::codes::coded("42704", format!("no user or role {name} (CREATE ROLE {name})"))),
     }
 }
 

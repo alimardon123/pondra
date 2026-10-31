@@ -1255,7 +1255,9 @@ fn table_sample(t: &mut TableFactor) -> Result<()> {
         Some(TableSampleKind::BeforeTableAlias(s) | TableSampleKind::AfterTableAlias(s)) => s,
         None => return Ok(()),
     };
-    ensure!(s.seed.is_none() && s.bucket.is_none() && s.offset.is_none(), "a sample with a seed, a bucket or an offset isn't taken");
+    if s.seed.is_some() || s.bucket.is_some() || s.offset.is_some() {
+        return Err(crate::codes::coded("0A000", "a sample with a seed, a bucket or an offset isn't taken"));
+    }
     let q = s.quantity.context("TABLESAMPLE (n PERCENT) or (n ROWS)")?;
     let rows = matches!(q.unit, Some(TableSampleUnit::Rows));
     let named = alias.take().unwrap_or_else(|| TableAlias { explicit: true, name: name.0.last().and_then(|p| p.as_ident()).cloned().unwrap_or_else(|| Ident::new("t")), columns: vec![], at: None });

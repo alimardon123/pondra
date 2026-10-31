@@ -697,7 +697,7 @@ mod tests {
                 crate::ddl::Ddl::Users(c) => serde_json::to_value(c).unwrap(),
                 _ => panic!(),
             },
-            Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
+            Some(crate::write::Stmt::Invalid(e) | crate::write::Stmt::Refused(_, e)) => j!({"error": e}),
             _ => j!(null),
         };
         let c = p("CREATE IDENTITY PROVIDER okta (ISSUER 'https://acme.okta.com', CLIENT_ID '0oa1', AUDIENCE ('api://pondra', 'b'), ROLES_CLAIM 'groups', USERS 'any', POSTGRES 'oauth')");
