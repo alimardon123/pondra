@@ -712,6 +712,9 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
+    if matches!(kind, "postgres" | "mysql" | "sqlserver") {
+        return Err(crate::codes::coded("0A000", format!("ATTACH … (TYPE {kind}): another database is attached in 1.1 (TYPE postgres, mysql or sqlserver); today TYPE is delta, iceberg, kafka or share")));
+    }
     ensure!(["delta", "iceberg", "kafka", "share"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg, kafka or share (or a Pondra lake, with no TYPE)");
     ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
     let mut options = options;

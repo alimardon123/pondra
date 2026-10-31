@@ -1,5 +1,5 @@
-//! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines, dashboards and
-//! connections, the grants on them, and `GRANT EXECUTE`. One list, read at the front (`front::expand`, which every node door and the
+//! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines, dashboards, the grants on
+//! them, and `GRANT EXECUTE`; and connections, which Pondra has none of (another database is attached), shown the `ATTACH`. One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
@@ -25,8 +25,11 @@ const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1
 /// A pipeline's WAIT FOR, where a script's statement starts.
 const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
-/// What a connection's statements say; `{}` is the statement's words.
-const CONNECTION: &str = "{}: connections come in 1.1; until then, ATTACH '…' AS name says where a source is, and CREATE SECRET who reads it";
+/// What a connection's statements say; `{}` is the statement's words. There is no connection object: what `ATTACH` makes is a
+/// database (`designs/etl-and-bi-tools.md` §3.7), so the words show the `ATTACH` to write.
+const CONNECTION: &str = "{}: Pondra has no connections; another database is attached: ATTACH 'postgres://…' AS name (TYPE postgres, SECRET s), which comes in 1.1 with mysql and sqlserver";
+/// `SHOW CONNECTIONS`: what `ATTACH` makes is listed as a database.
+const SHOW_CONNECTIONS: &str = "SHOW CONNECTIONS: what ATTACH makes is a database, and SHOW DATABASES lists them";
 
 /// A step's `ON FAILURE [OF step]` or `ALWAYS` in a task's head (`runs::task`), or the older `AFTER … FAILED`: a pipeline
 /// step's, not a task's.
@@ -58,7 +61,7 @@ const REFUSED: &[(&[&str], &str)] = &[
     (&["ALTER", "CONNECTION"], CONNECTION),
     (&["DROP", "CONNECTION"], CONNECTION),
     (&["SHOW", "CREATE", "CONNECTION"], CONNECTION),
-    (&["SHOW", "CONNECTIONS"], CONNECTION),
+    (&["SHOW", "CONNECTIONS"], SHOW_CONNECTIONS),
     (&["COMMENT", "ON", "CONNECTION"], CONNECTION),
     (&["GRANT", "EXECUTE", "ON"], GRANT_EXECUTE), // (a bare `GRANT execute TO u` grants a role, as it did)
     (&["REVOKE", "EXECUTE", "ON"], GRANT_EXECUTE),
@@ -198,9 +201,9 @@ mod tests {
         assert!(refusal("REVOKE EXECUTE ON FUNCTION f FROM r").unwrap().starts_with("GRANT EXECUTE comes in 1.1"));
         assert!(refusal("EXECUTE PIPELINE sales.orders (day => 1)").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
         assert!(refusal("EXECUTE PIPELINE nightly").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
-        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION: connections come in 1.1"));
-        assert!(refusal("show connections").unwrap().starts_with("SHOW CONNECTIONS: connections come in 1.1"));
-        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION: connections come in 1.1"));
+        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION: Pondra has no connections; another database is attached: ATTACH"));
+        assert_eq!(refusal("show connections").as_deref(), Some(SHOW_CONNECTIONS));
+        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION: Pondra has no connections"));
         assert_eq!(refusal("GRANT SELECT ON connection TO r"), None); // (a table called connection)
         assert_eq!(refusal("STEP a AS SELECT 1").as_deref(), Some(STEP));
         assert_eq!(refusal("parallel SELECT 1").as_deref(), Some(PARALLEL));
