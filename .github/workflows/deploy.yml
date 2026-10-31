@@ -107,8 +107,8 @@ jobs:
             fi
             rm -rf repo
           done
-      - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork)
-        if: env.WINGET_TOKEN != ''
+      - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork; a release, not a candidate)
+        if: env.WINGET_TOKEN != '' && !contains(github.ref_name, '-') # (v1.0.0-rc.1 goes to our own tap and bucket only: winget's reviewers take releases)
         run: |
           v=${GITHUB_REF_NAME#v}
           curl -fsSL -o wingetcreate.exe https://aka.ms/wingetcreate/latest
