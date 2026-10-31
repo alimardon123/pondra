@@ -106,11 +106,11 @@ The same idea covers the rest:
 
 | | `--ack durable` (default) | `--ack replicated` |
 |---|---|---|
-| Acknowledged when | The commit is in the bucket: one object-store write | `--replicas` nodes hold it (default 2: the leader in memory, a follower on its local disk). The bucket gets it a moment later |
-| Local disk | 5 ms | Not measured separately |
+| Acknowledged when | The commit is in the bucket: one object-store write (on a local disk, flushed to it) | `--replicas` nodes hold it (default 2: the leader in memory, a follower on its local disk). The bucket gets it a moment later |
+| Local disk | 5 ms, and about 1 ms more to flush it to the disk | Not measured separately |
 | Cloudflare R2, near bucket | 300 ms median (458 ms worst of 8 to 10) | 2 ms median (5 ms worst) |
 | Cloudflare R2, far bucket | 723 ms median (1,000 ms worst) | 2 ms median (4 ms worst) |
-| It survives | Anything: it is in the bucket | Any one node dying, the leader included |
+| It survives | Anything: it is in the bucket, or flushed to the local disk (a power loss too) | Any one node dying, the leader included |
 | It does not survive | | The leader and every holder dying in the same moment, before the bucket has the write (one bucket write: 0.3 to 0.7 s on R2) |
 
 ```bash norun
