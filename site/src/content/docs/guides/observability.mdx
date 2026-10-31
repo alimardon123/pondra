@@ -92,6 +92,18 @@ FROM pondra.history WHERE outcome = 'ok' GROUP BY fingerprint ORDER BY avg_ms DE
 worst join produced than the planner expected. `40` means forty times off. `plan_id` is the shape of the
 plan that ran, and `reads` and `writes` name the tables and views a statement used.
 
+A read that ran on one node also says what it used: `cpu_ms` is its operators' compute time, summed over
+every step and thread (so it can be more than `ms`), `bytes_read` the bytes its scans read from Parquet files,
+and `peak_memory` the most its statement's memory held at once, in bytes. Rows still in the log and columns
+already in memory are read without touching a file, so they add no `bytes_read`. Writes, DDL, `CALL`, `DO`
+and reads spread over several nodes leave the three NULL. The reads that cost the most CPU this week:
+
+```sql
+SELECT fingerprint, count(*) AS runs, sum(cpu_ms) AS cpu_ms, sum(bytes_read) AS bytes, max(peak_memory) AS peak
+FROM pondra.history WHERE class = 'read' AND at > now() - INTERVAL '7 days'
+GROUP BY fingerprint ORDER BY cpu_ms DESC LIMIT 5;
+```
+
 ## Slow statements keep their plan
 
 A statement slower than `PONDRA_SLOW_MS` (1000 ms by default) keeps its plan in its row. The plan shows
