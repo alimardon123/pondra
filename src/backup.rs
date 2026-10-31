@@ -347,6 +347,19 @@ pub fn instant(s: &str) -> Result<u64> {
 
 // ---------------------------------------------------------------- the backup's leader
 
+/// A backup's run that reached a node (its `/cluster/ddl`, or the inbox a node that lives drains), not the `pondra lead` the
+/// statement started for a new place: only a later run of a backup the node holds (`take` checks its source) or one resuming.
+/// A first run and a restore make a new lake in a place no node serves, after the statement's checks; one sent to a node
+/// would choose what it copies in, from its own disk or with its own credentials (invariant 260).
+pub(crate) fn sent(d: &Ddl) -> Result<()> {
+    match d {
+        Ddl::Backup(t) => ensure!(!t.fresh && !t.restore, crate::codes::coded("42501", "a backup's first run or a restore is led for its new place by the statement that asked (BACKUP DATABASE, RESTORE), never sent to a node")),
+        Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => sent(then)?, // (what they wrap is applied as it is: ddl.rs)
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The backup's (or the restored lake's) leader: take the run.
 pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
     let mine = lake.cat.scan_raw("", "\x7f").await?;
@@ -798,5 +811,18 @@ mod tests {
         for place in ["s3://b/a", "gs://b/a", "https://h/a"] {
             assert!(!crate::ext::on_disk(place), "{place} is a bucket or a server's");
         }
+    }
+
+    #[test]
+    fn a_backup_sent_to_a_node_is_never_a_first_run_or_a_restore() {
+        let run = |fresh: bool, restore: bool| Take { source: "/var/lib/pondra/other".into(), pin: "x#backup".into(), retention_days: None, restore, at: None, fresh };
+        let refused = |d: Ddl| crate::codes::of(&sent(&d).unwrap_err());
+        assert_eq!(refused(Ddl::Backup(run(true, false))), "42501", "a first run");
+        assert_eq!(refused(Ddl::Backup(run(false, true))), "42501", "a restore");
+        let unless = |then: Ddl| Ddl::Unless { name: "b".into(), kind: "relation".into(), then: Box::new(then) };
+        assert_eq!(refused(unless(Ddl::Backup(run(true, false)))), "42501", "a first run, IF NOT EXISTS");
+        assert_eq!(refused(Ddl::Replacing { name: "b".into(), then: Box::new(Ddl::Backup(run(false, true))) }), "42501", "a restore, OR REPLACE");
+        assert!(sent(&Ddl::Backup(run(false, false))).is_ok(), "a later run of a backup");
+        assert!(sent(&Ddl::Pin { lake: "x".into(), ms: None, lease: false }).is_ok(), "another Ddl");
     }
 }

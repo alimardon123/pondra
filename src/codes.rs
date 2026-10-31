@@ -115,6 +115,11 @@ pub fn received(code: &str) -> Option<&'static str> {
     Some(c)
 }
 
+/// The words of a write the site's browser storage can't keep, because its quota is full (`web/` says so when the browser
+/// refuses a write). A node's full disk is 53100 too, so this is the same answer at every door: `page::FULL` re-exports it.
+#[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
+pub const FULL: &str = "this site's browser storage is full";
+
 /// The code an error's words point to (the first that matches, most particular first).
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
@@ -142,6 +147,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has(" is read by ") => "2BP01",                                                     // dependent_objects_still_exist (DROP TABLE that a view or a task reads)
+        _ if has("can't change while these follow it") => "2BP01",                               // dependent_objects_still_exist (UPDATE or DELETE under a view that can't take it)
         _ if first_said("is a view") || first_said("is a table") => "42809",                    // wrong_object_type (a view's name where a table's goes, or the other way)
         _ if has("already has a column") => "42701",                                           // duplicate_column (ALTER TABLE … ADD or RENAME COLUMN)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
@@ -159,7 +165,8 @@ fn by_words(text: &str) -> &'static str {
         _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
-        _ if has(crate::page::FULL) => "53100",                                                 // disk_full (a page's browser storage is over its quota: `page::FULL`, `web/`'s words)
+        #[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
+        _ if has(FULL) => "53100",                                                              // disk_full (a page's browser storage is over its quota: `FULL`, `web/`'s words)
         _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
@@ -250,6 +257,7 @@ mod tests {
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
         assert_eq!(of("t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"), "2BP01");
+        assert_eq!(of("orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table"), "2BP01");
         assert_eq!(of("no view nov"), "42P01");
         assert_eq!(of("column \"d2\" of relation \"at2\" does not exist"), "42703");
         assert_eq!(of("constraint \"c\" of relation \"t\" does not exist"), "42704");

@@ -23,6 +23,9 @@ use std::time::Duration;
 /// What a stopped request answers (SQLSTATE 53200: `codes::by_words` reads "out of memory").
 pub const OOM: &str = "out of memory: the node was nearly out of memory and stopped this query, the one that grew it (PONDRA_MEMORY_MAX_GB); a write in it may or may not have been applied";
 
+/// What a query the page's watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory"): the page's words, as `OOM` is the node's.
+pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
+
 /// How long a stop holds the watch: the node's allocator gives freed pages back over about ten
 /// seconds (`main.rs`), so resident memory falls after a stop, and a second stop would be for memory
 /// the first one already let go.
@@ -50,12 +53,41 @@ crate::per_node!(static WAKE: tokio::sync::Notify = tokio::sync::Notify::new(); 
 pub fn line() -> Option<usize> {
     // (a page's line is its device's, and it has one only where its memory is read: `store::resident`)
     if cfg!(target_arch = "wasm32") {
-        return crate::store::resident().and_then(|_| crate::page::memory_line(crate::env::device_line()));
+        return crate::store::resident().and_then(|_| line_on(crate::env::device_line()));
     }
     if crate::node::hosted() {
         return None;
     }
     crate::env::memory_line(crate::store::ram().map(|ram| (ram as f64 * 0.85) as usize))
+}
+
+/// The memory line on a page's device, which has `device` bytes (`Options::line`, or the one its member was opened with): the
+/// device's, else `env::PAGE_LINE`, through `PONDRA_MEMORY_MAX_GB` as `env::memory_line` takes it.
+pub(crate) fn line_on(device: Option<usize>) -> Option<usize> {
+    crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
+}
+
+/// A request watched at each of its polls, where no watch loop can run beside it (a page's one thread): before each poll,
+/// past `line` by `reading` and grown by its own polls by a tenth of the line (`pick`'s margin), it is stopped: its
+/// future dropped, its memory let go, and `Err(())` answered (the caller says why).
+#[cfg(target_arch = "wasm32")] // (its one caller, `panics::work`, is a page's: a node has a watch loop)
+pub(crate) async fn polled<T>(reading: impl Fn() -> usize, line: usize, f: impl Future<Output = T>) -> Result<T, ()> {
+    let margin = line / 10; // (`pick`'s margin, a node's)
+    let mut inner = Some(Box::pin(f));
+    let mut grown = 0usize; // (what this query's polls grew the page by, less what they let go)
+    std::future::poll_fn(move |cx| {
+        let now = reading();
+        if now >= line && grown >= margin {
+            inner = None; // (the query's memory goes with its future, before anything else is read)
+            return Poll::Ready(Err(()));
+        }
+        let Some(future) = inner.as_mut() else { return Poll::Ready(Err(())) }; // (never polled once it has answered: an answer is the stop's)
+        let out = future.as_mut().poll(cx);
+        let after = reading();
+        grown = grown.saturating_add(after.saturating_sub(now)).saturating_sub(now.saturating_sub(after));
+        out.map(Ok)
+    })
+    .await
 }
 
 /// The resident memory the watch read last (0 before its first look). While the watch waits it is

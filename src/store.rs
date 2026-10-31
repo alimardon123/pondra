@@ -775,6 +775,7 @@ pub struct Lake {
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
     pub to: std::sync::OnceLock<crate::log::To>, // where this process's flushes and sequences' values go: its sequencer, or the leader's
+    pub owner_key: std::sync::OnceLock<String>, // the key of the program that started this process's node on the lake (`Auth::owner_key`): what its owner's tasks are signed with (`runs::signed`)
     pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
     sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
@@ -853,13 +854,16 @@ pub fn resident() -> Option<usize> {
     })
 }
 
+/// The page's live heap bytes, as the program that runs the page reads them (`page::Options::memory`, which re-exports this).
+pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+
 // A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
 #[cfg(target_arch = "wasm32")]
-static READER: std::sync::OnceLock<crate::page::Memory> = std::sync::OnceLock::new();
+static READER: std::sync::OnceLock<Memory> = std::sync::OnceLock::new();
 
 /// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn read_resident_with(reading: crate::page::Memory) {
+pub(crate) fn read_resident_with(reading: Memory) {
     let _ = READER.set(reading);
 }
 
@@ -1283,7 +1287,7 @@ impl Lake {
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1685,7 +1689,11 @@ impl Lake {
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
         let at = Path::from(path);
-        let m = self.store.head(&at).await?;
+        let m = match self.store.head(&at).await {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => return Err(Changed.into()), // (no file is not the version the caller read: 412)
+            Err(e) => return Err(e.into()),
+        };
         if version_of(&m) != expect {
             return Err(Changed.into());
         }

@@ -399,13 +399,19 @@ CREATE MATERIALIZED VIEW dips WITH (lateness = '10 seconds', idle = '1 minute') 
 
 - **What a run reads.** The rows up to the watermark: the `ORDER BY` column's newest time less `lateness`, as for the other
   `EMIT FINAL` views. A run reads the rows that came since the last one, and the rows each of their keys still holds for a
-  match not yet decided. So its cost follows the new rows, not each key's history.
+  match not yet decided. So its cost follows the new rows, not each key's history. A run reads about 1,000,000 new rows
+  (`PONDRA_MATCH_RUN_ROWS`): past that, it decides up to an earlier time and the next run goes on from there, so catching
+  up a long backlog takes bounded memory.
+- **A search that never ends.** Without `WITHIN`, a search a row can always extend (as `(a b* c)` with no `c`) holds its
+  key's rows until it is decided. Past `PONDRA_MATCH_HELD_ROWS` (1,000,000) rows of one key the view stops with 54000, and
+  the node's log names the key. Give the pattern a `WITHIN`.
 - **When a match is decided.** When its key has a later row that none of the search's partial matches can take, or, with
   `WITHIN`, once the watermark is past the interval. The ticker's last match ends in `up+`, which a next rise would extend,
   so it waits for the symbol's next row. With `WITHIN` it is written once the four hours have passed, and `idle` moves the
   watermark on with the clock when no rows come. Give a pattern that ends in a repetition a `WITHIN`.
-- **Late rows.** A row is late when its time is at or before the watermark of a run that read before the row came, or when
-  its time is NULL. It stays in its table, is counted in `pondra.flows`' `late_rows`, and is never matched: a match
+- **Late rows.** A row is late when its time is at or before the time a run decided up to (the watermark, or earlier when
+  the run was cut) and the run read before the row came, or when its time is NULL. It stays in its table, is counted in
+  `pondra.flows`' `late_rows`, and is never matched: a match
   already written may have read past its place.
 - **The answer.** Each match the view writes is the match the query gives over the table less its late rows, with the same
   key and start. `MATCH_NUMBER()` counts on across runs.

@@ -21,6 +21,7 @@
 //! id, so the view's change feed shows an update. That is one commit with the view's progress
 //! (producer `rerun:{view}`, seq the commit it read up to, `prev` the one before): a run is
 //! applied once, whichever leader runs it. Nothing is held between runs.
+use crate::codes::coded;
 use crate::query::{session_at, table_ref};
 use crate::store::*;
 use crate::text::{CREATED, ROW_ID, VERSION};
@@ -607,13 +608,15 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
         How::ByKey => {
             let keys = keys(plan).map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
             if let Some(u) = unfollow(src) {
-                bail!("{}", match u {
+                return Err(coded("0A000", match u {
                     Unfollow::Keyed => format!("{}, so a view of it can't be kept by key. refresh = 'full' runs its query whole again", u.said(source)),
                     Unfollow::Partial => format!("{}: make {name} from {source}'s own source, or refresh = 'full'", u.said(source)),
                     Unfollow::History => format!("{}: make {name} with refresh = 'full'", u.said(source)),
-                });
+                }));
             }
-            ensure!(upstream.is_none_or(|u| u.sessions.is_none() || u.rerun.is_some()), "{source} cuts sessions as they close: make {name} from {source}'s own source");
+            if upstream.is_some_and(|u| u.sessions.is_some() && u.rerun.is_none()) {
+                return Err(coded("0A000", format!("{source} cuts sessions as they close: make {name} from {source}'s own source")));
+            }
             let joins = joins(lake, plan, sql, source).await.map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
             (keys, joins, None, why.unwrap_or_else(|| "asked for (refresh = 'by key')".into()))
         }
@@ -704,11 +707,11 @@ async fn reads(lake: &Lake, sql: &str, source: &str) -> Result<(Vec<String>, boo
 /// windows were still being emitted, and its answer then came four seconds after it.
 #[derive(Default)]
 struct Pace {
+    of: String, // (the run's view: its rerun's id, so a view made again starts afresh)
     running: bool,
     started: Option<Instant>,
     took: Duration,
-    failures: u32,
-    error: Option<String>,
+    failed: crate::views::Failures,
     /// When a timed view last ran whatever changed.
     timed: Option<Instant>,
     /// The commit its last run that worked was as of, whether that run came early (its tables still
@@ -754,15 +757,9 @@ impl Turn {
     fn ended(&self, r: &Result<()>) {
         let mut pace = PACE.lock().unwrap();
         let Some(p) = pace.get_mut(&self.key) else { return };
-        match r {
-            Ok(()) => (p.failures, p.error, p.upto) = (0, None, p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed))),
-            Err(e) => {
-                let e = format!("{e:#}");
-                if p.error.as_ref() != Some(&e) {
-                    eprintln!("materialized view {}: {e}", self.key.1);
-                }
-                (p.failures, p.error) = (p.failures + 1, Some(e));
-            }
+        p.failed.note(&format!("materialized view {}", self.key.1), r.as_ref().err().map(|e| format!("{e:#}")));
+        if r.is_ok() {
+            p.upto = p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 }
@@ -772,8 +769,13 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
     let mut pace = PACE.lock().unwrap();
     let key = (lake.url.clone(), view.to_string());
     let p = pace.entry(key.clone()).or_default();
-    let backoff = Duration::from_secs(if p.failures == 0 { 0 } else { (1u64 << p.failures.min(6)).min(60) / 2 });
-    let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(backoff);
+    if p.of != r.id {
+        if p.running {
+            return None; // (the old view's run is still going: the new one waits for it to end)
+        }
+        *p = Pace { of: r.id.clone(), ..Default::default() };
+    }
+    let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(p.failed.backoff());
     let spaced = if r.full.is_some() { p.took * 10 } else { p.took * 2 }; // (from its start; a full run reads everything)
     let since = p.started.map(|s| s.elapsed());
     let paced = since.is_none_or(|s| s >= spaced.max(least));
@@ -793,10 +795,10 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
 }
 
 /// Why a view's runs keep failing on this node (two in a row), if they do: making it says so
-/// instead of waiting for a first run that won't come.
-pub fn failing(lake: &Lake, view: &str) -> Option<String> {
+/// instead of waiting for a first run that won't come. `of`: the view's `identity`.
+pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
     let pace = PACE.lock().unwrap();
-    pace.get(&(lake.url.clone(), view.to_string())).filter(|p| p.failures >= 2).and_then(|p| p.error.clone())
+    pace.get(&(lake.url.clone(), view.to_string())).filter(|p| p.of == of).and_then(|p| p.failed.failing())
 }
 
 /// Leader: start a run of every view that runs its query again whose turn it is, each in a task of
@@ -805,6 +807,11 @@ pub fn failing(lake: &Lake, view: &str) -> Option<String> {
 /// again at a later turn.
 pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     let views: Vec<(String, View)> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()).map(|(k, v)| (k[2..].to_string(), v)).collect();
+    {
+        // (a dropped view's pace goes too, before the early return below)
+        let names: std::collections::HashSet<&str> = views.iter().map(|(name, _)| name.as_str()).collect();
+        PACE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, view), _| url != &lake.url || names.contains(view.as_str()));
+    }
     if views.is_empty() {
         CHANGED.lock().unwrap().remove(&lake.url);
         return Ok(());
@@ -814,7 +821,8 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
         crate::panics::aside(async move {
-            let r = run(&lake, &seq, &lock, &name, &v, &turn).await;
+            let _slot = waiting(&turn.waited, crate::views::slot()).await; // (waiting for a slot is not the run's time)
+            let r = crate::views::bounded(run(&lake, &seq, &lock, &name, &v, &turn)).await;
             turn.ended(&r);
         });
     }
@@ -1355,6 +1363,30 @@ mod tests {
             ctx.register_table(name, Arc::new(table))?;
         }
         Ok(ctx.sql(&crate::pattern::rewritten(sql)?).await?.into_unoptimized_plan())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_made_again_under_its_name_starts_afresh() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-rerun-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let made = |id: &str| Rerun { id: id.into(), keys: vec![], full: None, reason: String::new(), asked: false, lag_secs: None, joins: vec![] };
+        let (a, b) = (made("a"), made("b"));
+        let key = (lake.url.clone(), "v".to_string());
+        let t = turn(&lake, "v", &a, None).expect("a's first turn");
+        assert!(turn(&lake, "v", &b, None).is_none(), "while a's run is going, b's waits for it to end");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        drop(t);
+        PACE.lock().unwrap().get_mut(&key).expect("a's pace").started = None; // (past a's pace)
+        let t = turn(&lake, "v", &a, None).expect("a's next turn");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        drop(t);
+        assert_eq!(failing(&lake, "v", "a").as_deref(), Some("boom"));
+        let t = turn(&lake, "v", &b, None).expect("b's first turn, with none of a's backoff");
+        assert_eq!(failing(&lake, "v", "a"), None, "a is gone: its failures went with it");
+        drop(t);
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[tokio::test]

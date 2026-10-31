@@ -504,7 +504,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     // CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL: each group once, when it's over.
     if let Some(rest) = crate::once::emit_final(sql) {
-        let wrong = || Stmt::Invalid("EMIT FINAL ends a materialized view's query: CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL".into());
+        let wrong = || match crate::pattern::wanted(&rest) {
+            true => Stmt::Invalid("EMIT FINAL over a MATCH_RECOGNIZE of a subquery or a join isn't supported: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…) EMIT FINAL".into()),
+            false => Stmt::Invalid("EMIT FINAL ends a materialized view's query: CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL".into()),
+        };
         return Some(match parse(&rest) {
             Some(Stmt::Ddl(mut d)) if d.len() == 1 => match crate::once::mark(&mut d[0]) {
                 true => Stmt::Ddl(d),
@@ -2351,7 +2354,7 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>) -> Result<Value> {
         }
         None => j!({"duplicate": true}),
     };
-    crate::inbox::drain(&lake, &seq, &lock).await?; // others who couldn't reach a leader
+    crate::inbox::drain(&lake, &seq, &lock, true).await?; // others who couldn't reach a leader, and the first run its statement led here (`backup::sent`)
     lake.cat.checkpoint().await?; // (so every node's view has it without replaying the WAL)
     Ok(out)
 }

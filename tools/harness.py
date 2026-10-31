@@ -24330,7 +24330,9 @@ def matches():
     row came before the watermark reached it (lateness 30 s), is written once the other symbol's rows move the watermark
     past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
-    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source. 5, 7 and 8
+    9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
+    as the input, 0A000 with the pattern view's words; a view kept by key as the input. 10: a search that never ends, past
+    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 5, 7 and 8
     (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
@@ -24406,6 +24408,15 @@ def matches():
         all([s_a, s_b, s_c]) and seen_a == want_a == seen_b == want_b == seen_c == want_c
     checks["late rows: pondra.flows counts each late row once for the view (late_rows 1 after GAMMA's row, 5 after HELIOS's four)"] = \
         flows_b == 1 and flows_c == 5
+    # a NULL time is late, also when its row came before the view's first run (audit 10-31 L2)
+    q("CREATE TABLE null_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("INSERT INTO null_src VALUES ('NULLS', 0, NULL, 1)")
+    _mx_put(q, "null_src", run_a)
+    q(f"CREATE MATERIALIZED VIEW null_v WITH (lateness = '0 seconds') AS {MX_TICKER.format(src='null_src')} EMIT FINAL")
+    s_n = _mx_settled(lake, "null_v", _mx_us("2026-10-01 00:05:00"))
+    flows_n = _mx_flow(q, "null_v")
+    info["null_v in pondra.flows: late_rows after its first run, with a NULL time from before it"] = flows_n
+    checks["late rows: a row with a NULL time made before a pattern view's first run is counted late (late_rows 1)"] = s_n and flows_n == 1
     lap("2, late rows")
 
     # 3. A quiet key: its last row came before the watermark reached it (lateness 30 s); the other symbol's rows move the
@@ -24548,13 +24559,50 @@ def matches():
     checks["refused 0A000, with its words: a plain table as the source, not keyed, not a GROUP BY view's table, not a history view"] = \
         all([refused(label, stmt, [words, "write it from a table of plain rows"]) for label, stmt, words in sources])
     checks["UPDATE and DELETE on the source are refused while the view follows it (\"can't change while these follow it\", naming late_v)"] = \
-        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code=None)
+        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code="2BP01")
              for label, stmt in [("UPDATE", "UPDATE late_src SET price = 1 WHERE day = 1"), ("DELETE", "DELETE FROM late_src WHERE day = 1")]])
-    # (the subquery form, which the parser refuses before any of the above: recorded, not checked)
-    refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
-            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", [], code=None)
+    q("CREATE MATERIALIZED VIEW r_bk WITH (refresh = 'by key') AS SELECT symbol, day, ts, max(price) AS price FROM late_src GROUP BY symbol, day, ts")
+    checks["a view kept by key as the input is refused 0A000 (\"is kept by key\", its own source)"] = \
+        refused("over a view kept by key", emit("r_kb", mr("r_bk")), ["is kept by key", "Make r_kb from r_bk's own source"])
+    # (the subquery form, which the parser refuses before any of the above: with the pattern view's words, not GROUP BY's)
+    checks["a subquery as the input is refused 0A000 with the pattern view's words (FROM t MATCH_RECOGNIZE), not GROUP BY's"] = refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
+            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
     lap("9, the refusals")
     node.kill()
+
+    # 10. A search that never ends: one key holds 100 rows of an open search, past PONDRA_MATCH_HELD_ROWS (50 here, its own node),
+    # so the view stops with 54000, the node's log names the key and the WITHIN, and nothing is written
+    node10 = Node(new_lake(), A.port, env={"PONDRA_MATCH_HELD_ROWS": "50"}).start()
+    q("CREATE TABLE t (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE MATERIALIZED VIEW open_v WITH (lateness = '0 seconds') AS SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+      "MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (a b* c) DEFINE c AS c.price < 0) EMIT FINAL")
+    q("INSERT INTO t SELECT 'X', CAST(value AS INT), TIMESTAMP '2026-10-01 00:00:00' + CAST(value AS BIGINT) * INTERVAL '1 second', "
+      "CAST(value AS INT) FROM generate_series(1, 100)")
+    held_line, deadline = None, time.time() + 30
+    while held_line is None and time.time() < deadline:
+        held_line = next((l for l in open(node10.log).read().splitlines() if "holds" in l and "PONDRA_MATCH_HELD_ROWS" in l), None)
+        if held_line is None:
+            time.sleep(0.5)
+    open_rows = q("SELECT count(*) AS n FROM open_v")[0]["n"]
+    info["10: the node's log line"] = held_line
+    checks["a search that never ends stops the view with the key and WITHIN named, past PONDRA_MATCH_HELD_ROWS"] = \
+        held_line is not None and "the key X holds" in held_line and "WITHIN" in held_line and "PONDRA_MATCH_HELD_ROWS" in held_line and open_rows == 0
+    # its runs keep failing on the same error (a try after each backoff): pondra.flows says why, and the node's log names it once
+    flow_error, deadline = None, time.time() + 10
+    while flow_error is None and time.time() < deadline:
+        flow_error = next((r["error"] for r in q("SELECT error FROM pondra.flows WHERE name = 'open_v'") if "PONDRA_MATCH_HELD_ROWS" in (r.get("error") or "")), None)
+        if flow_error is None:
+            time.sleep(0.5)
+    named_lines = lambda: sum("PONDRA_MATCH_HELD_ROWS" in l for l in open(node10.log).read().splitlines())
+    named_before = named_lines()
+    time.sleep(4)
+    named_after = named_lines()
+    info["10: pondra.flows' error"] = flow_error
+    info["10: log lines naming PONDRA_MATCH_HELD_ROWS, before and 4 s on"] = [named_before, named_after]
+    checks["a view whose search holds too many rows shows the error in pondra.flows' error column"] = flow_error is not None
+    checks["its failing runs are logged once, not at every try (no new line 4 s on)"] = named_before >= 1 and named_after == named_before
+    node10.kill()
+    lap("10, a search that never ends")
 
     # 5, 7 and 8: every skip rule and the generator's queries, a restart and three nodes, and a run's cost (each its own lake)
     for part, run in (("5, every skip rule", matches_random), ("7, a restart and three nodes", matches_restart), ("8, the cost", matches_cost)):

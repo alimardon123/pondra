@@ -244,6 +244,12 @@ pub enum Rendered {
     Sent,
 }
 
+/// `f` in the scope a `/sql` request's statement runs in: its session's temporary tables, views and variables (`session`), and
+/// the variables of the code a lent token runs for (`vars`). A page's fallback (`page::node_part`) reads a statement's names in it too.
+pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars: Option<crate::vars::Lent>, f: F) -> F::Output {
+    crate::vars::within(vars, temp::SESSION.scope(session, f)).await
+}
+
 /// One `/sql` request (its query, its headers, its body), for `role`, with every step a `/sql` takes around
 /// `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> Said {
@@ -262,7 +268,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement))))));
+    let go = crate::query::HELD.scope(Default::default(), scoped(session.clone(), vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
     // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
     let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();

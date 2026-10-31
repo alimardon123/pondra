@@ -217,7 +217,7 @@ def pondra_query(n, files, port, sql=MATCH):
 
         def run():
             t = time.time()
-            q(f"SELECT count(*) AS n{next(seq)} FROM ({sql}) m")  # (a new alias each run: the result cache answers a repeated text)
+            q(f"SELECT count(*) AS n{next(seq)}, max(start_ts), max(bottom_ts), max(end_ts) FROM ({sql}) m")  # (every measure, as Flink computes them; a new alias each run: the result cache answers a repeated text)
             return round(time.time() - t, 3)
 
         runs, med = median_of_three(run)

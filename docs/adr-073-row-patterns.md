@@ -142,17 +142,24 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
      undecided match could start at, less the rows `PREV` looks back. The rows from it on are
      held in `{v}$held`, keyed by their `_row_id`.
    - A run reads the rows in the watermark's new span and the held rows of the keys they touch
-     (with `WITHIN`, also of the keys whose live thread the watermark has passed). It appends the
-     matches decided since, and moves the held rows and the resume points, in one commit with the
-     producer `match:{v}` (seq the watermark, `prev` the last one: invariant 24's mechanism).
-   - A row is late when its time is at or before the watermark of a run that read before the row
-     came, or when its time is NULL: it stays in its table, is never matched, and counts as the
+     (with `WITHIN`, also of the keys whose live thread the watermark has passed). A run reads
+     about `PONDRA_MATCH_RUN_ROWS` (1,000,000) new rows: past that it decides up to just past the
+     time of its last such row, and the next step goes on from there, so a catch-up takes steps.
+     It appends the matches decided since, and moves the held rows and the resume points, in one
+     commit with the producer `match:{v}` (seq the time it decided up to, `prev` the last one:
+     invariant 24's mechanism).
+   - A row is late when its time is at or before the time a run decided up to (the watermark, or
+     earlier when the run was cut) and the run read before the row came, or when its time is NULL:
+     it stays in its table, is never matched, and counts as the
      view's `$late` (ADR-052 §4). (This was "a row behind its key's resume point". That rule let a
      late row into a run whose earlier matches had already read past its place, so a match
      written once could differ from the query's.)
    - The view takes a lake table read directly, with a projection and a `WHERE` around the
      pattern, one ascending time column in `ORDER BY`, and no `$`, `^`, `NEXT`, `WITH UNMATCHED
      ROWS` or volatile function; anything else is refused `0A000` with what to write.
+   - A search that never ends: without `WITHIN`, a search a row can always extend (as `(a b* c)` with no `c`) holds its
+     key's rows until it is decided; past `PONDRA_MATCH_HELD_ROWS` (1,000,000) rows of one key the view stops with 54000,
+     and the node's log names the key. Give the pattern a `WITHIN`.
 
 9. **Per-partition watermarks** come with L4's Kafka partitions (round 36). A feed commits each
    partition's newest event time with its offsets (`feeds::shard`), and `views::newest` takes the

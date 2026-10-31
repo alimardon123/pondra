@@ -254,6 +254,9 @@ pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
 /// followers' changes a leader inherits recovered, its sequencer and log started, its first user made. `replica` is
 /// what this follower holds for its leader (a node's folder; None elsewhere).
 pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::members::Members>, replica: Option<Arc<crate::replica::ReplicaLog>>, s: &Start) -> anyhow::Result<crate::app::App> {
+    if let Some(key) = s.auth.owner_key() {
+        let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
+    }
     let lives = !is_guest();
     let leader = members.is_leader();
     let term = members.leader().n;
@@ -530,28 +533,56 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
 }
 
-crate::per_node!(
-    /// Is a page's member open in this process (`open_page`)? Set when one opens, set back when it closes.
-    static PAGED: AtomicBool = AtomicBool::new(false));
+/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step,
+/// after `reset()`: a waiting `open_page` takes it only once every other static is set back. Not `per_node!`, since `reset()`
+/// would set it back before the rest are, and a page opened in that gap would have them cleared under it.
+static PAGED: AtomicBool = AtomicBool::new(false);
+
+/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page`. Not
+/// `per_node!`: a freed page's member closes in the background, and its `reset()` would set back the claim of the page made
+/// after it.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claims this module's page for a `page::Page` (`Page::claim`), refused 55006 while a live page holds it.
+pub fn claim_page() -> anyhow::Result<()> {
+    if CLAIMED.swap(true, SeqCst) {
+        return Err(crate::codes::coded("55006", "a page is open in this module already: close it (close() or free()) first, or open the other in a Worker"));
+    }
+    Ok(())
+}
+
+/// Gives the module's page back (`claim_page`): its page is closed, or dropped.
+pub fn unclaim_page() {
+    CLAIMED.store(false, SeqCst);
+}
 
 /// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
 /// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it.
 pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()> }
 
 /// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
-/// queries holding the page's share of its device's `line` (`env::device_line`): refused by name while one is open in this
-/// process, and set back if the open fails.
+/// queries holding the page's share of its device's `line` (`env::device_line`). A freed page's member may still be closing in
+/// the background, which sets PAGED back when it has ended: then this waits for it, 10 ms at a time, for 30 s at most, and is
+/// refused 55006 after that. Set back if the open fails.
 pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
-    if PAGED.swap(true, SeqCst) {
-        return Err(crate::codes::coded("55006", "a page on the lake is open in this module already: close it first"));
+    // (`swap` checks and sets at once, so two opens can't both take it)
+    let mut sleeps = 0;
+    while PAGED.swap(true, SeqCst) {
+        if sleeps == 3_000 {
+            return Err(crate::codes::coded("55006", "the page freed before this one is still closing: reload, or open this one in a Worker"));
+        }
+        sleeps += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     let url = crate::memory::place(":memory:");
+    let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
         crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
     let store = crate::memory::store(&url);
-    let (alone, marks) = match crate::members::Alone::lead(&store).await {
+    let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
+    let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
             crate::memory::forget_memory(&url);
@@ -592,7 +623,7 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, lake: Option<Arc<crate::st
     crate::terms::release(store, term).await;
     crate::memory::forget_memory(url);
     crate::reset::reset();
-    PAGED.store(false, SeqCst);
+    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
 }
 
 impl Paged {
@@ -625,4 +656,17 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_claimed_page_refuses_a_second_claim_by_55006() {
+        super::claim_page().expect("the first claim is taken");
+        let refused = super::claim_page().expect_err("a second claim is refused while the first holds the page");
+        assert_eq!(crate::codes::of(&refused), "55006");
+        super::unclaim_page();
+        super::claim_page().expect("the page is claimable again once it is given back");
+        super::unclaim_page();
+    }
 }

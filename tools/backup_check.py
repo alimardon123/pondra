@@ -94,10 +94,11 @@ def printed(out):
     return json.loads(out)
 
 
-def door(n, method, path, body=b"", owner=True):
+def door(n, method, path, body=b"", owner=True, json_body=False):
     """A request as `Node.call` makes it, except that a refusal is an answer: (status, SQLSTATE, text). `owner=False`
     is a superuser's own request: the admin token, and not the node's owner's key (`server::owner`)."""
-    headers = {"Authorization": f"Bearer {TOKEN}", **({"x-pondra-owner": OWNER} if owner else {})}
+    headers = {"Authorization": f"Bearer {TOKEN}", **({"x-pondra-owner": OWNER} if owner else {}),
+               **({"Content-Type": "application/json"} if json_body else {})}
     req = urllib.request.Request(f"http://127.0.0.1:{n.port}{path}", data=body, method=method, headers=headers)
     try:
         r = urllib.request.urlopen(req, timeout=120)
@@ -352,7 +353,7 @@ def scheduled_backup(bin, work, ports):
 
 
 def task_not_the_owners(bin, work, port):
-    """A task a superuser that isn't the node's owner made (`by_owner` false) runs as that superuser: its BACKUP into a folder on
+    """A task a superuser that isn't the node's owner made (without the task's owner mark) runs as that superuser: its BACKUP into a folder on
     this machine is refused 42501 when it runs (`backup::owners_only`), the run fails with the refusal's words, and nothing is
     written there."""
     lake, bkt = os.path.join(work, "task-theirs", "lake"), os.path.join(work, "task-theirs", "bk")
@@ -504,6 +505,26 @@ def owner_only_places(bin, work, port):
             "restore_location_a_folder": restore_into[2][-200:]}
 
 
+def node_door_not_a_first_run(bin, work, port):
+    """A backup's first run or a restore is led for its new place by the statement that asked (BACKUP DATABASE, RESTORE),
+    never taken from a node's door: a `Backup` run sent to `/cluster/ddl` that makes its lake, restores one, or does either
+    inside `CREATE … IF NOT EXISTS`, is refused 42501 even with the owner's key, and nothing of its source reaches the node."""
+    src = os.path.join(work, "node-door", "source")
+    cli(bin, src, "CREATE TABLE kept_apart (a INT)")
+    cli(bin, src, "INSERT INTO kept_apart VALUES (7)")
+    run = lambda **k: {"op": "backup", "source": src, **k}
+    sent = {"first_run": run(fresh=True), "restore": run(restore=True),
+            "first_run_if_not_exists": {"op": "unless", "name": "b", "kind": "relation", "then": run(fresh=True)}}
+    n = Node(bin, os.path.join(work, "node-door", "place"), port, work).start()
+    try:
+        said = {k: door(n, "POST", "/cluster/ddl", json.dumps(v).encode(), json_body=True) for k, v in sent.items()}
+        read = door(n, "POST", "/sql", b"SELECT count(*) FROM kept_apart")
+    finally:
+        n.stop()
+    ok = all(r[1] == "42501" and "never sent to a node" in r[2] for r in said.values()) and read[0] != 200
+    return {"ok": ok, **{k: f"{r[0]} {r[1]} {r[2][-160:]}" for k, r in said.items()}, "source_table_on_the_node": read[0]}
+
+
 def zstd_raw(data):
     """A zstd frame of raw blocks, uncompressed: a run's catalog as a stand-in for one a backup's writer made (zstd reads it)."""
     out = bytearray(b"\x28\xb5\x2f\xfd\xe0")  # the magic number; one segment, an 8-byte content size
@@ -630,6 +651,8 @@ def backup_check(bin, work, port, checks):
         c.update(task_not_the_owners(bin, work, next(ports)))
     with check(checks, "an owner's task run by a superuser's EXECUTE TASK is refused a folder on this machine; the owner's EXECUTE goes") as c:
         c.update(asked_task(bin, work, next(ports)))
+    with check(checks, "a backup's first run or a restore sent to a node's door is refused, even with the owner's key") as c:
+        c.update(node_door_not_a_first_run(bin, work, next(ports)))
     with check(checks, "two nodes on one lake: the owner's BACKUP sent to the follower goes, a superuser's is refused") as c:
         c.update(owner_through_a_follower(bin, work, next(ports), next(ports)))
     with check(checks, "pondra backup of a lake a node serves goes") as c:

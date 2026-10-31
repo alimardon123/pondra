@@ -378,7 +378,7 @@ impl Node {
         };
         let drained = async {
             if let Some(seq) = &app.seq {
-                inbox::drain(&app.lake, seq, &app.lock).await?;
+                inbox::drain(&app.lake, seq, &app.lock, false).await?;
                 app.lake.cat.wait_durable(app.lake.cat.committed()).await; // (no cap: the answer is printed after this, and a leader's acks are durable already)
             }
             anyhow::Ok(())

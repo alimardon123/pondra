@@ -1,7 +1,7 @@
-//! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, as
-//! `fetch.rs` is one web origin's objects. A page keeps its files and its tables there (`Page::kept`), so they are there
-//! after a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes
-//! one writer at a time, so two tabs never write over each other's tables.
+//! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, which
+//! is the lake's store of a kept page (`Page::kept`). A page keeps its files and its tables there, so they are there after
+//! a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes one
+//! writer at a time, so two tabs never write over each other's tables.
 //!
 //! A write is whole or not at all. Over an existing file, Chromium keeps the old bytes until the new ones are closed. A
 //! new object is written under a temporary name (`{name}#writing`: object_store encodes `#`, so no object has one) and
@@ -62,7 +62,7 @@ impl ObjectStore for Opfs {
         let folder = self.folder.clone();
         let outcome = step(location, put(folder, location.clone(), opts.mode, chunks)).await?;
         match outcome {
-            Put::Written(e_tag) => Ok(PutResult { e_tag: Some(e_tag), version: None }),
+            Put::Written(e_tag) => Ok(PutResult { e_tag: Some(e_tag), version: None, extensions: Default::default() }),
             Put::Exists => Err(Error::AlreadyExists {
                 path: location.to_string(),
                 source: "an object is there already, and this put is to create one".into(),
@@ -87,7 +87,7 @@ impl ObjectStore for Opfs {
         let at = location.clone();
         let meta = step(location, async move { meta_at(&folder, &at).await }).await?;
         options.check_preconditions(&meta)?;
-        // (what is read, and whether a body is wanted, is `js::read_of`'s, as `fetch.rs` reads it)
+        // (what is read, and whether a body is wanted, is `js::read_of`'s)
         let read = js::read_of(options);
         let range = answered(&read, meta.size, location)?;
         let payload = if read.body {
@@ -96,7 +96,7 @@ impl ObjectStore for Opfs {
         } else {
             stream::empty().boxed()
         };
-        Ok(GetResult { payload: GetResultPayload::Stream(payload), meta, range, attributes: Attributes::default() })
+        Ok(GetResult { payload: GetResultPayload::Stream(payload), meta, range, attributes: Attributes::default(), extensions: Default::default() })
     }
 
     fn delete_stream(&self, locations: BoxStream<'static, StoreResult<Path>>) -> BoxStream<'static, StoreResult<Path>> {
@@ -127,7 +127,7 @@ impl ObjectStore for Opfs {
         let (folder, names) = (self.folder.clone(), names_under(prefix));
         let at = prefix.cloned().unwrap_or_default();
         let level = step(&at, level_of(folder, names)).await?;
-        Ok(ListResult { common_prefixes: level.folders, objects: level.files })
+        Ok(ListResult { common_prefixes: level.folders, objects: level.files, extensions: Default::default() })
     }
 
     async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> StoreResult<()> {
