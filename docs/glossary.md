@@ -6,6 +6,8 @@ Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; `python3 t
 
 **database**: another lake this one reads, attached by name, or a branch cloned from one. Other products call it catalog, lake, workspace.
 
+**extension**: functions in a WebAssembly file, installed once and kept in the lake. Other products call it plugin.
+
 **external table**: a view of files outside the lake, read in place where they are. Other products call it foreign table.
 
 **function**: a named computation, in SQL or Python, run per row, per batch or in a query. Other products call it UDF, user-defined function.
