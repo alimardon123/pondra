@@ -4707,6 +4707,20 @@ def flight():
         conn.close()
     checks["a transaction word run as SQL is refused over Flight SQL (0A000): a script's COMMIT, a block's, a CALL's and a savepoint's, in a transaction the protocol began, and the rows of those transactions are rolled back, not committed"] = \
         plain_commit == "0A000" and all(v == "0A000" for v in txn_refused.values()) and count()["n"] == rows_before_txn
+    # A `$name` declared in a transaction the protocol began is bound in the writes sent after it, as every door binds it
+    # (audit 10-31 L9: Flight's writes skipped the binding).
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("DECLARE $bump = 7")
+        cur.execute("INSERT INTO ev VALUES ('declared', $bump, TIMESTAMP '2026-09-22 10:00:00')")
+        cur.execute("UPDATE ev SET amount = amount + $bump WHERE user = 'declared'")
+        conn.commit()
+        declared = q("SELECT amount FROM ev WHERE user = 'declared'")
+    except Exception as e:  # (a refusal fails the check, it doesn't end the run)
+        declared = str(e).splitlines()[0][:200]
+    conn.close()
+    checks["a $name declared in a Flight SQL transaction is bound in its INSERT and UPDATE"] = declared == [{"amount": 14}]
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
@@ -4736,7 +4750,7 @@ def flight():
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
     print(json.dumps({"flight": checks, "follow_ms": follow_ms, "kept_gauge": {"before": gauge_before, "at_getflightinfo": gauge_before + kept_rise, "after_doget": gauge_before + kept_back}, "ok": ok}, indent=1))
     if not ok:
-        print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total)
+        print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total, declared)
         sys.exit(1)
     return f"Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in {follow_ms} ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all {len(checks)} checks pass"
 
