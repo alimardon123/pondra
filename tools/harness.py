@@ -24578,6 +24578,20 @@ def matches():
     info["10: the node's log line"] = held_line
     checks["a search that never ends stops the view with the key and WITHIN named, past PONDRA_MATCH_HELD_ROWS"] = \
         held_line is not None and "the key X holds" in held_line and "WITHIN" in held_line and "PONDRA_MATCH_HELD_ROWS" in held_line and open_rows == 0
+    # its runs keep failing on the same error (a try after each backoff): pondra.flows says why, and the node's log names it once
+    flow_error, deadline = None, time.time() + 10
+    while flow_error is None and time.time() < deadline:
+        flow_error = next((r["error"] for r in q("SELECT error FROM pondra.flows WHERE name = 'open_v'") if "PONDRA_MATCH_HELD_ROWS" in (r.get("error") or "")), None)
+        if flow_error is None:
+            time.sleep(0.5)
+    named_lines = lambda: sum("PONDRA_MATCH_HELD_ROWS" in l for l in open(node10.log).read().splitlines())
+    named_before = named_lines()
+    time.sleep(4)
+    named_after = named_lines()
+    info["10: pondra.flows' error"] = flow_error
+    info["10: log lines naming PONDRA_MATCH_HELD_ROWS, before and 4 s on"] = [named_before, named_after]
+    checks["a view whose search holds too many rows shows the error in pondra.flows' error column"] = flow_error is not None
+    checks["its failing runs are logged once, not at every try (no new line 4 s on)"] = named_before >= 1 and named_after == named_before
     node10.kill()
     lap("10, a search that never ends")
 

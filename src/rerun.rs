@@ -707,8 +707,7 @@ struct Pace {
     running: bool,
     started: Option<Instant>,
     took: Duration,
-    failures: u32,
-    error: Option<String>,
+    failed: crate::views::Failures,
     /// When a timed view last ran whatever changed.
     timed: Option<Instant>,
     /// The commit its last run that worked was as of, whether that run came early (its tables still
@@ -754,15 +753,9 @@ impl Turn {
     fn ended(&self, r: &Result<()>) {
         let mut pace = PACE.lock().unwrap();
         let Some(p) = pace.get_mut(&self.key) else { return };
-        match r {
-            Ok(()) => (p.failures, p.error, p.upto) = (0, None, p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed))),
-            Err(e) => {
-                let e = format!("{e:#}");
-                if p.error.as_ref() != Some(&e) {
-                    eprintln!("materialized view {}: {e}", self.key.1);
-                }
-                (p.failures, p.error) = (p.failures + 1, Some(e));
-            }
+        p.failed.note(&format!("materialized view {}", self.key.1), r.as_ref().err().map(|e| format!("{e:#}")));
+        if r.is_ok() {
+            p.upto = p.upto.max(self.upto.load(std::sync::atomic::Ordering::Relaxed));
         }
     }
 }
@@ -772,8 +765,7 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
     let mut pace = PACE.lock().unwrap();
     let key = (lake.url.clone(), view.to_string());
     let p = pace.entry(key.clone()).or_default();
-    let backoff = Duration::from_secs(if p.failures == 0 { 0 } else { (1u64 << p.failures.min(6)).min(60) / 2 });
-    let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(backoff);
+    let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(p.failed.backoff());
     let spaced = if r.full.is_some() { p.took * 10 } else { p.took * 2 }; // (from its start; a full run reads everything)
     let since = p.started.map(|s| s.elapsed());
     let paced = since.is_none_or(|s| s >= spaced.max(least));
@@ -796,7 +788,7 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
 /// instead of waiting for a first run that won't come.
 pub fn failing(lake: &Lake, view: &str) -> Option<String> {
     let pace = PACE.lock().unwrap();
-    pace.get(&(lake.url.clone(), view.to_string())).filter(|p| p.failures >= 2).and_then(|p| p.error.clone())
+    pace.get(&(lake.url.clone(), view.to_string())).and_then(|p| p.failed.failing())
 }
 
 /// Leader: start a run of every view that runs its query again whose turn it is, each in a task of
@@ -814,7 +806,8 @@ pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &
         let Some(turn) = turn(lake, &name, v.rerun.as_ref().expect("filtered"), last_change(lake, &follows(&v))) else { continue };
         let (lake, seq, lock) = (lake.clone(), seq.clone(), lock.clone());
         crate::panics::aside(async move {
-            let r = run(&lake, &seq, &lock, &name, &v, &turn).await;
+            let _slot = waiting(&turn.waited, crate::views::slot()).await; // (waiting for a slot is not the run's time)
+            let r = crate::views::bounded(run(&lake, &seq, &lock, &name, &v, &turn)).await;
             turn.ended(&r);
         });
     }

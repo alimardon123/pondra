@@ -399,6 +399,7 @@ DROP TABLE IF EXISTS scratch;
 | `reads` | other tables its query reads, or null |
 | `expectations` | how many it has |
 | `late_rows` | an `EMIT FINAL` view's rows that came for a group already kept, or for a `MATCH_RECOGNIZE` behind its watermark; null for other views |
+| `error` | why its runs keep failing: the last error, once two runs in a row failed; null while they work |
 | `definition` | its query |
 
 `pondra.expectations` has a row per expectation: `view`, `expectation`, `condition`,

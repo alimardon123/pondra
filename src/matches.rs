@@ -264,6 +264,11 @@ impl Dues {
 
 crate::per_node!(static DUES: Mutex<HashMap<String, Dues>> = Default::default());
 
+crate::per_node!(
+    /// Each view's cut points still ahead (`cut_points`), by `{lake}|{view}|{id}`: a catch-up works them out once and its
+    /// steps take them in turn.
+    static CUTS: Mutex<HashMap<String, Vec<(i64, bool)>>> = Mutex::new(HashMap::new()));
+
 /// A catch-up's steps run back to back for this long, then go on next round, so the leader's other views emit too.
 const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -283,7 +288,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     Ok(())
 }
 
-/// One step of a run: the watermark's new span, cut to about `most_rows()` rows (`cut`), read at the snapshot; the keys it
+/// One step of a run: the watermark's new span, cut to about `most_rows()` rows (`next_cut`), read at the snapshot; the keys it
 /// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
 /// producer in one flush, under the lake's lock. A step that finds nothing new commits nothing. Returns whether a next step
 /// should follow at once: the time this one decided up to is short of the watermark.
@@ -320,7 +325,11 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let sctx = session_at(lake, &read, "", Some(at)).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
     let w_mark = w;
-    let w = cut(&table, &t, &m.time, &time_type, w0, w_mark, most_rows()).await?;
+    let mut points = CUTS.lock().unwrap().remove(&dkey).unwrap_or_default();
+    let w = next_cut(&mut points, &table, &m.time, &time_type, w0, w_mark, most_rows()).await?;
+    if !points.is_empty() {
+        CUTS.lock().unwrap().insert(dkey.clone(), points);
+    }
     let s_batches: Vec<RecordBatch> = table.clone().filter(span(&t, &time_type, w0, w)?)?.collect().await?;
 
     // Late rows: those that came after the last run's snapshot, with a time at or before the time the last run decided up
@@ -348,10 +357,14 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     // K: the keys S touches, and those whose live thread is dead by W.
     let due: Vec<Key> = if m.within { dues.due_by(w) } else { vec![] };
     if n_s == 0 && due.is_empty() && late == 0 {
+        let short = w < w_mark;
+        if short {
+            CUTS.lock().unwrap().remove(&dkey); // (a cached point left (W0, W] empty: the next step works its points out again)
+        }
         if m.within {
             DUES.lock().unwrap().insert(dkey, dues);
         }
-        return Ok(false); // (nothing new and nothing late: no run, no commit)
+        return Ok(short); // (nothing new and nothing late: no run, no commit; a short step goes on from W0 at once)
     }
     for k in &due {
         keys.intern(k.clone())?;
@@ -480,13 +493,113 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     }
 }
 
-/// The time a run decides up to: W, or, when (W0, W] holds more than `most` rows, 1 µs past its `most`-th row's time (a
-/// finer time is in too), and at least 1: a run reads about `most` new rows (all of a time) and always moves on.
+/// The exact cut, used within a full slice (and for a span whose slices can't be worked out): the time a run decides up to,
+/// W, or, when (W0, W] holds more than `most` rows, 1 µs past its `most`-th row's time (a finer time is in too), and at
+/// least 1: a run reads about `most` new rows (all of a time) and always moves on.
 async fn cut(table: &DataFrame, t: &Expr, time: &str, time_type: &DataType, w0: u64, w: i64, most: u64) -> Result<i64> {
     let top = table.clone().filter(span(t, time_type, w0, w)?)?.select(vec![t.clone()])?.sort(vec![t.clone().sort(true, false)])?.limit(most as usize - 1, Some(1))?.collect().await?;
     match top.iter().find(|b| b.num_rows() > 0) {
         Some(b) => Ok((micros_of(b, time)?[0] + 1).max(1).min(w)),
         None => Ok(w),
+    }
+}
+
+/// About how many slices of time a catch-up's pass counts its rows in (`cut_points`).
+const SLICES: i64 = 4096;
+
+/// Where a catch-up's steps stop, from one pass over the span (W0, W]: its rows counted in `SLICES` equal slices of time
+/// (from W0+1, or at W0 0 the span's first time, to W), walked in order, a cut placed before a slice that would take the
+/// rows since the last cut past `most`. A slice holding more than `most` rows alone is marked full: a step that reaches it
+/// stops by the exact `cut` within it. Empty when the span holds at most `most` rows (the step takes all of it). Rows
+/// that come later into a span already cut only make its step larger. Known limit: times spread very unevenly (one stray
+/// old time at W0 0 makes every slice days wide) fill few slices, so most rows land in full slices, and their steps cost
+/// what `cut` costs, plus the pass.
+async fn cut_points(table: &DataFrame, time: &str, time_type: &DataType, w0: u64, w: i64, most: u64) -> Result<Vec<(i64, bool)>> {
+    let t = ident(time);
+    // The least whole µs `c` with `t <= stamp(c)`, as `span` compares: a ceiling for a ns column, a cast otherwise.
+    let us = match time_type {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            // (a whole division drops toward zero: one more µs for what is left above it, below 1970 too)
+            let ns = datafusion::logical_expr::cast(t.clone(), DataType::Int64);
+            ns.clone() / lit(1000_i64) + datafusion::logical_expr::cast((ns % lit(1000_i64)).gt(lit(0_i64)), DataType::Int64)
+        }
+        _ => datafusion::logical_expr::cast(datafusion::logical_expr::cast(t.clone(), DataType::Timestamp(TimeUnit::Microsecond, None)), DataType::Int64),
+    };
+    let lo = match w0 > 0 {
+        true => w0 as i64 + 1,
+        false => {
+            let low = table.clone().filter(span(&t, time_type, w0, w)?)?.aggregate(vec![], vec![datafusion::functions_aggregate::expr_fn::min(us.clone()).alias("lo")])?.collect().await?;
+            let Some(b) = low.iter().find(|b| b.num_rows() > 0) else { return Ok(vec![]) };
+            let least = b.column(0).as_primitive::<Int64Type>();
+            if least.is_null(0) {
+                return Ok(vec![]);
+            }
+            least.value(0)
+        }
+    };
+    let Some(range) = w.checked_sub(lo) else { return Ok(vec![(w, true)]) };
+    let width = range / SLICES + 1;
+
+    let groups = table.clone().filter(span(&t, time_type, w0, w)?)?.aggregate(
+        vec![((us.clone() - lit(lo)) / lit(width)).alias("s")],
+        vec![datafusion::functions_aggregate::expr_fn::count(lit(1_i64)).alias("n")],
+    )?.collect().await?;
+    let mut slices: Vec<(i64, u64)> = vec![];
+    for b in &groups {
+        slices.extend(ints(b, "s")?.into_iter().zip(ints(b, "n")?.into_iter().map(|n| n as u64)));
+    }
+    slices.sort_unstable();
+    if slices.iter().map(|(_, n)| n).sum::<u64>() <= most {
+        return Ok(vec![]);
+    }
+
+    let mut points: Vec<(i64, bool)> = vec![];
+    let mut acc: u64 = 0;
+    for (s, n) in slices {
+        let start = lo.saturating_add(s.saturating_mul(width));
+        let end = start.saturating_add(width - 1).min(w);
+        if n > most {
+            if acc > 0 {
+                points.push((start - 1, false));
+            }
+            points.push((end, true));
+            acc = 0;
+        } else if acc + n > most {
+            points.push((start - 1, false));
+            acc = n;
+        } else {
+            acc += n;
+        }
+    }
+
+    // At least 1 (W0 0 is "the start", as `cut`'s), and one point per time: the first kept, full if any of its equals was.
+    let mut out: Vec<(i64, bool)> = vec![];
+    for (c, full) in points {
+        let c = c.max(1);
+        match out.last_mut() {
+            Some(last) if last.0 == c => last.1 |= full,
+            _ => out.push((c, full)),
+        }
+    }
+    Ok(out)
+}
+
+/// The time a step decides up to: the next of `points` (worked out by `cut_points` when none is left past W0), at most W;
+/// within a full slice, the exact `cut`; with no point, W. `points` keeps its head until W0 reaches it.
+async fn next_cut(points: &mut Vec<(i64, bool)>, table: &DataFrame, time: &str, time_type: &DataType, w0: u64, w: i64, most: u64) -> Result<i64> {
+    points.retain(|(c, _)| *c > w0 as i64);
+    if points.is_empty() {
+        *points = cut_points(table, time, time_type, w0, w, most).await?;
+    }
+    match points.first() {
+        None => Ok(w),
+        Some(&(c, full)) => {
+            let c = c.min(w); // (W can move back: an idle watermark drops when a new row comes)
+            match full {
+                true => cut(table, &ident(time), time, time_type, w0, c, most).await,
+                false => Ok(c),
+            }
+        }
     }
 }
 
@@ -982,6 +1095,107 @@ mod tests {
         assert_eq!(cut(&df, &t, "ts", &nano, 0, 100, 1).await?, 2);
         let df = frame(Arc::new(TimestampMicrosecondArray::from(vec![-5, -3])))?;
         assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 1).await?, 1);
+        Ok(())
+    }
+
+    /// A frame of one time column `ts` of `array`.
+    fn frame_of(ctx: &datafusion::prelude::SessionContext, array: ArrayRef) -> Result<DataFrame> {
+        Ok(ctx.read_batch(RecordBatch::try_from_iter(vec![("ts", array)])?)?)
+    }
+
+    #[tokio::test]
+    async fn cut_points_cut_the_span_into_steps_of_about_most_rows() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        // Times 1..=100 µs, one row each: a point every 10 rows, and the last 10 rows (91..=100) are left to W.
+        let df = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from((1..=100).collect::<Vec<i64>>())))?;
+        assert_eq!(cut_points(&df, "ts", &micro, 0, 100, 10).await?, [(10, false), (20, false), (30, false), (40, false), (50, false), (60, false), (70, false), (80, false), (90, false)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_cut_takes_the_exact_cut_within_a_full_slice() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        // 50 rows at 7 µs and times 1..=6 and 8..=20: from W0 6, the one slice [7, 31] holds 63 rows, so it is full, and
+        // its exact cut is just past the 10th row's time, 7 µs.
+        let mut times: Vec<i64> = vec![7; 50];
+        times.extend(1..=6);
+        times.extend(8..=20);
+        let df = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(times)))?;
+        let mut points = vec![];
+        assert_eq!(next_cut(&mut points, &df, "ts", &micro, 6, 100_000, 10).await?, 8);
+        assert_eq!(points, [(31, true)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cut_points_are_empty_when_the_span_fits_in_one_step() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let df = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(vec![1_i64, 2, 3])))?;
+        assert!(cut_points(&df, "ts", &micro, 0, 100, 10).await?.is_empty());
+        let mut points = vec![];
+        assert_eq!(next_cut(&mut points, &df, "ts", &micro, 0, 100, 10).await?, 100);
+        assert!(points.is_empty());
+        // A span with no rows at all (the least time of none is NULL): no points either.
+        let none = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())))?;
+        assert!(cut_points(&none, "ts", &micro, 0, 100, 10).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_cut_walks_its_points_and_makes_no_pass_while_one_is_left() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        // Times 1..=100 from W0 40: a point every 10 rows, 50 first.
+        let df = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from((1..=100).collect::<Vec<i64>>())))?;
+        let mut points = vec![];
+        assert_eq!(next_cut(&mut points, &df, "ts", &micro, 40, 100, 10).await?, 50);
+        assert_eq!(points, [(50, false), (60, false), (70, false), (80, false), (90, false)]);
+        // From W0 50 over an empty frame: a pass could find nothing, so the next point is taken as it is.
+        let empty = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())))?;
+        assert_eq!(next_cut(&mut points, &empty, "ts", &micro, 50, 100, 10).await?, 60);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cut_points_count_a_nanosecond_time_by_its_ceiling_in_micros() -> Result<()> {
+        use datafusion::arrow::array::TimestampNanosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let nano = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let df = frame_of(&ctx, Arc::new(TimestampNanosecondArray::from(vec![11_500_i64, 12_500])))?;
+        // The ns count is the raw count in ns: 11,500 ns is 12 µs by the ceiling, so from W0 10 with most 1 the point is 12.
+        let raw = df.clone().select(vec![datafusion::logical_expr::cast(ident("ts"), DataType::Int64).alias("raw")])?.collect().await?;
+        assert_eq!(ints(&raw[0], "raw")?, [11_500, 12_500]);
+        assert_eq!(cut_points(&df, "ts", &nano, 10, 100, 1).await?, [(12, false)]);
+        assert_eq!(df.filter(span(&ident("ts"), &nano, 10, 12)?)?.count().await?, 1, "the span (10, 12] holds the 11,500 ns row");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cut_points_clamp_negative_times_to_one() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let df = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(vec![-5_i64, -3])))?;
+        assert_eq!(cut_points(&df, "ts", &micro, 0, 100, 1).await?, [(1, false)]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_cut_stops_at_w_when_w_is_below_the_head() -> Result<()> {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let ctx = datafusion::prelude::SessionContext::new();
+        let micro = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let empty = frame_of(&ctx, Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new())))?;
+        let mut points = vec![(50, false)];
+        assert_eq!(next_cut(&mut points, &empty, "ts", &micro, 40, 45, 10).await?, 45);
+        assert_eq!(points, [(50, false)]);
         Ok(())
     }
 
