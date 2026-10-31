@@ -316,8 +316,9 @@ fn first_announced(batches: &[RecordBatch]) -> Schema { crate::answer::arrow_sch
 /// Run a query as every door runs a statement (`statement::run`, with `FlightWire`): its `$name`s, its macros, a script,
 /// and its answer kept for the next asker of the same query. It is armed as HTTP arms one (`FlightWire::pieces`), so an
 /// answer big enough goes to the stream in pieces as its plan makes them: then no rows come back here, and `answered`
-/// takes the pieces. The schema is the planned one when it has no rows, else the first batch's.
-async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+/// takes the pieces. The schema is the planned one when it has no rows, else the first batch's. A kept answer is not decoded:
+/// it comes back as its bytes (`Flown::Ipc`), which carry their own schema.
+async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown, Status> {
     if statement::is_write(sql) {
         return Err(refused("25006", "this changes data or a transaction: a query's ticket reads only (CommandStatementUpdate writes)"));
     }
@@ -325,7 +326,10 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<(Schem
     let how = How { job: None, spread: None, after: None, stale: None };
     let got = statement::run(app, req, how, who, &FlightWire).await.map_err(status)?;
     if matches!(got, Answer::Sent) {
-        return Ok((Arc::new(Schema::empty()), vec![]));
+        return Ok(Flown::Batches(Arc::new(Schema::empty()), vec![]));
+    }
+    if let Answer::Kept(bytes) | Answer::Own(Encoded::Kept(bytes)) = got {
+        return Ok(Flown::Ipc(bytes));
     }
     let batches = rows_of(got)?;
     let schema = match batches.is_empty() {
@@ -336,31 +340,49 @@ async fn query(app: &App, sql: &str, who: crate::routines::Who) -> Result<(Schem
         },
     };
     let schema = Arc::new(schema);
-    Ok((schema, batches))
+    Ok(Flown::Batches(schema, batches))
+}
+
+/// A query's answer as Flight sends it: its batches and the schema they are announced with, or the Arrow stream the
+/// results cache keeps for it (this run's `FlightWire::encode`, or another run's), sent as its messages are (`messages`),
+/// never decoded and encoded again.
+enum Flown {
+    Batches(SchemaRef, Vec<RecordBatch>),
+    Ipc(Bytes),
+}
+
+/// What `FlightWire::encode` gives its door: the bytes it kept (an answer up to `Results::BIGGEST`), or the rows.
+enum Encoded {
+    Kept(Bytes),
+    Rows(Vec<RecordBatch>),
 }
 
 /// Flight's wire. A query's answer is kept under `arrow`, HTTP's `?format=arrow` key, as the bytes HTTP's render makes for
 /// it (`answer::render`), so either door reads back what its own render writes. Kept only when it has rows and is up to
-/// `Results::BIGGEST`. It is armed as HTTP's arrow is: an answer big enough goes in pieces, except an EXPLAIN's.
+/// `Results::BIGGEST`, and the kept bytes are also what Flight streams for it, as they are (`sent_as_kept`). It is armed as
+/// HTTP's arrow is: an answer big enough goes in pieces, except an EXPLAIN's.
 struct FlightWire;
 
 impl Wire for FlightWire {
-    type Own = Vec<RecordBatch>;
+    type Own = Encoded;
     fn kept_as(&self) -> Option<Cow<'_, str>> { Some(Cow::Borrowed("arrow")) }
-    fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Vec<RecordBatch>)> {
+    fn encode(&self, rows: Vec<RecordBatch>) -> anyhow::Result<(Option<bytes::Bytes>, Encoded)> {
         let small = !rows.is_empty() && rows.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST;
         let keep = small.then(|| crate::answer::render(&rows, Some("arrow"), crate::pages::keep)).transpose()?;
-        Ok((keep, rows))
+        Ok(match keep {
+            Some(bytes) => (Some(bytes.clone()), Encoded::Kept(bytes)),
+            None => (None, Encoded::Rows(rows)),
+        })
     }
     fn pieces(&self, query: &str) -> Option<Option<&str>> { (!crate::explain::asked(query)).then_some(Some("arrow")) }
 }
 
 /// A statement's answer as the batches Flight streams: a query's rows, a kept answer read back, or, for a statement
 /// with no rows (`Done`), one row of `rows` 0, as a CALL's answer is.
-fn rows_of(got: Answer<Vec<RecordBatch>>) -> Result<Vec<RecordBatch>, Status> {
+fn rows_of(got: Answer<Encoded>) -> Result<Vec<RecordBatch>, Status> {
     match got {
-        Answer::Own(batches) | Answer::Rows(batches) => Ok(batches),
-        Answer::Kept(bytes) => crate::query::read_ipc(&bytes).map_err(status),
+        Answer::Own(Encoded::Rows(batches)) | Answer::Rows(batches) => Ok(batches),
+        Answer::Kept(bytes) | Answer::Own(Encoded::Kept(bytes)) => crate::query::read_ipc(&bytes).map_err(status),
         Answer::Done(_) => Ok(vec![RecordBatch::try_from_iter([("rows", Arc::new(datafusion::arrow::array::Int64Array::from(vec![0])) as _)]).map_err(status)?]),
         Answer::Sent => Err(refused("XX000", "an answer handed over in pieces where Flight keeps it whole (a script's)")),
     }
@@ -402,16 +424,16 @@ fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64
 
 /// A statement's answer, as its ticket names it: a script's or CALL's kept answer, a write's row count, or a
 /// query run now, as `who`.
-async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<Flown, Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
         // (the entry's memory goes with it: the batches stream out from here, as a query's answer does once it is returned)
         let Some((batches, _, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
-        return Ok((Arc::new(first_announced(&batches)), batches));
+        return Ok(Flown::Batches(Arc::new(first_announced(&batches)), batches));
     }
     if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
         let schema = Arc::new(crate::answer::arrow_schema(&rows_schema()));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![n]))]).map_err(status)?;
-        return Ok((schema, vec![batch]));
+        return Ok(Flown::Batches(schema, vec![batch]));
     }
     query(app, sql, who).await
 }
@@ -441,16 +463,16 @@ async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Futu
 /// What a statement's work hands its Flight stream: its whole answer, or the pieces its plan made (`query::Handed`), with the
 /// count its body holds until the last piece is read (`drain::Busy`).
 enum Sent {
-    Whole(SchemaRef, Vec<RecordBatch>, crate::drain::Busy),
+    Whole(Flown, crate::drain::Busy),
     Pieces(crate::query::Handed, crate::drain::Busy),
 }
 
 /// A statement's answer as Flight data. Its work (`f`, which runs in `query::PIECES`, so a query may hand its answer to the
 /// stream in pieces as its plan makes them) is `worked` as every statement is, and the answer is then its whole form
-/// (`whole`) or its pieces (`piece_stream`).
+/// (`whole`, or `sent_as_kept` for the bytes the results cache keeps) or its pieces (`piece_stream`).
 async fn answered<F>(txn: Option<&[u8]>, f: F) -> Result<Out<FlightData>, Status>
 where
-    F: std::future::Future<Output = Result<(SchemaRef, Vec<RecordBatch>), Status>> + Send + 'static,
+    F: std::future::Future<Output = Result<Flown, Status>> + Send + 'static,
 {
     let sent = worked(txn, async move {
         let (hand, mut handed) = tokio::sync::oneshot::channel();
@@ -462,7 +484,7 @@ where
             biased;
             done = &mut go => match handed.try_recv() {
                 Ok(h) => Ok(Sent::Pieces(h, crate::drain::Busy::carried())), // (handed as the statement ended: its rows still come in pieces)
-                Err(_) => done.map(|(schema, batches)| Sent::Whole(schema, batches, crate::drain::Busy::carried())), // (its messages are written as the client reads them, as the pieces' are)
+                Err(_) => done.map(|flown| Sent::Whole(flown, crate::drain::Busy::carried())), // (its messages are written as the client reads them, as the pieces' are)
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
@@ -473,7 +495,8 @@ where
     })
     .await?;
     Ok(match sent {
-        Sent::Whole(schema, batches, busy) => whole(schema, batches, busy),
+        Sent::Whole(Flown::Batches(schema, batches), busy) => whole(schema, batches, busy),
+        Sent::Whole(Flown::Ipc(bytes), busy) => sent_as_kept(bytes, busy),
         Sent::Pieces(h, busy) => piece_stream(h, busy),
     })
 }
@@ -503,12 +526,7 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy)
                 }
             }
         }
-        return Box::pin(futures::stream::unfold((futures::stream::iter(out), busy), |(mut out, busy)| async move {
-            match out.next().await {
-                Some(item) => Some((item, (out, busy))),
-                None => None,
-            }
-        }));
+        return held(out, busy);
     }
     let pieces = pieces.into_iter();
     let steps = futures::stream::try_unfold((Some((crate::answer::Encoding::with_schema(schema), pieces)), busy), |(state, busy)| async move {
@@ -521,6 +539,21 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy)
         Ok(Some((data, (next, busy))))
     });
     Box::pin(steps.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten())
+}
+
+/// Messages already made, as a Flight stream that holds `busy` until it ends or is dropped.
+fn held(out: Vec<Result<FlightData, Status>>, busy: crate::drain::Busy) -> Out<FlightData> {
+    Box::pin(futures::stream::unfold((futures::stream::iter(out), busy), |(mut out, busy)| async move {
+        match out.next().await {
+            Some(item) => Some((item, (out, busy))),
+            None => None,
+        }
+    }))
+}
+
+/// A kept answer's Arrow stream as Flight data: its messages as they are (`messages`), holding `busy` as `whole` does.
+fn sent_as_kept(bytes: Bytes, busy: crate::drain::Busy) -> Out<FlightData> {
+    held(messages(bytes).map_or_else(|e| vec![Err(status(e))], |data| data.into_iter().map(Ok).collect()), busy)
 }
 
 /// A statement's answer in pieces, as its plan made them (`query::Handed`): the first piece's messages, then each piece as the
@@ -1226,6 +1259,26 @@ mod tests {
         let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::drain::Busy::new()).try_collect().await?;
         assert_eq!(empty.len(), 1, "the schema alone");
         assert_eq!(names_and_types(&Schema::try_from(&empty[0])?), names_and_types(&schema));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_kept_answer_streams_the_messages_whole_would_make() -> anyhow::Result<()> {
+        let dict = dictionary();
+        let plan = Schema::new(vec![Field::new("d", dict.clone(), false), Field::new("s", DataType::Utf8View, false)]);
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec!["x", "y"]));
+        let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
+        let kept = crate::answer::render(&[batch.clone()], Some("arrow"), |_| None)?;
+        let a: Vec<FlightData> = sent_as_kept(kept, crate::drain::Busy::new()).try_collect().await?;
+        let b: Vec<FlightData> = whole(Arc::new(first_announced(&[batch.clone()])), vec![batch], crate::drain::Busy::new()).try_collect().await?;
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.data_header, y.data_header);
+            assert_eq!(x.data_body, y.data_body);
+        }
+        let back = arrow_flight::utils::flight_data_to_batches(&a)?;
+        assert_eq!(back.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         Ok(())
     }
 
