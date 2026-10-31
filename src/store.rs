@@ -35,6 +35,10 @@ pub type Store = Arc<dyn ObjectStore>;
 /// replaced or removed, so no cache keeps it (ADR-034). Everything else is written once.
 pub fn replaceable(path: &str) -> bool { path.starts_with("files/") }
 
+/// A lake's files and its log: the objects that may go to disk, and that a page may read through its node. The
+/// catalog's objects are not among them, since they hold what a page must not.
+pub(crate) fn lake_file(key: &str) -> bool { key.starts_with("data/") || key.starts_with("log/") }
+
 fn version_of(m: &object_store::ObjectMeta) -> String {
     match &m.e_tag {
         Some(e) => format!("{}:{}", e.trim_matches('"'), m.size),
