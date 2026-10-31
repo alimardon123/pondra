@@ -1,7 +1,9 @@
 //! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, which
 //! is the lake's store of a kept page (`Page::kept`). A page keeps its files and its tables there, so they are there after
 //! a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes one
-//! writer at a time, so two tabs never write over each other's tables.
+//! writer at a time across tabs, so two tabs never write over each other's tables. Inside the module, each object's
+//! changes take its lock (`hold`), so a put that creates an object, or replaces one version, is checked and written as one
+//! step, even when two requests for the same object are in flight at once.
 //!
 //! A write is whole or not at all. Over an existing file, Chromium keeps the old bytes until the new ones are closed. A
 //! new object is written under a temporary name (`{name}#writing`: object_store encodes `#`, so no object has one) and
@@ -22,23 +24,58 @@ use object_store::{
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::{Arc, PoisonError};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 /// The most bytes one part of a read holds: a large file is read a part at a time, as the stream is polled.
 const PART: u64 = 4 << 20;
 
+/// The objects being changed now, each with the lock its changes take in turn (`hold`). An entry goes once no change
+/// holds or waits for it.
+type Changing = std::sync::Mutex<std::collections::HashMap<Path, std::sync::Arc<futures::lock::Mutex<()>>>>;
+
 /// One folder of the origin's private file system, its objects the files under it. The name is checked by the page
 /// (`lib.rs`). Each operation reaches the folder afresh: a JavaScript handle is never kept.
 #[derive(Debug)]
 pub struct Opfs {
     folder: String,
+    changing: Arc<Changing>,
 }
 
 impl Opfs {
     pub fn new(folder: String) -> Opfs {
-        Opfs { folder }
+        Opfs { folder, changing: Arc::default() }
     }
+}
+
+/// A change's hold on one object: until it is dropped, no other change to the object is checked or written.
+struct Held {
+    guard: Option<futures::lock::OwnedMutexGuard<()>>,
+    at: Path,
+    changing: Arc<Changing>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // (the guard goes first: the entry's count falls only once this hold's lock is let go)
+        drop(self.guard.take());
+        let mut map = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.get(&self.at).is_some_and(|entry| Arc::strong_count(entry) == 1) {
+            map.remove(&self.at);
+        }
+    }
+}
+
+/// Waits for the lock on an object's changes, which take it in turn, and holds it until the `Held` is dropped. The
+/// object's entry is made if there is none. The std mutex is let go before the wait: it is never held across an await.
+async fn hold(changing: &Arc<Changing>, at: &Path) -> Held {
+    let entry = {
+        let mut map = changing.lock().unwrap_or_else(PoisonError::into_inner);
+        map.entry(at.clone()).or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))).clone()
+    };
+    let guard = entry.lock_owned().await;
+    Held { guard: Some(guard), at: at.clone(), changing: changing.clone() }
 }
 
 impl fmt::Display for Opfs {
@@ -59,8 +96,13 @@ pub fn available() -> bool {
 impl ObjectStore for Opfs {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> StoreResult<PutResult> {
         let chunks: Vec<Bytes> = payload.into_iter().collect();
-        let folder = self.folder.clone();
-        let outcome = step(location, put(folder, location.clone(), opts.mode, chunks)).await?;
+        // (the hold is taken inside the work: `step` runs the work to its end, even if this caller is dropped)
+        let (folder, changing, at) = (self.folder.clone(), self.changing.clone(), location.clone());
+        let outcome = step(location, async move {
+            let _held = hold(&changing, &at).await;
+            put(folder, at, opts.mode, chunks).await
+        })
+        .await?;
         match outcome {
             Put::Written(e_tag) => Ok(PutResult { e_tag: Some(e_tag), version: None, extensions: Default::default() }),
             Put::Exists => Err(Error::AlreadyExists {
@@ -100,13 +142,18 @@ impl ObjectStore for Opfs {
     }
 
     fn delete_stream(&self, locations: BoxStream<'static, StoreResult<Path>>) -> BoxStream<'static, StoreResult<Path>> {
-        let folder = self.folder.clone();
+        let (folder, changing) = (self.folder.clone(), self.changing.clone());
         locations
             .then(move |location| {
-                let folder = folder.clone();
+                let (folder, changing) = (folder.clone(), changing.clone());
                 async move {
                     let at = location?;
-                    step(&at, remove_at(folder, at.clone())).await?;
+                    let removing = at.clone();
+                    step(&at, async move {
+                        let _held = hold(&changing, &removing).await;
+                        remove_at(folder, removing).await
+                    })
+                    .await?;
                     Ok(at)
                 }
             })
