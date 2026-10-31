@@ -34,6 +34,9 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
+// moves down with each cut, never up without a reason in the commit that moves it.
+const BROTLI_BUDGET = 9_200_000;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
@@ -1396,6 +1399,11 @@ if (sizes) {
   result.brotli_bytes = brotliCompressSync(wasm, {
     params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: wasm.length },
   }).length;
+  result.brotli_budget = BROTLI_BUDGET;
+  if (result.brotli_bytes > BROTLI_BUDGET) {
+    result.ok = false;
+    result.failed.push(`the module's brotli is ${result.brotli_bytes} bytes, over its budget of ${BROTLI_BUDGET}`);
+  }
 }
 console.log(JSON.stringify(result));
 process.exitCode = result.ok ? 0 : 1;
