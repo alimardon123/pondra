@@ -468,7 +468,7 @@ fn relations(sql: &str) -> Option<Vec<String>> {
     let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [stmt] = &stmts[..] else { return None };
     let mut names = Names::default();
-    let _ = stmt.visit(&mut names);
+    let _ = crate::walk::visit(stmt, &mut names);
     let mut seen = std::collections::HashSet::new();
     let tables: Vec<String> = names.tables.into_iter().filter(|t| !names.ctes.contains(t) && seen.insert(t.clone())).collect();
     (!tables.is_empty()).then_some(tables)

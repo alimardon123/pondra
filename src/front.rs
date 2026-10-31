@@ -9,7 +9,7 @@ use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -114,7 +114,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     for s in stmts.iter_mut().filter(|_| expands) {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateFunction(_) | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { name: &name, all: &all, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
+            if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut Expander { name: &name, all: &all, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
                 return Err(e);
             }
         }

@@ -17,7 +17,7 @@ use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{ScalarUDF, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, VisitorMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -1355,7 +1355,7 @@ pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
         // (a table a statement makes or writes keeps its name: Postgres makes `CREATE TABLE
         // pg_stat_user_tables (…)` in the current schema; only reads look in pg_catalog first)
         let written = target(s).cloned();
-        let _ = s.visit(&mut r);
+        let _ = crate::walk::visit_mut(s, &mut r);
         if let (Some(name), Some(t)) = (written, target(s)) {
             *t = name;
         }
@@ -1482,7 +1482,7 @@ fn settle(q: &mut ast::Query) -> Option<ast::Expr> {
     split_and(selection, &mut conds);
     let outer_only = |c: &ast::Expr| {
         let mut qualifiers = vec![];
-        let _ = ast::visit_expressions(c, |x| {
+        let _ = crate::walk::visit_expressions(c, |x| {
             if let ast::Expr::CompoundIdentifier(parts) = x {
                 qualifiers.push(parts[parts.len().saturating_sub(2)].value.to_lowercase()); // (its table: `a.x`, `pg_catalog.pg_attrdef.x`)
             }
@@ -1518,7 +1518,7 @@ fn identity_of(q: &ast::Query) -> Option<ast::Expr> {
     }
     let mut serial = false;
     let mut outer = None; // the table the column is read from: `pg_catalog.pg_attribute` for `…pg_attribute.attidentity`
-    let _ = ast::visit_expressions(sel.selection.as_ref()?, |x| {
+    let _ = crate::walk::visit_expressions(sel.selection.as_ref()?, |x| {
         match x {
             ast::Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("pg_get_serial_sequence") => serial = true,
             ast::Expr::CompoundIdentifier(p) if p.len() > 1 && p.last().is_some_and(|i| i.value.eq_ignore_ascii_case("attidentity")) => {
@@ -1577,7 +1577,7 @@ pub fn empty_answer(sql: &str) -> Option<Vec<String>> {
 fn aggregated(e: &ast::Expr) -> bool {
     const AGGREGATES: &[&str] = &["count", "max", "min", "sum", "avg", "array_agg", "string_agg", "bool_or", "bool_and", "every", "first_value", "last_value"];
     let mut found = false;
-    let _ = ast::visit_expressions(e, |x| {
+    let _ = crate::walk::visit_expressions(e, |x| {
         if let ast::Expr::Function(f) = x {
             found |= AGGREGATES.contains(&f.name.to_string().to_lowercase().trim_start_matches("pg_catalog.")) && f.over.is_none();
         }
@@ -1806,7 +1806,7 @@ impl VisitorMut for Rewriter<'_> {
                     ast::Value::SingleQuotedString(c) if c.chars().count() == 1 && c != "\\" => c.chars().next(),
                     _ => None,
                 }) {
-                    let _ = ast::visit_expressions_mut(pattern.as_mut(), |x| {
+                    let _ = crate::walk::visit_expressions_mut(pattern.as_mut(), |x| {
                         if let ast::Expr::Value(v) = x {
                             if let ast::Value::SingleQuotedString(t) = &mut v.value {
                                 let mut out = String::new();

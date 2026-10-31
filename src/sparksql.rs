@@ -8,7 +8,7 @@
 //! never change outside it (invariant 190). A cast to an integer cuts its fraction toward zero, as Spark
 //! does (`pondra_truncate`: Pondra's own casts round it). Backticks are names in Pondra's SQL too.
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, TableFactor, UnaryOperator, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, SparkSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub fn inline(sql: &str) -> Result<String> {
     }
     let Ok(mut stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(sql.to_string()) }; // (its own error later, as written)
     let mut found = Found(false);
-    if let ControlFlow::Break(e) = stmts.visit(&mut found) {
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut stmts, &mut found) {
         return Err(e);
     }
     Ok(match found.0 {
@@ -95,7 +95,7 @@ pub fn query(text: &str) -> Result<ast::Query> {
     ensure!(stmts.len() == 1, "spark_sql takes one query, not {}", stmts.len());
     let ast::Statement::Query(mut q) = stmts.remove(0) else { bail!("spark_sql takes a query (SELECT, WITH, VALUES): other statements are Pondra's SQL") };
     let mut t = Turn { names: &crate::engine::spark_functions().names };
-    if let ControlFlow::Break(e) = q.visit(&mut t) {
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut q, &mut t) {
         return Err(e);
     }
     Ok(*q)
@@ -116,7 +116,7 @@ impl VisitorMut for Turn<'_> {
             return ControlFlow::Break(e);
         }
         if !views.is_empty() {
-            let _ = ast::visit_expressions_mut(q, |e| {
+            let _ = crate::walk::visit_expressions_mut(q, |e| {
                 if let Expr::CompoundIdentifier(parts) = e {
                     if let [view, _] = &mut parts[..] {
                         if let Some(to) = views.get(&view.value.to_lowercase()) {
@@ -133,7 +133,7 @@ impl VisitorMut for Turn<'_> {
                 let SelectItem::UnnamedExpr(e) = item else { continue };
                 let was = e.to_string();
                 let mut now = e.clone();
-                if let ControlFlow::Break(_) = now.visit(&mut Turn { names }) {
+                if let ControlFlow::Break(_) = crate::walk::visit_mut(&mut now, &mut Turn { names }) {
                     continue; // (said when the walk reaches it)
                 }
                 if now.to_string() == was || matches!(e, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
@@ -271,7 +271,7 @@ fn lateral(s: &mut ast::Select, views: &mut HashMap<String, String>) -> Result<(
                 f.name = ast::ObjectName::from(vec![ast::Ident::new("explode_outer")]);
             }
         }
-        let _ = ast::visit_expressions_mut(&mut call, |e| {
+        let _ = crate::walk::visit_expressions_mut(&mut call, |e| {
             if let Expr::CompoundIdentifier(parts) = e {
                 if let [view, _] = &mut parts[..] {
                     if let Some(to) = views.get(&view.value.to_lowercase()) {

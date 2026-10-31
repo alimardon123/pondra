@@ -1042,7 +1042,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         }
     }
     let mut seen = Seen { ctes: HashSet::new(), tables: vec![], key };
-    let _ = Visit::visit(&stmts, &mut seen);
+    let _ = crate::walk::visit(&stmts, &mut seen);
     let same = std::ptr::eq(query, target);
     let (mut renamed, mut sent, mut kept) = (HashMap::new(), vec![], HashMap::new());
     for (k, name, rows_of_call) in seen.tables {
@@ -1107,7 +1107,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
             ControlFlow::Continue(())
         }
     }
-    let _ = VisitMut::visit(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
+    let _ = crate::walk::visit_mut(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
     // An INSERT's target is no table factor, so the visits above never see it: it is named as that
     // lake names it, like the UPDATEs' and DELETEs' targets are (`plain` INSERTs into attached keyed tables).
     for s in stmts.iter_mut() {

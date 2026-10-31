@@ -340,7 +340,7 @@ impl<F: Fn(&Expr) -> bool> ast::Visitor for Look<F> {
 
 fn look(node: &impl ast::Visit, wanted: impl Fn(&Expr) -> bool) -> Option<String> {
     let mut look = Look { wanted, depth: 0, found: None };
-    let _ = ast::Visit::visit(node, &mut look);
+    let _ = crate::walk::visit(node, &mut look);
     look.found
 }
 
@@ -873,7 +873,7 @@ impl ast::Visitor for Found {
 
 /// Whether some SELECT of `stmt` has a value name of a JSON call written bare, as `e` and not `e.value`. `pg_casts::rewrite`
 /// asks the catalog for the columns only for such a statement.
-pub fn bare_aliases(stmt: &Statement) -> bool { ast::Visit::visit(stmt, &mut Found::default()).is_break() }
+pub fn bare_aliases(stmt: &Statement) -> bool { crate::walk::visit(stmt, &mut Found::default()).is_break() }
 
 /// Rewrites a statement's set-returning calls where SQL comes in (`pg_casts::rewrite`), and whether it changed any. What
 /// Postgres refuses, and what this engine doesn't take yet, is refused before anything changes. The names of changed
@@ -882,7 +882,7 @@ pub fn bare_aliases(stmt: &Statement) -> bool { ast::Visit::visit(stmt, &mut Fou
 /// them is that name. When they are unknown (None), no bare name is written.
 pub fn sets(stmt: &mut Statement, columns: Option<&HashSet<String>>) -> anyhow::Result<bool> {
     let mut scan = Scan::default();
-    if let ControlFlow::Break(e) = ast::Visit::visit(&*stmt, &mut scan) {
+    if let ControlFlow::Break(e) = crate::walk::visit(&*stmt, &mut scan) {
         return Err(e);
     }
     if !scan.found {
@@ -891,9 +891,9 @@ pub fn sets(stmt: &mut Statement, columns: Option<&HashSet<String>>) -> anyhow::
     let mut rewrite = Rewrite::default();
     names_kept(stmt, |s| {
         if let Some(columns) = columns {
-            let _ = ast::VisitMut::visit(s, &mut Bare { columns, scopes: Scopes::default() });
+            let _ = crate::walk::visit_mut(s, &mut Bare { columns, scopes: Scopes::default() });
         }
-        let _ = ast::VisitMut::visit(s, &mut rewrite);
+        let _ = crate::walk::visit_mut(s, &mut rewrite);
         true
     });
     match rewrite.failed {

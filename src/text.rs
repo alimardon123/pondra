@@ -1,6 +1,6 @@
 //! SQL as text: names as SQL resolves them, a table's name inside the lake, a statement written back.
 use anyhow::{bail, ensure, Result};
-use datafusion::sql::sqlparser::ast::{self, visit_expressions_mut, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement, Value, VisitMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement, Value};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
@@ -83,7 +83,7 @@ pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collec
 pub fn sql(s: &Statement) -> String {
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
-    let _ = ast::visit_expressions(s, |e| {
+    let _ = crate::walk::visit_expressions(s, |e| {
         doubled |= twice(e);
         ControlFlow::<()>::Continue(())
     });
@@ -91,7 +91,7 @@ pub fn sql(s: &Statement) -> String {
         return s.to_string();
     }
     let mut s = s.clone();
-    let _ = visit_expressions_mut(&mut s, |e| {
+    let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
         if let (true, Expr::UnaryOp { expr, .. }) = (twice(e), &mut *e) {
             **expr = Expr::Nested(Box::new(std::mem::replace(&mut **expr, Expr::Value(ast::Value::Null.into()))));
         }
@@ -300,7 +300,7 @@ pub(crate) fn at(e: &Expr) -> usize { std::ptr::from_ref(e) as usize }
 /// `change` changed anything.
 pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statement) -> bool) -> bool {
     let mut written = HashMap::new();
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+    let _ = crate::walk::visit_mut(stmt, &mut Items(|item: &mut SelectItem| {
         if let SelectItem::UnnamedExpr(e) = item {
             written.insert(at(e), e.to_string());
         }
@@ -308,7 +308,7 @@ pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statemen
     if !change(stmt) {
         return false;
     }
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+    let _ = crate::walk::visit_mut(stmt, &mut Items(|item: &mut SelectItem| {
         if let SelectItem::UnnamedExpr(e) = item {
             if let Some(text) = written.get(&at(e)).filter(|text| **text != e.to_string()) {
                 let expr = std::mem::replace(e, Expr::value(Value::Null));
@@ -411,7 +411,7 @@ mod tests {
         // (every `upper(…)` becomes 'x': the items it changed keep their names, the others are as they were)
         let upper = |s: &mut Statement| {
             let mut changed = false;
-            let _ = ast::visit_expressions_mut(s, |e| {
+            let _ = crate::walk::visit_expressions_mut(s, |e| {
                 if matches!(e, Expr::Function(f) if object(&f.name) == "upper") {
                     *e = Expr::value(Value::SingleQuotedString("x".into()));
                     changed = true;
