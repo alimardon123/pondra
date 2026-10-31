@@ -332,7 +332,7 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
         return Err(coded("22023", format!("{file} is not a WebAssembly file")));
     }
     let sha256 = crate::text::hex(&crate::crypto::sha256(&bytes));
-    let part = part_of(bytes.clone(), &sha256).await?;
+    let part = part_of(bytes.clone(), &sha256, &format!("{name} ({file})")).await?;
     if let Some(asked) = version.filter(|v| *v != part.version) {
         return Err(coded("22023", format!("{file} is {} {}, not {asked}", part.name, part.version)));
     }
@@ -401,14 +401,19 @@ async fn clash(lake: &Lake, name: &str, functions: &[Described]) -> Result<()> {
 static PARTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Arc<crate::wasm::Loaded>>>> = std::sync::LazyLock::new(Default::default);
 
 /// A part from its bytes, compiled off the async threads (a megabyte takes Cranelift a second the first time; the disk cache
-/// makes it milliseconds after) and kept in `PARTS`.
+/// makes it milliseconds after) and kept in `PARTS`. One that needs a capability this Pondra doesn't offer is refused naming
+/// `who` and the import (`words (words-0.2.wasm) needs pondra:http/http@1.0.0, …`, 0A000).
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
-async fn part_of(bytes: Vec<u8>, sha256: &str) -> Result<Arc<crate::wasm::Loaded>> {
+async fn part_of(bytes: Vec<u8>, sha256: &str, who: &str) -> Result<Arc<crate::wasm::Loaded>> {
     if let Some(p) = PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sha256) {
         return Ok(p.clone());
     }
     let sha = sha256.to_string();
-    let part = Arc::new(tokio::task::spawn_blocking(move || crate::wasm::load(&bytes, &sha)).await??);
+    let loaded = tokio::task::spawn_blocking(move || crate::wasm::load(&bytes, &sha)).await?;
+    let part = Arc::new(loaded.map_err(|e| match crate::codes::of(&e) {
+        "0A000" => coded("0A000", format!("{who} {e}")),
+        _ => e,
+    })?);
     PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(sha256.to_string(), part.clone());
     Ok(part)
 }
@@ -420,7 +425,7 @@ async fn part(lake: &Lake, name: &str, r: &Installed) -> Result<Arc<crate::wasm:
         return Ok(p.clone());
     }
     let bytes = lake.object(&file_key(name, &r.version, &r.sha256)).await.with_context(|| format!("reading the file of the extension {name}"))?;
-    part_of(bytes.to_vec(), &r.sha256).await
+    part_of(bytes.to_vec(), &r.sha256, name).await
 }
 
 /// The functions of the lake's installed extensions that `text` names (the query and the views it reads), in its session
