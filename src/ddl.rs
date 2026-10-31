@@ -813,7 +813,7 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
             if lake.cat.get::<u64>(ready).await?.is_some() {
                 break;
             }
-            if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name)) {
+            if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name, crate::views::identity(&view))) {
                 bail!("{name} is made, but its first run fails: {e}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;

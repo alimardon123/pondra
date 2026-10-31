@@ -24408,6 +24408,15 @@ def matches():
         all([s_a, s_b, s_c]) and seen_a == want_a == seen_b == want_b == seen_c == want_c
     checks["late rows: pondra.flows counts each late row once for the view (late_rows 1 after GAMMA's row, 5 after HELIOS's four)"] = \
         flows_b == 1 and flows_c == 5
+    # a NULL time is late, also when its row came before the view's first run (audit 10-31 L2)
+    q("CREATE TABLE null_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("INSERT INTO null_src VALUES ('NULLS', 0, NULL, 1)")
+    _mx_put(q, "null_src", run_a)
+    q(f"CREATE MATERIALIZED VIEW null_v WITH (lateness = '0 seconds') AS {MX_TICKER.format(src='null_src')} EMIT FINAL")
+    s_n = _mx_settled(lake, "null_v", _mx_us("2026-10-01 00:05:00"))
+    flows_n = _mx_flow(q, "null_v")
+    info["null_v in pondra.flows: late_rows after its first run, with a NULL time from before it"] = flows_n
+    checks["late rows: a row with a NULL time made before a pattern view's first run is counted late (late_rows 1)"] = s_n and flows_n == 1
     lap("2, late rows")
 
     # 3. A quiet key: its last row came before the watermark reached it (lateness 30 s); the other symbol's rows move the

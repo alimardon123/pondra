@@ -11,9 +11,10 @@
 //! seconds')` waits for rows that much out of order; `WITH (idle = '1 minute')` moves time on
 //! with the clock once no row has come for that long, so a quiet source's last group is kept too.
 //! Rows later than that are counted (`pondra.flows`' `late_rows`) and stay in their table.
+use crate::codes::coded;
 use crate::ddl::Ddl;
 use crate::store::*;
-use crate::views::{Once, Options, Sessions, View};
+use crate::views::{Once, Options, Refresh, Sessions, View};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, RecordBatch};
 use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
@@ -45,15 +46,29 @@ pub fn mark(d: &mut Ddl) -> bool {
     }
 }
 
+/// EMIT FINAL's options, checked once for a view of groups (`create`) and of matches (`matches::create`): it keeps
+/// `each` (each group once, when it's over; each match once, when it's decided), so no other way of keeping its rows
+/// goes with it. Refused 0A000.
+pub(crate) fn final_options(o: &Options, each: &str) -> Result<()> {
+    if !(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none()) {
+        return Err(coded("0A000", format!("EMIT FINAL keeps {each}: no window, session, join or history options with it")));
+    }
+    if !o.expect.is_empty() {
+        return Err(coded("0A000", format!("EMIT FINAL keeps {each}: put expectations on a view of the rows before it")));
+    }
+    if !(matches!(o.refresh, None | Some(Refresh::Incremental)) && o.lag_secs.is_none()) {
+        return Err(coded("0A000", format!("EMIT FINAL keeps {each}, from the rows as they come: not by key, run whole or with a lag")));
+    }
+    Ok(())
+}
+
 /// `EMIT FINAL`: a session view if the GROUP BY has `SESSION(ts, gap)`, else a view whose
 /// window is its time bucket (`views::create` under `{name}$open`, with the table `name`).
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
     if crate::pattern::wanted(sql) {
         return crate::matches::create(lake, name, sql, o).await; // (a MATCH_RECOGNIZE has no GROUP BY time bucket: `matches.rs`)
     }
-    ensure!(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL finds its window in the GROUP BY: no window, session, join or history options with it");
-    ensure!(o.expect.is_empty(), "EMIT FINAL keeps a group once it's over: put expectations on a view of the rows before it");
-    ensure!(matches!(o.refresh, None | Some(crate::views::Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each group once, when it's over, from the rows as they come: not by key, run whole or with a lag");
+    final_options(&o, "each group once, when it's over")?;
     let (select, mut stmt) = select(sql)?;
     if let Some((time, gap_secs, rest)) = session(&select, &mut stmt)? {
         let s = Sessions { time, gap_secs, lateness_secs: o.lateness_secs, keys: vec![], idle_secs: o.idle_secs };
@@ -64,8 +79,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     } else {
         ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none() && lake.cat.get::<View>(&crate::views::view_key(name)).await?.is_none(), "table {name} already exists");
     }
-    let (other, source) = crate::ddl::resolve(lake, &crate::query::first_table(sql)?).await?;
-    ensure!(other.is_none(), "a view follows a table of this lake");
+    let source = crate::views::followed(lake, &crate::query::first_table(sql)?).await?;
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical();
     let (column, time, bucket) = window(&select, &src)?;
     let once = Once { into: name.to_string(), column, time, bucket, lateness_secs: o.lateness_secs, idle_secs: o.idle_secs };
