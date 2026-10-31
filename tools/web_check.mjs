@@ -62,11 +62,13 @@ function judge(name, answer, want = {}) {
   const why = [];
   const headers = answer.headers ?? {};
   const text = dec.decode(answer.body);
-  if (want.status !== undefined && answer.status !== want.status) why.push(`status ${answer.status}`);
+  // A wrong status or SQLSTATE says the answer's words too (cut at 300 characters): the run's failures are read from them.
+  const words = JSON.stringify(text.slice(0, 300));
+  if (want.status !== undefined && answer.status !== want.status) why.push(`status ${answer.status} ${words}`);
   if (want.error && !(answer.status >= 400)) why.push(`status ${answer.status}, not an error`);
   if (want.says !== undefined && !text.includes(want.says)) why.push(`body ${JSON.stringify(text)}`);
   const sqlstate = headers['x-pondra-sqlstate'] ?? null;
-  if (want.sqlstate !== undefined && sqlstate !== want.sqlstate) why.push(`sqlstate ${sqlstate}`);
+  if (want.sqlstate !== undefined && sqlstate !== want.sqlstate) why.push(`sqlstate ${sqlstate} ${words}`);
   if (!headers['content-type']) why.push('no content-type');
   if (want.type !== undefined && headers['content-type'] !== want.type) why.push(`content-type ${headers['content-type']}`);
   if (want.etag && !(headers.etag ?? '').startsWith('"')) why.push(`etag ${headers.etag}`);
@@ -632,9 +634,11 @@ async function keptChecks(page, lake) {
   const letters = await ask('kept after reload: FROM "a-b"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a-b"', 'kept');
   if (letters) judge('kept after reload: FROM "a-b"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
   const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
+  // k's rows are the node's number for this sequence (a CREATE of 3 rows, then an INSERT of 1): /objects counts the rows
+  // of the lake's files, not the log, so it says 3 where count(*) says 4, on a node as on this page.
   if (listed) {
     judge('kept after reload: GET /objects', listed, {
-      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 4 }),
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 3 }),
     });
   }
   if (expected) {
@@ -1032,7 +1036,12 @@ async function serveFolder(root, { hidden = false, sendsRange = true } = {}) {
 
 // A CORS preflight, which a browser sends before a request CORS doesn't let through alone (a suffix Range is one).
 function answerPreflight(res, cors) {
-  res.writeHead(204, { ...cors, 'Access-Control-Allow-Methods': 'GET, HEAD', 'Access-Control-Allow-Headers': 'Range' });
+  // (If-Match: a read of the lake's files by the page's member sends it, and a browser's preflight asks leave for it.
+  // This server doesn't compare it: it answers the file's bytes whatever the etag. PROPFIND and Depth are a folder's
+  // listing, which a browser asks leave for too: this server answers it 405, as it does in Node, where no preflight is sent.)
+  res.writeHead(204, {
+    ...cors, 'Access-Control-Allow-Methods': 'GET, HEAD, PROPFIND', 'Access-Control-Allow-Headers': 'Range, If-Match, Depth',
+  });
   res.end();
 }
 
