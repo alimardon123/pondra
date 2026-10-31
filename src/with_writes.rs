@@ -14,7 +14,7 @@ use crate::text::{ident, object, write_of};
 use anyhow::Result;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::sql::sqlparser::ast::{self, FromTable, Query, SetExpr, Statement, TableFactor, TableObject, Visit, Visitor, With};
+use datafusion::sql::sqlparser::ast::{self, FromTable, Query, SetExpr, Statement, TableFactor, TableObject, Visitor, With};
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
@@ -464,7 +464,7 @@ fn returns(s: &Statement) -> bool {
 }
 
 /// The names a query or statement reads, each by its last part, lowercased: what `walk::visit_relations` finds.
-fn relations<V: Visit>(node: &V) -> Vec<String> {
+fn relations<V: ast::Visit>(node: &V) -> Vec<String> {
     let mut out = vec![];
     let _ = crate::walk::visit_relations(node, |n: &ast::ObjectName| {
         out.push(last(&object(n)));
