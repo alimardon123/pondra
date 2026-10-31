@@ -353,7 +353,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: crate::views::code_for_caller(|| mvs.get(name).cloned()).flatten(), identity: l.identity.clone(), constraints: if kind == 'm' { crate::views::code_for_caller(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -377,7 +377,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::views::shown(&v.sql)), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: crate::views::code_for_caller(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
@@ -723,10 +723,11 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     }).collect();
     listed.extend(l.indexes.iter().map(|i| vec![s(i.schema.clone()), s(i.table_name.clone()), s(i.name.clone()), n(), s(i.def.clone())]));
     add!("pg_indexes", &[("schemaname", TEXT), ("tablename", TEXT), ("indexname", TEXT), ("tablespace", TEXT), ("indexdef", TEXT)], listed);
+    // (a view's or materialized view's definition is NULL where a caller may not see its code, as `pg_get_viewdef` is)
     add!("pg_views", &[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
-        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect());
+        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), r.sql.clone().map(s).unwrap_or_else(n)]).collect());
     add!("pg_matviews", &[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
-        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(true), s(r.sql.clone().unwrap_or_default())]).collect());
+        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(true), r.sql.clone().map(s).unwrap_or_else(n)]).collect());
     add!("pg_proc", &[("oid", OID), ("proname", TEXT), ("pronamespace", OID), ("proowner", OID), ("prolang", OID), ("procost", DataType::Float32), ("prorows", DataType::Float32),
         ("provariadic", OID), ("prosupport", TEXT), ("prokind", TEXT), ("prosecdef", BOOL), ("proleakproof", BOOL), ("proisstrict", BOOL), ("proretset", BOOL), ("provolatile", TEXT),
         ("proparallel", TEXT), ("pronargs", INT2), ("pronargdefaults", INT2), ("prorettype", OID), ("proargtypes", list(OID)), ("proallargtypes", list(OID)), ("proargmodes", list(TEXT)),
@@ -886,7 +887,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
         ("identity_maximum", TEXT), ("identity_minimum", TEXT), ("identity_cycle", TEXT), ("is_generated", TEXT), ("generation_expression", TEXT), ("is_updatable", TEXT)], cols);
     add!("views", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("view_definition", TEXT), ("check_option", TEXT), ("is_updatable", TEXT),
         ("is_insertable_into", TEXT), ("is_trigger_updatable", TEXT), ("is_trigger_deletable", TEXT), ("is_trigger_insertable_into", TEXT)],
-        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(r.sql.clone().unwrap_or_default()), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect());
+        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), r.sql.clone().map(s).unwrap_or_else(n), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect());
     // Each table's key, then its declared constraints, as the standard lists them.
     let yes = |b: bool| s(if b { "YES" } else { "NO" });
     let keyed: Vec<&Rel> = l.rels.iter().filter(|r| !r.key.is_empty()).collect();
