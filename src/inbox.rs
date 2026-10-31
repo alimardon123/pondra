@@ -82,7 +82,7 @@ pub async fn send(store: &Store, r: &Request, wake: Option<&str>, holder: Option
 pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>, mut rings: tokio::sync::watch::Receiver<u64>) {
     crate::panics::spawn(async move {
         loop {
-            if let Err(e) = drain(&lake, &seq, &lock).await {
+            if let Err(e) = drain(&lake, &seq, &lock, false).await {
                 eprintln!("inbox: {e:#}");
             }
             let _ = tokio::time::timeout(Duration::from_secs(30), async {
@@ -95,8 +95,9 @@ pub fn serve(lake: Arc<Lake>, seq: Arc<Sequencer>, lock: Arc<Mutex<()>>, mut rin
     });
 }
 
-/// Leader: record every request waiting in the inbox, and leave each its answer.
-pub async fn drain(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>) -> Result<()> {
+/// Leader: record every request waiting in the inbox, and leave each its answer. `first_runs`: true only for the `pondra lead`
+/// a statement started for a new place (`write::led`): a backup's first run or a restore is taken only there (`backup::sent`).
+pub async fn drain(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>, first_runs: bool) -> Result<()> {
     let store = &lake.store;
     let items: Vec<_> = store.list(Some(&Path::from("inbox"))).try_collect().await?;
     for o in items {
@@ -113,7 +114,17 @@ pub async fn drain(lake: &Lake, seq: &Sequencer, lock: &Mutex<()>) -> Result<()>
             Ok(r) => r.bytes().await?,
             Err(_) => continue, // (withdrawn meanwhile)
         };
-        let answer = match async { handle(lake, seq, lock, Request::from_inbox(kind, body)?).await }.await {
+        let answer = match async {
+            let req = Request::from_inbox(kind, body)?;
+            if !first_runs {
+                if let Request::Ddl(d) = &req {
+                    crate::backup::sent(d)?;
+                }
+            }
+            handle(lake, seq, lock, req).await
+        }
+        .await
+        {
             Ok(v) => json!({"ok": v}),
             Err(e) => json!({"error": format!("{e:#}")}),
         };

@@ -2354,7 +2354,7 @@ async fn led(dir: &str, term: u64, req: &mut Option<Request>) -> Result<Value> {
         }
         None => j!({"duplicate": true}),
     };
-    crate::inbox::drain(&lake, &seq, &lock).await?; // others who couldn't reach a leader
+    crate::inbox::drain(&lake, &seq, &lock, true).await?; // others who couldn't reach a leader, and the first run its statement led here (`backup::sent`)
     lake.cat.checkpoint().await?; // (so every node's view has it without replaying the WAL)
     Ok(out)
 }
