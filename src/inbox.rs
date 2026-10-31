@@ -18,11 +18,10 @@ use tokio::sync::Mutex;
 
 pub const BELL: &str = "inbox/bell";
 
-/// Ring the bell (`id`, the body, tells one ring from the next). R2 takes one write a second to a key: a ring refused
-/// (429) means it just rang, so it counts as rung; and the leader looks every 30 s anyway (C5).
-pub async fn ring(store: &Store, id: &str) {
-    let _ = store.put(&Path::from(BELL), id.as_bytes().to_vec().into()).await;
-}
+/// Ring the bell (`id`, the body, tells one ring from the next): did it ring? R2 takes one write a second to a key: a
+/// ring refused (429) means another just rang, so a request in the inbox is answered (and the leader looks every 30 s
+/// anyway: C5); but the leader may hear nothing new, so no writer waits for its answer to this one (`terms::Ear`).
+pub async fn ring(store: &Store, id: &str) -> bool { store.put(&Path::from(BELL), id.as_bytes().to_vec().into()).await.is_ok() }
 
 /// Writer: leave a request and wait for the answer. None if no leader is alive any more (the
 /// caller then leads itself; the request is withdrawn, and a retry of it would be a duplicate).

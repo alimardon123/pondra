@@ -123,6 +123,25 @@ def new_lake():
     return lake
 
 
+def chromium(pw):
+    """Playwright's Chromium, launched; installed first when it isn't there. Chromium alone: the runners'
+    image has the libraries it needs, and `--with-deps`' apt mirror once took 16 min. Its libraries only
+    when a launch says they're missing."""
+    try:
+        return pw.chromium.launch()
+    except Exception as e:
+        if "Executable doesn't exist" not in str(e):
+            raise
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, stdout=subprocess.DEVNULL)
+    try:
+        return pw.chromium.launch()
+    except Exception as e:
+        if "missing dependencies" not in str(e):
+            raise
+    subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True, stdout=subprocess.DEVNULL)
+    return pw.chromium.launch()
+
+
 @atexit.register
 def clean_up():
     """Stop the nodes this run started and delete its lakes (buckets have size limits: R2's free tier is 10 GB)."""
@@ -294,7 +313,8 @@ def external():
     tier = os.path.join(here, "tier")
     node = Node(lake, A.port, env={"PONDRA_OWNER_KEY": owner}, cwd=here, **({"cache_dir": tier} if A.s3 else {})).start()
     # A node on the same lake that no program started for itself: a non-owner's requests go to it.
-    other = Node(lake, A.port + 2, env={"PONDRA_OWNER_KEY": ""}, cwd=here, **({"cache_dir": tier + "3"} if A.s3 else {})).start()
+    other = Node(lake, A.port + 2, env={"PONDRA_OWNER_KEY": ""}, cwd=here, pg=f"127.0.0.1:{A.port + 12}", flight=f"127.0.0.1:{A.port + 32}",
+                 **({"cache_dir": tier + "3"} if A.s3 else {})).start()
     hdr = {"x-pondra-owner": owner}  # (the node answers only its program: its requests carry this)
     def q(s):
         return call(A.port, "POST", "/sql", s.encode(), headers=hdr)
@@ -429,6 +449,23 @@ def external():
     checks["a client that isn't the program reads a relative name as a page does: the lake's own file, the same rows, through an external table's LOCATION too (the same file for the node's own program); a name no file is at: 404, 42P01; COPY TO one: 42501 by name"] = theirs == mine \
         and (nope_status, nope_code) == (404, "42P01") and "files/nope.csv" in nope_words and area not in nope_words \
         and their_table == mine == owners_table and their_copy.startswith("403:") and "a client's relative name is a file of the lake's own" in their_copy
+    # The same LOCATION through the other doors a client writes by (the 10-30 audit's H2): each stores it whole, as the
+    # lake's file, so the node's own program reads that file's rows from each table, not a file in its folder.
+    import psycopg, adbc_driver_flightsql.dbapi as adbc
+    made = "CREATE EXTERNAL TABLE {} (a BIGINT, b VARCHAR) STORED AS CSV LOCATION 'reports/q1.csv' OPTIONS ('format.has_header' 'true')"
+    with psycopg.connect(f"host=127.0.0.1 port={A.port + 12} user=pondra dbname=pondra", autocommit=True) as c:
+        c.execute(made.format("q1_pg"))
+    flight = adbc.connect(f"grpc://127.0.0.1:{A.port + 32}", autocommit=True)
+    fcur = flight.cursor(); fcur.execute(made.format("q1_flight")); fcur.close(); flight.close()
+    def read(name):
+        try:
+            return q(f"SELECT * FROM {name}")
+        except Exception as e:
+            return str(e)  # (stored as written: the program reads a file of that name in its own folder, which has none)
+    by_door = {d: read(f"q1_{d}") for d in ("pg", "flight")}
+    [anyone(f"DROP TABLE q1_{d}") for d in by_door]
+    checks["a relative LOCATION sent through Postgres and Flight SQL is the lake's file too: the node's own program reads its rows from each"] = \
+        all(rows == mine for rows in by_door.values())
     reader = Node(lake, A.port + 1, reader=True, cwd=here, **({"cache_dir": tier + "2"} if A.s3 else {})).start()
     count = lambda port: call(port, "POST", "/sql", f"SELECT count(*) AS n FROM read_csv('{area}reports/q1.csv')".encode(), headers=hdr)[0]["n"]
     etag = lambda: urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{A.port}/files/reports/q1.csv", headers=hdr)).headers["etag"]
@@ -2036,13 +2073,31 @@ def serverless_guest(port):
     checks["d with a node leading, an INSERT goes to it, the node's /stats keep it alone, and one argument of two statements reads its own write"] = \
         rc4 == 0 and n4 == 5 and len(nodes) == 1 and rc5 == 0 and shown(out5, 6)
 
-    # e. With PONDRA_NO_DIRECT, an INSERT goes through the inbox, and two statements are refused by name
+    # e. With PONDRA_NO_DIRECT, a write goes through the inbox: an INSERT, a text of two INSERTs (each one lands), a CREATE TABLE
+    # with the INSERTs after it, and a CALL of a procedure that writes. A transaction, a RETURNING and a COPY INTO are refused by
+    # name, and write nothing
     no_direct = {"PONDRA_NO_DIRECT": "1"}
     rc6, _, err6 = run("INSERT INTO t VALUES (7, 'f')", no_direct)
     n6 = node_count(port)
     rc7, _, err7 = run("INSERT INTO t VALUES (8, 'g'); INSERT INTO t VALUES (9, 'h')", no_direct)
-    checks["e with PONDRA_NO_DIRECT, an INSERT lands through the inbox, and two statements are refused with the reason"] = \
-        rc6 == 0 and n6 == 7 and rc7 == 1 and "several statements" in err7 and "doesn't answer from here" in err7
+    n7 = node_count(port)
+    rc_u, _, err_u = run("CREATE TABLE u (a INT); INSERT INTO u VALUES (1); INSERT INTO u VALUES (2)", no_direct)
+    rc_us, out_us, _ = run("SELECT count(*) AS n FROM u")
+    ran("CREATE PROCEDURE ins_inbox() LANGUAGE sql AS $$ INSERT INTO t VALUES (13, 'x'); $$")
+    rc_c, _, err_c = run("CALL ins_inbox()", no_direct)
+    n_c = node_count(port)
+    rc_b, _, err_b = run("BEGIN; INSERT INTO t VALUES (14, 'y'); COMMIT", no_direct)
+    rc_r, _, err_r = run("INSERT INTO t VALUES (15, 'z') RETURNING a", no_direct)
+    rc_i, _, err_i = run(f"COPY INTO t FROM '{csv}' (FORMAT csv, HEADER)", no_direct)
+    n_refused = node_count(port)
+    checks["e with PONDRA_NO_DIRECT, an INSERT and a text of two INSERTs land through the inbox, each of them once"] = \
+        rc6 == 0 and n6 == 7 and rc7 == 0 and n7 == 9
+    checks["e with PONDRA_NO_DIRECT, a CREATE TABLE and the INSERTs after it in one text land, the table there for them"] = \
+        rc_u == 0 and rc_us == 0 and shown(out_us, 2)
+    checks["e with PONDRA_NO_DIRECT, a CALL of a procedure that writes lands through the inbox"] = rc_c == 0 and n_c == 10
+    checks["e with PONDRA_NO_DIRECT, a transaction, a RETURNING and a COPY INTO are refused by name, and write nothing"] = \
+        rc_b == 1 and "a transaction needs the lake's leader" in err_b and rc_r == 1 and "RETURNING needs the lake's leader" in err_r \
+        and rc_i == 1 and "COPY INTO needs the lake's leader" in err_i and n_refused == n_c
     node.kill()
 
     # f. On a lake nobody leads: a CALL of a procedure that writes, and two statements in one argument, both write and answer
@@ -2050,7 +2105,7 @@ def serverless_guest(port):
     rc8, _, err8 = run("CALL ins()")
     rc9, out9, err9 = run("INSERT INTO t VALUES (11, 'q'); SELECT count(*) AS n FROM t")
     checks["f on a lake nobody leads, a CALL that writes and two statements in one argument both write and answer"] = \
-        rc8 == 0 and rc9 == 0 and shown(out9, 9) and count() == 9
+        rc8 == 0 and rc9 == 0 and shown(out9, 12) and count() == 12
 
     # g. A bad statement prints Error: with the words a node's POST /sql gives it, and exits 1
     node = Node(lake, port).start()
@@ -5112,7 +5167,8 @@ def copies():
     every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
     the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
     in text and CSV; COPY TO piped back gives the rows. The end marker `\\.` ends the data in any chunk, a blank CSV
-    line is a row, and a number out of its type's range is 22003."""
+    line is a row, and a number out of its type's range is 22003. A row past 64 MB is refused (54000) as it comes, and the
+    connection goes on; 40 MB of rows in 64 KB frames loads every row."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
     lake, pg = new_lake(), A.port + 10
     node = Node(lake, A.port, pg=f"127.0.0.1:{pg}").start()
@@ -5227,6 +5283,38 @@ def copies():
                 cp.write(filler[i:i + (1 << 20)])
         big_rows = sorted(r[0] for r in c.execute("SELECT a FROM big").fetchall())
     big_ok = big_rows == sorted(f"row {i}" for i in range(10))
+    # A row past 64 MB is refused (54000) as the frame that passes it comes, and the connection goes on. Both cases are
+    # sent in 64 KB frames: a text line of 70 MB with no newline, then CSV with a quote opened and never closed over 70 MB
+    # of lines (no row ends inside the quotes). Then 40 MB of rows, every one of which must load.
+    frame, longs, bulk = 64 << 10, {}, {}
+    with psycopg.connect(dsn, autocommit=True) as c:
+        cur = c.cursor()
+        cur.execute("CREATE TABLE longtext (a text)")
+        cur.execute("CREATE TABLE longcsv (a text)")
+        cur.execute("CREATE TABLE bulk40 (id BIGINT, name VARCHAR, amount DOUBLE)")
+        for key, copy_sql, data in [("text", "COPY longtext FROM STDIN", b"x" * (70 << 20)),
+                                    ("csv", "COPY longcsv FROM STDIN WITH (FORMAT csv)", b'"' + b"x,y\n" * ((70 << 20) // 4))]:
+            t0 = time.time()
+            try:
+                with cur.copy(copy_sql) as cp:
+                    for k in range(0, len(data), frame):
+                        cp.write(data[k:k + frame])
+                longs[key] = "accepted"
+            except psycopg.Error as e:
+                longs[key] = e.sqlstate
+            longs[f"{key}_secs"] = round(time.time() - t0, 2)
+            longs[f"{key}_then_select_1"] = c.execute("SELECT 1").fetchone()[0]
+        body, n = bytearray(), 0
+        while len(body) < (40 << 20):
+            body += f"{n}\tname {n}\t{n * 0.5}\n".encode()
+            n += 1
+        t0 = time.time()
+        with cur.copy("COPY bulk40 FROM STDIN") as cp:
+            for k in range(0, len(body), frame):
+                cp.write(bytes(body[k:k + frame]))
+        bulk.update(secs=round(time.time() - t0, 2), rows_sent=n, rowcount=cur.rowcount,
+                    loaded=list(c.execute("SELECT count(*), CAST(sum(id) AS BIGINT), max(id) FROM bulk40").fetchone()))
+    bulk_ok = bulk["loaded"] == [n, n * (n - 1) // 2, n - 1] and bulk["rowcount"] == n
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
@@ -5236,11 +5324,16 @@ def copies():
               **{f"COPY TO STDOUT, {f}": got[f] == want for f in got},
               "ADBC Postgres driver (Arrow)": [tuple(r.values()) for r in arrow.to_pylist()] == want,
               "DECIMAL as NUMERIC, text and binary": numeric_ok,
-              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok}
+              "COPY FROM reads the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea in text and CSV; COPY TO piped back gives the rows": text_ok,
+              "COPY FROM a row past 64 MB, text (70 MB, no newline) in 64 KB frames: refused with 54000 as it comes, and the connection runs SELECT 1 after":
+                  longs["text"] == "54000" and longs["text_then_select_1"] == 1 and longs["text_secs"] <= 10,
+              "COPY FROM a row past 64 MB, CSV (a quote open over 70 MB of lines) in 64 KB frames: refused with 54000, and the connection runs SELECT 1 after":
+                  longs["csv"] == "54000" and longs["csv_then_select_1"] == 1 and longs["csv_secs"] <= 10,
+              "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok}
     out = {"passed": all(checks.values()), "checks": checks,
            "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
                                 "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
-                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched}}
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
@@ -6910,13 +7003,15 @@ def upserts():
     round, its older versions and delete markers positions (not only after a compaction); another
     engine's append to it is upserts, its delete (copy-on-write) delete markers, an equality delete
     on the key a marker too; each arrives in the change feed; a table that combines its rows
-    (`order_by`) refuses them by name."""
+    (`order_by`) refuses them by name. A table with a TTL hides a row past it from every statement,
+    as if deleted: a key read, an UPDATE or DELETE by key, an INSERT of the key (23505 is for a live
+    row only), ON CONFLICT and MERGE, in a transaction too, over Postgres, HTTP and a follower."""
     import duckdb, glob, site, pyarrow as pa, pyarrow.parquet as pq, polars as pl
     from pyiceberg.catalog import load_catalog
     from pyiceberg.manifest import ManifestWriterV2, ManifestContent, DataFile, DataFileContent, FileFormat, ManifestEntry, ManifestEntryStatus, write_manifest_list
     from pyiceberg.typedef import Record
     lake = new_lake()
-    a = Node(lake, A.port, tier_secs=1, changelog_secs=600).start()
+    a = Node(lake, A.port, tier_secs=1, changelog_secs=600, pg=f"127.0.0.1:{A.port + 10}").start()
     b = Node(lake, A.port + 1, tier_secs=1).start()
     q = lambda s: sql(A.port, s)
     io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
@@ -7000,6 +7095,59 @@ def upserts():
     until(lambda: _try(lambda: cat.load_table("default.latest")) is not None, True, 30)
     refused = _raises_text(lambda: cat.load_table("default.latest").append(pa.table({"k": [1], "ts": [5], "v": ["old"]}, schema=pa.schema([pa.field("k", pa.int64(), nullable=False), pa.field("ts", pa.int64()), pa.field("v", pa.string())]))))
     checks["a table that combines each key's rows (order_by) refuses another engine's change by name"] = "combines each key's rows" in refused or refused
+    # A TTL (`seen + INTERVAL '1 hour'`): a row past it is gone for every statement, as if deleted, and the key paths agree with SQL
+    # (a key read, an UPDATE or DELETE of one key, the 23505 check of an INSERT, ON CONFLICT and MERGE; in a transaction too).
+    import psycopg
+    pgc = psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True)
+    def pg(s):  # a SELECT's rows, a change's row count, or the SQLSTATE of a refusal
+        try:
+            cur = pgc.execute(s)
+            return cur.fetchall() if cur.description else cur.rowcount
+        except psycopg.Error as e:
+            return e.sqlstate
+    old = "now() - INTERVAL '2 hours'"
+    q("CREATE TABLE seen_kv (k BIGINT PRIMARY KEY, seen TIMESTAMP, v VARCHAR) TTL seen + INTERVAL '1 hour'")
+    q("INSERT INTO seen_kv VALUES (2, now(), 'fresh'), " + ", ".join(f"({k}, {old}, 'old')" for k in range(1, 16) if k != 2))
+    live = lambda port=A.port: sorted(r["k"] for r in sql(port, "SELECT k FROM seen_kv"))
+    read = {"pg": pg("SELECT * FROM seen_kv WHERE k = 1"), "http": sql(A.port, "SELECT * FROM seen_kv WHERE k = 1"),
+            "fresh": sql(A.port, "SELECT * FROM seen_kv WHERE k = 2"), "all": live()}
+    checks["a TTL table: a key read of the row past the TTL gives no row (Postgres, HTTP), SELECT * leaves it out, a fresh key's read gives its row"] = \
+        (read["pg"], read["http"], [r["k"] for r in read["fresh"]], read["all"]) == ([], [], [2], [2]) or read
+    upd = (pg("UPDATE seen_kv SET v = 'x' WHERE k = 3"), sql(A.port, "UPDATE seen_kv SET v = 'x' WHERE k = 3")["rows"], pg("UPDATE seen_kv SET v = 'x' WHERE k = 2"))
+    pg("BEGIN")
+    txn_upd = pg("UPDATE seen_kv SET v = 'x' WHERE k = 4")
+    pg("COMMIT")
+    dele = pg("DELETE FROM seen_kv WHERE k = 5")
+    checks["an UPDATE or DELETE by an expired key counts 0 (Postgres, HTTP, in a transaction) and writes nothing, a fresh key's UPDATE counts 1"] = \
+        (upd[0], upd[1], txn_upd, dele, upd[2]) == (0, 0, 0, 0, 1) and live() == [2] and sql(A.port, "SELECT * FROM seen_kv WHERE k = 3") == [] or (upd, txn_upd, dele)
+    ins = {"pg": pg("INSERT INTO seen_kv VALUES (6, now(), 'new6')"), "http": sql(A.port, "INSERT INTO seen_kv VALUES (8, now(), 'h8')")["rows"]}
+    pg("BEGIN")
+    ins["txn"] = pg("INSERT INTO seen_kv VALUES (7, now(), 'txn7')")
+    ins["txn_commit"] = pg("COMMIT")
+    ins["dup"] = pg("INSERT INTO seen_kv VALUES (2, now(), 'again')")
+    checks["an INSERT of an expired key goes in as a new row (Postgres, HTTP, in a transaction); a key held by a fresh row is still refused (23505)"] = \
+        (ins["pg"], ins["http"], ins["txn"], ins["txn_commit"], ins["dup"]) == (1, 1, 1, -1, "23505") and pg("SELECT v FROM seen_kv WHERE k = 6") == [("new6",)] and \
+        sql(A.port, "SELECT v FROM seen_kv WHERE k = 7") == [{"v": "txn7"}] or (ins,)
+    ups = {"on_conflict": pg("INSERT INTO seen_kv VALUES (9, now(), 'up9') ON CONFLICT (k) DO UPDATE SET v = excluded.v"),
+           "returning": pg("INSERT INTO seen_kv VALUES (10, now(), 'r10') ON CONFLICT (k) DO UPDATE SET v = excluded.v RETURNING k, v"),
+           "nothing": pg("INSERT INTO seen_kv VALUES (15, now(), 'n15') ON CONFLICT (k) DO NOTHING")}
+    merge = {"autocommit": pg("MERGE INTO seen_kv t USING (VALUES (11, now(), 'm11')) AS s(k, seen, v) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, seen, v) VALUES (s.k, s.seen, s.v)")}
+    pg("BEGIN")
+    merge["txn"] = pg("MERGE INTO seen_kv t USING (VALUES (12, now(), 'm12')) AS s(k, seen, v) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = s.v WHEN NOT MATCHED THEN INSERT (k, seen, v) VALUES (s.k, s.seen, s.v)")
+    merge["txn_commit"] = pg("COMMIT")
+    pg("BEGIN")
+    ups["txn"] = pg("INSERT INTO seen_kv VALUES (13, now(), 'up13') ON CONFLICT (k) DO UPDATE SET v = excluded.v")
+    ups["txn_commit"] = pg("COMMIT")
+    pg("BEGIN")
+    txn_read = pg("SELECT * FROM seen_kv WHERE k = 14")
+    pg("COMMIT")
+    checks["ON CONFLICT and MERGE on an expired key insert its new row, in a transaction too (COMMIT checks it again), RETURNING answers the new row"] = \
+        (ups["on_conflict"], ups["returning"], ups["nothing"], merge["autocommit"], merge["txn"], merge["txn_commit"], ups["txn"], ups["txn_commit"], txn_read) == \
+        (1, [(10, "r10")], 1, 1, 1, -1, 1, -1, []) or (ups, merge, txn_read)
+    want = [2, 6, 7, 8, 9, 10, 11, 12, 13, 15]
+    checks["after all of it, SELECT * holds exactly the fresh row and the new rows; the expired rows stay gone (Postgres, HTTP, a follower)"] = \
+        live() == want and until(lambda: live(A.port + 1), want, 30) == want and sql(A.port + 1, "SELECT * FROM seen_kv WHERE k = 1") == [] or (live(), live(A.port + 1))
+    pgc.close()
     [x.kill() for x in (a, b)]
     ok = all(v is True for v in checks.values())
     print(json.dumps({"upserts": checks, "ok": ok}, indent=1, default=str))
@@ -10297,21 +10445,22 @@ def guarded():
     ask(P + 2, "CREATE TABLE t (id BIGINT)", auth="Bearer adm")
     ask(P + 2, "CREATE USER chief PASSWORD 'chief-password-1' SUPERUSER", auth="Bearer adm")
     w = "Bearer w"
-    # (x-pondra-as, a forwarded change's user, only narrows: a read or write token acting as a superuser keeps its own role)
+    # (x-pondra-as, a forwarded change's user, is the nodes' alone and only to /cluster/*: any other caller is itself, never
+    # acting or recorded as a user; and it only narrows)
     chief = {"x-pondra-as": "chief"}
     acting = {
         "a read token as a superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer rd", headers=chief),
         "…making a superuser": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth="Bearer rd", headers=chief),
         "a write token as a superuser, making one": ask(P + 2, "CREATE USER evil PASSWORD 'evil-password-1' SUPERUSER", auth=w, headers=chief),
         "…its writes still made": ask(P + 2, "INSERT INTO t VALUES (2)", auth=w, headers=chief),
-        "the admin token as the superuser": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
+        "the admin token as the superuser, off /cluster/*": ask(P + 2, b"", path="/whoami", method="GET", auth="Bearer adm", headers=chief),
     }
     info["acting as"] = acting
-    checks["a token acting as a user (x-pondra-as) keeps its own role: a read or write token never makes a superuser"] = \
-        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" \
+    checks["x-pondra-as is the nodes' alone, to /cluster/*: a read or write token is itself (never a superuser, never named as one), and the admin token elsewhere"] = \
+        isinstance(acting["a read token as a superuser"], dict) and acting["a read token as a superuser"].get("role") == "read" and acting["a read token as a superuser"].get("user") == "reader" \
         and "ERROR" in str(acting["…making a superuser"]) and "ERROR" in str(acting["a write token as a superuser, making one"]) \
         and not str(acting["…its writes still made"]).startswith("ERROR") \
-        and isinstance(acting["the admin token as the superuser"], dict) and acting["the admin token as the superuser"].get("superuser") is True
+        and isinstance(acting["the admin token as the superuser, off /cluster/*"], dict) and acting["the admin token as the superuser, off /cluster/*"].get("user") == "admin"
     said = {
         "append": ask(P + 2, json.dumps({"id": 1}), path="/append/t", auth=w),
         "a segment outside the log": ask(P + 2, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=w),
@@ -22276,7 +22425,7 @@ def doors():
     (its run in headless Chromium, one tab per feature). Each cell is right, or refused by name where the
     door can't (a USE needs a session, which Flight SQL has none of; a transaction is a session's on
     Postgres, HTTP, MCP, and a transaction id's on Flight SQL). The table is printed; every cell must be
-    one of the two. Needs playwright, and installs its Chromium when it isn't there."""
+    one of the two. Needs playwright, and installs its Chromium when it isn't there (`chromium`)."""
     import re, psycopg, adbc_driver_flightsql.dbapi as adbc
     from playwright.sync_api import sync_playwright
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
@@ -22494,13 +22643,7 @@ finally {{ await db.close?.(); }}"""
             return got["answers"]
         return got["sqlstate"] or "refused: " + got["message"][:160]
     pw = sync_playwright().start()
-    try:
-        browser = pw.chromium.launch()
-    except Exception as e:  # (CI's harness runners have no Chromium: only the console's job installs it)
-        if "Executable doesn't exist" not in str(e):
-            raise
-        subprocess.run([sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"], check=True, stdout=subprocess.DEVNULL)
-        browser = pw.chromium.launch()
+    browser = chromium(pw)
     via = {"http": via_http, "python": via_python, "postgres": via_postgres, "flight": via_flight, "javascript": via_javascript, "mcp": via_mcp, "cli": via_cli, "console": via_console}
     matrix, checks = {}, {}
     no_session = {"USE a schema": {"flight"}}  # (USE needs a session: Flight SQL has none, so it's refused by name there)
@@ -22553,6 +22696,7 @@ def friendly():
     nodes = [Node(lake, A.port + i, tier_secs=1, **({"pg": f"127.0.0.1:{A.port + 10}"} if i == 0 else {})).start() for i in range(3)]
     time.sleep(1)
     duck = duckdb.connect()
+    duck.execute("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'")  # (DuckDB 2.0 takes `lambda y: …` alone unless asked; Pondra's lambdas are `y -> …`)
     t0 = datetime.datetime(2026, 1, 1)
     def row(i):
         n = "NULL" if i % 5 == 0 else str(i / 2)

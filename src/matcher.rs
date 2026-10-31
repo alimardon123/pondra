@@ -31,6 +31,7 @@ use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use serde::Deserialize;
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
@@ -140,7 +141,7 @@ fn compile(text: &str) -> Result<Plan> {
     let spec: Spec = serde_json::from_str(text).map_err(|e| anyhow!("MATCH_RECOGNIZE: the pattern's spec doesn't read: {e}"))?;
     let (pattern, syms) = read(&spec.pattern)?;
     let (defines, slots) = defines_of(&spec, syms.len())?;
-    let mut c = Compiler { code: vec![] };
+    let mut c = Compiler { code: vec![], parts: 0 };
     c.emit(&pattern, false)?;
     c.push(Inst::Match)?;
     Ok(Plan {
@@ -191,6 +192,10 @@ fn defines_of(spec: &Spec, syms: usize) -> Result<(Vec<Define>, Vec<SlotSpec>)> 
 /// name rather than run slowly.
 const STATES: usize = 10_000;
 
+/// The parts a pattern may compile to, each emit counted. An empty group pushes no state, so STATES doesn't see a nest of
+/// empty counts, which runs for hours; counting every part does. Past it the pattern is refused by name.
+const PARTS: usize = 100_000;
+
 /// AFTER MATCH SKIP: where the search for the next match goes on. A symbol is named, as the pattern names it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "to", rename_all = "snake_case")]
@@ -233,6 +238,8 @@ enum Inst {
 /// Writes a pattern's program: a sequence is its parts in order, and a choice is a Split that prefers its first branch.
 struct Compiler {
     code: Vec<Inst>,
+    /// The parts emitted so far (see `PARTS`).
+    parts: usize,
 }
 
 impl Compiler {
@@ -246,6 +253,10 @@ impl Compiler {
     }
 
     fn emit(&mut self, n: &Pattern, excluded: bool) -> Result<()> {
+        self.parts += 1;
+        if self.parts > PARTS {
+            return Err(coded("54000", format!("MATCH_RECOGNIZE: the pattern repeats its parts more than {} times: use smaller counts in {{n,m}}", thousands(PARTS))));
+        }
         match n {
             Pattern::Sym(k) => {
                 self.push(Inst::Sym(*k, excluded))?;
@@ -372,6 +383,40 @@ struct Step {
     prev: Path,
 }
 
+thread_local! {
+    /// The path steps alive on this thread: a step adds one when it is made, and takes one off as it is freed (see
+    /// `Step::new` and its `Drop`). A search runs on one thread, so a partition reads it as its own count.
+    static LIVE_STEPS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The path steps alive on this thread (see `LIVE_STEPS`).
+fn live_steps() -> usize {
+    LIVE_STEPS.with(Cell::get)
+}
+
+impl Step {
+    /// A step made now, counted as live until it is freed.
+    fn new(sym: usize, excluded: bool, prev: Path) -> Rc<Step> {
+        LIVE_STEPS.with(|c| c.set(c.get() + 1));
+        Rc::new(Step { sym, excluded, prev })
+    }
+}
+
+impl Drop for Step {
+    /// Frees the steps before this one in a loop, not by recursion: a path of a million steps would overflow a 2 MB stack
+    /// that way. A step another path still holds is left to that path.
+    fn drop(&mut self) {
+        LIVE_STEPS.with(|c| c.set(c.get() - 1));
+        let mut next = self.prev.take();
+        while let Some(step) = next {
+            match Rc::try_unwrap(step) {
+                Ok(mut owned) => next = owned.prev.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
 type Path = Option<Rc<Step>>;
 
 /// A thread's state: one entry per slot of the spec, in its order (`Thread::state`).
@@ -483,7 +528,8 @@ struct Planned {
 }
 
 /// One partition as the search reads it: each symbol's row-only conditions, WITHIN's times, the glue's row-only columns and
-/// value columns, the planned glue (when a DEFINE reads the match), the cap on the partial matches a search holds, and the
+/// value columns, the planned glue (when a DEFINE reads the match), the cap on the partial matches a search holds, the two
+/// budgets (`keep`: the rows kept past n; `reads`: the rows read past `READS_PER_ROW` × n, the searches' own), and the
 /// statement's stop flag when one is bound (`Matcher::stop`).
 struct Part<'a> {
     cond: &'a [Vec<bool>],
@@ -493,7 +539,17 @@ struct Part<'a> {
     values: &'a [ArrayRef],
     planned: Option<&'a Planned>,
     cap: usize,
+    keep: usize,
+    reads: usize,
     stop: Option<&'a AtomicBool>,
+}
+
+/// What is left of a partition's budgets (see `Part`) as its searches draw on them. `live` is the live steps when the
+/// partition started, `keep` the rows it may still keep past those, and `reads` the rows its searches may still read.
+struct Room {
+    live: usize,
+    keep: usize,
+    reads: usize,
 }
 
 /// A thread that took row `i`, waiting for its glue (`check`: the glue's index and its place in that glue's batch) when it
@@ -613,16 +669,19 @@ fn take(state: &State, plan: &Plan, part: &Part, k: usize, i: usize) -> Result<S
 /// would take a row too late dies (`within_ok`), and the threads of each start are kept apart (`Seen`).
 /// A row is taken in three phases: each thread at a symbol takes the row and decides its row-only conditions (phase 1);
 /// each glue is evaluated once over its batch (phase 2); and the passing threads go on, in the order they came (phase 3).
-/// `m` is MATCH_NUMBER(): the matches so far, plus one.
-fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut usize, m: i64) -> Result<Option<Found>> {
+/// `m` is MATCH_NUMBER(): the matches so far, plus one. `room` is the partition's budgets, which each row draws on (`Part`).
+fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut usize, m: i64, room: &mut Room) -> Result<Option<Found>> {
     let code = &plan.code;
     let (n, w) = (part.n, part.within);
     let stated = !plan.defines.is_empty();
     let cap = if stated { part.cap } else { MAX_THREADS };
     let initial: Rc<State> = Rc::new(start_state(plan));
     let glued = part.planned.map_or(0, |p| p.glued.len());
-    let mut best: Option<Found> = None;
+    // the best match so far, as its start, its end and its path (built into a `Found` once, when the search returns)
+    let mut best: Option<(usize, usize, Path)> = None;
     let mut now: Vec<Thread> = vec![];
+    let mut next: Vec<Thread> = vec![];
+    let mut decisions: Vec<Decision> = vec![];
     let mut now_reached = Reached::default();
     let mut gen = *last + 1;
     let mut i = from;
@@ -630,18 +689,27 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
         if is_stopped(part) {
             return Err(stopped());
         }
+        // the budgets, once per row: a row read, and the rows kept (the live steps since the partition began)
+        if i < n {
+            if room.reads == 0 {
+                return Err(reads_error(part));
+            }
+            room.reads -= 1;
+        }
+        if live_steps().saturating_sub(room.live) > room.keep {
+            return Err(kept_error(part));
+        }
         // (a new thread starts at this row last in line, so it is the least preferred)
         if best.is_none() && i < n {
             let mut seen = Seen::of(w, stated, stamp, gen, &mut now_reached);
             close(code, &mut now, &mut seen, 0, i, None, &initial, i, n);
         }
-        // phase 1: the threads at a symbol, in order, up to the first that matches
-        let mut decisions: Vec<Decision> = vec![];
+        // phase 1: the threads at a symbol, in order, up to the first that matches (`decisions` is empty: see the end of the row)
         let mut batch: Vec<Vec<usize>> = vec![vec![]; glued];
         for t in &now {
             match code[t.pc] {
                 Inst::Match => {
-                    best = Some(Found::of(t, i));
+                    best = Some((t.start, i, t.path.clone()));
                     break;
                 }
                 Inst::Sym(k, excluded) => {
@@ -650,7 +718,7 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
                             true => Rc::new(take(&t.state, plan, part, k, i)?),
                             false => t.state.clone(),
                         };
-                        let step = Rc::new(Step { sym: k, excluded, prev: t.path.clone() });
+                        let step = Step::new(k, excluded, t.path.clone());
                         let waits = match part.planned.and_then(|p| p.by_symbol[k]) {
                             Some(g) => {
                                 batch[g].push(decisions.len());
@@ -678,7 +746,6 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
         }
         // phase 3: the passing threads go on, in their order
         let gen_next = gen + 1;
-        let mut next: Vec<Thread> = vec![];
         let mut next_reached = Reached::default();
         {
             let mut seen = Seen::of(w, stated, stamp, gen_next, &mut next_reached);
@@ -698,13 +765,16 @@ fn search(plan: &Plan, part: &Part, from: usize, stamp: &mut [usize], last: &mut
         if i == n || (best.is_some() && next.is_empty()) {
             break;
         }
-        now = next;
+        // (the row's decisions are freed here, and the threads go on in the buffer the row swapped out, emptied at once)
+        decisions.clear();
+        std::mem::swap(&mut now, &mut next);
+        next.clear();
         now_reached = next_reached;
         gen = gen_next;
         i += 1;
     }
     *last = gen + 1;
-    Ok(best)
+    Ok(best.map(|(start, end, path)| Found::of(start, end, path)))
 }
 
 /// A count with its thousands set off by commas, as the cap messages print it (100000 is 100,000).
@@ -730,6 +800,24 @@ fn cap_error(stated: bool, within: bool, cap: usize) -> anyhow::Error {
         (true, false) => format!("MATCH_RECOGNIZE: the search holds more than {cap} partial matches at once: make the conditions narrower"),
     };
     coded("54000", msg)
+}
+
+/// The refusal of a partition that keeps more rows than its budget: n plus `keep` (see `Part`).
+fn kept_error(part: &Part) -> anyhow::Error {
+    let limit = thousands(part.n + part.keep);
+    coded(
+        "54000",
+        format!("MATCH_RECOGNIZE: the search keeps more than {limit} rows of matches and partial matches: use AFTER MATCH SKIP PAST LAST ROW, or narrow WITHIN or the conditions"),
+    )
+}
+
+/// The refusal of a partition whose searches read more rows than their budget: `READS_PER_ROW` × n plus `reads` (see `Part`).
+fn reads_error(part: &Part) -> anyhow::Error {
+    let limit = thousands(READS_PER_ROW * part.n + part.reads);
+    coded(
+        "54000",
+        format!("MATCH_RECOGNIZE: the searches read more than {limit} rows, as the matches overlap or a preferred partial match runs on past them: use AFTER MATCH SKIP PAST LAST ROW, or bound the pattern with WITHIN or a count {{n,m}}"),
+    )
 }
 
 /// The stop flag of the statement being planned (`audit::stop`). The page has no statements, so it has none.
@@ -772,17 +860,21 @@ fn partition(plan: &Plan, part: &Part) -> Result<Vec<Vec<Mem>>> {
     let mut rows: Vec<Vec<Mem>> = vec![Vec::new(); n];
     let (mut from, mut m) = (0usize, 0i64);
     let (mut stamp, mut gen) = (vec![0usize; plan.code.len()], 0usize);
+    // (the budgets start here: the live steps now are the base the kept steps are counted from)
+    let mut room = Room { live: live_steps(), keep: n + part.keep, reads: READS_PER_ROW * n + part.reads };
     while from < n {
         if is_stopped(part) {
             return Err(stopped());
         }
         // (MATCH_NUMBER is the matches so far, plus one: the one this search finds)
-        let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1)? else { break };
+        let Some(f) = search(plan, part, from, &mut stamp, &mut gen, m + 1, &mut room)? else { break };
         m += 1;
         if f.start == f.end {
             rows[f.start].push(Mem { m, sym: None, seq: None, excluded: false });
+            room.keep = room.keep.saturating_sub(1);
             from = f.start + 1;
         } else {
+            room.keep = room.keep.saturating_sub(f.steps.len());
             for (j, &(sym, excluded)) in f.steps.iter().enumerate() {
                 rows[f.start + j].push(Mem { m, sym: Some(sym), seq: Some(j as i64 + 1), excluded });
             }
@@ -800,20 +892,30 @@ struct Found {
 }
 
 impl Found {
-    fn of(t: &Thread, end: usize) -> Found {
+    /// The match from row `start` to `end`, with the steps of its path (`path`), in order.
+    fn of(start: usize, end: usize, path: Path) -> Found {
         let mut steps = vec![];
-        let mut at = t.path.clone();
+        let mut at = path;
         while let Some(s) = at {
             steps.push((s.sym, s.excluded));
             at = s.prev.clone();
         }
         steps.reverse();
-        Found { start: t.start, end, steps }
+        Found { start, end, steps }
     }
 }
 
 /// The most threads a search may hold at once: past it the search is refused (54000), as WITHIN keeps one per start.
 const MAX_THREADS: usize = 1_000_000;
+
+/// The rows a partition may keep past its own n, and the rows its searches may read past `READS_PER_ROW` × n (see `Part`).
+/// Overlapping matches and stated threads that never merge keep or read a row many times over, so the work grows as the
+/// square of the partition's rows; past this the query is refused (54000) rather than run for hours.
+const KEEP: usize = 8_000_000;
+
+/// The rows a partition's searches may read per row of the partition, before `KEEP`. A preferred partial match runs on
+/// past the row it ends at, so the searches read more rows than the answer has.
+const READS_PER_ROW: usize = 16;
 
 /// WITHIN's times of one partition, in ticks of the time's unit (a timestamp's count from the epoch), and each row's bound:
 /// its time less the interval, so a row can be in a match only when the match's first row is no earlier than the bound.
@@ -1157,6 +1259,8 @@ impl Evaluator {
             values: columns,
             planned: self.planned.as_deref(),
             cap: STATE_CAP,
+            keep: KEEP,
+            reads: KEEP,
             stop: self.stop.as_deref(),
         };
         answer(&partition(plan, &part)?, &plan.syms, self.all, plan.unmatched)
@@ -1760,7 +1864,7 @@ mod tests {
     fn shown(spec: &str, rows: &[Vec<usize>]) -> Result<Vec<String>> {
         let plan = compile(spec)?;
         let cond = conds(rows, plan.syms.len());
-        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
         Ok(texts(&plan, &partition(&plan, &part)?))
     }
 
@@ -1771,7 +1875,7 @@ mod tests {
         let low = times.iter().map(|t| t.map(|t| t - interval)).collect();
         let w = Within { time: times.to_vec(), low };
         let cond = conds(rows, plan.syms.len());
-        let part = Part { cond: &cond, within: Some(&w), n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &cond, within: Some(&w), n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
         texts(&plan, &partition(&plan, &part).unwrap())
     }
 
@@ -1899,6 +2003,101 @@ mod tests {
     fn too_many_states_are_refused() {
         let err = compile(&spec("a{10001}", PAST)).unwrap_err();
         assert_eq!(crate::codes::of(&err), "54000");
+    }
+
+    #[test]
+    fn a_nest_of_empty_counts_is_refused_by_its_parts() {
+        // () is an empty group, which pushes no state: four counts of 1000 nest it to 10^12 empty repeats, so the parts are counted
+        let started = Instant::now();
+        let err = compile(&spec("(((((()){1000}){1000}){1000}){1000} a)", PAST)).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "54000");
+        assert!(err.to_string().contains("repeats its parts more than 100,000 times"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1), "refused in {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_pattern_of_8000_states_still_compiles() {
+        let plan = compile(&spec("(a b){4000}", PAST)).unwrap();
+        assert_eq!(plan.code.len(), 8_001);
+    }
+
+    /// `a+` with the default skip over `n` rows that are all `a`: the partition's memberships, and how long it took.
+    fn greedy_run(n: usize) -> (Vec<Vec<Mem>>, Duration) {
+        let plan = compile(&spec("a+", PAST)).unwrap();
+        let cond = vec![vec![true; n]];
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
+        let started = Instant::now();
+        let rows = partition(&plan, &part).unwrap();
+        (rows, started.elapsed())
+    }
+
+    /// Whether the memberships are one match of every row: each row is its one membership, the match's first, at place j+1.
+    fn one_match(rows: &[Vec<Mem>]) -> bool {
+        rows.iter().enumerate().all(|(j, r)| r.len() == 1 && r[0].m == 1 && r[0].sym == Some(0) && r[0].seq == Some(j as i64 + 1))
+    }
+
+    #[test]
+    fn a_long_greedy_match_is_built_once() {
+        // a+ reaches its match on every row: built once, when the search returns, 200,000 rows take well under a second
+        // (built on every row, they took hours; the bound leaves room for CI, which runs the tests side by side)
+        let (rows, took) = greedy_run(200_000);
+        assert!(one_match(&rows));
+        assert!(took < Duration::from_secs(5), "took {took:?}");
+    }
+
+    #[test]
+    fn a_greedy_match_of_a_million_rows_is_one_match() {
+        let (rows, _) = greedy_run(1_000_000);
+        assert!(one_match(&rows));
+    }
+
+    #[test]
+    fn overlapping_matches_hit_the_kept_rows_budget() {
+        // a+ with SKIP TO NEXT ROW over 10,000 rows of a: each search's match is every row from its start, so the kept rows
+        // pass n + KEEP after about 840 searches, and the refusal comes in about a second (it ran for minutes before; the
+        // bound leaves room for CI, which runs the tests side by side)
+        let plan = compile(&spec("a+", NEXT)).unwrap();
+        let n = 10_000;
+        let cond = vec![vec![true; n]];
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
+        let started = Instant::now();
+        let err = partition(&plan, &part).expect_err("the kept rows' refusal");
+        let took = started.elapsed();
+        assert_eq!(crate::codes::of(&err), "54000");
+        assert!(err.to_string().contains("keeps more than 8,010,000 rows of matches and partial matches"), "{err}");
+        assert!(took < Duration::from_secs(10), "refused in {took:?}");
+    }
+
+    #[test]
+    fn a_partial_match_that_runs_on_hits_the_rows_read_budget() {
+        // a b+ c | a with a and b true on every row and c on none: each search runs to the partition's end for the first
+        // branch, and takes the one-row a, so the rows read pass 16 × n + KEEP while the kept rows stay few
+        let plan = compile(&spec("a b+ c | a", PAST)).unwrap();
+        let n = 20_000;
+        let cond = vec![vec![true; n], vec![true; n], vec![false; n]];
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
+        let started = Instant::now();
+        let err = partition(&plan, &part).expect_err("the rows read's refusal");
+        let took = started.elapsed();
+        assert_eq!(crate::codes::of(&err), "54000");
+        assert!(err.to_string().contains("the searches read more than 8,320,000 rows"), "{err}");
+        assert!(took < Duration::from_secs(10), "refused in {took:?}"); // (as the kept rows' test: room for CI)
+    }
+
+    #[test]
+    fn stated_threads_that_never_merge_hit_the_kept_rows_budget() {
+        // a+ b, with a DEFINE that counts a's rows (true on every row) and b never true: each start keeps a thread that
+        // never merges with another, so the threads' paths grow as the square of the rows. With keep at 1,000 that is
+        // refused past n + 1,000 kept rows.
+        let text = r#"{"pattern":"a+ b","skip":{"to":"past_last"},"defines":[{"symbol":0,"glue":"(__mr_s0 < 1000000000)","slots":[{"index":0,"kind":"agg","fun":"count","var":0,"value":null}]}],"rows":0,"values":0}"#;
+        let plan = compile(text).unwrap();
+        let planned = planner().planned(text, &plan, &[DataType::Utf8, DataType::Boolean, DataType::Boolean]).unwrap();
+        let n = 200;
+        let cond = vec![vec![true; n], vec![false; n]];
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: Some(&*planned), cap: STATE_CAP, keep: 1_000, reads: super::KEEP, stop: None };
+        let err = partition(&plan, &part).expect_err("the kept rows' refusal");
+        assert_eq!(crate::codes::of(&err), "54000");
+        assert!(err.to_string().contains("keeps more than 1,200 rows of matches and partial matches"), "{err}");
     }
 
     #[test]
@@ -2311,14 +2510,14 @@ mod tests {
                 at
             })
         };
-        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: Some(&*stop) };
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: Some(&*stop) };
         let Err(err) = partition(&plan, &part) else { panic!("a stopped search answered") };
         let returned = Instant::now();
         let set_at = setter.join().unwrap();
         assert_eq!(crate::codes::of(&err), "57014");
         let latency = returned.duration_since(set_at);
         // the same search with no flag bound, which runs to its end
-        let free = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let free = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
         let start = Instant::now();
         let answered = partition(&plan, &free).is_ok();
         let full = start.elapsed();
@@ -2400,7 +2599,7 @@ mod tests {
         assert!(lock(&planner.plans).len() <= CACHE_CAP);
         let plan = planner.plan(&text).unwrap();
         let cond = conds(&rows, plan.syms.len());
-        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, stop: None };
+        let part = Part { cond: &cond, within: None, n: rows.len(), rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
         assert_eq!(texts(&plan, &partition(&plan, &part).unwrap()), before);
     }
 

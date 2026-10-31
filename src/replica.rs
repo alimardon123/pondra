@@ -129,10 +129,14 @@ fn keep(held: &mut BTreeMap<u64, (u64, Bytes)>, id: u64, term: u64, frame: Bytes
 /// A new leader (replicated mode), before it takes writes: collect what the members hold beyond
 /// the bucket's last commit, and commit it again — the longest run of consecutive changes,
 /// never one from an older term after one from a newer term. Every member is asked (a committed
-/// change is on at least `replicas - 1` of them); one that doesn't answer within 20 s is skipped.
+/// change is on at least `replicas - 1` of them); one that doesn't answer within 20 s is skipped,
+/// but by a claimer that isn't a member while the last leader's mark is under 30 s old: then the
+/// members can choose a leader among themselves, so it refuses (`Unreached`) and lets its term go.
 pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>) -> Result<u64> {
     let in_bucket = lake.cat.committed();
     let members: Vec<String> = lake.cat.get("m").await?.unwrap_or_default();
+    let outside = !members.is_empty() && !members.iter().any(|m| m == me);
+    let fresh = outside && crate::terms::marked_before(&lake.store, term).await.is_some_and(|d| d < Duration::from_secs(30));
     let mut found: BTreeMap<u64, (u64, Arc<Delta>)> = BTreeMap::new();
     let mut merge = |bytes: &[u8]| -> Result<()> {
         let mut buf = BytesMut::from(bytes);
@@ -152,6 +156,11 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
             match crate::dial::call(peer, crate::dial::Call::get(format!("/cluster/replica?after={in_bucket}&term={term}")).timeout(Duration::from_secs(5))).await.and_then(crate::dial::Reply::checked) {
                 Ok(r) => break merge(&r.bytes().await?).context("replica from a peer")?,
                 Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(250)).await,
+                Err(e) if fresh => {
+                    crate::terms::step_down(&lake.store, term).await; // (not alive, whatever a mark in flight says)
+                    crate::terms::release(&lake.store, term).await;
+                    return Err(Unreached(format!("{peer} holds this lake's acknowledged changes and can't be reached from here ({e}); its members lead it")).into());
+                }
                 Err(e) => break eprintln!("recovering without {peer}: {e}"), // (then only it held what it held)
             }
         }
@@ -175,6 +184,17 @@ pub async fn recover(lake: &Lake, me: &str, term: u64, own: Option<&ReplicaLog>)
     }
     Ok(n)
 }
+
+/// A claimer outside the members that can't reach one of them while they may still lead (`recover`):
+/// it let its term go, and leads nothing.
+#[derive(Debug)]
+pub struct Unreached(pub String);
+
+impl std::fmt::Display for Unreached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Unreached {}
 
 /// Leader, replicated mode: keep the list of followers whose copies count ("m") in step with
 /// the live ones. A follower is listed — in the bucket — before its acks count, and stops counting

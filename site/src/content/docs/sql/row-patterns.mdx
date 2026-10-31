@@ -395,6 +395,9 @@ These are refused by the standard or by how the answer is shaped. Each refusal s
 | `CLASSIFIER()` inside a navigation or an aggregate, such as `PREV(CLASSIFIER())` | refused, `0A000` | compare `CLASSIFIER()` itself, which is the symbol being defined |
 | a navigation of a navigation, such as `FIRST(LAST(a.price))` | refused, `0A000` | write `FIRST(a.price)`, or `PREV(LAST(a.price))`, the forms that navigate |
 | a match with more than 100,000 partial matches at once | refused, `54000` | make the conditions narrower, give a repetition a bound, such as `{1,5}`, or add a `WITHIN` interval |
+| a pattern whose parts repeat more than 100,000 times, such as counts nested in counts: `(((a){100}){100}){100}` | refused, `54000` | use smaller counts in `{n,m}` |
+| a search that keeps more than the partition's rows plus 8,000,000 rows of matches and partial matches, as overlapping matches do | refused, `54000` | use `AFTER MATCH SKIP PAST LAST ROW`, or narrow `WITHIN` or the conditions |
+| searches that read more than 16 times the partition's rows plus 8,000,000 rows, as overlapping matches do, or a preferred partial match runs on past them | refused, `54000` | use `AFTER MATCH SKIP PAST LAST ROW`, or bound the pattern with `WITHIN` or a count `{n,m}` |
 | a function the engine doesn't have, in a `DEFINE` | refused, `42883`, the message starts with the symbol: `MATCH_RECOGNIZE: DEFINE b: ...` | use a function the engine has, as in a `SELECT` |
 | `WITH UNMATCHED ROWS` with `{- -}` | refused, `42601` | use `SHOW EMPTY MATCHES`, or keep the rows in the pattern |
 | `PARTITION BY` an expression | refused, `0A000`: `takes columns; compute <e> in a subquery` | compute it in a subquery, and partition by its name |

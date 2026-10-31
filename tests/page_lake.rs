@@ -1,6 +1,7 @@
 //! A page's member on the core's lake (designs/page-p3.md, pieces 1, 5 and 6): its lake is kept in the store the page is given,
 //! so its tables are there again after a reopen; `GET /objects` is the lake's listing; a page on no store starts fresh; a folder
-//! kept by 0.36 is imported once on open; and one page at a time in a process. `cargo test --test page_lake`.
+//! kept by 0.36 is imported once on open; one page at a time in a process; and a kept lake's term is taken at once.
+//! `cargo test --test page_lake`.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
 use pondra::page::{Options, Page};
@@ -109,12 +110,44 @@ async fn steps() {
     assert_eq!(body.lines().nth(1), Some("3"), "step 4: the next id is 3: {body}");
     page.close().await;
 
-    // 5. One page at a time in a process: a second, opened while the first is open, is refused by name.
+    // 5. One page at a time in a process: a second, opened while the first is open, is refused by name. (Its SQLSTATE, 55006,
+    // is checked where the code is visible: node.rs's `a_claimed_page_refuses_a_second_claim_by_55006`.)
     let mut first = Page::open_lake(&Options::default()).await.expect("step 5: a page opens");
     let refused = Page::open_lake(&Options::default()).await.err().expect("step 5: a second page is refused while the first is open");
     let words = format!("{refused:#}");
-    assert!(words.contains("close it first"), "step 5: the refusal says to close it first: {words}");
+    assert!(words.contains("a page is open in this module already"), "step 5: the refusal names the page that is open: {words}");
     first.close().await;
+
+    // 6. A kept page's lake takes its term at once: its page reloaded without a close, so the term is still marked alive. The
+    // next page on the same store opens at once, not after that mark goes stale (`members::Alone::lead` claims and marks it).
+    let kept: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let (_, marks) = pondra::members::Alone::lead(&kept).await.expect("step 6: a page's term is claimed and marked alive");
+    marks.abort(); // (the page never closed: its term is not released, and its last mark is fresh)
+    let started = std::time::Instant::now();
+    let mut page = Page::open_lake(&Options { lake_store: Some(kept.clone()), ..Default::default() }).await.expect("step 6: a page opens on the store its old page left alive");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "step 6: it opens at once: {:?}", started.elapsed());
+    let (status, _, body) = sql(&page, "SELECT 1").await;
+    assert_eq!(status, 200, "step 6: SELECT 1 answers: {body}");
+    page.close().await;
+
+    // 7. A claimed page: a second claim is refused while the first lives. The first answers on its first request, which opens its
+    // member. Once the first is dropped (no close), a third claim succeeds, and its first request waits for the dropped member's
+    // close, then answers.
+    let one = Page::claim(&Options::default()).expect("step 7: a page is claimed");
+    let refused = Page::claim(&Options::default()).err().expect("step 7: a second claim is refused while the first lives");
+    let words = format!("{refused:#}");
+    assert!(words.contains("a page is open in this module already"), "step 7: the refusal names the page that is open: {words}");
+    let (status, _, body) = sql(&one, "SELECT 1").await;
+    assert_eq!((status, body.lines().nth(1)), (200, Some("1")), "step 7: the first page answers SELECT 1: {body}");
+    drop(one);
+    let mut third = Page::claim(&Options::default()).expect("step 7: a claim is made once the first page is dropped");
+    let (status, _, body) = sql(&third, "SELECT 1").await;
+    assert_eq!((status, body.lines().nth(1)), (200, Some("1")), "step 7: the third page answers SELECT 1 once the dropped member has closed: {body}");
+
+    // 8. A claimed page answers a route it doesn't have with 404.
+    let answer = third.request("GET", "/nothing", &[], bytes::Bytes::new()).await;
+    assert_eq!(answer.status, 404, "step 8: GET /nothing is 404: {}", String::from_utf8_lossy(&answer.body));
+    third.close().await;
 }
 
 /// Every object of `from`, the old engine's store (object_store 0.13), put into `to`, the lake's (0.14), under the same path.
