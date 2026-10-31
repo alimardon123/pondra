@@ -251,6 +251,11 @@ fn already_there(answer: &Answer) -> bool {
     answer.header("x-pondra-sqlstate") == Some("42P07")
 }
 
+/// Whether a statement's answer is a constraint's refusal: SQLSTATE class 23 (a duplicate key, a NULL in a NOT NULL column, a CHECK).
+fn refused_by_constraint(answer: &Answer) -> bool {
+    answer.header("x-pondra-sqlstate").is_some_and(|code| code.starts_with("23"))
+}
+
 /// The sequence a DEFAULT `nextval('s')` counts in, as `rules::create::identity_default` writes it; None for any other DEFAULT.
 fn sequence_of(default: &str) -> Option<String> {
     Some(default.strip_prefix("nextval('")?.strip_suffix("')")?.replace("''", "'"))
@@ -630,9 +635,8 @@ impl Page {
     }
 
     /// A kept table, imported: made by its CREATE text as the core takes it (`imported_create`), or, with no CREATE text (no column
-    /// of it had rules), as a `CREATE TABLE … AS` of its rows; with the rows in by an INSERT; then its counters and defaults
-    /// (`restored`). A table this import made is dropped again if the rest of its import fails, so the next open starts from the
-    /// file. A CREATE that finds a table of the name there is `table_there`'s.
+    /// of it had rules), as a `CREATE TABLE … AS` of its rows (`made_plain`); then filled and set (`filled`). A CREATE that finds a
+    /// table of the name there is `table_there`'s.
     async fn import_table(&mut self, store: &crate::store::Store, at: &object_store::path::Path) -> anyhow::Result<()> {
         let reader = FileReader::try_new(std::io::Cursor::new(kept_bytes(store, at).await?), None)?;
         let kept = reader.schema();
@@ -640,53 +644,87 @@ impl Page {
         let batches = reader.collect::<Result<Vec<_>, _>>()?;
         let counted: usize = batches.iter().map(RecordBatch::num_rows).sum();
         let rows = stream_of(&table_schema(&kept), &batches)?;
-        let table = crate::ext_names::quoted(&name);
-        let from_rows = format!("SELECT * FROM {}", crate::ext_names::quoted(KEPT_ROWS));
         let create = match kept.metadata().get(CREATE_KEY) {
             Some(text) => Some(self.imported_create(text, &name)?),
             None => None,
         };
         let made = match &create {
             Some(create) => self.imported_said(create, None).await,
-            None => self.imported_said(&format!("CREATE TABLE {table} AS {from_rows}"), Some(rows.as_slice())).await,
+            None => self.made_plain(&name, &rows).await,
         };
         match made {
             Ok(()) => {}
-            Err(answer) if already_there(&answer) => return self.table_there(store, at, &name, &kept, counted).await,
+            Err(answer) if already_there(&answer) => return self.table_there(store, at, &name, &kept, counted, &rows).await,
             Err(answer) => return Err(answered_words(&answer)),
         }
-        let filled = async {
-            if create.is_some() {
-                self.imported_said(&format!("INSERT INTO {table} {from_rows}"), Some(rows.as_slice())).await.map_err(|answer| answered_words(&answer))?;
-            }
-            self.restored(at, &name, &kept, create.is_none()).await
+        self.filled(store, at, &name, &kept, &rows, create.is_some()).await
+    }
+
+    /// A kept table whose CREATE found a table of its name there (42P07): an open that made the table from this file stopped before
+    /// the file went. A table with no rows is this import's own, and gets the file's rows (`filled`). A table of the file's count holds
+    /// them already: its counters and defaults are set again, and the file goes. A table of any other count is someone else's, and is
+    /// listed with the words of why.
+    async fn table_there(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, counted: usize, rows: &[u8]) -> anyhow::Result<()> {
+        let answer = self.lake_said("format=csv", &[], bytes::Bytes::from(format!("SELECT count(*) FROM {}", crate::ext_names::quoted(name)))).await;
+        if answer.status != 200 {
+            return Err(answered_words(&answer));
         }
-        .await;
-        if let Err(e) = filled {
+        let holds: usize = String::from_utf8_lossy(&answer.body).lines().nth(1).and_then(|n| n.parse().ok()).context("its row count is not a number")?;
+        if holds == 0 {
+            return self.filled(store, at, name, kept, rows, true).await;
+        }
+        anyhow::ensure!(holds == counted, "{name}: a table of this name is there already, with {holds} rows where its file has {counted}");
+        // (a table with no identity was imported without its rules, as `imported_without_rules` leaves one: it has no counter to set)
+        let lake = &self.member.get().context("the page's member on the core's lake is not open")?.app.lake;
+        let identity = lake.table_meta_if(name).await?.is_some_and(|m| !m.identity.is_empty());
+        self.restored(at, name, kept, !identity || kept.metadata().get(CREATE_KEY).is_none()).await?;
+        forgotten(store, at).await
+    }
+
+    /// A kept table once made gets its rows, then its counters and defaults: its rows go in by an INSERT when `insert` (a CREATE made
+    /// the table with none), `restored` sets the rest, and the file goes. A table made as a `CREATE TABLE … AS` has its rows in already.
+    /// An INSERT a constraint refuses is `imported_without_rules`'s; any other failure drops the table, kept to be undropped as a drop
+    /// keeps it, and the file stays for the next open.
+    async fn filled(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, rows: &[u8], insert: bool) -> anyhow::Result<()> {
+        let table = crate::ext_names::quoted(name);
+        if insert {
+            match self.imported_said(&format!("INSERT INTO {table} SELECT * FROM {}", crate::ext_names::quoted(KEPT_ROWS)), Some(rows)).await {
+                Ok(()) => {}
+                Err(refusal) if refused_by_constraint(&refusal) => return self.imported_without_rules(store, at, name, kept, rows, &refusal).await,
+                Err(answer) => {
+                    let _ = self.imported_said(&format!("DROP TABLE {table}"), None).await;
+                    return Err(answered_words(&answer));
+                }
+            }
+        }
+        if let Err(e) = self.restored(at, name, kept, kept.metadata().get(CREATE_KEY).is_none()).await {
             let _ = self.imported_said(&format!("DROP TABLE {table}"), None).await;
             return Err(e);
         }
         forgotten(store, at).await
     }
 
-    /// A kept table whose CREATE found a table of its name there (42P07): an open that made the table from this file stopped before
-    /// the file went. The file goes once the table holds the file's rows, with its counters and defaults set again. A table of other
-    /// rows is someone else's, and is listed with the words of why.
-    async fn table_there(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, counted: usize) -> anyhow::Result<()> {
-        let answer = self.lake_said("format=csv", &[], bytes::Bytes::from(format!("SELECT count(*) FROM {}", crate::ext_names::quoted(name)))).await;
-        if answer.status != 200 {
-            return Err(answered_words(&answer));
-        }
-        let holds: usize = String::from_utf8_lossy(&answer.body).lines().nth(1).and_then(|n| n.parse().ok()).context("its row count is not a number")?;
-        anyhow::ensure!(holds == counted, "{name}: a table of this name is there already, with {holds} rows where its file has {counted}");
-        self.restored(at, name, kept, kept.metadata().get(CREATE_KEY).is_none()).await?;
+    /// A kept table whose INSERT a constraint refused (`refusal`: a duplicate key, a NULL in a NOT NULL column, a CHECK): the table its
+    /// CREATE made is dropped for good (PURGE, which keeps nothing to UNDROP), and made again without its rules (`made_plain`), with its
+    /// other defaults (`restored`). It is listed by `unread` with the refusal's words, and its file goes, so it imports once.
+    async fn imported_without_rules(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, rows: &[u8], refusal: &Answer) -> anyhow::Result<()> {
+        self.imported_said(&format!("DROP TABLE {} PURGE", crate::ext_names::quoted(name)), None).await.map_err(|answer| answered_words(&answer))?;
+        self.made_plain(name, rows).await.map_err(|answer| answered_words(&answer))?;
+        self.restored(at, name, kept, true).await?;
+        self.unread.push((at.to_string(), format!("imported without its rules: {}", String::from_utf8_lossy(&refusal.body))));
         forgotten(store, at).await
+    }
+
+    /// A kept table's rows as a table with no rules: a `CREATE TABLE … AS` of them, as an import with no CREATE text makes it.
+    async fn made_plain(&self, name: &str, rows: &[u8]) -> Result<(), Answer> {
+        self.imported_said(&format!("CREATE TABLE {} AS SELECT * FROM {}", crate::ext_names::quoted(name), crate::ext_names::quoted(KEPT_ROWS)), Some(rows)).await
     }
 
     /// A kept table's counters and defaults, set once its rows are in. A column whose DEFAULT is `nextval('s')` counts in `s`, the
     /// sequence its counter is kept under (`pondra.counters`), so the lake's sequence of that column is restarted at the counter's
-    /// next value. A table with no CREATE text (`plain`) gets its other DEFAULTs back (`ALTER TABLE … SET DEFAULT`); one the core
-    /// refuses is listed by `unread`, and the table is imported all the same.
+    /// next value. A table with no rules (`plain`: no CREATE text, or one imported without its rules) has no identity to count, and
+    /// gets its other DEFAULTs back (`ALTER TABLE … SET DEFAULT`); one the core refuses is listed by `unread`, and the table is
+    /// imported all the same.
     async fn restored(&mut self, at: &object_store::path::Path, name: &str, kept: &Schema, plain: bool) -> anyhow::Result<()> {
         let counted: BTreeMap<String, counters::Counter> = match kept.metadata().get(COUNTERS_KEY) {
             Some(json) => serde_json::from_str(json).with_context(|| format!("its {COUNTERS_KEY} note is not a table's counters"))?,
@@ -695,6 +733,9 @@ impl Page {
         for field in kept.fields() {
             let Some(default) = field.metadata().get(DEFAULT_KEY) else { continue };
             if let Some(sequence) = sequence_of(default) {
+                if plain {
+                    continue; // (an identity's counter: a table with no rules has no identity)
+                }
                 let Some(next) = counted.get(&sequence).and_then(counters::Counter::next) else { continue };
                 let lake = &self.member.get().context("the page's member on the core's lake is not open")?.app.lake;
                 let lake_sequence = lake.table_meta_if(name).await?.and_then(|m| m.identity.get(field.name()).map(|i| i.sequence.clone()));
