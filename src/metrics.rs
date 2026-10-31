@@ -124,7 +124,7 @@ pub async fn render(app: &App) -> anyhow::Result<String> {
     metric("wire_bytes_total", "counter", "bytes other nodes sent this node, compressed as sent", &one(get(&WIRE)));
     metric("shuffle_wait_seconds_total", "counter", "time this node's steps waited for other nodes' buckets", &one(get(&WAIT_US) / 1e6));
     let (reserved, limit) = app.lake.memory();
-    metric("queries_stopped_for_memory_total", "counter", "queries stopped because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB)", &one(get(&STOPPED_FOR_MEMORY)));
+    metric("queries_stopped_for_memory_total", "counter", "queries stopped (answered 53200) because the node was nearly out of memory (PONDRA_MEMORY_MAX_GB); a first try stopped and run again frugally is not counted", &one(get(&STOPPED_FOR_MEMORY)));
     metric("memory_limit_bytes", "gauge", "query memory limit (spills beyond it)", &one(limit as f64));
     metric("memory_reserved_bytes", "gauge", "query memory in use", &one(reserved as f64));
     let (hot, hot_max, loading) = app.lake.hot.usage();
