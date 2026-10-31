@@ -6024,7 +6024,7 @@ $$""")
     q("DROP SCHEMA ops CASCADE")
     checks["…go with it (DROP SCHEMA … CASCADE)"] = "ops" not in json.dumps(call(A.port, "GET", "/routines", headers={"authorization": "Bearer r-tok"}))
     q("DROP MACRO big"); q("DROP PROCEDURE twice")
-    checks["DROP MACRO, DROP PROCEDURE"] = err("CALL twice(1)").endswith("no procedure twice'") or "no procedure twice" in err("CALL twice(1)")
+    checks["DROP MACRO, DROP PROCEDURE"] = "procedure twice does not exist" in err("CALL twice(1)") # (42883, as Postgres says it)
     # DO (ADR-030): a console's Python cell, from every door, as an admin. What it prints comes
     # back as notices; its last expression, a frame here, as rows; an error at the code's line.
     import urllib.request
@@ -15005,9 +15005,9 @@ def objects():
     http("PREPARE big (BIGINT) AS SELECT id FROM orders WHERE amount > $1 ORDER BY id", s)
     executed = http("EXECUTE big (25)", s)[2]
     script = q("SET TIME ZONE '+02:00'; SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t")
-    checks["SET, SHOW, RESET, PREPARE, EXECUTE: the session's; a script is a session of its own"] = zoned == [{"t": "2026-10-01T08:00:00+08:00"}] \
+    checks["SET, SHOW, RESET, PREPARE, EXECUTE: the session's; a script is a session of its own; an unknown dotted setting is 42704"] = zoned == [{"t": "2026-10-01T08:00:00+08:00"}] \
         and other == [{"t": "2026-10-01T00:00:00Z"}] and shown == [{"name": "datafusion.execution.time_zone", "value": "+08:00"}] \
-        and executed == [{"id": 3}, {"id": 4}] and script == [{"t": "2026-10-01T02:00:00+02:00"}] and http("SET aa.bb = 1", s)[0] == 500
+        and executed == [{"id": 3}, {"id": 4}] and script == [{"t": "2026-10-01T02:00:00+02:00"}] and http("SET aa.bb = 1", s)[1] == "42704"
     spark = q("SELECT format_string('%s x %d', 'tea', 3) AS f, pmod(-7, 3) AS m, arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS fl")
     http("SET datafusion.sql_parser.dialect = 'spark'", s)
     floor_spark = http("SELECT arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS t, arrow_typeof(floor(1.5)) AS d", s)[2]  # (Spark's: a DOUBLE's floor a BIGINT, a DECIMAL's a DECIMAL of scale 0)
@@ -23782,8 +23782,8 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
-    XX000 = 24  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 14, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 12}
+    XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)

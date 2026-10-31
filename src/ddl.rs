@@ -479,7 +479,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
                 true => {
                     let dir = full(&dir)?;
                     crate::ext::reach(lake, &dir, true, endpoint.as_deref()).await?; // (its key and its server, before it is opened)
-                    ensure!(has_catalog(&dir).await?, "{dir} holds no lake: a READ_ONLY attachment reads one that is there");
+                    if !has_catalog(&dir).await? {
+                        return Err(crate::codes::coded("58P01", format!("{dir} holds no lake: a READ_ONLY attachment reads one that is there")));
+                    }
                     (dir, false)
                 }
                 false => lake_dir(&dir).await?,

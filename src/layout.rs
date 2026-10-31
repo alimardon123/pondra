@@ -214,7 +214,15 @@ fn expr(text: &str) -> Result<ast::Expr> {
 fn exprs(text: &str) -> Result<Vec<ast::Expr>> {
     let mut p = Parser::new(&GenericDialect {}).try_with_sql(text)?;
     let all = p.parse_comma_separated(Parser::parse_expr)?;
-    ensure!(p.peek_token().token == Token::EOF, "{text:?}: {} isn't taken here", p.peek_token().token);
+    let next = p.peek_token().token.clone();
+    if next != Token::EOF {
+        // (Snowflake's COMMENT and BigQuery's OPTIONS after a table's clauses: each is said where a table's comment goes)
+        let hint = match &next {
+            Token::Word(w) if w.value.eq_ignore_ascii_case("comment") => "; COMMENT ON TABLE t IS '…' sets a comment",
+            _ => "",
+        };
+        return Err(crate::codes::coded("0A000", format!("{text:?}: {next} isn't taken here{hint}")));
+    }
     Ok(all)
 }
 

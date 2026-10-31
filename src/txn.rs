@@ -648,7 +648,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
             Some(Ddl::AlterColumn { .. } | Ddl::RenameTable { .. } | Ddl::Swap { .. } | Ddl::Constraint { .. }) => "ALTER TABLE",
             _ => "DDL",
         },
-        Stmt::Invalid(_) => "DDL",
+        Stmt::Invalid(_) | Stmt::Refused(..) => "DDL",
     }
 }
 
@@ -2020,6 +2020,16 @@ mod tests {
         let modes = begin_modes("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").expect("parses");
         assert_eq!(plan(&modes).expect("plans"), (Some(Level::Repeatable), Some(true)));
         assert_eq!(plan(&begin_modes("BEGIN").expect("parses")).expect("plans"), (None, None));
+        // (SQL Server's BEGIN TRAN [name]: a transaction with no modes, as BEGIN TRANSACTION is)
+        assert_eq!(crate::text::control("BEGIN TRAN"), Some("BEGIN"));
+        assert_eq!(crate::text::control("begin tran sales"), Some("BEGIN"));
+        assert_eq!(plan(&begin_modes("BEGIN TRAN sales").expect("parses")).expect("plans"), (None, None));
+        assert_eq!(plan(&begin_modes("BEGIN TRAN; ").expect("parses")).expect("plans"), (None, None));
+        // (SQL Server's COMMIT TRAN [name] is a COMMIT; ROLLBACK TRAN with no name a ROLLBACK, a named one is no control word)
+        assert_eq!(crate::text::control("COMMIT TRAN"), Some("COMMIT"));
+        assert_eq!(crate::text::control("commit transaction sales;"), Some("COMMIT"));
+        assert_eq!(crate::text::control("ROLLBACK TRAN"), Some("ROLLBACK"));
+        assert_eq!(crate::text::control("ROLLBACK TRAN sp"), None);
         let serializable = plan(&begin_modes("BEGIN ISOLATION LEVEL SERIALIZABLE").expect("parses"));
         assert!(serializable.is_err_and(|e| crate::codes::of(&e) == "0A000"));
     }

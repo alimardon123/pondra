@@ -177,6 +177,7 @@ pub async fn columns(app: &App, r: &Returning) -> Result<SchemaRef> {
 fn parsed(r: &Returning) -> Result<Stmt> {
     match crate::write::parse(&r.write) {
         Some(Stmt::Invalid(why)) => bail!(why),
+        Some(Stmt::Refused(code, why)) => Err(crate::codes::coded(code, why)),
         Some(stmt) => Ok(stmt),
         None => bail!("{} … RETURNING: not a write Pondra takes", r.word()),
     }
