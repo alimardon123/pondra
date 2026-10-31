@@ -16588,23 +16588,24 @@ def extensions():
     cache = tempfile.mkdtemp(prefix="pondra-ext-cache-")
     env = {"PONDRA_SECRET_KEY": "one key for the cluster", "PONDRA_OWNER_KEY": owner_key, "PONDRA_ALLOW_UNSIGNED_EXTENSIONS": "true",
            "PONDRA_EXTENSION_SECS": "2", "PONDRA_CACHE_DIR": cache}
-    nodes = [Node(lake, A.port + i, env=env, admin_token="a").start() for i in range(3)]
-    signed, admin = {"x-pondra-owner": owner_key}, {"authorization": "Bearer a"}
+    nodes = [Node(lake, A.port + i, env=env, admin_token="a", **({"read_token": "rtok"} if i == 1 else {})).start() for i in range(3)]
+    signed, admin, reader = {"x-pondra-owner": owner_key}, {"authorization": "Bearer a"}, {"authorization": "Bearer rtok"}
     checks = {}
 
     def q(s, i=0, spread=None, headers=None):
         return call(A.port + i, "POST", "/sql" + (f"?spread={spread}" if spread is not None else ""), s.encode(), headers=headers or signed, timeout=120)
 
     def refused(s, i=0, headers=None):
-        try:
-            q(s, i, headers=headers)
-            return ""
-        except RuntimeError as e:
-            return str(e)
+        """'' when `s` answers; else its status, SQLSTATE (`x-pondra-sqlstate`) and words, as one string."""
+        c = http.client.HTTPConnection("127.0.0.1", A.port + i, timeout=120)
+        c.request("POST", "/sql", s.encode(), headers or signed)
+        r = c.getresponse()
+        body = r.read().decode(errors="replace")
+        return "" if r.status == 200 else f"{r.status} {r.getheader('x-pondra-sqlstate')}: {body}"
     try:
         q("CREATE TABLE notes (id BIGINT, body TEXT)")
         for k in range(4):
-            q("INSERT INTO notes SELECT k AS id, repeat('word ', (k % 7)::int) || 'end' AS body FROM generate_series(%d, %d) AS g(k)" % (k * 50_000, k * 50_000 + 49_999))
+            q(f"INSERT INTO notes SELECT k AS id, repeat('word ', (k % 7)::int) || 'end' AS body FROM generate_series({k * 50_000}, {k * 50_000 + 49_999}) AS g(k)")
             call(A.port, "POST", "/tier", headers=signed, timeout=600)  # (files to slice: a spread query deals them out)
         checks["a non-owner may not install from a path on the node's machine"] = "42501" in refused(f"INSTALL words FROM '{fixture}'", headers=admin) or "path on the server" in refused(f"INSTALL words FROM '{fixture}'", headers=admin)
         installed = q(f"INSTALL words FROM '{fixture}'")
@@ -16614,17 +16615,25 @@ def extensions():
         checks["SHOW EXTENSIONS lists the built-ins, then words with its hash"] = [r["name"] for r in shown][-1] == "words" and shown[-1]["built_in"] is False and len(shown[-1]["sha256"] or "") == 64
         checks["every node has its functions at once"] = all(until(lambda i=i: q("SELECT word_count('a b c') AS n", i), [{"n": 3}], 15) for i in range(3))
         agg = "SELECT sum(word_count(body)) AS words, count(*) FILTER (WHERE shout(body) = upper(body)) AS same FROM notes"
+        # (a program's own requests run on their node alone, so the spread is asked with a reader's token, as `outside` asks it)
+        until(lambda: len(call(A.port + 1, "GET", "/stats", headers=admin).get("nodes", ())), 3, 30)
         before = metrics_of(A.port + 1, signed)["pondra_spread_queries_total"]
-        one, three = q(agg, 1, spread=0), q(agg, 1, spread=1)
+        one, three = q(agg, 1, spread=0, headers=reader), q(agg, 1, spread=1, headers=reader)
         checks["a query spread over three nodes == one node"] = one == three and one[0]["same"] == 200_000 and metrics_of(A.port + 1, signed)["pondra_spread_queries_total"] > before
-        checks["a table function's rows once, asked of three nodes (it runs on one) or of one"] = q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=1) == q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=0) == [{"n": 10000, "s": 50005000}]
+        checks["a table function's rows once, asked of three nodes (it runs on one) or of one"] = q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=1, headers=reader) == q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=0, headers=reader) == [{"n": 10000, "s": 50005000}]
         checks["a function's own error is 38000, in its words"] = "38000" in (e := refused("SELECT boom(1)")) and "boom always fails" in e
         started = time.time()
         e = refused("SELECT spin(id) FROM notes LIMIT 1", 2)
         checks["a runaway call stops at PONDRA_EXTENSION_SECS with 57014, and the node goes on"] = "57014" in e and time.time() - started < 30 and q("SELECT word_count('still here') AS n", 2) == [{"n": 2}]
-        q("CREATE DATABASE fork CLONE lake")
-        in_fork = lambda s: call(A.port, "POST", "/db/fork/sql", s.encode(), headers=signed, timeout=120)
-        checks["a branch keeps the extension and its file"] = [r["name"] for r in in_fork("SHOW EXTENSIONS")][-1] == "words" and in_fork("SELECT word_count('a b') AS n") == [{"n": 2}]
+        here, fork_at = q("SELECT name FROM pondra.databases")[0]["name"], f"{lake}-fork"
+        LAKES.append(fork_at)
+        q(f"CREATE DATABASE fork LOCATION '{fork_at}' CLONE \"{here}\"")
+        fork = Node(fork_at, A.port + 5, env=env, admin_token="a").start()  # (the branch on a node of its own: its file came with it)
+        try:
+            in_fork = lambda s: call(A.port + 5, "POST", "/sql", s.encode(), headers=signed, timeout=120)
+            checks["a branch keeps the extension and its file"] = [r["name"] for r in in_fork("SHOW EXTENSIONS")][-1] == "words" and in_fork("SELECT word_count('a b') AS n") == [{"n": 2}]
+        finally:
+            fork.kill()
         q("UNINSTALL words")
         gone = lambda i: "word_count" in refused("SELECT word_count('a b') AS n", i)
         checks["UNINSTALL takes its functions away on every node"] = all(until(lambda i=i: gone(i), True, 15) for i in range(3))
