@@ -24730,8 +24730,9 @@ def matches():
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
     9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
     as the input, 0A000 with the pattern view's words; a view kept by key as the input. 10: a search that never ends, past
-    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 5, 7 and 8
-    (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
+    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 11: a subquery before MATCH_RECOGNIZE over a lake
+    table answers its CTE's rows, aliased or not; a stored view shows the subquery as written; EMIT FINAL over one is refused.
+    5, 7 and 8 (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
     start = {"at": time.time(), "start": time.time()}  # (the seconds of each part, in info: `lap`)
@@ -24966,6 +24967,38 @@ def matches():
     checks["a subquery as the input is refused 0A000 with the pattern view's words (FROM t MATCH_RECOGNIZE), not GROUP BY's"] = refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
             f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
     lap("9, the refusals")
+    # 11. A subquery before MATCH_RECOGNIZE (pattern.rs `text`): it is a CTE in a derived table, so the clause reads it as a
+    # table. Over a lake table it answers what the same clause answers over a CTE of that subquery, with the input aliased, with
+    # AS, or with no alias; a stored view of it answers the same and shows its subquery as written; EMIT FINAL over a subquery
+    # with an alias is refused with the words of section 9
+    q("CREATE TABLE sub_src (symbol TEXT, day INT, ts TIMESTAMP, price INT, venue TEXT)")
+    rng11, sub_rows = random.Random(11), []
+    for s in range(40):
+        p11 = 50
+        for d in range(1, 21):
+            p11 = max(1, p11 + rng11.randint(-6, 6))
+            sub_rows.append(f"('s{s:02d}', {d}, '2026-10-01 00:{d:02d}:00', {p11}, '{'x' if d % 4 else 'y'}')")
+    q("INSERT INTO sub_src VALUES " + ", ".join(sub_rows))
+    sub_clause = ("MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES FIRST(a.ts) AS s, LAST(b.ts) AS e ONE ROW PER MATCH "
+                  "PATTERN (a b+) DEFINE b AS b.price > PREV(b.price))")
+    cte_rows = q(f"WITH t AS (SELECT * FROM sub_src WHERE venue = 'x') SELECT * FROM t {sub_clause} m ORDER BY symbol, s")
+    sub_rows_t = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m ORDER BY symbol, s")
+    sub_rows_as = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') AS t {sub_clause} AS m ORDER BY symbol, s")
+    sub_rows_bare = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') {sub_clause} m ORDER BY symbol, s")
+    info["11: matches of the CTE, the subquery aliased t, AS t, and with no alias"] = [len(cte_rows), len(sub_rows_t), len(sub_rows_as), len(sub_rows_bare)]
+    checks["a subquery before MATCH_RECOGNIZE over a lake table answers the rows its CTE answers, with the input aliased or not, with AS or without"] = \
+        len(cte_rows) > 0 and sub_rows_t == cte_rows and sub_rows_as == cte_rows and sub_rows_bare == cte_rows
+    q(f"CREATE VIEW sub_v AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m")
+    view_rows = q("SELECT * FROM sub_v ORDER BY symbol, s")
+    view_def = q("SHOW CREATE VIEW sub_v")[0]["definition"]
+    info["11: the view's definition"] = view_def
+    checks["a stored view of a subquery before MATCH_RECOGNIZE answers its CTE's rows, and shows its subquery as written (no __mr_input)"] = \
+        view_rows == cte_rows and "FROM (SELECT * FROM sub_src WHERE venue = 'x') t MATCH_RECOGNIZE" in view_def and "__mr_input" not in view_def
+    checks["EMIT FINAL over a subquery with an alias is refused 0A000 with the pattern view's words, as without one"] = \
+        refused("a subquery with an alias as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq2 AS SELECT * FROM (SELECT * FROM late_src) t "
+                f"MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+                f"PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
+    lap("11, a subquery as the input")
     node.kill()
 
     # 10. A search that never ends: one key holds 100 rows of an open search, past PONDRA_MATCH_HELD_ROWS (50 here, its own node),
