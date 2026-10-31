@@ -224,6 +224,18 @@ async fn steps() {
     assert_eq!(again.status, 200, "step 9: a PUT with the ETag it read: {}", String::from_utf8_lossy(&again.body));
     let gone = put("/files/nothere.csv", Some("\"v\"".into()), "a\n").await;
     assert_eq!(gone.status, 412, "step 9: If-Match on a file that isn't there: {}", String::from_utf8_lossy(&gone.body));
+
+    // 10. A file's name is percent-decoded, as the HTTP door's path is: `a%20b.csv` is the file `a b.csv`, which a PUT makes and a GET
+    // reads, and which `files()` lists under its decoded name (`/objects` lists tables, not files). A name that isn't UTF-8 is a 400
+    // that says so, as the door answers it.
+    let spaced = third.request("PUT", "/files/a%20b.csv", &[], bytes::Bytes::from_static(b"a\n1\n")).await;
+    assert_eq!(spaced.status, 200, "step 10: a PUT of a name with a space: {}", String::from_utf8_lossy(&spaced.body));
+    let read = third.request("GET", "/files/a%20b.csv", &[], bytes::Bytes::new()).await;
+    assert_eq!((read.status, read.body.as_ref()), (200, b"a\n1\n".as_slice()), "step 10: GET of the same name answers the body PUT wrote");
+    let (_, _, body) = sql(&third, "SELECT path FROM files() WHERE path = 'files/a b.csv'").await;
+    assert_eq!(body.lines().nth(1), Some("files/a b.csv"), "step 10: the file is listed under its decoded name: {body}");
+    let bad = third.request("PUT", "/files/%FF.csv", &[], bytes::Bytes::from_static(b"x")).await;
+    assert_eq!((bad.status, String::from_utf8_lossy(&bad.body).into_owned()), (400, "Invalid UTF-8 in `path`".to_string()), "step 10: a name that isn't UTF-8 is a 400 that says so");
     third.close().await;
 }
 
