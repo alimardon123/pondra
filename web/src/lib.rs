@@ -221,7 +221,6 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
 /// its allocator holds (`heap::live`) against the line its device has (`device_line`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
     pondra::page::Options {
-        web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
         store,
         node,
         memory: Some(Arc::new(heap::live)),
