@@ -15,6 +15,7 @@ use crate::app::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use futures::{Stream, StreamExt};
 use std::future::Future;
 use crate::reset::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -172,10 +173,17 @@ tokio::task_local! {
 /// the statement's planning, bound to it). None outside a statement.
 pub fn stop() -> Option<Arc<AtomicBool>> { STOP.try_with(|s| s.clone()).ok() }
 
-/// Sets its flag when dropped before `done` is set: the statement's future was dropped (a timeout, a Stop, a closed tab).
+/// Sets its flag when dropped before it is marked done: the statement's future was dropped (a timeout, a Stop, a closed tab).
 struct SetOnDrop {
     flag: Arc<AtomicBool>,
     done: bool,
+}
+
+impl SetOnDrop {
+    fn new(flag: Arc<AtomicBool>) -> Self { SetOnDrop { flag, done: false } }
+
+    /// The work ended: the drop that follows leaves the flag unset.
+    fn mark_done(&mut self) { self.done = true; }
 }
 
 impl Drop for SetOnDrop {
@@ -189,10 +197,25 @@ impl Drop for SetOnDrop {
 /// `f`, with `flag` as its statement's stop flag (`stop`). The flag is set if `f` is dropped before it finishes. A `f` that
 /// finishes leaves it unset, because a door may stream the rows the statement made after `statement` returns.
 pub(crate) async fn stoppable<T>(flag: Arc<AtomicBool>, f: impl Future<Output = T>) -> T {
-    let mut guard = SetOnDrop { flag: flag.clone(), done: false };
+    let mut guard = SetOnDrop::new(flag.clone());
     let out = STOP.scope(flag, f).await;
-    guard.done = true;
+    guard.mark_done();
     out
+}
+
+/// `s`, which sets `flag` when it is dropped before it ends. A door whose rows stream after `statement` returns (a
+/// plan's pieces, read by the client as they come) is guarded so: a client that goes mid-stream stops the search still
+/// running on those rows, as a statement dropped unfinished does (`stoppable`).
+pub(crate) fn guarded<S: Stream>(flag: Arc<AtomicBool>, s: S) -> impl Stream<Item = S::Item> {
+    futures::stream::unfold((Box::pin(s), SetOnDrop::new(flag)), |(mut s, mut guard)| async move {
+        match s.next().await {
+            Some(item) => Some((item, (s, guard))),
+            None => {
+                guard.mark_done(); // (read to its end: the drop that follows leaves the flag unset)
+                None
+            }
+        }
+    })
 }
 
 /// An error a door says: an error of its own kind (`code`: Postgres's SQLSTATE).
@@ -483,5 +506,29 @@ mod tests {
         }
         assert_eq!(knocked(Some(v6("2001:db8:0:1:ffff::2")), 1_000).0, None, "an IPv6 client's /64 counts as one");
         assert_eq!(knocked(Some(v6("2001:db8:0:2::1")), 1_000).0, Some(false), "the next /64 apart");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_dropped_after_one_item_sets_its_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut rows = Box::pin(guarded(flag.clone(), futures::stream::iter([1, 2, 3])));
+        assert_eq!(rows.next().await, Some(1));
+        drop(rows);
+        assert!(flag.load(Ordering::Relaxed), "a stream its client drops after one of its three items sets its flag");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_read_to_its_end_leaves_its_flag_unset() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let rows: Vec<i32> = guarded(flag.clone(), futures::stream::iter([1, 2, 3])).collect().await;
+        assert_eq!(rows, vec![1, 2, 3]);
+        assert!(!flag.load(Ordering::Relaxed), "a stream read to its end leaves its flag unset");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_never_polled_and_dropped_sets_its_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(guarded(flag.clone(), futures::stream::iter([1, 2, 3])));
+        assert!(flag.load(Ordering::Relaxed), "a stream dropped unpolled sets its flag: its statement was dropped unfinished");
     }
 }

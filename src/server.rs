@@ -976,7 +976,7 @@ fn respond(r: Rendered, format: Option<&str>) -> Response {
 /// The body of an answer in pieces (`query::Handed`): its first piece, then the rest as they are written. A channel
 /// that closes before the last piece was written fails the body, so a client never takes a cut answer for a whole one.
 fn pieces(h: crate::query::Handed) -> Body {
-    let crate::query::Handed { first, rest, ended } = h;
+    let crate::query::Handed { first, rest, ended, stop } = h;
     // (counted until the body's last piece is read, not until its writer ends: the pieces still in the channel are what
     // a node stopping after the writer would cut short, so a node told to stop waits for them: `drain::Busy::carried`)
     let busy = crate::drain::Busy::carried();
@@ -989,7 +989,11 @@ fn pieces(h: crate::query::Handed) -> Body {
             None => Some((Err(std::io::Error::other("the answer stopped before its end")), None)),
         }
     });
-    Body::from_stream(head.chain(rest))
+    // (a client that goes mid-answer stops the plan's search still running: the statement's flag, if it has one)
+    match stop {
+        Some(flag) => Body::from_stream(crate::audit::guarded(flag, head.chain(rest))),
+        None => Body::from_stream(head.chain(rest)),
+    }
 }
 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent

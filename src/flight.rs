@@ -513,7 +513,7 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
 /// door's body takes it. `busy` is held until the stream ends. A piece that fails, or a channel that closes before the answer's
 /// end, ends the stream with its status: a cut answer is never taken for a whole one.
 fn piece_stream(h: crate::query::Handed, busy: crate::drain::Busy) -> Out<FlightData> {
-    let crate::query::Handed { first, rest, ended } = h;
+    let crate::query::Handed { first, rest, ended, stop } = h;
     let pieces = futures::stream::try_unfold((Some(first), rest, ended, busy), |(first, mut rest, ended, busy)| async move {
         let bytes = match first {
             Some(first) => Bytes::from(first),
@@ -527,7 +527,12 @@ fn piece_stream(h: crate::query::Handed, busy: crate::drain::Busy) -> Out<Flight
         let data = messages(bytes).map_err(status)?;
         Ok(Some((data, (None, rest, ended, busy))))
     });
-    Box::pin(pieces.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten())
+    let pieces = pieces.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten();
+    // (a client that goes mid-answer stops the plan's search still running: the statement's flag, if it has one)
+    match stop {
+        Some(flag) => Box::pin(crate::audit::guarded(flag, pieces)),
+        None => Box::pin(pieces),
+    }
 }
 
 crate::per_node!(
