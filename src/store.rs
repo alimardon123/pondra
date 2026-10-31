@@ -545,7 +545,7 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
 
 /// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
 /// platform says.
-fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
@@ -592,9 +592,10 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
 }
 
 /// `PONDRA_SPILL_GB`: how many GB of spills the node may keep on disk. None when unset (a negative setting is none).
-fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
+pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
 
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
+/// The lakes in memory spill under the same setting and room, counted with these (`memory::spilled`, `others_held`).
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
@@ -688,9 +689,10 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
     }
 }
 
-/// Sets every live lake's cap from the disk as it is now (`room_cap`).
+/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles and the lakes in
+/// memory take their bytes out of it first (without it, the disk's free room already says what they hold).
 fn set_room(gb: Option<f64>) {
-    let shuffled = gb.map_or(0, |_| crate::spill::held()); // (shuffles count only under the setting: without it the disk's free room says it all)
+    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
     let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
     for manager in live_spillers() {
         if let Some(cap) = room_cap(gb, manager.used_disk_space(), shuffled, disk) {
@@ -721,19 +723,23 @@ pub(crate) fn spill_room() {
 /// Whether `bytes` more fit on the spill disk: within the setting, with `held` already on it (shuffles' pieces
 /// and spills), or in its free room beyond what a lake keeps. Where the platform can't say how much room there
 /// is, it fits.
-fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u64, u64)>) -> bool {
+pub(crate) fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u64, u64)>) -> bool {
     match gb {
         Some(gb) => held.saturating_add(bytes) <= gb_bytes(gb),
         None => disk.map_or(true, |(free, total)| bytes <= free.saturating_sub(lake_keeps(total))),
     }
 }
 
+/// What this process spills, other than its lakes in memory: the shuffles' pieces (`spill::held`) and the queries' spill
+/// disks (`live_spillers`). The lakes' bytes come with `memory::spilled`, so one check sees all of it.
+pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>() }
+
 /// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
 /// No spill folder: it fits, and the write fails with its own error.
 pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
-    let held = gb.map_or(0, |_| crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>());
+    let held = gb.map_or(0, |_| others_held() + crate::memory::spilled());
     match piece_fits(gb, held, bytes, space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
