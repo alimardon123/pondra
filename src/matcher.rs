@@ -10,10 +10,10 @@
 use crate::codes::coded;
 use crate::fsum;
 use anyhow::{anyhow, bail, Context, Result};
-use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, IntervalMonthDayNanoArray, ListArray, StringArray, StructArray, UInt32Array};
+use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Array, ListArray, StringArray, StructArray, UInt32Array};
 use datafusion::arrow::buffer::{NullBuffer, OffsetBuffer};
 use datafusion::arrow::compute::cast;
-use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, IntervalMonthDayNanoType, Schema, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{DFSchema, ScalarValue};
@@ -2082,6 +2082,8 @@ impl<'a> Pat<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::IntervalMonthDayNanoArray;
+    use datafusion::arrow::datatypes::{IntervalMonthDayNanoType, TimeUnit};
     use std::time::{Duration, Instant};
 
     /// The rows' conditions: `rows[r]` lists the symbols row r meets.
