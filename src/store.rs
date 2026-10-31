@@ -1685,7 +1685,11 @@ impl Lake {
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
         let at = Path::from(path);
-        let m = self.store.head(&at).await?;
+        let m = match self.store.head(&at).await {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => return Err(Changed.into()), // (no file is not the version the caller read: 412)
+            Err(e) => return Err(e.into()),
+        };
         if version_of(&m) != expect {
             return Err(Changed.into());
         }

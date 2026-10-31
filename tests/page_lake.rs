@@ -147,6 +147,22 @@ async fn steps() {
     // 8. A claimed page answers a route it doesn't have with 404.
     let answer = third.request("GET", "/nothing", &[], bytes::Bytes::new()).await;
     assert_eq!(answer.status, 404, "step 8: GET /nothing is 404: {}", String::from_utf8_lossy(&answer.body));
+
+    // 9. A file's PUT answers its version as an ETag, as GET does, and the next PUT names it in If-Match; If-Match on a file
+    // that isn't there is 412, as for a file changed since it was read.
+    let put = |path: &'static str, if_match: Option<String>, body: &'static str| {
+        let headers: Vec<(String, String)> = if_match.into_iter().map(|v| ("if-match".to_string(), v)).collect();
+        let page = &third;
+        async move { page.request("PUT", path, &headers, bytes::Bytes::from_static(body.as_bytes())).await }
+    };
+    let first = put("/files/e.csv", None, "a\n1\n").await;
+    let etag = first.header("etag").map(str::to_string).expect("step 9: a PUT answers an ETag");
+    let read = third.request("GET", "/files/e.csv", &[], bytes::Bytes::new()).await;
+    assert_eq!(read.header("etag"), Some(etag.as_str()), "step 9: GET's ETag is the one PUT answered");
+    let again = put("/files/e.csv", Some(etag), "a\n2\n").await;
+    assert_eq!(again.status, 200, "step 9: a PUT with the ETag it read: {}", String::from_utf8_lossy(&again.body));
+    let gone = put("/files/nothere.csv", Some("\"v\"".into()), "a\n").await;
+    assert_eq!(gone.status, 412, "step 9: If-Match on a file that isn't there: {}", String::from_utf8_lossy(&gone.body));
     third.close().await;
 }
 
