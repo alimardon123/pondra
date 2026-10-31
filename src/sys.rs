@@ -101,7 +101,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
     }
     let names = NAMES.iter().copied().filter(|_| mentioned(sql)).chain(deleted.then_some("_deleted")).collect();
     let mut v = Hide { ctes: vec![], changed: false, names };
-    let _ = VisitMut::visit(&mut stmts, &mut v);
+    let _ = crate::walk::visit_mut(&mut stmts, &mut v);
     match v.changed {
         true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")),
         false => Cow::Borrowed(sql),

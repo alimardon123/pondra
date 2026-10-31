@@ -157,7 +157,7 @@ pub fn as_of(sql: &str) -> anyhow::Result<Cow<'_, str>> {
         }
     }
     let mut v = Joins(false);
-    if let ControlFlow::Break(e) = VisitMut::visit(&mut stmts, &mut v) {
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut stmts, &mut v) {
         return Err(e);
     }
     Ok(match v.0 {

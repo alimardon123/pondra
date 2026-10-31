@@ -10,7 +10,7 @@ use crate::text::{contains_ci, join, PUBLIC};
 use crate::codes::coded;
 use crate::store::{table_key, Lake};
 use anyhow::{Context, Result};
-use datafusion::sql::sqlparser::ast::{self, CommentObject, CopySource, CreateTableLikeKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, ObjectName, ObjectNamePart, ObjectType, Query, Statement, TableFactor, TableObject, Value, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, CommentObject, CopySource, CreateTableLikeKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, ObjectName, ObjectNamePart, ObjectType, Query, Statement, TableFactor, TableObject, Value, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser};
 use regex::Regex;
 use std::collections::HashSet;
@@ -199,7 +199,7 @@ fn currents_of(path: &Path, sql: &str) -> String {
     let Some(mut stmts) = parse_text(sql) else { return sql.to_string() };
     let mut walk = Currents { path, changed: false };
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     match walk.changed {
         true => stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"),
@@ -457,7 +457,7 @@ async fn expr(lake: &Lake, skip: &HashSet<String>, e: &str) -> Result<String> {
 fn collect(path: &Path, skip: &HashSet<String>, stmts: &mut [Statement]) -> Vec<(Fam, String)> {
     let mut walk = Walk::new(path, skip, None);
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     let mut wanted = walk.wanted;
     wanted.sort();
@@ -469,7 +469,7 @@ fn collect(path: &Path, skip: &HashSet<String>, stmts: &mut [Statement]) -> Vec<
 fn apply(path: &Path, skip: &HashSet<String>, w: &World, stmts: &mut [Statement]) -> bool {
     let mut walk = Walk::new(path, skip, Some(w));
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     walk.changed
 }

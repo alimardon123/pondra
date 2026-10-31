@@ -26,7 +26,7 @@ use crate::write::Stmt;
 use crate::text::{ident, object};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::RecordBatch;
-use datafusion::sql::sqlparser::ast::{self, visit_expressions_mut, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::Deserialize;
 use serde_json::{json as j, Value};
@@ -353,9 +353,9 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
 
 /// Every `$n` and `$name` in a SQL function's body is one of its parameters (Postgres: "there is no
 /// parameter $2"): a function's answer depends on its arguments alone, never a session's variable.
-fn places<T: VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
+fn places<T: ast::VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
     let mut wrong = None;
-    let _ = visit_expressions_mut(body, |e| {
+    let _ = crate::walk::visit_expressions_mut(body, |e| {
         if let Expr::Value(v) = e {
             if let ast::Value::Placeholder(p) = &v.value {
                 let n = p.trim_start_matches('$');
@@ -453,7 +453,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
     named_as_written(&mut stmts, |e| {
         let mut uses = false;
-        let _ = ast::visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             uses |= match x {
                 Expr::Value(v) => matches!(&v.value, ast::Value::Placeholder(p) if bound(p)),
                 Expr::Function(f) => getvariable && object(&f.name) == "getvariable",
@@ -464,7 +464,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         uses
     });
     let mut missing: Vec<String> = vec![];
-    let _ = visit_expressions_mut(&mut stmts, |e| {
+    let _ = crate::walk::visit_expressions_mut(&mut stmts, |e| {
         match e {
             Expr::Value(v) => {
                 if let ast::Value::Placeholder(p) = &v.value {
@@ -525,7 +525,7 @@ fn named_as_written(stmts: &mut [Statement], uses: impl Fn(&Expr) -> bool) {
     }
     let mut namer = Namer(uses);
     for s in stmts {
-        let _ = s.visit(&mut namer);
+        let _ = crate::walk::visit_mut(s, &mut namer);
     }
 }
 
