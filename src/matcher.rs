@@ -130,6 +130,8 @@ struct Plan {
     rows: usize,
     values: usize,
     look: usize,
+    /// The most rows one match can hold (see `longest`), None when a repetition has no upper bound.
+    longest: Option<usize>,
 }
 
 /// A DEFINE of symbol `symbol` that reads the match: its glue, and the indices of its slots.
@@ -148,6 +150,7 @@ fn compile(text: &str) -> Result<Plan> {
     let mut c = Compiler { code: vec![], parts: 0 };
     c.emit(&pattern, false)?;
     c.push(Inst::Match)?;
+    let most_rows = longest(&c.code);
     Ok(Plan {
         syms,
         code: c.code,
@@ -159,7 +162,35 @@ fn compile(text: &str) -> Result<Plan> {
         rows: spec.rows,
         values: spec.values,
         look: spec.look,
+        longest: most_rows,
     })
+}
+
+/// The most rows one match of the program can hold: its longest path in rows (a `Sym`, excluded or not, is a row; the
+/// anchors are none), or None when it loops (an unbounded repetition jumps back: `Compiler::repeat`).
+fn longest(code: &[Inst]) -> Option<usize> {
+    // len[pc]: the longest path from pc to the Match, walked from the end down, so every target is already known
+    let mut len = vec![0usize; code.len()];
+    for pc in (0..code.len()).rev() {
+        len[pc] = match code[pc] {
+            Inst::Sym(..) => len[pc + 1].saturating_add(1),
+            Inst::Split(a, b) => {
+                if a <= pc || b <= pc {
+                    return None;
+                }
+                len[a].max(len[b])
+            }
+            Inst::Jmp(t) => {
+                if t <= pc {
+                    return None;
+                }
+                len[t]
+            }
+            Inst::Start | Inst::End => len[pc + 1],
+            Inst::Match => 0,
+        };
+    }
+    Some(len[0])
 }
 
 /// The spec's DEFINEs and slots, checked: the slots are numbered from 0, each once; each DEFINE names one of the pattern's
@@ -1202,12 +1233,27 @@ const MAX_THREADS: usize = 1_000_000;
 
 /// The rows a partition may keep past its own n, and the rows its searches may read past `READS_PER_ROW` × n (see `Part`).
 /// Overlapping matches and stated threads that never merge keep or read a row many times over, so the work grows as the
-/// square of the partition's rows; past this the query is refused (54000) rather than run for hours.
+/// square of the partition's rows; past this the query is refused (54000) rather than run for hours. A bounded pattern's
+/// budgets grow with its longest match (`budgets`), so only an unbounded one keeps these.
 const KEEP: usize = 8_000_000;
 
 /// The rows a partition's searches may read per row of the partition, before `KEEP`. A preferred partial match runs on
-/// past the row it ends at, so the searches read more rows than the answer has.
+/// past the row it ends at, so the searches read more rows than the answer has. A bounded pattern's budgets grow with its
+/// longest match (`budgets`), as `KEEP` does.
 const READS_PER_ROW: usize = 16;
+
+/// A partition's two budgets (see `Part`): `KEEP` past n, and `KEEP` past `READS_PER_ROW` × n. With a pattern whose matches
+/// hold at most `longest` rows, each search keeps at most that many and reads at most one more, so the work is linear in n
+/// and the budgets grow with it: n × (longest - 1) more rows kept, n × (longest + 1 - READS_PER_ROW) more read.
+fn budgets(longest: Option<usize>, n: usize) -> (usize, usize) {
+    match longest {
+        None => (KEEP, KEEP),
+        Some(l) => (
+            KEEP.saturating_add(n.saturating_mul(l.saturating_sub(1))),
+            KEEP.saturating_add(n.saturating_mul((l + 1).saturating_sub(READS_PER_ROW))),
+        ),
+    }
+}
 
 /// WITHIN's times of one partition, in ticks of the time's unit (a timestamp's count from the epoch), and each row's bound:
 /// its time less the interval, so a row can be in a match only when the match's first row is no earlier than the bound.
@@ -1541,6 +1587,7 @@ impl Evaluator {
         let columns = values
             .get(first + plan.rows..first + plan.rows + plan.values)
             .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
+        let (keep, reads) = budgets(plan.longest, n);
         let part = Part {
             cond: &cond,
             within: within.as_ref(),
@@ -1549,8 +1596,8 @@ impl Evaluator {
             values: columns,
             planned: self.planned.as_deref(),
             cap: STATE_CAP,
-            keep: KEEP,
-            reads: KEEP,
+            keep,
+            reads,
             stop: self.stop.as_deref(),
         };
         if !self.open {
@@ -2402,6 +2449,51 @@ mod tests {
         assert_eq!(crate::codes::of(&err), "54000");
         assert!(err.to_string().contains("keeps more than 8,010,000 rows of matches and partial matches"), "{err}");
         assert!(took < Duration::from_secs(10), "refused in {took:?}");
+    }
+
+    #[test]
+    fn longest_is_the_most_rows_a_match_holds() {
+        let longest_of = |pattern: &str| compile(&spec(pattern, PAST)).unwrap().longest;
+        assert_eq!(longest_of("a"), Some(1));
+        assert_eq!(longest_of("a b{29}"), Some(30));
+        assert_eq!(longest_of("a b{2,5} c"), Some(7));
+        assert_eq!(longest_of("a | b c"), Some(2));
+        assert_eq!(longest_of("^ a $"), Some(1));
+        assert_eq!(longest_of("{- a -} b"), Some(2));
+        assert_eq!(longest_of("PERMUTE(a, b)"), Some(2));
+        assert_eq!(longest_of("a+"), None);
+        assert_eq!(longest_of("a b*"), None);
+        assert_eq!(longest_of("(a b){3}"), Some(6));
+        assert_eq!(longest_of("a{0,3}"), Some(3));
+    }
+
+    #[test]
+    fn budgets_grow_with_the_longest_match() {
+        assert_eq!(budgets(None, 1_000), (super::KEEP, super::KEEP));
+        assert_eq!(budgets(Some(30), 1_000), (super::KEEP + 29_000, super::KEEP + 15_000));
+        assert_eq!(budgets(Some(5), 1_000), (super::KEEP + 4_000, super::KEEP));
+    }
+
+    #[test]
+    fn a_bounded_pattern_that_overlaps_has_budgets_for_its_longest_match() {
+        // a b{29} with SKIP TO NEXT ROW over 300,000 rows that all meet a and b: every row but the last 29 starts a match of
+        // 30 rows, so the kept rows are 30 × n, past the n + KEEP that the unbounded budgets allow (refused at about 276,000)
+        let plan = compile(&spec("a b{29}", NEXT)).unwrap();
+        let n = 300_000;
+        let cond = vec![vec![true; n], vec![true; n]];
+        let (keep, reads) = budgets(plan.longest, n);
+        let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep, reads, stop: None };
+        let started = Instant::now();
+        let rows = partition(&plan, &part).unwrap();
+        let took = started.elapsed();
+        let starts: Vec<usize> = (0..n).filter(|&i| rows[i].iter().any(|m| m.sym == Some(0) && m.seq == Some(1))).collect();
+        assert!(starts.into_iter().eq(0..n - 29), "the matches start at every row but the last 29");
+        assert!(took < Duration::from_secs(20), "took {took:?}");
+        // with today's budgets the same search is refused: the kept rows pass n + KEEP
+        let today = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep: super::KEEP, reads: super::KEEP, stop: None };
+        let err = partition(&plan, &today).expect_err("the kept rows' refusal");
+        assert_eq!(crate::codes::of(&err), "54000");
+        assert!(err.to_string().contains("keeps more than 8,300,000 rows"), "{err}");
     }
 
     #[test]
