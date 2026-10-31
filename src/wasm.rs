@@ -513,6 +513,37 @@ mod tests {
         assert_eq!((crate::codes::of(&e), e.to_string().as_str()), ("0A000", "needs pondra:http/http@1.0.0, which this Pondra doesn't offer (it offers pondra:log/log@1.0.0 and pondra:clock/clock@1.0.0)"));
     }
 
+    /// `extensions/hello`, written with the kit (`extensions/kit`, E4): its functions over plain Rust values.
+    const HELLO: &[u8] = include_bytes!("../tests/fixtures/extensions/hello-0.1.wasm");
+
+    /// The kit takes each function's types from its Rust signature; a NULL skips a function whose argument is a plain type
+    /// and reaches one whose argument is an Option; an Err fails the call in its words; a table function's tuples come a
+    /// thousand rows a batch.
+    #[test]
+    fn the_kits_functions_take_their_types_from_their_signatures() {
+        use datafusion::arrow::array::AsArray;
+        let h = load(HELLO, "hello-test").unwrap();
+        let shape = |n: &str| h.functions.iter().find(|f| f.name == n).map(|f| (f.arguments.clone(), f.returns.clone(), f.columns.clone(), f.volatile)).unwrap();
+        assert_eq!(shape("greet"), (vec![DataType::Utf8], DataType::Utf8, vec![], false));
+        assert_eq!(shape("add"), (vec![DataType::Int64, DataType::Int64], DataType::Int64, vec![], false));
+        let int = DataType::Int64;
+        assert_eq!(shape("count_to"), (vec![int.clone()], DataType::Null, vec![("i".to_string(), int.clone()), ("square".to_string(), int)], false));
+        let names: ArrayRef = Arc::new(StringArray::from(vec![Some("Ada Lovelace"), None]));
+        let strings = |a: ArrayRef| a.as_string::<i32>().iter().map(|v| v.map(str::to_string)).collect::<Vec<_>>();
+        assert_eq!(strings(h.call("greet", &[names.clone()], 2).unwrap()), [Some("hello, Ada Lovelace".to_string()), None]);
+        assert_eq!(strings(h.call("initials", &[names], 2).unwrap()), [Some("AL".to_string()), None]);
+        let (seven, zero): (ArrayRef, ArrayRef) = (Arc::new(Int64Array::from(vec![7])), Arc::new(Int64Array::from(vec![0])));
+        let e = h.call("checked_div", &[seven, zero], 1).unwrap_err();
+        assert_eq!((crate::codes::of(&e), e.to_string().as_str()), ("38000", "hello's checked_div: checked_div: division by zero"));
+        let mut rows = h.rows("count_to", &[Arc::new(Int64Array::from(vec![2500])) as ArrayRef], Limits::now()).unwrap();
+        let (mut batches, mut squares) = (0, 0i64);
+        while let Some(b) = rows.next().unwrap() {
+            batches += 1;
+            squares += b.column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().flatten().sum::<i64>();
+        }
+        assert_eq!((batches, squares), (3, 2500 * 2501 * 5001 / 6));
+    }
+
     #[test]
     fn what_isnt_a_component_is_refused() {
         let e = load(b"\0asm\x01\0\0\0", "not-a-component").unwrap_err();

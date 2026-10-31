@@ -1,0 +1,145 @@
+---
+title: Write an extension
+description: Write SQL functions and table functions in Rust, build them once to a WebAssembly file, and install it in any Pondra 1.x.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+An **extension** adds functions to SQL that you write in Rust. You build it once to a `.wasm` file, and
+an admin installs it with one statement. After that every node and every session has its functions,
+and every later Pondra 1.x loads the same file. It needs no rebuild of Pondra or of the extension.
+
+```sql
+INSTALL hello FROM 's3://my-bucket/hello-0.1.wasm';
+SELECT greet(name), add(2, 3) FROM people;
+SELECT * FROM count_to(3);
+```
+
+Each call runs in a sandbox of its own. It reaches no files, no network and no secrets, and it has a
+memory cap and a time limit. A call that misbehaves fails its query, and the node goes on.
+
+## The functions
+
+Start a library crate and depend on `pondra-extension`, the kit (in Pondra's repository at
+`extensions/kit`):
+
+```toml
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pondra-extension = { git = "https://github.com/alimardon123/pondra" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+```
+
+Write each function as a closure over plain Rust values. The kit takes the SQL types from the
+closure's signature:
+
+```rust
+use pondra_extension::Extension;
+
+fn hello() -> Extension {
+    Extension::new("hello", "0.1")
+        .scalar("greet", |name: String| format!("hello, {name}"))
+        .scalar("add", |a: i64, b: i64| a + b)
+        .scalar("initials", |name: Option<String>| {
+            name.map(|n| n.split_whitespace().filter_map(|w| w.chars().next()).collect::<String>())
+        })
+        .scalar("checked_div", |a: i64, b: i64| {
+            if b == 0 { Err("checked_div: division by zero".to_string()) } else { Ok(a / b) }
+        })
+        .table("count_to", ["i", "square"], |n: i64| (1..=n).map(|i| (i, i * i)))
+}
+
+pondra_extension::export!(hello);
+```
+
+| Rust | SQL |
+|---|---|
+| `i64`, `i32` | `BIGINT`, `INT` |
+| `f64` | `DOUBLE` |
+| `bool` | `BOOLEAN` |
+| `String` | `VARCHAR` |
+| `Option<T>` | the same type, with `NULL` as `None` |
+
+- **NULL:** when an argument is a plain type, a `NULL` gives `NULL` and the closure isn't called, as
+  SQL's own functions do. Take an `Option` to see the `NULL` yourself. Answer `None` for `NULL`.
+- **Errors:** answer `Result<T, String>`. An `Err` fails the query with your words (`38000`).
+- **Table functions:** give an iterator of tuples, one value per column, named by the list in
+  `table`. Its rows go to the query a thousand at a time, as the query reads them, so a table
+  function never has to hold all its rows. Read one as `SELECT * FROM name(…)` with literal arguments.
+- **Deterministic unless you say so:** call `.volatile()` after a function whose answer can change
+  between calls with the same arguments. Volatile functions run for each batch, never once for the
+  whole query.
+
+## Build it
+
+Build for `wasm32-unknown-unknown`, then make the module a component with
+[`wasm-tools`](https://github.com/bytecodealliance/wasm-tools):
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-tools
+cargo build --release --target wasm32-unknown-unknown
+wasm-tools component new target/wasm32-unknown-unknown/release/hello.wasm -o hello-0.1.wasm
+```
+
+One file runs everywhere Pondra does: Linux, macOS and Windows, on x86 and ARM. Each node compiles
+it once per Pondra release and keeps the compiled code in its cache folder (`PONDRA_CACHE_DIR`).
+
+## Install it
+
+```sql
+INSTALL hello FROM '/path/on/the/node/hello-0.1.wasm';
+INSTALL hello FROM 'https://example.com/hello-0.1.wasm' VERSION '0.1';
+SHOW EXTENSIONS;
+UNINSTALL hello;
+```
+
+Only an admin installs an extension, and only on a node started with
+`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since 1.0 checks no signatures. The lake keeps the file, so
+a cluster, a branch and a backup all carry it. A function name that another function already has is
+refused (`42723`). The full rules are in the [SQL reference](/pondra/sql/statements/).
+
+## Logs and the clock
+
+An extension reaches only what Pondra offers it, and Pondra 1.0 offers two things:
+
+```rust
+pondra_extension::log("took the slow path");   // a line in the node's log, with the extension's name
+let t = pondra_extension::now_micros();         // microseconds since 1970
+```
+
+A call writes at most 100 log lines. Every function of an extension that reads the clock is
+volatile, whatever it says, so a query spread over several nodes never mixes their times into one
+answer.
+
+Each capability carries its own version (`pondra:log/log@1.0.0`, `pondra:clock/clock@1.0.0`). Later
+releases add new capabilities beside these and never take one away, so a file built today keeps
+loading. A file built for a later Pondra that needs a capability this one lacks is refused at
+`INSTALL`, naming it: `hello (hello-0.2.wasm) needs pondra:http/http@1.0.0, which this Pondra
+doesn't offer …`.
+
+## Limits
+
+| Variable | Default | What it limits |
+|---|---|---|
+| `PONDRA_EXTENSION_MB` | `256` | one call's memory; past it the call fails with `53200` |
+| `PONDRA_EXTENSION_SECS` | `30` | one batch's time; past it the call fails with `57014` |
+| `PONDRA_EXTENSION_FILE_MB` | `64` | the size of a `.wasm` file at `INSTALL` |
+
+<Aside>
+Not in 1.0: aggregates, network and secrets, an index of published extensions with signatures, and
+extensions in the browser page (which refuses `INSTALL` by name). See the
+[roadmap](https://github.com/alimardon123/pondra/blob/main/docs/roadmap.md).
+</Aside>
