@@ -4,7 +4,7 @@
 //! to record the result: one small commit, the leader's job (`Request`, `handle`). A machine that
 //! isn't a node reaches the leader over HTTP, through the bucket when it can't (`inbox.rs`), or
 //! leads for a moment itself when nobody does.
-use crate::terms::{alive, claim, holder, latest, release, Holder};
+use crate::terms::{alive, claim, holder, latest, release, wait_for, Holder};
 use crate::log::{decode_flush, encode_flush, pack, Append, Outcome, Sequencer, Src};
 use crate::query::session;
 use crate::answer::schema;
@@ -20,7 +20,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use crate::text::{first_word, head, ident, object};
 pub(crate) use crate::rules::fit::{by_position, implicit};
@@ -2090,12 +2089,8 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool) 
     let store = open_store(dir)?.1;
     loop {
         match holder(&store).await? {
-            Holder::Recording(t) => {
-                // (another `pondra sql` is recording: wait. One elsewhere that was killed doesn't mark itself when rung)
-                if !crate::terms::deaf(&store, &t).await {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
+            // (another `pondra sql` is recording: wait)
+            Holder::Recording(t) => wait_for(&store, &t).await,
             Holder::Led(t) => {
                 let Some(r) = &req else {
                     // (the lake is led, so its inbox is answered: unless its leader elsewhere doesn't mark itself when rung)
@@ -2127,7 +2122,7 @@ async fn deliver(dir: &str, mut req: Option<Request>, job: &str, one_off: bool) 
                     // Another one-off writer took the catalog while this one was leading (both
                     // found the lake idle). Start over with the same job: whoever wins records it
                     // once, and the rest go through them.
-                    Err(e) if fenced(&e) && tries() < 5 => crate::node::restart_with("fenced while writing", &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())]),
+                    Err(e) if fenced(&e) && tries() < 5 => start_over("fenced while writing", job),
                     // (members this machine can't reach hold acknowledged changes: they choose a leader, and the write goes to it)
                     Err(e) if e.downcast_ref::<crate::replica::Unreached>().is_some() => {
                         eprintln!("{e:#}");
@@ -2324,6 +2319,12 @@ pub(crate) fn tries() -> u32 {
 pub(crate) fn job() -> &'static str {
     static JOB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     JOB.get_or_init(|| crate::env::get("PONDRA_JOB").unwrap_or_else(crate::log::auto_job))
+}
+
+/// Starts a write over with the same job, fenced out by a newer writer: it runs again, one more try each time, so whoever
+/// wins the race records the job once and the rest go through them. Its callers stop starting over after five tries (`tries`).
+pub(crate) fn start_over(why: &str, job: &str) -> ! {
+    crate::node::restart_with(why, &[("PONDRA_JOB", job.to_string()), ("PONDRA_TRIES", (tries() + 1).to_string())])
 }
 
 /// Nobody leads: record the write under our own term, and whatever waits in the inbox, then let go, however it ends.

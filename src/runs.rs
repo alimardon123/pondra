@@ -456,17 +456,13 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     } else if crate::routines::word(p, "after") {
         loop {
             task.after.push(crate::text::object(&p.parse_object_name(false)?));
-            // (`AFTER a FAILED`, `AFTER ANY FAILED`, `AFTER a ALWAYS`: a pipeline's steps, not a task's; `any` and `all` read as names)
-            if crate::routines::word(p, "failed") || crate::routines::word(p, "always") {
-                return Err(crate::codes::coded("0A000", crate::kept::AFTER_FAILED));
-            }
+            pipeline_words(p)?; // (`AFTER a ON FAILURE`, `AFTER a ALWAYS`, `AFTER ANY FAILED`: `any` and `all` read as names)
             if !p.consume_token(&Token::Comma) {
                 break;
             }
         }
-    } else if crate::routines::word(p, "on") && (crate::routines::word(p, "files") || crate::routines::word(p, "change")) {
-        return Err(crate::codes::coded("0A000", crate::kept::ON_FILES)); // (a pipeline's trigger, where a task's SCHEDULE or AFTER goes)
     } else {
+        pipeline_words(p)?; // (`ON FAILURE OF a`, `ALWAYS`, `ON FILES`, `ON CHANGE OF`, where a task's SCHEDULE or AFTER goes)
         bail!("SCHEDULE '…' or AFTER task is missing");
     }
     if p.parse_keyword(Keyword::WHEN) {
@@ -482,6 +478,25 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
     Ok((name, task))
 }
 
+
+/// A pipeline's words in a task's head, refused by name (0A000): a step's `ON FAILURE [OF step]` and `ALWAYS` (and the older
+/// `FAILED`), after a task's AFTER or in its place (`kept::ON_FAILURE`); a pipeline's `ON FILES` and `ON CHANGE OF`
+/// (`kept::ON_FILES`).
+fn pipeline_words(p: &mut Parser) -> Result<()> {
+    use crate::routines::word;
+    if word(p, "failed") || word(p, "always") {
+        return Err(crate::codes::coded("0A000", crate::kept::ON_FAILURE));
+    }
+    if word(p, "on") {
+        if word(p, "failure") {
+            return Err(crate::codes::coded("0A000", crate::kept::ON_FAILURE));
+        }
+        if word(p, "files") || word(p, "change") {
+            return Err(crate::codes::coded("0A000", crate::kept::ON_FILES));
+        }
+    }
+    Ok(())
+}
 
 /// Where a token starts in `sql` (sqlparser counts lines and characters from 1).
 pub(crate) fn offset(sql: &str, at: datafusion::sql::sqlparser::tokenizer::Location) -> usize {
@@ -1159,12 +1174,22 @@ mod tests {
         };
         assert!(head("CREATE TASK t AFTER a AS SELECT 1").is_ok());
         assert!(head("CREATE TASK t SCHEDULE '1 hour' AS SELECT 1").is_ok());
-        assert_eq!(head("CREATE TASK t AFTER a FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
-        assert_eq!(head("CREATE TASK t AFTER a, b FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
-        assert_eq!(head("CREATE TASK t AFTER a ALWAYS AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
-        assert_eq!(head("CREATE TASK t AFTER ANY FAILED AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
-        assert_eq!(head("CREATE TASK t AFTER ALL ALWAYS AS SELECT 1").unwrap_err(), crate::kept::AFTER_FAILED);
+        for sql in [
+            "CREATE TASK t ON FAILURE AS SELECT 1",
+            "CREATE TASK t ON FAILURE OF a AS SELECT 1",
+            "CREATE TASK t ALWAYS AS SELECT 1",
+            "CREATE TASK t AFTER a ON FAILURE AS SELECT 1",
+            "CREATE TASK t AFTER a, b ALWAYS AS SELECT 1",
+            "CREATE TASK t AFTER a FAILED AS SELECT 1",
+            "CREATE TASK t AFTER a, b FAILED AS SELECT 1",
+            "CREATE TASK t AFTER ANY FAILED AS SELECT 1",
+            "CREATE TASK t AFTER ALL ALWAYS AS SELECT 1",
+        ] {
+            assert_eq!(head(sql).unwrap_err(), crate::kept::ON_FAILURE, "{sql}");
+        }
         assert_eq!(head("CREATE TASK t ON FILES 'landing/' AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
+        assert_eq!(head("CREATE TASK t AFTER a ON FILES 'landing/' AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
+        assert!(head("CREATE TASK t AS SELECT 1").unwrap_err().contains("SCHEDULE '…' or AFTER task is missing"));
         assert_eq!(head("CREATE TASK t ON CHANGE OF sales.orders AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
     }
 

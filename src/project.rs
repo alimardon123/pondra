@@ -745,14 +745,14 @@ fn keep_login(base: &str, token: String) -> Result<()> {
 
 // ---------------------------------------------------------------- the project's files
 
-/// The files an apply reads: pondra.toml, objects/**/*.sql, migrations/*.sql, seeds/*.sql, tests/*.sql, and the YAML files
-/// under objects/ (listed by name, not read: apply refuses them).
+/// The files an apply reads: pondra.toml, objects/**/*.sql, migrations/*.sql, seeds/*.sql, tests/*.sql, and the YAML and
+/// Python files under objects/ (listed by name, not read: apply refuses them, `apply::later_object`).
 fn files(dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     let toml = dir.join("pondra.toml");
     ensure!(toml.exists(), "{} holds no pondra.toml: pondra init starts a project, pondra export writes one from a database", dir.display());
     out.insert("pondra.toml".into(), std::fs::read_to_string(&toml)?);
-    fn walk(root: &Path, at: &Path, deep: bool, yaml: bool, out: &mut BTreeMap<String, String>) -> Result<()> {
+    fn walk(root: &Path, at: &Path, deep: bool, later: bool, out: &mut BTreeMap<String, String>) -> Result<()> {
         let Ok(entries) = std::fs::read_dir(at) else { return Ok(()) };
         for e in entries {
             let p = e?.path();
@@ -762,20 +762,20 @@ fn files(dir: &Path) -> Result<BTreeMap<String, String>> {
             }
             if p.is_dir() {
                 if deep {
-                    walk(root, &p, deep, yaml, out)?;
+                    walk(root, &p, deep, later, out)?;
                 }
             } else {
                 let rel = p.strip_prefix(root)?.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join("/");
                 if name.ends_with(".sql") {
                     out.insert(rel, std::fs::read_to_string(&p).with_context(|| p.display().to_string())?);
-                } else if yaml && crate::apply::yaml_object(&rel) {
+                } else if later && crate::apply::later_object(&rel).is_some() {
                     out.insert(rel, String::new()); // (listed, not read: apply refuses it by name, as the SQL door does)
                 }
             }
         }
         Ok(())
     }
-    walk(dir, &dir.join("objects"), true, true, &mut out)?; // (the only walk that lists YAML: under objects/)
+    walk(dir, &dir.join("objects"), true, true, &mut out)?; // (the only walk that lists what 1.0 refuses: under objects/)
     walk(dir, &dir.join("migrations"), false, false, &mut out)?;
     walk(dir, &dir.join("seeds"), false, false, &mut out)?;
     walk(dir, &dir.join("tests"), false, false, &mut out)?;

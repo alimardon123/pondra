@@ -6,7 +6,7 @@
 //! `crm.t`, and one made without a path reads `t` as public, whoever reads it (`routines::expand_stored`).
 //! Names already full, and this lake's own `public`, come out as they went in.
 use crate::ddl::{self, lake_name};
-use crate::text::{join, PUBLIC};
+use crate::text::{contains_ci, join, PUBLIC};
 use crate::codes::coded;
 use crate::store::{table_key, Lake};
 use anyhow::{Context, Result};
@@ -284,9 +284,6 @@ fn part(p: &str) -> ObjectNamePart {
 fn text_of(here: &str, entries: &[(String, String)]) -> String {
     entries.iter().map(|(d, s)| if d.as_str() == here { quoted(s) } else { format!("{}.{}", quoted(d), quoted(s)) }).collect::<Vec<_>>().join(", ")
 }
-
-/// Does `hay` hold `needle`, whatever its case?
-fn contains_ci(hay: &str, needle: &str) -> bool { hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes())) }
 
 fn mentions_current(sql: &str) -> bool {
     ["current_schema", "current_database", "current_catalog"].iter().any(|w| contains_ci(sql, w))

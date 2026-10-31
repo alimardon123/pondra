@@ -123,6 +123,9 @@ pub fn head(sql: &str) -> String {
     first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
 }
 
+/// Does `hay` hold `needle`, whatever its case? (A byte scan: a query is not lower-cased to ask.)
+pub fn contains_ci(hay: &str, needle: &str) -> bool { hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes())) }
+
 /// The word of the write a query makes (`WITH … INSERT`, `… UPDATE`, `… DELETE`, `… MERGE`), or None for one that only
 /// reads. sqlparser reads each of those as a query whose body is the write, so the body is what says it.
 pub fn write_of(q: &Query) -> Option<&'static str> {

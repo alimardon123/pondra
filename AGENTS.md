@@ -510,9 +510,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    claimer's own machine nobody waits: a term names its lock file (invariant 370), and a free one
    means its process ended, so the next node or writer there claims at once. Elsewhere, a claimer
    that says so in its term (`Term::bell`) looks at the inbox's bell every second and marks its
-   term when it rang (`cluster::listen`), on bucket turns of its own (`budget::urgent`), so a scan
+   term when it rang (`terms::listen`), on bucket turns of its own (`budget::urgent`), so a scan
    holding every other turn doesn't stop it. A writer that would wait rings and watches the mark
-   (`cluster::deaf`, `cluster::Ear`): none in 5 s, by its own clock, means the claimer is gone (a
+   (`terms::deaf`, `terms::Ear`, `terms::wait_for`): none in 5 s, by its own clock, means the claimer is gone (a
    process killed or a machine lost: nothing marks for it), and it claims. One that answered isn't
    rung again by that process for 30 s. `harness.py serverless`: a writer elsewhere that can't
    reach a live leader writes through the inbox and leaves its term; after the leader is killed,
@@ -2490,7 +2490,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    keeps its SQLSTATE (`matcher::external`). `harness.py patterns`: 600 random patterns == a reference matcher
    written from the standard; three nodes == one node.
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
-   (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
+   (`terms::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
    only while it is the user's alone), and names `id` in its term (`Term.lock`, 32 hex characters,
    never a path). The OS lets go when the process ends, however it ends. A node or writer on that
@@ -2564,7 +2564,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    0.33 can't read a user holding one, so it waits until every node knows format 4. A new kind of grant
    is stored as one an older node reads (a sequence's as `On::Table`), or waits for its format.
    `upgrade_check.py format`: "…a grant on another database, to 4; and Pondra 0.33.0 then refuses it by
-   name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
+   name". And `terms::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
    down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
 
 378. **A node a program started answers only that program** (`Auth::owned`, `App::open`,
@@ -3009,14 +3009,14 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`smallint`, `bigint`; `numeric field overflow` for a decimal); never a quiet NULL, never Arrow's words. INSERT, a
    bulk INSERT, COPY INTO, the Postgres port's COPY, setval and a DEFAULT's check all cast through `casts::into`, and
    a new write path does too. `cargo test --lib casts:: codes::`, harness `loads`, `found`.
-434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`cluster::claim`,
+434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`terms::claim`,
    `prune`). After its put, a claim lists `cluster/term` while it writes its `alive` mark, one round trip for both: a term
    above its own number means a newer leader holds the lake, so the claim deletes its own `alive` mark, lets its lock go,
    and returns no term (its record stays; a later prune removes it). Above 32 terms, the claim also lists `alive` and `left`
    (one round trip) and deletes everything below the newest 16, awaited and capped at 10 s, so a one-off writer's prune
    finishes before it exits. A lake of 32 or fewer pays no more than the term listing. The superseded check holds
-   (`cluster::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
-   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib cluster::`; harness `serverless`
+   (`terms::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
+   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib terms::`; harness `serverless`
    (34 one-off INSERTs, which cross 32: at most 32 terms kept, the newest among them, the table reads back 34 rows, and
    nothing below the oldest kept in `alive` or `left`).
 ## Tests: run these before and after any change

@@ -3,7 +3,7 @@
 //! written by every node at once, each its own share's files (`spmd::copy`): nothing crosses
 //! between the nodes but how many rows each wrote.
 use crate::ext::{covering, list, owner, register, uncovered};
-use crate::ext_names::{format_of, scheme, NULL_FOLDER};
+use crate::ext_names::{compression_in, compression_named, compression_of, format_of, name_options, scheme, NULL_FOLDER};
 use crate::log::{forget_producers, now_ms};
 use crate::app::App;
 use crate::store::{json, producer_key, table_key, Lake, TableMeta, QUIET};
@@ -84,12 +84,22 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         }).await; // (a table, not files: ADR-028)
     }
     ensure!(["parquet", "csv", "json", "arrow"].contains(&format.as_str()), "COPY … TO as {format}: parquet, csv, json, arrow, delta or iceberg");
-    ensure!(format == "parquet" || !options.contains_key("compression") && !options.contains_key("row_group_size"), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (files are read as they are: not compressed)");
+    let text = matches!(format.as_str(), "csv" | "json"); // (the formats a compression is written in as well as Parquet)
+    ensure!(format == "parquet" || !options.contains_key("row_group_size") && (text || !options.contains_key("compression")), "COPY … TO as {format}: COMPRESSION and ROW_GROUP_SIZE are Parquet's (CSV and JSON take COMPRESSION gzip, zstd, bzip2 or xz)");
     if let Some((k, _)) = options.iter().find(|(k, v)| !KNOWN.contains(&k.as_str()) && writer(k, v) != Some(format.as_str())) {
         bail!("COPY … TO as {format}: {k} isn't {format}'s option");
     }
+    // A CSV or JSON file is compressed as COMPRESSION says, or as the name's ending says (`out.csv.gz`). Named here, before a
+    // folder that holds files is emptied, so a name the writer can't take is refused with the folder as it was.
+    let mut options = options.clone();
+    if text {
+        if let Some(c) = options.get("compression").cloned().or_else(|| compression_of(to).map(String::from)) {
+            compression_named(&c)?;
+            options.insert("compression".into(), c);
+        }
+    }
     let partition: Vec<String> = options.get("partition_by").map(|p| p.split(',').map(|c| c.trim().to_string()).collect()).unwrap_or_default();
-    let target = Target { to: to.into(), format, partition, options: options.clone() };
+    let target = Target { to: to.into(), format, partition, options };
     let mut kept = HashSet::new(); // (what the folder held before, and holds on)
     if target.folder() {
         // What is there: kept and added to, replaced, or a mistake (Spark's and DuckDB's default).
@@ -201,11 +211,13 @@ pub async fn write(mut df: DataFrame, t: &Target) -> Result<u64> {
             df.write_parquet(&t.to, write, Some(parquet)).await?
         }
         "json" => {
-            let json = own(datafusion::common::config::JsonOptions::default(), "json", options)?;
+            let mut json = own(datafusion::common::config::JsonOptions::default(), "json", options)?;
+            json.compression = compression_in(options)?;
             df.write_json(&t.to, write, Some(json)).await?
         }
         "csv" => {
             let mut csv = own(datafusion::common::config::CsvOptions::default(), "csv", options)?.with_has_header(options.get("header").is_none_or(|h| !h.eq_ignore_ascii_case("false")));
+            csv.compression = compression_in(options)?;
             if let Some(d) = options.get("delimiter").or(options.get("delim")).or(options.get("sep")) {
                 csv = csv.with_delimiter(d.bytes().next().filter(|_| d.len() == 1).context("DELIMITER is one character")?);
             }
@@ -235,7 +247,7 @@ pub enum Source {
 }
 
 /// The options `COPY INTO` takes: the reader's own (`read_*`'s names) and FORCE.
-const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "all_varchar", "force"];
+const LOAD_KNOWN: &[&str] = &["format", "header", "delim", "sep", "delimiter", "quote", "escape", "comment", "new_line", "all_varchar", "compression", "force"];
 
 /// How long a file's load record is kept, and so how old a file may be and still be loaded again
 /// without FORCE: a file last changed before this window is skipped, as its record may be gone
@@ -380,7 +392,7 @@ async fn plan(lake: &Lake, from: &Source, options: &BTreeMap<String, String>) ->
             // (a relative path is the owner's folder's, made whole here; a client's is read as `objects` maps it: the lake's files)
             let p = if scheme(p).is_none() && owner() { crate::ddl::full(p)? } else { p.clone() };
             let (format, mut reader) = match options.get("format") {
-                Some(f) => (f.to_lowercase(), BTreeMap::new()),
+                Some(f) => (f.to_lowercase(), name_options(&f.to_lowercase(), &p)?),
                 None => format_of(p.trim_end_matches('/')).context("COPY INTO: which FORMAT? (csv, parquet, json or arrow)")?,
             };
             reader.extend(options.iter().filter(|(k, _)| !matches!(k.as_str(), "format" | "force")).map(|(k, v)| (k.clone(), v.clone())));

@@ -32,6 +32,7 @@ use arrow_flight::sql::{Any, ActionBeginTransactionRequest, ActionBeginTransacti
 use arrow_flight::{Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::execution::memory_pool::MemoryReservation;
 use bytes::Bytes;
 use futures::{Stream, StreamExt, TryStreamExt};
 use prost::Message;
@@ -47,7 +48,10 @@ pub async fn serve(app: App, addr: String) -> anyhow::Result<()> {
     // (a message up to 1 GiB, as HTTP takes a batch, but only from a caller `Gate` has signed in)
     let service = FlightServiceServer::new(Door(Sql(app.clone()))).max_decoding_message_size(1 << 30).max_encoding_message_size(1 << 30);
     let doors = crate::tls::Doors::bind(&addr, crate::tls::Door::Flight).await?; // (TLS too: `tls.rs`)
-    tonic::transport::Server::builder().add_service(Gate { app, inner: service }).serve_with_incoming(doors.stream()).await?;
+    // (it closes with the HTTP door, gracefully: the answers being written go out whole, and the node's stop waits for its
+    // connections to close, `drain::Serving`, as an answer's last messages may still be in one when its stream has ended)
+    let _serving = crate::drain::Serving::new();
+    tonic::transport::Server::builder().add_service(Gate { app, inner: service }).serve_with_incoming_shutdown(doors.stream(), crate::drain::closing()).await?;
     Ok(())
 }
 
@@ -363,8 +367,10 @@ fn rows_of(got: Answer<Vec<RecordBatch>>) -> Result<Vec<RecordBatch>, Status> {
 }
 
 /// A script, a CALL or a write with RETURNING, as a statement's info: run now, as every door runs a statement, and its
-/// answer kept for the ticket to read back (`kept:`, ten minutes: `KEPT`). The info's schema is the answer's.
+/// answer kept for the ticket to read back (`kept:`, `KEPT`, until `KEPT_FOR`). The answer counts in the query memory while
+/// it is kept. The info's schema is the answer's.
 async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]>, descriptor: FlightDescriptor) -> Result<Response<FlightInfo>, Status> {
+    let pool = app.lake.rt.memory_pool.clone();
     let (app, sql) = (app.clone(), sql.to_string());
     let batches = worked(txn, async move {
         let req = crate::routines::Request { sql, ..Default::default() };
@@ -373,10 +379,10 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
     })
     .await?;
     let schema = first_announced(&batches);
+    // (a read token's script could keep answers that no ticket reads: counted here, they are bounded by the query memory)
+    let reserved = crate::query::kept_memory(&pool, &batches).ok_or_else(|| status(crate::query::too_big()))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let mut held = KEPT.lock().unwrap();
-    held.retain(|_, (_, at)| at.elapsed() < std::time::Duration::from_secs(600));
-    held.insert(id.clone(), (batches, std::time::Instant::now()));
+    KEPT.lock().unwrap().insert(id.clone(), (batches, std::time::Instant::now(), reserved));
     let ticket = TicketStatementQuery { statement_handle: format!("kept:{id}").into_bytes().into() };
     info(&schema, ticket.as_any().encode_to_vec(), descriptor)
 }
@@ -398,7 +404,8 @@ fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64
 /// query run now, as `who`.
 async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
     if let Some(id) = sql.strip_prefix("kept:") {
-        let Some((batches, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
+        // (the entry's memory goes with it: the batches stream out from here, as a query's answer does once it is returned)
+        let Some((batches, _, _)) = KEPT.lock().unwrap().remove(id) else { return Err(refused("34000", "that answer was read already, or is gone")) };
         return Ok((Arc::new(first_announced(&batches)), batches));
     }
     if let Some(n) = sql.strip_prefix("rows:").and_then(|n| n.parse::<i64>().ok()) {
@@ -414,6 +421,7 @@ async fn answer(app: &App, sql: &str, who: crate::routines::Who) -> Result<(Sche
 /// watch (`oom.rs`) may stop a query that grew the node, and a long one moves to the queries' runtime
 /// (invariant 231). A statement the node stopped for memory fails its transaction, as on HTTP and Postgres.
 async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Future<Output = Result<T, Status>> + Send + 'static) -> Result<T, Status> {
+    prune_kept(); // (every Flight call that runs work lets go of the kept answers that expired, not only a script's)
     let session = txn.map(in_txn).transpose()?;
     let failing = session.clone();
     let f = crate::auth::carried(in_session(session, f));
@@ -433,7 +441,7 @@ async fn worked<T: Send + 'static>(txn: Option<&[u8]>, f: impl std::future::Futu
 /// What a statement's work hands its Flight stream: its whole answer, or the pieces its plan made (`query::Handed`), with the
 /// count its body holds until the last piece is read (`drain::Busy`).
 enum Sent {
-    Whole(SchemaRef, Vec<RecordBatch>),
+    Whole(SchemaRef, Vec<RecordBatch>, crate::drain::Busy),
     Pieces(crate::query::Handed, crate::drain::Busy),
 }
 
@@ -454,7 +462,7 @@ where
             biased;
             done = &mut go => match handed.try_recv() {
                 Ok(h) => Ok(Sent::Pieces(h, crate::drain::Busy::carried())), // (handed as the statement ended: its rows still come in pieces)
-                Err(_) => done.map(|(schema, batches)| Sent::Whole(schema, batches)),
+                Err(_) => done.map(|(schema, batches)| Sent::Whole(schema, batches, crate::drain::Busy::carried())), // (its messages are written as the client reads them, as the pieces' are)
             },
             Ok(h) = &mut handed => {
                 // (the rest of the statement runs on the queries' runtime while the client reads its pieces, as the request that asked)
@@ -465,15 +473,16 @@ where
     })
     .await?;
     Ok(match sent {
-        Sent::Whole(schema, batches) => whole(schema, batches),
+        Sent::Whole(schema, batches, busy) => whole(schema, batches, busy),
         Sent::Pieces(h, busy) => piece_stream(h, busy),
     })
 }
 
 /// A statement's whole answer as Flight data, encoded as the client reads it: its pieces (`answer::pieces`) through one
 /// Arrow encoder on `schema` (`answer::Encoding::with_schema`), each step's messages as the step is written. With no batches,
-/// the schema and the end. An encoding error ends the stream with its status.
-fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
+/// the schema and the end. An encoding error ends the stream with its status. `busy` is held until the stream ends or is
+/// dropped, as `piece_stream`'s is.
+fn whole(schema: SchemaRef, batches: Vec<RecordBatch>, busy: crate::drain::Busy) -> Out<FlightData> {
     // (at most one piece: the answer is encoded at once, its piece then its end, as the stream below writes them, and is
     // sent as those messages; an encoding error ends it after the messages before it, as the stream does)
     let mut pieces = crate::answer::pieces(batches.into_iter().map(|b| crate::answer::as_sent(b, Some("arrow"))));
@@ -494,17 +503,22 @@ fn whole(schema: SchemaRef, batches: Vec<RecordBatch>) -> Out<FlightData> {
                 }
             }
         }
-        return Box::pin(futures::stream::iter(out));
+        return Box::pin(futures::stream::unfold((futures::stream::iter(out), busy), |(mut out, busy)| async move {
+            match out.next().await {
+                Some(item) => Some((item, (out, busy))),
+                None => None,
+            }
+        }));
     }
     let pieces = pieces.into_iter();
-    let steps = futures::stream::try_unfold(Some((crate::answer::Encoding::with_schema(schema), pieces)), |state| async move {
+    let steps = futures::stream::try_unfold((Some((crate::answer::Encoding::with_schema(schema), pieces)), busy), |(state, busy)| async move {
         let Some((mut enc, mut pieces)) = state else { return Ok::<_, Status>(None) };
         let (step, next) = match pieces.next() {
             Some(piece) => (enc.step(Some(&piece)), Some((enc, pieces))),
             None => (enc.step(None), None),
         };
         let data = step.and_then(|bytes| messages(Bytes::from(bytes))).map_err(status)?;
-        Ok(Some((data, next)))
+        Ok(Some((data, (next, busy))))
     });
     Box::pin(steps.map_ok(|data| futures::stream::iter(data.into_iter().map(Ok))).try_flatten())
 }
@@ -536,8 +550,16 @@ fn piece_stream(h: crate::query::Handed, busy: crate::drain::Busy) -> Out<Flight
 }
 
 crate::per_node!(
-    /// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (10 minutes).
-    static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant)>> = Default::default());
+    /// A script's or CALL's answer, run when its flight was asked for, until its ticket reads it (`KEPT_FOR`), with the
+    /// query memory its batches hold while it is kept.
+    static KEPT: std::sync::Mutex<std::collections::HashMap<String, (Vec<RecordBatch>, std::time::Instant, MemoryReservation)>> = Default::default());
+
+/// How long a kept answer waits for its ticket to read it.
+const KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Lets go of the kept answers older than `KEPT_FOR`, and with them their memory. `worked` calls it, so every Flight call that
+/// runs work does.
+fn prune_kept() { KEPT.lock().unwrap().retain(|_, (_, at, _)| at.elapsed() < KEPT_FOR); }
 
 /// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
@@ -566,11 +588,12 @@ async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
 }
 
 /// BEGIN, COMMIT, ROLLBACK and SAVEPOINT in SQL are refused, with or without a transaction id: a
-/// Flight SQL transaction is begun and ended by its own actions, as the protocol has it.
+/// Flight SQL transaction is begun and ended by its own actions, as the protocol has it. Every statement of
+/// the text is checked (`SELECT 1; COMMIT` is a script, and running it would commit).
 fn no_sql_transaction(sql: &str) -> Result<(), Status> {
-    match crate::text::control(sql) {
-        Some(_) => Err(status(crate::codes::coded("0A000", "Flight SQL's transactions are the protocol's own: BeginTransaction (ADBC: autocommit off), then EndTransaction (commit or rollback); BEGIN, COMMIT and ROLLBACK aren't run as SQL"))),
-        None => Ok(()),
+    match crate::routines::split(sql).iter().any(|one| crate::text::control(one).is_some()) {
+        true => Err(status(crate::codes::coded("0A000", crate::txn::PROTOCOL_OWN))),
+        false => Ok(()),
     }
 }
 
@@ -855,7 +878,7 @@ impl FlightSqlService for Sql {
         allowed(&self.0, &req, Role::Read)?;
         let id = format!("fl-{}", uuid::Uuid::new_v4().simple()); // (the client's handle; its session is the caller's own, named by it)
         crate::temp::with(&crate::temp::id(&id), false, |_| Ok(())).map_err(status)?; // (held as a session: an idle one ends, its transaction rolled back, as `temp::reap` does)
-        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::command(&self.0, "BEGIN", "BEGIN")).await.map_err(status)?;
+        crate::temp::SESSION.scope(Some(crate::temp::id(&id)), crate::txn::protocol(&self.0, "BEGIN")).await.map_err(status)?;
         Ok(ActionBeginTransactionResult { transaction_id: id.into_bytes().into() })
     }
 
@@ -869,7 +892,7 @@ impl FlightSqlService for Sql {
         let session = in_txn(&q.transaction_id)?;
         // (no statement text: COMMIT and ROLLBACK take none, only BEGIN's modes do)
         let app = self.0.clone();
-        let out = worked(Some(&q.transaction_id[..]), async move { crate::txn::command(&app, word, "").await.map_err(status) }).await;
+        let out = worked(Some(&q.transaction_id[..]), async move { crate::txn::protocol(&app, word).await.map_err(status) }).await;
         crate::temp::end(&session); // (the session ends with its transaction, committed or not)
         let (tag, _) = out?;
         if word == "COMMIT" && tag == "ROLLBACK" {
@@ -1195,12 +1218,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(plan), vec![cast(&strings, &dict)?, view])?;
         let names_and_types = |s: &Schema| s.fields().iter().map(|f| (f.name().clone(), f.data_type().clone())).collect::<Vec<_>>();
 
-        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch]).try_collect().await?;
+        let sent: Vec<FlightData> = whole(schema.clone(), vec![batch], crate::drain::Busy::new()).try_collect().await?;
         let streamed = arrow_flight::utils::flight_data_to_batches(&sent)?;
         assert_eq!(names_and_types(streamed[0].schema().as_ref()), names_and_types(&schema));
         assert_eq!(streamed[0].column(0).data_type(), &DataType::Utf8, "a dictionary arrives as its values");
 
-        let empty: Vec<FlightData> = whole(schema.clone(), vec![]).try_collect().await?;
+        let empty: Vec<FlightData> = whole(schema.clone(), vec![], crate::drain::Busy::new()).try_collect().await?;
         assert_eq!(empty.len(), 1, "the schema alone");
         assert_eq!(names_and_types(&Schema::try_from(&empty[0])?), names_and_types(&schema));
         Ok(())
@@ -1214,6 +1237,16 @@ mod tests {
         let mut own = Status::unimplemented("no");
         own.metadata_mut().insert("x-pondra-sqlstate", tonic::metadata::MetadataValue::from_static("42P01"));
         assert_eq!(header(coded(own)), "42P01");
+    }
+
+    #[test]
+    fn no_sql_transaction_refuses_a_transaction_word_in_any_statement() {
+        for sql in ["SELECT 1; COMMIT", "select 1;\nrollback", "BEGIN; SELECT 1"] {
+            assert!(no_sql_transaction(sql).is_err(), "{sql:?} runs a transaction word");
+        }
+        for sql in ["SELECT 1", "SELECT 'COMMIT'", "SELECT 1; SELECT 2"] {
+            assert!(no_sql_transaction(sql).is_ok(), "{sql:?} runs none");
+        }
     }
 
     #[test]

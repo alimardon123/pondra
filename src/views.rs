@@ -57,6 +57,9 @@ pub struct View {
     /// Kept current by key (ADR-056): the groups new and changed rows touch, worked out again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun: Option<crate::rerun::Rerun>,
+    /// A MATCH_RECOGNIZE with EMIT FINAL (`matches.rs`): each match written once, when it is decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<crate::matches::Matches>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -202,17 +205,23 @@ impl View {
     }
     /// Are its rows derived as flushes are packed (`derive`)? Sessions are cut as they close,
     /// stream joins and views kept by key run once rows commit.
-    pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() }
+    pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() && self.matches.is_none() }
 }
 
 /// A view's stored text as it was written, with the measures' and MATCH_RECOGNIZE's rewrites taken back
 /// (`measures::written`, `pattern::shown`): what every door that shows a definition shows.
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
+/// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
+/// code (`auth::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
+/// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
+pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::auth::shows_code().then(text) }
+
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
     let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
     p.extend([crate::rerun::producer(name), format!("{}:deleted", crate::rerun::producer(name))]);
+    p.extend(crate::matches::producers(name));
     p
 }
 
@@ -605,7 +614,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
     let written = finish.is_some().then(|| written.to_string());
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -637,7 +646,7 @@ async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &
 }
 
 /// `pondra$expectations`: what each view's expectations failed, and its late rows (`once::late`).
-fn expected_table(lake: &Lake) -> TableMeta {
+pub(crate) fn expected_table(lake: &Lake) -> TableMeta {
     let s = |c: &str| (c.to_string(), "Utf8".to_string());
     let columns = vec![s("view"), s("id"), s("expectation"), s("action"), ("failed".into(), "Int64".into())];
     let key = ["view", "id", "expectation", "action"].map(String::from).to_vec();
@@ -741,7 +750,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, &with, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -789,17 +798,18 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
     Some(c.name.clone())
 }
 
-/// Leader: emit what the watermark has passed, once, for every window and session view (one
-/// that fails is tried again next round; the others go on).
-pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+/// Leader: emit what the watermark has passed, once, for every window, session and EMIT FINAL view (one
+/// that fails is tried again next round; the others go on). A matches view's run writes through `seq`, under `lock`.
+pub async fn emit_all(lake: &Lake, log: &crate::log::Log, seq: &std::sync::Arc<crate::log::Sequencer>, lock: &std::sync::Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     if crate::backup::frozen(lake) {
         return Ok(()); // (a backup emits nothing: ADR-070)
     }
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        let done = match (&v.emit, &v.sessions, &v.once) {
-            (Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,
-            (_, Some(s), _) => sessions(lake, log, &key[2..], &v, s).await,
-            (_, _, Some(o)) => crate::once::emit(lake, log, &key[2..], &v, o).await,
+        let done = match (&v.matches, &v.emit, &v.sessions, &v.once) {
+            (Some(m), _, _, _) => crate::matches::run(lake, log, seq, lock, &key[2..], &v, m).await,
+            (_, Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,
+            (_, _, Some(s), _) => sessions(lake, log, &key[2..], &v, s).await,
+            (_, _, _, Some(o)) => crate::once::emit(lake, log, &key[2..], &v, o).await,
             _ => Ok(()),
         };
         if let Err(e) = done {
@@ -986,13 +996,13 @@ pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
 /// What follows `table` and can't take its rows' changes, and why: its views, what follows them
 /// (a flow: a row-by-row view's rows change as its source's do; a GROUP BY view's partial rows
 /// taken back arrive as new ones), and its tasks.
-async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
+pub(crate) async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
     let mut not = vec![];
     for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.follows(table)) {
         let name = &k[2..];
         let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
         let why = match () {
-            _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() => Some("emits windows or sessions once"),
+            _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() || v.matches.is_some() => Some("emits windows, sessions or matches once"),
             _ if v.join.is_some() => Some("pairs two streams' rows as they arrive"),
             _ if v.rerun.is_some() => None, // (it works the groups a change touches out again)
             _ if !append => None,
@@ -1409,7 +1419,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, sql, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -1528,6 +1538,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
             histories.insert(name.clone());
         }
         kinds.push(match () {
+            _ if v.matches.is_some() => "matches",
             _ if v.emit.is_some() || v.once.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
@@ -1549,27 +1560,46 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
-    let late = |v: &View| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), crate::once::LATE.to_string())).copied().unwrap_or(0);
+    // (a view's late rows are counted under its fill's id; a matches view's, under its own)
+    let late = |v: &View| {
+        let id = v.matches.as_ref().map(|m| m.id.clone()).or_else(|| v.fill.as_ref().map(|f| f.id.clone())).unwrap_or_default();
+        failed.get(&(id, crate::once::LATE.to_string())).copied().unwrap_or(0)
+    };
     let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
-        ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
+        ("follows", s(&|_, (_, v)| code_for_caller(|| v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
         ("refresh", s(&|_, (_, v)| Some(v.rerun.as_ref().map_or("incremental", |r| if r.full.is_some() { "full" } else { "by key" }).to_string()))),
         ("reason", s(&|_, (_, v)| v.rerun.as_ref().map(|b| b.reason.clone()))),
-        ("reads", s(&|_, (_, v)| reads(v))),
+        ("reads", s(&|_, (_, v)| code_for_caller(|| reads(v)).flatten())),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
-        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
-        ("definition", s(&|_, (_, v)| Some(shown(v.query())))),
+        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| (v.once.is_some() || v.matches.is_some()).then(|| late(v))).collect::<Int64Array>())),
+        ("definition", s(&|_, (_, v)| code_for_caller(|| shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let expectations = RecordBatch::try_from_iter(vec![
         ("view", e(&|(n, _, _)| n.to_string())),
         ("expectation", e(&|(_, _, x)| x.name.clone())),
-        ("condition", e(&|(_, _, x)| x.check.clone())),
+        ("condition", std::sync::Arc::new(all.iter().map(|(_, _, x)| code_for_caller(|| x.check.clone())).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef),
         ("on_violation", e(&|(_, _, x)| x.on.word().to_string())),
         ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
     ])?;
     let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     Ok(vec![("flows", mem(flows)?), ("expectations", mem(expectations)?)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Principal, Role, WHO};
+
+    #[tokio::test]
+    async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
+        // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
+        let reader = Principal { access: Some(std::sync::Arc::new(crate::users::Access::default())), ..Principal::of(Role::Read) };
+        let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
+        assert_eq!(query(reader).await, None);
+        assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));
+    }
 }

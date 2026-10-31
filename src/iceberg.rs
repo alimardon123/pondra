@@ -6,7 +6,8 @@
 //!
 //! As with Delta, it is derived from committed catalog state only. Version N is snapshot N and
 //! sequence number N; a version an earlier attempt wrote but never recorded is skipped, never
-//! rewritten. Pondra's Parquet files carry no Iceberg field ids, so columns are mapped by name
+//! rewritten. Pondra's Parquet files carry each column's Iceberg field id (`tier.rs`, `field_ids`);
+//! files written before round 26 carry none, so the metadata also maps columns by name
 //! (`schema.name-mapping.default`).
 use crate::delta::{columns, file_ranges, Column, Range};
 use crate::store::*;

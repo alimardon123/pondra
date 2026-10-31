@@ -89,7 +89,7 @@ pub fn router(app: App) -> Router {
                 None => crate::apply::export_here(&app.lake).await?,
             }))
         }))
-        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
+        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
@@ -384,7 +384,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Ok(r) => r,
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
-                failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+                crate::statement::failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
             }
             E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
         }
@@ -396,15 +396,6 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
 /// its client.
 fn stoppable(path: &str) -> bool {
     matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/")
-}
-
-/// A statement the node stopped for memory fails its session's transaction, as an error does
-/// (`txn::failed`): the session is found as `sql` finds it, for the caller that asked.
-fn failed_for_memory(who: crate::auth::Principal, headers: &axum::http::HeaderMap) {
-    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
-    if let Some(s) = session {
-        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
-    }
 }
 
 /// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,

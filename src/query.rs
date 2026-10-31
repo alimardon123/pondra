@@ -12,8 +12,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
 use datafusion::common::utils::memory::RecordBatchMemoryCounter;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation, PeakRecordingPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::{SessionState, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
@@ -1019,8 +1020,17 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
     Ok(out)
 }
 
+/// The memory an answer kept for a ticket to read back holds in `pool` (Flight's `kept`): its batches counted as `gather`
+/// counts them, each buffer once. None when it doesn't fit: the caller refuses it with `too_big`, and keeps nothing.
+pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Option<MemoryReservation> {
+    let held = MemoryConsumer::new("a Flight answer kept for its ticket").register(pool);
+    let mut counted = RecordBatchMemoryCounter::new();
+    batches.iter().try_for_each(|b| held.try_grow(counted.count_batch(b))).ok()?;
+    Some(held)
+}
+
 /// The refusal of an answer bigger than the query memory (53200), with the way out.
-fn too_big() -> anyhow::Error {
+pub(crate) fn too_big() -> anyhow::Error {
     crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
 }
 
@@ -1293,7 +1303,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    if crate::pattern::wanted(&text) || text.contains("pondra_match") {
+    if crate::pattern::wanted(&text) || text.contains("pondra_match") || text.contains("pondra_open") {
         crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
     }
     let named_sys = crate::sys::mentioned(&text); // (named: the tables get their system columns)
@@ -1304,6 +1314,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let entries = lake.cat.scan_raw("t/", "t0").await?;
     lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
     let upto = upto.or_else(|| Some(lake.visible())); // (one end for every table it reads, fixed once their entries are read: a table read twice, or two a transaction wrote, read one commit)
+    let mut unlisted = vec![]; // (tables a listing leaves out, which the views over them still plan against: below)
     for (key, raw) in entries {
         let name = &key[2..];
         // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
@@ -1319,8 +1330,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
             }
-            if let Some(t) = guarded(name, t, listing) {
-                ctx.register_table(table_ref(name), t)?;
+            match guarded(name, t.clone(), listing) {
+                Some(t) => {
+                    ctx.register_table(table_ref(name), t)?;
+                }
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1429,7 +1443,19 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
+    // A listing leaves out a table its user may not read, but a view over it is planned against it: the table is there
+    // for the views' planning and taken out again after, unless the session has a table of that name already.
+    let mut planned_only = vec![];
+    for (name, t) in unlisted {
+        if !ctx.table_exist(table_ref(&name))? {
+            ctx.register_table(table_ref(&name), t)?;
+            planned_only.push(table_ref(&name));
+        }
+    }
     register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
+    for name in planned_only {
+        ctx.deregister_table(name)?;
+    }
     if listing {
         let direct = crate::ext_names::names(sql);
         for n in crate::ext_names::names(&text).into_iter().filter(|n| !direct.contains(n)) {
@@ -1437,6 +1463,20 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     Ok(ctx)
+}
+
+/// A memory pool for one statement, over the lake's (which every statement shares): what its operators reserve goes
+/// through it (`task_with_peak`), so `PeakRecordingPool`'s peak is the most that statement held at once.
+pub fn peak_pool(ctx: &SessionContext) -> Arc<PeakRecordingPool> {
+    Arc::new(PeakRecordingPool::new(ctx.runtime_env().memory_pool.clone()))
+}
+
+/// The task a statement's plan runs on: `state`'s own (`SessionState::task_ctx`), but with `peak` for its memory pool.
+/// Only the runtime differs: the caches, the object stores and the spill disk are the lake's, and the session isn't
+/// made again.
+pub fn task_with_peak(state: &SessionState, peak: &Arc<PeakRecordingPool>) -> Result<Arc<TaskContext>> {
+    let rt = RuntimeEnvBuilder::from_runtime_env(state.runtime_env()).with_memory_pool(peak.clone()).build_arc()?;
+    Ok(Arc::new(TaskContext::from(state).with_runtime(rt)))
 }
 
 /// Whether a query ran out of memory, so a frugal run may help (DataFusion's "Resources exhausted", 53200).

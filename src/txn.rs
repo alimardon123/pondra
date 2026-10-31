@@ -184,6 +184,7 @@ struct Txn {
     snapshot: u64,          // the commit a statement reads at (REPEATABLE READ: the one BEGIN saw)
     ran: bool,              // a statement has run: SET TRANSACTION is refused from now on
     leader: Option<String>, // a follower's leader, which keeps its locks
+    protocol: bool,         // Flight SQL began it (BeginTransaction): its end is the protocol's, and SQL's words are refused (`command`)
     locked: bool,           // it holds row locks
     state: State,
     tables: BTreeMap<String, Changes>,
@@ -226,6 +227,9 @@ tokio::task_local! {
 const ENDED_FOR: Duration = Duration::from_secs(3600);
 
 const NO_SESSION: &str = "a transaction is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>; over MCP, the Mcp-Session-Id that initialize gave; over Flight SQL, BeginTransaction)";
+/// Refused where a transaction word is run as SQL in a transaction Flight SQL began (`command`, and flight.rs's check before
+/// a statement runs): the protocol's own BeginTransaction and EndTransaction end it.
+pub const PROTOCOL_OWN: &str = "Flight SQL's transactions are the protocol's own: BeginTransaction (ADBC: autocommit off), then EndTransaction (commit or rollback); BEGIN, COMMIT and ROLLBACK aren't run as SQL";
 /// Separates a key's parts as text: in a lock's name and in the keys the overlay filters on.
 pub const KEY_SEP: &str = "\u{1}";
 /// A statement that may take row locks (`FOR UPDATE`, `FOR SHARE`, and the weaker `FOR NO KEY UPDATE` and `FOR KEY SHARE`,
@@ -317,37 +321,61 @@ fn writable(word: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- transaction words
 
+/// Did Flight SQL's BeginTransaction begin session `s`'s transaction (open, or ended by the idle timeout)? Its end is the
+/// protocol's: `command` refuses the transaction words in it.
+fn protocol_owned(s: &str) -> bool { BOOK.lock().unwrap().txns.get(s).is_some_and(|t| t.protocol) }
+
 /// `BEGIN`, `COMMIT` or `ROLLBACK` (`control`), or a savepoint word, for the current session. Its answer: the command's
-/// tag (a failed transaction's COMMIT is a ROLLBACK, as in Postgres), and a warning, if any.
+/// tag (a failed transaction's COMMIT is a ROLLBACK, as in Postgres), and a warning, if any. A transaction Flight SQL began
+/// is ended by the protocol (`protocol`), so its words are refused here, whether they come from a script, a block or a
+/// procedure (each runs its statements through `routines::one`, which calls this).
 pub async fn command(app: &crate::app::App, word: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
     let s = crate::temp::current().context(NO_SESSION)?;
+    if protocol_owned(&s) {
+        return Err(crate::codes::coded("0A000", PROTOCOL_OWN));
+    }
+    word_in(app, &s, word, sql).await
+}
+
+/// Flight SQL's own transaction actions (flight.rs): BeginTransaction begins the current session's transaction as the
+/// protocol's, and EndTransaction (`word` COMMIT or ROLLBACK) ends it as `command` would.
+pub async fn protocol(app: &crate::app::App, word: &str) -> Result<(&'static str, Option<String>)> {
+    let s = crate::temp::current().context(NO_SESSION)?;
+    match word {
+        "BEGIN" => begin(app, &s, "BEGIN", true),
+        _ => word_in(app, &s, word, "").await,
+    }
+}
+
+/// The transaction word `word` for session `s` (`command`, `protocol`): an idle end first, then the word.
+async fn word_in(app: &crate::app::App, s: &str, word: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
     // (an idle end: a COMMIT must not say its writes landed; a transaction word ends the refusal)
-    if ended(&s) {
+    if ended(s) {
         if word == "COMMIT" {
-            end(&s);
+            end(s);
             return Err(idle_commit());
         }
         if !matches!(word, "ROLLBACK" | "BEGIN") {
             return Err(idle_ended());
         }
-        end(&s);
+        end(s);
         if word == "ROLLBACK" {
             return Ok(("ROLLBACK", None));
         }
     }
     match word {
-        "BEGIN" => begin(app, &s, sql),
-        "SAVEPOINT" => savepoint(&s, sql),
-        "RELEASE" => release_savepoint(&s, sql),
-        "ROLLBACK TO" => rollback_to(&s, sql),
-        "ROLLBACK" => match BOOK.lock().unwrap().txns.remove(&s) {
+        "BEGIN" => begin(app, s, sql, false),
+        "SAVEPOINT" => savepoint(s, sql),
+        "RELEASE" => release_savepoint(s, sql),
+        "ROLLBACK TO" => rollback_to(s, sql),
+        "ROLLBACK" => match BOOK.lock().unwrap().txns.remove(s) {
             Some(t) => {
                 release_txn(&t);
                 Ok(("ROLLBACK", None))
             }
             None => Ok(("ROLLBACK", Some(crate::rules::txn::NONE_OPEN.into()))),
         },
-        _ => commit(app, &s).await.map(|(tag, warning, _)| (tag, warning)),
+        _ => commit(app, s).await.map(|(tag, warning, _)| (tag, warning)),
     }
 }
 
@@ -430,13 +458,13 @@ fn leader_needed(app: &crate::app::App) -> Result<()> {
 }
 
 /// `BEGIN [modes]`: a transaction of this session, at the level and access mode its modes and the session's defaults
-/// give (ADR-067 §1).
-fn begin(app: &crate::app::App, s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
+/// give (ADR-067 §1). `protocol`: Flight SQL's BeginTransaction began it (`protocol`).
+fn begin(app: &crate::app::App, s: &str, sql: &str, protocol: bool) -> Result<(&'static str, Option<String>)> {
     leader_needed(app)?;
     let (level, read_only) = plan(&begin_modes(sql)?)?;
     let level = level.map_or_else(default_level, Ok)?;
     let read_only = read_only.unwrap_or_else(default_read_only);
-    if !start(app, s, level, read_only, None) {
+    if !start(app, s, level, read_only, None, protocol) {
         return Ok(("BEGIN", Some(crate::rules::txn::ALREADY.into())));
     }
     Ok(("BEGIN", None))
@@ -444,15 +472,15 @@ fn begin(app: &crate::app::App, s: &str, sql: &str) -> Result<(&'static str, Opt
 
 /// Opens a transaction for session `s` (false: it has one). Its snapshot is taken at its first statement (as Postgres
 /// takes it: `gate`), so this is a placeholder until then. Starts the upkeep loop if none runs. Its id is new each time; a
-/// `job` names its commit instead (`alone`).
-fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Option<String>) -> bool {
+/// `job` names its commit instead (`alone`). `protocol`: Flight SQL began it (`protocol`).
+fn start(app: &crate::app::App, s: &str, level: Level, read_only: bool, job: Option<String>, protocol: bool) -> bool {
     let mut book = BOOK.lock().unwrap();
     if book.txns.contains_key(s) {
         return false;
     }
     let id = uuid::Uuid::new_v4().simple().to_string(); // (fresh each time: a leader refuses locks to an id that ended)
     let txn = Txn {
-        id, job, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app),
+        id, job, lake: app.lake.url.clone(), level, read_only, snapshot: app.lake.visible(), ran: false, leader: leader_of(app), protocol,
         locked: false, state: State::Open, tables: BTreeMap::new(), by_key: BTreeMap::new(), reads: BTreeMap::new(), marks: vec![], failed: None,
         used: Instant::now(), busy: 0, next: -1,
     };
@@ -1583,7 +1611,7 @@ pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files:
         loop {
             tries += 1;
             let stmt = crate::write::parse(sql).context("not a write")?;
-            start(app, &s, Level::Committed, false, job.clone());
+            start(app, &s, Level::Committed, false, job.clone(), false);
             let out = Box::pin(crate::write::on_node_as(app, stmt, None, files)).await?; // (refused: the session's end rolls it back)
             match commit(app, &s).await {
                 Ok((_, _, sent)) => return Ok(if sent["duplicate"] == true { j!({"duplicate": true}) } else { out }),
