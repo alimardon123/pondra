@@ -433,11 +433,15 @@ pub(crate) fn kept_by_key(source: &str, name: &str, what: &str) -> anyhow::Error
 /// they are read, as subqueries `(…) AS t`: the form a view follows its table through (`first_table`), and that its
 /// rows are kept by, as Postgres, Databricks and Snowflake take both. A plain view is read as it is now: the view keeps
 /// that text. A recursive CTE stays as written (a view can't follow one), and so does a query that isn't one SELECT; a
-/// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000).
+/// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000). A query with a
+/// MATCH_RECOGNIZE stays as written too: `pattern.rs` reads its input as written (a CTE, or a subquery it refuses by name).
 pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
     use datafusion::sql::sqlparser::ast::{Query, Statement, TableAlias, TableFactor, VisitorMut};
     use std::collections::HashMap;
     use std::ops::ControlFlow;
+    if crate::text::contains_ci(sql, "match_recognize") {
+        return Ok(sql.to_string()); // (written in, its CTE would be a subquery before the pattern: `pattern::refused`'s case)
+    }
     let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok(sql.to_string()) };
     let [Statement::Query(q)] = &mut parsed[..] else { return Ok(sql.to_string()) };
     let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false).await?.into_iter().collect();
@@ -1945,6 +1949,8 @@ mod tests {
         assert_eq!(first_table(&w("SELECT x FROM vy").await?)?, "a");
         let recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
         assert_eq!(w(recursive).await?, recursive);
+        let pattern = "WITH t AS (SELECT * FROM a WHERE x > 1) SELECT * FROM t MATCH_RECOGNIZE (ORDER BY x PATTERN (b+) DEFINE b AS true) m";
+        assert_eq!(w(pattern).await?, pattern, "a pattern reads its CTE as written");
         let write = w("WITH m AS (DELETE FROM a WHERE x > 1 RETURNING *) SELECT x FROM m").await.unwrap_err();
         assert_eq!(crate::codes::of(&write), "0A000", "{write:#}");
         assert!(write.to_string().starts_with("WITH m AS (DELETE …): a view can't hold a write"), "{write:#}");
