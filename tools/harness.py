@@ -2207,6 +2207,14 @@ def serverless_guest(port):
     checks["g a bad statement prints Error: with a node's words for it, and exits 1"] = \
         reply.status != 200 and rc10 == 1 and err10 == f"Error: {words}"
     node.kill()
+
+    # h. `--dir :memory:`: a lake held in the process's memory for its statements, as DuckDB's `:memory:` is: they answer,
+    # and nothing is written where it ran
+    there = tempfile.mkdtemp(prefix="pondra-memory-")
+    p = subprocess.run([BIN, "sql", "--dir", ":memory:", "CREATE TABLE m AS SELECT 7 AS a; SELECT a FROM m"], capture_output=True, text=True, cwd=there, timeout=120)
+    checks["h --dir :memory: answers from a lake in memory and writes nothing where it ran"] = \
+        p.returncode == 0 and shown(p.stdout, 7) and os.listdir(there) == []
+    shutil.rmtree(there, ignore_errors=True)
     shutil.rmtree(folder, ignore_errors=True)
     return checks, times
 
