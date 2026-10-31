@@ -51,7 +51,7 @@ impl Remote {
 /// The error for a node's refusal. A 401 or 403 means the sign-in ended (closed), and the node's words are the message.
 fn refused(status: StatusCode, words: String) -> Error {
     let ended = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
-    Error::new(ended, if words.is_empty() { status.to_string() } else { words })
+    Error::new(ended, if words.is_empty() { status.to_string() } else { format!("{status}: {words}") }) // (the status names a sign-in the node refused)
 }
 
 /// `{node}/cluster/kv?key=K`: the key as text, percent-encoded.
@@ -147,10 +147,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_a_refusal_ends_the_sign_in_with_the_nodes_words() {
+    fn remote_a_refusal_ends_the_sign_in_with_its_status_and_the_nodes_words() {
         let ended = refused(StatusCode::FORBIDDEN, "the sign-in ended".into());
         assert!(ended.closed());
-        assert_eq!(ended.to_string(), "the sign-in ended");
+        assert_eq!(ended.to_string(), "403 Forbidden: the sign-in ended", "the status, then the node's words");
         assert!(refused(StatusCode::UNAUTHORIZED, String::new()).closed());
         assert!(!refused(StatusCode::INTERNAL_SERVER_ERROR, "boom".into()).closed());
     }
