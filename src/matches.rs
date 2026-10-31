@@ -62,7 +62,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     crate::once::final_options(&o, "each match once, when it's decided")?;
     let written = format!("{}\nEMIT FINAL", sql.trim_end());
     if let Some(v) = lake.cat.get::<View>(&crate::views::view_key(name)).await? {
-        ensure!(v.matches.is_some() && v.query() == written, "view {name} already exists, with other SQL or options");
+        ensure!(v.matches.as_ref().is_some_and(|m| (m.lateness_secs, m.idle_secs) == (o.lateness_secs, o.idle_secs)) && v.query() == written, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again as it is: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
@@ -266,6 +266,17 @@ crate::per_node!(
     /// steps take them in turn.
     static CUTS: Mutex<HashMap<String, Vec<(i64, bool)>>> = Mutex::new(HashMap::new()));
 
+/// The key of a matches view's per-node state (`DUES`, `CUTS`): its lake, its name and its id (one made again is another).
+fn dkey(lake: &Lake, view: &str, m: &Matches) -> String { format!("{}|{view}|{}", lake.url, m.id) }
+
+/// The per-node state of the matches views `views` (`emit_all`'s scan) no longer has: their dues and cut points.
+pub(crate) fn forget(lake: &Lake, views: &[(String, View)]) {
+    let live: std::collections::HashSet<String> = views.iter().filter_map(|(k, v)| v.matches.as_ref().map(|m| dkey(lake, &k[2..], m))).collect();
+    let ours = format!("{}|", lake.url);
+    DUES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&ours) || live.contains(k));
+    CUTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| !k.starts_with(&ours) || live.contains(k));
+}
+
 /// A catch-up's steps run back to back for this long, then go on next round, so the leader's other views emit too.
 const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -310,7 +321,7 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
     let t = ident(m.time.as_str());
 
     // The dues: each key's live thread's due time, from the whole of `$resume`, once (a leader's first run).
-    let dkey = format!("{}|{view}|{}", lake.url, m.id);
+    let dkey = dkey(lake, view, m);
     let mut dues = DUES.lock().unwrap().remove(&dkey).unwrap_or_default();
     if m.within && !dues.loaded {
         dues.load(&resume_map(&read_state(lake, &resume_name, at, None).await?, &part)?);
@@ -331,10 +342,13 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
 
     // Late rows: those that came after the last run's snapshot, with a time at or before the time the last run decided up
     // to, or none.
-    let late: i64 = match w0 > 0 && at > at0 {
+    let late: i64 = match at > at0 {
         true => {
             let version = ident(VERSION);
-            let stale = t.clone().lt_eq(lit(stamp(&time_type, w0 as i64)?)).or(t.clone().is_null());
+            let stale = match w0 > 0 {
+                true => t.clone().lt_eq(lit(stamp(&time_type, w0 as i64)?)).or(t.clone().is_null()),
+                false => t.clone().is_null(), // (no run has decided a time yet: only a NULL time is late)
+            };
             table.filter(version.clone().gt(lit(at0 as i64)).and(version.lt_eq(lit(at as i64))).and(stale))?.count().await? as i64
         }
         false => 0,
@@ -941,6 +955,46 @@ mod tests {
         let e = create(&lake, "dips", TICKER, Options { lag_secs: Some(60), ..options() }).await.expect_err("a refusal");
         assert_eq!(crate::codes::of(&e), "0A000", "{e}");
         assert!(e.to_string().contains("each match once"), "{e}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repeated_create_with_other_lateness_is_refused() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+        let lake = lake_with_ticks(&dir).await?;
+        create(&lake, "dips", TICKER, options()).await?;
+        create(&lake, "dips", TICKER, options()).await?;
+        let e = create(&lake, "dips", TICKER, Options { lateness_secs: 60, ..options() }).await.expect_err("a refusal");
+        assert!(e.to_string().contains("already exists, with other SQL or options"), "{e}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forget_drops_the_state_of_a_view_that_is_gone() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+        let lake = lake_with_ticks(&dir).await?;
+        create(&lake, "dips", TICKER, options()).await?;
+        let live: View = lake.cat.get(&crate::views::view_key("dips")).await?.context("the view")?;
+        let m = live.matches.clone().context("a matches view")?;
+        let gone = Matches { id: "gone".into(), ..m.clone() };
+        let (live_key, gone_key, elsewhere) = (dkey(&lake, "dips", &m), dkey(&lake, "gone", &gone), "elsewhere|dips|1".to_string());
+        for k in [&live_key, &gone_key, &elsewhere] {
+            DUES.lock().unwrap().insert(k.clone(), Dues::default());
+            CUTS.lock().unwrap().insert(k.clone(), vec![(1, true)]);
+        }
+        forget(&lake, &lake.cat.scan::<View>("v/", "v0").await?);
+        {
+            let dues = DUES.lock().unwrap();
+            assert!(dues.contains_key(&live_key) && !dues.contains_key(&gone_key) && dues.contains_key(&elsewhere), "dues");
+        }
+        {
+            let cuts = CUTS.lock().unwrap();
+            assert!(cuts.contains_key(&live_key) && !cuts.contains_key(&gone_key) && cuts.contains_key(&elsewhere), "cut points");
+        }
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

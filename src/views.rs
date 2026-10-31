@@ -456,7 +456,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     };
     if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
         let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
-        let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
+        let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs, s.idle_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
         let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
         let kept = v.rerun.as_ref().map(|r| if r.full.is_some() { Refresh::Full } else { Refresh::ByKey }).unwrap_or(Refresh::Incremental);
@@ -984,6 +984,7 @@ pub async fn emit_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>, seq: &Arc<cr
     }
     let views = lake.cat.scan::<View>("v/", "v0").await?;
     forget_runs(lake, &views);
+    crate::matches::forget(lake, &views);
     for (key, v) in views {
         if v.matches.is_none() && v.emit.is_none() && v.sessions.is_none() && v.once.is_none() {
             continue;

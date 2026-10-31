@@ -800,6 +800,11 @@ pub fn failing(lake: &Lake, view: &str) -> Option<String> {
 /// again at a later turn.
 pub async fn run_all(lake: &Arc<Lake>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     let views: Vec<(String, View)> = lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.rerun.is_some()).map(|(k, v)| (k[2..].to_string(), v)).collect();
+    {
+        // (a dropped view's pace goes too, before the early return below)
+        let names: std::collections::HashSet<&str> = views.iter().map(|(name, _)| name.as_str()).collect();
+        PACE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, view), _| url != &lake.url || names.contains(view.as_str()));
+    }
     if views.is_empty() {
         CHANGED.lock().unwrap().remove(&lake.url);
         return Ok(());
