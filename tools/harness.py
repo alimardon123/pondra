@@ -3879,7 +3879,8 @@ def schemas():
     nodes[2].kill()
     nodes[2].start(tries=1)
     after_restart = until(lambda: _try(lambda: n("warehouse.stock", 2)), 3, 15)  # (within a second of starting)
-    cli = subprocess.run([BIN, "sql", "--dir", lake, "SELECT count(*) AS n FROM warehouse.stock"], capture_output=True, text=True, timeout=120).stdout
+    ran = subprocess.run([BIN, "sql", "--dir", lake, "SELECT count(*) AS n FROM warehouse.stock"], capture_output=True, text=True, timeout=120)
+    cli = ran.stdout or f"(no answer, exit {ran.returncode}) {ran.stderr[-2000:]}"  # (why, when it fails: main's 86fd48d once printed nothing)
     listed = {r["catalog_name"] for r in q("SELECT DISTINCT catalog_name FROM information_schema.schemata")}
     # DuckDB's FROM-first (`FROM t` is SELECT * FROM t): alone, as a subquery, as a view's query;
     # a change to an attached lake's table says which lake and where it runs (ADR-024)
