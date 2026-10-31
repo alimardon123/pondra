@@ -500,10 +500,13 @@ before the statement, so no other part may name a table that a write changes. Th
 other shapes (see [Refused by name](#refused-by-name)).
 
 ```sql
-WITH moved AS (DELETE FROM orders WHERE status = 'done' RETURNING *)
-INSERT INTO archive SELECT * FROM moved;
+CREATE TABLE orders_done (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+WITH moved AS (DELETE FROM orders WHERE qty = 0 RETURNING *)
+INSERT INTO orders_done SELECT * FROM moved;
 
-WITH ins AS (INSERT INTO parent (name) VALUES ('a') RETURNING id),
+CREATE TABLE parent (id BIGINT, name VARCHAR);
+CREATE TABLE child (parent_id BIGINT, note VARCHAR);
+WITH ins AS (INSERT INTO parent VALUES (1, 'a') RETURNING id),
      kid AS (INSERT INTO child SELECT id, 'x' FROM ins RETURNING *)
 SELECT count(*) AS n FROM kid;
 ```
