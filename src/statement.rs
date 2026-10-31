@@ -94,7 +94,7 @@ pub(crate) fn single_statement(sql: &str) -> Option<String> {
 /// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
 /// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
 pub(crate) fn plain_statement(one: &str) -> bool {
-    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
+    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one) && crate::with_writes::of(one).is_none()
 }
 
 /// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
