@@ -14,8 +14,9 @@
 //! - L5 (ALL ROWS only): the partition and ORDER BY columns, the measures, then the input's other columns, without the
 //!   rows a `{- … -}` leaves out and the internal columns.
 //!
-//! `text` writes FINAL and RUNNING before a measure as calls that parse, and each PATTERN as one quoted name, since
-//! sqlparser refuses some standard forms; `matcher::read` reads the text. What isn't taken is refused by name.
+//! `text` writes FINAL and RUNNING before a measure as calls that parse, each PATTERN as one quoted name, since
+//! sqlparser refuses some standard forms, and a subquery before a clause as a CTE in a derived table, since sqlparser
+//! reads the clause only after a table's name; `matcher::read` reads the text. What isn't taken is refused by name.
 use crate::codes::coded;
 use crate::matcher::Pattern;
 use crate::text::{ident, object, ROW_ID};
@@ -51,11 +52,12 @@ pub fn wanted(sql: &str) -> bool {
     WORD.is_match(sql)
 }
 
-/// `sql` as the parser reads it, with two rewrites. FINAL and RUNNING before a call are wrapped as calls that parse
+/// `sql` as the parser reads it, with three rewrites. FINAL and RUNNING before a call are wrapped as calls that parse
 /// (`FINAL last(x)` is `pondra_final(last(x))`; the rewrite takes the wrapper away, since ONE ROW PER MATCH reads at the
 /// last row, where both agree). Each PATTERN is written as one quoted name that holds its text in hex, because sqlparser
 /// refuses forms standard SQL has (`{- b -}` of more than a symbol, PERMUTE of alternatives); `matcher::read` reads the
-/// text instead. A word in a string or a comment is left as it is.
+/// text instead. A subquery before a MATCH_RECOGNIZE is written as a CTE in a derived table (`hoists`), so the clause can
+/// read it as a table. A word in a string or a comment is left as it is.
 pub fn text(sql: &str) -> Cow<'_, str> {
     if !wanted(sql) {
         return Cow::Borrowed(sql);
@@ -63,6 +65,9 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     let code = code_mask(sql);
     let mut edits = calls(sql, &code);
     edits.extend(patterns(sql, &code));
+    if crate::once::emit_final(sql).is_none() {
+        edits.extend(hoists(sql, &code)); // (an EMIT FINAL view's subquery stays as it is: `write` refuses it, with its words)
+    }
     if edits.is_empty() {
         return Cow::Borrowed(sql);
     }
@@ -71,7 +76,7 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     let mut last = 0;
     for (start, end, new) in edits {
         if start < last {
-            continue; // inside an edit already made: a FINAL call in a PATTERN is read as the pattern
+            continue; // inside an edit already made: a FINAL call in a PATTERN is read as the pattern, a clause in a hoisted subquery as its own text
         }
         out.push_str(&sql[last..start]);
         out.push_str(&new);
@@ -97,14 +102,20 @@ pub fn refused(sql: &str) -> Result<()> {
 
 /// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
 /// `PATTERN (<text>)`, with its WITHIN after the `)` when the name carries one, and each `pondra_final(…)` and
-/// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A name written before WITHIN reads as it did. Text with neither is
-/// borrowed.
+/// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A subquery written as a CTE for a clause (`hoists`) reads as the
+/// subquery it was, with the text between it and the clause as written. A name written before WITHIN reads as it did.
+/// Text with none of these is borrowed.
 pub fn shown(sql: &str) -> Cow<'_, str> {
     static NAMED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\bpattern\s*\(\s*"__mr_pattern_([0-9a-f]*)(?:__within_([0-9a-f]*))?"\s*\)"#).expect("a regex")
     });
     static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bpondra_(final|running)\(").expect("a regex"));
-    if !sql.contains("__mr_pattern_") && !sql.contains("pondra_") {
+    // the hoisted subquery's head, and what follows its CTE: the input's name, then the clause (as sqlparser or `text` wrote it)
+    static HOIST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\(with\s+__mr_input\s+as\s*\(").expect("a regex"));
+    static READ: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*select\s+\*\s+from\s+__mr_input(?P<between>(?:\s+(?:as\s+)?[a-z_][a-z0-9_]*)?\s+)(?P<clause>match_recognize\b)").expect("a regex")
+    });
+    if !sql.contains("__mr_pattern_") && !sql.contains("pondra_") && !sql.contains("__mr_input") {
         return Cow::Borrowed(sql);
     }
     let code = code_mask(sql);
@@ -128,6 +139,21 @@ pub fn shown(sql: &str) -> Cow<'_, str> {
         let open = whole.end() - 1;
         let Some(close) = close_of(sql, &code, open) else { continue };
         edits.push((whole.start(), close + 1, format!("{} {}", c[1].to_uppercase(), &sql[open + 1..close])));
+    }
+    for h in HOIST.find_iter(sql) {
+        let (open, inner_open) = (h.start(), h.end() - 1);
+        if !code[open] {
+            continue;
+        }
+        let (Some(inner_close), Some(outer_close)) = (close_of(sql, &code, inner_open), close_of(sql, &code, open)) else { continue };
+        if inner_close >= outer_close {
+            continue;
+        }
+        let rest = &sql[inner_close + 1..outer_close];
+        let Some(read) = READ.captures(rest) else { continue };
+        let (between, clause) = (read.name("between").expect("the text between"), read.name("clause").expect("the clause"));
+        let subquery = shown(&sql[inner_open + 1..inner_close]);
+        edits.push((open, outer_close + 1, format!("({subquery}){}{}", between.as_str(), shown(&rest[clause.start()..]))));
     }
     if edits.is_empty() {
         return Cow::Borrowed(sql);
@@ -203,6 +229,85 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         out.push((whole.start(), end, name));
     }
     out
+}
+
+/// Each subquery that a MATCH_RECOGNIZE reads, written as a CTE in a derived table: `(<inner>)<between>MATCH_RECOGNIZE
+/// (<clause>)` becomes `(WITH __mr_input AS (<inner>) SELECT * FROM __mr_input<between>MATCH_RECOGNIZE (<clause>))`. sqlparser
+/// reads the clause only after a table's name, and a CTE is one, so the clause reads the subquery as it reads a table. Each
+/// part is written by `text` on its own, so the clauses inside it are written too; this edit covers them, and `text` skips
+/// their edits. A `(` that opens a parenthesised join is not a subquery, so it is left for the parser to refuse. `text` does
+/// not call this for an EMIT FINAL view, whose subquery `write` refuses with its own words.
+fn hoists(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
+    static CLAUSE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\)(\s+(?:as\s+)?(?:[a-z_][a-z0-9_]*\s+)?)match_recognize\b").expect("a regex"));
+    let mut out = vec![];
+    for c in CLAUSE.captures_iter(sql) {
+        let whole = c.get(0).expect("a whole match");
+        let between = c.get(1).expect("the text between");
+        let close = whole.start();
+        if !code[close] {
+            continue;
+        }
+        let Some(open) = open_of(sql, code, close) else { continue };
+        if !is_query(sql, code, open) {
+            continue;
+        }
+        let Some(clause_open) = (whole.end()..sql.len()).find(|&i| code[i] && sql.as_bytes()[i] == b'(') else { continue };
+        let Some(clause_close) = close_of(sql, code, clause_open) else { continue };
+        let inner = text(&sql[open + 1..close]);
+        let clause = text(&sql[between.end()..=clause_close]);
+        out.push((open, clause_close + 1, format!("(WITH __mr_input AS ({inner}) SELECT * FROM __mr_input{}{clause})", between.as_str())));
+    }
+    out
+}
+
+/// Whether the `(` at `open` opens a query: its content starts (past spaces and comments) with SELECT, WITH or VALUES, or
+/// with another `(` that does, as `((SELECT 1) UNION (SELECT 2))` does. A parenthesised join starts with a table, so it is
+/// no query.
+fn is_query(sql: &str, code: &[bool], open: usize) -> bool {
+    static START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(select|with|values)\b").expect("a regex"));
+    let b = sql.as_bytes();
+    let mut i = open + 1;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b[i..].starts_with(b"--") {
+            i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p);
+        } else if b[i..].starts_with(b"/*") {
+            i = sql[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2);
+        } else {
+            break;
+        }
+    }
+    if i >= b.len() || !code[i] {
+        return false;
+    }
+    if b[i] == b'(' {
+        return is_query(sql, code, i);
+    }
+    START.is_match(&sql[i..])
+}
+
+/// The `(` that opens the `)` at `close`, counting only the parentheses that are code: the reverse of `close_of`.
+fn open_of(sql: &str, code: &[bool], close: usize) -> Option<usize> {
+    let mut depth = 0;
+    for i in (0..=close).rev() {
+        if !code[i] {
+            continue;
+        }
+        match sql.as_bytes()[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The WITHIN that follows a PATTERN's `)` at `from`, when one does: where it ends (the interval's last character, before
@@ -2152,6 +2257,93 @@ mod tests {
         assert!(subset.to_string().contains("write a measure per symbol, as LAST(b.price) and LAST(c.price)"), "{subset}");
         assert!(refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS subset = 1) AS m").is_ok());
         assert!(refused("SELECT subset FROM t").is_ok());
+    }
+
+    /// A subquery before a MATCH_RECOGNIZE, its input aliased `t` and the clause aliased `m`.
+    const SUBQUERY: &str = "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts \
+                            MEASURES FIRST(a.ts) AS s, LAST(b.ts) AS e ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m";
+
+    #[test]
+    fn a_subquery_before_match_recognize_is_a_cte_in_a_derived_table() {
+        let written = text(SUBQUERY);
+        assert!(written.contains("(WITH __mr_input AS (SELECT * FROM ticks WHERE venue = 'x') SELECT * FROM __mr_input t MATCH_RECOGNIZE"), "{written}");
+        assert!(written.contains("PATTERN (\"__mr_pattern_6120622b\")"), "{written}");
+        Parser::parse_sql(&GenericDialect {}, &written).expect("the hoisted text parses");
+    }
+
+    #[test]
+    fn the_hoisted_input_is_a_cte_not_a_lake_table() {
+        let stmts = Parser::parse_sql(&GenericDialect {}, &text(SUBQUERY)).expect("a query");
+        let mut scan = Scan::default();
+        for s in &stmts {
+            let _ = crate::walk::visit(s, &mut scan);
+        }
+        assert!(scan.found);
+        assert!(scan.ctes.contains("__mr_input"));
+        assert!(scan.inputs.difference(&scan.ctes).next().is_none(), "{:?}", scan.inputs);
+    }
+
+    #[test]
+    fn the_hoisted_clause_rewrites_over_its_cte() {
+        let rewritten_sql = rewritten(SUBQUERY).expect("a rewrite");
+        assert!(rewritten_sql.contains("__mr_input"), "{rewritten_sql}");
+        assert!(!rewritten_sql.contains("MATCH_RECOGNIZE"), "{rewritten_sql}");
+    }
+
+    #[test]
+    fn a_subquery_before_match_recognize_reads_back_as_written() {
+        let subquery_within = "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts \
+                               PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true) m";
+        let nested = "SELECT * FROM (SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s \
+                      ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m2) t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts \
+                      MEASURES FIRST(a.s) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS true) m";
+        let cases = [
+            SUBQUERY,
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') AS t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) AS m",
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m",
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price))",
+            nested,
+            subquery_within,
+        ];
+        for sql in cases {
+            assert_eq!(shown(&text(sql)).as_ref(), sql);
+        }
+    }
+
+    #[test]
+    fn a_subquery_as_sqlparser_stores_it_reads_back_as_written() {
+        let stored = Parser::parse_sql(&GenericDialect {}, &text(SUBQUERY)).expect("a query")[0].to_string();
+        let back = shown(&stored);
+        assert!(back.contains("(SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE(PARTITION BY sym"), "{back}");
+        assert!(back.contains("PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)"), "{back}");
+        assert!(!back.contains("__mr_"), "{back}");
+    }
+
+    #[test]
+    fn a_join_or_a_table_before_match_recognize_is_not_hoisted() {
+        let join = "SELECT * FROM (a JOIN b ON a.k = b.k) MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        let written = text(join);
+        assert!(!written.contains("__mr_input"), "{written}");
+        assert!(Parser::parse_sql(&GenericDialect {}, &written).is_err());
+        let table = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        let written = text(table);
+        assert_eq!(written, "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (\"__mr_pattern_6120622b\") DEFINE b AS true) m");
+        assert_eq!(shown(&written).as_ref(), table);
+    }
+
+    #[test]
+    fn an_emit_final_view_over_a_subquery_is_refused_with_its_words() {
+        let err = open(SUBQUERY, &HashMap::new(), &engine_functions()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+        assert!(err.to_string().contains("has a subquery around the pattern"), "{err}");
+    }
+
+    #[test]
+    fn an_emit_final_view_over_a_subquery_is_not_hoisted_so_write_refuses_it() {
+        let view = format!("CREATE MATERIALIZED VIEW v AS {} EMIT FINAL", SUBQUERY);
+        let written = text(&view);
+        assert!(!written.contains("__mr_input"), "{written}");
+        assert!(written.starts_with("CREATE MATERIALIZED VIEW v AS SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE"), "{written}");
     }
 
     /// A lake with one table of these columns.
