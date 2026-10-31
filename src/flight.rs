@@ -207,7 +207,7 @@ async fn sign_in(app: &App, header: Option<&str>, peer: Option<crate::tls::Peer>
                 None => None,
             };
             if header.is_some() {
-                crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token"));
+                crate::audit::refused(app, "", "flight", from, "sign in", why.as_deref().unwrap_or("wrong token")).await;
             }
             if let Some(why) = why {
                 return Err(refused("28000", why));
@@ -246,7 +246,7 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<cr
     }
     if let Some(wait) = crate::auth::guessing(ip, user) {
         let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused(app, user, "flight", from, "sign in", &why);
+        crate::audit::refused(app, user, "flight", from, "sign in", &why).await;
         tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (as a wrong guess does)
         return Err(refused("28000", why));
     }
@@ -261,7 +261,7 @@ async fn password_sign_in(app: &App, user: &str, password: &str, peer: Option<cr
                 Some(why) => ("28000", why),
                 None => ("28P01", "wrong user name or password".to_string()),
             };
-            crate::audit::refused(app, user, "flight", from, "sign in", &why);
+            crate::audit::refused(app, user, "flight", from, "sign in", &why).await;
             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time, as HTTP's and Postgres's do)
             Err(refused(code, why))
         }

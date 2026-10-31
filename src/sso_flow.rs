@@ -40,7 +40,7 @@ pub async fn start(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>,
     match begin(&app, &peer, &name, &headers, &uri, &q).await {
         Ok((to, cookie)) => (StatusCode::FOUND, [("location", to), ("set-cookie", cookie), ("cache-control", "no-store".into())]).into_response(),
         Err(e) => {
-            crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("identity provider {name}: {e:#}"));
+            crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("identity provider {name}: {e:#}")).await;
             // (the page, or the command line that asked, hears why where the sign-in would have ended; a request
             // naming nowhere it may end, or a command line's without its challenge, gets the reason as the answer)
             let why = format!("not signed in through {name}: {}", crate::ext::said(&e));
@@ -110,7 +110,7 @@ fn destination(to: &str) -> Result<String> {
 pub async fn callback(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let Some(flow) = flow_of(&app, &headers).await else {
         let why = "this browser holds no sign-in of this node's, or it took longer than ten minutes: start it again";
-        crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", why);
+        crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", why).await;
         return (StatusCode::BAD_REQUEST, why).into_response();
     };
     let to = flow["to"].as_str().unwrap_or("/");
@@ -126,14 +126,17 @@ pub async fn callback(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Pee
         },
         Err(e) => Err(e),
     };
-    let (place, asks) = ended.unwrap_or_else(|e| {
-        crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("identity provider {name}: {e:#}"));
-        let why = format!("not signed in through {name}: {}", crate::ext::said(&e)); // (as the sign-in dialog and the command line say it, a door's words)
-        match flow["ch"].is_string() {
-            true => (with_query(to, "error", &why), None),
-            false => (format!("{to}#pondra_error={}", encode(&why)), None),
+    let (place, asks) = match ended {
+        Ok(ended) => ended,
+        Err(e) => {
+            crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("identity provider {name}: {e:#}")).await;
+            let why = format!("not signed in through {name}: {}", crate::ext::said(&e)); // (as the sign-in dialog and the command line say it, a door's words)
+            match flow["ch"].is_string() {
+                true => (with_query(to, "error", &why), None),
+                false => (format!("{to}#pondra_error={}", encode(&why)), None),
+            }
         }
-    });
+    };
     match asks {
         // (a code goes to the command line only once the person says so on this page: the link that started the
         // sign-in may be anyone's, naming a port of this machine and a challenge of theirs, and a person already
@@ -229,7 +232,7 @@ pub async fn redeem(State(app): State<App>, ConnectInfo(peer): ConnectInfo<Peer>
     match session.await {
         Ok(v) => Json(v).into_response(),
         Err(e) => {
-            crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("a sign-in's code: {e:#}"));
+            crate::audit::refused_by(&app, "", "http", Some(peer.addr), Some(peer.client(&headers)), "sign in", &format!("a sign-in's code: {e:#}")).await;
             (StatusCode::UNAUTHORIZED, crate::ext::said(&e)).into_response()
         }
     }
