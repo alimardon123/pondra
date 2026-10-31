@@ -10557,6 +10557,13 @@ def guarded():
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
         "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
+    # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the commit stream and the replica log
+    # carry the lake's keys (`z/auth`), and a raw flush or heartbeat writes what only the nodes write (L2's review, 10-31)
+    nodes_own = {p: ask(P, b"" if m == "GET" else "{}", path=p, method=m, auth=boss) for p, m in
+                 (("/cluster/log", "GET"), ("/cluster/replica", "GET"), ("/cluster/commit", "POST"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
+    info["nodes_own"] = nodes_own
+    checks["…nor a superuser's sign-in: the commit stream and the replica log (the lake's keys), a raw flush, a heartbeat, an ack: 403"] = \
+        all(refused(v) and "this route is the nodes' own" in v for v in nodes_own.values())
     # A change a follower forwards runs as its user: what it reads too
     forwarded = {
         "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),
@@ -10924,9 +10931,10 @@ def served():
     su = sqlt(pd, "CREATE TOKEN su_t FOR USER su")["token"]
     d_said = {"no token": door_of(pd), "a read token": door_of(pd, R), "a superuser's token": door_of(pd, su), "the admin token": door_of(pd, T)}
     info["holder's door refusals"] = {k: [v[0], v[1][:160]] for k, v in d_said.items()}
-    checks["the holder's door: no token 401; a read token refused; a superuser's token 403 saying a user's token can't open it; the admin token 200"] = \
+    # (a superuser's token is refused by the guard every /cluster/ route has, before the store's own check: `server::guard`)
+    checks["the holder's door: no token 401; a read token refused; a superuser's token 403 saying the route is the nodes' own; the admin token 200"] = \
         d_said["no token"][0] == 401 and d_said["a read token"][0] in (401, 403) and d_said["a superuser's token"][0] == 403 \
-        and "a user's token" in d_said["a superuser's token"][1] and d_said["the admin token"][0] == 200
+        and "the nodes' own" in d_said["a superuser's token"][1] and d_said["the admin token"][0] == 200
     X = Node(mk(), px, admin_token=T).start()  # (a node on its own folder, without --serve-store)
     checks["a node without --serve-store refuses its store's door, and says how to open it"] = \
         door_of(px, T)[0] == 403 and "--serve-store" in door_of(px, T)[1]

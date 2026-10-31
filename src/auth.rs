@@ -394,6 +394,11 @@ impl Auth {
         }
     }
 
+    /// The nodes' own routes (`/cluster/*`) a user's sign-in may reach, a superuser's too (`server::guard`): a branch's pin
+    /// (`ddl` lets nothing else of a user's through), the leader's probe, and where the node's Kafka door is (the console
+    /// asks). The others carry the lake's keys or write what only the nodes write.
+    pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka") }
+
     /// May this role run this write? (And, for a user's request, is it granted: `check`.)
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
         if crate::temp::own(stmt) {

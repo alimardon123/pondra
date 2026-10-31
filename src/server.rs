@@ -310,13 +310,17 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), vouched).await,
         None => None,
     };
+    let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
         None if crate::statement::owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
         None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, app.members.me()) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
-            None => crate::auth::Principal::of(crate::auth::Role::Admin),
+            None => {
+                open = true;
+                crate::auth::Principal::of(crate::auth::Role::Admin)
+            }
         },
         None if header.is_some() => {
             if let Some((name, ip)) = &basic_by {
@@ -352,6 +356,15 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 (StatusCode::FORBIDDEN, why).into_response()
             }
         };
+    }
+    // (the cluster's routes are the nodes' own: their tokens, their key, the program that started this one, anyone at an
+    // open node. A user's sign-in, a superuser's too, reaches only what `Auth::users_reach` names: the rest carry the
+    // lake's keys (the commit stream, the replica log) or write what only the nodes write (a raw flush, the audit's own
+    // tables, acks and beats). Checked before `AS_USER`, which makes a node's call its user's)
+    if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) {
+        let why = "this route is the nodes' own: a user's sign-in, a superuser's too, reaches the cluster's routes only for a branch's pin";
+        crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why);
+        return (StatusCode::FORBIDDEN, why).into_response();
     }
     // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. Only from the nodes (their key, the
     // admin token, the program that started this one) and only to `/cluster/*`; any other caller is itself, so a token
@@ -772,8 +785,8 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
-    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) {
-        crate::branch::cloning(&d)?; // (a user with CLONE: a pin, and nothing else)
+    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) || !cluster_call(&app, &headers) {
+        crate::branch::cloning(&d)?; // (a user with CLONE, or a user's own sign-in, a superuser's too: a pin, and nothing else)
     }
     if !cluster_call(&app, &headers) && key.is_none() {
         crate::protect::check_ddl(&app.lake, &d).await?;
