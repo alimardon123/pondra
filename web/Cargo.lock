@@ -3006,6 +3006,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store 0.14.2",
  "parquet",
+ "percent-encoding",
  "pondra-tokio-web",
  "postgres-types",
  "prost",

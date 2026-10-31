@@ -853,13 +853,16 @@ pub fn resident() -> Option<usize> {
     })
 }
 
+/// The page's live heap bytes, as the program that runs the page reads them (`page::Options::memory`, which re-exports this).
+pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+
 // A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
 #[cfg(target_arch = "wasm32")]
-static READER: std::sync::OnceLock<crate::page::Memory> = std::sync::OnceLock::new();
+static READER: std::sync::OnceLock<Memory> = std::sync::OnceLock::new();
 
 /// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn read_resident_with(reading: crate::page::Memory) {
+pub(crate) fn read_resident_with(reading: Memory) {
     let _ = READER.set(reading);
 }
 

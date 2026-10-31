@@ -115,6 +115,11 @@ pub fn received(code: &str) -> Option<&'static str> {
     Some(c)
 }
 
+/// The words of a write the site's browser storage can't keep, because its quota is full (`web/` says so when the browser
+/// refuses a write). A node's full disk is 53100 too, so this is the same answer at every door: `page::FULL` re-exports it.
+#[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
+pub const FULL: &str = "this site's browser storage is full";
+
 /// The code an error's words point to (the first that matches, most particular first).
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
@@ -160,7 +165,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
         #[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
-        _ if has(crate::page::FULL) => "53100",                                                 // disk_full (a page's browser storage is over its quota: `page::FULL`, `web/`'s words)
+        _ if has(FULL) => "53100",                                                              // disk_full (a page's browser storage is over its quota: `FULL`, `web/`'s words)
         _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)

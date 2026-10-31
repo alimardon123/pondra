@@ -21,8 +21,6 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-#[cfg(target_arch = "wasm32")]
-use std::task::Poll; // (`polled`'s)
 
 mod counters; // (a kept table's identity counter, as its note has it: `Counter`, which an import restarts a sequence at)
 
@@ -50,9 +48,6 @@ const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a C
 const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
 /// The name a kept table's rows have in the requests that import it (`import_table`): a request's table, as `imported_said` names it.
 const KEPT_ROWS: &str = "the kept rows";
-/// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
-pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
-
 /// How a page is made: the store its member keeps its lake in, how it asks its node, how it watches its memory, and the line
 /// its device has.
 pub struct Options {
@@ -68,22 +63,22 @@ pub struct Options {
     /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
     pub memory: Option<Memory>,
     /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
-    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `env::PAGE_LINE`.
+    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`oom::line_on`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
 }
 
-/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`).
-pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+/// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`, `store::Memory`).
+pub use crate::store::Memory;
 
 /// A page's memory watch: what it reads its live bytes with, and the line past which the query that grew them is stopped
-/// (`polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`memory_line`).
+/// (`oom::polled`). A page's line is set by `PONDRA_MEMORY_MAX_GB`, else by its device (`oom::line_on`).
 struct Watch {
     live: Memory,
     line: usize,
 }
 
 impl Watch {
-    /// The bytes a query may grow the page by now: to its line, and at least the tenth of the line `polled` lets any
+    /// The bytes a query may grow the page by now: to its line, and at least the tenth of the line `oom::polled` lets any
     /// query grow, so a page past its line still takes a small answer.
     fn room(&self) -> usize {
         self.line.saturating_sub((self.live)()).max(self.line / 10)
@@ -117,9 +112,8 @@ impl Default for Options {
     }
 }
 
-/// The words of a write the site's browser storage can't keep, because its quota is full (`web/` says so when the browser
-/// refuses a write). A node's full disk is 53100 too, so this is the same answer at every door.
-pub const FULL: &str = "this site's browser storage is full";
+/// The words of a write the site's browser storage can't keep, because its quota is full (`codes::FULL`, which `web/` reads here).
+pub use crate::codes::FULL;
 
 /// A page: a member on the core's lake, claimed once in the module (`claim`). Its requests are answered by its member (`request`).
 pub struct Page {
@@ -306,6 +300,12 @@ fn lake_route(method: &str, route: &str) -> bool {
     }
 }
 
+/// A `/files/…` route's name as written, percent-decoded as UTF-8, as the HTTP door's `Path` decodes it: `a%20b.csv` is `a b.csv`.
+/// A name that doesn't decode to UTF-8 is Err, with the words the door answers it with.
+fn file_name(written: &str) -> Result<String, String> {
+    percent_encoding::percent_decode_str(written).decode_utf8().map(|name| name.into_owned()).map_err(|_| "Invalid UTF-8 in `path`".to_string())
+}
+
 impl Page {
     /// The kept files `import_kept` couldn't read, each as its path and the words of why. The file is left as it is, so the
     /// next open tries it again.
@@ -322,7 +322,7 @@ impl Page {
         if let Some(live) = &options.memory {
             crate::store::read_resident_with(live.clone()); // (the core's watch reads the page's memory as this page's program does)
         }
-        let watch = options.memory.as_ref().zip(memory_line(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
+        let watch = options.memory.as_ref().zip(crate::oom::line_on(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
         Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![] })
     }
 
@@ -400,7 +400,10 @@ impl Page {
         match (method, route) {
             ("POST", "/sql") => self.lake_sql(query, headers, body).await,
             ("GET", "/objects") => self.lake_objects().await,
-            _ => self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
+            _ => match file_name(&route[FILES.len()..]) {
+                Ok(name) => self.lake_files(method, &name, query, headers, body).await,
+                Err(words) => refused(400, words), // (the door's own 400, before any file is touched)
+            },
         }
     }
 
@@ -507,7 +510,7 @@ impl Page {
         let said = match crate::panics::work(true, crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body)))).await {
             Ok(said) => said,
             Err(words) => {
-                if words == crate::oom::OOM || words == PAGE_OOM {
+                if words == crate::oom::OOM || words == crate::oom::PAGE_OOM {
                     crate::statement::failed_for_memory(lake_principal(), &asked);
                 }
                 return failed(anyhow::anyhow!(words));
@@ -814,35 +817,6 @@ impl Drop for Page {
             crate::panics::untracked(closing); // (untracked: `close` calls `abort_all`, which would cut a tracked task)
         }
     }
-}
-
-/// A request watched at each of its polls, where no watch loop can run beside it (a page's one thread): before each poll,
-/// past `line` by `reading` and grown by its own polls by a tenth of the line (`oom::pick`'s margin), it is stopped: its
-/// future dropped, its memory let go, and `Err(())` answered (the caller says why).
-#[cfg(target_arch = "wasm32")] // (its one caller, `panics::work`, is a page's: a node has a watch loop)
-pub(crate) async fn polled<T>(reading: impl Fn() -> usize, line: usize, f: impl Future<Output = T>) -> Result<T, ()> {
-    let margin = line / 10; // (`oom::pick`'s margin, a node's)
-    let mut inner = Some(Box::pin(f));
-    let mut grown = 0usize; // (what this query's polls grew the page by, less what they let go)
-    std::future::poll_fn(move |cx| {
-        let now = reading();
-        if now >= line && grown >= margin {
-            inner = None; // (the query's memory goes with its future, before anything else is read)
-            return Poll::Ready(Err(()));
-        }
-        let Some(future) = inner.as_mut() else { return Poll::Ready(Err(())) }; // (never polled once it has answered: an answer is the stop's)
-        let out = future.as_mut().poll(cx);
-        let after = reading();
-        grown = grown.saturating_add(after.saturating_sub(now)).saturating_sub(now.saturating_sub(after));
-        out.map(Ok)
-    })
-    .await
-}
-
-/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else
-/// `env::PAGE_LINE`.
-pub(crate) fn memory_line(device: Option<usize>) -> Option<usize> {
-    crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
 }
 
 /// The schema of a kept file without the notes a kept file adds (`TABLE_KEY` and the rest): the schema the table itself has.

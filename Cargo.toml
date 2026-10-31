@@ -64,6 +64,7 @@ lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)
 chrono-tz = { version = "0.10", default-features = false, optional = true } # (already built for arrow: time zones; tasks' cron schedules)
 url = "2"
+percent-encoding = "2" # (a page's `/files/…` names, decoded as the HTTP door's path is: `page.rs`'s `file_name`; already in Cargo.lock through url)
 http = { version = "1", optional = true } # (an AWS catalog's requests signed by object_store's signer, which takes http's; already built for reqwest)
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
 datafusion-spark = "55.1" # Spark's functions DataFusion doesn't name itself (format_string, pmod, parse_url…): PySpark's vocabulary in SQL
