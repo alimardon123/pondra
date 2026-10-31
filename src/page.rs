@@ -496,9 +496,6 @@ impl Page {
                 map.append(name, value);
             }
         }
-        if let Some(key) = paged.app.auth.owner_key().and_then(|k| http::HeaderValue::from_str(k).ok()) {
-            map.insert("x-pondra-owner", key); // (the page's program is its member's owner, `node::open_page`: whatever the request said)
-        }
         let who = lake_principal();
         let format = p.format.clone();
         let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
