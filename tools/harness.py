@@ -22778,6 +22778,248 @@ def returning():
         sys.exit(1)
 
 
+def withwrites():
+    """Data-modifying CTEs, as Postgres runs them: a write in a WITH (`WITH m AS (DELETE ... RETURNING *) INSERT ...`) and
+    a WITH before a write (`WITH src AS (...) INSERT ...`, `WITH c AS (...) UPDATE ... FROM c`). Each write runs once, in
+    WITH order; the parts after it read its rows by its name; the statement is one commit, or none. Through HTTP, the
+    Postgres port (psycopg: plain, prepared, and in a transaction that rolls back or commits), Flight SQL (ADBC) and MCP.
+    Refusals come before anything runs, with Postgres's codes: a table one part writes while another reads or writes it
+    (0A000: each part must see the data as it was before the statement), two writes of one table, a CTE named like a view,
+    MERGE in a WITH, a write under a subquery or in a CTE's own WITH, a write into a temporary table, a named write with no
+    RETURNING. A job sent again is refused 55000 and applied once; a read token's write is 42501, and MCP's query tool
+    refuses a write as a write (25006)."""
+    import base64
+    import psycopg
+    import adbc_driver_flightsql.dbapi as adbc
+
+    lake = new_lake()
+    pg, fl = A.port + 70, A.port + 80
+    url = f"host=127.0.0.1 port={pg} user=u dbname=lake"
+    checks, info = {}, {}
+    leader = c = None
+    example1 = "WITH moved AS (DELETE FROM orders WHERE status = 'done' RETURNING *) INSERT INTO archive SELECT * FROM moved"
+    example2 = ("WITH ins AS (INSERT INTO parent (name) VALUES ('a') RETURNING id), "
+                "kid AS (INSERT INTO child SELECT id, 'x' FROM ins RETURNING *) SELECT count(*) AS n FROM kid")
+    example3 = "WITH src AS (SELECT 20 AS id, 'new' AS status, 1 AS amount) INSERT INTO orders SELECT * FROM src"
+
+    def check(name, fn):
+        """A check's value is its bool. An exception fails it and is kept in info; the rest still run."""
+        try:
+            checks[name] = bool(fn())
+        except Exception as e:
+            checks[name] = False
+            info[f"error: {name}"] = f"{type(e).__name__}: {str(e)[:600]}"
+
+    def sqlstate_of(fn):
+        """The SQLSTATE a statement fails with, or None when it goes through."""
+        try:
+            fn()
+        except psycopg.Error as e:
+            return e.sqlstate
+        return None
+
+    def post(text, path="/sql", headers=None):
+        """(status, x-pondra-sqlstate, the answer if it went through, else the body's start) of a POST, with headers."""
+        conn = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+        conn.request("POST", path, text.encode(), headers or {})
+        r = conn.getresponse()
+        body = r.read()
+        conn.close()
+        if r.status == 200:
+            return 200, None, json.loads(body) if body[:1] in (b"[", b"{") else body.decode(errors="replace")
+        return r.status, r.getheader("x-pondra-sqlstate"), body[:300].decode(errors="replace")
+
+    def state(headers=None):
+        """Every row of orders and archive, by id, as the sign-in given (none: open) reads them."""
+        q = lambda s: call(A.port, "POST", "/sql", s.encode(), headers=headers or {})
+        return (q("SELECT id, status, amount FROM orders ORDER BY id"), q("SELECT id, status, amount FROM archive ORDER BY id"))
+
+    def ids_in(table, where=""):
+        """The sorted ids of a table's rows (those `where` holds)."""
+        return sorted(r["id"] for r in sql(A.port, f"SELECT id FROM {table}" + (f" WHERE {where}" if where else "")))
+
+    def mcp_query(token, text):
+        """MCP's query tool on `text`, with a bearer token: (isError, the answer's text)."""
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "query", "arguments": {"sql": text}}}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{A.port}/mcp", data=body, headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+        res = json.loads(urllib.request.urlopen(req, timeout=30).read())["result"]
+        return res["isError"], res["content"][0]["text"]
+
+    try:
+        leader = Node(lake, A.port, pg=f"127.0.0.1:{pg}", flight=f"127.0.0.1:{fl}").start()
+        sql(A.port, "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR, amount BIGINT)")
+        sql(A.port, "CREATE TABLE archive (id BIGINT, status VARCHAR, amount BIGINT)")
+        sql(A.port, "CREATE TABLE parent (id BIGINT GENERATED ALWAYS AS IDENTITY, name VARCHAR)")
+        sql(A.port, "CREATE TABLE child (pid BIGINT, tag VARCHAR)")
+        # The seeds the checks rely on: 1, 2 and 3 stay open (4 updates 1, 7 duplicates 2, 8 refuses to touch 3); 4, 5 and 20
+        # are done, so example 1 moves them; archive's own row 1 is there for checks 5 and 7 (5 takes row 20 back out).
+        sql(A.port, "INSERT INTO orders VALUES (1,'open',10), (2,'open',20), (3,'open',30), (4,'done',40), (5,'done',50), (20,'done',200)")
+        sql(A.port, "INSERT INTO archive VALUES (1,'old',1)")
+        c = psycopg.connect(url, autocommit=True)
+
+        # Example 1 moves exactly the 'done' rows: orders keeps its open ones, archive gets 4, 5 and 20 and keeps its row 1.
+        def moved():
+            sql(A.port, example1)
+            return ids_in("orders") == [1, 2, 3] and ids_in("archive") == [1, 4, 5, 20] and ids_in("archive", "status = 'done'") == [4, 5, 20]
+        check("moved: example 1 moves exactly the 'done' rows; orders lacks them, archive has them", moved)
+
+        # A write CTE's RETURNING rows answer the statement: the new order's id, doubled.
+        check("answered: WITH ins AS (INSERT INTO orders ... RETURNING id) SELECT id * 2 AS x FROM ins gives [{x: 20}]",
+              lambda: sql(A.port, "WITH ins AS (INSERT INTO orders VALUES (10,'new',5) RETURNING id) SELECT id * 2 AS x FROM ins") == [{"x": 20}])
+
+        # Example 2: the parent's new id feeds the child's write through the WITH; the statement counts one child row.
+        def chained():
+            n = sql(A.port, example2)
+            pid = [r["pid"] for r in sql(A.port, "SELECT pid FROM child")]
+            parent = [r["id"] for r in sql(A.port, "SELECT id FROM parent WHERE name = 'a'")]
+            info["example 2: its answer, the child's pid, the parent's id"] = [n, pid, parent]
+            return n == [{"n": 1}] and len(parent) == 1 and pid == parent
+        check("chained: example 2 answers n 1, and the child's pid is the parent's new id", chained)
+
+        # A plain CTE that runs first: example 3's CTE is its INSERT's source, and it inserts order 20 as a lone write does.
+        def plain_first():
+            sql(A.port, example3)
+            return sql(A.port, "SELECT status, amount FROM orders WHERE id = 20") == [{"status": "new", "amount": 1}]
+        check("plain first: example 3 inserts order 20 ('new', 1)", plain_first)
+
+        # A plain CTE before an UPDATE is a step too: the UPDATE reads it by name, and only order 1 matches it.
+        def plain_then_update():
+            sql(A.port, "WITH c AS (SELECT 1 AS id) UPDATE orders SET status = 'seen' FROM c WHERE orders.id = c.id")
+            return sorted((r["id"], r["status"]) for r in sql(A.port, "SELECT id, status FROM orders")) == [(1, "seen"), (2, "open"), (3, "open"), (10, "new"), (20, "new")]
+        check("...and WITH c AS (SELECT 1 AS id) UPDATE orders SET status = 'seen' FROM c WHERE orders.id = c.id updates order 1 only", plain_then_update)
+
+        # A column list renames the rows' columns: the archive row 20 that the DELETE returns answers under k.
+        check("column list: WITH m(k) AS (DELETE FROM archive WHERE id = 20 RETURNING id) SELECT k FROM m gives [{k: 20}]",
+              lambda: sql(A.port, "WITH m(k) AS (DELETE FROM archive WHERE id = 20 RETURNING id) SELECT k FROM m") == [{"k": 20}])
+
+        # A write CTE nobody names still runs: order 10 is gone, and the statement answers its one row.
+        check("unnamed runs: WITH d AS (DELETE FROM orders WHERE id = 10) SELECT 1 AS one gives one row, and order 10 is gone",
+              lambda: sql(A.port, "WITH d AS (DELETE FROM orders WHERE id = 10) SELECT 1 AS one") == [{"one": 1}] and ids_in("orders", "id = 10") == [])
+
+        # All or nothing: the INSERT's duplicate of order 2 fails the statement, and the DELETE before it in the same statement is undone.
+        check("all or nothing: the INSERT's duplicate of order 2 is refused 23505, and archive row 1 is still there",
+              lambda: post("WITH d AS (DELETE FROM archive WHERE id = 1 RETURNING *) INSERT INTO orders VALUES (2,'dup',1)")[1] == "23505" and ids_in("archive", "id = 1") == [1])
+
+        # Refusals: each one is 0A000 and runs nothing, so orders and archive are as they were before the batch.
+        sql(A.port, "CREATE VIEW ov AS SELECT * FROM orders")
+        c.execute("CREATE TEMP TABLE tt (id BIGINT)")
+        before = state()
+        refusals = {
+            "the table it writes, read": "WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *) SELECT * FROM orders",
+            "the table it writes, read through a view": "WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *) SELECT * FROM ov",
+            "two writes of one table": "WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *), e AS (DELETE FROM orders WHERE id = 1 RETURNING *) SELECT 1 AS one",
+            "a named write with no RETURNING": "WITH d AS (DELETE FROM orders WHERE id = 3) SELECT * FROM d",
+            "MERGE as a CTE": "WITH m AS (MERGE INTO orders USING (SELECT 3 AS id) s ON orders.id = s.id WHEN MATCHED THEN DELETE) SELECT 1 AS one",
+            "a write under a subquery": "WITH x AS (SELECT 1 AS one) SELECT * FROM (WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *) SELECT * FROM d) AS s",
+            "a write in a CTE's own WITH": "WITH x AS (WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *) SELECT * FROM d) SELECT * FROM x",
+            "a CTE named like a view": "WITH ov AS (DELETE FROM archive WHERE id = 1 RETURNING *) INSERT INTO orders SELECT id + 100, status, amount FROM ov",
+        }
+
+        def refused():
+            got = {label: post(text)[1] for label, text in refusals.items()}
+            got["a write into a temporary table"] = sqlstate_of(lambda: c.execute("WITH d AS (INSERT INTO tt VALUES (1) RETURNING id) SELECT * FROM d"))
+            info["refused: SQLSTATE by case"] = got
+            return all(v == "0A000" for v in got.values())
+        check("refused 0A000, before anything runs: a table read by another part, through a view, two writes of one table, a named write with no RETURNING, MERGE as a CTE, a write under a subquery or in a CTE's own WITH, a CTE named like a view, a write into a temporary table", refused)
+        check("...and orders and archive are as they were before those statements", lambda: state() == before)
+
+        # A job sent again is refused 55000 before anything runs: order 3 moved once, and archive holds one row of it.
+        job_sql = "WITH d AS (DELETE FROM orders WHERE id = 3 RETURNING *) INSERT INTO archive SELECT * FROM d"
+
+        def job_again():
+            first = call(A.port, "POST", "/sql?job=wwh-j1", job_sql.encode())
+            again = post(job_sql, path="/sql?job=wwh-j1")
+            info["job wwh-j1: the first send's answer, the second's SQLSTATE"] = [first, again[1]]
+            return again[0] != 200 and again[1] == "55000" and ids_in("archive", "id = 3") == [3] and ids_in("orders", "id = 3") == []
+        check("a job sent twice: the second is refused 55000, and order 3 moved once", job_again)
+
+        # Transactions on the Postgres port: example 1 rolled back moves nothing; committed, it moves its rows.
+        sql(A.port, "INSERT INTO orders VALUES (30,'done',300), (31,'done',310)")
+
+        def rolled_back():
+            before_archive = ids_in("archive")
+            c.execute("BEGIN")
+            c.execute(example1)
+            c.execute("ROLLBACK")
+            return ids_in("orders", "status = 'done'") == [30, 31] and ids_in("archive") == before_archive
+        check("a transaction that rolls back: BEGIN, example 1, ROLLBACK moves nothing", rolled_back)
+
+        def committed():
+            c.execute("BEGIN")
+            c.execute(example1)
+            c.execute("COMMIT")
+            return ids_in("orders", "status = 'done'") == [] and ids_in("archive", "id IN (30, 31)") == [30, 31]
+        check("a transaction that commits: BEGIN, example 1, COMMIT moves its rows", committed)
+
+        # The Postgres port's plain and prepared (Describe) executes of check 2's form give its rows; example 1's tag is INSERT 0 n.
+        sql(A.port, "INSERT INTO orders VALUES (60,'done',600), (61,'done',610)")
+        check("Postgres port, plain execute: WITH ins AS (INSERT ... RETURNING id) SELECT id * 2 AS x FROM ins gives (100,)",
+              lambda: c.execute("WITH ins AS (INSERT INTO orders VALUES (50,'new',5) RETURNING id) SELECT id * 2 AS x FROM ins").fetchall() == [(100,)])
+        check("Postgres port, prepare=True (Describe): the same form with order 51 gives (102,)",
+              lambda: c.execute("WITH ins AS (INSERT INTO orders VALUES (51,'new',5) RETURNING id) SELECT id * 2 AS x FROM ins", prepare=True).fetchall() == [(102,)])
+
+        def statusmessage():
+            cur = c.execute(example1)
+            info["example 1 on the Postgres port: cur.statusmessage"] = cur.statusmessage
+            return cur.statusmessage == "INSERT 0 2" and ids_in("archive", "id IN (60, 61)") == [60, 61]
+        check("example 1's cur.statusmessage is INSERT 0 2, and its two rows (60, 61) moved", statusmessage)
+
+        # Flight SQL (ADBC): check 2's form answers its rows, and the commit keeps the write (as returning() does).
+        def flight():
+            conn = adbc.connect(f"grpc://127.0.0.1:{fl}")
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute("WITH ins AS (INSERT INTO orders VALUES (70,'new',5) RETURNING id) SELECT id * 2 AS x FROM ins")
+                    got = [tuple(r) for r in cur.fetchall()]
+                finally:
+                    cur.close()
+                conn.commit()  # ADBC's DBAPI connection is not autocommit (PEP 249): without this, close rolls the INSERT back
+            finally:
+                conn.close()
+            info["Flight SQL: check 2's form"] = got
+            return got == [(140,)] and ids_in("orders", "id = 70") == [70]
+        check("Flight SQL (ADBC): WITH ins AS (INSERT ... RETURNING id) SELECT id * 2 AS x FROM ins gives (140,), and order 70 is written", flight)
+
+        # Read doors, last: once a user exists, every request signs in. A read token's write is 42501 and writes nothing;
+        # MCP's query tool refuses the same statement as a write (25006).
+        sql(A.port, "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER")
+        boss = {"Authorization": "Basic " + base64.b64encode(b"boss:boss-password-1").decode()}
+        for text in ("CREATE USER wreader PASSWORD 'reader-password-1'", "GRANT SELECT ON orders TO wreader",
+                     "GRANT SELECT ON archive TO wreader", "INSERT INTO orders VALUES (90,'done',900)"):
+            call(A.port, "POST", "/sql", text.encode(), headers=boss)
+        token = call(A.port, "POST", "/sql", b"CREATE TOKEN wwh_read FOR USER wreader", headers=boss)["token"]
+        reader = {"Authorization": f"Bearer {token}"}
+        before13 = state(boss)
+
+        # The token reads (a SELECT answers the table's rows), so the refusals below are about the write alone.
+        def reads():
+            got = post("SELECT count(*) AS n FROM orders", headers=reader)
+            return got[0] == 200 and got[2] == [{"n": len(before13[0])}]
+        check("a read token reads: SELECT count(*) AS n FROM orders answers the table's rows", reads)
+
+        def read_token_refused():
+            got = post(example1, headers=reader)
+            info["a read token: example 1 over HTTP, (status, SQLSTATE)"] = got[:2]
+            return got[0] != 200 and got[1] == "42501" and state(boss) == before13
+        check("a read token's write (example 1) is refused 42501, and nothing is written", read_token_refused)
+
+        def mcp_refused():
+            is_error, text = mcp_query(token, example1)
+            info["MCP's query tool, the read token: example 1's text"] = text[:300]
+            return is_error and "SQLSTATE 25006" in text and state(boss) == before13
+        check("MCP's query tool refuses example 1 as a write (SQLSTATE 25006), and nothing is written", mcp_refused)
+    finally:
+        if c is not None:
+            c.close()
+        if leader is not None:
+            leader.kill()
+    ok = all(checks.values())
+    print(json.dumps({"withwrites": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+
+
 def doors():
     """The doors matrix (ADR-036 §7): one list of features, each through every door — SQL over HTTP
     (a session), the Python client, the Postgres port (psycopg), Flight SQL (ADBC), the JavaScript
@@ -26433,7 +26675,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -26465,7 +26707,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -26478,7 +26720,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

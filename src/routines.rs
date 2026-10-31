@@ -788,7 +788,7 @@ async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> R
     }
 }
 
-async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if let Some(cmd) = crate::cursors::of(sql) {
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
         return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
@@ -845,6 +845,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
     }
     if let Some(steps) = Box::pin(steps(app, sql, who)).await? {
         return Box::pin(run_steps(app, steps, who, job)).await; // (several statements: an ALTER's actions, a DROP's views)
+    }
+    if let Some(w) = crate::with_writes::of(sql) {
+        return Box::pin(crate::with_writes::run(app, &w?, who, job)).await; // (a WITH that writes: its writes in one transaction, then its answer)
     }
     if let Some(r) = crate::returning::of(sql) {
         return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)

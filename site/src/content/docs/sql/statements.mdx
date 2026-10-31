@@ -476,6 +476,41 @@ SELECT * FROM users ORDER BY id;
 SELECT * FROM visits ORDER BY id;
 ```
 
+### RETURNING
+
+`INSERT`, `UPDATE` and `DELETE` take `RETURNING`, which answers with the rows the statement wrote: an
+`INSERT`'s and an `UPDATE`'s new rows, a `DELETE`'s old ones. The items are columns, expressions or `*`, as in a
+`SELECT`. It needs `SELECT` on the table, as Postgres asks (`42501` without it). An `ON CONFLICT … DO NOTHING`
+answers no row for a row it skips.
+
+```sql
+INSERT INTO users VALUES (5, 'ed', 'free') RETURNING id, name;
+UPDATE users SET plan = 'pro' WHERE name = 'ed' RETURNING *;
+DELETE FROM users WHERE name = 'ed' RETURNING id, plan;
+```
+
+### Writes in a WITH
+
+A `WITH` can hold a write, and a `WITH` can come before one. Each write runs once, in the order the `WITH`
+lists them, even when nothing names it. The parts after a write read its `RETURNING` rows by its name, and a
+column list renames them. A plain query in the `WITH` runs first when a write comes after it, and that write
+reads its rows by name. A write with no `RETURNING` runs too, but nothing can name its rows. The statement is
+one commit: in the open transaction if there is one, or in one of its own. Every part sees the data as it was
+before the statement, so no other part may name a table that a write changes. That is refused, and so are a few
+other shapes (see [Refused by name](#refused-by-name)).
+
+```sql
+CREATE TABLE orders_done (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+WITH moved AS (DELETE FROM orders WHERE qty = 0 RETURNING *)
+INSERT INTO orders_done SELECT * FROM moved;
+
+CREATE TABLE parent (id BIGINT, name VARCHAR);
+CREATE TABLE child (parent_id BIGINT, note VARCHAR);
+WITH ins AS (INSERT INTO parent VALUES (1, 'a') RETURNING id),
+     kid AS (INSERT INTO child SELECT id, 'x' FROM ins RETURNING *)
+SELECT count(*) AS n FROM kid;
+```
+
 ### Transactions
 
 | Statement | Syntax |
@@ -1044,7 +1079,15 @@ text is the node's own, it is shown in code:
 | a value that doesn't cast to its column's type (`'abc'` into a `BIGINT`) | refused, naming the value; never stored as `NULL` |
 | `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
 | `INSERT OVERWRITE` | refused: `write BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT (one commit), or CREATE OR REPLACE TABLE t AS …` |
-| `INSERT`, `UPDATE` or `DELETE` with `RETURNING` | refused, not taken yet; read the rows with a `SELECT` after it |
+| a table that a write in a `WITH` changes, named by another part of that statement (another CTE, or the main statement, its target included), directly or through a view | refused (`0A000`) before anything runs: each part sees the data as it was before the statement. Change or read the table in a statement after this one |
+| two write CTEs in one `WITH` that change the same table | refused (`0A000`), before anything runs |
+| `MERGE` as a CTE, as in `WITH m AS (MERGE …)` | refused (`0A000`), saying so |
+| a write CTE in `WITH RECURSIVE`, or one in a subquery or in a CTE's own `WITH` | refused (`0A000`): a write goes in the top `WITH` |
+| a write CTE with no `RETURNING` that a part names | refused (`0A000`), in Postgres's words: `WITH query "m" does not have a RETURNING clause`. A write that nothing names runs |
+| a write into a temporary table, in a `WITH` that writes | refused (`0A000`): it would land at once, outside the transaction |
+| a CTE named as a temporary table or a view, stored or temporary, in a `WITH` that writes | refused (`0A000`): the name would be read instead of the CTE |
+| a CTE with a quoted name that has a capital letter, in a `WITH` that writes | refused (`0A000`): the session keeps names in lowercase, so the name would not match |
+| `FOR UPDATE` or `FOR SHARE` in a `WITH` that writes | refused (`0A000`) |
 | `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused: `a table's options go in WITH (name = value, …)` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/sql/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |

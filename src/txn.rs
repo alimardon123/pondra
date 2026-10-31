@@ -1602,6 +1602,25 @@ pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
 /// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
 /// transaction's commit, so its commit sent again is a duplicate.
 pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
+    let out = as_one(app, job, move || async move {
+        let stmt = crate::write::parse(sql).context("not a write")?;
+        Box::pin(crate::write::on_node_as(app, stmt, None, files)).await // (refused: the session's end rolls it back)
+    })
+    .await?;
+    Ok(out.unwrap_or_else(|| j!({"duplicate": true})))
+}
+
+/// Runs `body` as one transaction of its own, committed when it returns: BEGIN, the body and COMMIT, in the caller's session (none
+/// open there: its temporary tables and settings are read as the body's own would be), or one of its own. A job names the commit,
+/// so a commit sent again is a duplicate (None), and what it wrote lands nowhere. A COMMIT refused with 40001 runs the body again,
+/// three times at most, since nothing has been answered yet (as Postgres works an UPDATE out again on the newest version of a row
+/// it waited for). A commit that answers ROLLBACK, or finds no transaction open, is a 40001 error and never a success: nothing was
+/// written.
+pub async fn as_one<T, F, Fut>(app: &crate::app::App, job: Option<String>, mut body: F) -> Result<Option<T>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
     leader_needed(app)?;
     let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
     let s = caller.clone().unwrap_or_else(crate::temp::of_script);
@@ -1610,11 +1629,25 @@ pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files:
         let mut tries = 0;
         loop {
             tries += 1;
-            let stmt = crate::write::parse(sql).context("not a write")?;
             start(app, &s, Level::Committed, false, job.clone(), false);
-            let out = Box::pin(crate::write::on_node_as(app, stmt, None, files)).await?; // (refused: the session's end rolls it back)
-            match commit(app, &s).await {
-                Ok((_, _, sent)) => return Ok(if sent["duplicate"] == true { j!({"duplicate": true}) } else { out }),
+            let out = {
+                // (a busy mark while the body runs: the idle upkeep must not end the transaction mid-statement)
+                let _busy = Busy(at(&s, |t| {
+                    t.busy += 1;
+                    t.id.clone()
+                })
+                .map(|id| (s.clone(), id)));
+                body().await?
+            };
+            let sent = match commit(app, &s).await {
+                Ok((tag, warning, _)) if tag == "ROLLBACK" || warning.as_deref() == Some(crate::rules::txn::NONE_OPEN) => {
+                    Err(crate::codes::coded("40001", "the transaction ended before its COMMIT: nothing was written"))
+                }
+                Ok((_, _, sent)) => Ok(sent),
+                Err(e) => Err(e),
+            };
+            match sent {
+                Ok(sent) => return Ok((sent["duplicate"] != true).then_some(out)),
                 Err(e) if crate::codes::of(&e) == "40001" && tries < 3 => continue,
                 Err(e) => return Err(e),
             }

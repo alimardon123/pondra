@@ -448,6 +448,27 @@ impl Backend {
                 crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }))),
             };
         }
+        if let Some(w) = crate::with_writes::of(&sql) {
+            // a WITH that writes (`WITH m AS (DELETE … RETURNING *) INSERT …`): its steps, then its answer, under its command's tag
+            let w = w.map_err(user_error)?;
+            let who = crate::routines::Who { role, files: false, depth: 0 };
+            return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(user_error)? {
+                crate::routines::Outcome::Rows(batches) => {
+                    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+                    let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
+                    let mut answer = rows(&schema, batches, format)?;
+                    answer.command_tag = w.tag().into();
+                    Response::Query(answer)
+                }
+                crate::routines::Outcome::Done(v) => {
+                    let tag = Tag::new(w.tag().split(' ').next().unwrap_or_default()).with_rows(v["rows"].as_u64().unwrap_or(0) as usize);
+                    Response::Execution(match w.tag().starts_with("INSERT") {
+                        true => tag.with_oid(0),
+                        false => tag,
+                    })
+                }
+            });
+        }
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
             let b = Box::pin(crate::returning::run(&self.app, &r, role, false, None)).await.map_err(user_error)?;
@@ -1668,6 +1689,23 @@ impl Backend {
                 return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
             }
         }
+        if crate::with_writes::of(sql).is_some() {
+            // (a WITH that writes: its columns as `run` answers them, with each `$i` read as NULL, as a plain statement's are planned)
+            let marks = crate::pg_types::columns(&self.app.lake, &written).await; // (its uuids, from the statement as written)
+            let sql = crate::vars::bound(sql).map_err(user_error)?;
+            let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
+            let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
+            if let Some(w) = crate::with_writes::of(&pg_dialect(&self.app.lake, &probe, "")) {
+                let w = w.map_err(user_error)?;
+                return Ok(match crate::with_writes::columns(&self.app, &w).await.map_err(user_error)? {
+                    Some(schema) => {
+                        let schema = crate::pg_types::typed(&schema, &marks);
+                        (described(&schema, format), Columns::Kept { schema, given: false })
+                    }
+                    None => (vec![], Columns::None), // (a write without RETURNING answers no columns)
+                });
+            }
+        }
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
@@ -1685,7 +1723,7 @@ impl Backend {
         let schema = match point {
             Some(s) => s,
             None => {
-                let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
+                let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
                 crate::pg_types::typed(&self.schema(&probe, "").await?, &marks)
             }
         };

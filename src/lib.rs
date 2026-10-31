@@ -168,6 +168,7 @@ mod rules;
 #[cfg(feature = "doors")] mod tls;
 #[cfg(feature = "lake")] mod txn;
 #[cfg(feature = "lake")] mod returning;
+#[cfg(feature = "lake")] mod with_writes;
 #[cfg(feature = "doors")] mod mcp;
 #[cfg(feature = "doors")] mod pg;
 #[cfg(feature = "lake")] mod past;
