@@ -1,7 +1,8 @@
 //! A page: a member on the core's lake (designs/page-p3.md). A claimed page (`claim`, one per module) answers its requests with
 //! its member, which opens at the first request: `/sql` is the core's statement path on the page's lake (`lake_sql`), `/objects`
 //! is its listing, and `/files/…` its files (`lake_files`). A folder kept by 0.35/0.36 is imported once on open (`import_kept`).
-//! A statement the lake can't answer because a table it names is a node's goes to the page's node (`lake_outgoing`, B5).
+//! A statement that names a table the lake can't answer for its session goes to the page's node, decided before the lake runs
+//! anything (`node_part`, B5, H6), and the node's part runs in the request's session.
 //! `web/` wraps it for a browser.
 
 #[cfg(target_arch = "wasm32")]
@@ -42,8 +43,8 @@ const COUNTERS_KEY: &str = "pondra.counters";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
-/// The 0A000 words of the refusals a page makes of a statement a node may not answer (`lake_outgoing`): a write that isn't a
-/// query (`query_of`), and a file named beside a node's table (`page_names`). A fill may not name its target `NODE_ROWS`
+/// The 0A000 words of the refusals a page makes of a statement a node may not answer (`part_of`): a write into a node's table
+/// that isn't a query (`writing`), and a file named beside a node's table (`page_names`). A fill may not name its target `NODE_ROWS`
 /// (`node_rows_taken`).
 const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node";
 const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
@@ -266,6 +267,23 @@ fn request_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a
     headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
+/// The headers that name a request's session (`x-pondra-session`, and `authorization` for a lent token's): what each request the
+/// page's fallback makes on the lake carries, so its statements run in the request's session (`lake_said`).
+fn session_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("x-pondra-session") || k.eq_ignore_ascii_case("authorization")).cloned().collect()
+}
+
+/// The request's headers as the HTTP door's map (a name or value that isn't valid is left out), as `statement::sql` reads them.
+fn header_map(headers: &[(String, String)]) -> http::HeaderMap {
+    let mut map = http::HeaderMap::new();
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (http::HeaderName::from_bytes(name.as_bytes()), http::HeaderValue::from_str(value)) {
+            map.append(name, value);
+        }
+    }
+    map
+}
+
 /// The value of `name` in a request's query (`format=csv`), or None; a bare `name` (`?versions`) has the empty value.
 fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     query.split('&').find_map(|kv| match kv.split_once('=') {
@@ -384,89 +402,74 @@ impl Page {
     /// `POST /sql` on the page's member (`open_lake`): the statement is `statement::sql`'s, run as the owner (`WHO` for an
     /// admin principal of this process, as the HTTP door's `guard` gives an owner's request), and its answer is the HTTP
     /// door's: the same body, status and content type, with `x-pondra-session` and `x-pondra-notices` as HTTP adds them.
+    /// A plain-SQL statement that names a table the lake can't answer for its session is the node's: that is decided before the
+    /// lake runs anything (`node_part`), so a 42P01 never fails a transaction, and the node's part runs in the request's session.
     async fn lake_sql(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
         // (a plain-SQL body, as `routines::Request` reads one: its content type is absent or text. Only such a body may go to the node)
         let plain = request_header(headers, "content-type").is_none_or(|kind| kind.starts_with("text/"));
         let text = body.clone(); // (a `Bytes` clone is a count, not a copy: the statement takes the body)
-        let answer = self.lake_said(query, headers, body).await;
-        if !plain || self.node.is_none() || answer.header("x-pondra-sqlstate") != Some("42P01") {
-            return answer;
+        if !plain || self.node.is_none() {
+            return self.lake_said(query, headers, body).await;
         }
-        let Ok(text) = std::str::from_utf8(&text) else { return answer };
-        match self.lake_outgoing(text, param(query, "format")).await {
-            Ok(Some(instead)) => instead,
-            Ok(None) => answer, // (the node has no part in it: the lake's 42P01 stands)
+        let Ok(sql) = std::str::from_utf8(&text) else { return self.lake_said(query, headers, body).await };
+        match Box::pin(self.node_part(sql, headers, param(query, "format"))).await {
+            Ok(Some(part)) => match Box::pin(self.node_answer(part, headers)).await {
+                Ok(answer) => answer,
+                Err(e) => failed(e),
+            },
+            Ok(None) => self.lake_said(query, headers, body).await, // (the node has no part in it: the lake runs it once, and its answer stands)
             Err(e) => failed(e),
         }
     }
 
-    /// What a node answers for a statement the lake can't plan because a table it names is not the page's (`lake_sql`'s 42P01),
-    /// as a node answers it: a query goes to the node with the rows of the page's tables it names, and
-    /// a fill (CTAS, or INSERT … SELECT into one of the page's tables) takes the node's rows for its query and runs its write over
-    /// them on the lake. The names are read over the text as the core expands it (`plain_of`); the node is asked the text as it
-    /// is written. None when no table it names is the node's, when a fill names none, or when the text doesn't parse: the 42P01 stands.
-    async fn lake_outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Answer>> {
+    /// The node's part of a plain-SQL statement (`part_of`), decided in the request's session (`statement::scoped`): its `$name`s
+    /// bind, and its temporary tables are the lake's. The words the lake runs as its own (a transaction's, a setting's, a variable's)
+    /// name no table, so they are the lake's before any name is read.
+    async fn node_part(&self, sql: &str, headers: &[(String, String)], format: Option<&str>) -> anyhow::Result<Option<Part>> {
         let Some(paged) = self.member.get() else { return Ok(None) };
-        let lake = &paged.app.lake;
-        let expanded = crate::routines::expand(lake, &crate::vars::bound(text)?).await?;
-        let state = lake.session().state();
-        let Ok(statement) = parsed(&state, &expanded) else { return Ok(None) };
-        // (a name is the page's when the lake holds a table of it: a file's name is never one, and the names are the lake's own)
-        let mut have = BTreeSet::new();
-        for name in state.resolve_table_references(&statement)? {
-            if !crate::ext_names::is(name.table()) && lake.table_meta_if(name.table()).await?.is_some() {
-                have.insert(name.table().to_string());
-            }
+        if crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() {
+            return Ok(None);
         }
-        let held = |name: &str| have.contains(name);
-        let tables = named(&state, &statement, &held)?;
+        let token = request_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer "));
+        let session = crate::temp::of(&header_map(headers))?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
-        match fill_of(&state, &statement)?.filter(|(target, _, insert)| !insert || home(&state, target, &held) == Home::Page) {
-            Some((target, fill, _)) => {
-                // (the fill's query as the text writes it, when it parses: the node is asked what was written)
-                let written = parsed(&state, text).ok().and_then(|as_written| fill_of(&state, &as_written).ok().flatten().map(|(_, q, _)| q.to_string()));
-                let sent = written.unwrap_or_else(|| fill.to_string());
-                let fill_tables = named(&state, &as_statement(fill), &held)?;
-                if fill_tables.iter().all(|(h, _)| *h != Home::Node) {
-                    return Ok(None);
-                }
-                if target.table() == NODE_ROWS {
-                    return Err(node_rows_taken());
-                }
-                let names = page_names(fill_tables)?;
-                let write = over_rows(&state, &statement)?;
-                let asked = self.lake_request(&sent, &names, "format=arrow").await?;
+        crate::statement::scoped(session, crate::auth::lent_vars(token), Box::pin(part_of(&paged.app.lake, sql, format_query))).await
+    }
+
+    /// The node's part, answered (`node_part`): a query goes to the node with the rows of the page's tables it names, and a fill
+    /// takes the node's rows for its query and runs its write over them on the lake. Every request the page makes on the lake
+    /// carries the request's session (`session_headers`), so its reads see the transaction's writes, and the fill commits or
+    /// rolls back with it.
+    async fn node_answer(&self, part: Part, headers: &[(String, String)]) -> anyhow::Result<Answer> {
+        let session = session_headers(headers);
+        match part {
+            Part::Query { sent, names, format } => {
+                let asked = self.lake_request(&sent, &names, &format, &session).await?;
+                self.ask(asked).await
+            }
+            Part::Fill { sent, names, write, format } => {
+                let asked = self.lake_request(&sent, &names, "format=arrow", &session).await?;
                 let answered = self.ask(asked).await?;
                 if answered.status != 200 {
-                    return Ok(Some(answered)); // (the node's refusal is the page's answer, as it is)
+                    return Ok(answered); // (the node's refusal is the page's answer, as it is)
                 }
                 node_arrow(&answered)?;
                 let body = request_of(&write, &BTreeSet::from([NODE_ROWS.to_string()]), &[answered.body])?;
-                let headers = [("content-type".to_string(), request_body::CONTENT_TYPE.to_string())];
-                Ok(Some(self.lake_said(&format_query, &headers, body).await))
-            }
-            None => {
-                if tables.iter().all(|(h, _)| *h != Home::Node) {
-                    return Ok(None);
-                }
-                if query_of(&statement).is_none() {
-                    return Err(crate::codes::coded("0A000", WRITE_TO_NODE));
-                }
-                let names = page_names(tables)?;
-                let asked = self.lake_request(text, &names, &format_query).await?;
-                Ok(Some(self.ask(asked).await?))
+                let mut headers = session;
+                headers.push(("content-type".to_string(), request_body::CONTENT_TYPE.to_string()));
+                Ok(self.lake_said(&format, &headers, body).await)
             }
         }
     }
 
     /// The request a page sends its node (`Sent`): `sql`, with the rows of the page's tables `names`, each read on the lake as
-    /// `SELECT *` (an Arrow stream), within `PONDRA_WEB_SEND_MB` (`sending`). A page table the lake can't read is the statement's
-    /// own answer, sent as it is.
-    async fn lake_request(&self, sql: &str, names: &BTreeSet<String>, query: &str) -> anyhow::Result<Sent> {
+    /// `SELECT *` (an Arrow stream) in the request's `session` (`session_headers`), within `PONDRA_WEB_SEND_MB` (`sending`). A page
+    /// table the lake can't read is the statement's own answer, sent as it is.
+    async fn lake_request(&self, sql: &str, names: &BTreeSet<String>, query: &str, session: &[(String, String)]) -> anyhow::Result<Sent> {
         let mut streams = vec![];
         for name in names {
             let read = format!("SELECT * FROM {}", crate::ext_names::quoted(name));
-            let answer = self.lake_said("format=arrow", &[], bytes::Bytes::from(read)).await;
+            let answer = self.lake_said("format=arrow", session, bytes::Bytes::from(read)).await;
             if answer.status != 200 {
                 return Err(anyhow::anyhow!(String::from_utf8_lossy(&answer.body).into_owned()));
             }
@@ -492,12 +495,7 @@ impl Page {
             (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return refused(400, e),
         };
         let p = crate::statement::SqlParams { format: text("format"), job: text("job"), spread: text("spread"), catalog: text("catalog"), after, stale_ms, rows };
-        let mut map = http::HeaderMap::new();
-        for (name, value) in headers {
-            if let (Ok(name), Ok(value)) = (http::HeaderName::from_bytes(name.as_bytes()), http::HeaderValue::from_str(value)) {
-                map.append(name, value);
-            }
-        }
+        let map = header_map(headers);
         let who = lake_principal();
         let format = p.format.clone();
         let asked = map.clone(); // (a stop fails the session the statement ran in: the headers name it, `failed_for_memory`)
@@ -839,6 +837,79 @@ enum Home {
     Page,
     File,
     Node,
+}
+
+/// The node's part of a statement (`part_of`), decided before the lake runs anything: a query the node answers, with the page's
+/// tables it names (`names`), as `sent` is, in `format`; or a fill, whose query the node answers (`sent`, with `names`), and whose
+/// rows `write` (the fill's statement over the node's rows) puts on the lake, in `format`.
+enum Part {
+    Query { sent: String, names: BTreeSet<String>, format: String },
+    Fill { sent: String, names: BTreeSet<String>, write: String, format: String },
+}
+
+/// The node's part of `sql` as the lake reads it (`node_part`, in the request's session): None when no table it names is the
+/// node's, when it is the lake's own (it neither reads nor writes one of the node's tables), or when it doesn't parse. The node is
+/// asked the text with its variables bound (`vars::bound`), as it is written.
+async fn part_of(lake: &crate::store::Lake, sql: &str, format_query: String) -> anyhow::Result<Option<Part>> {
+    let bound = crate::vars::bound(sql)?.into_owned();
+    let expanded = crate::routines::expand(lake, &bound).await?;
+    let state = lake.session().state();
+    let Ok(statement) = parsed(&state, &expanded) else { return Ok(None) };
+    // (a name is the page's when the lake answers it for this session (`lake_answers`); a file's name never is one)
+    let mut have = BTreeSet::new();
+    for name in state.resolve_table_references(&statement)? {
+        if !crate::ext_names::is(name.table()) && lake_answers(lake, name.table()).await? {
+            have.insert(name.table().to_string());
+        }
+    }
+    let held = |name: &str| have.contains(name);
+    let tables = named(&state, &statement, &held)?;
+    match fill_of(&state, &statement)?.filter(|(target, _, insert)| !insert || home(&state, target, &held) == Home::Page) {
+        Some((target, fill, _)) => {
+            // (the fill's query as the text writes it, when it parses: the node is asked what was written)
+            let written = parsed(&state, &bound).ok().and_then(|as_written| fill_of(&state, &as_written).ok().flatten().map(|(_, q, _)| q.to_string()));
+            let sent = written.unwrap_or_else(|| fill.to_string());
+            let fill_tables = named(&state, &as_statement(fill), &held)?;
+            if fill_tables.iter().all(|(h, _)| *h != Home::Node) {
+                return Ok(None);
+            }
+            if target.table() == NODE_ROWS {
+                return Err(node_rows_taken());
+            }
+            let names = page_names(fill_tables)?;
+            let write = over_rows(&state, &statement)?;
+            Ok(Some(Part::Fill { sent, names, write, format: format_query }))
+        }
+        None => {
+            if tables.iter().all(|(h, _)| *h != Home::Node) {
+                return Ok(None);
+            }
+            if query_of(&statement).is_none() {
+                // (a write into one of the node's tables is refused by name; any other statement is the lake's own, and its answer stands)
+                return if writing(&statement) { Err(crate::codes::coded("0A000", WRITE_TO_NODE)) } else { Ok(None) };
+            }
+            let names = page_names(tables)?;
+            Ok(Some(Part::Query { sent: bound, names, format: format_query }))
+        }
+    }
+}
+
+/// Whether the lake answers `name` in the session it is asked in: a table or a materialized view of the lake (`table_meta_if`), a
+/// stored view of it (`ddl::query_key`, where the lake's planner finds its views), or a temporary table or view of the session.
+async fn lake_answers(lake: &crate::store::Lake, name: &str) -> anyhow::Result<bool> {
+    Ok(crate::temp::made(name).is_some() || lake.table_meta_if(name).await?.is_some() || lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_some())
+}
+
+/// Whether a statement writes a table: an INSERT, UPDATE, DELETE or MERGE, or a query that writes (`writes`).
+fn writing(statement: &DfStatement) -> bool {
+    match statement {
+        DfStatement::Statement(s) => match &**s {
+            SqlStatement::Query(q) => writes(q),
+            SqlStatement::Insert(_) | SqlStatement::Update(_) | SqlStatement::Delete(_) | SqlStatement::Merge(_) => true,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// The home of the table `name` names, given whether the page holds a table of its name (`held`). A name carries the default
