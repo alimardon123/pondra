@@ -707,6 +707,7 @@ async fn reads(lake: &Lake, sql: &str, source: &str) -> Result<(Vec<String>, boo
 /// windows were still being emitted, and its answer then came four seconds after it.
 #[derive(Default)]
 struct Pace {
+    of: String, // (the run's view: its rerun's id, so a view made again starts afresh)
     running: bool,
     started: Option<Instant>,
     took: Duration,
@@ -768,6 +769,12 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
     let mut pace = PACE.lock().unwrap();
     let key = (lake.url.clone(), view.to_string());
     let p = pace.entry(key.clone()).or_default();
+    if p.of != r.id {
+        if p.running {
+            return None; // (the old view's run is still going: the new one waits for it to end)
+        }
+        *p = Pace { of: r.id.clone(), ..Default::default() };
+    }
     let least = Duration::from_secs(r.lag_secs.unwrap_or(0)).max(p.failed.backoff());
     let spaced = if r.full.is_some() { p.took * 10 } else { p.took * 2 }; // (from its start; a full run reads everything)
     let since = p.started.map(|s| s.elapsed());
@@ -788,10 +795,10 @@ fn turn(lake: &Lake, view: &str, r: &Rerun, changed: Option<(u64, u64)>) -> Opti
 }
 
 /// Why a view's runs keep failing on this node (two in a row), if they do: making it says so
-/// instead of waiting for a first run that won't come.
-pub fn failing(lake: &Lake, view: &str) -> Option<String> {
+/// instead of waiting for a first run that won't come. `of`: the view's `identity`.
+pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
     let pace = PACE.lock().unwrap();
-    pace.get(&(lake.url.clone(), view.to_string())).and_then(|p| p.failed.failing())
+    pace.get(&(lake.url.clone(), view.to_string())).filter(|p| p.of == of).and_then(|p| p.failed.failing())
 }
 
 /// Leader: start a run of every view that runs its query again whose turn it is, each in a task of
@@ -1356,6 +1363,30 @@ mod tests {
             ctx.register_table(name, Arc::new(table))?;
         }
         Ok(ctx.sql(&crate::pattern::rewritten(sql)?).await?.into_unoptimized_plan())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_view_made_again_under_its_name_starts_afresh() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-rerun-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let made = |id: &str| Rerun { id: id.into(), keys: vec![], full: None, reason: String::new(), asked: false, lag_secs: None, joins: vec![] };
+        let (a, b) = (made("a"), made("b"));
+        let key = (lake.url.clone(), "v".to_string());
+        let t = turn(&lake, "v", &a, None).expect("a's first turn");
+        assert!(turn(&lake, "v", &b, None).is_none(), "while a's run is going, b's waits for it to end");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        drop(t);
+        PACE.lock().unwrap().get_mut(&key).expect("a's pace").started = None; // (past a's pace)
+        let t = turn(&lake, "v", &a, None).expect("a's next turn");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        drop(t);
+        assert_eq!(failing(&lake, "v", "a").as_deref(), Some("boom"));
+        let t = turn(&lake, "v", &b, None).expect("b's first turn, with none of a's backoff");
+        assert_eq!(failing(&lake, "v", "a"), None, "a is gone: its failures went with it");
+        drop(t);
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[tokio::test]

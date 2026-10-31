@@ -855,6 +855,7 @@ impl Failures {
 /// A background view's runs on this node: one at a time, the next not before `after` (its failures' backoff).
 #[derive(Default)]
 struct Runs {
+    of: String, // (the view these runs are for: its `identity`)
     running: bool,
     after: Option<datafusion::common::instant::Instant>, // (a page's clock too: std's Instant has none there)
     failed: Failures,
@@ -869,10 +870,17 @@ struct Turn {
     done: bool,
 }
 
-/// `key`'s turn to run, if it has none running and its backoff is over; the run is then its own.
-fn turn_of(key: (String, String), what: &'static str) -> Option<Turn> {
+/// `key`'s turn to run for the view `of` (`identity`), if it has none running and its backoff is over; the run is then its
+/// own. A view made again under the name has another identity: it starts afresh, once the old one's run has ended.
+fn turn_of(key: (String, String), of: &str, what: &'static str) -> Option<Turn> {
     let mut runs = RUNS.lock().unwrap();
     let run = runs.entry(key.clone()).or_default();
+    if run.of != of {
+        if run.running {
+            return None; // (the old view's run is still going: the new one waits for it to end)
+        }
+        *run = Runs { of: of.to_string(), ..Default::default() };
+    }
     if run.running || run.after.is_some_and(|t| t > datafusion::common::instant::Instant::now()) {
         return None;
     }
@@ -881,8 +889,8 @@ fn turn_of(key: (String, String), what: &'static str) -> Option<Turn> {
 }
 
 /// The turn of view `view` on `lake` to run, as `turn_of`.
-fn turn(lake: &Lake, view: &str, what: &'static str) -> Option<Turn> {
-    turn_of((lake.url.clone(), view.to_string()), what)
+fn turn(lake: &Lake, view: &str, of: &str, what: &'static str) -> Option<Turn> {
+    turn_of((lake.url.clone(), view.to_string()), of, what)
 }
 
 /// Ends `key`'s run: its failures noted (`what` starts the log line), and the next run not before its backoff.
@@ -910,19 +918,25 @@ impl Drop for Turn {
     }
 }
 
-/// Why `key`'s runs keep failing, if they do (two in a row).
-fn failing_of(key: &(String, String)) -> Option<String> {
-    RUNS.lock().unwrap().get(key).and_then(|run| run.failed.failing())
+/// Why `key`'s runs keep failing, if they do (two in a row), for the view `of`.
+fn failing_of(key: &(String, String), of: &str) -> Option<String> {
+    RUNS.lock().unwrap().get(key).filter(|run| run.of == of).and_then(|run| run.failed.failing())
 }
 
-/// Why view `view`'s runs on `lake` keep failing, if they do: `pondra.flows`' `error`.
-pub fn failing(lake: &Lake, view: &str) -> Option<String> {
-    failing_of(&(lake.url.clone(), view.to_string()))
+/// Which view of its name `v` is: the id it was made with (its pattern's, its rerun's or its fill's; "" for a view
+/// made before Pondra 0.21, which has none). A view made again under the same name has another.
+pub(crate) fn identity(v: &View) -> &str {
+    v.matches.as_ref().map(|m| m.id.as_str()).or(v.rerun.as_ref().map(|r| r.id.as_str())).or(v.fill.as_ref().map(|f| f.id.as_str())).unwrap_or("")
+}
+
+/// Why view `view`'s runs on `lake` keep failing, if they do: `pondra.flows`' `error`. `of`: the view's `identity`.
+pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
+    failing_of(&(lake.url.clone(), view.to_string()), of)
 }
 
 /// Forgets the runs of views `lake` no longer has: `views` is every view it scans now (stream joins' too, so they are kept
-/// whatever their kind). Only names are compared: a view dropped and made again between two scans keeps the old one's
-/// failures until its first run that works.
+/// whatever their kind). Only names are compared here: a view made again under a name starts afresh at its next turn, as
+/// `turn_of` sees that its identity differs.
 fn forget_runs(lake: &Lake, views: &[(String, View)]) {
     let names: std::collections::HashSet<&str> = views.iter().map(|(k, _)| &k[2..]).collect();
     RUNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, name), _| url != &lake.url || names.contains(name.as_str()));
@@ -957,12 +971,12 @@ async fn bounded_by(secs: u64, f: impl std::future::Future<Output = Result<()>>)
 
 /// Start `name`'s run if it is its turn here: in a task of its own on the queries' runtime (invariant 231), once a slot is
 /// free; the view read again then (dropped meanwhile: nothing; made again: the new one), the run bounded, how it went noted.
-fn hand_out<F, Fut>(lake: &Arc<Lake>, name: &str, what: &'static str, run: F)
+fn hand_out<F, Fut>(lake: &Arc<Lake>, name: &str, of: &str, what: &'static str, run: F)
 where
     F: FnOnce(Arc<Lake>, String, View) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
-    let Some(turn) = turn(lake, name, what) else { return };
+    let Some(turn) = turn(lake, name, of, what) else { return };
     let (lake, name) = (lake.clone(), name.to_string());
     crate::panics::aside(async move {
         let _slot = slot().await;
@@ -990,7 +1004,7 @@ pub async fn emit_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>, seq: &Arc<cr
             continue;
         }
         let (log, seq, lock) = (log.clone(), seq.clone(), lock.clone());
-        hand_out(lake, &key[2..], "emission of", move |lake, name, v| async move {
+        hand_out(lake, &key[2..], identity(&v), "emission of", move |lake, name, v| async move {
             match (&v.matches, &v.emit, &v.sessions, &v.once) {
                 (Some(m), _, _, _) => crate::matches::run(&lake, &log, &seq, &lock, &name, &v, m).await,
                 (_, Some(e), _, _) => emit(&lake, &log, &name, &v, e).await,
@@ -1626,7 +1640,7 @@ pub async fn join_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>) -> Result<()
             continue;
         }
         let log = log.clone();
-        hand_out(lake, &key[2..], "stream join", move |lake, name, v| async move {
+        hand_out(lake, &key[2..], identity(&v), "stream join", move |lake, name, v| async move {
             match &v.join {
                 Some(j) => join(&lake, &log, &name, &v, j).await,
                 None => Ok(()),
@@ -1775,7 +1789,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
         ("reads", s(&|_, (_, v)| code_for_caller(|| reads(v)).flatten())),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| (v.once.is_some() || v.matches.is_some()).then(|| late(v))).collect::<Int64Array>())),
-        ("error", s(&|_, (n, v)| code_for_caller(|| if v.rerun.is_some() { crate::rerun::failing(lake, n) } else { failing(lake, n) }).flatten())), // (an error names tables and keys: S27)
+        ("error", s(&|_, (n, v)| code_for_caller(|| if v.rerun.is_some() { crate::rerun::failing(lake, n, identity(v)) } else { failing(lake, n, identity(v)) }).flatten())), // (an error names tables and keys: S27)
         ("definition", s(&|_, (_, v)| code_for_caller(|| shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
@@ -1843,17 +1857,33 @@ mod tests {
     #[tokio::test]
     async fn a_views_runs_take_turns_back_off_and_forget_a_run_that_stopped() {
         let key = ("test-lake-runs".to_string(), "registry_a".to_string());
-        let t = turn_of(key.clone(), "emission of").expect("its first turn");
-        assert!(turn_of(key.clone(), "emission of").is_none(), "one run at a time");
+        let t = turn_of(key.clone(), "", "emission of").expect("its first turn");
+        assert!(turn_of(key.clone(), "", "emission of").is_none(), "one run at a time");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        assert!(turn_of(key.clone(), "emission of").is_none(), "after a failure, its backoff");
-        assert_eq!(failing_of(&key), None, "one failure is not yet failing");
+        assert!(turn_of(key.clone(), "", "emission of").is_none(), "after a failure, its backoff");
+        assert_eq!(failing_of(&key, ""), None, "one failure is not yet failing");
         RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
-        let t = turn_of(key.clone(), "emission of").expect("its backoff is over");
+        let t = turn_of(key.clone(), "", "emission of").expect("its backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
-        assert_eq!(failing_of(&key).as_deref(), Some("boom"));
+        assert_eq!(failing_of(&key, "").as_deref(), Some("boom"));
         RUNS.lock().unwrap().get_mut(&key).unwrap().after = None;
-        drop(turn_of(key.clone(), "emission of").expect("a turn"));
+        drop(turn_of(key.clone(), "", "emission of").expect("a turn"));
         assert!(RUNS.lock().unwrap().get(&key).is_some_and(|r| !r.running), "a turn dropped unfinished is given back");
+    }
+
+    #[tokio::test]
+    async fn a_view_made_again_under_its_name_starts_afresh() {
+        let key = ("test-lake-again".to_string(), "registry_again".to_string());
+        let t = turn_of(key.clone(), "a", "emission of").expect("a's first turn");
+        assert!(turn_of(key.clone(), "b", "emission of").is_none(), "while a's run is going, b's waits for it to end");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        let t = turn_of(key.clone(), "a", "emission of").expect("a's backoff is over");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        assert_eq!(failing_of(&key, "a").as_deref(), Some("boom"));
+        assert_eq!(failing_of(&key, "b"), None, "a's failures are not b's");
+        let t = turn_of(key.clone(), "b", "emission of").expect("b's first turn: no backoff of a's");
+        assert_eq!(failing_of(&key, "a"), None, "a is gone: its failures went with it");
+        t.ended(&Ok(()));
     }
 }
