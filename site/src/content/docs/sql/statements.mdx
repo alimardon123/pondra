@@ -851,7 +851,9 @@ Only an admin installs an extension, and a node takes one only when it runs with
 the node that got the statement (a path on its machine from the program that started it, or a URL a
 secret covers), and every node sees the record; a branch and a backup carry the file with it. The
 file says its version and its functions, which a query then calls by name in every session, on every
-node; a name another function has already is refused at `INSTALL` (`42723`). Each call runs in a
+node; a name another function has already is refused at `INSTALL` (`42723`). A function the file gives
+columns is a table function, read as `SELECT * FROM name(…)` with literal arguments: its rows come a
+batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
 sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
 past it) and `PONDRA_EXTENSION_SECS` for a batch (`57014`); the function's own error is `38000`, and
 the node goes on.

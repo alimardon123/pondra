@@ -16,13 +16,27 @@ use wasmtime::{Config, Engine, Store};
 
 wasmtime::component::bindgen!({ path: "wit", world: "extension" });
 
-/// One scalar function an extension has, as its `describe()` says.
+/// The world of an extension with table functions too (`open`, `next`, `close`): asked for only when `describe()` names one.
+mod tables {
+    wasmtime::component::bindgen!({ path: "wit", world: "extension-with-tables" });
+}
+
+/// One function an extension has, as its `describe()` says: a scalar's answer is `returns`; a table function's rows have
+/// `columns` (and its `returns` is Null).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
     pub arguments: Vec<DataType>,
     pub returns: DataType,
     pub volatile: bool,
+    pub columns: Vec<(String, DataType)>,
+}
+
+impl Function {
+    pub fn is_table(&self) -> bool { !self.columns.is_empty() }
+
+    /// A table function's rows' schema.
+    pub fn schema(&self) -> Arc<Schema> { Arc::new(Schema::new(self.columns.iter().map(|(n, t)| Field::new(n, t.clone(), true)).collect::<Vec<_>>())) }
 }
 
 /// An extension's WebAssembly part, compiled and ready to call: its name and version, and its functions.
@@ -31,6 +45,7 @@ pub struct Loaded {
     pub version: String,
     pub functions: Vec<Function>,
     pre: ExtensionPre<Held>,
+    tables: Option<tables::ExtensionWithTablesPre<Held>>,
 }
 
 impl std::fmt::Debug for Loaded {
@@ -159,7 +174,8 @@ pub fn load(bytes: &[u8], sha256: &str) -> Result<Loaded> {
     if let Some((import, _)) = ty.imports(engine()).next() {
         return Err(coded("0A000", format!("the extension needs {import}, which this Pondra doesn't offer")));
     }
-    let pre = ExtensionPre::new(linker.instantiate_pre(&component)?)?;
+    let instance_pre = linker.instantiate_pre(&component)?;
+    let pre = ExtensionPre::new(instance_pre.clone())?;
     let limits = Limits::now();
     let mut store = store(limits);
     let said = match pre.instantiate(&mut store).and_then(|i| i.call_describe(&mut store)) {
@@ -167,7 +183,13 @@ pub fn load(bytes: &[u8], sha256: &str) -> Result<Loaded> {
         Err(e) => return Err(stopped(&store, limits, "the extension", "describe()", e)),
     };
     let (name, version, functions) = described(&said)?;
-    Ok(Loaded { name, version, functions, pre })
+    let tables = match functions.iter().filter(|f| f.is_table()).map(|f| f.name.as_str()).collect::<Vec<_>>() {
+        none if none.is_empty() => None,
+        named => Some(tables::ExtensionWithTablesPre::new(instance_pre).map_err(|e| {
+            coded("22023", format!("{name}'s describe() names table functions ({}), but it doesn't export open, next and close: {e:#}", named.join(", ")))
+        })?),
+    };
+    Ok(Loaded { name, version, functions, pre, tables })
 }
 
 /// `describe()`'s JSON: the name, version and functions, each type Arrow's as written (`Int64`, `Utf8`). Fields a host
@@ -182,7 +204,12 @@ fn described(json: &str) -> Result<(String, String, Vec<Function>)> {
     let mut functions = vec![];
     for f in v["functions"].as_array().map(Vec::as_slice).unwrap_or_default() {
         let arguments = f["arguments"].as_array().map(Vec::as_slice).unwrap_or_default().iter().map(ty).collect::<Result<_>>()?;
-        functions.push(Function { name: text(f, "name")?, arguments, returns: ty(&f["returns"])?, volatile: f["volatile"].as_bool().unwrap_or(false) });
+        let mut columns = vec![];
+        for c in f["columns"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            columns.push((text(c, "name")?, ty(&c["type"])?));
+        }
+        let returns = if columns.is_empty() { ty(&f["returns"])? } else { DataType::Null };
+        functions.push(Function { name: text(f, "name")?, arguments, returns, volatile: f["volatile"].as_bool().unwrap_or(false), columns });
     }
     Ok((text(&v, "name")?, text(&v, "version")?, functions))
 }
@@ -217,6 +244,82 @@ impl Loaded {
     }
 }
 
+impl Loaded {
+    /// Starts a call of the table function `function` with its arguments, one value each, cast to the types `describe()`
+    /// gave: its rows, read a batch at a time (`Rows::next`). The call keeps its store until it is dropped, within `limits`:
+    /// its memory for the whole call, its time for each batch.
+    pub fn rows(&self, function: &str, arguments: &[ArrayRef], limits: Limits) -> Result<Rows> {
+        let f = self.functions.iter().find(|f| f.name == function && f.is_table()).with_context(|| format!("{} has no table function {function}", self.name))?;
+        let pre = self.tables.as_ref().with_context(|| format!("{} has no table function {function}", self.name))?;
+        if arguments.len() != f.arguments.len() {
+            bail!("{function} takes {} arguments, not {}", f.arguments.len(), arguments.len());
+        }
+        let cast = arguments.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
+        let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(1)))?;
+        let (bytes, mut store) = (ipc(&batch)?, store(limits));
+        let opened = pre.instantiate(&mut store).and_then(|i| Ok((i.call_open(&mut store, function, &bytes)?, i)));
+        let (handle, instance) = match opened {
+            Ok((handle, instance)) => (handle.map_err(|said| coded("38000", format!("{}'s {function}: {said}", self.name)))?, instance),
+            Err(e) => return Err(stopped(&store, limits, &self.name, function, e)),
+        };
+        Ok(Rows { store, instance, handle, name: self.name.clone(), function: function.to_string(), schema: f.schema(), limits, open: true })
+    }
+}
+
+/// A table function's call in progress: its store, held until its rows are read or it is dropped.
+pub struct Rows {
+    store: Store<Held>,
+    instance: tables::ExtensionWithTables,
+    handle: u32,
+    name: String,
+    function: String,
+    schema: Arc<Schema>,
+    limits: Limits,
+    open: bool,
+}
+
+impl Rows {
+    pub fn schema(&self) -> Arc<Schema> { self.schema.clone() }
+
+    /// The next batch, in the columns `describe()` gave, or None once the call has given them all. A batch of other columns
+    /// fails the call, as a trap or the function's own error does.
+    pub fn next(&mut self) -> Result<Option<RecordBatch>> {
+        if !self.open {
+            return Ok(None);
+        }
+        self.store.set_epoch_deadline(self.limits.secs * 1000 / TICK.as_millis() as u64); // (its time is each batch's)
+        let out = match self.instance.call_next(&mut self.store, self.handle) {
+            Ok(out) => out,
+            Err(e) => {
+                self.open = false; // (a trapped instance is called no more)
+                return Err(stopped(&self.store, self.limits, &self.name, &self.function, e));
+            }
+        };
+        let Some(bytes) = out.map_err(|said| coded("38000", format!("{}'s {}: {said}", self.name, self.function)))? else {
+            self.close();
+            return Ok(None);
+        };
+        let got = StreamReader::try_new(bytes.as_slice(), None)?.next().context("a batch with no rows")??;
+        let types = |s: &Schema| s.fields().iter().map(|f| f.data_type().clone()).collect::<Vec<_>>();
+        if types(&got.schema()) != types(&self.schema) {
+            bail!("{}'s {} gave columns of {:?}, not {:?}", self.name, self.function, types(&got.schema()), types(&self.schema));
+        }
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), got.columns().to_vec())?)) // (its names as describe() gave them)
+    }
+
+    fn close(&mut self) {
+        if std::mem::take(&mut self.open) {
+            self.store.set_epoch_deadline(1000 / TICK.as_millis() as u64); // (a second to let go)
+            let _ = self.instance.call_close(&mut self.store, self.handle);
+        }
+    }
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) { self.close() } // (a query that stops reading lets the call go)
+}
+
 /// A batch as Arrow IPC stream bytes, the world's own form.
 fn ipc(batch: &RecordBatch) -> Result<Vec<u8>> {
     let mut out = vec![];
@@ -232,7 +335,8 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
 
-    /// `tests/extensions/words`, built by tools/extension_fixture.sh: word_count, shout and boom (and spin and hog, for limits).
+    /// `tests/extensions/words`, built by tools/extension_fixture.sh: word_count, shout and boom (spin and hog, for limits;
+    /// words_of and series, tables).
     const WORDS: &[u8] = include_bytes!("../tests/fixtures/extensions/words-0.1.wasm");
 
     fn words() -> Loaded { load(WORDS, "words-test").unwrap() }
@@ -241,8 +345,9 @@ mod tests {
     fn a_part_says_what_it_has() {
         let w = words();
         assert_eq!((w.name.as_str(), w.version.as_str()), ("words", "0.1"));
-        assert_eq!(w.functions[0], Function { name: "word_count".into(), arguments: vec![DataType::Utf8], returns: DataType::Int64, volatile: false });
-        assert_eq!(w.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["word_count", "shout", "boom", "spin", "hog"]);
+        assert_eq!(w.functions[0], Function { name: "word_count".into(), arguments: vec![DataType::Utf8], returns: DataType::Int64, volatile: false, columns: vec![] });
+        assert_eq!(w.functions[5].columns, [("word".to_string(), DataType::Utf8), ("place".to_string(), DataType::Int64)], "a table function's columns");
+        assert_eq!(w.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["word_count", "shout", "boom", "spin", "hog", "words_of", "series"]);
     }
 
     #[test]
@@ -285,6 +390,29 @@ mod tests {
         assert_eq!(w.call("hog", &[big], 1).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().value(0), 64 << 20, "under the default 256 MB it answers");
         let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
         assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "the part goes on");
+    }
+
+    /// A table function's rows come a batch at a time, in its columns, until there are none; a call let go before its end
+    /// leaves the part as it was.
+    #[test]
+    fn a_table_function_gives_its_rows_a_batch_at_a_time() {
+        use datafusion::arrow::array::AsArray;
+        let w = words();
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![2500]));
+        let mut rows = w.rows("series", &[n.clone()], Limits::now()).unwrap();
+        let (mut batches, mut sum) = (0, 0i64);
+        while let Some(b) = rows.next().unwrap() {
+            assert_eq!(b.schema().field(0).name(), "i");
+            batches += 1;
+            sum += b.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().flatten().sum::<i64>();
+        }
+        assert_eq!((batches, sum), (3, 2500 * 2501 / 2), "1,000 a batch");
+        assert!(rows.next().unwrap().is_none(), "and none after its end");
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["to be or not"]));
+        let got = w.rows("words_of", &[text], Limits::now()).unwrap().next().unwrap().unwrap();
+        assert_eq!((got.num_rows(), got.column(0).as_string::<i32>().value(3)), (4, "not"));
+        drop(w.rows("series", &[n], Limits::now()).unwrap()); // (let go unread)
+        assert!(w.rows("word_count", &[], Limits::now()).err().unwrap().to_string().contains("no table function word_count"));
     }
 
     #[test]

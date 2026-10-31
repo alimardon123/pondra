@@ -1253,6 +1253,10 @@ pub async fn volatile(lake: &Lake, sql: &str) -> bool {
 /// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
 /// each would call it.
 pub async fn pinned(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| !f.columns.is_empty()).await {
+        return true; // (an extension's table function, as a Python one: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return false };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
 }

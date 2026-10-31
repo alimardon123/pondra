@@ -16579,7 +16579,7 @@ def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
 def extensions():
     """Extensions (ADR-075 E1-E2c): an admin installs a WebAssembly file once and every node of a cluster has its functions at
     once, by their own names; SHOW EXTENSIONS lists it after the built-ins; a query spread over three nodes answers as one node
-    does; a function's own error is 38000 and a runaway call stops at PONDRA_EXTENSION_SECS with 57014, failing alone while the
+    does, and a table function's rows come once; a function's own error is 38000 and a runaway call stops at PONDRA_EXTENSION_SECS with 57014, failing alone while the
     nodes go on; a branch keeps the extension and its file; UNINSTALL takes the functions away on every node. A non-owner may
     not install from a path on the node's machine, and a node started without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL
     by the variable's name."""
@@ -16617,6 +16617,7 @@ def extensions():
         before = metrics_of(A.port + 1, signed)["pondra_spread_queries_total"]
         one, three = q(agg, 1, spread=0), q(agg, 1, spread=1)
         checks["a query spread over three nodes == one node"] = one == three and one[0]["same"] == 200_000 and metrics_of(A.port + 1, signed)["pondra_spread_queries_total"] > before
+        checks["a table function's rows once, asked of three nodes (it runs on one) or of one"] = q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=1) == q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=0) == [{"n": 10000, "s": 50005000}]
         checks["a function's own error is 38000, in its words"] = "38000" in (e := refused("SELECT boom(1)")) and "boom always fails" in e
         started = time.time()
         e = refused("SELECT spin(id) FROM notes LIMIT 1", 2)

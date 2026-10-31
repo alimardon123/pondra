@@ -67,6 +67,9 @@ pub struct Described {
     pub returns: String,
     #[serde(default)]
     pub volatile: bool,
+    /// A table function's columns, by name and type (a scalar has none, and its `returns`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<(String, String)>,
 }
 
 /// What a statement does with a name.
@@ -334,7 +337,13 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
         return Err(coded("22023", format!("{file} is {} {}, not {asked}", part.name, part.version)));
     }
     let version = part.version.clone();
-    let functions: Vec<Described> = part.functions.iter().map(|f| Described { name: f.name.clone(), arguments: f.arguments.iter().map(ToString::to_string).collect(), returns: f.returns.to_string(), volatile: f.volatile }).collect();
+    let functions: Vec<Described> = part.functions.iter().map(|f| Described {
+        name: f.name.clone(),
+        arguments: f.arguments.iter().map(ToString::to_string).collect(),
+        returns: f.returns.to_string(),
+        volatile: f.volatile,
+        columns: f.columns.iter().map(|(n, t)| (n.clone(), t.to_string())).collect(),
+    }).collect();
     clash(lake, name, &functions).await?;
     let size = bytes.len() as u64;
     match lake.put(&file_key(name, &version, &sha256), bytes).await {
@@ -429,7 +438,11 @@ pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, t
     for (name, r) in installed.iter().filter(|(_, r)| r.functions.iter().any(|f| words.contains(f.name.as_str()))) {
         let part = part(lake, name, r).await?;
         for f in &part.functions {
-            ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(Call::new(part.clone(), f)));
+            if f.is_table() {
+                ctx.register_udtf(&f.name, Arc::new(TableCall { part: part.clone(), function: f.clone() }));
+            } else {
+                ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(Call::new(part.clone(), f)));
+            }
         }
     }
     Ok(())
@@ -447,6 +460,93 @@ pub async fn calls(lake: &Lake, sql: &str, which: impl Fn(&Described) -> bool) -
     match crate::routines::with_views(lake, sql).await {
         Ok(text) => names.iter().any(|n| crate::text::mentions(&text, n)),
         Err(_) => true,
+    }
+}
+
+/// One of an extension's table functions in a session: `f(…)` in FROM, its arguments values worked out once, as a
+/// Python table function's are (`pyfn::TableFn`).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+struct TableCall {
+    part: Arc<crate::wasm::Loaded>,
+    function: crate::wasm::Function,
+}
+
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl datafusion::catalog::TableFunctionImpl for TableCall {
+    fn call(&self, args: &[datafusion::prelude::Expr]) -> datafusion::error::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+        use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+        let simplifier = ExprSimplifier::new(datafusion::logical_expr::simplify::SimplifyContext::builder().with_current_time().build());
+        let mut values = vec![];
+        for a in args {
+            match simplifier.simplify(crate::optimize::whole_literals(a.clone())?)? {
+                datafusion::prelude::Expr::Literal(v, _) => values.push(v.to_array()?),
+                e => return datafusion::common::plan_err!("{}: its arguments are values (worked out once), not {e}", self.function.name),
+            }
+        }
+        Ok(Arc::new(Called { part: self.part.clone(), function: self.function.clone(), values }))
+    }
+}
+
+/// A table function called with its arguments: its rows, streamed from the part as the query reads them.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+struct Called {
+    part: Arc<crate::wasm::Loaded>,
+    function: crate::wasm::Function,
+    values: Vec<datafusion::arrow::array::ArrayRef>,
+}
+
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+#[async_trait::async_trait]
+impl datafusion::catalog::TableProvider for Called {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef { self.function.schema() }
+    fn table_type(&self) -> datafusion::datasource::TableType { datafusion::datasource::TableType::Temporary }
+
+    async fn scan(&self, _: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, _: &[datafusion::prelude::Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        let rows: Arc<dyn datafusion::physical_plan::streaming::PartitionStream> = Arc::new(Streamed { part: self.part.clone(), function: self.function.name.clone(), values: self.values.clone(), schema: self.function.schema() });
+        Ok(Arc::new(datafusion::physical_plan::streaming::StreamingTableExec::try_new(self.function.schema(), vec![rows], projection, [], false, limit)?))
+    }
+}
+
+/// The call's rows as one stream: opened, read and let go on a thread of its own (a call is the part's to run, as long as
+/// it takes within its limits), two batches ahead of the query at most. A query that stops reading lets the call go.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+#[derive(Debug)]
+struct Streamed {
+    part: Arc<crate::wasm::Loaded>,
+    function: String,
+    values: Vec<datafusion::arrow::array::ArrayRef>,
+    schema: datafusion::arrow::datatypes::SchemaRef,
+}
+
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+impl datafusion::physical_plan::streaming::PartitionStream for Streamed {
+    fn schema(&self) -> &datafusion::arrow::datatypes::SchemaRef { &self.schema }
+
+    fn execute(&self, _: Arc<datafusion::execution::TaskContext>) -> datafusion::execution::SendableRecordBatchStream {
+        let mut builder = datafusion::physical_plan::stream::RecordBatchReceiverStream::builder(self.schema.clone(), 2);
+        let tx = builder.tx();
+        let (part, function, values) = (self.part.clone(), self.function.clone(), self.values.clone());
+        builder.spawn_blocking(move || {
+            let mut rows = part.rows(&function, &values, crate::wasm::Limits::now()).map_err(coded_error)?;
+            while let Some(batch) = rows.next().map_err(coded_error)? {
+                if tx.blocking_send(Ok(batch)).is_err() {
+                    break; // (the query stopped reading: the call is let go as `rows` drops)
+                }
+            }
+            Ok(())
+        });
+        builder.build()
+    }
+}
+
+/// An error for DataFusion, its code kept (a function's own error is 38000 at every door).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+fn coded_error(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+        Some(c) => datafusion::error::DataFusionError::External(Box::new(crate::codes::Coded(c.0, c.1.clone()))),
+        None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
     }
 }
 
@@ -497,11 +597,7 @@ impl datafusion::logical_expr::ScalarUDFImpl for Call {
         }).collect::<datafusion::error::Result<Vec<_>>>()?;
         match self.part.call(&self.function, &columns, rows) {
             Ok(column) => Ok(ColumnarValue::Array(column)),
-            // (its code goes with it: a function's own error is 38000 at every door)
-            Err(e) => Err(match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
-                Some(c) => datafusion::error::DataFusionError::External(Box::new(crate::codes::Coded(c.0, c.1.clone()))),
-                None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
-            }),
+            Err(e) => Err(coded_error(e)),
         }
     }
 }
@@ -766,7 +862,7 @@ mod tests {
 
         let first = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
         assert_eq!((first.version.as_str(), first.bytes as usize), ("0.1", WORDS.len()), "the version is the file's own");
-        assert_eq!(first.functions[0], Described { name: "word_count".into(), arguments: vec!["Utf8".into()], returns: "Int64".into(), volatile: false });
+        assert_eq!(first.functions[0], Described { name: "word_count".into(), arguments: vec!["Utf8".into()], returns: "Int64".into(), volatile: false, columns: vec![] });
         let e = keep(&lake, "words", "/data/words.wasm", Some("0.2".into()), WORDS.to_vec()).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("22023", "words.wasm is words 0.1, not 0.2".to_string()));
         let again = keep(&lake, "words", "https://x.org/words.wasm", Some("0.1".into()), WORDS.to_vec()).await?;
@@ -779,7 +875,7 @@ mod tests {
         assert!(keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.is_ok(), "installed again over itself: its own names");
         let e = keep(&lake, "words2", "/data/words-0.1.wasm", None, WORDS.to_vec()).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42723", "words2's function word_count: the extension words has a function word_count already".to_string()));
-        let upper = Described { name: "upper".into(), arguments: vec!["Utf8".into()], returns: "Utf8".into(), volatile: false };
+        let upper = Described { name: "upper".into(), arguments: vec!["Utf8".into()], returns: "Utf8".into(), volatile: false, columns: vec![] };
         let e = clash(&lake, "mine", &[upper]).await.err().unwrap();
         assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("42723", "mine's function upper: Pondra has a function upper already".to_string()));
         // (a branch copies the file each record names: there it is)
@@ -818,6 +914,11 @@ mod tests {
         let got = run("SELECT word_count(t) AS n, shout(t) AS s FROM (VALUES (arrow_cast('a quick test', 'Utf8View')), (NULL), ('')) AS v(t)").await?;
         assert_eq!(got[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>(), &Int64Array::from(vec![Some(3), None, Some(0)]));
         assert_eq!(got[0].column(1).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("A QUICK TEST"), None, Some("")]);
+        let got = run("SELECT count(*) AS n, sum(i) AS s FROM series(2500)").await?;
+        assert_eq!(got[0].column(1).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 2500 * 2501 / 2, "a table function's rows, every batch");
+        let got = run("SELECT word FROM words_of('to be or not') WHERE place > 2 ORDER BY place").await?;
+        assert_eq!(got[0].column(0).as_string::<i32>().iter().collect::<Vec<_>>(), [Some("or"), Some("not")]);
+        assert!(run("SELECT * FROM series(2500) LIMIT 3").await?.iter().map(|b| b.num_rows()).sum::<usize>() == 3, "a query that stops reading lets the call go");
         let e = run("SELECT boom(1)").await.err().unwrap();
         assert_eq!((crate::codes::of(&e), crate::codes::words(&e)), ("38000", "words's boom: boom always fails".to_string()));
         uninstall(&lake, "words", false).await?;
