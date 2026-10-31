@@ -1452,7 +1452,10 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             planned_only.push(table_ref(&name));
         }
     }
-    register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
+    // (a listing shows what it can; and so does a session without `except`, whose caller registers that table after, as a
+    // view's new rows: a view over it, only named in the query (a subquery's alias, `views::written_in`), can't be planned
+    // yet, and the query fails by itself if it reads one)
+    register_views(&ctx, views, !listing && except.is_empty(), listing).await?;
     for name in planned_only {
         ctx.deregister_table(name)?;
     }
