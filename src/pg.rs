@@ -1592,7 +1592,7 @@ impl Backend {
             let marks = crate::pg_types::columns(&self.app.lake, &written).await; // (its uuids, from the statement as written)
             let sql = crate::vars::bound(sql).map_err(user_error)?;
             let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
-            let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
+            let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
             if let Some(w) = crate::with_writes::of(&pg_dialect(&self.app.lake, &probe, "")) {
                 let w = w.map_err(user_error)?;
                 return Ok(match crate::with_writes::columns(&self.app, &w).await.map_err(user_error)? {
@@ -1621,7 +1621,7 @@ impl Backend {
         let schema = match point {
             Some(s) => s,
             None => {
-                let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
+                let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
                 crate::pg_types::typed(&self.schema(&probe, "").await?, &marks)
             }
         };
