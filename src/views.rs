@@ -19,6 +19,7 @@
 //! * A session view (`sessions`) holds each key's sessions, a session being its rows with no gap
 //!   of `gap_secs` between them, each emitted once, when the watermark passes its last row plus
 //!   the gap. A row that falls inside a session already emitted is late, and left out.
+use crate::codes::coded;
 use crate::query::{first_table, over, session, session_at};
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
@@ -418,6 +419,12 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
+/// The refusal of a view that takes each row once (`what`: sessions, stream joins, pattern views with EMIT FINAL)
+/// over `source`, a view kept by key: its rows are replaced as their groups are worked out again (0A000).
+pub(crate) fn kept_by_key(source: &str, name: &str, what: &str) -> anyhow::Error {
+    coded("0A000", format!("{source} is kept by key: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {source}'s own source"))
+}
+
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
@@ -463,7 +470,9 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     };
     ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
-    ensure!(upstream.as_ref().is_none_or(|u| u.rerun.is_none()) || (sessions.is_none() && join.is_none()), "{source} is kept by key: its rows are replaced as their groups are worked out again, and sessions and stream joins take each row once. Make {name} from {source}'s own source");
+    if upstream.as_ref().is_some_and(|u| u.rerun.is_some()) && sessions.is_some() {
+        return Err(kept_by_key(&source, name, "sessions"));
+    }
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
@@ -1405,7 +1414,9 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins {source} with one other append table of this lake (the append tables it reads: {named})");
     for t in &tables {
         let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.rerun.is_some());
-        ensure!(!kept, "{t} is kept by key: its rows are replaced as their groups are worked out again, and a stream join pairs each row once. Join its own source");
+        if kept {
+            return Err(kept_by_key(t, name, "stream joins"));
+        }
     }
     for (i, t) in tables.iter().enumerate() {
         if let Some(c) = j.time.get(i).or(j.time.first()) {
