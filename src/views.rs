@@ -282,7 +282,9 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
         Some(e) => bail!("emit = '{e}': a view's query ends EMIT FINAL to keep each group once, when it's over"),
         None => false,
     };
-    ensure!(!once || !kv.contains_key("window"), "EMIT FINAL finds its window in the GROUP BY: leave out window = '…' and size_secs");
+    if once && kv.contains_key("window") {
+        return Err(coded("0A000", "EMIT FINAL finds its window in the GROUP BY: leave out window = '…' and size_secs"));
+    }
     ensure!(idle_secs.is_none() || once || kv.contains_key("session"), "idle moves time on for a view that keeps what is over: its query ends EMIT FINAL");
     let slide_secs = kv.get("slide_secs").map(|_| num("slide_secs", 0)).transpose()?;
     let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None, slide_secs })).transpose()?;
@@ -427,6 +429,15 @@ pub(crate) fn kept_by_key(source: &str, name: &str, what: &str) -> anyhow::Error
     coded("0A000", format!("{source} is kept by key: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {source}'s own source"))
 }
 
+/// The table a view follows, by its name in this lake (`ddl::resolve`): refused 0A000 when it names another lake's.
+pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
+    let (other, source) = crate::ddl::resolve(lake, table).await?;
+    if other.is_some() {
+        return Err(coded("0A000", "a view follows a table of this lake"));
+    }
+    Ok(source)
+}
+
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
@@ -456,8 +467,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
     crate::ddl::unclaimed(lake, name).await?;
-    let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
-    ensure!(other.is_none(), "a view follows a table of this lake");
+    let source = followed(lake, &first_table(sql)?).await?;
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
     // A view of a view: a flow (ADR-036 §1's pipeline). Its rows are derived from the other's in the
     // same flush, so in the same commit (`derive`). A GROUP BY view's table keeps partial rows,

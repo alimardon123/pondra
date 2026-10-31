@@ -21,6 +21,7 @@
 //! id, so the view's change feed shows an update. That is one commit with the view's progress
 //! (producer `rerun:{view}`, seq the commit it read up to, `prev` the one before): a run is
 //! applied once, whichever leader runs it. Nothing is held between runs.
+use crate::codes::coded;
 use crate::query::{session_at, table_ref};
 use crate::store::*;
 use crate::text::{CREATED, ROW_ID, VERSION};
@@ -607,13 +608,15 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
         How::ByKey => {
             let keys = keys(plan).map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
             if let Some(u) = unfollow(src) {
-                bail!("{}", match u {
+                return Err(coded("0A000", match u {
                     Unfollow::Keyed => format!("{}, so a view of it can't be kept by key. refresh = 'full' runs its query whole again", u.said(source)),
                     Unfollow::Partial => format!("{}: make {name} from {source}'s own source, or refresh = 'full'", u.said(source)),
                     Unfollow::History => format!("{}: make {name} with refresh = 'full'", u.said(source)),
-                });
+                }));
             }
-            ensure!(upstream.is_none_or(|u| u.sessions.is_none() || u.rerun.is_some()), "{source} cuts sessions as they close: make {name} from {source}'s own source");
+            if upstream.is_some_and(|u| u.sessions.is_some() && u.rerun.is_none()) {
+                return Err(coded("0A000", format!("{source} cuts sessions as they close: make {name} from {source}'s own source")));
+            }
             let joins = joins(lake, plan, sql, source).await.map_err(|e| anyhow::anyhow!("{name} can't be kept by key: {e:#}. refresh = 'full' runs its query whole again"))?;
             (keys, joins, None, why.unwrap_or_else(|| "asked for (refresh = 'by key')".into()))
         }

@@ -8,7 +8,7 @@ use crate::log::{Append, Outcome, Sequencer, Src};
 use crate::query::{over_ctx, session, session_at, table_ref};
 use crate::store::*;
 use crate::text::{ROW_ID, VERSION};
-use crate::views::{Options, Refresh, View, EXPECTED};
+use crate::views::{Options, View, EXPECTED};
 use crate::codes::coded;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StructArray};
@@ -59,9 +59,7 @@ pub fn tables(name: &str) -> Vec<String> { vec![held_of(name), resume_of(name)] 
 /// `CREATE MATERIALIZED VIEW v AS SELECT … MATCH_RECOGNIZE (…) EMIT FINAL`, as `once::create` hands it over: the query
 /// without EMIT FINAL. Makes the view, `{v}$held` and `{v}$resume` in one commit.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
-    takes(o.emit.is_none() && o.join.is_none() && o.history.is_none() && o.sessions.is_none(), "EMIT FINAL keeps each match once: no window, session, join or history options with it")?;
-    takes(o.expect.is_empty(), "EMIT FINAL keeps each match once, when it's decided: put expectations on a view of the rows before it")?;
-    takes(matches!(o.refresh, None | Some(Refresh::Incremental)) && o.lag_secs.is_none(), "EMIT FINAL keeps each match once, when it's decided, from the rows as they come: not by key, run whole or with a lag")?;
+    crate::once::final_options(&o, "each match once, when it's decided")?;
     let written = format!("{}\nEMIT FINAL", sql.trim_end());
     if let Some(v) = lake.cat.get::<View>(&crate::views::view_key(name)).await? {
         ensure!(v.matches.is_some() && v.query() == written, "view {name} already exists, with other SQL or options");
@@ -78,8 +76,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let ctx = session(lake, sql, "").await?;
     let cols = crate::pattern::open_columns(lake, sql).await?;
     let open = crate::pattern::open(sql, &cols, &ctx.state())?;
-    let (other, source) = crate::ddl::resolve(lake, &open.table).await?;
-    takes(other.is_none(), "a view follows a table of this lake")?;
+    let source = crate::views::followed(lake, &open.table).await?;
     takes(source == open.table, format!("{}: a view follows the table by its name in this lake: write {source}", open.table))?;
     let src: TableMeta = table_meta(lake, &source).await?.logical(); // (SQL's names)
     if lake.cat.get::<View>(&crate::views::view_key(&source)).await?.is_some_and(|u| u.rerun.is_some()) {
@@ -881,6 +878,7 @@ fn without(b: &RecordBatch, name: &str) -> Result<RecordBatch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::Refresh;
 
     const TICKER: &str = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.ts AS start_ts ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m";
 
@@ -898,7 +896,11 @@ mod tests {
         let lake = lake_with_ticks(&dir).await?;
         let refused = |o: Options, sql: &str| {
             let (lake, sql) = (lake.clone(), sql.to_string());
-            async move { create(&lake, "dips", &sql, o).await.expect_err("a refusal").to_string() }
+            async move {
+                let e = create(&lake, "dips", &sql, o).await.expect_err("a refusal");
+                assert_eq!(crate::codes::of(&e), "0A000", "{e}");
+                e.to_string()
+            }
         };
         let e = refused(Options { refresh: Some(Refresh::ByKey), ..options() }, TICKER).await;
         assert!(e.contains("not by key, run whole or with a lag"), "{e}");
@@ -923,6 +925,22 @@ mod tests {
         }
         let e = refused(options(), &TICKER.replace("ticks", "nowhere")).await;
         assert!(e.contains("reads a table directly"), "{e}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn once_and_matches_refuse_the_same_options_with_one_code() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-matches-{}", uuid::Uuid::new_v4()));
+        let lake = lake_with_ticks(&dir).await?;
+        let by_minute = "SELECT date_trunc('minute', ts) AS m, count(*) AS n FROM ticks GROUP BY 1";
+        let e = crate::once::create(&lake, "per_min", by_minute, Options { lag_secs: Some(60), ..options() }).await.expect_err("a refusal");
+        assert_eq!(crate::codes::of(&e), "0A000", "{e}");
+        assert!(e.to_string().contains("each group once"), "{e}");
+        let e = create(&lake, "dips", TICKER, Options { lag_secs: Some(60), ..options() }).await.expect_err("a refusal");
+        assert_eq!(crate::codes::of(&e), "0A000", "{e}");
+        assert!(e.to_string().contains("each match once"), "{e}");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
