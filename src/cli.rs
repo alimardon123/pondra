@@ -660,7 +660,7 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
         Ok(node) => node,
         // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
-        Err(e) if write::fenced(&e) && write::tries() < 5 => run_again("fenced while starting"),
+        Err(e) if write::fenced(&e) && write::tries() < 5 => write::start_over("fenced while starting", write::job()),
         Err(e) => return Err(e),
     };
     // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
@@ -681,24 +681,18 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            run_again("fenced while writing");
+            write::start_over("fenced while writing", write::job());
         }
         return Err(err);
     }
     // (fenced out as it finished, before what it wrote was durable: run again, and the job says whether it was recorded)
     if finished.as_ref().is_err_and(|e| write::fenced(e) && write::tries() < 5) {
-        run_again("fenced while finishing");
+        write::start_over("fenced while finishing", write::job());
     }
     finished?;
     print!("{heard}");
     println!("{body}");
     Ok(())
-}
-
-/// A `pondra sql` guest fenced out by a newer writer runs again with the same job, so whoever records its write
-/// records it once (`write::deliver` does the same), one more try each time.
-fn run_again(why: &str) -> ! {
-    crate::node::restart_with(why, &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())])
 }
 
 /// The statement `pondra backup` runs on the lake: `BACKUP DATABASE TO 'to' [WITH (retention_days = n)]`, its place quoted

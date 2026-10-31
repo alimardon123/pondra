@@ -241,7 +241,7 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                     let kept = facts.get(&(o.lake.clone(), local.clone())).map_or(&[][..], |f: &Vec<crate::constraints::Constraint>| f.as_slice());
                     format!("CREATE VIEW {named}{} AS\n{s}", crate::facts::in_list(kept))
                 }),
-                "materialized view" => views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
+                "materialized view" => crate::views::code_for_caller(|| views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref()))).flatten(),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
             let def = def.filter(|_| !partial);
@@ -1040,7 +1040,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
         "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
-        _ if !crate::auth::shows_code() && matches!(o.family(), "routine" | "task") => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
+        _ if !crate::auth::shows_code() && (matches!(o.family(), "routine" | "task") || matches!(o.kind, "view" | "materialized view")) => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
         _ if crate::auth::limited().is_some() => "its statement names every column, and you may read only some of them",
         _ => "made with its materialized view",
     }))?;

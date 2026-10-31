@@ -113,17 +113,17 @@ pub async fn claim(store: &Store, n: u64, addr: &str) -> Result<Option<Term>> {
     }
 }
 
-/// The term a one-off writer claims: the next term with no address, once the newest term is not alive. While it is alive,
-/// `live` decides: an `Err` refuses (no claim is made), and an `Ok` waits a second and looks again. (A backup waits for
-/// another one-off writer this way; a page's lake alone refuses one, `members::Alone::lead`.)
+/// The term a one-off writer claims: the next term with no address, once the lake has no holder (`holder`). While it is
+/// held, `live` decides: an `Err` refuses (no claim is made), and an `Ok` waits for the holder (`wait_for`) and looks
+/// again. (A backup waits for another one-off writer this way; a page's lake alone refuses one, `members::Alone::lead`.)
 pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>) -> Result<Term> {
     loop {
-        match latest(store).await? {
-            Some(t) if alive(store, &t).await => {
+        match holder(store).await? {
+            Holder::Led(t) | Holder::Recording(t) => {
                 live(&t)?;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                wait_for(store, &t).await;
             }
-            t => {
+            Holder::Free(t) => {
                 if let Some(term) = claim(store, t.map_or(1, |t| t.n + 1), "").await? {
                     return Ok(term);
                 }
@@ -289,6 +289,16 @@ pub async fn deaf(store: &Store, t: &Term) -> bool {
         if let Some(gone) = ear.gone(store).await {
             return gone;
         }
+    }
+}
+
+/// A writer that would wait for holder `t` (a one-off writer recording, or a leader it can't reach): a second, then it
+/// looks again. A holder that doesn't answer its bell (`deaf`) is gone, and `alive` says so from then on, so the wait is
+/// over at once and the next look claims the lake. Each writer that waits for a one-off writer waits this way
+/// (`Cluster::join`, `Cluster::guest`, `write::deliver`, `claim_one_off`), so a killed one is passed in about 5 s.
+pub(crate) async fn wait_for(store: &Store, t: &Term) {
+    if !deaf(store, t).await {
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -496,6 +506,32 @@ mod tests {
         assert_eq!(bell(&store).await, rung, "nothing to watch for: no ring");
         assert!(marked_before(&store, 9_003).await.is_some_and(|d| d < Duration::from_secs(30)), "9,002's mark, a moment ago");
         assert!(marked_before(&store, 9_002).await.is_none(), "no term before it was marked");
+    }
+
+    #[tokio::test]
+    async fn a_one_off_writer_passes_a_recorder_that_doesnt_answer_its_bell() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let killed = Term { n: 9_004, addr: String::new(), lock: String::new(), bell: true };
+        store.put(&Path::from(format!("cluster/term/{:020}", 9_004)), serde_json::to_vec(&killed).unwrap().into()).await.unwrap();
+        mark_alive(&store, 9_004).await.unwrap(); // (fresh: its process was killed a moment after, and nothing marks it again)
+        let waited = tokio::time::Instant::now();
+        let won = claim_one_off(&store, |_| Ok(())).await.unwrap();
+        assert_eq!(won.n, 9_005, "the killed recorder's term is passed");
+        assert!(waited.elapsed() < Duration::from_secs(10), "passed within 10 s");
+        release(&store, 9_005).await;
+    }
+
+    #[tokio::test]
+    async fn a_one_off_writer_refused_by_a_live_holder_claims_nothing() {
+        let store: Store = Arc::new(object_store::memory::InMemory::new());
+        let recording = Term { n: 9_006, addr: String::new(), lock: String::new(), bell: true };
+        store.put(&Path::from(format!("cluster/term/{:020}", 9_006)), serde_json::to_vec(&recording).unwrap().into()).await.unwrap();
+        mark_alive(&store, 9_006).await.unwrap();
+        let asked = tokio::time::Instant::now();
+        let refused = claim_one_off(&store, |_| Err(anyhow::anyhow!("a live recorder"))).await;
+        assert!(refused.is_err(), "live says no: refused");
+        assert!(asked.elapsed() < Duration::from_millis(500), "refused at once, not after a wait");
+        assert_eq!(latest(&store).await.unwrap().map(|t| t.n), Some(9_006), "no term was claimed");
     }
 
     /// The numbers of the records under `prefix`, sorted.

@@ -23,7 +23,7 @@ use crate::members::Members;
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
-use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, Holder, Term, HELD, LEASE};
+use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, wait_for, Holder, Term, HELD, LEASE};
 use anyhow::Result;
 use futures::StreamExt;
 use std::collections::BTreeMap;
@@ -105,7 +105,7 @@ impl Cluster {
                         break t;
                     }
                 }
-                Some(t) if alive(store, &t).await && !deaf(store, &t).await => tokio::time::sleep(Duration::from_secs(1)).await, // a `pondra sql` INSERT is recording: wait
+                Some(t) if t.addr.is_empty() && alive(store, &t).await => wait_for(store, &t).await, // a `pondra sql` INSERT is recording: wait
                 t => {
                     if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr).await? {
                         break t; // (or someone else just did: look again)
@@ -147,9 +147,7 @@ impl Cluster {
                     if !writes {
                         return Ok(made("", t, true, may_lead, false, false));
                     }
-                    if !deaf(store, &t).await {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
+                    wait_for(store, &t).await;
                 }
                 // (nobody alive: a read reads what is there, and a write claims the next term and leads it)
                 Holder::Free(t) => {

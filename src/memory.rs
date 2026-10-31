@@ -6,10 +6,12 @@
 //! their version: `PutMode::Update`) stay in memory: they are small, and a local folder can't take
 //! an update.
 //!
-//! What spills is capped as a query's spills are (`store::spill_cap`: `PONDRA_SPILL_GB`, else the disk's
-//! room), each lake on its own, and the room a lake keeps on its disk is kept either way. Past either, the
-//! write is refused by name (53100), and a write that would pass it reserves its bytes first, so writes
-//! racing for the last of the room can't both take it.
+//! What spills is one budget for everything this process spills: `PONDRA_SPILL_GB`, else the disk's room, shared
+//! with the queries' and the shuffles' spills (`store::others_held`). The lakes in memory count their bytes on
+//! disk and their reserved bytes together (`Spilled`, one for the process), so the spill disk is counted once for
+//! all of them. The room a lake keeps on its disk is kept either way. Past either, the write is refused by name
+//! (53100), and a write that would pass it reserves its bytes first, so writes racing for the last of the room
+//! can't both take it.
 //!
 //! A lake moves out of memory with `set_location` (`ALTER DATABASE … SET LOCATION`, `db.save`): its objects
 //! are copied to the target while the node serves, the host stops the node, `settle` makes the target equal
@@ -44,6 +46,27 @@ static MEMORY: std::sync::LazyLock<Mutex<HashMap<String, Store>>> = std::sync::L
 /// `sweep` skips these (on NFS a lock is per process, so opening a folder's lock again would drop ours). Not the
 /// pid: an exec restart keeps it, and the container image runs `pondra` as PID 1 on a shared volume.
 static MADE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// What the lakes in memory hold on disk: the bytes of every lake's files and log that spilled (`on_disk`), and the
+/// bytes reserved for spills in flight (`reserved`, see `Reserved`). A reservation counts before its write lands and
+/// stops counting once the write's bytes are on disk. One for the process (`PROCESS`), so the spill disk is counted
+/// once for all of its lakes; a test makes its own, so tests running in parallel don't see each other's bytes.
+#[derive(Debug, Default)]
+pub(crate) struct Spilled {
+    on_disk: AtomicU64,
+    reserved: AtomicU64,
+}
+
+impl Spilled {
+    /// The bytes on disk and reserved: what the lakes take of the spill disk.
+    fn total(&self) -> u64 { self.on_disk.load(SeqCst) + self.reserved.load(SeqCst) }
+}
+
+/// The spilled bytes of this process's lakes in memory: the one `Spilled` every lake made by `Held::with_budget` counts in.
+static PROCESS: std::sync::LazyLock<Arc<Spilled>> = std::sync::LazyLock::new(Arc::default);
+
+/// What the lakes in this process's memory take of the spill disk, on disk or reserved for spills in flight.
+pub(crate) fn spilled() -> u64 { PROCESS.total() }
 
 crate::per_node!(
     /// Why the last move of this node's lake failed (`move_failed`): the host starts the node again on the lake
@@ -108,17 +131,26 @@ struct Inner {
     objects: InMemory,
     tier: OnceLock<Disk>, // the disk tier (made on the first object that spills)
     mem: Tally,           // the objects in `objects`: what the budget is measured against
-    disk: Tally,          // the objects in `tier`: what the cap is measured against
-    pending: AtomicU64,   // bytes reserved on disk for spills in flight (`Reserved`), not in `disk` yet
+    disk: Tally,          // the objects in `tier`: this lake's bytes on disk, also counted in `spilled`
+    spilled: Arc<Spilled>, // the count this lake's bytes are in: the process's (`PROCESS`), or a test's own
     budget: u64,
+    #[cfg(test)]
+    cap: Option<u64>, // a test's setting in bytes, in place of `PONDRA_SPILL_GB` (`setting`)
 }
 
 /// The objects one tier holds, by path, each with its bytes, and their sum. Every write and delete that moves
-/// an object into or out of a tier notes it here, so each sum is the tier's whole.
+/// an object into or out of a tier notes it here, so each sum is the tier's whole. A counted tier (the disk
+/// tier) moves its `Spilled` by the same change, under the same lock, so the two never disagree.
 #[derive(Debug, Default)]
 struct Tally {
     sizes: Mutex<HashMap<Path, u64>>,
     sum: AtomicU64,
+    counted: Option<Arc<Spilled>>,
+}
+
+impl Tally {
+    /// A tally whose sum is also counted in `spilled`'s `on_disk`.
+    fn counting(spilled: &Arc<Spilled>) -> Tally { Tally { counted: Some(spilled.clone()), ..Default::default() } }
 }
 
 /// The store of a spill folder: a local folder's. A page has no folder, so there a `Disk` is never made (`Disk::make`).
@@ -133,27 +165,33 @@ type FolderStore = InMemory;
 struct Disk {
     store: FolderStore,
     folder: Folder,
-    cap: Option<u64>, // the most that may spill here (`store::spill_cap`); None where the disk's room can't be told
 }
 
 impl Held {
     /// A lake held in memory, spilling past this process's budget.
     pub fn new() -> Held { Held::with_budget(budget()) }
 
-    /// A lake held in memory, spilling past `budget` bytes of it in memory.
-    pub fn with_budget(budget: u64) -> Held {
-        Held(Arc::new(Inner { objects: InMemory::new(), tier: OnceLock::new(), mem: Tally::default(), disk: Tally::default(), pending: AtomicU64::new(0), budget }))
+    /// A lake held in memory, spilling past `budget` bytes of it in memory. Its spills count in this process's `Spilled`.
+    pub fn with_budget(budget: u64) -> Held { Held::counting(budget, PROCESS.clone()) }
+
+    /// A lake held in memory whose spills count in `spilled`.
+    fn counting(budget: u64, spilled: Arc<Spilled>) -> Held {
+        let disk = Tally::counting(&spilled);
+        Held(Arc::new(Inner { objects: InMemory::new(), tier: OnceLock::new(), mem: Tally::default(), disk, spilled, budget, #[cfg(test)] cap: None }))
     }
 
-    /// A lake held in memory whose disk takes at most `cap` bytes of spills (the tests' cap, not the disk's room).
+    /// A lake held in memory whose spills count in `spilled` (a test's own, so tests running in parallel never see each
+    /// other's bytes) and stand against `cap` bytes in place of the setting, if there is one.
     #[cfg(test)]
-    fn with_cap(budget: u64, cap: u64) -> Held {
-        let h = Held::with_budget(budget);
-        let mut disk = Disk::make().unwrap();
-        disk.cap = Some(cap);
-        let _ = h.0.tier.set(disk);
+    fn sharing(budget: u64, cap: Option<u64>, spilled: Arc<Spilled>) -> Held {
+        let mut h = Held::counting(budget, spilled);
+        Arc::get_mut(&mut h.0).expect("a lake made here is not shared yet").cap = cap;
         h
     }
+
+    /// A lake held in memory whose spills stand against `cap` bytes in place of the setting, counted on their own.
+    #[cfg(test)]
+    fn with_cap(budget: u64, cap: u64) -> Held { Held::sharing(budget, Some(cap), Arc::default()) }
 }
 
 impl std::fmt::Display for Held {
@@ -191,7 +229,7 @@ fn full(what: String) -> object_store::Error {
 /// A part's future that fails with a refusal (`Upload::put_part`), without sending the part on.
 fn refused(why: String) -> UploadPart { Box::pin(async move { Err(full(why)) }) }
 
-/// Bytes reserved on disk for a spill in flight (`Inner::reserve`). They count against the cap until the write
+/// Bytes reserved on disk for a spill in flight (`Inner::reserve`). They count against the spill budget until the write
 /// lands (the disk's tally takes them over) or the reservation goes; dropping one gives its bytes back.
 #[derive(Debug)]
 struct Reserved {
@@ -209,7 +247,7 @@ impl Reserved {
     }
 
     /// Gives back what is reserved: once the write has landed (its bytes are in the disk's sum) or has failed.
-    fn release(&mut self) { self.inner.pending.fetch_sub(std::mem::take(&mut self.bytes), SeqCst); }
+    fn release(&mut self) { self.inner.spilled.reserved.fetch_sub(std::mem::take(&mut self.bytes), SeqCst); }
 }
 
 impl Drop for Reserved {
@@ -230,10 +268,16 @@ impl Tally {
         let old = sizes.remove(at);
         if let Some(old) = old {
             self.sum.fetch_sub(old, SeqCst);
+            if let Some(spilled) = &self.counted {
+                spilled.on_disk.fetch_sub(old, SeqCst);
+            }
         }
         if let Some(bytes) = bytes {
             sizes.insert(at.clone(), bytes);
             self.sum.fetch_add(bytes, SeqCst);
+            if let Some(spilled) = &self.counted {
+                spilled.on_disk.fetch_add(bytes, SeqCst);
+            }
         }
         old.is_some()
     }
@@ -260,20 +304,43 @@ impl Inner {
     /// The disk tier, if it exists and `at` may be on it.
     fn disk_of(&self, at: &Path) -> Option<&Disk> { self.tier.get().filter(|_| spillable(at)) }
 
-    /// Adds `bytes` to what is reserved on disk for spills in flight, if the disk has the room and the cap allows
-    /// it; else says why not. The one check for `reserve` and `Reserved::grow`. Checking the sum and then writing
-    /// would let several writes read the same sum and all pass, so the reservation is what stops that. The pending
-    /// bytes are read before the sum (SeqCst): a landing is in the sum before its reservation goes, so the two
-    /// never both miss it.
+    /// The setting the spills of this lake are checked against, in GB (`piece_fits`): `PONDRA_SPILL_GB`, or a test's cap.
+    #[cfg(test)]
+    fn setting(&self) -> Option<f64> {
+        match self.cap {
+            Some(cap) => Some(cap as f64 / (1u64 << 30) as f64), // (a power of two: `gb_bytes` gives `cap` back exactly)
+            None => crate::store::spill_gb(),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn setting(&self) -> Option<f64> { crate::store::spill_gb() }
+
+    /// Adds `bytes` to what is reserved for spills in flight, if they fit; else says why not. The one check for
+    /// `reserve` and `Reserved::grow`. Under the setting, everything this process spills must stay within it: the
+    /// others' bytes (`store::others_held`) and the lakes' (`on_disk` and `reserved`). Without it, the bytes in flight
+    /// come off the disk's free room, which counts only what has landed. The check and the reservation are one
+    /// `fetch_update` on `reserved`, so writes racing for the last of the room can't both take it. The room and
+    /// `on_disk` are read after `reserved` (SeqCst): a landing is on disk before its reservation goes, so it is
+    /// counted once, in one or the other, never in neither.
     fn claim(&self, disk: &Disk, bytes: u64) -> Result<(), String> {
         if let Some((free, keep)) = crate::store::short_of_room(&disk.folder.path) {
             return Err(format!("the disk a lake in memory spills to has {} MB free, and a lake keeps {} MB", free >> 20, keep >> 20));
         }
-        let fits = |pending: u64| disk.cap.is_none_or(|cap| pending + self.disk.sum() + bytes <= cap);
-        self.pending
-            .fetch_update(SeqCst, SeqCst, |pending| fits(pending).then_some(pending + bytes))
+        let gb = self.setting();
+        let others = gb.map_or(0, |_| crate::store::others_held()); // (the queries' and the shuffles' spills count under the setting only)
+        let fits = |reserved: u64| {
+            let room = crate::store::space(&disk.folder.path).map(|(free, total)| (free.saturating_sub(reserved), total));
+            crate::store::piece_fits(gb, others + self.spilled.on_disk.load(SeqCst) + reserved, bytes, room)
+        };
+        self.spilled
+            .reserved
+            .fetch_update(SeqCst, SeqCst, |reserved| fits(reserved).then_some(reserved + bytes))
             .map(|_| ())
-            .map_err(|_| format!("a lake in memory may spill {} MB to disk and holds {} MB there", disk.cap.unwrap_or(0) >> 20, self.disk.sum() >> 20))
+            .map_err(|_| match gb {
+                Some(gb) => format!("this process's spills may take {:.1} MB of disk and hold {} MB there", gb * 1024.0, (crate::store::others_held() + self.spilled.total()) >> 20),
+                None => format!("the disk a lake in memory spills to has no room for {} MB more beside the spills in flight", bytes >> 20),
+            })
     }
 
     /// Reserves `bytes` on disk for a write about to land there, refused by name when the disk has no room or
@@ -352,14 +419,18 @@ impl Inner {
     }
 }
 
+/// A lake that goes gives its bytes on disk back to the count they were in (its reservations go with it: each holds the lake).
+impl Drop for Inner {
+    fn drop(&mut self) { self.spilled.on_disk.fetch_sub(self.disk.sum(), SeqCst); }
+}
+
 impl Disk {
     /// A lake's spill folder, made on the first object that spills.
     #[cfg(not(target_arch = "wasm32"))]
     fn make() -> object_store::Result<Disk> {
         let folder = Folder::make("memory").map_err(spill_failed)?;
         let store = FolderStore::new_with_prefix(&folder.path)?;
-        let cap = crate::store::spill_cap(Some(&folder.path));
-        Ok(Disk { store, folder, cap })
+        Ok(Disk { store, folder })
     }
 
     /// A page's lake in memory doesn't spill: it has no folder, so a write past its budget is refused here, where a node
@@ -1085,7 +1156,7 @@ mod tests {
         h.put(&Path::from("data/t/a"), bytes(1)).await.unwrap(); // 10 bytes: under the cap
         let err = h.put(&Path::from("data/t/b"), bytes(2)).await.unwrap_err(); // 20 bytes would pass it
         let text = err.to_string();
-        assert!(text.contains("a lake in memory may spill") && text.contains("PONDRA_SPILL_GB"), "{text}");
+        assert!(text.contains("this process's spills may take") && text.contains("PONDRA_SPILL_GB"), "{text}");
         assert_eq!(crate::codes::of(&anyhow::Error::from(err)), "53100");
         assert!(matches!(h.get(&Path::from("data/t/b")).await, Err(object_store::Error::NotFound { .. })), "a refused write leaves nothing");
         h.delete(&Path::from("data/t/a")).await.unwrap(); // gives its 10 bytes back
@@ -1104,13 +1175,13 @@ mod tests {
         assert!(up.put_part(bytes(6)).await.is_err(), "and so does every part after it");
         up.abort().await.unwrap();
         assert!(matches!(h.get(&at).await, Err(object_store::Error::NotFound { .. })), "an aborted upload leaves nothing");
-        assert_eq!(h.0.pending.load(SeqCst), 0, "and gives its room back");
+        assert_eq!(h.0.spilled.reserved.load(SeqCst), 0, "and gives its room back");
         let mut again = h.put_multipart_opts(&at, PutMultipartOptions::default()).await.unwrap();
         again.put_part(bytes(4)).await.unwrap();
         assert!(again.put_part(bytes(5)).await.is_err());
         assert!(again.complete().await.is_err(), "a completed upload past the cap is refused too");
         assert!(matches!(h.get(&at).await, Err(object_store::Error::NotFound { .. })), "and leaves nothing");
-        assert_eq!(h.0.pending.load(SeqCst), 0);
+        assert_eq!(h.0.spilled.reserved.load(SeqCst), 0);
         assert_eq!(h.0.disk.sum(), 0);
     }
 
@@ -1130,6 +1201,29 @@ mod tests {
         h.copy(&Path::from("data/t/a"), &Path::from("data/t/b")).await.unwrap();
         assert_eq!(read(&h, "data/t/b").await, vec![1; 10]);
         assert_eq!(h.0.disk.sum(), 20, "the copy's bytes count as the source's did");
+    }
+
+    /// Two lakes sharing one `Spilled` and one cap (what the process's lakes share under the setting): the second's spill
+    /// past what is left is refused by name, a delete in the first gives its room back, and racing writes from both
+    /// never take the last of it together.
+    #[tokio::test]
+    async fn two_lakes_share_one_cap_and_a_delete_gives_its_room_back() {
+        let shared: Arc<Spilled> = Arc::default();
+        let a = Held::sharing(0, Some(15), shared.clone()); // every file spills; the spills of both may take 15 bytes
+        let b = Held::sharing(0, Some(15), shared.clone());
+        a.put(&Path::from("data/t/a"), bytes(1)).await.unwrap(); // 10 bytes of the 15
+        let err = b.put(&Path::from("data/t/b"), bytes(2)).await.unwrap_err(); // 20 would pass it, with a's 10
+        let text = err.to_string();
+        assert!(text.contains("this process's spills may take") && text.contains("PONDRA_SPILL_GB"), "{text}");
+        assert_eq!(crate::codes::of(&anyhow::Error::from(err)), "53100");
+        assert!(matches!(b.get(&Path::from("data/t/b")).await, Err(object_store::Error::NotFound { .. })), "a refused write leaves nothing");
+        a.delete(&Path::from("data/t/a")).await.unwrap(); // gives its 10 bytes back to b
+        b.put(&Path::from("data/t/b"), bytes(2)).await.unwrap(); // lands now
+        b.delete(&Path::from("data/t/b")).await.unwrap();
+        let (px, py) = (Path::from("data/t/x"), Path::from("data/t/y")); // (the puts borrow their paths while they race)
+        let (x, y) = tokio::join!(a.put(&px, bytes(3)), b.put(&py, bytes(4)));
+        assert_eq!([x.is_ok(), y.is_ok()].iter().filter(|ok| **ok).count(), 1, "racing for the last of the room, one lands");
+        assert_eq!(shared.total(), 10, "and the two lakes hold what landed");
     }
 
     #[cfg(target_os = "linux")]
