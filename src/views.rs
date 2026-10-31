@@ -846,7 +846,7 @@ impl Failures {
 #[derive(Default)]
 struct Runs {
     running: bool,
-    after: Option<std::time::Instant>,
+    after: Option<datafusion::common::instant::Instant>, // (a page's clock too: std's Instant has none there)
     failed: Failures,
 }
 
@@ -863,7 +863,7 @@ struct Turn {
 fn turn_of(key: (String, String), what: &'static str) -> Option<Turn> {
     let mut runs = RUNS.lock().unwrap();
     let run = runs.entry(key.clone()).or_default();
-    if run.running || run.after.is_some_and(|t| t > std::time::Instant::now()) {
+    if run.running || run.after.is_some_and(|t| t > datafusion::common::instant::Instant::now()) {
         return None;
     }
     run.running = true;
@@ -881,7 +881,7 @@ fn record(key: &(String, String), what: &str, error: Option<String>) {
     let Some(run) = runs.get_mut(key) else { return }; // (its node stopped: its state is gone)
     run.running = false;
     run.failed.note(&format!("{what} {}", key.1), error);
-    run.after = (run.failed.failures > 0).then(|| std::time::Instant::now() + run.failed.backoff());
+    run.after = (run.failed.failures > 0).then(|| datafusion::common::instant::Instant::now() + run.failed.backoff());
 }
 
 impl Turn {
@@ -910,8 +910,9 @@ pub fn failing(lake: &Lake, view: &str) -> Option<String> {
     failing_of(&(lake.url.clone(), view.to_string()))
 }
 
-/// Forgets the runs of views `lake` no longer has, or has made again since: `views` is every view it scans now (stream
-/// joins' too, so they are kept whatever their kind).
+/// Forgets the runs of views `lake` no longer has: `views` is every view it scans now (stream joins' too, so they are kept
+/// whatever their kind). Only names are compared: a view dropped and made again between two scans keeps the old one's
+/// failures until its first run that works.
 fn forget_runs(lake: &Lake, views: &[(String, View)]) {
     let names: std::collections::HashSet<&str> = views.iter().map(|(k, _)| &k[2..]).collect();
     RUNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, name), _| url != &lake.url || names.contains(name.as_str()));
@@ -1836,7 +1837,7 @@ mod tests {
         t.ended(&Err(anyhow::anyhow!("boom")));
         assert!(turn_of(key.clone(), "emission of").is_none(), "after a failure, its backoff");
         assert_eq!(failing_of(&key), None, "one failure is not yet failing");
-        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(std::time::Instant::now());
+        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
         let t = turn_of(key.clone(), "emission of").expect("its backoff is over");
         t.ended(&Err(anyhow::anyhow!("boom")));
         assert_eq!(failing_of(&key).as_deref(), Some("boom"));
