@@ -518,7 +518,11 @@ async fn cut_points(table: &DataFrame, time: &str, time_type: &DataType, w0: u64
     let t = ident(time);
     // The least whole µs `c` with `t <= stamp(c)`, as `span` compares: a ceiling for a ns column, a cast otherwise.
     let us = match time_type {
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => (datafusion::logical_expr::cast(t.clone(), DataType::Int64) + lit(999_i64)) / lit(1000_i64),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            // (a whole division drops toward zero: one more µs for what is left above it, below 1970 too)
+            let ns = datafusion::logical_expr::cast(t.clone(), DataType::Int64);
+            ns.clone() / lit(1000_i64) + datafusion::logical_expr::cast((ns % lit(1000_i64)).gt(lit(0_i64)), DataType::Int64)
+        }
         _ => datafusion::logical_expr::cast(datafusion::logical_expr::cast(t.clone(), DataType::Timestamp(TimeUnit::Microsecond, None)), DataType::Int64),
     };
     let lo = match w0 > 0 {
