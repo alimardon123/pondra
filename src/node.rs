@@ -254,6 +254,9 @@ pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
 /// followers' changes a leader inherits recovered, its sequencer and log started, its first user made. `replica` is
 /// what this follower holds for its leader (a node's folder; None elsewhere).
 pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::members::Members>, replica: Option<Arc<crate::replica::ReplicaLog>>, s: &Start) -> anyhow::Result<crate::app::App> {
+    if let Some(key) = s.auth.owner_key() {
+        let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
+    }
     let lives = !is_guest();
     let leader = members.is_leader();
     let term = members.leader().n;

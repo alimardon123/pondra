@@ -373,11 +373,19 @@ pub struct Task {
     /// follows it (`EXECUTE TASK` runs it, and its whole graph).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspended: bool,
-    /// Made by the node's owner (`ext::owner()` where `CREATE TASK` runs on the leader): its SQL runs as the owner,
-    /// so a BACKUP or RESTORE the owner may run runs here too. Made any other way, false (a follower's CREATE
-    /// forwarded to the leader is made with no owner there).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub by_owner: bool,
+    /// Made by the owner of the process that led (`ext::owner()` where `CREATE TASK` ran): `Task::what` signed with that
+    /// owner's key (`signed`). Only a process its owner started runs it as the owner (`owners`), so a BACKUP or RESTORE the
+    /// owner may run runs there too. The key is the program's for one launch (the shell, `connect()`): once it ends, the
+    /// task runs as no one's. A task written any other way (a shell of someone else, a row written by hand) runs as no
+    /// one's too. None: made with no owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+}
+
+impl Task {
+    /// What its owner signs (`signed`): all of it but its mark and `suspended`, which ALTER TASK changes and which says only
+    /// whether it runs, never what it does. `name` is its catalog name (`task_key`'s).
+    fn what(&self, name: &str) -> String { format!("task\x1f{name}\x1f{}", serde_json::to_string(&Task { owner: None, suspended: false, ..self.clone() }).unwrap_or_default()) }
 }
 
 /// `WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = notify)`.
@@ -422,23 +430,41 @@ struct Tick {
     /// Claimed by `EXECUTE TASK`: the tasks after it run in its run, suspended ones too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     asked: bool,
-    /// Claimed by the node's owner (`EXECUTE TASK` from the owner's door): an asked run reaches the owner's disk only then.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    by_owner: bool,
+    /// The owner's: `Tick::what` signed (`signed`) by `EXECUTE TASK` from the owner's door, by the scheduler for its owner's
+    /// task, and again when the owner's run ends. A run reaches the owner's disk only with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
 }
 
 impl Tick {
     /// Ended, and well enough for what follows it.
     fn passed(&self) -> bool { self.done && matches!(self.status.as_deref(), None | Some("ok" | "skipped")) }
 
-    /// Is this run the task owner's (`ext::scope`, so a folder on the owner's disk is theirs to write)? A scheduled tick is
-    /// as its task is. An asked one is only if the owner asked too: whoever may run a task may name any folder for it, so
-    /// a superuser's ask must not reach the owner's disk through a task the owner made.
-    fn as_owner(&self, task: &Task) -> bool { task.by_owner && (!self.asked || self.by_owner) }
+    /// What the owner signs of a tick (`signed`): its time, values, status and result (another task's `pondra.result` reads it).
+    fn what(&self, name: &str) -> String {
+        let values = serde_json::to_string(&self.params.iter().collect::<std::collections::BTreeMap<_, _>>()).unwrap_or_default(); // (a map's own order is random)
+        format!("tick\x1f{name}\x1f{}\x1f{}\x1f{values}\x1f{}\x1f{}", self.at, self.done, self.status.as_deref().unwrap_or(""), self.result.as_deref().unwrap_or(""))
+    }
+
+    /// Is this run the task owner's (`ext::scope`, so a folder on the owner's disk is theirs to write)? Both marks must be the
+    /// owner's (`owners`): the task's and the tick's. A scheduled tick of the owner's task is signed by the scheduler; an asked
+    /// one only when the owner asked (EXECUTE TASK from the owner's door), so a superuser's ask never reaches the owner's disk.
+    fn as_owner(&self, lake: &Lake, name: &str, task: &Task) -> bool { owners(lake, task.owner.as_deref(), &task.what(name)) && owners(lake, self.owner.as_deref(), &self.what(name)) }
 }
 
 pub fn task_key(name: &str) -> String { format!("j/{name}") }
 fn tick_key(name: &str) -> String { format!("jt/{name}") }
+
+/// `what`, signed with the key of the program that started this process's node on `lake` (`Lake::owner_key`), as hex;
+/// None when no program did. The lake's URL is signed too, so a mark copied into a restored or branched lake holds there
+/// for no one. A task's owner and a tick's are kept so (invariant 260).
+fn signed(lake: &Lake, what: &str) -> Option<String> {
+    let key = lake.owner_key.get()?;
+    Some(crate::text::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("{}\x1f{what}", lake.url).as_bytes())))
+}
+
+/// Is `mark` `what` signed by this process's owner (`signed`)? Compared in constant time.
+fn owners(lake: &Lake, mark: Option<&str>, what: &str) -> bool { mark.zip(signed(lake, what)).is_some_and(|(m, s)| crate::crypto::same(m.as_bytes(), s.as_bytes())) }
 
 pub const USAGE: &str = "CREATE TASK name SCHEDULE 'cron 0 2 * * * UTC' | '5 minutes' | AFTER task, … [WHEN condition] [WITH (retries = 2, retry_delay = '1 minute', timeout = '1 hour', on_failure = procedure)] AS statement";
 
@@ -632,7 +658,9 @@ pub async fn execute_task(lake: &Lake, name: &str, params: HashMap<String, serde
     }
     let at = now_ms().max(last.map_or(0, |t| t.at + 1));
     // (the leader's own context, as `create_task`'s: a forwarded EXECUTE is none of the owner's)
-    lake.cat.commit(vec![(tick_key(&name), json(&Tick { at, params, asked: true, by_owner: crate::ext::owner(), ..Default::default() }))], &[]).await?;
+    let mut tick = Tick { at, params, asked: true, ..Default::default() };
+    tick.owner = crate::ext::owner().then(|| signed(lake, &tick.what(&name))).flatten();
+    lake.cat.commit(vec![(tick_key(&name), json(&tick))], &[]).await?;
     WAKE.notify_one();
     Ok(serde_json::json!({"task": name, "run": format!("task-{name}-{at}")}))
 }
@@ -685,7 +713,7 @@ pub async fn create_task(lake: &Lake, name: &str, mut task: Task, replace: bool)
         roots(&all, other, t, &mut vec![])?; // (replaced: what follows it still has one start, no loop)
     }
     task.created_ms = now_ms();
-    task.by_owner = crate::ext::owner(); // (what the request says is not taken: this is the leader's own context)
+    task.owner = crate::ext::owner().then(|| signed(lake, &task.what(&name))).flatten(); // (what the request says is not taken: this is the leader's own context)
     lake.cat.commit(vec![(task_key(&name), json(&task))], &[]).await?;
     let next = every(&task.schedule).ok().filter(|_| task.after.is_empty() && !task.suspended).map(|e| next_after(&e, task.created_ms));
     let mut out = serde_json::json!({"task": name, "next": next, "after": task.after});
@@ -762,7 +790,7 @@ pub fn schedule(app: App) {
                         continue;
                     }
                 };
-                let as_owner = tick.as_owner(task);
+                let as_owner = tick.as_owner(&app.lake, name, task);
                 running.lock().unwrap().insert(name.clone());
                 let (app, name, task) = (app.clone(), name.clone(), task.clone());
                 let ran = Ran(running.clone(), name.clone()); // (let go even if the tick panics: else it never ran again here)
@@ -852,8 +880,9 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
     };
     let error = out.as_ref().err().map(|e| format!("{e:#}"));
     let _ = tokio::time::timeout(Duration::from_secs(60), run.ended(app, status, error, heard)).await; // (in the log before the tick is done)
-    let done = json(&Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params, asked: tick.asked, by_owner: tick.by_owner });
-    if let Err(e) = app.lake.cat.commit(vec![(tick_key(name), done)], &[]).await {
+    let mut done = Tick { at: tick.at, done: true, status: Some(status.into()), result, params: tick.params, asked: tick.asked, owner: None };
+    done.owner = crate::ext::owner().then(|| signed(&app.lake, &done.what(name))).flatten(); // (the run is in its owner's scope only when it was the owner's: `as_owner`)
+    if let Err(e) = app.lake.cat.commit(vec![(tick_key(name), json(&done))], &[]).await {
         eprintln!("task {name}: tick {} ran, and couldn't be marked done ({e:#}): a new leader runs it again, with the same job", tick.at);
     }
 }
@@ -868,7 +897,8 @@ async fn results(lake: &Lake, sql: &str, at: u64) -> String {
         let name = c[1].replace("''", "'");
         let name = crate::ddl::local(lake, &name).unwrap_or(name);
         let tick = lake.cat.get::<Tick>(&tick_key(&name)).await.ok().flatten();
-        let value = tick.filter(|t| t.at == at && t.done).and_then(|t| t.result).unwrap_or_else(|| "NULL".into());
+        let trusted = |t: &Tick| !crate::ext::owner() || owners(lake, t.owner.as_deref(), &t.what(&name)); // (an owner's run reads only the owner's results)
+        let value = tick.filter(|t| t.at == at && t.done && trusted(t)).and_then(|t| t.result).unwrap_or_else(|| "NULL".into());
         out.push_str(&sql[from..m.start()]);
         out.push_str(&format!("({value})"));
         from = m.end();
@@ -884,6 +914,7 @@ async fn results(lake: &Lake, sql: &str, at: u64) -> String {
 /// `EXECUTE TASK` asked for.
 async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
     let lake = &app.lake;
+    let mine = owners(lake, task.owner.as_deref(), &task.what(name)); // (the owner's task: its runs are the owner's, `Tick::as_owner`)
     let last = lake.cat.get::<Tick>(&tick_key(name)).await?;
     if let Some(t) = last.as_ref().filter(|t| !t.done) {
         return Ok(Some(t.clone())); // (again, with its job: what it wrote lands once)
@@ -895,13 +926,17 @@ async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
             }
             let after = last.as_ref().map_or(task.created_ms, |t| t.at.max(task.created_ms));
             let Some(at) = latest(&every(&task.schedule)?, after, now_ms()) else { return Ok(None) };
-            let params = tokio::time::timeout(Duration::from_secs(30), crate::ext::scope(task.by_owner, values(app, task, HashMap::new()))).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
-            Tick { at, params, ..Default::default() }
+            let params = tokio::time::timeout(Duration::from_secs(30), crate::ext::scope(mine, values(app, task, HashMap::new()))).await.unwrap_or_default(); // (a timeout: no values, and the task's own DECLARE works them out)
+            let mut tick = Tick { at, params, ..Default::default() };
+            tick.owner = mine.then(|| signed(lake, &tick.what(name))).flatten();
+            tick
         }
         false => {
             let mut before: Option<Tick> = None;
+            let mut all = true; // (every one they ended in is the owner's: the owner's graph carries on down it, anyone else's doesn't)
             for a in &task.after {
                 let Some(t) = lake.cat.get::<Tick>(&tick_key(a)).await?.filter(Tick::passed) else { return Ok(None) };
+                all &= owners(lake, t.owner.as_deref(), &t.what(a));
                 match &before {
                     Some(b) if b.at != t.at => return Ok(None), // (they are in different runs of the graph yet)
                     _ => before = Some(t),
@@ -911,7 +946,9 @@ async fn due(app: &App, name: &str, task: &Task) -> Result<Option<Tick>> {
             if task.suspended && !b.asked {
                 return Ok(None);
             }
-            Tick { at: b.at, params: b.params, asked: b.asked, by_owner: b.by_owner, ..Default::default() }
+            let mut tick = Tick { at: b.at, params: b.params, asked: b.asked, ..Default::default() };
+            tick.owner = (mine && all).then(|| signed(lake, &tick.what(name))).flatten();
+            tick
         }
     };
     lake.cat.commit(vec![(tick_key(name), json(&tick))], &[]).await?;
@@ -1237,29 +1274,74 @@ mod tests {
     async fn a_task_remembers_whether_its_owner_made_it() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("pondra-task-owner-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
-        // (what the wire says is no say: `by_owner` is stamped where CREATE TASK runs, from its owner)
-        let sent = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), by_owner: true, ..Default::default() };
+        // (what the wire says is no say: `owner` is signed where CREATE TASK runs, by its owner's program)
+        let sent = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), owner: Some("theirs".into()), ..Default::default() };
         create_task(&lake, "theirs", sent, false).await?;
         let stored = lake.cat.get::<Task>(&task_key("theirs")).await?.context("no task theirs")?;
-        assert!(!stored.by_owner, "a task made with no owner is not the owner's");
+        assert!(stored.owner.is_none(), "a task made with no owner is no one's");
+        let _ = lake.owner_key.set("k1".into());
         let owned = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
         crate::ext::scope(true, create_task(&lake, "mine", owned, false)).await?;
         let stored = lake.cat.get::<Task>(&task_key("mine")).await?.context("no task mine")?;
-        assert!(stored.by_owner, "the owner's task is stamped");
+        let mark = stored.owner.clone().context("the owner's task is signed")?;
+        assert!(owners(&lake, Some(mark.as_str()), &stored.what("mine")), "the owner's task carries its owner's mark");
+        // (the mark is of what the task does: not of its name, its SQL, its WHEN or its options; ALTER TASK's SUSPEND is none of that)
+        let holds = |t: Task| owners(&lake, Some(mark.as_str()), &t.what("mine"));
+        assert!(!holds(Task { sql: "SELECT 2".into(), ..stored.clone() }), "another statement is not the owner's task");
+        assert!(!holds(Task { when: Some("1 = 1".into()), ..stored.clone() }), "another WHEN is not the owner's task");
+        assert!(!holds(Task { with: TaskOptions { on_failure: Some("notify".into()), ..Default::default() }, ..stored.clone() }), "other options are not the owner's task");
+        assert!(!owners(&lake, Some(mark.as_str()), &stored.what("theirs")), "the mark is of its own name");
+        assert!(holds(Task { suspended: true, ..stored.clone() }), "a suspended task is still the owner's");
+        // (a reader of the same lake with another program's key, or with none, verifies no mark of this one)
+        let other = Lake::open(dir.to_str().unwrap(), false, false).await?;
+        let _ = other.owner_key.set("k2".into());
+        assert!(!owners(&other, Some(mark.as_str()), &stored.what("mine")), "another program's key signs no mark of this owner's");
+        let none = Lake::open(dir.to_str().unwrap(), false, false).await?;
+        assert!(!owners(&none, Some(mark.as_str()), &stored.what("mine")), "a lake with no owner's key verifies no mark");
         Ok(())
     }
 
-    #[test]
-    fn an_asked_run_is_the_owners_only_when_the_owner_asked() {
-        let owned = Task { by_owner: true, ..Default::default() };
-        let theirs = Task::default();
-        let scheduled = Tick::default();
-        let asked = |by_owner: bool| Tick { asked: true, by_owner, ..Default::default() };
-        assert!(scheduled.as_owner(&owned), "a scheduled tick of the owner's task is the owner's");
-        assert!(!scheduled.as_owner(&theirs), "a scheduled tick of a task someone else made is not the owner's");
-        assert!(asked(true).as_owner(&owned), "the owner's EXECUTE TASK of the owner's task is the owner's");
-        assert!(!asked(false).as_owner(&owned), "a superuser's EXECUTE TASK of the owner's task is not: its folders are its own");
-        assert!(!asked(true).as_owner(&theirs), "the owner's EXECUTE TASK of a task someone else made is not the owner's run");
-        assert!(!asked(false).as_owner(&theirs), "a superuser's EXECUTE TASK of a task someone else made is not the owner's run");
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_asked_run_is_the_owners_only_when_the_owner_asked() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-tick-owner-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let _ = lake.owner_key.set("k1".into());
+        let mut owned = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
+        owned.owner = signed(&lake, &owned.what("owned"));
+        let theirs = Task { schedule: "5 minutes".into(), sql: "SELECT 1".into(), ..Default::default() };
+        let mut scheduled = Tick { at: 1, ..Default::default() }; // (the scheduler's, for the owner's task)
+        scheduled.owner = signed(&lake, &scheduled.what("owned"));
+        let mut asked = Tick { at: 2, asked: true, ..Default::default() }; // (the owner's EXECUTE TASK)
+        asked.owner = signed(&lake, &asked.what("owned"));
+        let superuser = Tick { at: 3, asked: true, ..Default::default() }; // (a superuser's EXECUTE TASK: no mark)
+        assert!(scheduled.as_owner(&lake, "owned", &owned), "a scheduled tick of the owner's task is the owner's");
+        assert!(!Tick { at: 1, ..Default::default() }.as_owner(&lake, "owned", &owned), "an unsigned tick is no one's");
+        assert!(!scheduled.as_owner(&lake, "owned", &theirs), "a signed tick of a task with no owner is not the owner's run");
+        assert!(asked.as_owner(&lake, "owned", &owned), "the owner's EXECUTE TASK of the owner's task is the owner's");
+        assert!(!superuser.as_owner(&lake, "owned", &owned), "a superuser's EXECUTE TASK of the owner's task is not: its folders are its own");
+        let mut edited = scheduled.clone();
+        edited.params.insert("day".into(), serde_json::json!(1));
+        assert!(!edited.as_owner(&lake, "owned", &owned), "a tick whose values changed after it was signed is no one's");
+        let mut edited = scheduled.clone();
+        edited.result = Some("42".into());
+        assert!(!edited.as_owner(&lake, "owned", &owned), "a tick whose result changed after it was signed is no one's");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_owners_run_reads_only_the_owners_results() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-result-owner-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let _ = lake.owner_key.set("k1".into());
+        let up = |owner: Option<String>| Tick { at: 7, done: true, status: Some("ok".into()), result: Some("42".into()), owner, ..Default::default() };
+        let sql = "SELECT pondra.result('up')";
+        lake.cat.commit(vec![(tick_key("up"), json(&up(None)))], &[]).await?;
+        assert_eq!(crate::ext::scope(true, results(&lake, sql, 7)).await, "SELECT (NULL)", "an owner's run reads no one else's result");
+        assert_eq!(results(&lake, sql, 7).await, "SELECT (42)", "a run that isn't the owner's reads results as today");
+        let mut own = up(None);
+        own.owner = signed(&lake, &own.what("up"));
+        lake.cat.commit(vec![(tick_key("up"), json(&own))], &[]).await?;
+        assert_eq!(crate::ext::scope(true, results(&lake, sql, 7)).await, "SELECT (42)", "the owner's own result is read");
+        Ok(())
     }
 }

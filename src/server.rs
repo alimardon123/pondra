@@ -767,6 +767,7 @@ fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`), and a
 /// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
 async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+    crate::backup::sent(&d)?;
     let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(String::from);
     let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
