@@ -50,7 +50,7 @@ pub async fn scope<F: std::future::Future>(owner: bool, f: F) -> F::Output {
     OWNER.scope(owner, listing(f)).await
 }
 
-/// Run `f`, a statement sent to the lake at `url` (`ROOT`, `statement::run`).
+/// Run `f`, a statement sent to the lake at `url` (`ROOT`): `audit::statement` runs every door's so.
 pub async fn rooted<F: std::future::Future>(url: &str, f: F) -> F::Output {
     let root = format!("{}/", url.trim_end_matches('/'));
     ROOT.scope(root, f).await

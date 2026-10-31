@@ -361,6 +361,22 @@ impl TableMeta {
     pub fn ttl_sql(&self) -> String {
         self.ttl.as_ref().map(|(c, s)| format!("\"{c}\" >= now() - INTERVAL '{s} seconds'")).unwrap_or_default()
     }
+
+    /// Is `row` past the TTL, as `ttl_sql` keeps it out? A key lookup applies this to the row it found, so a lookup and a
+    /// statement agree (`serve::lookup`, `serve::lookup_versioned`). Its timestamp column (a date counts from its midnight, UTC)
+    /// is older than the TTL's seconds before `now_us` (microseconds since the epoch), or NULL, which that comparison keeps out
+    /// too. A column the row lacks is NULL. A table with no TTL keeps every row. `row` is one row.
+    pub fn past_ttl(&self, row: &RecordBatch, now_us: i64) -> Result<bool> {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+        use datafusion::arrow::datatypes::{DataType, TimeUnit, TimestampMicrosecondType};
+        let Some((c, secs)) = &self.ttl else { return Ok(false) };
+        let Some(column) = row.column_by_name(c) else { return Ok(true) };
+        let column = cast(column, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+        let ts = column.as_primitive::<TimestampMicrosecondType>();
+        let cutoff = now_us.saturating_sub(i64::try_from(*secs).unwrap_or(i64::MAX).saturating_mul(1_000_000));
+        Ok(ts.is_null(0) || ts.value(0) < cutoff)
+    }
 }
 
 pub use crate::data_file::{DataFile, Lineage};
@@ -3245,6 +3261,30 @@ mod tests {
         assert!(c.rules.0.get().is_none(), "a clone's memo is empty");
         let made = Arc::new(c).rules()?;
         assert_eq!(*made, *x, "and the clone's rules are the same");
+        Ok(())
+    }
+
+    /// `past_ttl` keeps out what `ttl_sql` does: a timestamp older than the TTL's seconds, a NULL, a row without the column.
+    /// A row exactly the TTL old is kept (`>=`), a date counts from its midnight, and a table with no TTL keeps every row.
+    #[test]
+    fn a_row_past_its_ttl_is_the_one_ttl_sql_keeps_out() -> Result<()> {
+        use datafusion::arrow::array::{ArrayRef, Date32Array, Int64Array, TimestampMicrosecondArray};
+        let hour = 3_600_000_000i64; // µs
+        let now = 1_800_000_000_000_000i64; // µs since the epoch: 08:00 UTC
+        let ttl = |secs: u64| TableMeta { ttl: Some(("seen".into(), secs)), ..Default::default() };
+        let one = |a: ArrayRef| RecordBatch::try_from_iter([("seen", a)]);
+        let at = |v: Option<i64>| one(Arc::new(TimestampMicrosecondArray::from(vec![v])) as ArrayRef);
+        let old = at(Some(now - 2 * hour))?;
+        assert!(ttl(3600).past_ttl(&old, now)?, "two hours old, a one hour TTL");
+        assert!(!ttl(3600).past_ttl(&at(Some(now - hour / 2))?, now)?, "half an hour old");
+        assert!(!ttl(3600).past_ttl(&at(Some(now - hour))?, now)?, "exactly the TTL old is kept");
+        assert!(ttl(3600).past_ttl(&at(None)?, now)?, "a NULL is gone: SQL keeps no NULL");
+        let no_column = RecordBatch::try_from_iter([("k", Arc::new(Int64Array::from(vec![1i64])) as ArrayRef)])?;
+        assert!(ttl(3600).past_ttl(&no_column, now)?, "a row without the column reads it as NULL");
+        assert!(!TableMeta::default().past_ttl(&old, now)?, "no TTL, no row is past it");
+        let date = one(Arc::new(Date32Array::from(vec![Some(20833)])) as ArrayRef)?; // 08:00 UTC is eight hours past its midnight
+        assert!(ttl(3600).past_ttl(&date, now)?, "a date is its midnight: eight hours old");
+        assert!(!ttl(864_000).past_ttl(&date, now)?, "ten days' TTL keeps it");
         Ok(())
     }
 }

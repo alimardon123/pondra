@@ -1955,7 +1955,7 @@ def main():
     results, said, failed = {}, {}, []
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch()
+            browser = harness.chromium(pw)
             parts = [("node", lambda: node_checks(browser, A.port, A.show)), ("files", lambda: files_checks(browser, A.port, A.show)), ("grid", lambda: grid_checks(browser, A.port, A.show)), ("work", lambda: work_checks(browser, A.port, A.show)),
                      ("layout", lambda: layout_checks(browser, A.port, A.show)), ("budget", lambda: budget_checks(browser, A.port, A.show)),
                      ("tokens", lambda: token_checks(browser, A.port + 1)), ("server", lambda: server_checks(browser, A.port + 2)), ("extensions", lambda: ext_checks(browser, A.port + 3)),

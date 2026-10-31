@@ -594,7 +594,7 @@ impl Backend {
         // (a keyed table's rows replace their keys': UPDATE too; a `_deleted` column named may delete them: S11)
         crate::auth::check_changes(&table, !rules.key.is_empty(), c.columns.iter().any(|c| c == "_deleted")).map_err(user_error)?;
         let n = if c.columns.is_empty() { rules.width() } else { c.columns.len() };
-        COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
+        COPIES.lock().unwrap().insert(client.socket_addr(), Pending { copy: Copy { table, ..c }, data: vec![], ends: Default::default(), rows: 0, seq: 0, job: uuid::Uuid::new_v4().to_string(), ended: false });
         Ok(Response::CopyIn(CopyResponse::new(0, n, stream::empty())))
     }
 
@@ -606,8 +606,9 @@ impl Backend {
         }
         let err = |e: anyhow::Error| user_error(e);
         let csv = p.copy.format == "csv";
-        let cut = if all { p.data.len() } else { crate::pg_copy::rows_end(&p.data, csv) };
+        let cut = if all { p.data.len() } else { p.ends.end(&p.data, csv) };
         let mut chunk: Vec<u8> = p.data.drain(..cut).collect();
+        p.ends.taken(cut);
         if let Some(end) = crate::pg_copy::data_end(&chunk, csv).map_err(err)? {
             chunk.truncate(end);
             p.ended = true;
@@ -667,9 +668,9 @@ impl Backend {
         let Some(version) = version else { return self.app.query(sql, None).await };
         let run = || async {
             let batches = self.app.query(sql, None).await?;
-            let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= 1 << 20 {
+            let keep = match batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() <= crate::app::Results::BIGGEST {
                 true => Some(crate::answer::ipc(&batches)?.into()),
-                false => None, // (a big answer: `Results` keeps none past 1 MB, nor encodes it to find out)
+                false => None, // (a big answer: `Results` keeps none past `Results::BIGGEST`, nor encodes it to find out)
             };
             Ok((keep, batches)) // (its own caller takes the batches as they are: never decoded again)
         };
@@ -1169,15 +1170,21 @@ impl Copy {
 }
 
 /// A COPY FROM STDIN under way, per connection: what it loads, and what came that isn't loaded yet. `ended`: its
-/// data's end marker has come, so what follows it is not read.
+/// data's end marker has come, so what follows it is not read. `ends`: where the whole rows of `data` end, as it grows.
 struct Pending {
     copy: Copy,
     data: Vec<u8>,
+    ends: crate::pg_copy::RowEnds,
     rows: u64,
     seq: u64,
     job: String,
     ended: bool,
 }
+
+/// The longest row a COPY FROM may send. The bytes after a COPY's last whole row that pass this are refused (54000) as
+/// the frame that adds them comes, and the COPY is dropped: one row past it is refused, so the buffer can't grow past
+/// this and one frame.
+const LONGEST_ROW: usize = 64 << 20;
 
 crate::per_node!(static COPIES: std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, Pending>> = Default::default());
 
@@ -1195,6 +1202,11 @@ impl CopyHandler for Backend {
             let Some(p) = copies.get_mut(&client.socket_addr()) else { return Err(user_error(anyhow::anyhow!("COPY data without a COPY"))) };
             if !p.ended {
                 p.data.extend_from_slice(&data.data); // (what follows the end marker is not gathered)
+                let end = p.ends.end(&p.data, p.copy.format == "csv"); // (each byte is looked at once, as it comes)
+                if p.data.len() - end > LONGEST_ROW {
+                    copies.remove(&client.socket_addr()); // (dropped: nothing more is gathered, and the connection goes on)
+                    return Err(user_error(crate::codes::coded("54000", "a row of COPY data is longer than 64 MB")));
+                }
             }
             if p.data.len() < 32 << 20 {
                 return Ok(());

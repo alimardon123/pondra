@@ -48,6 +48,7 @@ PROCESS = {
     "cache.rs:OUTSIDE": "files outside the lakes, kept by the version each was listed at (invariant 96): nothing of a lake's own",
     "cli.rs:ERROR_LINES": "the process's logger, set by the command (`log` keeps one a process): it holds nothing",
     "codes.rs:SEEN": "the SQLSTATE codes other nodes answered with, each kept once as a &'static: the same five letters for every node",
+    "matcher.rs:LIVE_STEPS": "a count of the path steps alive on this thread, which a search makes and frees within one partition: a partition reads it against its own start, so no node's state is in it",
     "console.rs:FILES": "the console's files, built into the binary",
     "console.rs:PAGE": "the console's page, built into the binary",
     "console.rs:SERVER": "the server's page, built into the binary",
