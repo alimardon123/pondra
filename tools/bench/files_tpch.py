@@ -2,7 +2,7 @@
 """TPC-H from files outside the lake, against the lake's own tables (ADR-026: within 10%).
 
   files_tpch.py --data ~/tpch/sf1-bench [--queries tools/bench/tpch-queries] [--runs 3]
-                [--stores local,s3] [--files pondra|given]
+                [--stores local,s3,r2] [--files pondra|given]
 
 The 22 queries, each run `--runs` times (the best time counts), over two copies of one data set:
 
@@ -20,6 +20,10 @@ Each on this machine's disk (`local`: the files read by the program that started
 a local S3 (`s3`: `sim_r2.py --zero`, moto without R2's latency; the files read with a secret).
 On S3 the lake's own files go through its caches, as they do in use, and the files through the
 cache of files outside the lake (kept by version). Every answer is compared with the first run's.
+
+`r2` is a real bucket (limits-r2.yml's cold job): PONDRA_BUCKET, with AWS_ENDPOINT and the AWS_* keys, everything
+under cold/<id>/ (the workflow deletes it). Beside the lake and the files it times DuckDB over httpfs on the same files,
+each engine from a fresh start: `cold_s` is each query's first run there, `per_query` its best, as everywhere.
 """
 import argparse, glob, json, os, shutil, subprocess, sys, tempfile, time, uuid
 
@@ -34,15 +38,32 @@ TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "order
 
 
 def run_all(port, qs, owner):
-    """Every query `--runs` times: (best seconds, rows) each."""
+    """Every query `--runs` times: (best seconds, rows, first seconds) each."""
     out = {}
     for i, sql in qs.items():
         times, rows = [], None
+        for run in range(A.runs):
+            t = time.time()
+            rows = harness.call(port, "POST", "/sql", f"{sql}\n-- run {run}".encode(), timeout=3600, headers={"x-pondra-owner": owner})  # (a new text each run: the result cache never answers)
+            times.append(time.time() - t)
+        out[i] = (min(times), rows, times[0])
+    return out
+
+
+def duckdb_runs(qs, setup):
+    """DuckDB on a fresh connection, each query `--runs` times as run_all runs them: (best seconds, rows, first seconds)."""
+    import duckdb
+    con = duckdb.connect()
+    for s in setup:
+        con.execute(s)
+    out = {}
+    for i, sql in qs.items():
+        times = []
         for _ in range(A.runs):
             t = time.time()
-            rows = harness.call(port, "POST", "/sql", sql.encode(), timeout=3600, headers={"x-pondra-owner": owner})
+            rows = con.execute(sql).fetchall()
             times.append(time.time() - t)
-        out[i] = (min(times), rows)
+        out[i] = (min(times), rows, times[0])
     return out
 
 
@@ -52,7 +73,7 @@ def one(name, lake, env, owner, setup, qs, before=None):
     try:
         for s in setup:
             harness.call(A.port, "POST", "/sql", s.encode(), timeout=3600, headers={"x-pondra-owner": owner})
-        harness.call(A.port, "POST", "/tier", timeout=3600)  # (merges and sealing done before timing)
+        harness.call(A.port, "POST", "/tier", timeout=3600, headers={"x-pondra-owner": owner})  # (merges and sealing done before timing)
         if before:
             before()
         return run_all(A.port, qs, owner)
@@ -106,14 +127,37 @@ def main():
             results["files, s3"] = one("files, s3", f"s3://lakes/views-{uuid.uuid4().hex[:8]}", env, owner, views, qs)
         finally:
             sim.kill()
+    rivals = {}
+    if "r2" in stores:
+        import boto3
+        bucket, prefix, endpoint = os.environ["PONDRA_BUCKET"], f"cold/{uuid.uuid4().hex[:8]}", os.environ["AWS_ENDPOINT"]
+        key, secret = os.environ["AWS_ACCESS_KEY_ID"], os.environ["AWS_SECRET_ACCESS_KEY"]
+        s3 = boto3.client("s3", endpoint_url=endpoint, region_name=os.environ.get("AWS_REGION", "auto"))
+        for t in TABLES:
+            for f in glob.glob(f"{files}/{t}/*.parquet"):
+                s3.upload_file(f, bucket, f"{prefix}/files/{t}/{os.path.basename(f)}")
+        cold = lambda: {"PONDRA_CACHE_DIR": harness.new_lake()}  # (each node's disk cache empty: its first runs read R2)
+        lake = f"s3://{bucket}/{prefix}/lake"
+        load(lake, cold())
+        results["lake, r2"] = one("lake, r2", lake, cold(), owner, [], qs)
+        at = lambda t: f"s3://{bucket}/{prefix}/files/{t}/*.parquet"
+        views = [f"CREATE SECRET r2 (TYPE s3, KEY_ID '{key}', SECRET '{secret}', ENDPOINT '{endpoint}', REGION 'auto', SCOPE 's3://{bucket}/{prefix}/files')"]
+        results["files, r2"] = one("files, r2", f"s3://{bucket}/{prefix}/views", cold(), owner, views + [f"CREATE VIEW {t} AS SELECT * FROM '{at(t)}'" for t in TABLES], qs)
+        print("== duckdb, r2", flush=True)
+        rivals["duckdb, r2"] = duckdb_runs(qs, ["INSTALL httpfs", "LOAD httpfs",
+                                                f"CREATE SECRET (TYPE s3, KEY_ID '{key}', SECRET '{secret}', ENDPOINT '{endpoint.split('://')[1]}', REGION 'auto', URL_STYLE 'path', USE_SSL {endpoint.startswith('https')})"]
+                                           + [f"CREATE VIEW {t} AS SELECT * FROM read_parquet('{at(t)}')" for t in TABLES])
     ref = next(iter(results.values()))
-    table = {name: {"total_s": round(sum(t for t, _ in r.values()), 2), "answers_match": sum(same(r[i][1], ref[i][1]) for i in qs),
-                    "per_query": {i: round(r[i][0], 3) for i in qs}} for name, r in results.items()}
+    table = {name: {"total_s": round(sum(r[i][0] for i in qs), 2), "cold_s": round(sum(r[i][2] for i in qs), 2),
+                    "answers_match": sum(same(r[i][1], ref[i][1]) for i in qs) if name in results else None,  # (DuckDB's rows are tuples: its answers are checked elsewhere)
+                    "per_query": {i: round(r[i][0], 3) for i in qs}, "cold_per_query": {i: round(r[i][2], 3) for i in qs}}
+             for name, r in {**results, **rivals}.items()}
     print(f"\n{'':4}" + "".join(f"{n:>14}" for n in table))
     for i in qs:
         print(f"q{i:<3}" + "".join(f"{table[n]['per_query'][i]:>14.3f}" for n in table))
     print("all " + "".join(f"{table[n]['total_s']:>14.2f}" for n in table))
-    print("same" + "".join(f"{str(table[n]['answers_match']) + '/22':>14}" for n in table))
+    print("cold" + "".join(f"{table[n]['cold_s']:>14.2f}" for n in table))
+    print("same" + "".join(f"{'-' if table[n]['answers_match'] is None else str(table[n]['answers_match']) + '/22':>14}" for n in table))
     for store in stores:
         lake, files_ = table.get(f"lake, {store}"), table.get(f"files, {store}")
         if lake and files_:
