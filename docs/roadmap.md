@@ -112,7 +112,10 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   any, says who reaches it (one with `PROVIDER credential_chain` is the machine's own identity, chosen and
   granted, never a fallback). Connections (the owner, 10-31): one `CONNECTION` kind for every outside place,
   `postgres`, `mysql`, `sqlserver`, `s3`, `gcs`, `azure`, `sftp`, `http`, its secret by name and its paths
-  `'@name/path'`; `ATTACH` is its one-line form for tables, over the same records 1.0's attaches keep. 1.0
+  `'@name/path'`; `ATTACH` is its one-line form for tables, over the same records 1.0's attaches keep. Drivers
+  (proposed 10-31): each database type on an ADBC driver through one driver manager, each driver an ADR-075 package
+  fetched on first use and run in a helper process, with Pondra still pushing work down as the database's own SQL;
+  rows per second against each database's native client decide it before it is chosen. 1.0
   refuses `CREATE CONNECTION` showing the `ATTACH` and the `CREATE SECRET … SCOPE` to write. Row filters
   and column masks come before the dashboards (J6), whose tiles run as their viewer (§4.9). **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
   over one definition, as plugins.
