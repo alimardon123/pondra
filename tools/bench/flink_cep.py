@@ -13,7 +13,7 @@ conf = env.get_config()
 conf.set("parallelism.default", str(spec["parallelism"]))
 # (State as cep_bench.py sets it, with nexmark.py's convention: RocksDB with its managed memory a third of the machine's,
 # or the heap. The JVM's heap is JVM_ARGS's -Xmx, which cep_bench.py sets.)
-conf.set("state.backend.type", spec["state"])
+conf.set("state.backend.type", "hashmap" if spec["state"] == "heap" else spec["state"])  # (Flink's name for the heap: hashmap)
 if spec["state"] == "rocksdb":
     conf.set("taskmanager.memory.managed.size", spec["managed"])
 conf.set("table.local-time-zone", "UTC")
