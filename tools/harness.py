@@ -1747,12 +1747,15 @@ def tails():
     def pair_reader():
         c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         while not pair_stop.is_set():
-            c.request("POST", "/sql", f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2 -- {uuid.uuid4()}".encode())  # (never a remembered answer)
+            # (a3 and w: windows over whole partitions, each answered as a GROUP BY joined back to the table read again, `frugal.rs`)
+            c.request("POST", "/sql", (f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2, "
+                                       f"(SELECT sum(id) FROM (SELECT id, count(*) OVER (PARTITION BY id) AS n FROM pa)) AS a3, "
+                                       f"(SELECT max(n) - count(*) FROM (SELECT count(*) OVER () AS n FROM pa)) AS w -- {uuid.uuid4()}").encode())  # (never a remembered answer)
             r = c.getresponse()
             body = json.loads(r.read())
             with pair_lock:
                 pair_reads[0] += 1
-            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2")):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
+            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2") == body[0].get("a3")) or body[0].get("w") not in (None, 0):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
                 with pair_lock:
                     pair_wrong.append(body)
 
@@ -1762,7 +1765,7 @@ def tails():
     pair_stop.set()
     [t.join(60) for t in pair_threads]
     print(f"tails: pairs: {pair_reads[0]} reads, {pair_commits[0]} commits, {len(pair_wrong)} wrong {pair_wrong[:3]}, {len(pair_errors)} refused {pair_errors[:3]}")
-    pairs_name = f"a table read twice and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
+    pairs_name = f"a table read twice (a window over whole partitions too) and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
     pairs_good = not pair_wrong and pair_reads[0] >= 200 and pair_commits[0] >= 500
     node.kill()
     checks = {
@@ -4050,7 +4053,7 @@ def scale():
         "three nodes: a self-join on sealed files by their time ranges": by_ranges,
         "shuffles (GROUP BY, joins, windows) = one node": all(same for same, *_ in shuffles.values()) and sum(sh for _, sh, *_ in shuffles.values()) >= 10,
         "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": sum(sp for _, _, sp, _ in list(shuffles.values())[14:23]) >= 9,
-        "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:]) >= 4,
+        "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:29]) >= 4,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
     for n in list(NODES):
@@ -4108,7 +4111,7 @@ def scale():
     got_part = answered("avg(id) OVER (PARTITION BY id % 3)", "SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
     win_peak = vm_hwm(node.p.pid)
     win_refused = refusal("SELECT max(id + n) AS m FROM (SELECT id, last_value(id) OVER (ORDER BY s ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM big)")
-    checks["a window over all rows past the memory limit answers on the frugal retry (a GROUP BY joined back); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
+    checks["a window over whole partitions past the memory limit answers (a GROUP BY joined back: at once over a table, on the frugal retry over a join); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
         got_all == [{"m": want_all}]
         and got_part is not None and abs(got_part[0]["m"] - want_part) <= 1e-6
         and win_refused is not None and win_refused["sqlstate"] == "53200"  # (its sort may refuse before the window's held rows do)
@@ -4813,6 +4816,9 @@ def shuffle_checks(port):
         "by key ranges: NULL keys": "SELECT count(*) AS n, sum(qty) AS q FROM li WHERE oid IS NULL OR oid > 199990",
         # (the NULLs a LEFT JOIN pads with sit wherever the unmatched rows are: not keyed by range)
         "by key ranges: grouped by a padded key": "SELECT li.oid, count(*) AS n FROM o LEFT JOIN li ON o.id = li.oid AND li.qty = 1 GROUP BY li.oid ORDER BY n DESC, li.oid LIMIT 3",
+        # (a window over whole partitions is answered as a GROUP BY joined back, `frugal.rs`: spread as on one node)
+        "window, whole partitions": "SELECT k, id, v - avg(v) OVER (PARTITION BY k) AS d, count(*) OVER (PARTITION BY k) AS c FROM a WHERE k < 4 ORDER BY k, id",
+        "window, OVER () on every row": "SELECT max(v + c) AS m, count(*) AS n FROM (SELECT v, count(*) OVER () AS c FROM a)",
     }
     out = {}
     for name, s in queries.items():
