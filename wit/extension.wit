@@ -1,0 +1,17 @@
+package pondra:extension@1.0.0;
+
+/// What every Pondra 1.x calls an extension's WebAssembly part by (ADR-075 §2). An extension never links Pondra's Rust: it
+/// exports these two, and imports only Pondra's own capabilities, each versioned on its own (none yet; `log@1` and
+/// `clock@1` come next). A Pondra loads an extension when it offers every import the extension needs (§3).
+world extension {
+  /// What the extension has, as JSON that only grows (a host passes over fields it doesn't know):
+  /// `{"name": "words", "version": "0.1", "functions": [{"name": "word_count", "arguments": ["Utf8"], "returns": "Int64",
+  /// "volatile": false}]}`. A type is Arrow's, written as its `DataType` displays it (`Int64`, `Float64`, `Utf8`,
+  /// `Boolean`, `Date32`, …).
+  export describe: func() -> string;
+
+  /// Runs the scalar function `name` over one batch: Arrow IPC stream bytes in, a column per argument in the types
+  /// `describe` gave; Arrow IPC stream bytes out, one column of the same number of rows in its `returns` type. An error is
+  /// the function's own words: it fails the query that called it.
+  export call: func(name: string, batch: list<u8>) -> result<list<u8>, string>;
+}
