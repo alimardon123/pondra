@@ -1,6 +1,6 @@
-//! What a transaction's statements mean, and the words its refusals say, in every form (ADR-067): a node keeps its
-//! transactions in `txn.rs` and a page in `page::txn`, each reading BEGIN's modes, a savepoint's name and a write's word
-//! here, so the two forms take the same statements and say the same thing.
+//! What a transaction's statements mean, and the words its refusals say (ADR-067): a node keeps its transactions in
+//! `txn.rs`, reading BEGIN's modes, a savepoint's name and a write's word here. Every form is a node's member (a page
+//! too, ADR-072), so every form takes the same statements and says the same thing.
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::{Statement, TransactionAccessMode, TransactionIsolationLevel, TransactionMode};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};

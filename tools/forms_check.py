@@ -2,7 +2,7 @@
 """One set of SQL cases on every form (ADR-072 §6, reviews/form-parity.md): each form answers as a node does, or
 refuses by the name docs/forms.json gives it.
 
-  forms_check.py [--form server,cluster,inprocess,memory,page,page-lake] [--only keys,defaults] [--bin PATH] [--lib PATH]
+  forms_check.py [--form server,cluster,inprocess,memory,page] [--only keys,defaults] [--bin PATH] [--lib PATH]
                  [--pkg web/pkg] [--out PATH]
 
 The cases are tests/forms/*.slt, sqllogictest records as slt_check.py reads and prints them, one behaviour a file,
@@ -18,9 +18,7 @@ Every form is reached through the one request contract, request(method, path, he
 - server: a node over HTTP; cluster: three nodes on one lake, each query spread over them (`?spread=1`);
 - inprocess and memory: a node in this process through the library's pondra_request (python/pondra/inprocess.py),
   on a folder and on `:memory:`;
-- page: web/pkg's Page in Node behind a port (page_serve.mjs), over HTTP as a node.
-- page-lake: the same module, its page a member on the core's lake as every page is, behind a port as `page` is (the
-  form keeps its name until the page's own engine is gone).
+- page: web/pkg's Page, a member on the core's lake, in Node behind a port (page_serve.mjs), over HTTP as a node.
 
 docs/forms.json's `refusals` are the only differences a form may have. On that form, the file's first record that
 doesn't pass must be refused with the listed SQLSTATE and words, and the rest of the file isn't run. Each names its
@@ -38,7 +36,7 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 import harness, slt_check
 
-FORMS = ("server", "cluster", "inprocess", "memory", "page", "page-lake")
+FORMS = ("server", "cluster", "inprocess", "memory", "page")
 SQLSTATE = re.compile(r"^[0-9A-Z]{5}$")
 # DataFusion's own words for what it lacks: a refusal in them isn't yet one the form names (ADR-072 §6)
 DATAFUSION = re.compile(r"This feature is not implemented|not supported|Unsupported|SQL error|Schema error|Error during planning|Inconsistent data length|Placeholder")
@@ -115,8 +113,8 @@ class InProcess:
 
 
 class Page(Nodes):
-    """page and page-lake: web/pkg's Page in Node behind a port (page_serve.mjs), made afresh (`POST /reset`) for each
-    file. Every page is a member on the core's lake, so the two forms run the same module."""
+    """page: web/pkg's Page, a member on the core's lake, in Node behind a port (page_serve.mjs), made afresh
+    (`POST /reset`) for each file."""
 
     def __init__(self, pkg):
         super().__init__(1, None)
@@ -220,7 +218,7 @@ def split(table):
 
 def form_of(name):
     return {"server": lambda: Nodes(1, A.port), "cluster": lambda: Nodes(3, A.port), "inprocess": lambda: InProcess(False),
-            "memory": lambda: InProcess(True), "page": lambda: Page(A.pkg), "page-lake": lambda: Page(A.pkg)}[name]()
+            "memory": lambda: InProcess(True), "page": lambda: Page(A.pkg)}[name]()
 
 
 def main():

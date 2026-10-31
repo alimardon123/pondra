@@ -218,11 +218,11 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
     pondra::env::give(settings).map_err(|e| JsValue::from_str(&format!("{e:#}")))
 }
 
-/// A page's options: its member's lake is kept in `lake_store` (a kept page's folder; None is memory, as `new` has it),
+/// A page's options: its member's lake is kept in `store` (a kept page's folder; None is memory, as `new` has it),
 /// `node` (`node.rs`) answers the tables the page doesn't have, and the bytes its allocator holds (`heap::live`) are
 /// watched against the line its device has (`device_line`).
-fn options(lake_store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
-    pondra::page::Options { lake_store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
+fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
+    pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
 }
 
 const GIB: f64 = (1u64 << 30) as f64;

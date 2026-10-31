@@ -124,6 +124,16 @@ async fn steps() {
     assert_eq!((answer.status, answer.header("x-pondra-sqlstate")), (404, Some("42P01")), "step 5: a JSON body never goes to the node: {}", String::from_utf8_lossy(&answer.body));
 
     page.close().await;
+
+    // 6. A node that doesn't answer is 08001, and its words say which node did not answer: the page's own answer (`ask`), with a
+    // table the page doesn't have, and a node that gives no answer.
+    let gone: Node = Arc::new(|_sent: Sent| -> Asked { Box::pin(async { Err("no answer from http://x".to_string()) }) });
+    let mut page = Page::open_lake(&Options { node: Some(gone), ..Default::default() }).await.expect("step 6: a page opens with a node that doesn't answer");
+    let (status, sqlstate, body) = sql(&page, "SELECT count(*) FROM lake_orders").await;
+    assert_eq!((status, sqlstate.as_deref()), (503, Some("08001")), "step 6: a node not reached is 08001: {body}");
+    assert_eq!(body, "the page's node didn't answer: no answer from http://x", "step 6: its words say which node did not answer");
+    page.close().await;
+
     leader.kill();
     let _ = std::fs::remove_dir_all(&dir);
 }

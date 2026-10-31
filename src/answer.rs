@@ -436,7 +436,7 @@ pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
 /// that keeps its name is passed as it is, never aliased to its own name, as SQL's planner does for `t.id AS id`:
 /// DataFusion 55's push_down_leaf_projections, which takes a JSON or struct field down to the scan, adds `?table?.id`
 /// beside such an alias's `id`, and refused the plan as ambiguous (`doc->'a'` on every keyed table, and on any table with
-/// a renamed column). Shared by a node's tables (`query::named`) and a page's Delta tables (`page::delta_table`).
+/// a renamed column). Used by a node's tables (`query::named`).
 pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&str) -> bool) -> datafusion::error::Result<DataFrame> {
     let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| {
         let name = name_of(f.name());
