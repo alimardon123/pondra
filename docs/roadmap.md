@@ -103,9 +103,12 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   `INSTALL`/`LOAD` of what is built in.
 - **J1:** the server's catalog (ADR-032 §9). **J3, J6:** reports and dashboards of Pondra's own,
   snappy at any scale. **J4:** connections (`CREATE CONNECTION`, `designs/etl-and-bi-tools.md` §3.7): a
-  connection says where a source is and a secret who may reach it; one definition in Git for every
-  environment, parameterized as Data Factory's linked services are, with `ATTACH` its one-line form and
-  table macros its datasets. **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
+  connection says where a source is, and a secret, if it has one, who may reach it (a secret with
+  `PROVIDER credential_chain` is the machine's own identity, chosen and granted, never a fallback); one
+  definition in Git for every environment, parameterized as Data Factory's linked services are, with
+  `ATTACH` its one-line form and table macros its datasets; `WITH (max_parallel = n)` caps the steps
+  that reach it at once, and its `slack`, `email` and `webhook` types are what `SEND … TO` delivers
+  through. **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
   over one definition, as plugins.
 - **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
 - **Governance** (the owner, 2026-10-13, after single sign-on by the freeze; `reviews/platform-comparison.md`'s
