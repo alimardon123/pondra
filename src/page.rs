@@ -185,7 +185,15 @@ pub struct Page {
     notes: std::sync::Mutex<Vec<String>>, // (what the statement running now says beside its answer: `note`)
     types: std::sync::Mutex<BTreeMap<String, Vec<String>>>, // (each enum type's labels, by its name: `page::types`)
     #[cfg(feature = "lake")]
-    paged: Option<crate::node::Paged>, // (the page's member on the core's lake, when `open_lake` opened one: `/sql` is answered there)
+    lake: bool, // (a page claimed on the core's lake (`claim`): its requests are answered by its member, and never by the page's own engine)
+    #[cfg(feature = "lake")]
+    holds_claim: bool, // (the module's page is this page's: `close` and `ending` clear it, and give the module's page back)
+    #[cfg(feature = "lake")]
+    member: tokio::sync::OnceCell<crate::node::Paged>, // (the page's member on the core's lake: opened by its first request, or by `open_lake`)
+    #[cfg(feature = "lake")]
+    lake_store: Option<crate::store::Store>, // (the store the member keeps its lake in, as `Options::lake_store` gave it)
+    #[cfg(feature = "lake")]
+    line: Option<usize>, // (the device's line the member's queries hold, as `Options::line` gave it)
 }
 
 /// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), that statement's text, which a kept
@@ -386,6 +394,16 @@ fn param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// The routes a claimed page answers in its member (`request`): `/sql`, `/objects`, and `/files/…` by the four methods.
+#[cfg(feature = "lake")]
+fn lake_route(method: &str, route: &str) -> bool {
+    match (method, route) {
+        ("POST", "/sql") | ("GET", "/objects") => true,
+        ("PUT" | "GET" | "DELETE" | "POST", _) => route.starts_with(FILES),
+        _ => false,
+    }
+}
+
 impl Page {
     /// A page over `options`'s store, with the files and tables it kept: `open`, then every object the store lists under
     /// `tables/` that ends `.arrow` is read back as a table of the page's default schema (`restore`). A kept table has its
@@ -424,24 +442,56 @@ impl Page {
         Page::with_watch(options, watch)
     }
 
-    /// `open`, with the page's member on the core's lake (`node::open_page`, behind the `lake` feature until P3): its
-    /// `/sql` is answered by `statement::sql` as the owner's, as the HTTP door answers a node's. A folder kept by 0.35/0.36 in
-    /// `lake_store` is imported into the lake once (`import_kept`).
+    /// A page on the core's lake: the module's one page, claimed now (`node::claim_page`, refused 55006 while a live page holds
+    /// it), with the session `open` makes. Its member on the core's lake opens at its first request (`member`), and keeps its
+    /// lake in `lake_store`. Its memory is watched when `memory` is given, as `open`'s is. A kept page opens with `open_lake`,
+    /// which imports its folder; a claimed page's member opens without the import.
     #[cfg(feature = "lake")]
-    pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
+    pub fn claim(options: &Options) -> anyhow::Result<Page> {
+        crate::node::claim_page()?;
         #[cfg(target_arch = "wasm32")]
         if let Some(live) = &options.memory {
             crate::store::read_resident_with(live.clone()); // (the core's watch reads the page's memory as this page's program does)
         }
         let mut page = Page::open(options);
-        page.paged = Some(crate::node::open_page(options.lake_store.clone(), options.line).await?);
-        if let Some(store) = &options.lake_store {
-            if let Err(e) = page.import_kept(store).await {
-                page.close().await; // (a page that fails to open closes its member: the module's one page is free again, not 55006)
-                return Err(e);
-            }
+        page.lake = true;
+        page.holds_claim = true;
+        page.lake_store = options.lake_store.clone();
+        page.line = options.line;
+        Ok(page)
+    }
+
+    /// `claim`, with the member opened now (`open_now`), so an open's error is this call's. A folder kept by 0.35/0.36 in
+    /// `lake_store` is imported into the lake once (`import_kept`). A page that fails to open is closed, and the module's
+    /// page is free again.
+    #[cfg(feature = "lake")]
+    pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
+        let mut page = Page::claim(options)?;
+        if let Err(e) = page.open_now().await {
+            page.close().await; // (a page that fails to open closes: the module's one page is free again, not 55006)
+            return Err(e);
         }
         Ok(page)
+    }
+
+    /// The member opened (`member`), and the kept folder imported into it (`import_kept`, which runs its statements through
+    /// the member, so it is set first): what `open_lake` does at once.
+    #[cfg(feature = "lake")]
+    async fn open_now(&mut self) -> anyhow::Result<()> {
+        self.member().await?;
+        match self.lake_store.clone() {
+            Some(store) => self.import_kept(&store).await,
+            None => Ok(()),
+        }
+    }
+
+    /// The page's member on the core's lake, opened if it isn't yet (`node::open_page`, with the store and the line the page
+    /// was claimed with). A closed page has none, and its requests are refused. An open that fails is tried again by the next
+    /// request, as the cell keeps no error.
+    #[cfg(feature = "lake")]
+    async fn member(&self) -> anyhow::Result<&crate::node::Paged> {
+        anyhow::ensure!(self.holds_claim, "this page is closed");
+        self.member.get_or_try_init(|| crate::node::open_page(self.lake_store.clone(), self.line)).await
     }
 
     /// `open_lake`, refused by name: this build has no core's lake (build `web/` with `--features lake`).
@@ -450,13 +500,28 @@ impl Page {
         Err(crate::codes::coded("0A000", "this page was built without the core's lake: build web/ with --features lake"))
     }
 
-    /// Ends the page's member on the core's lake, if `open_lake` opened one: its loops, its catalog, its term and its lake in
-    /// memory (`node::Paged::close`). A page opened another way has nothing to end.
+    /// Ends the page's member on the core's lake, if one opened: its loops, its catalog, its term and its lake in memory
+    /// (`node::Paged::close`), and then gives the module's page back. A page closed twice, or opened another way, does nothing
+    /// the second time.
     #[cfg(feature = "lake")]
     pub async fn close(&mut self) {
-        if let Some(paged) = self.paged.take() {
+        if let Some(paged) = self.member.take() {
             paged.close().await;
         }
+        if std::mem::take(&mut self.holds_claim) {
+            crate::node::unclaim_page();
+        }
+    }
+
+    /// The page's end, as `Drop` gives it: the module's page is given back at once, and the member's close is returned for the
+    /// caller to run (None when no member opened). The next claim can be made while that close runs, and the next member's open
+    /// waits for it (`node::open_page`).
+    #[cfg(feature = "lake")]
+    pub fn ending(&mut self) -> Option<impl Future<Output = ()> + 'static> {
+        if std::mem::take(&mut self.holds_claim) {
+            crate::node::unclaim_page();
+        }
+        self.member.take().map(|paged| paged.close())
     }
 
     /// `close`, for a build with no core's lake: nothing was opened, so nothing ends.
@@ -505,7 +570,15 @@ impl Page {
             notes: Default::default(),
             types: Default::default(),
             #[cfg(feature = "lake")]
-            paged: None,
+            lake: false,
+            #[cfg(feature = "lake")]
+            holds_claim: false,
+            #[cfg(feature = "lake")]
+            member: Default::default(),
+            #[cfg(feature = "lake")]
+            lake_store: None,
+            #[cfg(feature = "lake")]
+            line: None,
         }
     }
 
@@ -515,12 +588,19 @@ impl Page {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let answer = match (method, route) {
             ("GET", "/ready") => return Answer::ok(TEXT, "ready"),
+            // (a claimed page is the core's lake: its member opens at this request, and its error is the answer. Any other
+            // route falls to the `_` arm below, which answers 404 as the node's router does)
             #[cfg(feature = "lake")]
-            ("POST", "/sql") if self.paged.is_some() => return self.lake_sql(query, headers, body).await,
-            #[cfg(feature = "lake")]
-            ("PUT" | "GET" | "DELETE" | "POST", _) if self.paged.is_some() && route.starts_with(FILES) => return self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
-            #[cfg(feature = "lake")]
-            ("GET", "/objects") if self.paged.is_some() => return self.lake_objects().await,
+            _ if self.lake && lake_route(method, route) => {
+                if let Err(e) = self.member().await {
+                    return failed(e);
+                }
+                return match (method, route) {
+                    ("POST", "/sql") => self.lake_sql(query, headers, body).await,
+                    ("GET", "/objects") => self.lake_objects().await,
+                    _ => self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
+                };
+            }
             ("POST", "/sql") => match std::str::from_utf8(&body) {
                 Ok(text) => self.sql(text, param(query, "format")).await,
                 Err(e) => Err(crate::codes::coded("22P02", format!("the request's body can't be read: {e}"))),
@@ -565,7 +645,7 @@ impl Page {
     /// is written. None when no table it names is the node's, when a fill names none, or when the text doesn't parse: the 42P01 stands.
     #[cfg(feature = "lake")]
     async fn lake_outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Answer>> {
-        let Some(paged) = &self.paged else { return Ok(None) };
+        let Some(paged) = self.member.get() else { return Ok(None) };
         let lake = &paged.app.lake;
         let expanded = crate::routines::expand(lake, &crate::vars::bound(text)?).await?;
         let state = lake.session().state();
@@ -640,7 +720,7 @@ impl Page {
     /// rows it sends its node) go through it too, so each is the core's statement path.
     #[cfg(feature = "lake")]
     async fn lake_said(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
-        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let Some(paged) = self.member.get() else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
         // (the query read as the HTTP door's `Query` reads it: decoded, and a number that doesn't parse refused 400)
         let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
         let text = |name: &str| q.get(name).cloned();
@@ -697,7 +777,7 @@ impl Page {
     /// the lake reads a file the page was given. Its answer has the node's status and headers (`filed_answer`).
     #[cfg(feature = "lake")]
     async fn lake_files(&self, method: &str, name: &str, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
-        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let Some(paged) = self.member.get() else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
         let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
         let if_match = request_header(headers, "if-match");
         let lake = &paged.app.lake;
@@ -719,7 +799,7 @@ impl Page {
     /// run as the owner, as `lake_files` runs its requests. Its answer is JSON, or the listing's error.
     #[cfg(feature = "lake")]
     async fn lake_objects(&self) -> Answer {
-        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let Some(paged) = self.member.get() else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
         let listed = crate::auth::WHO.scope(lake_principal(), Box::pin(crate::objects::listed(&paged.app.lake))).await;
         match listed {
             Ok(v) => match serde_json::to_vec(&v) {
@@ -866,7 +946,7 @@ impl Page {
             let Some(default) = field.metadata().get(DEFAULT_KEY) else { continue };
             if let Some(sequence) = sequence_of(default) {
                 let Some(next) = counted.get(&sequence).and_then(counters::Counter::next) else { continue };
-                let lake = &self.paged.as_ref().context("the page's member on the core's lake is not open")?.app.lake;
+                let lake = &self.member.get().context("the page's member on the core's lake is not open")?.app.lake;
                 let lake_sequence = lake.table_meta_if(name).await?.and_then(|m| m.identity.get(field.name()).map(|i| i.sequence.clone()));
                 let lake_sequence = lake_sequence.with_context(|| format!("{name}: its column {} is no identity column", field.name()))?;
                 self.imported_said(&format!("ALTER SEQUENCE {} RESTART WITH {next}", crate::ext_names::quoted(&lake_sequence)), None).await.map_err(|answer| answered_words(&answer))?;
@@ -2036,6 +2116,22 @@ impl Page {
         let (Some(name), Some(query)) = (kept["name"].as_str(), kept["query"].as_str()) else { anyhow::bail!("it has no name and query, so it is not a kept view") };
         self.views.lock().unwrap_or_else(PoisonError::into_inner).insert(name.to_string(), query.to_string());
         Ok(())
+    }
+}
+
+/// A page dropped with its member open ends the member in the background, and gives the module's page back at once (`ending`).
+/// Where this thread has no runtime to run the close on, the member is only dropped, and PAGED stays set.
+#[cfg(feature = "lake")]
+impl Drop for Page {
+    fn drop(&mut self) {
+        let Some(closing) = self.ending() else { return };
+        #[cfg(target_arch = "wasm32")]
+        let runtime = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        let runtime = tokio::runtime::Handle::try_current().is_ok();
+        if runtime {
+            crate::panics::untracked(closing); // (untracked: `close` calls `abort_all`, which would cut a tracked task)
+        }
     }
 }
 
