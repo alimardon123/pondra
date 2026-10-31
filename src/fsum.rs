@@ -144,15 +144,20 @@ impl Exact {
         for &v in rest {
             add(&mut hi[0], &mut lo[0], sign * v);
         }
-        if hi.iter().any(|h| !h.is_finite()) {
-            // (a lane went past f64's range where adding in order may not, as 1e308, -1e308 twice: the values again, in order)
-            for &v in values {
-                add(&mut self.hi, &mut self.lo, sign * v);
+        let (hi0, lo0) = (self.hi, self.lo);
+        if hi.iter().all(|h| h.is_finite()) {
+            for (&h, &l) in hi.iter().zip(&lo) {
+                add_partial(&mut self.hi, &mut self.lo, h, l);
             }
-            return;
+            if self.hi.is_finite() || !hi0.is_finite() {
+                return;
+            }
+            (self.hi, self.lo) = (hi0, lo0);
         }
-        for (&h, &l) in hi.iter().zip(&lo) {
-            add_partial(&mut self.hi, &mut self.lo, h, l);
+        // (a lane, or the lanes' fold, went past f64's range where adding in order may not: lanes of 1e308 and -1e308 each
+        // twice, or lanes of 1e308, 1e308 and -1e308 whose values in order meet the -1e308 first. The values again, in order)
+        for &v in values {
+            add(&mut self.hi, &mut self.lo, sign * v);
         }
     }
 }
@@ -355,6 +360,12 @@ mod tests {
             ("one inf among finite values", inf_in_middle),
             ("inf and -inf", vec![INF, 1.0, -INF]),
             ("lanes past the range, in order within it", [1e308, -1e308, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0].repeat(2)),
+            // (lanes of 1e308, 1e308 and -1e308, each within the range, fold past it; in order the -1e308 comes second: audit 10-30 L1)
+            ("the lanes' fold past the range, in order within it", {
+                let mut v = vec![0.0; 16];
+                (v[0], v[2], v[9]) = (1e308, -1e308, 1e308);
+                v
+            }),
         ];
         for (name, values) in cases {
             let expect = one_by_one(&values);

@@ -336,7 +336,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
         }
     };
     if let Some(why) = &refused {
-        crate::audit::refused(app, &user, "kafka", who.from, "sign in", why);
+        crate::audit::refused(app, &user, "kafka", who.from, "sign in", why).await;
         if why != PASSWORD_PLAIN {
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time, as on HTTP)
         }

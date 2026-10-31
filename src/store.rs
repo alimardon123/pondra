@@ -2528,8 +2528,8 @@ impl Catalog {
     }
 
     /// `key` from this node's own view of the bucket, past the mirror: for what a follower needs
-    /// before its commit stream opens, which never changes once written (the lake's own keys, which
-    /// signing in to that stream takes: `users::keys`).
+    /// before its commit stream opens (the lake's own keys, which signing in to that stream takes:
+    /// `users::keys`), or when the key it signed in with is refused (`users::sealed_node_key`).
     pub async fn from_view(&self, key: &str) -> Result<Option<Bytes>> {
         match self.kv.is_writer() {
             true => self.get_raw(key).await,

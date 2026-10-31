@@ -365,7 +365,9 @@ secret's key when it starts (the values aren't touched), and the old key can the
 The master key seals the lake's own keys too: the one sessions are signed with, and the one nodes call
 each other with. A lake made with `PONDRA_SECRET_KEY` (or a key service) has them sealed from its first
 write. One made without has them sealed when its leader next starts with one, once every node runs a
-release that reads them sealed (the lake's format moves to 3). So a key that only reads the bucket, such
+release that reads them sealed (the lake's format moves to 3). They are made new as they are sealed,
+since the ones kept in the clear could be read from the bucket: everyone signs in again, and the other
+nodes take the new ones from the bucket within seconds. So a key that only reads the bucket, such
 as a backup's or another environment's, can't sign anyone in. `GET /stats` says which in its `keys`
 field: `"sealed"`, `"clear"` (kept in the clear), or `"none"` until the lake makes them. The key made
 for one machine never seals them, since a node on another machine couldn't open them.
@@ -397,7 +399,9 @@ A write stopped this way may still land if it was already committing, as with Po
 Only a superuser reads it. By default it keeps every change to users, roles, grants, tokens and
 secrets (`role`), every other change to what exists (`ddl`), every procedure call and `DO` block
 (`function`), and every refusal: a sign-in that failed, a statement its rights or its quota didn't
-cover. `PONDRA_AUDIT` chooses the classes, as pgaudit does: `role`, `ddl`, `function`, `write` (rows
+cover. A refusal that names one of the lake's users is always written. One that names none of them,
+or no user at all, is written up to 60 a minute from one client (an IPv6 one's /64); past that a row
+says how many weren't, once the minute has ended. `PONDRA_AUDIT` chooses the classes, as pgaudit does: `role`, `ddl`, `function`, `write` (rows
 written), `read` (queries), `misc` (`SET`, `BEGIN`), `all` or `off`. Rows are kept 90 days
 (`PONDRA_AUDIT_DAYS`). A statement that makes a user, a token or a secret is kept with its quoted
 values as `'***'`:

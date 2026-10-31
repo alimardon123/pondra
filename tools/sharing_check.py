@@ -30,6 +30,52 @@ def door(port, method, path, token, body=None, headers=None):
         return e.code, dict(e.headers), e.read().decode(errors="replace")
 
 
+def stub_provider():
+    """A Delta Sharing provider of one share whose tables link: `direct` to another port of this machine, `hop` to its own
+    origin, which redirects to that port, `home` to its own origin, which redirects on it (to a file that isn't Parquet).
+    (its port, the probe's port, the paths both were asked for)"""
+    import http.server, socketserver, threading
+    hits = []
+    class Probe(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"not parquet")
+        def log_message(self, *a):
+            pass
+    probe = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Probe)
+    pport = probe.server_address[1]
+    schema = json.dumps({"type": "struct", "fields": [{"name": "x", "type": "long", "nullable": True, "metadata": {}}]})
+    class Stub(Probe):
+        def do_GET(self):
+            hits.append(self.path)
+            to = {"/hop": f"http://127.0.0.1:{pport}/landed", "/home": f"http://127.0.0.1:{self.server.server_address[1]}/stay"}.get(self.path)
+            if self.path.endswith("/shares"):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"items": [{"name": "s"}]}).encode())
+            elif to:
+                self.send_response(302)
+                self.send_header("Location", to)
+                self.end_headers()
+            else:
+                super().do_GET()
+        def do_POST(self):
+            t = self.path.rstrip("/").split("/")[-2]
+            own = f"http://127.0.0.1:{self.server.server_address[1]}"
+            url = {"direct": f"http://127.0.0.1:{pport}/probe", "hop": f"{own}/hop", "home": f"{own}/home"}[t]
+            lines = [{"protocol": {"minReaderVersion": 1}}, {"metaData": {"id": t, "format": {"provider": "parquet"}, "schemaString": schema, "partitionColumns": []}},
+                     {"file": {"url": url, "id": "f1", "partitionValues": {}, "size": 11, "stats": json.dumps({"numRecords": 1})}}]
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write("".join(json.dumps(l) + "\n" for l in lines).encode())
+    stub = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Stub)
+    for srv in (probe, stub):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return stub.server_address[1], pport, hits
+
+
 def sharing_check(bin, work, port, s3):
     import delta_sharing
     lake = f"s3://{os.environ['PONDRA_BUCKET']}/sharing-{uuid.uuid4().hex[:8]}" if s3 else os.path.join(work, "provider")
@@ -121,6 +167,8 @@ def sharing_check(bin, work, port, s3):
 
     # Another Pondra: the profile is an invite, attaching it accepts it.
     m = Node(bin, os.path.join(work, "recipient"), port + 1, work).start()
+    if s3:  # (the bucket's signed links are on this machine, off the provider's origin: reached only where an admin's secret covers them)
+        m.q(f"CREATE SECRET bucket_links (TYPE http, SCOPE '{os.environ['AWS_ENDPOINT'].rstrip('/')}/')")
     m.q(f"ATTACH '{json.dumps(profile)}' AS acme (TYPE share)")
     theirs = sorted(tuple(r.values()) for r in m.q("SELECT id, region, total FROM acme.sales.orders"))
     theirs_eu = sorted(tuple(r.values()) for r in m.q("SELECT id, region, total FROM acme.sales.orders_eu"))
@@ -129,6 +177,20 @@ def sharing_check(bin, work, port, s3):
     checks["another Pondra attaches the share by its profile and reads it == the provider's rows (deletion vectors, a partition, a join)"] = \
         theirs == now and theirs_eu == rows("SELECT id, region, total FROM sales.orders WHERE region IN ('EU', 'UK')") \
         and joined == q("SELECT count(*) AS n FROM sales.orders o JOIN kv k ON o.id = k.id") and all(token not in r["statement"] for r in audit_m)
+
+    # A provider that links elsewhere on its machine (audit 10-30 M8): a link to another port, and a link on its own origin
+    # that redirects to another port, are never fetched; a redirect on its own origin is followed
+    stub, probe, hits = stub_provider()
+    m.q(f"ATTACH 'http://127.0.0.1:{stub}/delta-sharing' AS stub (TYPE share, TOKEN 'stub-token')")
+    said = {}
+    for t in ("direct", "hop", "home"):
+        try:
+            said[t] = m.q(f"SELECT * FROM stub.sc.{t}")
+        except Failed as e:
+            said[t] = str(e)
+    checks["a provider's link to another port of its machine isn't fetched, nor one on its own origin that redirects there; a redirect on its own origin is followed"] = \
+        "public address" in str(said["direct"]) and "public address" in str(said["hop"]) and not any(h.startswith("/probe") or h.startswith("/landed") for h in hits) \
+        and "/stay" in hits and "/home" in hits
 
     # Refusals, each in the audit log.
     no_token = door(port, "GET", "/shares", None)[0]

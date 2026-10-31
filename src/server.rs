@@ -303,7 +303,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
             let why = crate::auth::guessing_says(name, wait);
-            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
         }
@@ -312,13 +312,17 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), vouched).await,
         None => None,
     };
+    let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
         None if crate::statement::owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
         None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, app.members.me()) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
-            None => crate::auth::Principal::of(crate::auth::Role::Admin),
+            None => {
+                open = true;
+                crate::auth::Principal::of(crate::auth::Role::Admin)
+            }
         },
         None if header.is_some() => {
             if let Some((name, ip)) = &basic_by {
@@ -330,7 +334,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 None => None,
             };
             let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
-            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
         }
@@ -350,10 +354,19 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                     true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
                     false => "this needs more rights than this token's or user's",
                 };
-                crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why);
+                crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await;
                 (StatusCode::FORBIDDEN, why).into_response()
             }
         };
+    }
+    // (the cluster's routes are the nodes' own: their tokens, their key, the program that started this one, anyone at an
+    // open node. A user's sign-in, a superuser's too, reaches only what `Auth::users_reach` names: the rest carry the
+    // lake's keys (the commit stream, the replica log) or write what only the nodes write (a raw flush, the audit's own
+    // tables, acks and beats). Checked before `AS_USER`, which makes a node's call its user's)
+    if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) {
+        let why = "this route is the nodes' own: a user's sign-in, a superuser's too, reaches the cluster's routes only for a branch's pin";
+        crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why);
+        return (StatusCode::FORBIDDEN, why).into_response();
     }
     // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. Only from the nodes (their key, the
     // admin token, the program that started this one) and only to `/cluster/*`; any other caller is itself, so a token
@@ -453,13 +466,13 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     let ip = Some(peer.client(&headers));
     if let Some(wait) = crate::auth::guessing(ip, user) {
         let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why);
+        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why).await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
     }
     if !crate::users::password_ok(&app.lake, user, password).await {
         crate::auth::guessed(ip, user);
-        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password");
+        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password").await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
     }
@@ -861,8 +874,8 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
     let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
-    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) {
-        crate::branch::cloning(&d)?; // (a user with CLONE: a pin, and nothing else)
+    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) || !cluster_call(&app, &headers) {
+        crate::branch::cloning(&d)?; // (a user with CLONE, or a user's own sign-in, a superuser's too: a pin, and nothing else)
     }
     if !cluster_call(&app, &headers) && key.is_none() {
         crate::protect::check_ddl(&app.lake, &d).await?;

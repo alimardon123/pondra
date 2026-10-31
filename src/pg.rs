@@ -114,7 +114,7 @@ fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo
 /// audited as HTTP's is, and waits 400 ms first, as a wrong guess does.
 async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAddr>, wait: u64) -> PgWireError {
     let why = crate::auth::guessing_says(user, wait);
-    crate::audit::refused(app, user, "postgres", from, "sign in", &why);
+    crate::audit::refused(app, user, "postgres", from, "sign in", &why).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     fatal(why)
 }
@@ -157,7 +157,7 @@ impl Startup {
         let first = m.into_sasl_initial_response()?;
         if first.auth_method != "OAUTHBEARER" {
             let why = format!("user \"{user}\" signs in through an identity provider (OAuth), which this client doesn't speak: use psql 18 or another libpq 18 client, with oauth_issuer={} and oauth_client_id, or ask for the provider's POSTGRES 'password' to send a token as the password", bearer.issuer);
-            crate::audit::refused(app, &user, "postgres", from, "sign in", "the client doesn't speak OAuth");
+            crate::audit::refused(app, &user, "postgres", from, "sign in", "the client doesn't speak OAuth").await;
             return Err(fatal(why));
         }
         let discovery = format!("{}/.well-known/openid-configuration", bearer.issuer);
@@ -170,7 +170,7 @@ impl Startup {
                 }
                 None => {
                     let why = crate::sso::why(&app.lake, &token).await.unwrap_or_else(|| format!("the token doesn't sign in {user}"));
-                    crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                    crate::audit::refused(app, &user, "postgres", from, "sign in", &why).await;
                     // (the cost of a wrong guess, but not counted by `auth::Guesses`: a provider's token isn't
                     // guessed, and counting it would lock the user out of the right one, invariant 381)
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -197,8 +197,8 @@ impl StartupHandler for Startup {
         let app = &self.backend.app;
         let from = Some(client.socket_addr());
         let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
-        let wrong = |user: &str| {
-            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password");
+        let wrong = async |user: &str| {
+            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password").await;
             PgWireError::InvalidPassword(user.to_string())
         };
         match message {
@@ -249,10 +249,10 @@ impl StartupHandler for Startup {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     if let Some(why) = crate::sso::why(&app.lake, &password).await {
                         // (an identity provider's token says why it was refused, as HTTP's 401 does)
-                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why).await;
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {why}")))));
                     }
-                    return Err(wrong(&user));
+                    return Err(wrong(&user).await);
                 };
                 *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                 return finish(client, &self.cancels).await;
@@ -273,7 +273,9 @@ impl StartupHandler for Startup {
                             true => app.auth.token_for(&user).filter(|t| !t.is_empty()).map(|t| crate::users::Verifier::of(&t)),
                             false => crate::users::verifier(&app.lake, &user).await,
                         };
-                        let (exchange, reply) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text).map_err(|_| wrong(&user))?;
+                        let Ok((exchange, reply)) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text) else {
+                            return Err(wrong(&user).await);
+                        };
                         *scram = Some((exchange, user));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(reply.into_bytes().into()))).await?;
                     }
@@ -286,13 +288,13 @@ impl StartupHandler for Startup {
                                 crate::auth::guessed(ip, &user);
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
-                            return Err(wrong(&user));
+                            return Err(wrong(&user).await);
                         };
                         let who = match crate::users::BUILT_IN.contains(&user.as_str()) {
                             true => Some(crate::auth::Principal::token(app.auth.role_of_user(&user))),
                             false => crate::users::principal(&app.lake, &user).await.ok(),
                         };
-                        let Some(who) = who else { return Err(wrong(&user)) };
+                        let Some(who) = who else { return Err(wrong(&user).await) };
                         *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return finish(client, &self.cancels).await;

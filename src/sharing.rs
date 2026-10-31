@@ -77,7 +77,7 @@ impl FromRequestParts<App> for Caller {
             None => None,
         };
         let Some((name, _)) = found else {
-            crate::audit::refused(app, "", "sharing", from, &format!("{} {}", parts.method, parts.uri.path()), "no recipient's token, or one that ended");
+            crate::audit::refused(app, "", "sharing", from, &format!("{} {}", parts.method, parts.uri.path()), "no recipient's token, or one that ended").await;
             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
             return Err(Fail(StatusCode::UNAUTHORIZED, "UNAUTHENTICATED", "a recipient's token, as its profile gives it (bearerToken), or a new one: ask the provider to rotate it".into()).into_response());
         };

@@ -129,7 +129,8 @@ pub fn web() -> &'static reqwest::Client {
     {
         static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
         CLIENT.get_or_init(|| {
-            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).dns_resolver(Names).redirect(redirects()).build().expect("an HTTP client")
+            // (never through a proxy: a proxy resolves the names itself, past `Names`' check: audit 10-30 M8)
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).dns_resolver(Names).redirect(redirects()).no_proxy().build().expect("an HTTP client")
         })
     }
     #[cfg(target_arch = "wasm32")]
