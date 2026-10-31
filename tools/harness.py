@@ -23654,6 +23654,123 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def recursive():
+    """WITH RECURSIVE over big graphs (L6, the recursive_builds rule in optimize.rs): each answer is DuckDB 2.0's on the
+    same rows, and the work table is the build side of a recursive term's join (EXPLAIN). The graphs are made in each
+    engine by the same SQL (integer arithmetic only), so the rows are the same; the timings are information only, beside
+    the deep reach with `SET datafusion.optimizer.join_reordering = false` (the work table built too, but the big table
+    shuffled on every iteration)."""
+    import duckdb
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: call(A.port, "POST", "/sql", s.encode(), timeout=600)
+    con = duckdb.connect()
+    checks, info, seconds = {}, {"duckdb": duckdb.__version__}, {}
+    # (each engine's range() names its column: Pondra's value, DuckDB's range)
+    GRAPHS = {
+        "edges": "SELECT ((i * 7919 + 13) % 1000003) % 100000 AS src, ((i * 104729 + 7) % 1000033) % 100000 AS dst FROM (SELECT {c} AS i FROM range(0, 1000000)) AS g",
+        "deep": "SELECT i % 500000 AS src, i % 500000 + 1 + ((i * 7919 + 13) % 1000003) % 2000 AS dst FROM (SELECT {c} AS i FROM range(0, 1000000)) AS g",
+        "small": "SELECT ((i * 7919 + 13) % 1000003) % 100 AS src, ((i * 104729 + 7) % 1000033) % 100 AS dst FROM (SELECT {c} AS i FROM range(0, 100)) AS g",
+    }
+    REACH = "WITH RECURSIVE reach(n) AS (SELECT CAST({s} AS BIGINT) UNION SELECT e.dst FROM reach JOIN {g} e ON e.src = reach.n) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    PATHS = "WITH RECURSIVE reach(n, d) AS (SELECT CAST({s} AS BIGINT), 0 UNION ALL SELECT e.dst, d + 1 FROM reach JOIN edges e ON e.src = reach.n WHERE d < 4) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    SMALL = "WITH RECURSIVE reach(n) AS (SELECT CAST({s} AS BIGINT) UNION SELECT s.dst FROM reach JOIN small s ON s.src = reach.n) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    WALK = ("WITH RECURSIVE t(id, depth, path) AS (SELECT id, 0, CAST(id AS VARCHAR) FROM emp WHERE boss IS NULL "
+            "UNION ALL SELECT e.id, t.depth + 1, t.path || '/' || CAST(e.id AS VARCHAR) FROM t JOIN emp e ON e.boss = t.id) "
+            "SELECT id, depth, path FROM t ORDER BY id")
+
+    def both(pondra_sql, duck_sql=None):
+        """(Pondra's rows, DuckDB's rows, both as lists of lists; Pondra's seconds, DuckDB's seconds) for one query."""
+        t = time.time()
+        got = [list(r.values()) for r in q(pondra_sql)]
+        tp = time.time() - t
+        t = time.time()
+        want = [list(r) for r in con.execute(duck_sql or pondra_sql).fetchall()]
+        return got, want, tp, time.time() - t
+
+    def build_side(text, op="HashJoinExec"):
+        """The first `op`'s first input in an EXPLAIN's indented plan: the lines under the first line below it that is two spaces deeper."""
+        lines = text.splitlines()
+        indent = lambda l: len(l) - len(l.lstrip(" "))
+        for i, l in enumerate(lines):
+            if op not in l:
+                continue
+            d, first = indent(l) + 2, []
+            for m in lines[i + 1:]:
+                if indent(m) < d or (indent(m) == d and first):
+                    break  # (the parent's next line, or the second input)
+                first.append(m)
+            return "\n".join(first)
+        return ""
+
+    try:
+        for name, body in GRAPHS.items():
+            q(f"CREATE TABLE {name} (src BIGINT, dst BIGINT)")
+            q(f"INSERT INTO {name} " + body.format(c='"value"'))
+            con.execute(f"CREATE TABLE {name} (src BIGINT, dst BIGINT)")
+            con.execute(f"INSERT INTO {name} " + body.format(c='"range"'))
+            got = [list(r.values()) for r in q(f"SELECT count(*) AS n, sum(src) AS s, sum(dst) AS d FROM {name}")]
+            want = [list(r) for r in con.execute(f"SELECT count(*), sum(src), sum(dst) FROM {name}").fetchall()]
+            checks[f"{name}: the same rows in both engines (count and sums of src and dst)"] = got == want
+        # emp: a tree rooted at 0, each employee's boss an earlier id, so all 10,000 are reached from the root
+        q("CREATE TABLE emp (id BIGINT, boss BIGINT)")
+        q("INSERT INTO emp VALUES (0, NULL)")
+        q('INSERT INTO emp SELECT i, ((i * 7919 + 13) % 1000003) % i FROM (SELECT "value" AS i FROM range(1, 10000)) AS g')
+        con.execute("CREATE TABLE emp (id BIGINT, boss BIGINT)")
+        con.execute("INSERT INTO emp VALUES (0, NULL)")
+        con.execute('INSERT INTO emp SELECT i, ((i * 7919 + 13) % 1000003) % i FROM (SELECT "range" AS i FROM range(1, 10000)) AS g')
+        hot_settled(A.port)
+        q(REACH.format(s=1, g="deep"))  # (a warm-up from a start no check uses)
+
+        # 1. reach (UNION) from three nodes on each graph; paths to depth 4 (UNION ALL, WHERE d < 4) on the shallow one
+        for g, starts in (("edges", (11, 4242, 99991)), ("deep", (0, 250001, 499999))):
+            for s in starts:
+                got, want, tp, td = both(REACH.format(s=s, g=g))
+                checks[f"reach (UNION) from node {s} on the {g} graph: count and sum of the reach = DuckDB 2.0's"] = got == want
+                seconds[f"reach from {s} on {g}: Pondra, DuckDB"] = (tp, td)
+        for s in (11, 4242, 99991):
+            got, want, tp, td = both(PATHS.format(s=s))
+            checks[f"paths to depth 4 (UNION ALL, WHERE d < 4) from node {s} on the shallow graph = DuckDB 2.0's"] = got == want
+            seconds[f"paths to depth 4 from {s} on edges: Pondra, DuckDB"] = (tp, td)
+
+        # 2. a hierarchy walk over emp with a depth and a path string; a recursive term joining small (100 rows)
+        got, want, tp, td = both(WALK)
+        checks["hierarchy walk over emp (10,000 employees): each one's depth and path = DuckDB 2.0's"] = got == want and len(want) == 10000
+        seconds["hierarchy walk over emp: Pondra, DuckDB"] = (tp, td)
+        small = [both(SMALL.format(s=s)) for s in (0, 17, 63)]
+        checks["a recursive term joining small (100 rows): count and sum of the reach from 0, 17 and 63 = DuckDB 2.0's"] = all(g == w for g, w, _, _ in small)
+        info["small: reach from 0, 17, 63 (count, sum)"] = [g for g, _, _, _ in small]
+
+        # 3. EXPLAIN: the reach over edges, whose join's first input (the build side) reads the work table and not edges
+        plan = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + REACH.format(s=5, g="edges"))}.get("physical_plan", "")
+        side = build_side(plan)
+        info["EXPLAIN: the first input of the first HashJoinExec"] = side
+        checks["EXPLAIN: the reach over edges has the work table on the build side (the HashJoinExec's first input reads it, not edges)"] = \
+            "WorkTableExec" in side and "DataSourceExec" not in side
+
+        # 4. information only: the deep reach from one start, as it is and with join_reordering off (the written order)
+        s = 300017  # (no check above uses it: a repeat of a checked query could come from the result cache)
+        t = time.time()
+        rule = [list(r.values()) for r in q(REACH.format(s=s, g="deep"))]
+        seconds[f"deep reach from {s}, as planned (the rule): Pondra"] = (time.time() - t, None)
+        t = time.time()
+        written = [list(r.values()) for r in q("SET datafusion.optimizer.join_reordering = false; " + REACH.format(s=s, g="deep"))]
+        seconds[f"deep reach from {s}, join_reordering = false: Pondra"] = (time.time() - t, None)
+        t = time.time()
+        want = [list(r) for r in con.execute(REACH.format(s=s, g="deep")).fetchall()]
+        seconds[f"deep reach from {s}: DuckDB"] = (time.time() - t, None)
+        info["deep reach from 300017: the rule and join_reordering = false agree with DuckDB"] = [rule == want, written == want]
+    finally:
+        con.close()
+        node.kill()
+    info["seconds"] = {k: [round(a, 3), None if b is None else round(b, 3)] for k, (a, b) in seconds.items()}
+    ok = all(checks.values())
+    print(json.dumps({"recursive": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} recursive checks"
+
+
 def dialects():
     """What people from other databases type on their first days (round 34, L6): the statements of
     `tools/dialects_check.py`, spelled as Postgres, DuckDB, Snowflake, Spark, MySQL, BigQuery and SQL
@@ -26764,7 +26881,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -26796,7 +26913,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -26809,7 +26926,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
