@@ -8,6 +8,7 @@ use pondra::page::Node;
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
+mod fetch;
 mod heap;
 mod js;
 mod node;
@@ -259,10 +260,15 @@ fn mobile_agent(global: &JsValue) -> bool {
     ["Mobi", "Android", "iPhone", "iPad"].iter().any(|m| agent.contains(m))
 }
 
-/// Sets the panic hook once: a panic says why, not just "unreachable".
+/// Sets the panic hook once: a panic says why, not just "unreachable". It gives the core the page's store of a web origin
+/// too (`fetch.rs`): a statement that names a web address reads it through the browser's `fetch`, in every page, and the
+/// core keeps the first store given.
 fn set_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| std::panic::set_hook(Box::new(|p| error(&p.to_string()))));
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|p| error(&p.to_string())));
+        pondra::page::web_with(Box::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>));
+    });
 }
 
 /// A page's folder is one name in the origin's private file system: not empty, not `.` or `..`, and with no `/` or `\`
