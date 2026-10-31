@@ -538,14 +538,18 @@ crate::per_node!(
 /// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it.
 pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()> }
 
-/// Opens a page's member (`Paged`), its queries holding the page's share of its device's `line` (`env::device_line`):
-/// refused by name while one is open in this process, and set back if the open fails.
-pub async fn open_page(line: Option<usize>) -> anyhow::Result<Paged> {
+/// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
+/// queries holding the page's share of its device's `line` (`env::device_line`): refused by name while one is open in this
+/// process, and set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
     if PAGED.swap(true, SeqCst) {
         return Err(crate::codes::coded("55006", "a page on the lake is open in this module already: close it first"));
     }
     crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     let url = crate::memory::place(":memory:");
+    if let Some(given) = store {
+        crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
+    }
     let store = crate::memory::store(&url);
     let (alone, marks) = match crate::members::Alone::lead(&store).await {
         Ok(led) => led,

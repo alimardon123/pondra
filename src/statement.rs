@@ -187,6 +187,15 @@ pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool
 /// node meanwhile. Each door adds it (HTTP's `held_session`, a page's `lake_sql`).
 pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
 
+/// A statement the node stopped for memory fails its session's transaction, as an error does (`txn::failed`): the session is
+/// found as `sql` finds it, for the caller that asked. Each door that stops one calls it (HTTP's `guard`, a page's `lake_sql`).
+pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap) {
+    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
+    if let Some(s) = session {
+        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
+    }
+}
+
 /// What the statement's procedures printed, for the caller: a JSON list of lines (all of it in ASCII, the first 32 KB of
 /// it; the run log has the rest), as the text of the `x-pondra-notices` header. None when nothing was said.
 pub fn notices(heard: &[String]) -> Option<String> {

@@ -1138,6 +1138,28 @@ fn words(v: &Value) -> Option<String> {
 /// `GET /kinds`: every kind, part and pattern, as `pondra.kinds` lists them.
 pub fn kinds() -> Value { Value::Array(rows()) }
 
+/// `GET /objects`'s answer, at every door (the HTTP door, a page): what the console's catalog and its details panel show of
+/// each table and view of this lake and the lakes attached to it — its kind, key, layout, formats and size, and a view's
+/// definition — read from the catalog alone, no query run (ADR-032); and where the lake's own files are, for
+/// `read_csv('…/files/x.csv')`. Columns come from `information_schema`, as every client reads them.
+pub async fn listed(lake: &crate::store::Lake) -> anyhow::Result<serde_json::Value> {
+    let mut all = vec![];
+    for o in crate::ddl::listed(lake).await? {
+        let (catalog, schema, name) = (&o.lake, &o.schema, &o.name);
+        let Some(m) = o.meta else {
+            all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": if o.kind == "external table" { "files" } else { o.kind }, "sql": o.sql}));
+            continue;
+        };
+        let sealed = m.sealed.clone().unwrap_or_default();
+        let (rows, bytes) = m.files.iter().fold((sealed.rows, sealed.bytes), |(r, b), f| (r + f.rows, b + f.bytes));
+        all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": o.kind, "rows": rows, "bytes": bytes,
+            "files": m.files.len() as u64 + sealed.files, "key": m.key, "partition": m.partition, "cluster": m.cluster, "publish": m.publish,
+            "not_null": m.not_null, "defaults": m.defaults, "ttl": m.ttl.as_ref().map(|(c, s)| format!("{c}: {s} s")), "ttl_secs": m.ttl,
+            "merge": m.merge, "order_by": m.order, "sql": o.sql})); // (a materialized view's SQL: what the console scripts it as)
+    }
+    Ok(serde_json::json!({"objects": all, "files": format!("{}/files/", lake.url.trim_end_matches('/'))}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

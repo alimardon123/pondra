@@ -27,6 +27,12 @@ pub struct Counter {
 }
 
 impl Counter {
+    /// The value its next `nextval` gives, or None once it is past its end (`take`): what an import restarts its sequence at.
+    #[cfg(feature = "lake")]
+    pub(crate) fn next(&self) -> Option<i64> {
+        self.next
+    }
+
     /// The counter an identity column starts at, from its options (`shape`). A SERIAL column's sequence has its type, as Postgres
     /// makes it (`AS integer` for SERIAL), so it counts to that type's maximum.
     pub fn of(identity: &Identity, data_type: &SqlType) -> anyhow::Result<Counter> {

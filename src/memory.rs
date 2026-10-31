@@ -106,6 +106,10 @@ pub fn store(url: &str) -> Store {
     MEMORY.lock().unwrap_or_else(PoisonError::into_inner).entry(url.trim_end_matches('/').to_string()).or_insert_with(|| Arc::new(Counted(Arc::new(Held::new())))).clone()
 }
 
+/// Holds `given` (a page's private folder, OPFS) as the lake in memory at `url`, so every open of `url` gives it
+/// (`store`), as it gives a lake made in memory; `forget_memory` lets it go, its objects staying where they are.
+pub fn give(url: &str, given: Store) { MEMORY.lock().unwrap_or_else(PoisonError::into_inner).insert(url.trim_end_matches('/').to_string(), Arc::new(Counted(given))); }
+
 /// The bytes past which a lake's files and log go to disk: `PONDRA_MEMORY_LAKE_GB`, else a quarter of
 /// the machine's memory (4 GB where it can't say).
 fn budget() -> u64 {
