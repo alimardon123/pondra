@@ -86,18 +86,24 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read.
-/// `front::expand` asks first, at every door.
+/// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read,
+/// and a materialized view over one of a subquery, which reads a lake table by its name (an EMIT FINAL one is refused by
+/// `write`, in its own words). `front::expand` asks first, at every door.
 pub fn refused(sql: &str) -> Result<()> {
     static SUBSET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bsubset\s+[a-z_][a-z0-9_]*\s*=").expect("a regex"));
+    static VIEW: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b").expect("a regex"));
     if !wanted(sql) {
         return Ok(());
     }
     let code = code_mask(sql);
-    match SUBSET.find_iter(sql).any(|m| code[m.start()]) {
-        true => Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions")),
-        false => Ok(()),
+    if SUBSET.find_iter(sql).any(|m| code[m.start()]) {
+        return Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions"));
     }
+    if VIEW.is_match(sql) && crate::once::emit_final(sql).is_none() && !hoists(sql, &code).is_empty() {
+        return Err(coded("0A000", "a materialized view over a MATCH_RECOGNIZE of a subquery isn't supported yet: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…); a query or a plain view takes the subquery"));
+    }
+    Ok(())
 }
 
 /// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
@@ -2336,6 +2342,18 @@ mod tests {
         let err = open(SUBQUERY, &HashMap::new(), &engine_functions()).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "0A000");
         assert!(err.to_string().contains("has a subquery around the pattern"), "{err}");
+    }
+
+    #[test]
+    fn a_materialized_view_over_a_subquery_is_refused_by_name_and_a_plain_one_is_not() {
+        let err = refused(&format!("CREATE MATERIALIZED VIEW v AS {SUBQUERY}")).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+        assert!(err.to_string().contains("a materialized view over a MATCH_RECOGNIZE of a subquery"), "{err}");
+        assert!(refused(&format!("create or replace materialized view v as {SUBQUERY}")).is_err());
+        assert!(refused(&format!("CREATE VIEW v AS {SUBQUERY}")).is_ok());
+        assert!(refused(SUBQUERY).is_ok());
+        assert!(refused("CREATE MATERIALIZED VIEW v AS SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m").is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS {SUBQUERY} EMIT FINAL")).is_ok(), "write refuses it, in its own words");
     }
 
     #[test]

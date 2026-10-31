@@ -24731,7 +24731,7 @@ def matches():
     9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
     as the input, 0A000 with the pattern view's words; a view kept by key as the input. 10: a search that never ends, past
     PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 11: a subquery before MATCH_RECOGNIZE over a lake
-    table answers its CTE's rows, aliased or not; a stored view shows the subquery as written; EMIT FINAL over one is refused.
+    table answers its CTE's rows, aliased or not; a stored view shows the subquery as written; a materialized view over one is refused by name, EMIT FINAL or not.
     5, 7 and 8 (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
@@ -24994,6 +24994,9 @@ def matches():
     info["11: the view's definition"] = view_def
     checks["a stored view of a subquery before MATCH_RECOGNIZE answers its CTE's rows, and shows its subquery as written (no __mr_input)"] = \
         view_rows == cte_rows and "FROM (SELECT * FROM sub_src WHERE venue = 'x') t MATCH_RECOGNIZE" in view_def and "__mr_input" not in view_def
+    checks["a materialized view (not EMIT FINAL) over a subquery before MATCH_RECOGNIZE is refused 0A000 by name, with what to write"] = \
+        refused("a materialized view over a subquery", f"CREATE MATERIALIZED VIEW sub_mv AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m",
+                ["a materialized view over a MATCH_RECOGNIZE of a subquery", "FROM t MATCH_RECOGNIZE"])
     checks["EMIT FINAL over a subquery with an alias is refused 0A000 with the pattern view's words, as without one"] = \
         refused("a subquery with an alias as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq2 AS SELECT * FROM (SELECT * FROM late_src) t "
                 f"MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
