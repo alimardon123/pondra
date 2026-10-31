@@ -27,13 +27,13 @@ pub(crate) async fn reader(store: crate::store::Store, streamed: bool, cache_dir
 /// The catalog's store as its leader opens it on a page: a `page::Log` in the lake's own store (designs/page-same-core.md P2).
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn writer(store: crate::store::Store, _: Option<std::path::PathBuf>, _: bool) -> Result<Arc<dyn Kv>, Error> {
-    Ok(Arc::new(page::Log::open(store, true).await?))
+    Ok(Arc::new(page::Log::writer(store).await?))
 }
 
 /// The catalog's store as a follower or a reader opens it on a page: the same log, read only.
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, _: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
-    Ok(Arc::new(page::Log::open(store, false).await?))
+pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, poll: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(page::Log::reader(store, poll).await?))
 }
 
 /// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`), a page's log in the lake's store (`kv::page`).
