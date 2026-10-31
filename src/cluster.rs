@@ -19,13 +19,12 @@
 //!   a second or two (`listen`), and one that doesn't answer in `HEARD` is gone (`deaf`); but not a
 //!   replicating leader, whose followers hold acknowledged changes: its mark alone decides. A leader
 //!   killed and started again takes the next term: only its own restart takes its term back.
-use crate::members::Members;
+use crate::members::{self, Members};
 use crate::node::Guest;
 use crate::replica::ReplicaLog;
 use crate::store::{Frame, Lake, Store};
 use crate::terms::{alive, claim, deaf, gone_here, holder, latest, listen, lock_dir, lock_path, mark_alive, open_lock, say, stepped_down, superseded, wait_for, Holder, Term, HELD, LEASE};
 use anyhow::Result;
-use futures::StreamExt;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -502,42 +501,39 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
             let _ = http().post(url).timeout(Duration::from_secs(2)).send().await;
         }
     });
-    crate::panics::spawn(async move {
-        let mut last = 0; // the last change we got (a reconnect replays some we have)
-        loop {
-            if let Ok(r) = http().get(crate::tls::url(&format!("{leader}/cluster/log"))).send().await.and_then(|r| r.error_for_status()) {
-                STREAM_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
-                let (mut body, mut buf, mut term) = (r.bytes_stream(), bytes::BytesMut::new(), None);
-                while let Some(Ok(chunk)) = body.next().await {
-                    buf.extend_from_slice(&chunk);
-                    while let Ok(Some(f)) = Frame::take(&mut buf) {
-                        match (f, &replica) {
-                            (Frame::Start { term: t, replicated }, log) => {
-                                term = replicated.then_some(t);
-                                log.iter().for_each(|log| log.start(t));
-                            }
-                            (Frame::Change(d), _) if d.id <= last => {}
-                            (Frame::Change(d), log) => {
-                                last = d.id;
-                                if let (Some(log), Some(t)) = (log, term) {
-                                    match log.hold(t, &d) {
-                                        Ok(Some((first, upto))) => drop(held.send_replace((t, first, upto))),
-                                        Ok(None) => {} // a newer leader exists: never ack this one again
-                                        Err(e) => eprintln!("keeping a replica: {e}"),
-                                    }
-                                }
-                                lake.hold(d);
-                            }
-                            (Frame::Committed(upto), _) => lake.commit_upto(upto),
-                            (Frame::Durable(upto), log) => log.iter().for_each(|log| log.prune(upto)),
-                        }
-                    }
+    // The stream is read by `members::follow`, which a joined page reads the same way. What is this node's alone (its replica
+    // log, and the acks that say what it holds) rides on each frame, before the lake takes it.
+    let mut term = None; // the leader's term, when its commits are replicated (`Frame::Start`)
+    let frame = move |f: &Frame, _: &Lake| match (f, &replica) {
+        (Frame::Start { term: t, replicated }, log) => {
+            term = replicated.then_some(*t);
+            log.iter().for_each(|log| log.start(*t));
+        }
+        (Frame::Change(d), log) => {
+            if let (Some(log), Some(t)) = (log, term) {
+                match log.hold(t, d) {
+                    Ok(Some((first, upto))) => drop(held.send_replace((t, first, upto))),
+                    Ok(None) => {} // a newer leader exists: never ack this one again
+                    Err(e) => eprintln!("keeping a replica: {e}"),
                 }
             }
-            STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
-    });
+        (Frame::Durable(upto), log) => log.iter().for_each(|log| log.prune(*upto)),
+        (Frame::Committed(_), _) => {}
+    };
+    let open = move || -> futures::future::BoxFuture<'static, std::result::Result<crate::fetch::Response, members::Open>> {
+        let url = crate::tls::url(&format!("{leader}/cluster/log"));
+        Box::pin(async move {
+            match crate::fetch::send(http().get(url)).await.and_then(crate::fetch::Response::error_for_status) {
+                Ok(r) => {
+                    STREAM_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+                    Ok(r)
+                }
+                Err(_) => Err(members::Open::Retry),
+            }
+        })
+    };
+    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed)));
 }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's

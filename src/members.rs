@@ -1,10 +1,13 @@
 //! Who a lake's member is, and who leads it: what a lake's modules ask of the form they run in, instead of the node's
 //! cluster. A node answers with its `Cluster` (`cluster.rs`); a page, or a test, with `Alone`, its own leader and no
 //! peers (`page-same-core.md` §7.3). The terms themselves are in `terms.rs`.
-use crate::store::Store;
+use crate::fetch;
+use crate::store::{Frame, Lake, Store};
 use crate::terms::{self, Term};
 use anyhow::{bail, Result};
-use std::sync::Arc;
+use futures::{future::BoxFuture, StreamExt};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// Who this member is among its lake's members, and who leads.
@@ -74,6 +77,57 @@ impl Alone {
 fn led(store: &Store, term: Term) -> (Arc<Alone>, JoinHandle<()>) {
     let marks = terms::mark_every(store.clone(), term.n);
     (Arc::new(Alone { term }), marks)
+}
+
+/// What `follow`'s `open` answers when it has no stream: `Retry` waits and tries again (a node's every failure, a page's
+/// network error), `Stop` ends the loop (a page's 401 or 403: its sign-in ended, so it may not follow any more).
+pub enum Open {
+    Retry,
+    Stop,
+}
+
+/// Follow a lake's commit stream: a node's member and a page's both read it this way, one connection at a time. Each
+/// change is held and each commit applied, and a connection that ends or fails is tried again 500 ms later. `frame` sees
+/// every frame before the lake takes it (a node keeps its replica there), and `down` runs when a connection ends or
+/// fails, before that wait. A change no newer than the last one is skipped: a reconnect replays some. The loop ends when
+/// `lake` is gone (checked as a frame arrives) or `open` says `Stop`.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a node's `cluster::mirror` calls it; a page's join will too)
+pub async fn follow(
+    lake: Weak<Lake>,
+    open: impl Fn() -> BoxFuture<'static, Result<fetch::Response, Open>> + Send,
+    mut frame: impl FnMut(&Frame, &Lake) + Send,
+    mut down: impl FnMut() + Send,
+) {
+    let mut last = 0; // the last change we got (a reconnect replays some we have)
+    while lake.strong_count() > 0 {
+        match open().await {
+            Ok(r) => {
+                let (mut body, mut buf) = (r.bytes_stream(), bytes::BytesMut::new());
+                while let Some(Ok(chunk)) = body.next().await {
+                    buf.extend_from_slice(&chunk);
+                    while let Ok(Some(f)) = Frame::take(&mut buf) {
+                        if let Frame::Change(d) = &f {
+                            if d.id <= last {
+                                continue;
+                            }
+                            last = d.id;
+                        }
+                        let Some(live) = lake.upgrade() else { return };
+                        frame(&f, &live);
+                        match f {
+                            Frame::Change(d) => live.hold(d),
+                            Frame::Committed(upto) => live.commit_upto(upto),
+                            Frame::Start { .. } | Frame::Durable(_) => {}
+                        }
+                    }
+                }
+            }
+            Err(Open::Stop) => return,
+            Err(Open::Retry) => {}
+        }
+        down();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 impl Members for Alone {

@@ -198,12 +198,6 @@ impl std::fmt::Display for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "memory, spilling to disk past {} MB", self.0.budget >> 20) }
 }
 
-/// The objects that may go to disk: a lake's files and its log.
-fn spillable(at: &Path) -> bool {
-    let key: &str = at.as_ref();
-    key.starts_with("data/") || key.starts_with("log/")
-}
-
 /// The spill folder's lock file is not one of the lake's objects.
 fn hidden(meta: &ObjectMeta) -> bool {
     let key: &str = meta.location.as_ref();
@@ -289,7 +283,7 @@ impl Inner {
     /// whole. An upload, whose size isn't known yet, goes to disk once the budget is reached. An update
     /// stays in memory, where its version is checked.
     fn spills(&self, at: &Path, mode: &PutMode, bytes: u64) -> bool {
-        spillable(at) && !matches!(mode, PutMode::Update(_)) && self.mem.sum() + bytes.max(1) > self.budget
+        crate::store::lake_file(at.as_ref()) && !matches!(mode, PutMode::Update(_)) && self.mem.sum() + bytes.max(1) > self.budget
     }
 
     /// The disk tier of this lake, made on the first need.
@@ -302,7 +296,7 @@ impl Inner {
     }
 
     /// The disk tier, if it exists and `at` may be on it.
-    fn disk_of(&self, at: &Path) -> Option<&Disk> { self.tier.get().filter(|_| spillable(at)) }
+    fn disk_of(&self, at: &Path) -> Option<&Disk> { self.tier.get().filter(|_| crate::store::lake_file(at.as_ref())) }
 
     /// The setting the spills of this lake are checked against, in GB (`piece_fits`): `PONDRA_SPILL_GB`, or a test's cap.
     #[cfg(test)]
