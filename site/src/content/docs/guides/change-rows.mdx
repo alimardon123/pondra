@@ -386,7 +386,7 @@ db.sql("DROP VIEW biggest")
 ```
 
 ```text
-500: orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table
+409: orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table
 ```
 
 A merge table takes `INSERT`s only. Its rows add up as they are read: that covers a table with `MERGE`

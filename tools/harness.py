@@ -24330,7 +24330,8 @@ def matches():
     row came before the watermark reached it (lateness 30 s), is written once the other symbol's rows move the watermark
     past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
-    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source. 5, 7 and 8
+    9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
+    as the input, 0A000 with the pattern view's words. 5, 7 and 8
     (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
@@ -24548,11 +24549,11 @@ def matches():
     checks["refused 0A000, with its words: a plain table as the source, not keyed, not a GROUP BY view's table, not a history view"] = \
         all([refused(label, stmt, [words, "write it from a table of plain rows"]) for label, stmt, words in sources])
     checks["UPDATE and DELETE on the source are refused while the view follows it (\"can't change while these follow it\", naming late_v)"] = \
-        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code=None)
+        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code="2BP01")
              for label, stmt in [("UPDATE", "UPDATE late_src SET price = 1 WHERE day = 1"), ("DELETE", "DELETE FROM late_src WHERE day = 1")]])
-    # (the subquery form, which the parser refuses before any of the above: recorded, not checked)
-    refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
-            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", [], code=None)
+    # (the subquery form, which the parser refuses before any of the above: with the pattern view's words, not GROUP BY's)
+    checks["a subquery as the input is refused 0A000 with the pattern view's words (FROM t MATCH_RECOGNIZE), not GROUP BY's"] = refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
+            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
     lap("9, the refusals")
     node.kill()
 
