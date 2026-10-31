@@ -12,8 +12,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
 use datafusion::common::utils::memory::RecordBatchMemoryCounter;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
-use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation, PeakRecordingPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::{SessionState, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
@@ -1462,6 +1463,20 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     Ok(ctx)
+}
+
+/// A memory pool for one statement, over the lake's (which every statement shares): what its operators reserve goes
+/// through it (`task_with_peak`), so `PeakRecordingPool`'s peak is the most that statement held at once.
+pub fn peak_pool(ctx: &SessionContext) -> Arc<PeakRecordingPool> {
+    Arc::new(PeakRecordingPool::new(ctx.runtime_env().memory_pool.clone()))
+}
+
+/// The task a statement's plan runs on: `state`'s own (`SessionState::task_ctx`), but with `peak` for its memory pool.
+/// Only the runtime differs: the caches, the object stores and the spill disk are the lake's, and the session isn't
+/// made again.
+pub fn task_with_peak(state: &SessionState, peak: &Arc<PeakRecordingPool>) -> Result<Arc<TaskContext>> {
+    let rt = RuntimeEnvBuilder::from_runtime_env(state.runtime_env()).with_memory_pool(peak.clone()).build_arc()?;
+    Ok(Arc::new(TaskContext::from(state).with_runtime(rt)))
 }
 
 /// Whether a query ran out of memory, so a frugal run may help (DataFusion's "Resources exhausted", 53200).

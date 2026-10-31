@@ -165,8 +165,8 @@ def clean_up():
 
 
 class Node:
-    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", **flags):
-        self.args = [BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
+    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", bin=None, **flags):
+        self.args = [bin or BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
         self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
         self.port, self.env, self.cwd, self.p = port, {**os.environ, **(env or {})}, cwd, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
@@ -8091,6 +8091,7 @@ def history():
         shares = {s["node"] for s in trace if s["what"] in ("its share", "step 0")}
         checks["…spread over three nodes: each node's share in its trace"] = len(spread) == 1 and spread[0]["nodes"] == 3 and shares == {f"127.0.0.1:{A.port + i}" for i in range(3)}
         checks["…and a line in the node's log"] = "slow statement:" in open(b.log).read() and "h-slow" in open(b.log).read()
+        checks["…a statement spread over the nodes has no cost: the other nodes' parts come back as rows, not metrics"] = len(spread) == 1 and all(spread[0].get(k) is None for k in ("cpu_ms", "bytes_read", "peak_memory"))
         # PONDRA_HISTORY=off: nothing from that node
         q("SELECT 5 AS x -- h-off", 2)
         time.sleep(2.5)
@@ -8106,6 +8107,54 @@ def history():
         skipped = sum(r["rows"] for r in q("SELECT rows FROM pondra.history WHERE class = 'skipped'"))
         seen["rate"] = {"written": len(written), "skipped": skipped}
         checks["past PONDRA_HISTORY_RATE a second: the rest counted in one row, not written"] = 40 <= len(written) <= 80 and len(written) + skipped == 120
+        # The cost of a statement (`cpu_ms`, the bytes its Parquet files gave it, `peak_memory`): a read's, from its own plan
+        # and pool; a write's and a DDL's are NULL, and so is a skipped row's
+        time.sleep(1.5)  # (a new second: the 120 statements above spent this one's rate, and a skipped statement has no row)
+        q("/* h-ddl */ CREATE TABLE cost (a BIGINT)")
+        q("/* h-write */ INSERT INTO cost SELECT value FROM range(0, 20000)")
+        q("/* h-write */ INSERT INTO cost SELECT value FROM range(20000, 40000)")
+        call(A.port, "POST", "/tier")  # (rows in the log are read from memory, which `bytes_read` doesn't count: tiered, they are files)
+        q("SELECT sum(a) AS s FROM cost -- h-cost")
+        def rows_where(sql, want, secs=15):  # (a DDL and a write are stored as sent, minus their leading comment: matched by text)
+            deadline = time.time() + secs
+            while len(got := q(sql)) < want and time.time() < deadline:
+                time.sleep(0.5)
+            return got
+        cost = until("h-cost")
+        ddl = rows_where("SELECT * FROM pondra.history WHERE class = 'ddl' AND statement LIKE 'CREATE TABLE cost%'", 1)
+        write = rows_where("SELECT * FROM pondra.history WHERE class = 'write' AND statement LIKE 'INSERT INTO cost%'", 2)
+        seen["cost"] = [{k: r.get(k) for k in ("cpu_ms", "bytes_read", "peak_memory")} for r in cost]
+        seen["ddl and writes"] = [{k: r.get(k) for k in ("statement", "class", "cpu_ms", "bytes_read", "peak_memory")} for r in ddl + write]
+        checks["a read's cost: its cpu_ms, the bytes its Parquet files gave it, its peak memory"] = len(cost) == 1 \
+            and cost[0].get("cpu_ms") is not None and cost[0]["cpu_ms"] >= 0 \
+            and (cost[0].get("bytes_read") or 0) > 0 and (cost[0].get("peak_memory") or 0) > 0
+        checks["a write and a DDL have no cost (their plans aren't measured)"] = len(ddl) == 1 and len(write) == 2 and all(r.get(k) is None for r in ddl + write for k in ("cpu_ms", "bytes_read", "peak_memory"))
+        skipped_rows = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE class = 'skipped'")
+        checks["a skipped row has no cost"] = len(skipped_rows) > 0 and all(v is None for r in skipped_rows for v in r.values())
+        # An older release's lake: its history gains the cost columns at the next row, its old rows NULL and the new node's rows costed
+        old_bin = os.environ.get("PONDRA_HISTORY_OLD_BIN")  # (a build from before these columns: skipped without one)
+        if old_bin:
+            old_lake = new_lake()
+            old = Node(old_lake, A.port + 4, bin=old_bin).start()
+            q("CREATE TABLE t (a BIGINT)", 4)
+            q("INSERT INTO t VALUES (1), (2)", 4)
+            call(A.port + 4, "POST", "/tier")
+            q("SELECT sum(a) AS s FROM t -- h-old", 4)
+            time.sleep(2.5)  # (the history writer writes what it has once a second)
+            old.kill()
+            new = Node(old_lake, A.port + 4).start()
+            q("SELECT sum(a) AS s FROM t -- h-after", 4)
+            deadline = time.time() + 15
+            while not q("SELECT statement FROM pondra.history WHERE statement LIKE '%h-after%' AND statement NOT LIKE '%pondra.history%'", 4) and time.time() < deadline:
+                time.sleep(0.5)
+            old_row = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE statement LIKE '%h-old%' AND statement NOT LIKE '%pondra.history%'", 4)
+            new_row = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE statement LIKE '%h-after%' AND statement NOT LIKE '%pondra.history%'", 4)
+            new.kill()
+            seen["older lake"] = {"old": old_row, "new": new_row}
+            checks["an older lake's history gains the cost columns: its old rows have none, the new node's rows have theirs"] = \
+                len(old_row) == 1 and all(v is None for v in old_row[0].values()) and len(new_row) == 1 and new_row[0].get("cpu_ms") is not None and (new_row[0].get("bytes_read") or 0) > 0
+        else:
+            seen["older lake"] = "skipped: PONDRA_HISTORY_OLD_BIN is not set"
         # An admin reads every row; a user, their own
         basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
         ann, boss = basic("ann", "ann-password-1"), basic("boss", "boss-password-1")

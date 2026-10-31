@@ -233,18 +233,19 @@ impl App {
             crate::query::mark("session with its tables");
             let ctx = if files { ctx.enable_url_table() } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
+            let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
             let out = crate::query::frugally(&ctx, |ctx| async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 crate::query::mark("parsed to logical plan");
-                let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
+                let task = crate::query::task_with_peak(&state, peak)?;
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 crate::query::mark("optimized plan");
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 crate::query::mark("physical plan");
                 let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
                 crate::query::mark("run to the end");
-                crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
+                crate::history::planned(&logical, &plan, peak.peak_reserved()); // (its shape; a slow statement's plan, with what each operator did; what it learned; its cost)
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
                 anyhow::Ok(crate::engine::kept(out, &plan))
             }).await?;
