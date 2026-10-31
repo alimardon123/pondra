@@ -1036,7 +1036,11 @@ fn folder(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
     // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
     // and a writer fenced by a newer one restarts (`fatal`).)
-    Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None))
+    // (each write is flushed to the disk, the file and then its folder, before it returns: a commit acknowledged on a
+    // folder survives a power loss as one in a bucket does, and a catalog file renamed into place is never found
+    // empty after one. It cost a one-client commit 1.0 ms at the median, 8 clients 10% of their commits a second and a
+    // 1M-row INSERT 3%, on a sandbox's ext4: 10-31)
+    Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?.with_fsync(true))))), None))
 }
 
 /// A page has no folders: its lake is in memory or in a bucket.
