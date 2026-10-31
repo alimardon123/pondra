@@ -588,10 +588,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
         }
     };
     let term = alone.leader().n;
-    // (the page's own program owns its member, as `connect()`'s does (`library.rs`): its statements read the URLs no secret
-    // covers with the page's own fetch, and the page sends its key with each, `page::lake_said`)
-    let owner = uuid::Uuid::new_v4().simple().to_string();
-    let start = Start { auth: Arc::new(crate::auth::Auth::new(None, None, None).owned_by(Some(owner))), ..Start::default() };
+    let start = Start::default();
     let mut lake = None;
     let made = async {
         let l = crate::store::Lake::open(&url, true, false).await?;

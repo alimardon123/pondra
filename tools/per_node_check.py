@@ -61,6 +61,7 @@ PROCESS = {
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:BARE": "a client with no token and no time limit (`bare`): only its keep-alive sockets",
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
+    "ext.rs:WEB": "a page's store of a web origin, the browser's fetch (`web_with`): set once a module, as its allocator is",
     "engine.rs:SUBSTR": "a function's definition",
     "fit.rs:ANALYZER": "the analyzer's rules, DataFusion's and Pondra's, for a point change's SET: no state, nothing of a lake",
     "flight.rs:INFO": "what Flight SQL says of the server: constants",
