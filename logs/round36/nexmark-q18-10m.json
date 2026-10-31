@@ -1,0 +1,80 @@
+{
+ "what": "Nexmark q18 alone over 10M events (9.2M bids) on one 4-core VM (Xeon 2.1 GHz, 15 GB), tools/bench/nexmark.py --events 10000000 --only q18, Pondra and Flink alternating on the same box. Pondra: #320's binary (row ids fixed), its time counting all 10M events sent over HTTP and committed, the view's answer equal to DuckDB's. Flink 2.3.0 (PyFlink, local MiniCluster, parallelism 2, state on a 10 GB heap: its best), events made by datagen inside Flink.",
+ "pondra_q18_s": [
+  30.87,
+  30.77,
+  29.11
+ ],
+ "flink_heap_q18_alone_s": [
+  37.6,
+  37.47
+ ],
+ "raw": {
+  "pondra": [
+   {
+    "engine": "pondra",
+    "events": 10000000,
+    "secs": 31.07,
+    "events_per_s": 321873,
+    "sent_s": 5.89,
+    "done_s": {
+     "q18": 30.87
+    },
+    "wrong": {},
+    "refused": {}
+   },
+   {
+    "engine": "pondra",
+    "events": 10000000,
+    "secs": 30.97,
+    "events_per_s": 322880,
+    "sent_s": 5.9,
+    "done_s": {
+     "q18": 30.77
+    },
+    "wrong": {},
+    "refused": {}
+   },
+   {
+    "engine": "pondra",
+    "events": 10000000,
+    "secs": 29.32,
+    "events_per_s": 341121,
+    "sent_s": 6.33,
+    "done_s": {
+     "q18": 29.11
+    },
+    "wrong": {},
+    "refused": {}
+   }
+  ],
+  "flink": [
+   {
+    "engine": "flink",
+    "events": 10000000,
+    "state": "heap",
+    "jvm_args": "-Xmx10g",
+    "startup_s": 14.06,
+    "alone_s": {
+     "q18": 37.6
+    },
+    "failed": {},
+    "secs": 33.73,
+    "events_per_s": 296472
+   },
+   {
+    "engine": "flink",
+    "events": 10000000,
+    "state": "heap",
+    "jvm_args": "-Xmx10g",
+    "startup_s": 10.51,
+    "alone_s": {
+     "q18": 37.47
+    },
+    "failed": {},
+    "secs": 32.99,
+    "events_per_s": 303122
+   }
+  ]
+ }
+}
