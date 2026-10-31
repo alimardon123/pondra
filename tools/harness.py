@@ -24331,7 +24331,8 @@ def matches():
     past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
     9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
-    as the input, 0A000 with the pattern view's words; a view kept by key as the input. 5, 7 and 8
+    as the input, 0A000 with the pattern view's words; a view kept by key as the input. 10: a search that never ends, past
+    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 5, 7 and 8
     (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
@@ -24559,6 +24560,26 @@ def matches():
             f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
     lap("9, the refusals")
     node.kill()
+
+    # 10. A search that never ends: one key holds 100 rows of an open search, past PONDRA_MATCH_HELD_ROWS (50 here, its own node),
+    # so the view stops with 54000, the node's log names the key and the WITHIN, and nothing is written
+    node10 = Node(new_lake(), A.port, env={"PONDRA_MATCH_HELD_ROWS": "50"}).start()
+    q("CREATE TABLE t (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE MATERIALIZED VIEW open_v WITH (lateness = '0 seconds') AS SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+      "MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (a b* c) DEFINE c AS c.price < 0) EMIT FINAL")
+    q("INSERT INTO t SELECT 'X', CAST(value AS INT), TIMESTAMP '2026-10-01 00:00:00' + CAST(value AS BIGINT) * INTERVAL '1 second', "
+      "CAST(value AS INT) FROM generate_series(1, 100)")
+    held_line, deadline = None, time.time() + 30
+    while held_line is None and time.time() < deadline:
+        held_line = next((l for l in open(node10.log).read().splitlines() if "holds" in l and "PONDRA_MATCH_HELD_ROWS" in l), None)
+        if held_line is None:
+            time.sleep(0.5)
+    open_rows = q("SELECT count(*) AS n FROM open_v")[0]["n"]
+    info["10: the node's log line"] = held_line
+    checks["a search that never ends stops the view with the key and WITHIN named, past PONDRA_MATCH_HELD_ROWS"] = \
+        held_line is not None and "the key X holds" in held_line and "WITHIN" in held_line and "PONDRA_MATCH_HELD_ROWS" in held_line and open_rows == 0
+    node10.kill()
+    lap("10, a search that never ends")
 
     # 5, 7 and 8: every skip rule and the generator's queries, a restart and three nodes, and a run's cost (each its own lake)
     for part, run in (("5, every skip rule", matches_random), ("7, a restart and three nodes", matches_restart), ("8, the cost", matches_cost)):

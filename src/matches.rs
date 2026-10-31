@@ -271,6 +271,10 @@ const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
 /// earlier time and the next one goes on from there, so a catch-up's memory stays bounded at any backlog.
 fn most_rows() -> u64 { crate::env::or("PONDRA_MATCH_RUN_ROWS", 1_000_000u64).max(1) }
 
+/// The most rows one key's open search may hold (`PONDRA_MATCH_HELD_ROWS`, 1,000,000): a search that is never decided
+/// (no WITHIN, and a row that can always go on) would hold every row of its key and fill the leader's memory.
+fn most_held() -> u64 { crate::env::or("PONDRA_MATCH_HELD_ROWS", 1_000_000u64).max(1) }
+
 /// One run of a matches view (leader only, `views::emit_all`): steps of about `most_rows()` new rows each, back to back
 /// for `STEPS_FOR` while a step has more to do.
 pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<()> {
@@ -393,6 +397,18 @@ async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &
         matched.push(without(&filter_record_batch(b, &rest)?, "__mr_resume")?);
     }
     let markers = markers_of(&marks, &part)?;
+    let most = most_held();
+    if let Some((key, mk)) = markers.iter().find(|(_, mk)| mk.keep > most as i64) {
+        let who = match part.is_empty() {
+            true => format!("the view holds {}", mk.keep),
+            false => format!("the key {} holds {}", key.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "), mk.keep),
+        };
+        let fix = match m.within {
+            true => "narrow its WITHIN, so a search ends sooner, or raise the setting",
+            false => "give its PATTERN a WITHIN, so a search ends, or raise the setting",
+        };
+        return Err(coded("54000", format!("materialized view {view}: {who} rows of a search still open, more than PONDRA_MATCH_HELD_ROWS ({most}): {fix}")));
+    }
 
     // The view's rows: the matches, through the query's own clause when it has one.
     let match_schema: SchemaRef = Arc::new(Schema::new(inner_schema.fields().iter().filter(|f| f.name() != "__mr_resume").map(|f| f.as_ref().clone()).collect::<Vec<_>>()));
