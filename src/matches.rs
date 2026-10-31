@@ -2,7 +2,8 @@
 //! can change it. Its source is a lake table, read as its rows come. A run reads the source's rows in the new span of the
 //! watermark, with the rows the last runs left open, and writes the matches that are decided. What is still open stays
 //! held: `{view}$held` keeps those rows, and `{view}$resume` keeps each key's counts and the time a live thread dies. Late
-//! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`).
+//! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`). A run reads about
+//! `PONDRA_MATCH_RUN_ROWS` new rows, and a catch-up goes on in steps.
 use crate::log::{Append, Outcome, Sequencer, Src};
 use crate::query::{over_ctx, session, session_at, table_ref};
 use crate::store::*;
@@ -15,7 +16,9 @@ use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch, inte
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::ScalarValue;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Expr;
 use datafusion::prelude::{ident, lit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -258,16 +261,32 @@ impl Dues {
 
 crate::per_node!(static DUES: Mutex<HashMap<String, Dues>> = Default::default());
 
-/// One run of a matches view (leader only, `views::emit_all`): the watermark's new span, read at the snapshot; the keys it
-/// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
-/// producer in one flush, under the lake's lock. A run that finds nothing new commits nothing.
+/// A catch-up's steps run back to back for this long, then go on next round, so the leader's other views emit too.
+const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// About the most new rows one run reads (`PONDRA_MATCH_RUN_ROWS`, 1,000,000): past it, the run decides up to an
+/// earlier time and the next one goes on from there, so a catch-up's memory stays bounded at any backlog.
+fn most_rows() -> u64 { crate::env::or("PONDRA_MATCH_RUN_ROWS", 1_000_000u64).max(1) }
+
+/// One run of a matches view (leader only, `views::emit_all`): steps of about `most_rows()` new rows each, back to back
+/// for `STEPS_FOR` while a step has more to do.
 pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<()> {
+    let started = datafusion::common::instant::Instant::now(); // (a page's clock too: std's Instant has none there)
+    while step(lake, _log, seq, lock, view, v, m).await? && started.elapsed() < STEPS_FOR {}
+    Ok(())
+}
+
+/// One step of a run: the watermark's new span, cut to about `most_rows()` rows (`cut`), read at the snapshot; the keys it
+/// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
+/// producer in one flush, under the lake's lock. A step that finds nothing new commits nothing. Returns whether a next step
+/// should follow at once: the time this one decided up to is short of the watermark.
+async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<bool> {
     let producer = format!("match:{view}");
     let late_producer = format!("{producer}$late");
     let w0: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-    let Some(w) = crate::views::watermark(lake, &v.source, &m.time, m.lateness_secs, m.idle_secs).await? else { return Ok(()) };
+    let Some(w) = crate::views::watermark(lake, &v.source, &m.time, m.lateness_secs, m.idle_secs).await? else { return Ok(false) };
     if w <= w0 as i64 {
-        return Ok(());
+        return Ok(false);
     }
     let at = lake.visible();
     let at0: u64 = lake.cat.get(&producer_key(&late_producer)).await?.unwrap_or(0);
@@ -279,25 +298,23 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let time_type = dtype(&column_type(&src, &m.time)?)?;
     let cols: Vec<(String, DataType)> = src.columns.iter().map(|(c, t)| Ok((c.clone(), dtype(t)?))).collect::<Result<_>>()?;
     let part: Vec<(String, DataType)> = m.part.iter().map(|p| Ok((p.clone(), dtype(&column_type(&src, p)?)?))).collect::<Result<_>>()?;
-    let stamp = |us: i64| -> Result<ScalarValue> { Ok(ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(&time_type)?) };
     let t = ident(m.time.as_str());
 
-    // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions.
+    // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions. The run decides up to the cut.
     let names: Vec<String> = src.columns.iter().map(|(c, _)| c.clone()).collect();
     let read = format!("SELECT {}, {ROW_ID}, {VERSION} FROM {}", crate::objects::list_sql(&names), crate::write::sql_name(&v.source));
     let sctx = session_at(lake, &read, "", Some(at)).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
-    let mut bounds = t.clone().lt_eq(lit(stamp(w)?));
-    if w0 > 0 {
-        bounds = bounds.and(t.clone().gt(lit(stamp(w0 as i64)?)));
-    }
-    let s_batches: Vec<RecordBatch> = table.clone().filter(bounds)?.collect().await?;
+    let w_mark = w;
+    let w = cut(&table, &t, &m.time, &time_type, w0, w_mark, most_rows()).await?;
+    let s_batches: Vec<RecordBatch> = table.clone().filter(span(&t, &time_type, w0, w)?)?.collect().await?;
 
-    // Late rows: those that came after the last run's snapshot, with a time at or before its watermark, or none.
+    // Late rows: those that came after the last run's snapshot, with a time at or before the time the last run decided up
+    // to, or none.
     let late: i64 = match w0 > 0 && at > at0 {
         true => {
             let version = ident(VERSION);
-            let stale = t.clone().lt_eq(lit(stamp(w0 as i64)?)).or(t.clone().is_null());
+            let stale = t.clone().lt_eq(lit(stamp(&time_type, w0 as i64)?)).or(t.clone().is_null());
             table.filter(version.clone().gt(lit(at0 as i64)).and(version.lt_eq(lit(at as i64))).and(stale))?.count().await? as i64
         }
         false => 0,
@@ -330,7 +347,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
         if m.within {
             DUES.lock().unwrap().insert(dkey, dues);
         }
-        return Ok(()); // (nothing new and nothing late: no run, no commit)
+        return Ok(false); // (nothing new and nothing late: no run, no commit)
     }
     let mut touched = vec![false; keys.len()];
     for &id in &s_kid {
@@ -362,7 +379,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let counts: Vec<(i64, i64)> = keys.all.iter().map(|k| resume.get(k).map_or((0, 0), |r| (r.0, r.1))).collect();
     let in_schema = input_schema(&cols, &time_type);
     let parts: Vec<&RecordBatch> = s_list.iter().chain([&held_k]).collect();
-    let input = input_of(&in_schema, &cols, &parts, &ids_in, &kid_in, &counts, &stamp(w)?)?;
+    let input = input_of(&in_schema, &cols, &parts, &ids_in, &kid_in, &counts, &stamp(&time_type, w)?)?;
 
     // The matcher in open mode: the matches, and the markers that say what stays held.
     let ictx = over_ctx(lake, &v.source, in_schema.clone(), input.clone(), &m.inner).await?;
@@ -425,7 +442,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let guard = lock.lock().await;
     let kept = lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|x| x.matches);
     if kept.is_none_or(|x| x.id != m.id) {
-        return Ok(());
+        return Ok(false);
     }
     let outcome = crate::change::submit(lake, seq, &pending).await?;
     drop(guard);
@@ -437,16 +454,39 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
                 }
                 DUES.lock().unwrap().insert(dkey, dues); // (after a commit: the dues are as the writes say)
             }
+            Ok(w < w_mark) // (a step short of the watermark: the next one reads on from the time it decided up to)
         }
         Outcome::Acks(acks) if acks.iter().any(|a| a.conflict) => {
             eprintln!("materialized view {view}: another run committed first; the next one reads on from it");
+            Ok(false)
         }
         Outcome::Acks(acks) if acks.iter().any(|a| a.refused || a.gone) => bail!("materialized view {view}: its rows were refused"),
         Outcome::Refused(why) => bail!("materialized view {view}: {why}"),
-        _ => {} // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
+        _ => Ok(false), // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
     }
-    Ok(())
 }
+
+/// The time a run decides up to: W, or, when (W0, W] holds more than `most` rows, 1 µs past its `most`-th row's time (a
+/// finer time is in too), and at least 1: a run reads about `most` new rows (all of a time) and always moves on.
+async fn cut(table: &DataFrame, t: &Expr, time: &str, time_type: &DataType, w0: u64, w: i64, most: u64) -> Result<i64> {
+    let top = table.clone().filter(span(t, time_type, w0, w)?)?.select(vec![t.clone()])?.sort(vec![t.clone().sort(true, false)])?.limit(most as usize - 1, Some(1))?.collect().await?;
+    match top.iter().find(|b| b.num_rows() > 0) {
+        Some(b) => Ok((micros_of(b, time)?[0] + 1).max(1).min(w)),
+        None => Ok(w),
+    }
+}
+
+/// The rows of the span (W0, W] of the time column `t`: at or before W, and after W0 once W0 is past the start.
+fn span(t: &Expr, time: &DataType, w0: u64, w: i64) -> Result<Expr> {
+    let upto = t.clone().lt_eq(lit(stamp(time, w)?));
+    match w0 > 0 {
+        true => Ok(upto.and(t.clone().gt(lit(stamp(time, w0 as i64)?)))),
+        false => Ok(upto),
+    }
+}
+
+/// A time in µs, as the time column's type.
+fn stamp(time: &DataType, us: i64) -> Result<ScalarValue> { Ok(ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(time)?) }
 
 /// What the view takes: when `ok` doesn't hold, the statement is refused 0A000 with `why`, which says what to write.
 fn takes(ok: bool, why: impl Into<String>) -> Result<()> {
@@ -845,6 +885,26 @@ mod tests {
         let picked = pick(&parts, &schema, &[4, 0, 2])?;
         assert_eq!(ints(&picked, "x")?, [22, 10, 20]);
         assert_eq!(pick(&parts, &schema, &[])?.num_rows(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cut_is_just_past_the_nth_time() -> Result<()> {
+        use datafusion::arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+        let ctx = datafusion::prelude::SessionContext::new();
+        let frame = |array: ArrayRef| -> Result<DataFrame> { Ok(ctx.read_batch(RecordBatch::try_from_iter(vec![("ts", array)])?)?) };
+        let (micro, nano) = (DataType::Timestamp(TimeUnit::Microsecond, None), DataType::Timestamp(TimeUnit::Nanosecond, None));
+        let t = ident("ts");
+        // Times 10, 20, 20 and 30 µs, W0 0, W 100: the 2nd time is 20, the 4th 30, and fewer than 9 rows give W.
+        let df = frame(Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 20, 30])))?;
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 2).await?, 21);
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 4).await?, 31);
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 9).await?, 100);
+        // One row at 1,500 ns in a nanosecond column (1 µs, so 2), and negative times (at least 1).
+        let df = frame(Arc::new(TimestampNanosecondArray::from(vec![1500])))?;
+        assert_eq!(cut(&df, &t, "ts", &nano, 0, 100, 1).await?, 2);
+        let df = frame(Arc::new(TimestampMicrosecondArray::from(vec![-5, -3])))?;
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 1).await?, 1);
         Ok(())
     }
 
