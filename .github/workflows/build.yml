@@ -377,6 +377,19 @@ jobs:
         # just built: the program 26.6 MB on a0eae4f, 29.1-29.8 on main from dcf17f1 to d514755 as the list aged, a build
         # without the layout about 95. The library, which the packages run, is reported until main has measured it)
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
+      # Signed before it is packaged, so every package holds the signed binary: with the certificates' secrets
+      # (ADR-041 §8), a step that says so and does nothing until they are set (signed binaries come after 1.0)
+      - name: Signed (macOS, Windows), when the certificates are set
+        if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: python tools/sign.py "$BIN"
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
       - run: python tools/package.py --bin "$BIN" --platform ${{ matrix.platform }} --npm-main --out dist && bash tools/try_packages.sh ${{ matrix.platform }}
