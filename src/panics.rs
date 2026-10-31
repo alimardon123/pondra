@@ -28,11 +28,19 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 ///
 /// A `stoppable` request is one the node may stop for memory (`oom.rs`), where the node has a line to
 /// stop it at: then it answers [`crate::oom::OOM`] and its future is dropped, its memory let go, and its
-/// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node.
+/// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node. A page (wasm32) has no
+/// watch loop, so it watches each poll of one instead (`page::polled`), and answers its own [`crate::page::PAGE_OOM`].
 /// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
+    // (a page's one thread runs no watch loop beside a request, so each poll of a stoppable one is watched: `page::polled`)
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(line) = stoppable.then(crate::oom::line).flatten() {
+            return door(crate::page::polled(|| crate::store::resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::page::PAGE_OOM.to_string());
+        }
+    }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {

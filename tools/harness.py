@@ -9608,8 +9608,74 @@ def users():
     gone = [until(lambda: str(as_(port, ann, "SELECT 1 AS x")).startswith("ERROR 401"), True, 10) for port in (A.port, A.port + 1)]
     checks["revoked (a column, a role) and dropped: at once on the leader and a follower; pondra.grants says what stands"] = revoked == [True, True] and still == [{"id": 1}, {"id": 2}] \
         and no_role is True and gone == [True, True] and {"grantee": "analyst", "privilege": "SELECT", "on_name": "sales.orders", "columns": "id, amount"} in grants
+    # W50: a user granted a view (and a materialized view) alone is shown their names, columns and rows, not their queries,
+    # the base table's name or the filter; a listing shows the view as a read does; the server's folder is an admin's
+    vee_pw = "vee-password-1"
+    vee = basic("vee", vee_pw)
+    for q in ["CREATE VIEW sales.v_orders (PRIMARY KEY (id) NOT ENFORCED) AS SELECT id, item FROM sales.orders WHERE item = 'tea'",
+              "CREATE MATERIALIZED VIEW sales.m_orders AS SELECT item, count(*) AS n FROM sales.orders GROUP BY item",
+              f"CREATE USER vee PASSWORD '{vee_pw}'", "GRANT SELECT ON sales.v_orders TO vee", "GRANT SELECT ON sales.m_orders TO vee"]:
+        as_(A.port, boss, q)
+    w50 = {
+        "show_create": as_(A.port, vee, "SHOW CREATE VIEW sales.v_orders"), "boss_show_create": as_(A.port, boss, "SHOW CREATE VIEW sales.v_orders"),
+        "mat_show_create": as_(A.port, vee, "SHOW CREATE MATERIALIZED VIEW sales.m_orders"),
+        "objects": as_(A.port, vee, "SELECT name, definition FROM pondra.objects WHERE name = 'v_orders'"),
+        "boss_objects": as_(A.port, boss, "SELECT name, definition FROM pondra.objects WHERE name = 'v_orders'"),
+        "tables": as_(A.port, vee, "SELECT name, definition FROM pondra.tables WHERE name IN ('v_orders', 'm_orders') ORDER BY name"),
+        "boss_tables": as_(A.port, boss, "SELECT name, definition FROM pondra.tables WHERE name IN ('v_orders', 'm_orders') ORDER BY name"),
+        "parts": as_(A.port, vee, "SELECT kind, name, definition FROM pondra.parts WHERE object = 'v_orders' ORDER BY name"),
+        "boss_parts": as_(A.port, boss, "SELECT kind, name, definition FROM pondra.parts WHERE object = 'v_orders' ORDER BY name"),
+        "flows": as_(A.port, vee, "SELECT name, definition, follows, reads FROM pondra.flows WHERE name = 'sales.m_orders'"),
+        "boss_flows": as_(A.port, boss, "SELECT name, definition, follows FROM pondra.flows WHERE name = 'sales.m_orders'"),
+        "location": as_(A.port, vee, "SELECT location FROM pondra.databases"), "boss_location": as_(A.port, boss, "SELECT location FROM pondra.databases"),
+        "show_tables": as_(A.port, vee, "SHOW TABLES"),
+        "info_tables": as_(A.port, vee, "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = 'sales' ORDER BY 1"),
+        "info_views": as_(A.port, vee, "SELECT table_name, definition FROM information_schema.views WHERE table_schema = 'sales' ORDER BY 1"),
+        "boss_info_views": as_(A.port, boss, "SELECT table_name, definition FROM information_schema.views WHERE table_schema = 'sales' ORDER BY 1"),
+        "columns": as_(A.port, vee, "SHOW COLUMNS FROM sales.v_orders"), "base_columns": as_(A.port, vee, "SHOW COLUMNS FROM sales.orders"),
+        "select": as_(A.port, vee, "SELECT * FROM sales.v_orders"), "mat_rows": as_(A.port, vee, "SELECT item, n FROM sales.m_orders ORDER BY item"),
+        "pg_views": pg_as("vee", vee_pw, "SELECT definition FROM pg_views WHERE viewname = 'v_orders'"),
+        "boss_pg_views": pg_as("boss", "boss-password-1", "SELECT definition FROM pg_views WHERE viewname = 'v_orders'"),
+        "pg_matviews": pg_as("vee", vee_pw, "SELECT definition FROM pg_matviews WHERE matviewname = 'm_orders'"),
+        "pg_viewdef": pg_as("vee", vee_pw, "SELECT pg_get_viewdef('sales.v_orders')"),
+        "boss_pg_viewdef": pg_as("boss", "boss-password-1", "SELECT pg_get_viewdef('sales.v_orders')"),
+        "pg_info_views": pg_as("vee", vee_pw, "SELECT view_definition FROM information_schema.views WHERE table_name = 'v_orders'"),
+        "pg_info_tables": pg_as("vee", vee_pw, "SELECT table_name FROM information_schema.tables WHERE table_schema = 'sales' ORDER BY 1"),
+        "pg_columns": pg_as("vee", vee_pw, "SELECT column_name FROM information_schema.columns WHERE table_schema = 'sales' AND table_name = 'v_orders' ORDER BY ordinal_position"),
+        "mcp": as_(A.port, vee, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}), path="/mcp"),
+        "boss_mcp": as_(A.port, boss, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "list_tables", "arguments": {}}}), path="/mcp"),
+    }
+    rows = lambda r: r if isinstance(r, list) and all(isinstance(x, dict) for x in r) else []  # (an error answers a string: no rows)
+    mcp_tables = lambda r: {t["table"]: t.get("view") for t in json.loads(r["result"]["content"][0]["text"])["tables"]} if isinstance(r, dict) and "result" in r else {}
+    vee_mcp, boss_mcp = mcp_tables(w50["mcp"]), mcp_tables(w50["boss_mcp"])
+    shown_listing = {(x.get("table_schema"), x.get("table_name")) for x in rows(w50["show_tables"])}
+    checks["W50: a user granted a view alone is shown its name and columns, not its query, base table or filter (SHOW CREATE, pondra.objects, pondra.tables, pg_views, pg_matviews, information_schema, MCP); an admin is shown all of it"] = \
+        "shown to an admin" in str(w50["show_create"]) and "item = 'tea'" not in str(w50["show_create"]) and "item = 'tea'" in str(w50["boss_show_create"]) \
+        and w50["objects"] == [{"name": "v_orders"}] and "item = 'tea'" in str(w50["boss_objects"]) \
+        and w50["tables"] == [{"name": "m_orders"}, {"name": "v_orders"}] and "GROUP BY" in str(w50["boss_tables"]) \
+        and "shown to an admin" in str(w50["mat_show_create"]) and "GROUP BY" not in str(w50["mat_show_create"]) \
+        and w50["pg_views"] == [(None,)] and "item = 'tea'" in str(w50["boss_pg_views"]) and w50["pg_matviews"] == [(None,)] \
+        and w50["pg_viewdef"] == [(None,)] and "item = 'tea'" in str(w50["boss_pg_viewdef"]) and w50["pg_info_views"] == [(None,)] \
+        and "sales.v_orders" in vee_mcp and vee_mcp["sales.v_orders"] is None and "item = 'tea'" in str(boss_mcp.get("sales.v_orders"))
+    checks["W50: the same user's pondra.parts name the view's columns and no key (its PRIMARY KEY is its definition); an admin's list the key"] = \
+        rows(w50["parts"]) == [{"kind": "column", "name": "id"}, {"kind": "column", "name": "item"}] and any(x.get("kind") == "key" for x in rows(w50["boss_parts"]))
+    checks["W50: pondra.flows of a materialized view granted alone lists it with no definition, no tables it reads or follows; an admin's has them"] = \
+        rows(w50["flows"]) == [{"name": "sales.m_orders"}] and "GROUP BY" in str(w50["boss_flows"]) and "orders" in str(w50["boss_flows"])
+    checks["W50: pondra.databases' location is NULL for a user, and set for an admin (the server's folder)"] = \
+        len(rows(w50["location"])) == 1 and "location" not in rows(w50["location"])[0] \
+        and len(rows(w50["boss_location"])) == 1 and bool(rows(w50["boss_location"])[0].get("location"))
+    checks["W50: SHOW TABLES, information_schema.tables and SHOW COLUMNS FROM v list the granted view and its columns, and its unread base table not at all; a granted materialized view reads its rows"] = \
+        {("sales", "v_orders"), ("sales", "m_orders")} <= shown_listing and ("sales", "orders") not in shown_listing \
+        and [r.get("table_name") for r in rows(w50["info_tables"])] == ["m_orders", "v_orders"] and {r.get("table_name"): r.get("table_type") for r in rows(w50["info_tables"])}.get("v_orders") == "VIEW" \
+        and {r.get("table_name"): r.get("definition") for r in rows(w50["info_views"])} == {"m_orders": None, "v_orders": None} \
+        and "item = 'tea'" in str({r.get("table_name"): r.get("definition") for r in rows(w50["boss_info_views"])}.get("v_orders")) \
+        and [r.get("column_name") for r in rows(w50["columns"])] == ["id", "item"] and "card" not in str(w50["base_columns"]) \
+        and "permission denied" in str(w50["select"]) and w50["mat_rows"] == [{"item": "cake", "n": 1}, {"item": "tea", "n": 1}]
+    checks["W50: over the Postgres port a granted view and materialized view are listed by information_schema.tables, the view's columns read, and its base table not"] = \
+        w50["pg_info_tables"] == [("m_orders",), ("v_orders",)] and w50["pg_columns"] == [("id",), ("item",)]
     info = {"said": said, "wrote": wrote, "pg": pg_said, "kafka": kafka_said, "flight": flight_said[1:], "grants": grants, "revoked": [revoked, still, no_role, gone],
             "tokens": [by_token, expired, by_session, tampered, ended, dropped_token], "shown": shown_info}
+    info["w50"] = w50  # (a view granted alone: what it was shown, for a failing check)
     a.kill(), b.kill()  # (the ports free for the next test of `all`)
     ok = all(checks.values())
     print(json.dumps({"users": checks, "ok": ok, "info": info}, indent=1, default=str))

@@ -25,7 +25,7 @@ Prints the checks as JSON and exits 1 if one fails (a failing release's lakes an
 kept in --work). Needs the Python packages in tools/requirements.txt for other engines' reads
 (deltalake, pyiceberg); without them those checks are skipped, and say so.
 """
-import argparse, atexit, collections, http.client, io, json, os, platform, random, shutil, signal, socket, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
+import argparse, atexit, base64, collections, hashlib, hmac, http.client, io, json, os, platform, random, shutil, signal, socket, struct, subprocess, sys, tarfile, tempfile, threading, time, urllib.error, urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = "alimardon123/pondra"
@@ -871,6 +871,9 @@ def drain_check(new_bin, work, port):
             checks["…an answer being sent in pieces when it is told to stop is sent whole, then it stops (exit 0)"] = got_pieces["whole"] and got_pieces["exit"] == 0
         else:
             checks["…and one collected whole, then sent in pieces (?catalog=postgres), likewise"] = got_pieces["whole"] and got_pieces["exit"] == 0
+    pg_checks, pg_info = pg_piecewise_stop(new_bin, work, port)
+    checks.update(pg_checks)
+    info.update(pg_info)
     # A leader stopped under load hands over at once; killed, its followers wait out the lease. They
     # are on other machines: each node has a temporary folder of its own, where its terms' lock files
     # are (invariant 370), so none sees another's lock let go. On one machine a killed leader's lock is
@@ -944,6 +947,217 @@ def piecewise_stop(new_bin, work, port, path, sql, col, rows):
     whole = got is not None and len(got) == rows and sorted(g[col] for g in got) == list(range(rows)) and all(g["s"] == f"x{g[col]}" for g in got)
     return {"answer MB": round(len(body) / 2**20, 1), "rows": len(got) if got is not None else None, "whole": whole,
             "exit": exit_code, "seconds to exit after the read": round(time.time() - read_ended, 2), "error": error}
+
+
+PG_ROWS = 300_000  # (a table of about 60 MB of text, read slowly over seconds)
+
+
+class SlowPg:
+    """A Postgres client's raw socket that reads slowly: each read takes what is there, then pauses, so a big answer
+    arrives over seconds. `ended` says how the connection ended, when `message` returns None."""
+
+    def __init__(self, sock, pause):
+        self.sock, self.pause, self.buf, self.ended = sock, pause, b"", None
+
+    def take(self, n):
+        while len(self.buf) < n:
+            try:
+                chunk = self.sock.recv(8192)
+            except OSError as e:
+                self.ended = f"{type(e).__name__}: {e}"[:200]
+                return None
+            if not chunk:
+                self.ended = "the connection closed"
+                return None
+            self.buf += chunk
+            time.sleep(self.pause)
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def message(self):
+        """The next (kind, body) the server sends, or None."""
+        head = self.take(5)
+        if head is None:
+            return None
+        size = struct.unpack("!I", head[1:])[0]
+        body = self.take(size - 4) if size > 4 else b""
+        return None if body is None else (head[:1], body)
+
+
+def pg_sign_in(sock, slow, user, password):
+    """Postgres's SCRAM-SHA-256 sign-in over a raw socket, as libpq makes it (`pg.rs`'s `Startup`): the client's first
+    message, the server's challenge, the client's proof, then the server's AuthenticationOk. The server's signature is
+    not checked: this is a test client, and a wrong proof is refused by the server before it gets there."""
+    def send(kind, body):
+        sock.sendall(kind + struct.pack("!I", len(body) + 4) + body)
+
+    def auth(want):
+        m = slow.message()
+        if m is None or m[0] != b"R":
+            raise Failed(f"no sign-in: {slow.ended or m}")
+        code, rest = struct.unpack("!I", m[1][:4])[0], m[1][4:]
+        if code != want:
+            raise Failed(f"sign-in: asked for {want}, got {code}")
+        return rest
+
+    auth(10)  # (AuthenticationSASL: the mechanisms, SCRAM-SHA-256 among them)
+    nonce = base64.b64encode(os.urandom(18)).decode()
+    bare = f"n=,r={nonce}"  # (Postgres takes the user from the startup message, so libpq sends no name here)
+    first = f"n,,{bare}".encode()
+    send(b"p", b"SCRAM-SHA-256\0" + struct.pack("!i", len(first)) + first)
+    challenge = auth(11).decode()
+    fields = dict(f.split("=", 1) for f in challenge.split(","))
+    if not fields["r"].startswith(nonce):
+        raise Failed("sign-in: the server's nonce is not this client's")
+    final_bare = f"c=biws,r={fields['r']}"
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(fields["s"]), int(fields["i"]))
+    client_key = hmac.new(salted, b"Client Key", hashlib.sha256).digest()
+    signature = hmac.new(hashlib.sha256(client_key).digest(), f"{bare},{challenge},{final_bare}".encode(), hashlib.sha256).digest()
+    proof = bytes(a ^ b for a, b in zip(client_key, signature))
+    send(b"p", f"{final_bare},p={base64.b64encode(proof).decode()}".encode())
+    auth(12)  # (SASLFinal)
+    auth(0)  # (AuthenticationOk: the server's parameters and key come next, then ReadyForQuery)
+
+
+def pg_piecewise_stop(new_bin, work, port):
+    """A Postgres answer sent in pieces when its node is told to stop (`drain.rs`, step 3): the rows are written to the
+    client after their statement has returned, so the drain waits for the last of them. A simple query's answer is waited
+    for: a client that reads slowly (a small receive buffer, a pause between reads) gets every row and CommandComplete, and
+    the node exits by itself. A portal left open by a row limit is not waited for, so it can't hold the drain (its node
+    exits at once). An Execute with no row limit is waited for too: pgwire takes its rows into memory before it writes them,
+    and the call that writes them is counted (`pg.rs`). The client is a raw socket, since psycopg reads every row at once, and
+    it signs in as `drain_check`'s psycopg does (admin, the admin token). Also checked: a Flight answer read slowly
+    (`flight_stop_answer`). Uses `port`, `port + 1` (Postgres) and `port + 2` (Flight)."""
+    checks, info = {}, {}
+    simple = pg_stop_answer(new_bin, work, port, "simple")
+    extended = pg_stop_answer(new_bin, work, port, "extended")
+    limited = pg_stop_answer(new_bin, work, port, "limited")
+    checks["a slow client gets every row and CommandComplete, though its node is told to stop mid-answer (a simple query)"] = (
+        simple["rows"] == PG_ROWS and simple["CommandComplete"] == f"SELECT {PG_ROWS}" and simple["ended"] == "ReadyForQuery")
+    checks["…and the node exits by itself, within PONDRA_DRAIN_SECS (30 s), with exit 0"] = (
+        simple["exit"] == 0 and simple["exited after the stop, s"] is not None and simple["exited after the stop, s"] < 30)
+    checks["a slow client gets every row and CommandComplete, though its node is told to stop mid-answer (an Execute with no row limit)"] = (
+        extended["rows"] == PG_ROWS and extended["CommandComplete"] == f"SELECT {PG_ROWS}" and extended["ended"] == "ReadyForQuery")
+    checks["…and that node exits by itself, within PONDRA_DRAIN_SECS (30 s), with exit 0"] = (
+        extended["exit"] == 0 and extended["exited after the stop, s"] is not None and extended["exited after the stop, s"] < 30)
+    checks["a portal left open by a row limit (10 rows, suspended) doesn't hold the drain: its node exits within 10 s"] = (
+        limited["rows"] == 10 and limited["exit"] == 0 and limited["exited after the stop, s"] is not None and limited["exited after the stop, s"] < 10)
+    info["a Postgres answer in pieces, told to stop"] = {"simple query": simple, "Execute, no row limit": extended, "Execute, 10-row limit": limited}
+    flight = flight_stop_answer(new_bin, work, port)
+    if flight is None:
+        info["a Flight answer, told to stop"] = "not checked: pyarrow is not installed"
+    else:
+        checks["a slow Flight reader (small windows) gets every row of a whole answer, though its node is told to stop after the first chunk"] = (
+            flight["rows"] == PG_ROWS and flight["ended"] == "the stream ended")
+        checks["…and that node exits by itself, within PONDRA_DRAIN_SECS (30 s), with exit 0"] = (
+            flight["exit"] == 0 and flight["exited after the stop, s"] is not None and flight["exited after the stop, s"] < 30)
+        info["a Flight answer, told to stop"] = flight
+    return checks, info
+
+
+def flight_stop_answer(new_bin, work, port):
+    """One Flight answer (a whole one, `SELECT` of every row) read slowly by a client whose HTTP/2 windows stay small
+    (`grpc.http2.bdp_probe` 0: with gRPC's default the client buffers the whole answer, and nothing waits on it), its node
+    told to stop after the first chunk. None when pyarrow isn't installed."""
+    try:
+        import pyarrow.flight as fl
+    except ImportError:
+        return None
+    flight_port = port + 2
+    n = Node(new_bin, os.path.join(work, f"flight-drain-{int(time.time() * 1000)}"), port, work, "--flight", f"127.0.0.1:{flight_port}").start()
+    n.q(f"CREATE TABLE big AS SELECT i, repeat('x', 200) AS s FROM generate_series(1, {PG_ROWS}) t(i)")
+    client = fl.FlightClient(f"grpc://127.0.0.1:{flight_port}", generic_options=[("grpc.http2.bdp_probe", 0)])
+    opts = fl.FlightCallOptions(headers=[(b"authorization", f"Bearer {TOKEN}".encode())])
+    reader = client.do_get(fl.Ticket(json.dumps({"sql": "SELECT i, s FROM big"})), options=opts)
+    got, ended, term, exit_at = 0, None, None, {}
+    try:
+        while True:
+            chunk = reader.read_chunk()
+            got += 0 if chunk.data is None else chunk.data.num_rows
+            if term is None:  # (the first chunk is in: the node is told to stop, with most of the answer still to come)
+                term = time.time()
+                n.p.send_signal(signal.SIGTERM)
+                threading.Thread(target=lambda: (n.p.wait(), exit_at.update(t=time.time())), daemon=True).start()
+            time.sleep(0.5)
+    except StopIteration:
+        ended = "the stream ended"
+    except Exception as e:  # (a cut answer says so here: the error the client got)
+        ended = f"{type(e).__name__}: {str(e)[:200]}"
+    read_s = round(time.time() - term, 2) if term else None
+    if term and not exit_at:
+        for _ in range(800):  # (up to 40 s: the node's exit, if it has not come by now)
+            if n.p.poll() is not None:
+                break
+            time.sleep(0.05)
+    if n.p.poll() is None:
+        n.stop("kill")
+    return {"rows": got, "ended": ended, "read after the stop, s": read_s,
+            "exited after the stop, s": round(exit_at["t"] - term, 2) if "t" in exit_at else None, "exit": n.p.returncode,
+            "said": n.said()[-300:]}
+
+
+def pg_stop_answer(new_bin, work, port, how):
+    """One Postgres answer told to stop mid-way. `how` is "simple" (a simple query), "extended" (an Execute with no row
+    limit) or "limited" (an Execute with a 10-row limit, which leaves its portal suspended). The node is told to stop once
+    the first row is in, or, for "limited", once the portal is suspended."""
+    pg_port = port + 1
+    n = Node(new_bin, os.path.join(work, f"pg-drain-{how}-{int(time.time() * 1000)}"), port, work, "--pg", f"127.0.0.1:{pg_port}").start()
+    n.q(f"CREATE TABLE big AS SELECT i, repeat('x', 200) AS s FROM generate_series(1, {PG_ROWS}) t(i)")  # (about 60 MB of text)
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)  # (a small window: the answer can't be taken in at once)
+    sock.connect(("127.0.0.1", pg_port))
+    slow = SlowPg(sock, pause=0.001)
+    startup = struct.pack("!I", 196608) + b"user\0admin\0database\0lake\0\0"
+    sock.sendall(struct.pack("!I", len(startup) + 4) + startup)
+    pg_sign_in(sock, slow, "admin", TOKEN)
+    m = slow.message()
+    while m is not None and m[0] != b"Z":  # (the server's parameters and key, then ReadyForQuery)
+        m = slow.message()
+    if m is None:
+        raise Failed(f"no ReadyForQuery after the sign-in: {slow.ended}")
+
+    def send(kind, body):
+        sock.sendall(kind + struct.pack("!I", len(body) + 4) + body)
+
+    sql = b"SELECT i, s FROM big"
+    if how == "simple":
+        send(b"Q", sql + b"\0")
+    else:  # (Parse, Bind, Execute with its row limit (0: none), Sync)
+        send(b"P", b"\0" + sql + b"\0" + struct.pack("!h", 0))
+        send(b"B", b"\0\0" + struct.pack("!hhh", 0, 0, 0))
+        send(b"E", b"\0" + struct.pack("!i", 10 if how == "limited" else 0))
+        send(b"S", b"")
+    rows, tag, last, term, exit_at, ended = 0, None, None, None, {}, None
+    while (m := slow.message()) is not None:
+        if m[0] == b"D":
+            rows += 1
+            if rows == 1 and how != "limited":  # (the first row is in: the node is told to stop, with most of the answer still to come)
+                term = time.time()
+                n.p.send_signal(signal.SIGTERM)
+                threading.Thread(target=lambda: (n.p.wait(), exit_at.update(t=time.time())), daemon=True).start()
+        elif m[0] in (b"C", b"s"):  # (CommandComplete, or PortalSuspended)
+            last = m[0].decode()
+            tag = m[1].rstrip(b"\0").decode() if m[0] == b"C" else None
+            if how == "limited":
+                term = time.time()
+                n.p.send_signal(signal.SIGTERM)
+                threading.Thread(target=lambda: (n.p.wait(), exit_at.update(t=time.time())), daemon=True).start()
+        elif m[0] == b"Z":
+            ended = "ReadyForQuery"
+            break
+    ended = ended or slow.ended
+    read_s = round(time.time() - term, 2) if term else None
+    if term and not exit_at:
+        for _ in range(800):  # (up to 40 s: the node's exit, if it has not come by now)
+            if n.p.poll() is not None:
+                break
+            time.sleep(0.05)
+    if n.p.poll() is None:
+        n.stop("kill")
+    sock.close()
+    exit_s = round(exit_at["t"] - term, 2) if "t" in exit_at else None
+    return {"rows": rows, "CommandComplete": tag, "last message": last, "ended": ended, "read after the stop, s": read_s,
+            "exited after the stop, s": exit_s, "exit": n.p.returncode, "said": n.said()[-300:]}
 
 
 def killed_here(new_bin, work, port, env):

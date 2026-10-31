@@ -127,7 +127,7 @@ impl Page {
     /// A name a statement gives a page table, as the page's one schema reads it: its table, or 42P01 for a name in another schema
     /// (a table of another schema is no page table).
     pub(super) fn table_named(&self, name: &ObjectName) -> anyhow::Result<String> {
-        let reference = self.table_ref(name)?;
+        let reference = table_ref(&self.ctx.state(), name)?;
         let state = self.ctx.state();
         let options = state.config().options();
         let here = reference.schema().is_none_or(|s| s == options.catalog.default_schema) && reference.catalog().is_none_or(|c| c == options.catalog.default_catalog);
@@ -139,7 +139,7 @@ impl Page {
 
     /// A CREATE TABLE's text, parsed as the page's session parses SQL.
     pub(super) fn create_of(&self, text: &str) -> anyhow::Result<CreateTable> {
-        let DfStatement::Statement(s) = self.parsed(text)? else { anyhow::bail!("{text} is not a CREATE TABLE") };
+        let DfStatement::Statement(s) = parsed(&self.ctx.state(), text)? else { anyhow::bail!("{text} is not a CREATE TABLE") };
         let SqlStatement::CreateTable(c) = *s else { anyhow::bail!("{text} is not a CREATE TABLE") };
         Ok(c)
     }

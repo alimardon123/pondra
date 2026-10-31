@@ -241,7 +241,7 @@ fn relations(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
                     let kept = facts.get(&(o.lake.clone(), local.clone())).map_or(&[][..], |f: &Vec<crate::constraints::Constraint>| f.as_slice());
                     format!("CREATE VIEW {named}{} AS\n{s}", crate::facts::in_list(kept))
                 }),
-                "materialized view" => views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref())),
+                "materialized view" => crate::views::code_for_caller(|| views.get(&(o.lake.clone(), local.clone())).or_else(|| views.get(&(o.lake.clone(), crate::once::open(&local)))).map(|v| materialized_sql(&named, v, o.meta.as_ref()))).flatten(),
                 _ => None, // (an external table's statement isn't kept as written; a window view's `_final` table is made with it)
             };
             let def = def.filter(|_| !partial);
@@ -1040,7 +1040,7 @@ pub async fn show_create(lake: &Lake, sql: &str) -> Result<Option<String>> {
         "user" => "a user's password and tokens are never shown (CREATE USER … PASSWORD '…')",
         "recipient" => "a recipient's token is shown once, when it is made (ALTER RECIPIENT … ROTATE TOKEN gives it another)",
         "external table" => "its statement isn't kept as written yet (its query is in pondra.tables)",
-        _ if !crate::auth::shows_code() && matches!(o.family(), "routine" | "task") => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
+        _ if !crate::auth::shows_code() && (matches!(o.family(), "routine" | "task") || matches!(o.kind, "view" | "materialized view")) => "its code is shown to an admin, a token, a superuser, or a user with APPLY or CLONE on this database",
         _ if crate::auth::limited().is_some() => "its statement names every column, and you may read only some of them",
         _ => "made with its materialized view",
     }))?;
@@ -1137,6 +1137,28 @@ fn words(v: &Value) -> Option<String> {
 
 /// `GET /kinds`: every kind, part and pattern, as `pondra.kinds` lists them.
 pub fn kinds() -> Value { Value::Array(rows()) }
+
+/// `GET /objects`'s answer, at every door (the HTTP door, a page): what the console's catalog and its details panel show of
+/// each table and view of this lake and the lakes attached to it — its kind, key, layout, formats and size, and a view's
+/// definition — read from the catalog alone, no query run (ADR-032); and where the lake's own files are, for
+/// `read_csv('…/files/x.csv')`. Columns come from `information_schema`, as every client reads them.
+pub async fn listed(lake: &crate::store::Lake) -> anyhow::Result<serde_json::Value> {
+    let mut all = vec![];
+    for o in crate::ddl::listed(lake).await? {
+        let (catalog, schema, name) = (&o.lake, &o.schema, &o.name);
+        let Some(m) = o.meta else {
+            all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": if o.kind == "external table" { "files" } else { o.kind }, "sql": o.sql}));
+            continue;
+        };
+        let sealed = m.sealed.clone().unwrap_or_default();
+        let (rows, bytes) = m.files.iter().fold((sealed.rows, sealed.bytes), |(r, b), f| (r + f.rows, b + f.bytes));
+        all.push(serde_json::json!({"catalog": catalog, "schema": schema, "name": name, "kind": o.kind, "rows": rows, "bytes": bytes,
+            "files": m.files.len() as u64 + sealed.files, "key": m.key, "partition": m.partition, "cluster": m.cluster, "publish": m.publish,
+            "not_null": m.not_null, "defaults": m.defaults, "ttl": m.ttl.as_ref().map(|(c, s)| format!("{c}: {s} s")), "ttl_secs": m.ttl,
+            "merge": m.merge, "order_by": m.order, "sql": o.sql})); // (a materialized view's SQL: what the console scripts it as)
+    }
+    Ok(serde_json::json!({"objects": all, "files": format!("{}/files/", lake.url.trim_end_matches('/'))}))
+}
 
 #[cfg(test)]
 mod tests {
