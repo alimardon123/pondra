@@ -2025,6 +2025,12 @@ pub struct Delta {
 
 impl Delta {
     fn bytes(&self) -> usize { self.puts.iter().map(|(k, v)| k.len() + v.len()).sum() }
+
+    /// The same change with only the puts and deletes `keep` names. The id stays, so a stream that filters
+    /// its changes shows no gap (`server::feed`, `objects::readable`).
+    pub fn only(&self, keep: impl Fn(&str) -> bool) -> Delta {
+        Delta { id: self.id, puts: self.puts.iter().filter(|(k, _)| keep(k)).cloned().collect(), deletes: self.deletes.iter().filter(|k| keep(k)).cloned().collect() }
+    }
 }
 
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
@@ -2895,6 +2901,19 @@ mod tests {
         assert!(!quiet_with(&[("d/3", "x"), ("s/3", &user), (&expiring, "1"), ("n", "4"), ("c", "9")], &[]), "a table's rows keep the commit loud");
         assert!(!quiet_with(&[("d/3", "x"), ("s/3", &user), ("c", "9")], &["p/sql:auto-y"]), "a table's rows keep the commit loud, with a mark gone");
         assert!(!quiet_with(&[(&expiring, "1"), (&marker, "\"Done\""), ("n", "4"), ("c", "9")], &[]), "expiries alone are as loud as nothing: unmarked numbers are loud");
+    }
+
+    /// A change a page's caller sees keeps its id and only the keys it may hold: a change with nothing kept is still
+    /// a change, so the ids the page sees run on without a gap.
+    #[test]
+    fn only_keeps_the_keys_asked_and_the_id() {
+        let d = Delta { id: 7, puts: vec![("t/a".into(), Bytes::from("1")), ("z/auth".into(), Bytes::from("2"))], deletes: vec!["z/old".into(), "t/b".into()] };
+        let kept = d.only(|k| !k.starts_with("z/"));
+        assert_eq!(kept.id, 7);
+        assert_eq!(kept.puts.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["t/a"]);
+        assert_eq!(kept.deletes, ["t/b"]);
+        assert_eq!(d.only(|_| false).id, 7, "an empty change keeps its id");
+        assert!(d.only(|_| false).puts.is_empty() && d.only(|_| false).deletes.is_empty());
     }
 
     /// `scan_first` is the first keys of a range, in key order, and `count` counts the range as the catalog holds it.
