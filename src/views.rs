@@ -209,6 +209,11 @@ impl View {
 /// (`measures::written`, `pattern::shown`): what every door that shows a definition shows.
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
+/// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
+/// code (`auth::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
+/// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
+pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::auth::shows_code().then(text) }
+
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
     let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
@@ -1552,24 +1557,39 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     let late = |v: &View| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), crate::once::LATE.to_string())).copied().unwrap_or(0);
     let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
-        ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
+        ("follows", s(&|_, (_, v)| code_for_caller(|| v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
         ("refresh", s(&|_, (_, v)| Some(v.rerun.as_ref().map_or("incremental", |r| if r.full.is_some() { "full" } else { "by key" }).to_string()))),
         ("reason", s(&|_, (_, v)| v.rerun.as_ref().map(|b| b.reason.clone()))),
-        ("reads", s(&|_, (_, v)| reads(v))),
+        ("reads", s(&|_, (_, v)| code_for_caller(|| reads(v)).flatten())),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
         ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
-        ("definition", s(&|_, (_, v)| Some(shown(v.query())))),
+        ("definition", s(&|_, (_, v)| code_for_caller(|| shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let expectations = RecordBatch::try_from_iter(vec![
         ("view", e(&|(n, _, _)| n.to_string())),
         ("expectation", e(&|(_, _, x)| x.name.clone())),
-        ("condition", e(&|(_, _, x)| x.check.clone())),
+        ("condition", std::sync::Arc::new(all.iter().map(|(_, _, x)| code_for_caller(|| x.check.clone())).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef),
         ("on_violation", e(&|(_, _, x)| x.on.word().to_string())),
         ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
     ])?;
     let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     Ok(vec![("flows", mem(flows)?), ("expectations", mem(expectations)?)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Principal, Role, WHO};
+
+    #[tokio::test]
+    async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
+        // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
+        let reader = Principal { access: Some(std::sync::Arc::new(crate::users::Access::default())), ..Principal::of(Role::Read) };
+        let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
+        assert_eq!(query(reader).await, None);
+        assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));
+    }
 }

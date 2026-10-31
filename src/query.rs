@@ -1304,6 +1304,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let entries = lake.cat.scan_raw("t/", "t0").await?;
     lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
     let upto = upto.or_else(|| Some(lake.visible())); // (one end for every table it reads, fixed once their entries are read: a table read twice, or two a transaction wrote, read one commit)
+    let mut unlisted = vec![]; // (tables a listing leaves out, which the views over them still plan against: below)
     for (key, raw) in entries {
         let name = &key[2..];
         // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
@@ -1319,8 +1320,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
             }
-            if let Some(t) = guarded(name, t, listing) {
-                ctx.register_table(table_ref(name), t)?;
+            match guarded(name, t.clone(), listing) {
+                Some(t) => {
+                    ctx.register_table(table_ref(name), t)?;
+                }
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1429,7 +1433,19 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
+    // A listing leaves out a table its user may not read, but a view over it is planned against it: the table is there
+    // for the views' planning and taken out again after, unless the session has a table of that name already.
+    let mut planned_only = vec![];
+    for (name, t) in unlisted {
+        if !ctx.table_exist(table_ref(&name))? {
+            ctx.register_table(table_ref(&name), t)?;
+            planned_only.push(table_ref(&name));
+        }
+    }
     register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
+    for name in planned_only {
+        ctx.deregister_table(name)?;
+    }
     if listing {
         let direct = crate::ext_names::names(sql);
         for n in crate::ext_names::names(&text).into_iter().filter(|n| !direct.contains(n)) {

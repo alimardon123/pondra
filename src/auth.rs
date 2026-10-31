@@ -99,9 +99,9 @@ pub fn check_all(table: &str) -> Result<()> {
 /// A user's grants, if the request being served is a user's who isn't a superuser.
 pub fn limited() -> Option<Arc<crate::users::Access>> { current().and_then(|p| p.access) }
 
-/// Whether the request being served is shown routines' code and tasks' statements (S27): a token, a superuser,
-/// an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into
-/// a branch it owns). A user granted some tables is shown their names and parameters only.
+/// Whether the request being served is shown routines' code, tasks' statements and views' queries (S27): a token, a
+/// superuser, an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them
+/// into a branch it owns). A user granted some tables is shown their names and parameters only.
 pub fn shows_code() -> bool { limited().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
 
 /// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no

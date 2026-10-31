@@ -120,7 +120,7 @@ pub struct Listed {
     /// `table`, `view`, `materialized view` (its `_final` table too) or `external table`.
     pub kind: &'static str,
     pub meta: Option<TableMeta>, // (a table's, as its users see it)
-    pub sql: Option<String>,     // (a view's definition; a materialized view's query)
+    pub sql: Option<String>,     // (a view's definition; a materialized view's query: for a caller who may see code, `views::code_for_caller`)
 }
 
 /// Every table and view of this lake and the lakes attached to it, lake by lake.
@@ -141,12 +141,12 @@ pub async fn listed(lake: &Lake) -> Result<Vec<Listed>> {
             let (schema, table) = split(name);
             let found = materialized.get(name).or_else(|| materialized.get(name.trim_end_matches("_final"))).or_else(|| materialized.get(&crate::once::open(name)));
             let kind = if found.is_some() { "materialized view" } else { "table" };
-            let sql = found.filter(|s| !s.is_empty()).cloned();
+            let sql = crate::views::code_for_caller(|| found.filter(|s| !s.is_empty()).cloned()).flatten();
             all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: table.into(), kind, meta: Some(m.described()), sql });
         }
         for (k, v) in l.cat.scan::<StoredView>("q/", "q0").await? {
             let (schema, view) = split(&k[2..]);
-            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: Some(crate::views::shown(&v.sql)) });
+            all.push(Listed { lake: catalog.clone(), schema: schema.into(), name: view.into(), kind: if v.external { "external table" } else { "view" }, meta: None, sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)) });
         }
     }
     if let Some(a) = crate::auth::limited() {

@@ -75,7 +75,7 @@ is left as any node leaves it.
 
 A node that the shell, Python or Node.js starts gets a pipe as its standard input. When the pipe
 closes — the parent called `close()`, exited, or was killed outright — the node stops as it does
-on Ctrl-C: a leader gives up its term at once (`cluster::release`), so the next process on the
+on Ctrl-C: a leader gives up its term at once (`terms::release`), so the next process on the
 lake leads immediately, instead of waiting out the lease a killed leader leaves.
 
 - It works the same on Linux, macOS and Windows. The other ways of noticing a dead parent are
