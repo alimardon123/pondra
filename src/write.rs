@@ -504,7 +504,10 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     // CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL: each group once, when it's over.
     if let Some(rest) = crate::once::emit_final(sql) {
-        let wrong = || Stmt::Invalid("EMIT FINAL ends a materialized view's query: CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL".into());
+        let wrong = || match crate::pattern::wanted(&rest) {
+            true => Stmt::Invalid("EMIT FINAL over a MATCH_RECOGNIZE of a subquery or a join isn't supported: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…) EMIT FINAL".into()),
+            false => Stmt::Invalid("EMIT FINAL ends a materialized view's query: CREATE MATERIALIZED VIEW v AS SELECT … GROUP BY … EMIT FINAL".into()),
+        };
         return Some(match parse(&rest) {
             Some(Stmt::Ddl(mut d)) if d.len() == 1 => match crate::once::mark(&mut d[0]) {
                 true => Stmt::Ddl(d),
