@@ -6,6 +6,7 @@
 //! that serves a store leads its lake, and the others never claim a term (`checked`, invariant 299).
 
 use crate::byte_range;
+use crate::store_wire::{chunks, content_span, error, folder_of_lake, generic, listing_query, lines, nanos, object_meta, text_of, Delimited, Failed, Meta};
 use crate::store::Store;
 use axum::body::Body;
 use axum::extract::{self, Query, State};
@@ -15,8 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
-use futures::stream::{BoxStream, Stream};
+use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::client::{HttpClient, HttpError, HttpErrorKind, HttpRequest, HttpRequestBody, HttpResponse};
 use object_store::path::Path;
@@ -27,8 +27,6 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::ops::Range;
-use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
@@ -38,38 +36,6 @@ const MIB: u64 = 1 << 20;
 const MAX_BODY: u64 = 1 << 30;
 /// An answer at least this long is streamed, not read into one buffer.
 const STREAM_FROM: u64 = 8 * MIB;
-/// How long a body may go without a chunk before its read fails (a stalled bucket fails the same way).
-const IDLE: Duration = Duration::from_secs(30);
-
-/// One object as the listings and the object headers say it: the same fields on both sides.
-#[derive(Serialize, Deserialize)]
-struct Meta { path: String, size: u64, modified_ns: i64, e_tag: Option<String>, version: Option<String> }
-
-impl From<&ObjectMeta> for Meta {
-    fn from(m: &ObjectMeta) -> Meta {
-        Meta { path: m.location.to_string(), size: m.size, modified_ns: nanos(m.last_modified), e_tag: m.e_tag.clone(), version: m.version.clone() }
-    }
-}
-
-impl Meta {
-    fn meta(self) -> object_store::Result<ObjectMeta> {
-        Ok(ObjectMeta { location: Path::parse(&self.path)?, last_modified: DateTime::from_timestamp_nanos(self.modified_ns), size: self.size, e_tag: self.e_tag, version: self.version })
-    }
-}
-
-/// A listing's last line when the store fails midway: the error's text and the status it answers with.
-#[derive(Serialize, Deserialize)]
-struct Failed { error: String, status: u16 }
-
-/// One line of a listing: an object, or the failure that ends it.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Line { Failed(Failed), Object(Meta) }
-
-/// A delimited listing: the objects under the prefix and the prefixes under it.
-#[derive(Serialize, Deserialize)]
-struct Delimited { objects: Vec<Meta>, prefixes: Vec<String> }
-
 /// A listing's query: `prefix`, `offset` (the objects after it) or `delimiter` (any value).
 #[derive(Deserialize)]
 struct Listing { prefix: Option<String>, offset: Option<String>, delimiter: Option<String> }
@@ -77,10 +43,6 @@ struct Listing { prefix: Option<String>, offset: Option<String>, delimiter: Opti
 /// A copy's query: the path it copies from.
 #[derive(Deserialize)]
 struct CopyFrom { from: Option<String> }
-
-/// A time as nanoseconds since the epoch, which the headers and listings carry so it comes back
-/// exactly (no store reports a time past 2262, the last one that has none).
-fn nanos(t: DateTime<Utc>) -> i64 { t.timestamp_nanos_opt().unwrap_or_default() }
 
 // ---- the door (the server side) ----
 
@@ -129,12 +91,6 @@ async fn lake_files_only(object: Option<extract::Path<String>>, Query(listing): 
         return next.run(req).await;
     }
     refused("a page reads the lake's files and log through its node, never its catalog")
-}
-
-/// Whether a listing's prefix is one of the lake's folders. `Path::parse` takes the trailing slash off a prefix, so
-/// the folder is checked with it back on, the way the lake's files are named. No prefix is the whole store: refused.
-fn folder_of_lake(prefix: &str) -> bool {
-    Path::parse(prefix).is_ok_and(|at| crate::store::lake_file(&format!("{at}/")))
 }
 
 /// A refusal of the door: 403, with the header that makes the client say it as `PermissionDenied`.
@@ -199,10 +155,6 @@ fn answer_error(e: E) -> Response {
 /// store's fault, a 500.
 fn header_of(text: &str) -> Result<HeaderValue, Response> {
     HeaderValue::from_str(text).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the store gave {text:?}, which a header can't carry: {e}")).into_response())
-}
-
-fn text_of(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
 }
 
 /// The listings: `?prefix=` (optional), `&offset=` (the objects after it) or `&delimiter=1` (the
@@ -559,35 +511,6 @@ impl Link {
     }
 }
 
-/// The error for an answer the door gave. Without the door's header it is another server's answer
-/// (an older Pondra, a proxy, or the node's sign-in check, which says why in its body).
-fn error(at: &str, status: StatusCode, headers: &HeaderMap, body: &str, path: &str, create: bool) -> E {
-    if !headers.contains_key("x-pondra-store") {
-        return generic(at, format!("answered {status} without a store door: an older Pondra, or not a node ({body})"));
-    }
-    let path = path.to_string();
-    let source = |text: &str| -> Box<dyn std::error::Error + Send + Sync> { text.into() };
-    match status.as_u16() {
-        404 => E::NotFound { path, source: source(body) },
-        412 if create => E::AlreadyExists { path, source: source(body) },
-        412 => E::Precondition { path, source: source(body) },
-        304 => E::NotModified { path, source: source(body) },
-        403 => E::PermissionDenied { path, source: source(body) },
-        401 => E::Unauthenticated { path, source: source(body) },
-        501 => match headers.get("x-pondra-error").and_then(|v| v.to_str().ok()) {
-            Some("not-supported") => E::NotSupported { source: source(body) },
-            Some("not-implemented") => E::NotImplemented { operation: body.to_string(), implementer: format!("pondra://{at}") },
-            _ => generic(at, format!("answered 501: {body}")),
-        },
-        _ => generic(at, format!("answered {status}: {body}")),
-    }
-}
-
-/// A failure of this store that no variant of its own says: `pondra://host:port`, then what happened.
-fn generic(at: &str, what: impl std::fmt::Display) -> E {
-    E::Generic { store: "pondra", source: format!("pondra://{at} {what}").into() }
-}
-
 /// An operation the door doesn't carry: refused by name, never done some other way.
 fn refuse(at: &str, operation: impl Into<String>) -> E {
     E::NotImplemented { operation: operation.into(), implementer: format!("pondra://{at}") }
@@ -602,105 +525,6 @@ fn refuse_tags(at: &str, tags: &TagSet, attributes: &Attributes) -> object_store
 /// A header value for text this side was given: one no header can carry is refused.
 fn header_text(at: &str, text: &str) -> object_store::Result<HeaderValue> {
     HeaderValue::from_str(text).map_err(|e| generic(at, format!("can't send {text:?} in a header: {e}")))
-}
-
-/// The query of a listing: its prefix and where it starts after.
-fn listing_query(prefix: Option<&Path>, offset: Option<&Path>) -> Vec<(&'static str, String)> {
-    prefix.map(|p| ("prefix", p.to_string())).into_iter().chain(offset.map(|o| ("offset", o.to_string()))).collect()
-}
-
-/// An object's metadata as the object headers carry it.
-fn object_meta(headers: &HeaderMap, at: &Path, served: &str) -> object_store::Result<ObjectMeta> {
-    Ok(ObjectMeta {
-        location: at.clone(),
-        last_modified: DateTime::from_timestamp_nanos(number(headers, "x-pondra-modified-ns", served)?),
-        size: number(headers, "x-pondra-size", served)?,
-        e_tag: text_of(headers, "etag"),
-        version: text_of(headers, "x-pondra-version"),
-    })
-}
-
-/// A header's number, which the door always sends.
-fn number<T: std::str::FromStr>(headers: &HeaderMap, name: &str, served: &str) -> object_store::Result<T> {
-    text_of(headers, name).and_then(|t| t.parse().ok()).ok_or_else(|| generic(served, format!("answered without a usable {name}")))
-}
-
-/// The range of a partial answer, from its `content-range`.
-fn content_span(headers: &HeaderMap, served: &str) -> object_store::Result<Range<u64>> {
-    let text = text_of(headers, "content-range").ok_or_else(|| generic(served, "answered a partial read without its content-range"))?;
-    byte_range::answered(&text).map(|(span, _)| span).ok_or_else(|| generic(served, format!("answered the content-range {text:?}, which isn't one")))
-}
-
-/// A body's chunks, each waited for `IDLE` at most. After a failure the stream is over.
-fn chunks(body: BoxStream<'static, Result<Bytes, HttpError>>, at: String) -> impl Stream<Item = object_store::Result<Bytes>> + Send + 'static {
-    futures::stream::unfold(Some(body), move |state| {
-        let at = at.clone();
-        async move {
-            let mut body = state?;
-            match tokio::time::timeout(IDLE, body.next()).await {
-                Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
-                Ok(Some(Err(e))) => Some((Err(generic(&at, format!("failed mid-body: {e}"))), None)),
-                Ok(None) => None,
-                Err(_) => Some((Err(generic(&at, format!("sent no bytes for {} s", IDLE.as_secs()))), None)),
-            }
-        }
-    })
-    .fuse() // (object_store's `bytes` polls an empty body once more after its end)
-}
-
-/// A listing's lines as objects. A line cut across chunks is put together again; a line that says the
-/// store failed is that error, and the listing is over after it.
-pub fn lines(chunks: impl Stream<Item = object_store::Result<Bytes>>, at: &str) -> impl Stream<Item = object_store::Result<ObjectMeta>> {
-    let state = Lines { chunks: Box::pin(chunks), held: Vec::new(), at: at.to_string(), ended: false, done: false };
-    futures::stream::unfold(state, next_line).fuse()
-}
-
-struct Lines<S> { chunks: Pin<Box<S>>, held: Vec<u8>, at: String, ended: bool, done: bool }
-
-async fn next_line<S: Stream<Item = object_store::Result<Bytes>>>(mut st: Lines<S>) -> Option<(object_store::Result<ObjectMeta>, Lines<S>)> {
-    loop {
-        if st.done {
-            return None;
-        }
-        if let Some(end) = st.held.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = st.held.drain(..=end).collect();
-            if line.len() == 1 {
-                continue; // (a blank line)
-            }
-            let item = object_of_line(&line[..line.len() - 1], &st.at);
-            st.done = item.is_err();
-            return Some((item, st));
-        }
-        if st.ended {
-            if st.held.is_empty() {
-                return None;
-            }
-            st.done = true;
-            let text = format!("the listing from pondra://{} ended midway", st.at);
-            return Some((Err(E::Generic { store: "pondra", source: text.into() }), st));
-        }
-        match st.chunks.next().await {
-            Some(Ok(chunk)) => st.held.extend_from_slice(&chunk),
-            Some(Err(e)) => {
-                st.done = true;
-                return Some((Err(e), st));
-            }
-            None => st.ended = true,
-        }
-    }
-}
-
-fn object_of_line(text: &[u8], at: &str) -> object_store::Result<ObjectMeta> {
-    match serde_json::from_slice::<Line>(text) {
-        Ok(Line::Object(meta)) => meta.meta(),
-        Ok(Line::Failed(f)) => {
-            let mut headers = HeaderMap::new(); // (a failure line comes from a door)
-            headers.insert("x-pondra-store", HeaderValue::from_static("1"));
-            let status = StatusCode::from_u16(f.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            Err(error(at, status, &headers, &f.error, "", false))
-        }
-        Err(e) => Err(generic(at, format!("sent a listing line that isn't one: {e}"))),
-    }
 }
 
 /// A multipart upload: its parts are kept until `complete`, which sends them as one PUT (the door's
@@ -819,6 +643,8 @@ impl ObjectStore for Served {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
+    use std::ops::Range;
     use object_store::local::LocalFileSystem;
     use object_store::memory::InMemory;
     use object_store::Attribute;
@@ -1181,5 +1007,39 @@ mod tests {
         assert!(matches!(store.head(&Path::from("data/t/b.parquet")).await, Err(E::NotFound { .. })), "a refused put wrote nothing");
         store.head(&Path::from("data/t/a.parquet")).await.expect("a refused delete deleted nothing");
         store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused copy copied nothing");
+    }
+
+    /// A joined page's store reads the lake's files through its node, as the node's own store answers them: a whole read,
+    /// a suffix, a head, a listing and a missing file. The catalog and every write are refused by name, and nothing is written.
+    #[tokio::test]
+    async fn a_joined_page_reads_a_lakes_files_through_its_node() {
+        let store: Store = Arc::new(InMemory::new());
+        store.put(&Path::from("data/t/a.parquet"), PutPayload::from_static(b"0123456789")).await.expect("a data file");
+        store.put(&Path::from("catalog/x"), PutPayload::from_static(b"catalog")).await.expect("a catalog object");
+        let at = serve(Router::new().nest_service("/store", files_door(store.clone()))).await;
+        let joined = crate::joined::Joined::new(&format!("http://{at}"), "Bearer page-session");
+        let file = Path::from("data/t/a.parquet");
+
+        let whole = joined.get(&file).await.expect("a get");
+        assert_eq!(whole.meta.size, 10, "the size the door sends");
+        assert_eq!(whole.bytes().await.expect("the bytes").to_vec(), b"0123456789".to_vec());
+        let tail = joined.get_opts(&file, ranged(GetRange::Suffix(4))).await.expect("a suffix get");
+        assert_eq!(tail.range, 6..10, "the span the door answers");
+        assert_eq!(tail.bytes().await.expect("the bytes").to_vec(), b"6789".to_vec());
+        assert_eq!(joined.head(&file).await.expect("a head").size, 10);
+
+        let found = listed(joined.list(Some(&Path::from("data")))).await.expect("a listing");
+        assert_eq!(found.iter().map(|m| m.location.to_string()).collect::<Vec<_>>(), ["data/t/a.parquet"]);
+        let split = joined.list_with_delimiter(Some(&Path::from("data/t"))).await.expect("a delimited listing");
+        assert_eq!(split.objects.len(), 1, "the file, under its folder");
+
+        let missing = joined.get(&Path::from("data/x")).await.expect_err("a missing file");
+        assert!(matches!(missing, E::NotFound { .. }), "a missing file: {missing}");
+        let catalog = joined.get(&Path::from("catalog/x")).await.expect_err("a catalog object");
+        assert!(matches!(catalog, E::NotFound { .. }), "the catalog is not there for a page: {catalog}");
+        assert!(listed(joined.list(Some(&Path::from("catalog")))).await.expect("a listing of the catalog").is_empty(), "nor is a listing of it");
+        let write = joined.put(&Path::from("data/t/b.parquet"), PutPayload::from_static(b"new")).await.expect_err("a put");
+        assert!(matches!(write, E::NotSupported { .. }), "a put is refused by name: {write}");
+        store.head(&Path::from("data/t/b.parquet")).await.expect_err("a refused put wrote nothing");
     }
 }

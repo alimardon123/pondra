@@ -130,6 +130,7 @@ mod rules;
 #[cfg(feature = "lake")] mod iceberg;
 #[cfg(feature = "doors")] mod iceberg_rest;
 #[cfg(feature = "lake")] mod inbox;
+#[cfg(feature = "lake")] pub mod joined; // (a page's store for the lake it joined: its node's `/store`, read with the page's sign-in)
 #[cfg(feature = "doors")] mod kafka;
 #[cfg(feature = "lake")] mod kafka_client;
 #[cfg(feature = "lake")] mod kafka_wire;
@@ -200,6 +201,7 @@ mod rules;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;
+#[cfg(feature = "lake")] mod store_wire;
 #[cfg(feature = "doors")] mod sync;
 #[cfg(feature = "lake")] mod sys;
 #[cfg(feature = "lake")] mod tasks;
