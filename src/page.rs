@@ -46,6 +46,9 @@ const NODE_ROWS: &str = "the node's rows";
 /// (`node_rows_taken`).
 const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node";
 const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
+/// The 0A000 words of a transaction a joined page refuses (`joined_part`), after the statement's own word: each statement is the
+/// node's, run on its own, and the page holds none of its transaction.
+const JOINED_TRANSACTION: &str = "a page that joined a node runs each statement on its own: run a transaction through a client of the node";
 /// The name a kept table's rows have in the requests that import it (`import_table`): a request's table, as `imported_said` names it.
 const KEPT_ROWS: &str = "the kept rows";
 /// How a page is made: the store its member keeps its lake in, how it asks its node, how it watches its memory, and the line
@@ -65,6 +68,47 @@ pub struct Options {
     /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
     /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`oom::line_on`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
+    /// The node the page joins (`Join`): the page follows its lake, reads its own tables from it, and sends each write to
+    /// `node`. A joined page has no `store`. A body that isn't plain text is not routed, so its write fails 25006 on the page.
+    /// None: a page of its own.
+    pub joined: Option<Join>,
+}
+
+/// A page's join of a node (J5b): the node whose lake it follows, and the sign-in it follows it with. A page joins with an
+/// admin's `ps_` session (the node's `/login`), never a token: a page holds no key of the lake's or the nodes'.
+#[derive(Clone)]
+pub struct Join {
+    node: String, // (the bare origin: `https://host:port`, no trailing `/`)
+    session: String,
+}
+
+impl Join {
+    /// A join of the node at `url`, with the sign-in `session`. Refused by name: a session that isn't a `ps_` one; a URL that
+    /// isn't http(s), or has userinfo, a path past `/`, a query or a fragment; and `http:` to any host but `localhost`,
+    /// `127.0.0.1` or `[::1]` (the session would cross the network in clear).
+    pub fn new(url: &str, session: &str) -> anyhow::Result<Join> {
+        anyhow::ensure!(session.starts_with("ps_"), "a page joins a node with an admin's sign-in (a ps_ session from the node's /login), never a token: a page holds no key of the lake's or the nodes'");
+        let parsed = url::Url::parse(url).with_context(|| format!("{url}: the join's address is not a URL"))?;
+        anyhow::ensure!(matches!(parsed.scheme(), "http" | "https"), "{url}: a page joins a node at its http or https address");
+        anyhow::ensure!(parsed.username().is_empty() && parsed.password().is_none(), "{url}: a join's address has no userinfo: the sign-in is the session");
+        anyhow::ensure!(parsed.path() == "/", "{url}: a join's address is the node's origin, with no path");
+        anyhow::ensure!(parsed.query().is_none() && parsed.fragment().is_none(), "{url}: a join's address has no query or fragment");
+        let loopback = matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+        anyhow::ensure!(parsed.scheme() == "https" || loopback, "{url}: http to a node that isn't on this machine would send the session in clear: use https");
+        Ok(Join { node: parsed.origin().ascii_serialization(), session: session.to_string() })
+    }
+
+    /// The node's origin, as every client of the join takes it (`node::open_joined`, `joined::Joined`, the page's node).
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+}
+
+impl std::fmt::Debug for Join {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // (the session is not shown: it is the page's sign-in)
+        f.debug_struct("Join").field("node", &self.node).finish_non_exhaustive()
+    }
 }
 
 /// The page's live heap bytes, as the program that runs the page reads them (`Options::memory`, `store::Memory`).
@@ -108,7 +152,7 @@ pub struct Sent {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { store: None, node: None, memory: None, line: None }
+        Options { store: None, node: None, memory: None, line: None, joined: None }
     }
 }
 
@@ -124,6 +168,7 @@ pub struct Page {
     node: Option<Node>,
     watch: Option<Watch>, // (the page's memory watch: none when the page was given no `memory`, or its line is 0)
     unread: Vec<(String, String)>, // (the kept files `import_kept` couldn't read, each as its path and the words of why)
+    joined: Option<Join>, // (the node this page follows, as `Options::joined` gave it: its member is a follower, and its writes go there)
 }
 
 /// What a request answers, as ADR-061's contract says: a status, its headers (the node's names, in lower case) and its
@@ -317,13 +362,17 @@ impl Page {
     /// it). Its member on the core's lake opens at its first request (`member`), and keeps its lake in `store`. Its memory is
     /// watched when `memory` is given. `open_lake` also opens the member now, and imports a folder kept by 0.35/0.36.
     pub fn claim(options: &Options) -> anyhow::Result<Page> {
+        if options.joined.is_some() {
+            anyhow::ensure!(options.store.is_none(), "a page that joined a node keeps no folder of its own");
+            anyhow::ensure!(options.node.is_some(), "a page that joined a node sends its writes to its node: it needs one");
+        }
         crate::node::claim_page()?;
         #[cfg(target_arch = "wasm32")]
         if let Some(live) = &options.memory {
             crate::store::read_resident_with(live.clone()); // (the core's watch reads the page's memory as this page's program does)
         }
         let watch = options.memory.as_ref().zip(crate::oom::line_on(options.line)).map(|(live, line)| Watch { live: live.clone(), line });
-        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![] })
+        Ok(Page { holds_claim: true, member: Default::default(), store: options.store.clone(), line: options.line, node: options.node.clone(), watch, unread: vec![], joined: options.joined.clone() })
     }
 
     /// `claim`, with the member opened now (`open_now`), so an open's error is this call's. A folder kept by 0.35/0.36 in
@@ -349,11 +398,21 @@ impl Page {
     }
 
     /// The page's member on the core's lake, opened if it isn't yet (`node::open_page`, with the store and the line the page
-    /// was claimed with). A closed page has none, and its requests are refused. An open that fails is tried again by the next
-    /// request, as the cell keeps no error.
+    /// was claimed with; a joined page's follows its node's lake, `node::open_joined`). A closed page has none, and its requests
+    /// are refused. An open that fails is tried again by the next request, as the cell keeps no error.
     async fn member(&self) -> anyhow::Result<&crate::node::Paged> {
         anyhow::ensure!(self.holds_claim, "this page is closed");
-        self.member.get_or_try_init(|| crate::node::open_page(self.store.clone(), self.line)).await
+        self.member
+            .get_or_try_init(|| async {
+                match &self.joined {
+                    Some(j) => {
+                        let auth = format!("Bearer {}", j.session);
+                        crate::node::open_joined(j.node(), &auth, Arc::new(crate::joined::Joined::new(j.node(), &auth)), self.line).await
+                    }
+                    None => crate::node::open_page(self.store.clone(), self.line).await,
+                }
+            })
+            .await
     }
 
     /// `open_lake`, refused by name: this build has no core's lake (build `web/` with `--features lake`).
@@ -394,6 +453,10 @@ impl Page {
             answer.status = 404;
             return answer;
         }
+        // (a joined page whose sign-in ended no longer follows its node's lake: its answers would be the lake's, and stale)
+        if self.joined.is_some() && self.member.get().is_some_and(crate::node::Paged::ended) {
+            return failed(crate::codes::coded("28000", "this page's sign-in at its node ended: join again"));
+        }
         if let Err(e) = self.member().await {
             return failed(e);
         }
@@ -432,16 +495,21 @@ impl Page {
 
     /// The node's part of a plain-SQL statement (`part_of`), decided in the request's session (`statement::scoped`): its `$name`s
     /// bind, and its temporary tables are the lake's. The words the lake runs as its own (a transaction's, a setting's, a variable's)
-    /// name no table, so they are the lake's before any name is read.
+    /// name no table, so they are the lake's before any name is read. A joined page's statements are all routed (`joined_part`).
     async fn node_part(&self, sql: &str, headers: &[(String, String)], format: Option<&str>) -> anyhow::Result<Option<Part>> {
         let Some(paged) = self.member.get() else { return Ok(None) };
-        if crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some() {
+        let joined = self.joined.is_some();
+        if !joined && (crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some()) {
             return Ok(None);
         }
         let token = request_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer "));
         let session = crate::temp::of(&header_map(headers))?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
-        crate::statement::scoped(session, crate::auth::lent_vars(token), Box::pin(part_of(&paged.app.lake, sql, format_query))).await
+        let lent = crate::auth::lent_vars(token);
+        match joined {
+            true => crate::statement::scoped(session, lent, Box::pin(joined_part(&paged.app.lake, sql, format_query))).await,
+            false => crate::statement::scoped(session, lent, Box::pin(part_of(&paged.app.lake, sql, format_query))).await,
+        }
     }
 
     /// The node's part, answered (`node_part`): a query goes to the node with the rows of the page's tables it names, and a fill
@@ -452,8 +520,14 @@ impl Page {
         let session = session_headers(headers);
         match part {
             Part::Query { sent, names, format } => {
+                // (a joined page's write is in its lake before its answer: `seen_node_commit`)
+                let wrote = self.joined.is_some() && (crate::statement::is_write(&sent) || crate::seq::calls(&sent));
                 let asked = self.lake_request(&sent, &names, &format, &session).await?;
-                self.ask(asked).await
+                let answered = self.ask(asked).await?;
+                if let (true, Some(paged)) = (wrote, self.member.get()) {
+                    seen_node_commit(&paged.app.lake).await;
+                }
+                Ok(answered)
             }
             Part::Fill { sent, names, write, format } => {
                 let asked = self.lake_request(&sent, &names, "format=arrow", &session).await?;
@@ -799,7 +873,14 @@ impl Page {
     async fn ask(&self, mut sent: Sent) -> anyhow::Result<Answer> {
         let Some(node) = &self.node else { return Err(crate::codes::coded("08001", "the page has no node to ask")) };
         sent.room = self.watch.as_ref().map(Watch::room);
-        node(sent).await.map_err(|words| crate::codes::coded("08001", format!("the page's node didn't answer: {words}")))
+        let answered = node(sent).await.map_err(|words| crate::codes::coded("08001", format!("the page's node didn't answer: {words}")))?;
+        // (a node that refuses a joined page's sign-in ends it: the page's requests are refused 28000 from here, `request`)
+        if self.joined.is_some() && matches!(answered.status, 401 | 403) {
+            if let Some(paged) = self.member.get() {
+                paged.set_ended();
+            }
+        }
+        Ok(answered)
     }
 
 }
@@ -907,6 +988,65 @@ async fn part_of(lake: &crate::store::Lake, sql: &str, format_query: String) -> 
             Ok(Some(Part::Query { sent: bound, names, format: format_query }))
         }
     }
+}
+
+/// The node's part of a statement a joined page runs (`node_part`, in the request's session), each statement as the node runs it.
+/// A transaction is refused by name: the page holds none of the node's. A setting or a variable is the lake's, and so is a
+/// statement that is the session's own (its temporary tables, views and secrets). An `EXECUTE` runs its prepared text with the
+/// arguments bound, as the lake binds them (`settings::statement`, which for an EXECUTE only reads the text and runs nothing), and
+/// is routed by that text. A write goes whole to the node, with no page tables: a statement that calls `nextval` is one too, since a
+/// page can't reach the leader that numbers it. Any other statement is `part_of`'s, so a name the page lacks (an attached lake's
+/// table, which it never reads) goes to the node.
+async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String) -> anyhow::Result<Option<Part>> {
+    if let Some(word) = crate::text::control(sql) {
+        return Err(crate::codes::coded("0A000", format!("{word}: {JOINED_TRANSACTION}")));
+    }
+    let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default();
+    let text = if crate::settings::is(sql) {
+        if !(word.eq_ignore_ascii_case("EXECUTE") || word.eq_ignore_ascii_case("EXEC")) {
+            return Ok(None); // (a setting, a PREPARE or a DEALLOCATE: the lake's)
+        }
+        match crate::settings::statement(lake, sql).await? {
+            crate::settings::Done::Run(run) => run,
+            crate::settings::Done::Said(_) => return Ok(None),
+        }
+    } else if crate::vars::change(sql).is_some() {
+        return Ok(None); // (a variable's: the lake's)
+    } else {
+        sql.to_string()
+    };
+    let bound = crate::vars::bound(&text)?.into_owned();
+    let expanded = crate::routines::expand(lake, &bound).await?;
+    if let Some(stmt) = crate::write::parse(&expanded) {
+        if crate::temp::own(&stmt) {
+            return Ok(None); // (the session's own: its temporary tables, views and secrets are the page's)
+        }
+    }
+    if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
+        return Ok(Some(Part::Query { sent: bound, names: BTreeSet::new(), format: format_query }));
+    }
+    part_of(lake, &text, format_query).await
+}
+
+/// Waits until the page's lake holds the node's commit, once a joined page's write has answered (`node_answer`): its `c` is at
+/// least the node's, 5 s at most, as `write::seen_here` waits for a follower. A failure to read the node's commit number is said,
+/// and the node's answer stands.
+async fn seen_node_commit(lake: &crate::store::Lake) {
+    let upto = match node_commit(lake).await {
+        Ok(upto) => upto,
+        Err(e) => return eprintln!("the node's commit number didn't read, so the page may not hold the write yet: {e:#}"),
+    };
+    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
+    while !matches!(lake.cat.get::<u64>("c").await, Ok(Some(c)) if c >= upto) && datafusion::common::instant::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The node's commit number, as the node's own view holds it (`from_view`: a read of the node, current once it has answered the
+/// write). 0 when it holds none.
+async fn node_commit(lake: &crate::store::Lake) -> anyhow::Result<u64> {
+    let raw = lake.cat.from_view("c").await?;
+    Ok(raw.map(|v| serde_json::from_slice::<u64>(&v)).transpose()?.unwrap_or(0))
 }
 
 /// Whether the lake answers `name` in the session it is asked in: a table or a materialized view of the lake (`table_meta_if`), a
@@ -1094,5 +1234,76 @@ mod tests {
         let over = within(3 * 1024 * 1024, 1).unwrap_err();
         assert_eq!(crate::codes::of(&over), "54000");
         assert!(crate::codes::words(&over).contains("web_send_mb"), "{over:#}");
+    }
+
+    #[test]
+    fn a_join_is_a_node_origin_with_an_admin_session_over_https_or_loopback() {
+        let node = |url: &str| Join::new(url, "ps_test").map(|j| j.node().to_string());
+        assert!(Join::new("https://n:7000", "pk_x").is_err(), "a token is no join's session");
+        assert!(node("http://example.com").is_err(), "http to a node off this machine would send the session in clear");
+        assert!(node("https://u:p@n").is_err(), "userinfo is refused");
+        assert!(node("https://n/x").is_err(), "a path past the origin is refused");
+        assert!(node("https://n/?q=1").is_err(), "a query is refused");
+        assert!(node("ftp://n").is_err(), "only http and https");
+        assert_eq!(node("http://localhost:7000/").unwrap(), "http://localhost:7000");
+        assert_eq!(node("http://127.0.0.1:7000").unwrap(), "http://127.0.0.1:7000");
+        assert_eq!(node("https://n:7000").unwrap(), "https://n:7000");
+        assert_eq!(node("https://N:443/").unwrap(), "https://n", "the origin, as the URL gives it");
+    }
+
+    /// A joined page's refusals and its routing. No page is claimed or opened: the module's page is one static
+    /// (`node::claim_page`), and a page that opened its member resets every node's statics when it closes (`node::end_page`),
+    /// which would break a test beside this one. So the routing runs over a lake of the test's own, as `rules::create`'s does.
+    #[test]
+    fn a_joined_page_is_refused_without_its_node_and_routes_each_statement() {
+        // (planning needs more than a test thread's stack, as `tests/page_lake.rs`'s does)
+        std::thread::Builder::new()
+            .stack_size(32 << 20)
+            .spawn(|| tokio::runtime::Builder::new_multi_thread().thread_stack_size(32 << 20).enable_all().build().unwrap().block_on(joined_steps()).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn joined_steps() -> anyhow::Result<()> {
+        const SESSION: &str = "joined-test-session";
+        let node: Node = Arc::new(|_: Sent| -> Asked { Box::pin(async { Err("no node in this test".to_string()) }) });
+        let join = Join::new("https://n:7000", "ps_test").expect("a join of a node's origin");
+        let store: crate::store::Store = Arc::new(object_store::memory::InMemory::new());
+        let e = Page::claim(&Options { joined: Some(join.clone()), store: Some(store), node: Some(node.clone()), ..Default::default() }).err().expect("a joined page keeps no folder");
+        assert!(format!("{e:#}").contains("keeps no folder of its own"), "{e:#}");
+        let e = Page::claim(&Options { joined: Some(join.clone()), ..Default::default() }).err().expect("a joined page needs its node");
+        assert!(format!("{e:#}").contains("sends its writes to its node"), "{e:#}");
+        // (both are refused before the module's page is claimed, so this test never takes it: `node.rs`'s claim test does)
+        let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
+        let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let _sequencer = crate::log::Sequencer::start(made.clone(), None).await?;
+        let lake = &made;
+        let Some(crate::write::Stmt::Create(c)) = crate::write::parse("CREATE TABLE t (a INT)") else { anyhow::bail!("not a CREATE TABLE") };
+        crate::write::create_table(lake, "t", &crate::write::create_spec(&c, lake, false).await?).await?;
+        let routed = |sql: &'static str| async move {
+            crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, sql, String::new()))).await.expect(sql)
+        };
+        // the page keeps what it reads from its own lake and its session, and the node has the writes
+        for (sql, node_has) in [("SELECT 1", false), ("FROM t", false), ("INSERT INTO t VALUES (1)", true), ("CREATE TABLE u (a INT)", true), ("SET x = 1", false), ("CREATE TEMP TABLE w (a INT)", false), ("SELECT nextval('s')", true)] {
+            assert_eq!(routed(sql).await.is_some(), node_has, "{sql}");
+        }
+        let refused = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "BEGIN", String::new()))).await.err().expect("a transaction is refused");
+        assert_eq!(crate::codes::of(&refused), "0A000");
+        // a prepared statement runs as its text, with its arguments bound: a write goes to the node, a read of the lake stays
+        crate::statement::scoped(Some(SESSION.to_string()), None, async {
+            crate::settings::statement(lake, "PREPARE p AS INSERT INTO t VALUES ($1)").await.expect("the statement is prepared");
+            crate::settings::statement(lake, "PREPARE q AS SELECT a FROM t").await.expect("the read is prepared");
+        })
+        .await;
+        let got = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "EXECUTE p(5)", String::new()))).await.expect("EXECUTE p");
+        let shown = match &got {
+            Some(Part::Query { sent, .. }) => sent.clone(),
+            Some(Part::Fill { .. }) => "a fill".to_string(),
+            None => "none (the lake's)".to_string(),
+        };
+        assert!(shown.contains("(5)") && !shown.contains('$'), "EXECUTE p is the node's write, bound: it routed {shown}");
+        assert!(routed("EXECUTE q").await.is_none(), "EXECUTE q reads the lake's own table");
+        Ok(())
     }
 }
