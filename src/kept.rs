@@ -1,9 +1,9 @@
 //! The statements 1.1 brings, refused by name in 1.0 at every door and form (ADR-072): pipelines, dashboards, the grants on
-//! them, and `GRANT EXECUTE`; and connections, which Pondra has none of (another database is attached), shown the `ATTACH`. One list, read at the front (`front::expand`, which every node door and the
+//! them, and `GRANT EXECUTE`; and connections (1.1, one object for every outside place), shown the `ATTACH` and the secret 1.0 writes. One list, read at the front (`front::expand`, which every node door and the
 //! page pass through), so a word added here is refused at every door in the same words. A pipeline's STEP, PARALLEL and
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
-//! The names kept free for later (`CREATE TABLE … USING x`, `VECTOR(n)`) are refused here too, by name, and only a
+//! The names kept free for later (`CREATE TABLE … USING x`, `VECTOR(n)` and the other AI types) are refused here too, by name, and only a
 //! statement that spells one of them is tokenised.
 
 use crate::text::contains_ci;
@@ -11,8 +11,14 @@ use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tok
 
 /// What a table's `USING x` says, where a table is made; `{}` is the format named.
 const USING: &str = "CREATE TABLE … USING {}: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)";
-/// What a `VECTOR(n)` type says: a vector is FLOAT[] until vector indexes come.
-const VECTOR: &str = "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then";
+/// The types kept free for after 1.0 (ADR-051), each a word written before `(`, and what it says: a vector or a tensor is
+/// FLOAT[] until then. 1.1 gives them their meaning without changing what anything meant (designs/ai-data-plan.md).
+const TYPES: &[(&str, &str)] = &[
+    ("vector", "VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
+    ("halfvec", "HALFVEC(n): half-precision vectors come with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
+    ("sparsevec", "SPARSEVEC(n): sparse vectors come with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"),
+    ("tensor", "TENSOR(…): tensors come after 1.0 (ADR-051); a tensor is a FLOAT[] list until then"),
+];
 
 /// What a pipeline's statements say; `{}` is the statement's words.
 const PIPELINE: &str = "{}: pipelines come in 1.1; until then, tasks that follow others run statements in order (CREATE TASK … AFTER …)";
@@ -25,11 +31,12 @@ const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1
 /// A pipeline's WAIT FOR, where a script's statement starts.
 const WAIT_FOR: &str = "WAIT FOR is a pipeline's, coming in 1.1";
 const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
-/// What a connection's statements say; `{}` is the statement's words. There is no connection object: what `ATTACH` makes is a
-/// database (`designs/etl-and-bi-tools.md` §3.7), so the words show the `ATTACH` to write.
-const CONNECTION: &str = "{}: Pondra has no connections; another database is attached: ATTACH 'postgres://…' AS name (TYPE postgres, SECRET s), which comes in 1.1 with mysql and sqlserver";
+/// What a connection's statements say; `{}` is the statement's words. A connection, one object for every outside place (a
+/// database, a bucket, SFTP, HTTP), comes in 1.1 with `ATTACH` as its one-line form for tables (Alimardon, 10-31 15:28;
+/// `designs/etl-and-bi-tools.md` §3.7), so the words show what 1.0 writes instead.
+const CONNECTION: &str = "{} comes in 1.1. Today a lake or catalog is attached: ATTACH 'url' AS name (TYPE delta, iceberg, kafka or share; a Pondra lake takes none); a bucket's or an API's credentials are a SECRET with a SCOPE: CREATE SECRET … SCOPE 's3://bucket'";
 /// `SHOW CONNECTIONS`: what `ATTACH` makes is listed as a database.
-const SHOW_CONNECTIONS: &str = "SHOW CONNECTIONS: what ATTACH makes is a database, and SHOW DATABASES lists them";
+const SHOW_CONNECTIONS: &str = "SHOW CONNECTIONS: connections come in 1.1; SHOW DATABASES lists what ATTACH makes";
 
 /// A step's `ON FAILURE [OF step]` or `ALWAYS` in a task's head (`runs::task`), or the older `AFTER … FAILED`: a pipeline
 /// step's, not a task's.
@@ -92,21 +99,20 @@ pub fn refusal(sql: &str) -> Option<String> {
     }
 }
 
-/// The names kept free for later, refused where a statement spells one: `VECTOR(n)` anywhere (a column's or a cast's type),
+/// The names kept free for later, refused where a statement spells one: a type of `TYPES` anywhere (a column's or a cast's),
 /// and `CREATE TABLE … USING x` (`head` is the statement's first word). Read from the tokens, so a string or a join's
-/// `USING (id)` is not one. A statement that spells neither, the common case, is not tokenised.
+/// `USING (id)` is not one. A statement that spells none, the common case, is not tokenised.
 fn type_kept(sql: &str, head: &str) -> Option<String> {
-    let vector = contains_ci(sql, "vector");
+    let typed = contains_ci(sql, "vec") || contains_ci(sql, "tensor"); // (vector, halfvec, sparsevec, tensor)
     let using = head == "create" && contains_ci(sql, "using");
-    if !vector && !using {
+    if !typed && !using {
         return None;
     }
     let tokens: Vec<Token> = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
     if let Some(format) = table_using(&tokens) {
         return Some(USING.replace("{}", &format));
     }
-    let vector_type = tokens.windows(2).any(|w| is_word(&w[0], "vector") && matches!(w[1], Token::LParen));
-    vector_type.then(|| VECTOR.to_string())
+    tokens.windows(2).filter(|w| matches!(w[1], Token::LParen)).find_map(|w| TYPES.iter().find(|(name, _)| is_word(&w[0], name))).map(|(_, says)| says.to_string())
 }
 
 /// The format a `CREATE TABLE … USING x` names (`x`): a USING in the table's header, which ends at an AS, a SELECT or a VALUES
@@ -201,9 +207,10 @@ mod tests {
         assert!(refusal("REVOKE EXECUTE ON FUNCTION f FROM r").unwrap().starts_with("GRANT EXECUTE comes in 1.1"));
         assert!(refusal("EXECUTE PIPELINE sales.orders (day => 1)").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
         assert!(refusal("EXECUTE PIPELINE nightly").unwrap().starts_with("EXECUTE PIPELINE: pipelines come in 1.1"));
-        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION: Pondra has no connections; another database is attached: ATTACH"));
+        assert!(refusal("CREATE CONNECTION crm (TYPE postgres, HOST $host)").unwrap().starts_with("CREATE CONNECTION comes in 1.1. Today a lake or catalog is attached: ATTACH"));
+        assert!(refusal("ALTER CONNECTION crm SET (db => 'eu')").unwrap().contains("CREATE SECRET … SCOPE 's3://bucket'"));
         assert_eq!(refusal("show connections").as_deref(), Some(SHOW_CONNECTIONS));
-        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION: Pondra has no connections"));
+        assert!(refusal("GRANT USAGE ON CONNECTION crm TO r").unwrap().starts_with("GRANT ON CONNECTION comes in 1.1"));
         assert_eq!(refusal("GRANT SELECT ON connection TO r"), None); // (a table called connection)
         assert_eq!(refusal("STEP a AS SELECT 1").as_deref(), Some(STEP));
         assert_eq!(refusal("parallel SELECT 1").as_deref(), Some(PARALLEL));
@@ -256,12 +263,18 @@ mod tests {
         assert_eq!(refusal("CREATE TABLE t (id INT, v VECTOR(3))").as_deref(), Some(vector));
         assert_eq!(refusal("ALTER TABLE t ADD COLUMN v VECTOR(3)").as_deref(), Some(vector));
         assert_eq!(refusal("SELECT CAST(x AS VECTOR(FLOAT, 3)) FROM t").as_deref(), Some(vector));
+        // (the AI types kept free too, designs/ai-data-plan.md)
+        assert!(refusal("CREATE TABLE t (v HALFVEC(768))").unwrap().starts_with("HALFVEC(n): half-precision vectors come with vector indexes"));
+        assert!(refusal("ALTER TABLE t ADD COLUMN v sparsevec(30000)").unwrap().starts_with("SPARSEVEC(n): sparse vectors"));
+        assert!(refusal("CREATE TABLE t (x TENSOR(FLOAT, 3, 224, 224))").unwrap().starts_with("TENSOR(…): tensors come after 1.0"));
         for sql in [
             "CREATE TABLE t AS SELECT * FROM a JOIN b USING (id)",
             "CREATE TABLE t (a INT) WITH (publish = 'delta')",
             "SELECT * FROM a JOIN b USING (id)",
             "SELECT 'VECTOR(3)' AS s",
             "SELECT vector FROM t",
+            "SELECT tensor, halfvec FROM t",
+            "SELECT * FROM vectors(3)",
             "CREATE INDEX i ON t USING hnsw (v)",
         ] {
             let refused = refusal(sql);

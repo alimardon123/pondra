@@ -110,9 +110,11 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   snappy at any scale. **J4:** database attaches (`designs/etl-and-bi-tools.md` §3.7): `ATTACH 'url' AS name (TYPE postgres,
   mysql or sqlserver, SECRET s, MAX_PARALLEL n)` makes a database read and written as ours are; a secret, if
   any, says who reaches it (one with `PROVIDER credential_chain` is the machine's own identity, chosen and
-  granted, never a fallback). Pondra has no connection object: `CREATE CONNECTION` is refused showing the
-  `ATTACH` to write. Row filters and column masks come before the dashboards (J6), whose tiles run as their
-  viewer (§4.9). **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
+  granted, never a fallback). Connections (the owner, 10-31): one `CONNECTION` kind for every outside place,
+  `postgres`, `mysql`, `sqlserver`, `s3`, `gcs`, `azure`, `sftp`, `http`, its secret by name and its paths
+  `'@name/path'`; `ATTACH` is its one-line form for tables, over the same records 1.0's attaches keep. 1.0
+  refuses `CREATE CONNECTION` showing the `ATTACH` and the `CREATE SECRET … SCOPE` to write. Row filters
+  and column masks come before the dashboards (J6), whose tiles run as their viewer (§4.9). **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
   over one definition, as plugins.
 - **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
 - **Governance** (the owner, 2026-10-13, after single sign-on by the freeze; `reviews/platform-comparison.md`'s
