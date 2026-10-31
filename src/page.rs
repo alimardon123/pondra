@@ -683,8 +683,8 @@ impl Page {
 
     /// A kept table once made gets its rows, then its counters and defaults: its rows go in by an INSERT when `insert` (a CREATE made
     /// the table with none), `restored` sets the rest, and the file goes. A table made as a `CREATE TABLE … AS` has its rows in already.
-    /// An INSERT a constraint refuses is `imported_without_rules`'s; any other failure drops the table, kept to be undropped as a drop
-    /// keeps it, and the file stays for the next open.
+    /// An INSERT a constraint refuses is `imported_without_rules`'s; any other failure drops the table for good (PURGE: the file is
+    /// still the table, so nothing is kept to UNDROP), and the file stays for the next open.
     async fn filled(&mut self, store: &crate::store::Store, at: &object_store::path::Path, name: &str, kept: &Schema, rows: &[u8], insert: bool) -> anyhow::Result<()> {
         let table = crate::ext_names::quoted(name);
         if insert {
@@ -692,13 +692,13 @@ impl Page {
                 Ok(()) => {}
                 Err(refusal) if refused_by_constraint(&refusal) => return self.imported_without_rules(store, at, name, kept, rows, &refusal).await,
                 Err(answer) => {
-                    let _ = self.imported_said(&format!("DROP TABLE {table}"), None).await;
+                    let _ = self.imported_said(&format!("DROP TABLE {table} PURGE"), None).await;
                     return Err(answered_words(&answer));
                 }
             }
         }
         if let Err(e) = self.restored(at, name, kept, kept.metadata().get(CREATE_KEY).is_none()).await {
-            let _ = self.imported_said(&format!("DROP TABLE {table}"), None).await;
+            let _ = self.imported_said(&format!("DROP TABLE {table} PURGE"), None).await;
             return Err(e);
         }
         forgotten(store, at).await
