@@ -372,7 +372,8 @@ function objectsProblems(j, names, rows = {}) {
   if (JSON.stringify(listed) !== JSON.stringify(names)) problems.push(`objects ${JSON.stringify(listed)}`);
   for (const [name, count] of Object.entries(rows)) {
     const object = found.find((o) => o.name === name);
-    if (object?.rows !== count) problems.push(`${name} rows ${object?.rows}`);
+    const allowed = Array.isArray(count) ? count : [count]; // (a list: any of them)
+    if (!allowed.includes(object?.rows)) problems.push(`${name} rows ${object?.rows}`);
   }
   return problems;
 }
@@ -646,11 +647,12 @@ async function keptChecks(page, lake) {
   const letters = await ask('kept after reload: FROM "a-b"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a-b"', 'kept');
   if (letters) judge('kept after reload: FROM "a-b"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
   const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
-  // k's rows are the node's number for this sequence (a CREATE of 3 rows, then an INSERT of 1): /objects counts the rows
-  // of the lake's files, not the log, so it says 3 where count(*) says 4, on a node as on this page.
+  // k's rows (a CREATE of 3 rows, then an INSERT of 1): /objects counts the rows of the lake's files, not the log, so it
+  // says 3 while the INSERT's row is in the log, as on a node, and 4 once the reopened page's first tier round (at once on
+  // open) has put it in a file. Which one this request sees is a race, so either is right.
   if (listed) {
     judge('kept after reload: GET /objects', listed, {
-      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 3 }),
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: [3, 4] }),
     });
   }
   if (expected) {
