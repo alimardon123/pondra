@@ -1595,6 +1595,7 @@ impl Lake {
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
         crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
         crate::ext::register_secrets(&ctx, self.arc()); // secrets()
+        crate::extension::register(&ctx, self.arc()); // extensions() (SHOW EXTENSIONS)
         ctx
     }
 

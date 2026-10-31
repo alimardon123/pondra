@@ -834,6 +834,8 @@ SELECT taxed(100) AS t;
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
+| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly file, kept in the lake by its SHA-256 |
+| List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
 covers it (a user's query, one it has `USAGE` on), and only an admin may write files. A path on a
@@ -841,6 +843,12 @@ machine is written only by the program that started the node: the shell, a lake 
 Each secret is sealed with a key of its own, which the master key (`PONDRA_SECRET_KEY`, or a key
 service: `PONDRA_KMS_COMMAND`) wraps; `SELECT * FROM secrets()` lists their names and scopes, never
 their values.
+
+Only an admin installs an extension, and a node takes one only when it runs with
+`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
+the node that got the statement (a path on its machine from the program that started it, or a URL a
+secret covers), and every node sees the record; a branch and a backup carry the file with it. This
+release keeps the file and runs none of its functions yet.
 
 ## Users and grants
 
@@ -1129,7 +1137,7 @@ text is the node's own, it is shown in code:
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` while a row has NULL in `c` | refused, naming the rows: `column "c" of relation "t" contains null values (1 rows): UPDATE t SET c = … WHERE c IS NULL first` |
 | `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
-| `PRAGMA`, `INSTALL`, `LOAD`, `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
+| `PRAGMA`, `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |

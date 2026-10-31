@@ -277,6 +277,9 @@ pub enum Ddl {
     CreateSecret { name: String, params: std::collections::BTreeMap<String, String>, replace: bool, if_not_exists: bool }, // (ADR-026: `ext.rs`)
     AttachOutside { name: String, url: String, kind: String, options: std::collections::BTreeMap<String, String> }, // another engine's tables (`ext.rs`)
     DropSecret { name: String, if_exists: bool },
+    FetchExtension { name: String, from: String, version: Option<String> }, // INSTALL name FROM 'file or URL': the node that got it reads the file, then sends the record (`extension.rs`)
+    InstallExtension { name: String, record: crate::extension::Installed }, // the record of an extension, kept by the leader (ADR-075 §6: `extension.rs`)
+    UninstallExtension { name: String, if_exists: bool }, // UNINSTALL name: the leader drops its record (`extension.rs`)
     CreateTask { name: String, task: crate::runs::Task, replace: bool }, // CREATE TASK … SCHEDULE … AS … (ADR-027: `runs.rs`)
     DropTask { name: String, if_exists: bool },
     ExecuteTask { name: String, params: std::collections::HashMap<String, Value> }, // EXECUTE TASK name (…): a tick claimed now (ADR-045)
@@ -552,6 +555,9 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropRoutine { name, if_exists } => crate::routines::drop(lake, &name, if_exists).await,
         Ddl::CreateSecret { name, params, replace, if_not_exists } => crate::ext::create(lake, &name, params, replace, if_not_exists).await,
         Ddl::DropSecret { name, if_exists } => crate::ext::drop(lake, &name, if_exists).await,
+        Ddl::InstallExtension { name, record } => crate::extension::install(lake, &name, record).await,
+        Ddl::UninstallExtension { name, if_exists } => crate::extension::uninstall(lake, &name, if_exists).await,
+        Ddl::FetchExtension { name, .. } => anyhow::bail!("INSTALL {name} FROM is read by the node the statement reached, not the leader"),
         Ddl::CreateTask { name, task, replace } => crate::runs::create_task(lake, &name, task, replace).await,
         Ddl::DropTask { name, if_exists } => crate::runs::drop_task(lake, &name, if_exists).await,
         Ddl::ExecuteTask { name, params } => crate::runs::execute_task(lake, &name, params).await,

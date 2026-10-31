@@ -19467,7 +19467,8 @@ def bi():
 # The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
 # section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
 ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
-             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso"}
+             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso",
+             "extension": "tests/forms/extensions.slt, extension.rs's tests (an installed one runs from E2b's harness.py extensions)"}
 
 
 def registry():
@@ -23557,8 +23558,8 @@ def friendly():
     checks["FORCE INSTALL json alone over HTTP: the command tag, and its notice in the header"] = \
         st == 200 and json.loads(body) == {"command": "INSTALL"} and json.loads(hd.get("x-pondra-notices", "[]")) == [said("json", "install")]
     st, hd, body = raw("INSTALL spatial")
-    checks["INSTALL spatial over HTTP: refused by name, naming it and the 1.1 that brings Pondra's own, SQLSTATE 0A000"] = \
-        st != 200 and hd.get("x-pondra-sqlstate") == "0A000" and "spatial" in body and "1.1" in body
+    checks["INSTALL spatial over HTTP: refused by name, naming it and how a Pondra extension is installed (from its file), SQLSTATE 0A000"] = \
+        st != 200 and hd.get("x-pondra-sqlstate") == "0A000" and "spatial isn't built into Pondra" in body and "INSTALL spatial FROM 'path or URL'" in body
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
         told = []
         pg.add_notice_handler(lambda n: told.append(n.message_primary))
