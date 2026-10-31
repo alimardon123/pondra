@@ -1,6 +1,6 @@
-//! What an ALTER TABLE asks of a table's columns, and the words its refusals say, in every form: a node changes its
-//! catalog entry (`ddl::alter_column`, `write::alter_spec`) and a page its table (`page::alter`), each reading the
-//! statement and naming its faults here, so the two forms say the same thing.
+//! What an ALTER TABLE asks of a table's columns, and the words its refusals say: a node changes its catalog entry
+//! (`ddl::alter_column`, `write::alter_spec`), reading the statement and naming its faults here. Every form is a node's
+//! member (a page too, ADR-072), so every form says the same thing.
 use crate::text::ident;
 use datafusion::sql::sqlparser::ast;
 use std::ops::ControlFlow;

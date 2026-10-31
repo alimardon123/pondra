@@ -3,23 +3,24 @@ name = "pondra-web"
 version = "0.34.0"
 edition = "2021"
 publish = false
-description = "Pondra in a page: the core's lake-less engine for a browser or Node, through wasm-bindgen (designs/l2-b4-web.md)"
+description = "Pondra in a page: the core's lake in a browser or Node, through wasm-bindgen (designs/l2-b4-web.md)"
 license = "MIT OR Apache-2.0"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-pondra = { path = "..", default-features = false }
+# The core's lake is the page: every page is a member on it (`Page::claim`, `Page::open_lake`), so the core's lake-less engine is not built here.
+pondra = { path = "..", default-features = false, features = ["lake"] }
 wasm-bindgen = "=0.2.128" # (the same version as the wasm-bindgen command line that binds it: tools/web_build.sh checks)
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-# A web origin's store (fetch.rs): object_store at DataFusion's version, so the core takes this crate's stores (`cargo tree -i object_store` shows one 0.13).
-object_store = { version = "0.13", default-features = false }
+# The page's store (opfs.rs): object_store at the core's version, so the core takes this crate's store (`cargo tree -i object_store` shows one 0.14).
+object_store = { version = "0.14", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
-url = "2"
 bytes = "1"
+url = "2" # (the web store's origin: fetch.rs)
 # What the core's dependencies need in a page: the clock from JavaScript's Date (std's panics on wasm32-unknown-unknown),
 # random numbers from the browser's crypto.
 chrono = { version = "0.4", default-features = false, features = ["wasmbind", "clock"] }
@@ -28,11 +29,6 @@ getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # The page's heap: std's allocator, over a memory grown in steps (src/heap.rs).
 dlmalloc = "0.2"
-
-[features]
-# The core's lake under the page (designs/page-lake-p2.md): `lake()` opens a page whose member is a node's lake in its memory.
-# Off by default: a build without it refuses `lake()` by name.
-lake = ["pondra/lake"]
 
 [profile.release]
 opt-level = "s" # (TPC-H SF1 in Node 5.2–5.4 s against "z"'s 7.7–8.0, for 5.75 MB brotli against 4.90; 3 is no faster and 2.2× the size)

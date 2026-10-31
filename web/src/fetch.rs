@@ -1,6 +1,7 @@
 //! A web origin's objects, read with `fetch` (the page's store for one origin, designs/l2-b4-web.md section 4i): a `GET`
-//! with a `Range`, and a `HEAD`. A web server lists and writes nothing, so those are refused by name. Options other than
-//! `head` and `range` (`if_match`, `version`, …) are not sent: DataFusion asks for none of them.
+//! with a `Range`, and a `HEAD`. A web server writes nothing, so a write is refused by name. Options other than `head` and
+//! `range` (`if_match`, `version`, …) are not sent: DataFusion asks for none of them. A web server lists nothing, so a
+//! listing is refused by name, except the listing of an object this store found missing, which is empty (`missing`).
 //!
 //! A web server on another origin must allow the page's origin (CORS). A page sees only the response headers CORS lets
 //! it read, so the server exposes `Content-Range` only for a read from the end of an object (a suffix range); a part
@@ -27,11 +28,24 @@ use wasm_bindgen_futures::JsFuture;
 #[derive(Debug)]
 pub struct Fetch {
     origin: Result<Url, String>,
+    /// The objects a read found missing (a 404 or a 403). DataFusion reads a file it names by its path, and when that
+    /// path is no object it lists the path, as a folder: a web server lists nothing, so the listing of a missing object
+    /// is empty (what a store answers for a key it doesn't have), and a folder is still refused by name.
+    missing: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Fetch {
     pub fn new(origin: &str) -> Fetch {
-        Fetch { origin: Url::parse(origin).map_err(|e| format!("{origin} is not an origin: {e}")) }
+        Fetch {
+            origin: Url::parse(origin).map_err(|e| format!("{origin} is not an origin: {e}")),
+            missing: Default::default(),
+        }
+    }
+
+    /// Is `prefix` an object this store found missing (a read of it answered 404 or 403)?
+    fn is_missing(&self, prefix: Option<&Path>) -> bool {
+        let Some(prefix) = prefix else { return false };
+        self.missing.lock().map_or(false, |m| m.contains(prefix.as_ref()))
     }
 
     /// The object's URL: the origin, then the object's path segments (as object_store's own HTTP store makes it).
@@ -77,7 +91,13 @@ impl ObjectStore for Fetch {
             .await
             .map_err(|_| dropped(&url))?
             .map_err(|e| transport(&url, &e))?;
-        let mut object = object_from(location, &url, answer, read.range.as_ref(), !read.body)?;
+        let found = object_from(location, &url, answer, read.range.as_ref(), !read.body);
+        if let Err(Error::NotFound { .. }) = &found {
+            if let Ok(mut missing) = self.missing.lock() {
+                missing.insert(location.as_ref().to_string());
+            }
+        }
+        let mut object = found?;
         if let Some(start) = read.empty_at {
             object.range = start..start;
         }
@@ -87,6 +107,7 @@ impl ObjectStore for Fetch {
             meta,
             range,
             attributes: Attributes::default(),
+            extensions: Default::default(),
         })
     }
 
@@ -97,11 +118,17 @@ impl ObjectStore for Fetch {
         locations.map(|_| Err(writes())).boxed()
     }
 
-    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        if self.is_missing(prefix) {
+            return stream::empty().boxed();
+        }
         stream::once(async { Err(listing()) }).boxed()
     }
 
-    async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> StoreResult<ListResult> {
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> StoreResult<ListResult> {
+        if self.is_missing(prefix) {
+            return Ok(ListResult { common_prefixes: Vec::new(), objects: Vec::new(), extensions: Default::default() });
+        }
         Err(listing())
     }
 

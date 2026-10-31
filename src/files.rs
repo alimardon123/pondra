@@ -174,7 +174,8 @@ pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::B
             if let Err(e) = keep(lake, &path, &body).await {
                 eprintln!("{path}: saved, but not kept as a version: {e:#}");
             }
-            Ok(Filed::json(serde_json::json!({"path": path, "bytes": bytes, "version": version})))
+            let etag = Some(version.clone()); // (the version written, as GET's `etag`: the next save's `If-Match`)
+            Ok(Filed { etag, ..Filed::json(serde_json::json!({"path": path, "bytes": bytes, "version": version})) })
         }
         Err(e) if e.is::<Changed>() => Ok(Filed::text(412, lake_files::changed(&path))),
         Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") => Ok(Filed::text(409, lake_files::there_already(&path))),
