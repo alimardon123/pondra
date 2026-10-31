@@ -10649,6 +10649,12 @@ def guarded():
         return {(r["statement"], r["outcome"]) for r in got} if isinstance(got, list) else set()
     checks["rows through /append and /insert are in the audit log when writes are audited, and refused ones always"] = until(lambda: expect <= audited(), True, 15)
     info["audit"] = sorted(audited())
+    # A superuser's call the nodes' routes refused (above) is in the audit log, as every refusal at a door is
+    def cluster_refused():
+        got = ask(P, "SELECT statement FROM pondra.audit WHERE outcome = 'refused' AND statement LIKE '% /cluster/%'", auth=boss)
+        return {r["statement"] for r in got} if isinstance(got, list) else set()
+    checks["a superuser's call that the nodes' own routes refuse is in the audit log, as every refusal at a door is"] = \
+        until(lambda: {"GET /cluster/replica", "POST /cluster/commit"} <= cluster_refused(), True, 15)
     # Flight's DoPut and Kafka's produce ask the same check as /append, at their own doors (the user's grants
     # decide, not the node's); a hidden table's rows stream to a superuser only, through DoGet and /watch alike
     def put(table, auth, cols):
