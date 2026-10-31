@@ -420,9 +420,19 @@ fn idle_commit() -> anyhow::Error {
     crate::codes::coded("25P03", format!("the transaction was ended after {} s idle (PONDRA_TXN_IDLE_SECS) and rolled back: nothing was committed", idle_limit().as_secs()))
 }
 
+/// A transaction needs the lake's leader: its commit goes to it over HTTP, and the inbox of a guest whose leader doesn't answer
+/// from here carries one request at a time. Refused by name there (`begin`, and `alone` for a RETURNING's own transaction).
+fn leader_needed(app: &crate::app::App) -> Result<()> {
+    match app.members.by_inbox() {
+        true => Err(crate::codes::coded("0A000", "a transaction needs the lake's leader, which is alive but doesn't answer from here: send each statement by itself")),
+        false => Ok(()),
+    }
+}
+
 /// `BEGIN [modes]`: a transaction of this session, at the level and access mode its modes and the session's defaults
 /// give (ADR-067 §1).
 fn begin(app: &crate::app::App, s: &str, sql: &str) -> Result<(&'static str, Option<String>)> {
+    leader_needed(app)?;
     let (level, read_only) = plan(&begin_modes(sql)?)?;
     let level = level.map_or_else(default_level, Ok)?;
     let read_only = read_only.unwrap_or_else(default_read_only);
@@ -1564,6 +1574,7 @@ pub async fn committed(lake: &Lake, job: &str, table: &str) -> Result<bool> {
 /// has been answered yet (as Postgres works an UPDATE out again on the newest version of a row it waited for). A job names the
 /// transaction's commit, so its commit sent again is a duplicate.
 pub async fn alone(app: &crate::app::App, sql: &str, job: Option<String>, files: bool) -> Result<Value> {
+    leader_needed(app)?;
     let caller = crate::temp::SESSION.try_with(|s| s.clone()).ok().flatten();
     let s = caller.clone().unwrap_or_else(crate::temp::of_script);
     let job = job.map(|j| as_job(&j));

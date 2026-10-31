@@ -15,6 +15,9 @@ pub trait Members: Send + Sync + 'static {
     fn leader(&self) -> &Term;
     /// It never leads, runs tasks or takes writes.
     fn reader(&self) -> bool;
+    /// It writes through the lake's inbox: its leader is alive but doesn't answer from here (`Cluster::guest`), so a
+    /// statement's writes are sent to the leader through the bucket (`write::by_inbox`).
+    fn by_inbox(&self) -> bool { false }
     /// Live members, sorted, itself among them when it leads or is alone; none while a follower hasn't heard its leader.
     fn nodes(&self) -> Vec<String>;
     /// It leads its term.

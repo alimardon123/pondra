@@ -2073,13 +2073,31 @@ def serverless_guest(port):
     checks["d with a node leading, an INSERT goes to it, the node's /stats keep it alone, and one argument of two statements reads its own write"] = \
         rc4 == 0 and n4 == 5 and len(nodes) == 1 and rc5 == 0 and shown(out5, 6)
 
-    # e. With PONDRA_NO_DIRECT, an INSERT goes through the inbox, and two statements are refused by name
+    # e. With PONDRA_NO_DIRECT, a write goes through the inbox: an INSERT, a text of two INSERTs (each one lands), a CREATE TABLE
+    # with the INSERTs after it, and a CALL of a procedure that writes. A transaction, a RETURNING and a COPY INTO are refused by
+    # name, and write nothing
     no_direct = {"PONDRA_NO_DIRECT": "1"}
     rc6, _, err6 = run("INSERT INTO t VALUES (7, 'f')", no_direct)
     n6 = node_count(port)
     rc7, _, err7 = run("INSERT INTO t VALUES (8, 'g'); INSERT INTO t VALUES (9, 'h')", no_direct)
-    checks["e with PONDRA_NO_DIRECT, an INSERT lands through the inbox, and two statements are refused with the reason"] = \
-        rc6 == 0 and n6 == 7 and rc7 == 1 and "several statements" in err7 and "doesn't answer from here" in err7
+    n7 = node_count(port)
+    rc_u, _, err_u = run("CREATE TABLE u (a INT); INSERT INTO u VALUES (1); INSERT INTO u VALUES (2)", no_direct)
+    rc_us, out_us, _ = run("SELECT count(*) AS n FROM u")
+    ran("CREATE PROCEDURE ins_inbox() LANGUAGE sql AS $$ INSERT INTO t VALUES (13, 'x'); $$")
+    rc_c, _, err_c = run("CALL ins_inbox()", no_direct)
+    n_c = node_count(port)
+    rc_b, _, err_b = run("BEGIN; INSERT INTO t VALUES (14, 'y'); COMMIT", no_direct)
+    rc_r, _, err_r = run("INSERT INTO t VALUES (15, 'z') RETURNING a", no_direct)
+    rc_i, _, err_i = run(f"COPY INTO t FROM '{csv}' (FORMAT csv, HEADER)", no_direct)
+    n_refused = node_count(port)
+    checks["e with PONDRA_NO_DIRECT, an INSERT and a text of two INSERTs land through the inbox, each of them once"] = \
+        rc6 == 0 and n6 == 7 and rc7 == 0 and n7 == 9
+    checks["e with PONDRA_NO_DIRECT, a CREATE TABLE and the INSERTs after it in one text land, the table there for them"] = \
+        rc_u == 0 and rc_us == 0 and shown(out_us, 2)
+    checks["e with PONDRA_NO_DIRECT, a CALL of a procedure that writes lands through the inbox"] = rc_c == 0 and n_c == 10
+    checks["e with PONDRA_NO_DIRECT, a transaction, a RETURNING and a COPY INTO are refused by name, and write nothing"] = \
+        rc_b == 1 and "a transaction needs the lake's leader" in err_b and rc_r == 1 and "RETURNING needs the lake's leader" in err_r \
+        and rc_i == 1 and "COPY INTO needs the lake's leader" in err_i and n_refused == n_c
     node.kill()
 
     # f. On a lake nobody leads: a CALL of a procedure that writes, and two statements in one argument, both write and answer
@@ -2087,7 +2105,7 @@ def serverless_guest(port):
     rc8, _, err8 = run("CALL ins()")
     rc9, out9, err9 = run("INSERT INTO t VALUES (11, 'q'); SELECT count(*) AS n FROM t")
     checks["f on a lake nobody leads, a CALL that writes and two statements in one argument both write and answer"] = \
-        rc8 == 0 and rc9 == 0 and shown(out9, 9) and count() == 9
+        rc8 == 0 and rc9 == 0 and shown(out9, 12) and count() == 12
 
     # g. A bad statement prints Error: with the words a node's POST /sql gives it, and exits 1
     node = Node(lake, port).start()
