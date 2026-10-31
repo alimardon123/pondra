@@ -4,7 +4,9 @@
 //! WAIT FOR are refused where a statement starts: here, and in a script before any of it runs (`script.rs`, with its
 //! line). A statement that starts with none of the heads below is not read further, and a query pays nothing.
 //! The names kept free for later (`CREATE TABLE … USING x`, `VECTOR(n)` and the other AI types) are refused here too, by name, and only a
-//! statement that spells one of them is tokenised.
+//! statement that spells one of them is tokenised. The list also holds what Postgres has and Pondra doesn't yet: advisory
+//! locks, and LISTEN, UNLISTEN and NOTIFY. Migration tools send those first, so the answer says what to write instead. A
+//! function is looked for anywhere in a statement, but only one that spells `advisory` or `pg_notify` is tokenised.
 
 use crate::text::contains_ci;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
@@ -37,6 +39,12 @@ const GRANT_EXECUTE: &str = "GRANT EXECUTE comes in 1.1, with pipelines";
 const CONNECTION: &str = "{} comes in 1.1. Today a lake or catalog is attached: ATTACH 'url' AS name (TYPE delta, iceberg, kafka or share; a Pondra lake takes none); a bucket's or an API's credentials are a SECRET with a SCOPE: CREATE SECRET … SCOPE 's3://bucket'";
 /// `SHOW CONNECTIONS`: what `ATTACH` makes is listed as a database.
 const SHOW_CONNECTIONS: &str = "SHOW CONNECTIONS: connections come in 1.1; SHOW DATABASES lists what ATTACH makes";
+/// What a Postgres advisory-lock function says; `{}` is its name. Migration tools take one first (Rails, Prisma Migrate,
+/// Flyway, golang-migrate), so the answer says what locks a row instead.
+const ADVISORY: &str = "{}: advisory locks aren't built yet (planned for 1.1); until then, a transaction locks a row: SELECT … FROM a lock table WHERE … FOR UPDATE, held until its COMMIT";
+/// What LISTEN, UNLISTEN, NOTIFY and `pg_notify` say; `{}` is the statement's words or the function's name. Migration tools
+/// send these first, so the answer says what streams rows instead.
+const LISTEN: &str = "{}: LISTEN and NOTIFY aren't built yet (planned for 1.1); until then, GET /watch/{table} streams a table's rows as they commit";
 
 /// A step's `ON FAILURE [OF step]` or `ALWAYS` in a task's head (`runs::task`), or the older `AFTER … FAILED`: a pipeline
 /// step's, not a task's.
@@ -72,10 +80,13 @@ const REFUSED: &[(&[&str], &str)] = &[
     (&["COMMENT", "ON", "CONNECTION"], CONNECTION),
     (&["GRANT", "EXECUTE", "ON"], GRANT_EXECUTE), // (a bare `GRANT execute TO u` grants a role, as it did)
     (&["REVOKE", "EXECUTE", "ON"], GRANT_EXECUTE),
+    (&["LISTEN"], LISTEN),
+    (&["UNLISTEN"], LISTEN),
+    (&["NOTIFY"], LISTEN),
 ];
 
 /// The first words a refused statement can start with: a statement that starts with none of them is not read further.
-const HEADS: &[&str] = &["create", "alter", "drop", "show", "explain", "comment", "grant", "revoke", "execute"];
+const HEADS: &[&str] = &["create", "alter", "drop", "show", "explain", "comment", "grant", "revoke", "execute", "listen", "unlisten", "notify"];
 
 /// What is refused in `sql`, if it is one of 1.1's statements: the words that say what to write instead. None for any other.
 pub fn refusal(sql: &str) -> Option<String> {
@@ -85,6 +96,9 @@ pub fn refusal(sql: &str) -> Option<String> {
         return pipeline_part(&first, next.as_deref()).map(str::to_string); // (a page has no scripts: it reads these here)
     }
     if let Some(why) = type_kept(sql, &first) {
+        return Some(why);
+    }
+    if let Some(why) = function_kept(sql) {
         return Some(why);
     }
     if !HEADS.contains(&first.as_str()) {
@@ -108,11 +122,40 @@ fn type_kept(sql: &str, head: &str) -> Option<String> {
     if !typed && !using {
         return None;
     }
-    let tokens: Vec<Token> = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let tokens = tokens_of(sql)?;
     if let Some(format) = table_using(&tokens) {
         return Some(USING.replace("{}", &format));
     }
     tokens.windows(2).filter(|w| matches!(w[1], Token::LParen)).find_map(|w| TYPES.iter().find(|(name, _)| is_word(&w[0], name))).map(|(_, says)| says.to_string())
+}
+
+/// What a function named in `sql` says, when it is one Postgres has and Pondra doesn't yet: `pg_notify`, or an advisory
+/// lock (`pg_advisory_lock`, `pg_try_advisory_xact_lock`, `pg_advisory_unlock_all`…). Read anywhere in a statement, since
+/// a call can sit in a SELECT's list or a WHERE. Only a statement that spells `advisory` or `pg_notify` is tokenised, so
+/// the rest pay nothing; a string or a column named so is no call, and the tokens show it.
+fn function_kept(sql: &str) -> Option<String> {
+    if !contains_ci(sql, "advisory") && !contains_ci(sql, "pg_notify") {
+        return None;
+    }
+    let tokens = tokens_of(sql)?;
+    tokens.windows(2).find_map(|w| match (&w[0], &w[1]) {
+        (Token::Word(word), Token::LParen) if word.quote_style.is_none() => {
+            let name = word.value.to_lowercase();
+            if name == "pg_notify" {
+                Some(LISTEN.replace("{}", &name))
+            } else if name.starts_with("pg_") && name.contains("advisory") {
+                Some(ADVISORY.replace("{}", &name))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+/// The tokens of `sql` without its whitespace, so a word's neighbours are the next tokens. None when the tokeniser refuses it.
+fn tokens_of(sql: &str) -> Option<Vec<Token>> {
+    Some(Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect())
 }
 
 /// The format a `CREATE TABLE … USING x` names (`x`): a USING in the table's header, which ends at an AS, a SELECT or a VALUES
@@ -279,6 +322,25 @@ mod tests {
         ] {
             let refused = refusal(sql);
             assert!(refused.as_deref().is_none_or(|w| !w.contains("1.2") && !w.contains("ADR-051")), "{sql}: {refused:?}");
+        }
+    }
+
+    /// Advisory locks and LISTEN/NOTIFY, which Postgres has and Pondra doesn't yet: refused by name, with the words that say
+    /// what to write instead, since a migration tool sends them first. A string, a column or a table named so is not one.
+    #[test]
+    fn names_what_postgres_has_and_pondra_lacks() {
+        let advisory = |name: &str| ADVISORY.replace("{}", name);
+        assert_eq!(refusal("SELECT pg_advisory_lock(1)"), Some(advisory("pg_advisory_lock")));
+        assert_eq!(refusal("select pg_try_advisory_xact_lock(42)"), Some(advisory("pg_try_advisory_xact_lock")));
+        assert_eq!(refusal("SELECT pg_advisory_unlock_all()"), Some(advisory("pg_advisory_unlock_all")));
+        assert_eq!(refusal("LISTEN jobs"), Some(LISTEN.replace("{}", "LISTEN")));
+        assert_eq!(refusal("notify jobs, 'x'"), Some(LISTEN.replace("{}", "NOTIFY")));
+        assert_eq!(refusal("UNLISTEN *"), Some(LISTEN.replace("{}", "UNLISTEN")));
+        assert_eq!(refusal("SELECT pg_notify('c', 'p')"), Some(LISTEN.replace("{}", "pg_notify")));
+        assert!(refusal("LISTEN jobs").unwrap().starts_with("LISTEN: LISTEN and NOTIFY aren't built yet (planned for 1.1)"));
+        assert!(refusal("SELECT pg_advisory_lock(1)").unwrap().contains("a transaction locks a row"));
+        for sql in ["SELECT 'pg_advisory_lock(1)'", "SELECT advisory FROM t", "SELECT * FROM listen_log", "SELECT \"pg_advisory_lock\" FROM t"] {
+            assert_eq!(refusal(sql), None, "{sql}");
         }
     }
 }
