@@ -166,7 +166,10 @@ async function openInBrowser() {
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
+    // One context for the checks' tabs: they share its origin's private file system and Web Locks. (`newPage` of a context
+    // made by `browser.newPage()` is refused, so the context is made here.)
+    const context = await browser.newContext();
+    const page = await context.newPage();
     watch(page);
     const origin = `http://127.0.0.1:${site.port}`; // (the origin a node names for this page, in PONDRA_WEB_ORIGINS)
     await page.goto(`${origin}/`, { waitUntil: 'commit' }); // (the module takes long to start: waited for below)
@@ -176,7 +179,7 @@ async function openInBrowser() {
     const tabs = new Map([['pondra', page]]);
     // A tab of the page's context on the bare page, registered as `name`, which the checks then call by that name.
     const tab = async (name) => {
-      const made = await openBare(page.context(), origin);
+      const made = await openBare(context, origin);
       tabs.set(name, made);
       return made;
     };
@@ -584,7 +587,7 @@ async function keptChecks(page, lake) {
   for (const [name, text] of [
     ['kept: CREATE TABLE k AS FROM k.csv', "CREATE TABLE k AS FROM 'k.csv'"],
     ['kept: INSERT INTO k', "INSERT INTO k VALUES (9, 'z')"],
-    ['kept: CREATE TABLE "a{b}"', 'CREATE TABLE "a{b}" AS SELECT 1 AS x'],
+    ['kept: CREATE TABLE "a-b"', 'CREATE TABLE "a-b" AS SELECT 1 AS x'],
   ]) {
     const made = await ask(name, 'POST', '/sql', undefined, text, 'kept');
     if (made) judge(name, made, { status: 200, sqlstate: null });
@@ -626,12 +629,12 @@ async function keptChecks(page, lake) {
   if (!(await openKept(page, 'pondra-check'))) return;
   const after = await ask('kept after reload: SELECT * FROM k', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM k ORDER BY id', 'kept');
   if (after && before) judge('kept after reload: SELECT * FROM k', after, { status: 200, sqlstate: null, out: dec.decode(before.body) });
-  const letters = await ask('kept after reload: FROM "a{b}"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a{b}"', 'kept');
-  if (letters) judge('kept after reload: FROM "a{b}"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
+  const letters = await ask('kept after reload: FROM "a-b"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a-b"', 'kept');
+  if (letters) judge('kept after reload: FROM "a-b"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
   const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
   if (listed) {
     judge('kept after reload: GET /objects', listed, {
-      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}', 'k'], { k: 4 }),
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 4 }),
     });
   }
   if (expected) {
@@ -682,7 +685,7 @@ async function keptChecks(page, lake) {
   if (!(await openKept(page, 'pondra-check'))) return;
   const droppedList = await ask('kept after the drop: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
   if (droppedList) {
-    judge('kept after the drop: GET /objects', droppedList, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a{b}']) });
+    judge('kept after the drop: GET /objects', droppedList, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b']) });
   }
   const gone = await ask('kept after the drop: GET /files/k.csv', 'GET', '/files/k.csv', undefined, undefined, 'kept');
   if (gone) judge('kept after the drop: GET /files/k.csv', gone, { status: 404, sqlstate: null, type: TEXT, out: 'no such file: files/k.csv' });
@@ -913,8 +916,10 @@ const CASES = [
   ['window', 'POST', '/sql?format=csv', 'SELECT id, sum(qty) OVER (ORDER BY id) AS run FROM orders', 200, null,
     'id,run\n1,5\n2,12\n3,21\n'],
   ['syntax error', 'POST', '/sql', 'SELEC 1', 400, '42601', undefined],
-  ['CREATE EXTERNAL TABLE refused', 'POST', '/sql', "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION 'orders.csv'", 501, '0A000', undefined],
-  ['AT refused', 'POST', '/sql', 'FROM orders AT (VERSION => 1)', 501, '0A000', undefined],
+  // The core answers these (a node does too, forms.json names no page refusal for them), so they are answered, not refused.
+  // The external table is ext, not t: the checks below make t, and an external table over a file takes no INSERT.
+  ['CREATE EXTERNAL TABLE', 'POST', '/sql', "CREATE EXTERNAL TABLE ext STORED AS CSV LOCATION 'orders.csv'", 200, null, undefined],
+  ['AT', 'POST', '/sql', 'FROM orders AT (VERSION => 1)', 200, null, undefined],
   ['a file by name', 'POST', '/sql?format=csv', "SELECT sum(qty) AS s FROM 'orders.csv'", 200, null, 's\n21\n'],
   ['a file by its files/ path', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'files/orders.csv'", 200, null, 'n\n3\n'],
   ['a glob', 'POST', '/sql?format=csv', "SELECT count(*) AS n FROM 'order*.csv'", 200, null, 'n\n3\n'],
@@ -928,14 +933,17 @@ for (const [name, method, path, send, status, sqlstate, out] of CASES) {
   const answer = await ask(name, method, path, undefined, send);
   if (answer) judge(name, answer, { status, sqlstate, out });
 }
+const droppedExt = await ask('DROP TABLE ext', 'POST', '/sql', undefined, 'DROP TABLE ext');
+if (droppedExt) judge('DROP TABLE ext', droppedExt, { status: 200, sqlstate: null });
 
 // A file a client reads back is the bytes it put, with its etag and its content type by name (GET).
 const got = await ask('GET /files/orders.csv', 'GET', '/files/orders.csv');
 if (got) judge('GET /files/orders.csv', got, { status: 200, sqlstate: null, type: 'text/csv; charset=utf-8', etag: true, out: ORDERS });
 const missing = await ask('GET a missing file', 'GET', '/files/nope.csv');
 if (missing) judge('GET a missing file', missing, { status: 404, sqlstate: null, type: TEXT, out: 'no such file: files/nope.csv' });
-const versions = await ask('GET ?versions refused', 'GET', '/files/orders.csv?versions');
-if (versions) judge('GET ?versions refused', versions, { status: 501, sqlstate: '0A000' });
+// The versions of a file are answered as a JSON list, one version a row (the core's, as a node answers it).
+const versions = await ask('GET ?versions', 'GET', '/files/orders.csv?versions');
+if (versions) judge('GET ?versions', versions, { status: 200, sqlstate: null, type: JSON_TYPE });
 
 // The version checks of orders.csv, put above, on the memory page (`versionChecks`, below).
 await versionChecks('pondra', 'orders.csv');
@@ -967,7 +975,9 @@ if (objects) {
       const names = (j.objects ?? []).map((o) => o.name);
       const problems = [];
       if (JSON.stringify(names) !== JSON.stringify(['names', 'orders', 't'])) problems.push(`objects ${JSON.stringify(names)}`);
-      if (j.files !== 'mem:///files/') problems.push(`files ${j.files}`);
+      // Where SQL reads a relative file from: the page's files folder in its own memory store (memory://<id>/files/),
+      // or a node's real folder (<folder>/files/). Its exact URL is the store's, so only its last part is checked.
+      if (typeof j.files !== 'string' || !j.files.endsWith('/files/')) problems.push(`files ${j.files}`);
       return problems;
     },
   });

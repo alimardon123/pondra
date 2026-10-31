@@ -2,6 +2,7 @@
 //! Its requests and answers are a node's (ADR-061's contract), so a client speaks to a page as it speaks to a node. A
 //! module holds one page at a time: a second is refused by name until the first is closed or freed, or it runs in a
 //! Worker of its own (a Worker is a module of its own).
+#![recursion_limit = "256"] // (`kept` awaits the core's lake open, whose future is many awaits deep: as the core's own `lib.rs` says)
 
 use pondra::page::Node;
 use std::sync::Arc;
