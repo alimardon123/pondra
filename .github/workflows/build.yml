@@ -445,8 +445,8 @@ jobs:
       - run: cargo test --release --lib
       # The core as the page form builds it (web/: no server feature), checked: a module every build has that
       # called one only a node has broke main's browser build after a pull request merged on Linux's CI alone (#131).
-      - name: The browser's half of the crate compiles (no server feature)
-        run: cargo check --release --lib --no-default-features
+      - name: The browser's half of the crate compiles (as the page builds it, with the lake and no server feature)
+        run: cargo check --release --lib --no-default-features --features lake
 
   host:
     needs: plan

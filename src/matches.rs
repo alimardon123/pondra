@@ -2,7 +2,8 @@
 //! can change it. Its source is a lake table, read as its rows come. A run reads the source's rows in the new span of the
 //! watermark, with the rows the last runs left open, and writes the matches that are decided. What is still open stays
 //! held: `{view}$held` keeps those rows, and `{view}$resume` keeps each key's counts and the time a live thread dies. Late
-//! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`).
+//! rows are counted in `pondra$expectations` and never matched. The leader runs it (`views::emit_all`). A run reads about
+//! `PONDRA_MATCH_RUN_ROWS` new rows, and a catch-up goes on in steps.
 use crate::log::{Append, Outcome, Sequencer, Src};
 use crate::query::{over_ctx, session, session_at, table_ref};
 use crate::store::*;
@@ -11,13 +12,16 @@ use crate::views::{Options, Refresh, View, EXPECTED};
 use crate::codes::coded;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch, StructArray};
-use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch};
+use datafusion::arrow::compute::{cast, concat_batches, filter_record_batch, interleave_record_batch};
 use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema, SchemaRef, TimeUnit, TimestampMicrosecondType};
+use datafusion::arrow::row::{RowConverter, SortField};
 use datafusion::common::ScalarValue;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Expr;
 use datafusion::prelude::{ident, lit};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// The state of a view made from a MATCH_RECOGNIZE with EMIT FINAL: the id of this view (one made again under the name is
@@ -159,6 +163,63 @@ struct Marker {
     due: Option<i64>,
 }
 
+/// The keys of a run, each once: a row's key is its index in `all`. Rows are looked up by their PARTITION BY columns' row
+/// encoding; `by_key` finds the id of a key given by value (due keys, markers).
+struct Keys { part: Vec<(String, DataType)>, conv: Option<RowConverter>, by_row: HashMap<Box<[u8]>, u32>, by_key: HashMap<Key, u32>, all: Vec<Key> }
+
+impl Keys {
+    /// The keys of a run over the PARTITION BY columns `part` (none: the one key of the view, id 0).
+    fn new(part: &[(String, DataType)]) -> Result<Keys> {
+        let conv = match part.is_empty() {
+            true => None,
+            false => Some(RowConverter::new(part.iter().map(|(_, t)| SortField::new(t.clone())).collect())?),
+        };
+        let mut keys = Keys { part: part.to_vec(), conv, by_row: HashMap::new(), by_key: HashMap::new(), all: vec![] };
+        if part.is_empty() {
+            keys.intern(vec![ScalarValue::Boolean(Some(true))])?;
+        }
+        Ok(keys)
+    }
+
+    /// The id of each row's key, a key the run has not seen getting the next id.
+    fn ids(&mut self, b: &RecordBatch) -> Result<Vec<u32>> {
+        let Some(conv) = &self.conv else { return Ok(vec![0; b.num_rows()]) };
+        let cols = part_cols(b, &self.part)?;
+        let rows = conv.convert_columns(&cols)?;
+        let mut out = Vec::with_capacity(b.num_rows());
+        for i in 0..b.num_rows() {
+            let row = rows.row(i);
+            let id = match self.by_row.get(row.data()) {
+                Some(id) => *id,
+                None => {
+                    let id = self.intern(key_at(&cols, i)?)?;
+                    self.by_row.insert(row.data().into(), id);
+                    id
+                }
+            };
+            out.push(id);
+        }
+        Ok(out)
+    }
+
+    /// The id of `key`, a new one when the run has not seen it.
+    fn intern(&mut self, key: Key) -> Result<u32> {
+        if let Some(id) = self.by_key.get(&key) {
+            return Ok(*id);
+        }
+        let id = u32::try_from(self.all.len())?;
+        self.by_key.insert(key.clone(), id);
+        self.all.push(key);
+        Ok(id)
+    }
+
+    /// The id of `key`, if the run has it.
+    fn find(&self, key: &Key) -> Option<u32> { self.by_key.get(key).copied() }
+
+    /// How many keys the run has.
+    fn len(&self) -> usize { self.all.len() }
+}
+
 /// The keys by their due time, for a WITHIN view: each key whose live thread dies at a watermark at or after it. Kept in
 /// memory per view; loaded from `$resume` when a run first needs it (after a start or a leader change).
 #[derive(Default)]
@@ -200,16 +261,32 @@ impl Dues {
 
 crate::per_node!(static DUES: Mutex<HashMap<String, Dues>> = Default::default());
 
-/// One run of a matches view (leader only, `views::emit_all`): the watermark's new span, read at the snapshot; the keys it
-/// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
-/// producer in one flush, under the lake's lock. A run that finds nothing new commits nothing.
+/// A catch-up's steps run back to back for this long, then go on next round, so the leader's other views emit too.
+const STEPS_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// About the most new rows one run reads (`PONDRA_MATCH_RUN_ROWS`, 1,000,000): past it, the run decides up to an
+/// earlier time and the next one goes on from there, so a catch-up's memory stays bounded at any backlog.
+fn most_rows() -> u64 { crate::env::or("PONDRA_MATCH_RUN_ROWS", 1_000_000u64).max(1) }
+
+/// One run of a matches view (leader only, `views::emit_all`): steps of about `most_rows()` new rows each, back to back
+/// for `STEPS_FOR` while a step has more to do.
 pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<()> {
+    let started = datafusion::common::instant::Instant::now(); // (a page's clock too: std's Instant has none there)
+    while step(lake, _log, seq, lock, view, v, m).await? && started.elapsed() < STEPS_FOR {}
+    Ok(())
+}
+
+/// One step of a run: the watermark's new span, cut to about `most_rows()` rows (`cut`), read at the snapshot; the keys it
+/// touches, run with their held rows; the matches the matcher decides, and each key's markers; and the writes of every
+/// producer in one flush, under the lake's lock. A step that finds nothing new commits nothing. Returns whether a next step
+/// should follow at once: the time this one decided up to is short of the watermark.
+async fn step(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>, view: &str, v: &View, m: &Matches) -> Result<bool> {
     let producer = format!("match:{view}");
     let late_producer = format!("{producer}$late");
     let w0: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
-    let Some(w) = crate::views::watermark(lake, &v.source, &m.time, m.lateness_secs, m.idle_secs).await? else { return Ok(()) };
+    let Some(w) = crate::views::watermark(lake, &v.source, &m.time, m.lateness_secs, m.idle_secs).await? else { return Ok(false) };
     if w <= w0 as i64 {
-        return Ok(());
+        return Ok(false);
     }
     let at = lake.visible();
     let at0: u64 = lake.cat.get(&producer_key(&late_producer)).await?.unwrap_or(0);
@@ -221,25 +298,23 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let time_type = dtype(&column_type(&src, &m.time)?)?;
     let cols: Vec<(String, DataType)> = src.columns.iter().map(|(c, t)| Ok((c.clone(), dtype(t)?))).collect::<Result<_>>()?;
     let part: Vec<(String, DataType)> = m.part.iter().map(|p| Ok((p.clone(), dtype(&column_type(&src, p)?)?))).collect::<Result<_>>()?;
-    let stamp = |us: i64| -> Result<ScalarValue> { Ok(ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(&time_type)?) };
     let t = ident(m.time.as_str());
 
-    // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions.
+    // S: the source's rows in (W0, W], as they are at `at`, with their ids and versions. The run decides up to the cut.
     let names: Vec<String> = src.columns.iter().map(|(c, _)| c.clone()).collect();
     let read = format!("SELECT {}, {ROW_ID}, {VERSION} FROM {}", crate::objects::list_sql(&names), crate::write::sql_name(&v.source));
     let sctx = session_at(lake, &read, "", Some(at)).await?;
     let table = sctx.table(table_ref(&v.source)).await?;
-    let mut bounds = t.clone().lt_eq(lit(stamp(w)?));
-    if w0 > 0 {
-        bounds = bounds.and(t.clone().gt(lit(stamp(w0 as i64)?)));
-    }
-    let s_batches: Vec<RecordBatch> = table.clone().filter(bounds)?.collect().await?;
+    let w_mark = w;
+    let w = cut(&table, &t, &m.time, &time_type, w0, w_mark, most_rows()).await?;
+    let s_batches: Vec<RecordBatch> = table.clone().filter(span(&t, &time_type, w0, w)?)?.collect().await?;
 
-    // Late rows: those that came after the last run's snapshot, with a time at or before its watermark, or none.
+    // Late rows: those that came after the last run's snapshot, with a time at or before the time the last run decided up
+    // to, or none.
     let late: i64 = match w0 > 0 && at > at0 {
         true => {
             let version = ident(VERSION);
-            let stale = t.clone().lt_eq(lit(stamp(w0 as i64)?)).or(t.clone().is_null());
+            let stale = t.clone().lt_eq(lit(stamp(&time_type, w0 as i64)?)).or(t.clone().is_null());
             table.filter(version.clone().gt(lit(at0 as i64)).and(version.lt_eq(lit(at as i64))).and(stale))?.count().await? as i64
         }
         false => 0,
@@ -254,41 +329,60 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
         dues.load(&resume);
     }
     let s_schema: SchemaRef = Arc::new(Schema::new(fields_of(&cols).chain([Field::new(ROW_ID, DataType::Int64, true)]).collect::<Vec<_>>()));
-    let s_all = rows_as(&s_schema, &s_batches)?;
-    let s_keys = keys_of(&s_all, &part)?;
-    let s_ids = ints(&s_all, ROW_ID)?;
+    let s_list: Vec<RecordBatch> = s_batches.iter().filter(|b| b.num_rows() > 0).map(|b| crate::query::conform(b, &s_schema)).collect::<Result<_>>()?;
+    let n_s: usize = s_list.iter().map(|b| b.num_rows()).sum();
     let held_all = rows_as(&held_schema_of(&cols), &held_rows)?;
-    let held_keys = keys_of(&held_all, &part)?;
+
+    // Each row's key is an id (`Keys`): S's rows, then the held rows.
+    let mut keys = Keys::new(&part)?;
+    let mut s_kid: Vec<u32> = vec![];
+    for b in &s_list {
+        s_kid.extend(keys.ids(b)?);
+    }
+    let held_kid = keys.ids(&held_all)?;
 
     // K: the keys S touches, and those whose live thread is dead by W.
-    let mut touched: HashSet<Key> = s_keys.iter().cloned().collect();
-    if m.within {
-        touched.extend(dues.due_by(w));
-    }
-    if touched.is_empty() && late == 0 {
+    let due: Vec<Key> = if m.within { dues.due_by(w) } else { vec![] };
+    if n_s == 0 && due.is_empty() && late == 0 {
         if m.within {
             DUES.lock().unwrap().insert(dkey, dues);
         }
-        return Ok(()); // (nothing new and nothing late: no run, no commit)
+        return Ok(false); // (nothing new and nothing late: no run, no commit)
     }
-    let keep_held: Vec<bool> = held_keys.iter().map(|k| touched.contains(k)).collect();
+    let mut touched = vec![false; keys.len()];
+    for &id in &s_kid {
+        touched[id as usize] = true;
+    }
+    for k in &due {
+        if let Some(id) = keys.find(k) {
+            touched[id as usize] = true;
+        }
+    }
+    let keep_held: Vec<bool> = held_kid.iter().map(|&id| touched[id as usize]).collect();
     let held_k = filter_record_batch(&held_all, &BooleanArray::from(keep_held.clone()))?;
-    let held_keys_k: Vec<Key> = held_keys.iter().zip(&keep_held).filter(|(_, k)| **k).map(|(k, _)| k.clone()).collect();
+    let held_kid_k: Vec<u32> = held_kid.iter().zip(&keep_held).filter(|(_, k)| **k).map(|(id, _)| *id).collect();
     let held_ids_k = ints(&held_k, "__mr_row")?;
 
-    // The input: S (new), then the held rows of K (not new), each with its key's counts and W.
-    let mut keys_in = s_keys.clone();
-    keys_in.extend(held_keys_k);
-    let mut ids_in = s_ids.clone();
+    // The input, in parts: S (new), then the held rows of K (not new), each with its key's counts and W.
+    let mut kid_in = s_kid;
+    kid_in.extend(held_kid_k);
+    let mut ids_in: Vec<i64> = vec![];
+    for b in &s_list {
+        ids_in.extend(ints(b, ROW_ID)?);
+    }
     ids_in.extend(held_ids_k.iter().copied());
-    let is_new: Vec<bool> = (0..keys_in.len()).map(|i| i < s_keys.len()).collect();
-    let counts: Vec<(i64, i64)> = keys_in.iter().map(|k| resume.get(k).map_or((0, 0), |r| (r.0, r.1))).collect();
+    let mut times_in: Vec<i64> = vec![];
+    for b in &s_list {
+        times_in.extend(micros_of(b, &m.time)?);
+    }
+    times_in.extend(micros_of(&held_k, &m.time)?);
+    let counts: Vec<(i64, i64)> = keys.all.iter().map(|k| resume.get(k).map_or((0, 0), |r| (r.0, r.1))).collect();
     let in_schema = input_schema(&cols, &time_type);
-    let input = input_of(&in_schema, &cols, &s_all, &s_ids, &held_k, &held_ids_k, &counts, &stamp(w)?)?;
-    let times_in: Vec<i64> = micros_of(&s_all, &m.time)?.into_iter().chain(micros_of(&held_k, &m.time)?).collect();
+    let parts: Vec<&RecordBatch> = s_list.iter().chain([&held_k]).collect();
+    let input = input_of(&in_schema, &cols, &parts, &ids_in, &kid_in, &counts, &stamp(&time_type, w)?)?;
 
     // The matcher in open mode: the matches, and the markers that say what stays held.
-    let ictx = over_ctx(lake, &v.source, in_schema.clone(), vec![input.clone()], &m.inner).await?;
+    let ictx = over_ctx(lake, &v.source, in_schema.clone(), input.clone(), &m.inner).await?;
     let inner = crate::engine::sql(&ictx, &m.inner).await?;
     let inner_schema: SchemaRef = Arc::new(inner.schema().as_arrow().clone());
     let out: Vec<RecordBatch> = inner.collect().await?;
@@ -318,10 +412,15 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
 
     // The writes: the matches; the held delta (new rows that stay held, and held rows that no longer do); each key's
     // resume row; and the late count. Every producer moves in one flush.
-    let keep: HashMap<Key, usize> = markers.iter().map(|(k, mk)| (k.clone(), mk.keep.max(0) as usize)).collect();
-    let (new_mask, gone_mask) = delta(&keys_in, &times_in, &ids_in, &is_new, &keep);
-    let new_held = held_rows_of(&filter_record_batch(&input, &BooleanArray::from(new_mask))?, &cols)?;
-    let gone_held = held_rows_of(&filter_record_batch(&input, &BooleanArray::from(gone_mask))?, &cols)?;
+    let mut keep: Vec<Option<usize>> = vec![None; keys.len()];
+    for (key, mk) in &markers {
+        if let Some(id) = keys.find(key) {
+            keep[id as usize] = Some(mk.keep.max(0) as usize);
+        }
+    }
+    let (new_at, gone_at) = delta(&kid_in, &times_in, &ids_in, n_s, &keep);
+    let new_held = held_rows_of(&pick(&input, &in_schema, &new_at)?, &cols)?;
+    let gone_held = held_rows_of(&pick(&input, &in_schema, &gone_at)?, &cols)?;
     let resume_out = resume_batch(&markers, &part, &resume_meta)?;
     let (wv, w0v) = (w as u64, w0);
     let view_meta = Arc::new(view_meta);
@@ -343,7 +442,7 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
     let guard = lock.lock().await;
     let kept = lake.cat.get::<View>(&crate::views::view_key(view)).await?.and_then(|x| x.matches);
     if kept.is_none_or(|x| x.id != m.id) {
-        return Ok(());
+        return Ok(false);
     }
     let outcome = crate::change::submit(lake, seq, &pending).await?;
     drop(guard);
@@ -355,16 +454,39 @@ pub async fn run(lake: &Lake, _log: &crate::log::Log, seq: &Arc<Sequencer>, lock
                 }
                 DUES.lock().unwrap().insert(dkey, dues); // (after a commit: the dues are as the writes say)
             }
+            Ok(w < w_mark) // (a step short of the watermark: the next one reads on from the time it decided up to)
         }
         Outcome::Acks(acks) if acks.iter().any(|a| a.conflict) => {
             eprintln!("materialized view {view}: another run committed first; the next one reads on from it");
+            Ok(false)
         }
         Outcome::Acks(acks) if acks.iter().any(|a| a.refused || a.gone) => bail!("materialized view {view}: its rows were refused"),
         Outcome::Refused(why) => bail!("materialized view {view}: {why}"),
-        _ => {} // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
+        _ => Ok(false), // (a resent flush: its parts are duplicates; the dues are read again from `$resume` next time)
     }
-    Ok(())
 }
+
+/// The time a run decides up to: W, or, when (W0, W] holds more than `most` rows, 1 µs past its `most`-th row's time (a
+/// finer time is in too), and at least 1: a run reads about `most` new rows (all of a time) and always moves on.
+async fn cut(table: &DataFrame, t: &Expr, time: &str, time_type: &DataType, w0: u64, w: i64, most: u64) -> Result<i64> {
+    let top = table.clone().filter(span(t, time_type, w0, w)?)?.select(vec![t.clone()])?.sort(vec![t.clone().sort(true, false)])?.limit(most as usize - 1, Some(1))?.collect().await?;
+    match top.iter().find(|b| b.num_rows() > 0) {
+        Some(b) => Ok((micros_of(b, time)?[0] + 1).max(1).min(w)),
+        None => Ok(w),
+    }
+}
+
+/// The rows of the span (W0, W] of the time column `t`: at or before W, and after W0 once W0 is past the start.
+fn span(t: &Expr, time: &DataType, w0: u64, w: i64) -> Result<Expr> {
+    let upto = t.clone().lt_eq(lit(stamp(time, w)?));
+    match w0 > 0 {
+        true => Ok(upto.and(t.clone().gt(lit(stamp(time, w0 as i64)?)))),
+        false => Ok(upto),
+    }
+}
+
+/// A time in µs, as the time column's type.
+fn stamp(time: &DataType, us: i64) -> Result<ScalarValue> { Ok(ScalarValue::TimestampMicrosecond(Some(us), None).cast_to(time)?) }
 
 /// What the view takes: when `ok` doesn't hold, the statement is refused 0A000 with `why`, which says what to write.
 fn takes(ok: bool, why: impl Into<String>) -> Result<()> {
@@ -433,8 +555,13 @@ fn flush_parts(parts: Vec<Append>, table: &str, meta: &TableMeta, producer: &str
 
 /// A key of each row of `b`: its PARTITION BY columns as SQL compares them (`[true]` with no PARTITION BY).
 fn keys_of(b: &RecordBatch, part: &[(String, DataType)]) -> Result<Vec<Key>> {
-    let cols = part.iter().map(|(c, t)| Ok(cast(b.column_by_name(c).with_context(|| format!("no column {c}"))?, t)?)).collect::<Result<Vec<ArrayRef>>>()?;
+    let cols = part_cols(b, part)?;
     (0..b.num_rows()).map(|i| key_at(&cols, i)).collect()
+}
+
+/// The PARTITION BY columns of `b`, cast to their types as keys compare them.
+fn part_cols(b: &RecordBatch, part: &[(String, DataType)]) -> Result<Vec<ArrayRef>> {
+    part.iter().map(|(c, t)| Ok(cast(b.column_by_name(c).with_context(|| format!("no column {c}"))?, t)?)).collect()
 }
 
 fn key_at(cols: &[ArrayRef], row: usize) -> Result<Key> {
@@ -496,15 +623,39 @@ fn input_schema(cols: &[(String, DataType)], time: &DataType) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// The run's input: S's rows (`s`, with their ids), then the held rows of K (`held`, ids `held_ids`), each row with its
-/// key's counts (`counts`: `k` and `m`, one per row) and W.
+/// The run's input, in parts: S's rows, then the held rows of K (`parts`, one batch each), with their ids (`ids`, over all
+/// the parts), each row with its key's counts (`counts`: `k` and `m`, one per key id, read through `kid`) and W.
 #[allow(clippy::too_many_arguments)]
-fn input_of(schema: &SchemaRef, cols: &[(String, DataType)], s: &RecordBatch, s_ids: &[i64], held: &RecordBatch, held_ids: &[i64], counts: &[(i64, i64)], w: &ScalarValue) -> Result<RecordBatch> {
-    let n = s_ids.len();
-    let (ok, om): (Vec<i64>, Vec<i64>) = counts.iter().copied().unzip();
-    let a = input_part(schema, cols, s, s_ids, &ok[..n], &om[..n], w)?;
-    let b = input_part(schema, cols, held, held_ids, &ok[n..], &om[n..], w)?;
-    Ok(concat_batches(schema, &[a, b])?)
+fn input_of(schema: &SchemaRef, cols: &[(String, DataType)], parts: &[&RecordBatch], ids: &[i64], kid: &[u32], counts: &[(i64, i64)], w: &ScalarValue) -> Result<Vec<RecordBatch>> {
+    let mut out = vec![];
+    let mut at = 0;
+    for rows in parts {
+        let n = rows.num_rows();
+        let (ok, om): (Vec<i64>, Vec<i64>) = kid[at..at + n].iter().map(|&k| counts[k as usize]).unzip();
+        out.push(input_part(schema, cols, rows, &ids[at..at + n], &ok, &om, w)?);
+        at += n;
+    }
+    Ok(out)
+}
+
+/// The rows at global positions `at` of `parts`, taken in order, as one batch of `schema` (empty when `at` is empty).
+fn pick(parts: &[RecordBatch], schema: &SchemaRef, at: &[usize]) -> Result<RecordBatch> {
+    if at.is_empty() {
+        return Ok(RecordBatch::new_empty(schema.clone()));
+    }
+    let mut starts = Vec::with_capacity(parts.len());
+    let mut total = 0;
+    for p in parts {
+        starts.push(total);
+        total += p.num_rows();
+    }
+    // The last part that starts at or before a position holds it (an empty part never does).
+    let index: Vec<(usize, usize)> = at.iter().map(|&pos| {
+        let part = starts.partition_point(|&s| s <= pos) - 1;
+        (part, pos - starts[part])
+    }).collect();
+    let refs: Vec<&RecordBatch> = parts.iter().collect();
+    Ok(interleave_record_batch(&refs, &index)?)
 }
 
 /// Some rows as the input's: their columns by name, with their row ids, their counts and W.
@@ -544,22 +695,24 @@ fn resume_batch(markers: &[(Key, Marker)], part: &[(String, DataType)], meta: &T
     Ok(RecordBatch::try_new(schema, arrays)?)
 }
 
-/// The held delta of a run, as masks over its input: the new rows that stay held, and the held rows that don't stay. For
-/// each key, its last `keep` rows by (time, row id) stay; a key with no marker keeps all of them.
-fn delta(keys: &[Key], times: &[i64], ids: &[i64], is_new: &[bool], keep: &HashMap<Key, usize>) -> (Vec<bool>, Vec<bool>) {
-    let stay = stay_mask(keys, times, ids, keep);
-    ((0..keys.len()).map(|i| is_new[i] && stay[i]).collect(), (0..keys.len()).map(|i| !is_new[i] && !stay[i]).collect())
+/// The held delta of a run, as positions in its input (ascending): the new rows (the first `n_new`) that stay held, and the
+/// held rows that don't stay. For each key id, its last `keep` rows by (time, row id) stay; a key with no marker keeps all.
+fn delta(kid: &[u32], times: &[i64], ids: &[i64], n_new: usize, keep: &[Option<usize>]) -> (Vec<usize>, Vec<usize>) {
+    let stay = stay_mask(kid, times, ids, keep);
+    let n = kid.len();
+    ((0..n).filter(|&i| i < n_new && stay[i]).collect(), (0..n).filter(|&i| i >= n_new && !stay[i]).collect())
 }
 
-fn stay_mask(keys: &[Key], times: &[i64], ids: &[i64], keep: &HashMap<Key, usize>) -> Vec<bool> {
-    let mut groups: HashMap<&Key, Vec<usize>> = HashMap::new();
-    for (i, k) in keys.iter().enumerate() {
-        groups.entry(k).or_default().push(i);
+/// Which input rows stay held: per key id, the last `keep` rows by (time, row id), or all of them with no marker.
+fn stay_mask(kid: &[u32], times: &[i64], ids: &[i64], keep: &[Option<usize>]) -> Vec<bool> {
+    let mut groups: Vec<Vec<usize>> = vec![vec![]; keep.len()];
+    for (i, &k) in kid.iter().enumerate() {
+        groups[k as usize].push(i);
     }
-    let mut stay = vec![false; keys.len()];
-    for (k, mut rows) in groups {
+    let mut stay = vec![false; kid.len()];
+    for (k, rows) in groups.iter_mut().enumerate() {
         rows.sort_by_key(|&i| (times[i], ids[i]));
-        let n = keep.get(k).copied().unwrap_or(rows.len()).min(rows.len());
+        let n = keep[k].unwrap_or(rows.len()).min(rows.len());
         for &i in &rows[rows.len() - n..] {
             stay[i] = true;
         }
@@ -676,13 +829,13 @@ mod tests {
             ("symbol", Arc::new(datafusion::arrow::array::StringArray::from(vec!["B"])) as ArrayRef),
             ("price", Arc::new(datafusion::arrow::array::Float64Array::from(vec![2.0])) as ArrayRef),
         ])?;
-        // Held rows of key A (its counts: k 1, m 2), and a new key B with one row of its own.
+        // Held rows of key A (its counts: k 1, m 2), and a new key B with one row of its own. Key B is id 0, A is id 1.
         let held = RecordBatch::try_from_iter(vec![
             ("symbol", Arc::new(datafusion::arrow::array::StringArray::from(vec!["A", "A"])) as ArrayRef),
             ("price", Arc::new(datafusion::arrow::array::Float64Array::from(vec![5.0, 4.0])) as ArrayRef),
         ])?;
         let w = ScalarValue::TimestampMicrosecond(Some(100), None).cast_to(&time)?;
-        let all = input_of(&schema, &cols, &s, &[7], &held, &[3, 4], &[(0, 0), (1, 2), (1, 2)], &w)?;
+        let all = concat_batches(&schema, &input_of(&schema, &cols, &[&s, &held], &[7, 3, 4], &[0, 1, 1], &[(0, 0), (1, 2)], &w)?)?;
         assert_eq!(all.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(), ["symbol", "price", "_row_id", "__mr_ok", "__mr_om", "__mr_w"]);
         assert_eq!(ints(&all, ROW_ID)?, [7, 3, 4]);
         assert_eq!(ints(&all, "__mr_ok")?, [0, 1, 1]);
@@ -693,19 +846,66 @@ mod tests {
 
     #[test]
     fn a_key_keeps_its_last_rows_and_the_rest_leave() {
-        let key = |s: &str| vec![ScalarValue::Utf8(Some(s.into()))];
-        // A's held rows 3 and 4 (times 1 and 2), its new row 9 (time 3); B's new row 5 (time 1).
-        let keys = [key("A"), key("A"), key("A"), key("B")];
-        let times = [1, 2, 3, 1];
-        let ids = [3, 4, 9, 5];
-        let is_new = [false, false, true, true];
-        let keep = HashMap::from([(key("A"), 2usize), (key("B"), 1usize)]);
-        let (new, gone) = delta(&keys, &times, &ids, &is_new, &keep);
-        let pick = |m: &[bool]| (0..4).filter(|&i| m[i]).map(|i| ids[i]).collect::<Vec<i64>>();
-        assert_eq!((pick(&new), pick(&gone)), (vec![9, 5], vec![3]), "A keeps its last two rows, B its one");
+        // The new rows first: A's new row 9 (time 3) and B's new row 5 (time 1). Then A's held rows 3 and 4 (times 1 and 2).
+        let kid: [u32; 4] = [0, 1, 0, 0];
+        let times: [i64; 4] = [3, 1, 1, 2];
+        let ids: [i64; 4] = [9, 5, 3, 4];
+        let keep: [Option<usize>; 2] = [Some(2), Some(1)];
+        let (new, gone) = delta(&kid, &times, &ids, 2, &keep);
+        let at = |p: &[usize]| p.iter().map(|&i| ids[i]).collect::<Vec<i64>>();
+        assert_eq!((at(&new), at(&gone)), (vec![9, 5], vec![3]), "A keeps its last two rows, B its one");
         // A key with no marker keeps all its rows: nothing leaves.
-        let (_, gone) = delta(&keys, &times, &ids, &is_new, &HashMap::new());
-        assert!(gone.iter().all(|g| !g));
+        let (_, gone) = delta(&kid, &times, &ids, 2, &[None, None]);
+        assert!(gone.is_empty());
+    }
+
+    #[test]
+    fn keys_are_one_id_each_across_batches() -> Result<()> {
+        let part = vec![("symbol".to_string(), DataType::Utf8)];
+        let batch = |s: Vec<Option<&str>>| -> Result<RecordBatch> { Ok(RecordBatch::try_from_iter(vec![("symbol", Arc::new(datafusion::arrow::array::StringArray::from(s)) as ArrayRef)])?) };
+        let mut keys = Keys::new(&part)?;
+        assert_eq!(keys.ids(&batch(vec![Some("A"), None, None])?)?, [0, 1, 1]);
+        assert_eq!(keys.ids(&batch(vec![Some("B"), Some("A"), None])?)?, [2, 0, 1]);
+        assert_eq!(keys.len(), 3);
+        let key = |s: Option<&str>| vec![ScalarValue::Utf8(s.map(String::from))];
+        assert_eq!((keys.find(&key(Some("A"))), keys.find(&key(None)), keys.find(&key(Some("C")))), (Some(0), Some(1), None));
+
+        // No PARTITION BY: every row is the one key, id 0.
+        let mut all = Keys::new(&[])?;
+        assert_eq!(all.ids(&batch(vec![Some("x"), None])?)?, [0, 0]);
+        assert_eq!(all.find(&vec![ScalarValue::Boolean(Some(true))]), Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn pick_takes_rows_across_parts() -> Result<()> {
+        let part = |v: Vec<i64>| RecordBatch::try_from_iter(vec![("x", Arc::new(Int64Array::from(v)) as ArrayRef)]);
+        let parts = vec![part(vec![10, 11])?, part(vec![])?, part(vec![20, 21, 22])?];
+        let schema = parts[0].schema();
+        let picked = pick(&parts, &schema, &[4, 0, 2])?;
+        assert_eq!(ints(&picked, "x")?, [22, 10, 20]);
+        assert_eq!(pick(&parts, &schema, &[])?.num_rows(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cut_is_just_past_the_nth_time() -> Result<()> {
+        use datafusion::arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+        let ctx = datafusion::prelude::SessionContext::new();
+        let frame = |array: ArrayRef| -> Result<DataFrame> { Ok(ctx.read_batch(RecordBatch::try_from_iter(vec![("ts", array)])?)?) };
+        let (micro, nano) = (DataType::Timestamp(TimeUnit::Microsecond, None), DataType::Timestamp(TimeUnit::Nanosecond, None));
+        let t = ident("ts");
+        // Times 10, 20, 20 and 30 µs, W0 0, W 100: the 2nd time is 20, the 4th 30, and fewer than 9 rows give W.
+        let df = frame(Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 20, 30])))?;
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 2).await?, 21);
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 4).await?, 31);
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 9).await?, 100);
+        // One row at 1,500 ns in a nanosecond column (1 µs, so 2), and negative times (at least 1).
+        let df = frame(Arc::new(TimestampNanosecondArray::from(vec![1500])))?;
+        assert_eq!(cut(&df, &t, "ts", &nano, 0, 100, 1).await?, 2);
+        let df = frame(Arc::new(TimestampMicrosecondArray::from(vec![-5, -3])))?;
+        assert_eq!(cut(&df, &t, "ts", &micro, 0, 100, 1).await?, 1);
+        Ok(())
     }
 
     #[test]
