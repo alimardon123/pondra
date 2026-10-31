@@ -10518,6 +10518,13 @@ def guarded():
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
         "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
+    # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the commit stream and the replica log
+    # carry the lake's keys (`z/auth`), and a raw flush or heartbeat writes what only the nodes write (L2's review, 10-31)
+    nodes_own = {p: ask(P, b"" if m == "GET" else "{}", path=p, method=m, auth=boss) for p, m in
+                 (("/cluster/log", "GET"), ("/cluster/replica", "GET"), ("/cluster/commit", "POST"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
+    info["nodes_own"] = nodes_own
+    checks["…nor a superuser's sign-in: the commit stream and the replica log (the lake's keys), a raw flush, a heartbeat, an ack: 403"] = \
+        all(refused(v) and "this route is the nodes' own" in v for v in nodes_own.values())
     # A change a follower forwards runs as its user: what it reads too
     forwarded = {
         "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),
