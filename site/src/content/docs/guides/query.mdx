@@ -329,7 +329,8 @@ curl -s -X POST "http://localhost:8080/sql?spread=0" -d "SELECT count(*) AS n FR
 
 Answers are the same on one node and on many, and a sum over `DOUBLE` comes out the same whatever
 order its rows arrive in. Queries that need more memory than `--memory-gb` allows (a third of the
-machine's by default) spill to disk.
+machine's by default) spill to disk. A window over whole partitions of a table (`avg(x) OVER (PARTITION BY k)`,
+`count(*) OVER ()`) holds no rows at all: it is answered as a `GROUP BY` joined back to the table read again.
 [Clusters](/pondra/guides/clusters/) covers running several nodes.
 
 <Aside type="caution">
