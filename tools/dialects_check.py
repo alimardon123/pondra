@@ -197,9 +197,9 @@ CASES = [
     ("spark", "SELECT size(split(tags, ',')) AS n, array_contains(split(tags, ','), 'vip') AS has_vip FROM orders"),
     ("spark", "SELECT substring_index(email, '@', -1) AS domain, instr(name, 'o') AS pos, months_between(current_date(), signed_up) AS months FROM customers"),
     # spark: tables and rows
-    ("spark", "CREATE TABLE IF NOT EXISTS t_case_301 (id INT, customer_id INT, amount DECIMAL(10,2), day DATE) USING DELTA PARTITIONED BY (day) COMMENT 'daily orders' TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')"),
+    ("spark", "CREATE TABLE IF NOT EXISTS t_case_301 (id INT, customer_id INT, amount DECIMAL(10,2), day DATE) USING DELTA PARTITIONED BY (day) COMMENT 'daily orders' TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')", ("0A000", "USING DELTA")),
     ("spark", "CREATE TABLE t_case_302 (id INT, status STRING) CLUSTERED BY (id) INTO 4 BUCKETS STORED AS PARQUET"),
-    ("spark", "CREATE TABLE t_case_303 USING PARQUET AS SELECT customer_id, sum(amount) AS total FROM orders GROUP BY customer_id"),
+    ("spark", "CREATE TABLE t_case_303 USING PARQUET AS SELECT customer_id, sum(amount) AS total FROM orders GROUP BY customer_id", ("0A000", "USING PARQUET")),
     ("spark", "CREATE OR REPLACE TEMPORARY VIEW paid_orders AS SELECT * FROM orders WHERE status = 'paid'"),
     ("spark", "INSERT INTO t_case_302 VALUES (1, 'new'), (2, 'paid')"),
     ("spark", "MERGE INTO t_case_302 t USING (SELECT id, status FROM orders) o ON t.id = o.id WHEN MATCHED THEN UPDATE SET t.status = o.status WHEN NOT MATCHED THEN INSERT (id, status) VALUES (o.id, o.status)"),

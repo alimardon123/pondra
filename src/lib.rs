@@ -155,6 +155,7 @@ mod rules;
 #[cfg(feature = "lake")] mod oom;
 #[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))] mod jemalloc;
 #[cfg(feature = "lake")] mod once;
+#[cfg(feature = "lake")] mod matches;
 #[cfg(feature = "doors")] mod origins;
 #[cfg(feature = "lake")] mod metrics;
 #[cfg(feature = "doors")] pub mod library;

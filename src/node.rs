@@ -424,12 +424,12 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     if lives && app.log.is_some() {
         feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
     }
-    if let (true, Some(_), Some(log)) = (lives, &app.seq, &app.log) {
-        let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
+    if let (true, Some(seq), Some(log)) = (lives, &app.seq, &app.log) {
+        let (lake, log, seq, lock) = (lake.clone(), log.clone(), seq.clone(), app.lock.clone()); // windows, sessions and matches past the watermark, emitted once
         panics::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Err(e) = views::emit_all(&lake, &log).await {
+                if let Err(e) = views::emit_all(&lake, &log, &seq, &lock).await {
                     eprintln!("emission: {e:#}");
                 }
             }

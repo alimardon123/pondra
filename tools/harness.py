@@ -165,8 +165,8 @@ def clean_up():
 
 
 class Node:
-    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", **flags):
-        self.args = [BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
+    def __init__(self, lake, port, reader=False, env=None, cwd=None, host="127.0.0.1", bin=None, **flags):
+        self.args = [bin or BIN, "serve", "--dir", lake, "--addr", f"{host}:{port}"] + (["--reader"] if reader else [])
         self.args += [f"--{k.replace('_', '-')}" + ("" if v is True or v == "true" else f"={v}") for k, v in flags.items()]  # (a bare flag for true)
         self.port, self.env, self.cwd, self.p = port, {**os.environ, **(env or {})}, cwd, None
         self.log = os.path.join(tempfile.gettempdir(), f"pondra-{port}-{uuid.uuid4().hex[:6]}.stderr")
@@ -329,6 +329,26 @@ def external():
     open(os.path.join(here, "j.json"), "w").write('{"a": 1, "b": "x", "extra": true}\n{"a": 2, "b": "y"}\n')
     q(f"COPY (SELECT 1 AS id, 'a' AS name, 10 AS n) TO '{here}/dir/one.parquet'")
     q(f"COPY (SELECT 2 AS id, 'b' AS name, 20 AS n) TO '{here}/dir/two.parquet'")
+    # Compressed CSV and JSON, as the same rows as the plain files: gzip, bzip2 and xz from Python's standard library, zstd when
+    # the zstandard package is there (tools/requirements.txt doesn't pin it: the zstd cases are skipped without it).
+    import gzip, bz2, lzma
+    try:
+        import zstandard
+    except ImportError:
+        zstandard = None
+    packs = {"gz": gzip.compress, "bz2": bz2.compress, "xz": lambda b: lzma.compress(b, format=lzma.FORMAT_XZ)}
+    if zstandard is not None:
+        packs["zst"] = zstandard.ZstdCompressor().compress
+    csv_text, json_text = open(os.path.join(here, "a.csv"), "rb").read(), open(os.path.join(here, "j.json"), "rb").read()
+    for end, pack in packs.items():
+        open(os.path.join(here, f"a.csv.{end}"), "wb").write(pack(csv_text))
+        open(os.path.join(here, f"j.json.{end}"), "wb").write(pack(json_text))
+        open(os.path.join(here, f"j.jsonl.{end}"), "wb").write(pack(json_text))
+    os.makedirs(os.path.join(here, "cdir"))
+    for name in ("one.csv.gz", "two.csv.gz"):
+        open(os.path.join(here, "cdir", name), "wb").write(gzip.compress(csv_text))
+    open(os.path.join(here, "cdir", "plain.csv"), "wb").write(csv_text)  # (a folder read as gzip takes its .csv.gz files, not this)
+    open(os.path.join(here, "named.dat"), "wb").write(gzip.compress(csv_text))  # (a name that doesn't say its compression: read_csv's compression => 'gzip')
     checks = {}
     q("CREATE EXTERNAL TABLE c1 (a INT, b VARCHAR, c DATE) STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.has_header' 'true')")
     checks["CSV: declared columns by position, typed as declared, a relative LOCATION where the node runs"] = q("SELECT a, b, CAST(c AS VARCHAR) AS c FROM c1 ORDER BY a") == [{"a": 1, "b": "hello", "c": "2024-01-02"}, {"a": 2, "b": "world", "c": "2024-02-03"}]
@@ -336,6 +356,75 @@ def external():
     checks["Parquet: a folder's files, declared columns by name, one they don't hold NULL (and IS NULL finds it)"] = q("SELECT name, id, n FROM p2 WHERE missing IS NULL AND n > 15") == [{"name": "b", "id": 2, "n": 20.0}]
     q("CREATE EXTERNAL TABLE j1 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json'")
     checks["JSON: declared columns by name, others left out"] = q("SELECT * FROM j1 ORDER BY a") == [{"b": "x", "a": 1}, {"b": "y", "a": 2}]
+    # Compressed CSV and JSON (ADR-032): a name's ending is its compression and the name before it its format, at every door.
+    # The rows are the plain files' rows in each codec here (zstd only when the zstandard package is there), and each file is
+    # read back by Python's decoder: the write side is checked by bytes, not by Pondra alone.
+    def refused(s):  # (status, SQLSTATE, words) of a statement the node refuses by name
+        c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=30)
+        c.request("POST", "/sql", s.encode(), hdr)
+        r = c.getresponse()
+        return r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    rd = lambda name: open(os.path.join(here, name), "rb").read()
+    decode = {"gz": gzip.decompress, "bz2": bz2.decompress, "xz": lzma.decompress}
+    if zstandard is not None:
+        decode["zst"] = lambda data: zstandard.ZstdDecompressor().decompressobj().decompress(data)  # (a stream frame: Pondra's writer keeps no content size)
+    checks["compressed CSV and JSON by name (FROM, read_csv, read_json, a .jsonl name), in each codec: the plain files' rows"] = all(
+        q(f"SELECT sum(x) AS s, count(*) AS n FROM '{here}/a.csv.{e}'") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(x) AS s, count(*) AS n FROM read_csv('{here}/a.csv.{e}')") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(a) AS s, count(*) AS n FROM read_json('{here}/j.json.{e}')") == [{"s": 3, "n": 2}]
+        and q(f"SELECT sum(a) AS s, count(*) AS n FROM '{here}/j.jsonl.{e}'") == [{"s": 3, "n": 2}]
+        for e in decode)
+    checks["a name that doesn't say its compression (named.dat): read as gzip with compression => 'gzip'; read without it, refused"] = \
+        q(f"SELECT sum(x) AS s, count(*) AS n FROM read_csv('{here}/named.dat', compression => 'gzip')") == [{"s": 3, "n": 2}] \
+        and err(f"SELECT sum(x) AS s FROM read_csv('{here}/named.dat')") != ""
+    checks["a folder read with compression => 'gzip' takes its .csv.gz files (plain.csv left out), and a glob takes the same four rows"] = \
+        q(f"SELECT count(*) AS n, sum(x) AS s FROM read_csv('{here}/cdir/', compression => 'gzip')") == [{"n": 4, "s": 6}] \
+        and q(f"SELECT count(*) AS n FROM '{here}/cdir/*.csv.gz'") == [{"n": 4}]
+    q("CREATE EXTERNAL TABLE ce1 (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'cdir/' OPTIONS ('format.has_header' 'true', 'format.compression' 'gzip')")
+    q("CREATE EXTERNAL TABLE ce2 (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'a.csv.xz' OPTIONS ('format.has_header' 'true')")
+    q("CREATE EXTERNAL TABLE ce3 (b VARCHAR, a BIGINT) STORED AS JSON LOCATION 'j.json.bz2'")
+    checks["external tables of compressed files: a folder with 'format.compression' 'gzip' (4 rows), a name's own compression with no option (2 rows), JSON's too"] = \
+        q("SELECT count(*) AS n, sum(x) AS s FROM ce1") == [{"n": 4, "s": 6}] and q("SELECT count(*) AS n, sum(x) AS s FROM ce2") == [{"n": 2, "s": 3}] \
+        and q("SELECT sum(a) AS s FROM ce3") == [{"s": 3}]
+    for t in ("ce1", "ce2", "ce3"):
+        q(f"DROP TABLE {t}")
+    q("CREATE TABLE ci (x BIGINT, y VARCHAR, z VARCHAR)")
+    q(f"COPY INTO ci FROM '{here}/cdir/*.csv.gz' (FORMAT csv, HEADER true)")
+    q(f"COPY INTO ci FROM '{here}/a.csv.xz' (FORMAT csv, HEADER true)")
+    checks["COPY INTO loads a glob of .csv.gz files, then one .csv.xz by its name: six rows, the sum of both"] = q("SELECT count(*) AS n, sum(x) AS s FROM ci") == [{"n": 6, "s": 9}]
+    q("DROP TABLE ci")
+    q("CREATE EXTERNAL TABLE cw (x INT, y VARCHAR, z VARCHAR) STORED AS CSV LOCATION 'cw/' OPTIONS ('format.has_header' 'false', 'format.compression' 'gzip')")
+    q("INSERT INTO cw VALUES (7, 'q', 'r')")
+    written = os.listdir(os.path.join(here, "cw"))
+    checks["INSERT into a view of a compressed folder writes one .csv.gz file, and its view reads it back"] = len(written) == 1 and written[0].endswith(".csv.gz") \
+        and q("SELECT sum(x) AS s FROM cw") == [{"s": 7}]
+    q("DROP TABLE cw")
+    back = {}
+    for e in decode:
+        q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/out.csv.{e}'")
+        q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/out.json.{e}'")
+        back[e] = decode[e](rd(f"out.csv.{e}")).decode().splitlines() == ["a,b", "1,x"] \
+            and [json.loads(line) for line in decode[e](rd(f"out.json.{e}")).decode().splitlines()] == [{"a": 1, "b": "x"}] \
+            and q(f"SELECT a, b FROM '{here}/out.csv.{e}'") == [{"a": 1, "b": "x"}] and q(f"SELECT a, b FROM '{here}/out.json.{e}'") == [{"a": 1, "b": "x"}]
+    checks["COPY TO a name ending .csv or .json and a codec: each file holds the rows, read back by Python and by Pondra"] = all(back.values())
+    q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/opt.csv' (FORMAT csv, COMPRESSION bzip2)")
+    checks["COPY TO with COMPRESSION bzip2: the file is bzip2 under its plain name, and Python reads its rows"] = \
+        bz2.decompress(rd("opt.csv")).decode().splitlines() == ["a,b", "1,x"]
+    os.makedirs(os.path.join(here, "outdir"))
+    q(f"COPY (SELECT 1 AS a, 'x' AS b) TO '{here}/outdir/' (FORMAT csv, COMPRESSION gzip)")
+    outs = os.listdir(os.path.join(here, "outdir"))
+    checks["COPY TO a folder with COMPRESSION gzip: its file is .csv.gz, read back by Python and by read_csv with compression => 'gzip'"] = \
+        len(outs) == 1 and outs[0].endswith(".csv.gz") and gzip.decompress(open(os.path.join(here, "outdir", outs[0]), "rb").read()).decode().splitlines() == ["a,b", "1,x"] \
+        and q(f"SELECT count(*) AS n FROM read_csv('{here}/outdir/', compression => 'gzip')") == [{"n": 1}]
+    refusal = {"parquet": err(f"SELECT * FROM '{here}/dir/one.parquet.gz'"), "option": err(f"SELECT * FROM read_parquet('{here}/dir/', compression => 'gzip')"),
+               "codec": err(f"COPY (SELECT 1 AS a) TO '{here}/lz.csv' (FORMAT csv, COMPRESSION lz4)"), "arrow": err(f"COPY (SELECT 1 AS a) TO '{here}/a.arrow' (FORMAT arrow, COMPRESSION gzip)")}
+    checks["a compression refused by name: a Parquet name's .gz (compressed inside the file), read_parquet's compression, COPY COMPRESSION lz4, COMPRESSION on Arrow"] = \
+        "compressed inside the file" in refusal["parquet"] and "parquet has no option compression" in refusal["option"] \
+        and "compression lz4" in refusal["codec"] and "COMPRESSION and ROW_GROUP_SIZE are Parquet's" in refusal["arrow"]
+    using, vector = refused("CREATE TABLE ut (a BIGINT) USING delta"), refused("CREATE TABLE vt (v VECTOR(3))")
+    checks["CREATE TABLE … USING delta and VECTOR(3) are refused by name with SQLSTATE 0A000, and no table is made"] = \
+        using[0] != 200 and using[1] == "0A000" and "USING delta" in using[2] and vector[0] != 200 and vector[1] == "0A000" and "VECTOR(n)" in vector[2] \
+        and "not found" in err("SELECT * FROM ut") and "not found" in err("SELECT * FROM vt")
     # The program that started the node has its answers remembered too (apart from anyone else's),
     # but never a statement that reads files: a file here changes on its own.
     import re
@@ -372,12 +461,12 @@ def external():
     q("DROP TABLE c1")
     checks["DROP TABLE drops it; its file stays"] = "not found" in err("SELECT * FROM c1") and os.path.exists(os.path.join(here, "a.csv"))
     said = {"one file": err("INSERT INTO j1 VALUES ('z', 3)"), "update": err("UPDATE ev SET name = 'x'"), "avro": err("CREATE EXTERNAL TABLE b1 STORED AS AVRO LOCATION 'x.avro'"),
-            "gzip": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'gzip')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
+            "codec": err("CREATE EXTERNAL TABLE b2 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.compression' 'lz4')"), "none": err("CREATE EXTERNAL TABLE b3 STORED AS CSV LOCATION 'nothing.csv'"),
             "temp": err("CREATE TEMPORARY EXTERNAL TABLE b4 STORED AS CSV LOCATION 'a.csv'"), "option": err("CREATE EXTERNAL TABLE b5 STORED AS CSV LOCATION 'a.csv' OPTIONS ('format.null_regex' 'x')"),
             "view": (q("CREATE VIEW v AS SELECT 1 AS a"), err("INSERT INTO v VALUES (2)"))[1],
             "not owner": _raises_text(lambda: call(other.port, "POST", "/sql", f"CREATE EXTERNAL TABLE z STORED AS PARQUET LOCATION '{here}/dir/'".encode()))}  # (a path on the server's disk: a client's relative name is the lake's files, below)
-    checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, gzip, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
-        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "gzip" in said["gzip"] and "no file matches" in said["none"] \
+    checks["what it can't do, it says: INSERT into one file, UPDATE, Avro, a compression Pondra doesn't have, no files, TEMPORARY, an option it doesn't read, INSERT into a view; others' files need the owner"] = \
+        "view of a folder" in said["one file"] and "UPDATE" in said["update"] and "avro" in said["avro"] and "compression lz4" in said["codec"] and "no file matches" in said["none"] \
         and "TEMP VIEW" in said["temp"] and "null_regex" in said["option"] and "is a view" in said["view"] and "through a node it started itself" in said["not owner"]
     # A lake table's files are the lake's: LOCATION was dropped and the table made in the lake; and
     # a DELETE of an attached Delta table read "no table" with its path.
@@ -890,7 +979,7 @@ def outside():
     checks["a file changed under its name, or one more in a folder: the next query, at once, reads them as they are now"] = (before == [{"s": 13}] and q(total) == [{"s": 50}]
         and small == [{"n": 3, "m": 3, "s": 6}] and more == [{"n": 5003, "m": 4999, "s": 12497506}] and _try(lambda: q(xs, 1)) == [{"n": 5003, "m": 4999, "s": 12497524}])
     checks["refused by name: an unknown option, a compressed file, an unknown format"] = all(w in refused(s, owner=True) for s, w in [
-        ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.csv.gz'", "compressed"), ("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
+        ("SELECT * FROM read_csv('s3://ext/drop/orders.csv', bogus => 1)", "no option bogus"), ("SELECT * FROM 's3://ext/x.parquet.gz'", "compressed inside the file"),("SELECT * FROM 's3://ext/x.xlsx'", "which format")])
     # COPY … TO: files out, in each format, read back by pyarrow and by Pondra.
     got = lambda key: s3.get_object(Bucket="ext", Key=key)["Body"].read()
     keys = lambda prefix: sorted(o["Key"] for o in s3.list_objects_v2(Bucket="ext", Prefix=prefix).get("Contents", []))
@@ -2118,6 +2207,14 @@ def serverless_guest(port):
     checks["g a bad statement prints Error: with a node's words for it, and exits 1"] = \
         reply.status != 200 and rc10 == 1 and err10 == f"Error: {words}"
     node.kill()
+
+    # h. `--dir :memory:`: a lake held in the process's memory for its statements, as DuckDB's `:memory:` is: they answer,
+    # and nothing is written where it ran
+    there = tempfile.mkdtemp(prefix="pondra-memory-")
+    p = subprocess.run([BIN, "sql", "--dir", ":memory:", "CREATE TABLE m AS SELECT 7 AS a; SELECT a FROM m"], capture_output=True, text=True, cwd=there, timeout=120)
+    checks["h --dir :memory: answers from a lake in memory and writes nothing where it ran"] = \
+        p.returncode == 0 and shown(p.stdout, 7) and os.listdir(there) == []
+    shutil.rmtree(there, ignore_errors=True)
     shutil.rmtree(folder, ignore_errors=True)
     return checks, times
 
@@ -4540,6 +4637,51 @@ def flight():
     checks.update(flight_protocol(fport))  # (the protocol's own actions and RPCs, over gRPC)
     checks.update(flight_schemas(fport))  # (the schema each query announces is the one its stream sends)
     checks.update(_flight_announced(client, opts))  # (list_flights' schema is the one its ticket streams)
+    # A script's answer is kept for its ticket and counts in the query memory while it is kept: the gauge rises by the answer's
+    # 5 MB at GetFlightInfo (no DoGet), and falls back once the ticket reads it.
+    gauge = lambda: metrics_of(port, headers={"authorization": "Bearer a"})["pondra_memory_reserved_bytes"]
+    kept_script = "SET x = 1; SELECT repeat('a', 1000) AS s FROM generate_series(1, 5000)"
+    def pb_varint(n):
+        out = bytearray()
+        while n > 0x7F:
+            out.append((n & 0x7F) | 0x80)
+            n >>= 7
+        return bytes(out + bytes([n]))
+    pb_ld = lambda num, data: pb_varint(num << 3 | 2) + pb_varint(len(data)) + data
+    # Flight SQL's CommandStatementQuery, packed in an Any, as ADBC sends it: the JSON command takes one statement only.
+    statement_cmd = pb_ld(1, b"type.googleapis.com/arrow.flight.protocol.sql.CommandStatementQuery") + pb_ld(2, pb_ld(1, kept_script.encode()))
+    gauge_before = gauge()
+    kept_info = client.get_flight_info(fl.FlightDescriptor.for_command(statement_cmd), opts("r"))
+    kept_rise = gauge() - gauge_before
+    kept_rows = client.do_get(kept_info.endpoints[0].ticket, options=opts("r")).read_all()
+    kept_back = gauge() - gauge_before
+    checks["a script's answer counts in the query memory while kept (the gauge rises by its 5 MB at GetFlightInfo, with no DoGet), and falls back once its ticket reads it"] = \
+        kept_rise >= 5_000_000 and kept_rows.num_rows == 5000 and kept_back < 1 << 20
+    # A script's COMMIT is refused as SQL, with or without a transaction (no transaction: the first check).
+    def sqlstate_of(run):
+        try:
+            run()
+        except Exception as e:  # (ADBC's error carries the status's metadata, as via_flight reads it)
+            meta = {(k.decode() if isinstance(k, bytes) else k): (v.decode() if isinstance(v, bytes) else v) for k, v in (getattr(e, "details", None) or [])}
+            return meta.get("x-pondra-sqlstate") or "refused: " + str(e).splitlines()[0][:160]
+        return None
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=True)
+    plain_commit = sqlstate_of(lambda: conn.cursor().execute("SELECT 1; COMMIT"))
+    conn.close()
+    # Inside a transaction the protocol began, a transaction word run as SQL is refused too: in a script, a block, a procedure's
+    # COMMIT (CALL) and a savepoint. Each runs in its own transaction, since a refused statement fails the one it is in.
+    q("CREATE PROCEDURE commits() AS BEGIN INSERT INTO ev VALUES ('proc', 1, TIMESTAMP '2026-09-22 10:00:00'); COMMIT; END")
+    rows_before_txn = count()["n"]
+    txn_refused = {}
+    for name, stmt in [("script", "SELECT 1; COMMIT"), ("block", "BEGIN SELECT 1; COMMIT; END"), ("CALL", "CALL commits()"), ("savepoint", "BEGIN SAVEPOINT s; END")]:
+        conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=False)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO ev VALUES ('txn', 1, TIMESTAMP '2026-09-22 10:00:00')")
+        txn_refused[name] = sqlstate_of(lambda: cur.execute(stmt))
+        conn.rollback()
+        conn.close()
+    checks["a transaction word run as SQL is refused over Flight SQL (0A000): a script's COMMIT, a block's, a CALL's and a savepoint's, in a transaction the protocol began, and the rows of those transactions are rolled back, not committed"] = \
+        plain_commit == "0A000" and all(v == "0A000" for v in txn_refused.values()) and count()["n"] == rows_before_txn
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
@@ -4567,7 +4709,7 @@ def flight():
     node.kill(); follower.kill()
     ok = all(checks.values())
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
-    print(json.dumps({"flight": checks, "follow_ms": follow_ms, "ok": ok}, indent=1))
+    print(json.dumps({"flight": checks, "follow_ms": follow_ms, "kept_gauge": {"before": gauge_before, "at_getflightinfo": gauge_before + kept_rise, "after_doget": gauge_before + kept_back}, "ok": ok}, indent=1))
     if not ok:
         print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total)
         sys.exit(1)
@@ -7949,6 +8091,7 @@ def history():
         shares = {s["node"] for s in trace if s["what"] in ("its share", "step 0")}
         checks["…spread over three nodes: each node's share in its trace"] = len(spread) == 1 and spread[0]["nodes"] == 3 and shares == {f"127.0.0.1:{A.port + i}" for i in range(3)}
         checks["…and a line in the node's log"] = "slow statement:" in open(b.log).read() and "h-slow" in open(b.log).read()
+        checks["…a statement spread over the nodes has no cost: the other nodes' parts come back as rows, not metrics"] = len(spread) == 1 and all(spread[0].get(k) is None for k in ("cpu_ms", "bytes_read", "peak_memory"))
         # PONDRA_HISTORY=off: nothing from that node
         q("SELECT 5 AS x -- h-off", 2)
         time.sleep(2.5)
@@ -7964,6 +8107,54 @@ def history():
         skipped = sum(r["rows"] for r in q("SELECT rows FROM pondra.history WHERE class = 'skipped'"))
         seen["rate"] = {"written": len(written), "skipped": skipped}
         checks["past PONDRA_HISTORY_RATE a second: the rest counted in one row, not written"] = 40 <= len(written) <= 80 and len(written) + skipped == 120
+        # The cost of a statement (`cpu_ms`, the bytes its Parquet files gave it, `peak_memory`): a read's, from its own plan
+        # and pool; a write's and a DDL's are NULL, and so is a skipped row's
+        time.sleep(1.5)  # (a new second: the 120 statements above spent this one's rate, and a skipped statement has no row)
+        q("/* h-ddl */ CREATE TABLE cost (a BIGINT)")
+        q("/* h-write */ INSERT INTO cost SELECT value FROM range(0, 20000)")
+        q("/* h-write */ INSERT INTO cost SELECT value FROM range(20000, 40000)")
+        call(A.port, "POST", "/tier")  # (rows in the log are read from memory, which `bytes_read` doesn't count: tiered, they are files)
+        q("SELECT sum(a) AS s FROM cost -- h-cost")
+        def rows_where(sql, want, secs=15):  # (a DDL and a write are stored as sent, minus their leading comment: matched by text)
+            deadline = time.time() + secs
+            while len(got := q(sql)) < want and time.time() < deadline:
+                time.sleep(0.5)
+            return got
+        cost = until("h-cost")
+        ddl = rows_where("SELECT * FROM pondra.history WHERE class = 'ddl' AND statement LIKE 'CREATE TABLE cost%'", 1)
+        write = rows_where("SELECT * FROM pondra.history WHERE class = 'write' AND statement LIKE 'INSERT INTO cost%'", 2)
+        seen["cost"] = [{k: r.get(k) for k in ("cpu_ms", "bytes_read", "peak_memory")} for r in cost]
+        seen["ddl and writes"] = [{k: r.get(k) for k in ("statement", "class", "cpu_ms", "bytes_read", "peak_memory")} for r in ddl + write]
+        checks["a read's cost: its cpu_ms, the bytes its Parquet files gave it, its peak memory"] = len(cost) == 1 \
+            and cost[0].get("cpu_ms") is not None and cost[0]["cpu_ms"] >= 0 \
+            and (cost[0].get("bytes_read") or 0) > 0 and (cost[0].get("peak_memory") or 0) > 0
+        checks["a write and a DDL have no cost (their plans aren't measured)"] = len(ddl) == 1 and len(write) == 2 and all(r.get(k) is None for r in ddl + write for k in ("cpu_ms", "bytes_read", "peak_memory"))
+        skipped_rows = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE class = 'skipped'")
+        checks["a skipped row has no cost"] = len(skipped_rows) > 0 and all(v is None for r in skipped_rows for v in r.values())
+        # An older release's lake: its history gains the cost columns at the next row, its old rows NULL and the new node's rows costed
+        old_bin = os.environ.get("PONDRA_HISTORY_OLD_BIN")  # (a build from before these columns: skipped without one)
+        if old_bin:
+            old_lake = new_lake()
+            old = Node(old_lake, A.port + 4, bin=old_bin).start()
+            q("CREATE TABLE t (a BIGINT)", 4)
+            q("INSERT INTO t VALUES (1), (2)", 4)
+            call(A.port + 4, "POST", "/tier")
+            q("SELECT sum(a) AS s FROM t -- h-old", 4)
+            time.sleep(2.5)  # (the history writer writes what it has once a second)
+            old.kill()
+            new = Node(old_lake, A.port + 4).start()
+            q("SELECT sum(a) AS s FROM t -- h-after", 4)
+            deadline = time.time() + 15
+            while not q("SELECT statement FROM pondra.history WHERE statement LIKE '%h-after%' AND statement NOT LIKE '%pondra.history%'", 4) and time.time() < deadline:
+                time.sleep(0.5)
+            old_row = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE statement LIKE '%h-old%' AND statement NOT LIKE '%pondra.history%'", 4)
+            new_row = q("SELECT cpu_ms, bytes_read, peak_memory FROM pondra.history WHERE statement LIKE '%h-after%' AND statement NOT LIKE '%pondra.history%'", 4)
+            new.kill()
+            seen["older lake"] = {"old": old_row, "new": new_row}
+            checks["an older lake's history gains the cost columns: its old rows have none, the new node's rows have theirs"] = \
+                len(old_row) == 1 and all(v is None for v in old_row[0].values()) and len(new_row) == 1 and new_row[0].get("cpu_ms") is not None and (new_row[0].get("bytes_read") or 0) > 0
+        else:
+            seen["older lake"] = "skipped: PONDRA_HISTORY_OLD_BIN is not set"
         # An admin reads every row; a user, their own
         basic = lambda u, p: {"Authorization": "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()}
         ann, boss = basic("ann", "ann-password-1"), basic("boss", "boss-password-1")
@@ -23139,6 +23330,610 @@ def dialects():
     return f"dialects: {sum(ran.values())} of {len(rows)} newcomers' statements run, the rest refused with a SQLSTATE; columns named as system ones change: all {len(checks)} checks pass"
 
 
+# ---------------------------------------------------------------- EMIT FINAL: skip rules, restarts, three nodes, cost (ADR-073 step 8c)
+# The state tables `{v}$held` and `{v}$resume` are hidden from SQL (a `$` name), so the checks read them through `/watch`,
+# which a superuser's stream answers. The oracle is the view's plain MATCH_RECOGNIZE query over its table, less the matches
+# that start at or after each key's resume point: the first held row after its k look-back rows, else the key's first row
+# after the watermark (no run has read it yet), else none. No row is late in these tests (rows come in time order, and
+# the lateness keeps a tie across commits from being late), so the plain query is over the whole table.
+
+EF_TICK_DEF = "DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)"
+EF_ONE = "MATCH_NUMBER() AS mn, FIRST(day) AS s, LAST(down.day) AS bottom, LAST(up.day) AS e"
+EF_ALL = "MATCH_NUMBER() AS mn, FIRST(day) AS s, FINAL count(*) AS n, LAST(down.price) AS d"
+EF_READS = ("DEFINE down AS down.price < PREV(down.price) AND count(down.*) < 8, "
+            "up AS up.price > PREV(up.price) AND up.price > LAST(down.price) AND count(up.*) < 6")
+EF_PREV3 = "DEFINE down AS down.price < PREV(down.price, 3), up AS up.price > PREV(up.price, 3)"
+
+
+def ef_tick_sql(measures, rows_per, skip, pattern="strt down+ up+", define=EF_TICK_DEF, within=""):
+    """The ticker's query over `ticks`, without an ORDER BY: the same text is the EMIT FINAL view's (less EMIT FINAL)."""
+    return (f"SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES {measures} {rows_per} "
+            f"AFTER MATCH SKIP {skip} PATTERN ({pattern}){within} {define})")
+
+
+def ef_ticks():
+    """matches_random's ticks: 50 symbols, a price walk over 40 days, as (symbol, day, price) rows."""
+    rng = random.Random(7)
+    out = []
+    for k in range(50):
+        price = 100
+        for day in range(1, 41):
+            price = max(1, price + rng.randint(-3, 3))
+            out.append((f"s{k:02d}", day, price))
+    return out
+
+
+def ef_tick_commit(ticks, c):
+    """The ticks of commit c (0-based): days 4c+1 to 4c+4, so the commits come in time order."""
+    return [t for t in ticks if 4 * c < t[1] <= 4 * c + 4]
+
+
+def ef_tick_values(rows):
+    """The VALUES of INSERT INTO ticks for these rows (ts is the day in minutes from 2026-10-01 00:00)."""
+    from datetime import datetime, timedelta
+    base = datetime(2026, 10, 1)
+    return ", ".join(f"('{s}', {d}, TIMESTAMP '{base + timedelta(minutes=d):%Y-%m-%d %H:%M:%S}', {p})" for s, d, p in rows)
+
+
+def ef_random_sql(table, pattern, skip, mode, spec, within, define, order="ts"):
+    """patterns_check's random query over `table`, ordered by `order` and without the final ORDER BY (a view's text)."""
+    import patterns_check as pc
+    measures = ", ".join(pc.measure_text(x) for x in spec)
+    clause = "" if within is None else f" WITHIN INTERVAL '{within[1]}' {within[0]}"
+    defs = ", ".join(f"{s} AS {define[s]}" for s in "abc")
+    return (f"SELECT * FROM {table} MATCH_RECOGNIZE (PARTITION BY p ORDER BY {order} MEASURES {measures} {pc.ROWS_PER[mode]} "
+            f"AFTER MATCH SKIP {skip} PATTERN ({pattern}){clause} DEFINE {defs})")
+
+
+def ef_view(name, table, keys, start, plain, late_secs):
+    """A view to check: its name, the table it reads, its PARTITION BY columns, the column of its first row's value (the
+    match's `s`), its plain query (no EMIT FINAL), and its lateness in seconds."""
+    return {"name": name, "table": table, "keys": keys, "start": start, "plain": plain, "late": late_secs}
+
+
+def ef_when(s):
+    """A timestamp as the node's JSON answer writes it, as a datetime (rows compare as the time does)."""
+    from datetime import datetime
+    return datetime.fromisoformat(s)
+
+
+def ef_watch(port, name, after=0, secs=0.5, partial=False, marks=None):
+    """The rows of a hidden table (`{v}$held`, `{v}$resume`) as the node streams them, in the order each version was
+    written. A table with no rows after `after` answers nothing, so the wait of `secs` is its empty answer. With `partial`, the
+    rows read before a timeout are returned, for a poll that looks for one row. `marks`, when given, gets the version the
+    rows were read up to (the `_after` line), to read on from."""
+    import socket
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=secs)
+    out = []
+    try:
+        c.request("GET", f"/watch/{name.replace('$', '%24')}?after={after}&marks=true")
+        r = c.getresponse()
+        if r.status != 200:
+            raise RuntimeError(f"/watch/{name}: {r.status} {r.read()[:200]!r}")
+        while (line := r.readline()):
+            row = json.loads(line)
+            if "_after" in row:
+                if marks is not None:
+                    marks.append(row["_after"])
+                break
+            out.append(row)
+    except socket.timeout:
+        if out and not partial:
+            raise RuntimeError(f"/watch/{name}: the stream stopped after {len(out)} rows")
+    finally:
+        c.close()
+    return out
+
+
+EF_SEEN = {}  # (port, hidden table): the version ef_since last read it up to, and its rows by key then
+
+
+def ef_since(port, name, key_of, secs=1):
+    """A hidden table's rows now, each key's last version, as `port` serves them. A read asks only for the versions
+    since the last one's mark and adds them to what was read before: a replay from 0 reads the lake's whole log, which
+    took 8 to 20 s a table by the tenth commit, past any short wait. No new version by `secs` leaves the rows as they
+    were (a slow answer is read again by the next pass). A section clears EF_SEEN when it starts a lake."""
+    mark, rows = EF_SEEN.get((port, name), (0, {}))
+    got = []
+    for r in ef_watch(port, name, after=mark, secs=secs, marks=got):
+        rows[key_of(r)] = r
+    EF_SEEN[(port, name)] = (got[-1] if got else mark, rows)
+    return rows
+
+
+def ef_state(port, view, keys, secs=1):
+    """A view's state in the lake: each key's k (`{v}$resume`), and each key's held rows as (time, row id), in order
+    (`{v}$held`). Each row's last version wins, and a deleted one is gone."""
+    resume = {k: None if r.get("_deleted") else r["k"]
+              for k, r in ef_since(port, f"{view}$resume", lambda r: tuple(r[c] for c in keys), secs).items()}
+    last = {i: None if r.get("_deleted") else r for i, r in ef_since(port, f"{view}$held", lambda r: r["__mr_row"], secs).items()}
+    held = {}
+    for r in last.values():
+        if r is not None:
+            held.setdefault(tuple(r[c] for c in keys), []).append((ef_when(r["ts"]), r["__mr_row"]))
+    for rows in held.values():
+        rows.sort()
+    return {k: v for k, v in resume.items() if v is not None}, held
+
+
+def ef_table(port, table, keys, start, late_secs):
+    """A source table's rows by key, as (time, row id, start value); each start value's (time, row id) by key; and W, the
+    newest time less the lateness (views::watermark)."""
+    from datetime import timedelta
+    rows_of, start_of, newest = {}, {}, None
+    for r in sql(port, f"SELECT {', '.join(keys)}, {start}, ts, _row_id FROM {table}"):
+        key, t, rid = tuple(r[c] for c in keys), ef_when(r["ts"]), r["_row_id"]
+        rows_of.setdefault(key, []).append((t, rid, r[start]))
+        start_of[(key, r[start])] = (t, rid)
+        newest = t if newest is None or t > newest else newest
+    return rows_of, start_of, None if newest is None else newest - timedelta(seconds=late_secs)
+
+
+def ef_expected(plain, rows_of, start_of, w, resume, held, keys):
+    """The rows a view must hold, out of the plain query's: those of the matches that start before their key's resume
+    point. The point is the first held row after the key's k look-back rows; with none, the key's first row after W; with
+    neither, none (every match of the key is decided)."""
+    point = {}
+    for key, rows in rows_of.items():
+        h, k = held.get(key, []), resume.get(key, 0)
+        if len(h) > k:
+            point[key] = h[k]
+        else:
+            later = [(t, rid) for t, rid, _ in rows if w is not None and t > w]
+            point[key] = min(later) if later else None
+    out = []
+    for r in plain:
+        key = tuple(r[c] for c in keys)
+        at = point.get(key)
+        if at is None or start_of[(key, r["s"])] < at:
+            out.append(r)
+    return out
+
+
+def ef_expect(port, v, tabs):
+    """The rows view `v` must hold now, from the lake's state as `port` reads it (`tabs` caches the source tables)."""
+    tkey = (v["table"], tuple(v["keys"]), v["start"], v["late"])
+    if tkey not in tabs:
+        tabs[tkey] = ef_table(port, v["table"], v["keys"], v["start"], v["late"])
+    rows_of, start_of, w = tabs[tkey]
+    resume, held = ef_state(port, v["name"], v["keys"])
+    if ("plain", v["name"]) not in tabs:  # (the source is the same in every pass of one settle)
+        tabs[("plain", v["name"])] = sql(port, v["plain"])
+    plain = tabs[("plain", v["name"])]
+    return ef_expected(plain, rows_of, start_of, w, resume, held, v["keys"]), held, resume
+
+
+def mn_gaps(rows, keys):
+    """How many keys have written MATCH_NUMBER()s that are not 1 to n."""
+    per = {}
+    for r in rows:
+        per.setdefault(tuple(r[c] for c in keys), set()).add(r["mn"])
+    return sum(sorted(s) != list(range(1, len(s) + 1)) for s in per.values())
+
+
+def ef_pass(port, views, view_ports=None, tabs=None):
+    """Each view, once, against the lake as it is now: its rows, read through each of `view_ports` (the state through
+    `port`), equal the expected rows as multisets, and its MATCH_NUMBER()s run 1 to n with no gap per key. Returns
+    {name: {ok, gaps, want, got, missing, extra}}, with at most three examples of a miss. `tabs` caches the source
+    tables and the plain queries, which do not change while one settle runs. The views are read eight at a time: a state
+    table with no new version answers only when ef_since's wait ends."""
+    import patterns_check as pc
+    from collections import Counter
+    from concurrent.futures import ThreadPoolExecutor
+    tabs = {} if tabs is None else tabs
+
+    def one(v):
+        t0 = time.time()
+        want, held, resume = ef_expect(port, v, tabs)
+        wc = Counter(pc.canon(r) for r in want)
+        res = {"ok": True, "gaps": 0, "want": len(want), "got": None, "missing": [], "extra": []}
+        for i, p in enumerate(view_ports or [port]):
+            got = sql(p, f"SELECT * FROM {v['name']}")
+            gc = Counter(pc.canon(r) for r in got)
+            if gc != wc:
+                res["ok"] = False
+                res["missing"] = [dict(x) for x in list((wc - gc).elements())[:3]]
+                res["extra"] = [dict(x) for x in list((gc - wc).elements())[:3]]
+            if i == 0:
+                res["got"], res["gaps"] = len(got), mn_gaps(got, v["keys"])
+        res["ok"] = res["ok"] and res["gaps"] == 0
+        res["secs"] = round(time.time() - t0, 2)
+        return v["name"], res
+    with ThreadPoolExecutor(8) as pool:
+        return dict(pool.map(one, views))
+
+
+def ef_settle(port, views, view_ports=None, secs=60, quiet=1):
+    """Each view checked after a commit. The node is left alone for `quiet` seconds, then one pass reads every view's rows
+    and state (the state's new versions only: ef_since). A view still wrong
+    gets another quiet wait and pass, until all are right or `secs` have passed: then the last pass, and the views
+    still wrong go to stderr. The source does not change during one settle, so its tables and plain queries are read once."""
+    t0, deadline, passes, tabs = time.time(), time.time() + secs, 0, {}
+    while True:
+        time.sleep(quiet)
+        t_pass = time.time()
+        res = ef_pass(port, views, view_ports, tabs)
+        passes += 1
+        if time.time() - t_pass > 15:  # (a slow pass is named: the views it spent its time on)
+            slow = sorted(((r["secs"], n) for n, r in res.items()), reverse=True)[:3]
+            print(f"ef_settle: a pass took {time.time() - t_pass:.1f} s, slowest views (s, name): {slow}", file=sys.stderr, flush=True)
+        if all(r["ok"] for r in res.values()):
+            print(f"ef_settle: {len(views)} views right in {passes} pass(es), {time.time() - t0:.1f} s", file=sys.stderr, flush=True)
+            return res
+        if time.time() > deadline:
+            wrong = {n: (r["want"], r["got"], r["gaps"]) for n, r in res.items() if not r["ok"]}
+            print(f"ef_settle: {len(wrong)} views still wrong after {secs} s (want, got, gaps): {wrong}", file=sys.stderr, flush=True)
+            return res
+
+
+def ef_stderr_runs(node):
+    """The run errors a node wrote to its stderr (`emission of <view>: ...`)."""
+    return [line for line in open(node.log, errors="replace").read().splitlines() if "emission of" in line]
+
+
+def matches_random():
+    """EMIT FINAL over a MATCH_RECOGNIZE, every skip rule (ADR-073 step 8c, the design's check 5). Two tables on one node:
+    `ticks`, 50 symbols of 40 days, in 10 commits of four days each, and `seqs`, the 4 partitions of patterns_check.py's
+    generator (seed 1), in 10 commits in time order. Views of `ticks`: 13 fixed ones (ONE ROW and ALL ROWS PER MATCH under each
+    AFTER MATCH SKIP rule, a DEFINE that reads the match with LAST and an aggregate, PREV(price, 3), WITHIN, a reluctant and an
+    alternating pattern). Views of `seqs`: the generator's random queries, less the anchors, WITH UNMATCHED ROWS and the
+    patterns that can match empty (a match with no row has no start to read in SQL), ordered by ts (an INT ORDER BY is
+    refused); a query the engine refuses 0A000 is counted and skipped, and so is one whose plain query answers an error.
+    Every view is checked after each commit against the oracle of ef_expected. Returns (checks, info)."""
+    import patterns_check as pc
+    from collections import Counter
+    from datetime import datetime, timedelta
+    checks, info = {}, {}
+    lake = new_lake()
+    EF_SEEN.clear()
+    port = A.port
+    node = Node(lake, port, tier_secs=1).start()
+    q = lambda s: sql(port, s)
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE TABLE seqs (p INT, i INT, ts TIMESTAMP, dt DATE, ca BOOLEAN, cb BOOLEAN, cc BOOLEAN)")
+    q("CREATE TABLE seqs_all (p INT, i INT, ts TIMESTAMP, dt DATE, ca BOOLEAN, cb BOOLEAN, cc BOOLEAN)")
+    prng = random.Random(1)  # patterns_check's seed: its data first, then its queries
+    data = pc.gen_data(prng)
+    seq_rows = sorted((r for _, rows in data for r in rows), key=lambda r: (r["ts"], r["p"], r["i"]))
+    seq_values = lambda rows: ", ".join(
+        f"({r['p']}, {r['i']}, {pc.sql_value(r['ts'])}, {pc.sql_value(r['dt'])}, {pc.sql_value(r['ca'])}, "
+        f"{pc.sql_value(r['cb'])}, {pc.sql_value(r['cc'])})" for r in rows)
+    n_seq = len(seq_rows)
+    seq_commit = lambda c: seq_rows[c * n_seq // 10:(c + 1) * n_seq // 10]
+    q("INSERT INTO seqs_all VALUES " + seq_values(seq_rows))  # (the pre-check of each random query runs over all of them)
+    ticks = ef_ticks()
+
+    fixed = [
+        ("f_one_past", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW")),
+        ("f_one_next", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "TO NEXT ROW")),
+        ("f_one_last_up", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "TO LAST up")),
+        ("f_one_first_down", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "TO FIRST down")),
+        ("f_all_past", ef_tick_sql(EF_ALL, "ALL ROWS PER MATCH", "PAST LAST ROW")),
+        ("f_all_next", ef_tick_sql(EF_ALL, "ALL ROWS PER MATCH", "TO NEXT ROW")),
+        ("f_all_last_up", ef_tick_sql(EF_ALL, "ALL ROWS PER MATCH", "TO LAST up")),
+        ("f_one_reads_match", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW", define=EF_READS)),
+        ("f_one_prev3", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW", define=EF_PREV3)),
+        ("f_all_prev3", ef_tick_sql(EF_ALL, "ALL ROWS PER MATCH", "TO NEXT ROW", define=EF_PREV3)),
+        ("f_one_within", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW", within=" WITHIN INTERVAL '6' MINUTE")),
+        ("f_one_reluctant", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW", pattern="strt down+ up+?")),
+        ("f_one_alt", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "TO NEXT ROW", pattern="strt (down up | up down)+")),
+    ]
+    views, refused = [], {}
+    for name, text in fixed:
+        made = pc.post_sql(port, f"CREATE MATERIALIZED VIEW {name} WITH (lateness = '1 minute') AS {text} EMIT FINAL")
+        if made["ok"]:
+            views.append(ef_view(name, "ticks", ["symbol"], "day", text, 60))
+        else:
+            refused[name] = f"{made['code']} {made['msg'][:160]}"
+    info["fixed views refused at creation"] = refused
+
+    # the generator's random queries: each is made as a view, unless it is left out, refused, or its plain query fails
+    def has_anchor(t):
+        if isinstance(t, tuple) and t and t[0] == "anchor":
+            return True
+        return isinstance(t, (tuple, list)) and any(has_anchor(x) for x in t)
+    skipped, kinds, rand_views, tries = {}, Counter(), [], 0
+    def skip_because(why):
+        skipped[why] = skipped.get(why, 0) + 1
+    while len(rand_views) < 20 and tries < 400:
+        tries += 1
+        tree, text = pc.gen_pattern(prng)
+        skip = pc.gen_skip(prng)
+        mode = prng.choices(pc.MODES, pc.MODE_WEIGHTS)[0]
+        spec = pc.random_spec(prng, mode)
+        within = ("MINUTE", prng.choice(pc.WITHIN_MINUTES)) if prng.random() < 0.3 else None
+        define = pc.random_define(prng)
+        if mode == "unmatched":
+            skip_because("WITH UNMATCHED ROWS")
+            continue
+        if has_anchor(tree):
+            skip_because("an anchor")
+            continue
+        if pc.nullable(tree):
+            skip_because("a pattern that can match empty")
+            continue
+        pre = pc.post_sql(port, ef_random_sql("seqs_all", text, skip, mode, spec, within, define))
+        if not pre["ok"]:
+            skip_because(f"its plain query answers {pre['code']}")
+            continue
+        plain = ef_random_sql("seqs", text, skip, mode, spec, within, define)
+        name = f"rv{len(rand_views) + 1:02d}"
+        made = pc.post_sql(port, f"CREATE MATERIALIZED VIEW {name} WITH (lateness = '1 minute') AS {plain} EMIT FINAL")
+        if not made["ok"]:
+            skip_because(f"the view refuses {made['code']}")
+            continue
+        rand_views.append(ef_view(name, "seqs", ["p"], "i", plain, 60))
+        kinds[mode] += 1
+        kinds["WITHIN" if within else "no WITHIN"] += 1
+        kinds["DEFINE reads the match" if define is not pc.DEFAULT_DEFINE else "DEFINE of the seqs' booleans"] += 1
+    views += rand_views
+    info["random: candidates tried, views made, skipped by reason"] = [tries, len(rand_views), skipped]
+    info["random: views by kind"] = dict(kinds)
+    probe = pc.post_sql(port, "CREATE MATERIALIZED VIEW ef_by_int WITH (lateness = '1 minute') AS SELECT * FROM ticks "
+                              "MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day MEASURES FIRST(day) AS s ONE ROW PER MATCH "
+                              "PATTERN (strt down+ up+) " + EF_TICK_DEF + ") EMIT FINAL")
+    info["ORDER BY an INT column, refused as"] = probe["code"] if not probe["ok"] else "accepted"
+
+    # the commits: each one's rows, then every view checked until it is right
+    per_commit = []
+    for c in range(10):
+        q("INSERT INTO ticks VALUES " + ef_tick_values(ef_tick_commit(ticks, c)))
+        q("INSERT INTO seqs VALUES " + seq_values(seq_commit(c)))
+        per_commit.append(ef_settle(port, views, secs=120))
+    names = [v["name"] for v in views]
+    fixed_names = [name for name, _ in fixed if name not in refused]
+    rand_names = [v["name"] for v in rand_views]
+    fixed_ok = sum(per_commit[c][nm]["ok"] for c in range(10) for nm in fixed_names if nm in per_commit[c])
+    rand_ok = sum(per_commit[c][nm]["ok"] for c in range(10) for nm in rand_names)
+    info["fixed: commits right, views"] = [fixed_ok, 10 * len(fixed_names)]
+    info["random: commits right, views"] = [rand_ok, 10 * len(rand_names)]
+    last = per_commit[-1]
+    info["final rows: view, want, got"] = {nm: [last[nm]["want"], last[nm]["got"]] for nm in names if nm in last}
+    misses = [(c, nm, {k: per_commit[c][nm][k] for k in ("want", "got", "missing", "extra", "gaps")}) for c in range(10)
+              for nm in names if nm in per_commit[c] and not per_commit[c][nm]["ok"]][:4]
+    info["misses (commit, view, want, got, missing, extra, gaps)"] = misses
+    listed = {r["name"] for r in q("SELECT name FROM pondra.flows")}
+    runs_err = ef_stderr_runs(node)
+    checks[f"fixed: {len(fixed_names)} views of the ticker over 50 symbols (ONE ROW and ALL ROWS PER MATCH under each AFTER MATCH SKIP rule, "
+           f"a DEFINE that reads the match with LAST and an aggregate, PREV(price, 3), WITHIN, a reluctant and an alternating pattern) "
+           f"equal the oracle after each of the 10 commits, {fixed_ok} of {10 * len(fixed_names)} view-commits, with MATCH_NUMBER() "
+           f"counting on with no gap"] = bool(fixed_names) and fixed_ok == 10 * len(fixed_names)
+    checks[f"random: {len(rand_views)} views of patterns_check.py's generator (seed 1; less anchors, WITH UNMATCHED ROWS and empty "
+           f"matches) equal the oracle after each of the 10 commits, {rand_ok} of {10 * len(rand_views)} view-commits, with MATCH_NUMBER() "
+           f"counting on with no gap"] = len(rand_views) >= 15 and rand_ok == 10 * len(rand_views)
+    checks["every view of the 10 commits is listed in pondra.flows by its name"] = set(names) <= listed
+    checks["no run wrote an error to the node's stderr (`emission of <view>`)"] = not runs_err
+    info["stderr: run errors"] = runs_err[:5]
+    node.kill()
+    return checks, info
+
+
+def matches_restart():
+    """EMIT FINAL across a restart (ADR-073 step 8c, the design's check 7). One node on a lake of `ticks` (matches_random's
+    ticks, 10 commits of four days), with two views of the ticker, ONE ROW and ALL ROWS PER MATCH. The node is killed and
+    started again on the same lake after commit 3 (between commits); commit 6's INSERT is in flight when the node is killed
+    (a few milliseconds into it, so the commit is in or not, and it is made again when it is not); and the node is killed
+    after commit 8, before its run. Each view is checked against the oracle after every commit and every restart. Then the
+    same 10 commits go into a lake three nodes serve, written through each node in turn: after each commit each node's views
+    equal the oracle, and at the end they equal one node's views. Returns (checks, info)."""
+    import patterns_check as pc
+    from collections import Counter
+    checks, info = {}, {}
+    lake = new_lake()
+    EF_SEEN.clear()
+    port = A.port
+    node = Node(lake, port, tier_secs=1).start()
+    q = lambda s: sql(port, s)
+    ticks = ef_ticks()
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    texts = (("rs_one", ef_tick_sql(EF_ONE, "ONE ROW PER MATCH", "PAST LAST ROW")),
+             ("rs_all", ef_tick_sql(EF_ALL, "ALL ROWS PER MATCH", "TO NEXT ROW")))
+    views = []
+    for name, text in texts:
+        q(f"CREATE MATERIALIZED VIEW {name} WITH (lateness = '1 minute') AS {text} EMIT FINAL")
+        views.append(ef_view(name, "ticks", ["symbol"], "day", text, 60))
+    commit = lambda c: f"INSERT INTO ticks VALUES {ef_tick_values(ef_tick_commit(ticks, c))}"
+    landed = lambda c: q(f"SELECT count(*) AS n FROM ticks WHERE day > {4 * c} AND day <= {4 * c + 4}")[0]["n"]
+    restarts, rounds, labels = 0, [], []
+
+    def restart():
+        nonlocal node, restarts
+        node.kill()
+        node = Node(lake, port, tier_secs=1).start()
+        restarts += 1
+
+    flight = {}
+    for c in range(10):
+        number = c + 1  # the brief's commit numbers
+        if number == 6:
+            def insert():
+                try:
+                    flight["answer"] = call(port, "POST", "/sql", commit(c).encode(), timeout=60)
+                except Exception as e:
+                    flight["error"] = str(e)[:120]
+            t = threading.Thread(target=insert)
+            t.start()
+            time.sleep(0.003)
+            node.kill()
+            t.join()
+            restart()
+            flight["landed"] = landed(c) == 200
+            if not flight["landed"]:
+                assert landed(c) == 0, "a commit landed in part"
+                q(commit(c))  # not in: made again
+            flight["partly"] = landed(c) not in (0, 200)
+        else:
+            q(commit(c))
+        if number == 8:
+            restart()  # (killed with the commit in and its views not yet run)
+        rounds.append(ef_settle(port, views, secs=120))
+        labels.append(f"after commit {number}")
+        if number == 3:
+            restart()
+            rounds.append(ef_settle(port, views, secs=120))
+            labels.append("after a restart between commits 3 and 4")
+    final_one = {nm: Counter(pc.canon(r) for r in q(f"SELECT * FROM {nm}")) for nm, _ in texts}
+    info["restarts"] = restarts
+    info["commit 6 in flight"] = flight
+    info["rounds: each view's want, got, gaps"] = [{nm: [r[nm]["want"], r[nm]["got"], r[nm]["gaps"]] for nm, _ in texts} for r in rounds][-3:]
+    right = sum(r[nm]["ok"] for r in rounds for nm, _ in texts)
+    # (an ALL ROWS PER MATCH view has many rows per match, so a row is compared whole: no two rows of a view are alike)
+    dup = {nm: sum(v - 1 for v in Counter(pc.canon(r) for r in q(f"SELECT * FROM {nm}")).values() if v > 1) for nm, _ in texts}
+    info["restarts: rows of each view that appear more than once"] = dup
+    info["restarts: rows in ticks"] = q("SELECT count(*) AS n FROM ticks")[0]["n"]
+    info["rounds right"] = [right, len(rounds) * len(texts)]
+    runs_err = ef_stderr_runs(node)
+    checks[f"restarts: the node is killed and started again on the same lake {restarts} times (after commit 3, while commit 6's INSERT "
+           f"is in flight, after commit 8 before its run): each view == the oracle after every commit and every restart, "
+           f"{right} of {len(rounds) * len(texts)} view-rounds"] = right == len(rounds) * len(texts)
+    checks["restarts: nothing is written twice (no row of a view appears more than once), and the 2,000 rows are in once each"] = \
+        not any(dup.values()) and q("SELECT count(*) AS n FROM ticks") == [{"n": 2000}]
+    checks["restarts: no run wrote an error to the node's stderr"] = not runs_err
+    node.kill()
+
+    # three nodes on one lake: the same commits, each written through a node in turn
+    lake3 = new_lake()
+    EF_SEEN.clear()
+    ports3 = [port + 1 + i for i in range(3)]
+    nodes3 = [Node(lake3, p, tier_secs=1).start() for p in ports3]
+    q3 = lambda s: sql(ports3[0], s)
+    q3("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    views3 = []
+    for name, text in texts:
+        q3(f"CREATE MATERIALIZED VIEW {name}3 WITH (lateness = '1 minute') AS {text} EMIT FINAL")
+        views3.append(ef_view(f"{name}3", "ticks", ["symbol"], "day", text, 60))
+    three_rounds = []
+    for c in range(10):
+        sql(ports3[c % 3], commit(c))
+        three_rounds.append(ef_settle(ports3[0], views3, view_ports=ports3, secs=120))
+    same_as_one = {}
+    for nm, _ in texts:
+        got = Counter(pc.canon(r) for r in q3(f"SELECT * FROM {nm}3"))
+        same_as_one[nm] = got == final_one[nm]
+    three_right = sum(r[v["name"]]["ok"] for r in three_rounds for v in views3)
+    info["three nodes: view-rounds right"] = [three_right, 10 * len(views3)]
+    info["three nodes: final views equal one node's"] = same_as_one
+    runs_err3 = [e for n3 in nodes3 for e in ef_stderr_runs(n3)]
+    for n3 in nodes3:
+        n3.kill()
+    checks["three nodes on one lake: after each of the 10 commits, each node's two views == the oracle (commits written through each node in turn), "
+           f"{three_right} of {10 * len(views3)} view-rounds"] = three_right == 10 * len(views3)
+    checks["three nodes on one lake: at the end, each view equals the one-node lake's view"] = all(same_as_one.values())
+    checks["three nodes: no run wrote an error to a node's stderr"] = not runs_err3
+    return checks, info
+
+
+def matches_cost(sizes=(10_000, 100_000, 1_000_000), samples=3, keys_small=10, keys_big=1000):
+    """EMIT FINAL's cost (ADR-073 step 8c, the design's check 8). A run is timed from its commit (the INSERT's start) until the
+    view's state shows the run that took it: the key's `{v}$resume` row is written again. Three cases:
+    (1) one key, `hist2`, whose matches are all decided (zigzag prices: each search ends at the next row), with 10,000,
+        100,000 and 1,000,000 rows of history, each step one INSERT ... SELECT ... FROM generate_series, and one search open at
+        its tail; after each step one new row of the key is timed, the median of three. Checked: the largest median is under 3
+        times the smallest;
+    (2) the same sizes in `hist`, a key open from its first row (rising prices, so the search from row 1 is never decided): one
+        run per size, measured for info only and not checked. Its run reads its whole open search, so its time is expected to
+        grow with the history;
+    (3) 10 keys against 1,000, each key 60 rows: k0 open from its first row (rising), the others zigzags; a run after one new
+        row of another key (k1 to k5, the median of five). Checked: the 1,000-key median is under 3 times the 10-key median. A
+        run reads the rows of the keys its commit touched, so k0's open search is not read by it.
+    Returns (checks, info)."""
+    checks, info = {}, {}
+    lake = new_lake()
+    EF_SEEN.clear()
+    port = A.port
+    node = Node(lake, port, tier_secs=1).start()
+    q = lambda s: sql(port, s)
+    med = lambda xs: sorted(xs)[len(xs) // 2]
+
+    def timed(view, col, key, statement):
+        """Seconds from `statement` until the view's `$resume` row of `key` is written again (the run that took it)."""
+        v0 = int(call(port, "GET", "/cluster/visible"))  # (the answer is the version's number as bytes)
+        t0 = time.time()
+        q(statement)
+        while not any(r.get(col) == key for r in ef_watch(port, f"{view}$resume", after=v0, secs=0.02, partial=True)):
+            if time.time() - t0 > 900:
+                raise RuntimeError(f"{view}: no run of {key} in 900 s after its commit")
+            time.sleep(0.05)  # (reads back to back are seen to stall the emit loop)
+        return time.time() - t0
+
+    def hist_insert(table, price, a, b):
+        return (f"INSERT INTO {table} SELECT 'K', CAST(value AS INT), TIMESTAMP '2026-10-01 00:00:00' + "
+                f"CAST(value AS BIGINT) * INTERVAL '1 second', CAST({price} AS INT) FROM generate_series({a}, {b})")
+
+    open_q = ("SELECT symbol, s, mn FROM {t} MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES MATCH_NUMBER() AS mn, "
+              "FIRST(day) AS s ONE ROW PER MATCH PATTERN (strt up+) DEFINE up AS up.price > PREV(up.price)) EMIT FINAL")
+    cases = [("hist2", "hist_zig", "100 + 10 * (value % 2)", "decided history, one search open at the tail", sizes, samples, True),
+             ("hist", "hist_open", "value", "open from its first row, rising prices (measured, not checked; the 1,000,000 "
+              "step is left out, as the open rows are all read again each run: 100,000 take about 1 s)", sizes[:2], 1, False)]
+    results = {}
+    for table, view, price, what, case_sizes, runs_per_size, checked in cases:
+        q(f"CREATE TABLE {table} (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+        q(f"CREATE MATERIALIZED VIEW {view} WITH (lateness = '0 seconds') AS {open_q.format(t=table)}")
+        last, rows_by_size, medians = 0, {}, []
+        for size in case_sizes:
+            try:
+                fill = timed(view, "symbol", "K", hist_insert(table, price, last + 1, size))
+                last = size
+                runs = []
+                for _ in range(runs_per_size):
+                    last += 1
+                    runs.append(timed(view, "symbol", "K", hist_insert(table, price, last, last)))
+            except RuntimeError as e:
+                rows_by_size[size] = {"stopped": str(e)[:200]}
+                print(f"cost: {what}, {size} rows of history: stopped: {e}", flush=True)
+                break
+            held = len(ef_watch(port, f"{view}$held", secs=2))
+            medians.append(med(runs))
+            rows_by_size[size] = {"fill_secs": round(fill, 3), "run_secs": [round(x, 4) for x in runs],
+                                  "median_run_secs": round(med(runs), 4), "held_rows": held}
+            print(f"cost: {what}, {size} rows of history: run {med(runs):.4f} s (samples {[round(x, 4) for x in runs]}), "
+                  f"fill {fill:.2f} s, held {held} rows", flush=True)
+        info[f"{view}: {what}"] = rows_by_size
+        if checked:
+            results[view] = [round(m, 4) for m in medians]
+    z = results["hist_zig"]
+    checks[f"one key with decided history and one search open at its tail ({sizes[0]:,}, {sizes[1]:,} and {sizes[2]:,} rows of history): "
+           f"a run after one new row takes under 3 times as long at the largest size as at the smallest, medians {z} s"] = \
+        len(z) == len(sizes) and max(z) < 3 * min(z)
+
+    # (3) the keys: 10 against 1,000, with k0 open from its first row
+    flat = lambda xs: max(xs) < 3 * min(xs)
+    keys_times, first_run = {}, {}
+    for n in (keys_small, keys_big):
+        table, view = f"kk{n}", f"kv{n}"
+        q(f"CREATE TABLE {table} (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+        q(f"CREATE MATERIALIZED VIEW {view} WITH (lateness = '0 seconds') AS {open_q.format(t=table)}")
+        t0 = time.time()
+        q(f"INSERT INTO {table} SELECT 'k' || CAST(s AS VARCHAR), CAST(d AS INT), TIMESTAMP '2026-10-01 00:00:00' + "
+          f"CAST(s * 100 + d AS BIGINT) * INTERVAL '1 second', CAST(CASE WHEN s = 0 THEN d ELSE 100 + 10 * (d % 2) END AS INT) "
+          f"FROM range(0, {n}) AS a(s) CROSS JOIN range(1, 61) AS b(d)")
+        deadline = time.time() + 600  # (the first run: every key has its resume row)
+        while len({r["symbol"] for r in ef_watch(port, f"{view}$resume", secs=1, partial=True)}) < n:
+            if time.time() > deadline:
+                raise RuntimeError(f"{view}: the first run did not reach every key")
+            time.sleep(0.2)
+        first_run[n] = round(time.time() - t0, 3)
+        top = (n - 1) * 100 + 60  # the newest time of the table so far
+        times = []
+        for j in range(5):
+            key = f"k{1 + j}"
+            times.append(timed(view, "symbol", key, f"INSERT INTO {table} VALUES ('{key}', 61, TIMESTAMP '2026-10-01 00:00:00' + "
+                                                    f"CAST({top + 1 + j} AS BIGINT) * INTERVAL '1 second', 110)"))
+        keys_times[n] = times
+        print(f"cost: {n} keys (k0 open from its first row): run after one new row of another key {med(times):.4f} s "
+              f"(samples {[round(x, 4) for x in times]})", flush=True)
+    info["keys: first run of every key, secs"] = first_run
+    info["keys: run secs by key count (samples)"] = {n: [round(x, 4) for x in t] for n, t in keys_times.items()}
+    med10, med1000 = med(keys_times[keys_small]), med(keys_times[keys_big])
+    checks[f"1,000 keys (k0 open from its first row) against {keys_small}: a run after one new row of another key takes under 3 times as "
+           f"long as with {keys_small} keys, medians {round(med10, 4)} s and {round(med1000, 4)} s"] = flat([med10, med1000])
+    runs_err = ef_stderr_runs(node)
+    info["stderr: run errors"] = runs_err[:5]
+    checks["cost: no run wrote an error to the node's stderr"] = not runs_err
+    node.kill()
+    return checks, info
+
+
 def patterns():
     """MATCH_RECOGNIZE (ADR-073): `tools/patterns_check.py`'s checks. Sections 2-4 on one node: 600 random queries
     (every pattern operator, every skip rule, empty matches, ONE ROW and ALL ROWS PER MATCH in its three forms with
@@ -23475,6 +24270,352 @@ def pattern_views():
         all(round_same) and big_same and all(a != float("inf") and b != float("inf") for _, a, b in rounds)
     checks["10 rows into one symbol of a 1,000 x 1,000 table: the view kept by key takes at most half the time of refresh = 'full' (median of three symbols)"] = \
         key_med * 2 <= full_med
+    return checks, info
+
+
+# ---------------------------------------------------------------- EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8)
+
+MX_DEF = "DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)"
+MX_TICKER = ("SELECT symbol, start_day, bottom_day, end_day FROM {src} MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+             "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+             "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) " + MX_DEF + ")")
+
+
+def mx_within(src, interval):  # the ticker's thread with WITHIN: its matches, by their start and end times
+    return ("SELECT symbol, start_ts, end_ts FROM " + src + " MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+            "MEASURES strt.ts AS start_ts, LAST(up.ts) AS end_ts ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+            "PATTERN (strt down+ up+) WITHIN INTERVAL " + interval + " " + MX_DEF + ")")
+
+
+def _mx_us(stamp):  # a timestamp as the tables store it ('2026-10-01 00:01:00', UTC), in µs since the epoch: a watermark
+    import calendar
+    return calendar.timegm(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")) * 1_000_000
+
+
+def _mx_seq(lake, view):  # a view's watermark, as its producer's mark shows it in `pondra catalog` (None: no mark yet)
+    out = subprocess.run([BIN, "catalog", "--dir", lake, f"p/match:{view}"], capture_output=True, text=True, timeout=120).stdout
+    return next((int(line.split()[1]) for line in out.splitlines() if line.split()[:1] == [f"p/match:{view}"]), None)
+
+
+def _mx_settled(lake, view, want, secs=60):  # the view's watermark has reached `want`: the run for it has committed
+    deadline = time.time() + secs
+    while (seq := _mx_seq(lake, view)) is None or seq < want:
+        if time.time() > deadline:
+            return False
+        time.sleep(0.3)
+    return True
+
+
+def _mx_put(q, table, rows):  # (symbol, day, price) rows: day d is 2026-10-01 00:dd:00, in chunks of 1,000
+    for i in range(0, len(rows), 1000):
+        q(f"INSERT INTO {table} VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in rows[i:i + 1000]))
+
+
+def _mx_decided(q, src, query):  # the smoke rule: the matches of `query` over `src` that end before their symbol's last row
+    last = {r["symbol"]: r["mx"] for r in q(f"SELECT symbol, max(day) AS mx FROM {src} GROUP BY symbol")}
+    return [r for r in q(query.format(src=src) + " ORDER BY symbol, start_day") if r["end_day"] < last[r["symbol"]]]
+
+
+def _mx_flow(q, view):  # pondra.flows' late_rows for a view (None when the row has none: the JSON leaves a null out)
+    return next((r.get("late_rows") for r in q("SELECT name, late_rows FROM pondra.flows") if r["name"] == view), "no row")
+
+
+def matches():
+    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `src/matches.rs`): a view that writes each match once, when it is
+    decided. Its own lake and node, after the smoke check (`patterns_emit_final`). 1: the ticker over 1,000 symbols in 20
+    commits, lateness 0 s and idle 2 s: after each commit the view's producer reaches the commit's newest time, and the view
+    is the matches that end before their symbol's last row (the smoke rule: `dips$held` and `dips$resume` are not readable
+    by SQL, so the resume point itself is not read); once idle, the whole query less each symbol's undecided tail. 2: late
+    rows are counted once in pondra.flows, never matched, and the run after one doesn't read it. 3: a quiet key, whose last
+    row came before the watermark reached it (lateness 30 s), is written once the other symbol's rows move the watermark
+    past it. 4: WITHIN: a key with no new rows is written once the watermark passes its thread's interval; under one MONTH a
+    match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
+    9: the refusals of "What it takes", each 0A000 with its words, and UPDATE and DELETE on a followed source. 5, 7 and 8
+    (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
+    ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
+    checks, info = {}, {}
+    start = {"at": time.time(), "start": time.time()}  # (the seconds of each part, in info: `lap`)
+
+    def lap(part):
+        info[f"secs: {part}"] = round(time.time() - start["at"], 1)
+        start["at"] = time.time()
+
+    smoke_checks, smoke_info = patterns_emit_final()  # (its own lake and node, killed at its end)
+    checks.update(smoke_checks)
+    info.update(smoke_info)
+    lap("the smoke check")
+    q = lambda s: sql(A.port, s)
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+
+    # 1. The ticker as a stream: 1,000 symbols, two days each in 20 commits (lateness 0 s, idle 2 s)
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds', idle = '2 seconds') AS {MX_TICKER.format(src='ticks')} EMIT FINAL")
+    rng, price, stream = random.Random(8), [50] * 1000, []
+    for c in range(20):
+        rows = []
+        for day in (2 * c + 1, 2 * c + 2):
+            for s in range(1000):
+                price[s] = max(1, price[s] + rng.randint(-4, 4))
+                rows.append((f"s{s:04d}", day, price[s]))
+        _mx_put(q, "ticks", rows)
+        settled = _mx_settled(lake, "dips", _mx_us(f"2026-10-01 00:{2 * c + 2:02d}:00"))
+        want, got = _mx_decided(q, "ticks", MX_TICKER), q("SELECT * FROM dips ORDER BY symbol, start_day")
+        stream.append({"settled": settled, "same": got == want, "once": len(got) == len({(r["symbol"], r["start_day"]) for r in got}),
+                       "decided": len(want), "written": len(got)})
+    time.sleep(3)  # idle (2 s): the watermark moves with the clock, and no run commits anything
+    whole = q(MX_TICKER.format(src="ticks") + " ORDER BY symbol, start_day")
+    idle_want, idle_got = _mx_decided(q, "ticks", MX_TICKER), q("SELECT * FROM dips ORDER BY symbol, start_day")
+    info["stream: decided, written, per commit"] = [(s["decided"], s["written"]) for s in stream]
+    info["stream: the whole query's matches, and the undecided tails left out once idle"] = [len(whole), len(whole) - len(idle_want)]
+    checks["the ticker as a stream (1,000 symbols, 20 commits, lateness 0 s, idle 2 s): after each commit the producer reaches its newest time, and the view == the matches that end before their symbol's last row, each written once"] = \
+        all(s["settled"] and s["same"] and s["once"] for s in stream)
+    checks["the ticker as a stream: once idle, the view == the whole query less each symbol's first undecided search and what follows it"] = \
+        idle_got == idle_want and len(idle_got) > 0
+    lap("1, the ticker as a stream")
+
+    # 2. Late rows: a row at or before the watermark of the last run is counted once in pondra.flows and never matched;
+    # `late_ref` is the table less its late rows, the oracle
+    q("CREATE TABLE late_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE TABLE late_ref (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW late_v WITH (lateness = '0 seconds') AS {MX_TICKER.format(src='late_src')} EMIT FINAL")
+    run_a = [("ACME", 1, 100), ("ACME", 2, 90), ("ACME", 3, 95), ("ACME", 4, 96), ("ACME", 5, 80),
+             ("GAMMA", 1, 100), ("GAMMA", 2, 90), ("GAMMA", 4, 85), ("GAMMA", 5, 80)]
+    late_gamma = [("GAMMA", 3, 95)]  # behind the watermark (day 5): late. Read, it would make GAMMA's match (1, 2, 3)
+    run_b = [("BETA", 6, 10), ("BETA", 7, 11)]
+    late_helios = [("HELIOS", 1, 100), ("HELIOS", 2, 90), ("HELIOS", 3, 95), ("HELIOS", 4, 80)]  # a new key, all late
+    run_c = [("ZETA", 8, 10), ("ZETA", 9, 11)]
+    _mx_put(q, "late_src", run_a)
+    _mx_put(q, "late_ref", run_a)
+    s_a = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:05:00"))
+    seen_a, want_a = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    _mx_put(q, "late_src", late_gamma)
+    _mx_put(q, "late_src", run_b)
+    _mx_put(q, "late_ref", run_b)
+    s_b = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:07:00"))
+    seen_b, want_b = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    flows_b = _mx_flow(q, "late_v")
+    _mx_put(q, "late_src", late_helios)
+    _mx_put(q, "late_src", run_c)
+    _mx_put(q, "late_ref", run_c)
+    s_c = _mx_settled(lake, "late_v", _mx_us("2026-10-01 00:09:00"))
+    seen_c, want_c = q("SELECT * FROM late_v ORDER BY symbol, start_day"), _mx_decided(q, "late_ref", MX_TICKER)
+    flows_c = _mx_flow(q, "late_v")
+    info["late_v in pondra.flows: late_rows after GAMMA's row, then after HELIOS's four"] = [flows_b, flows_c]
+    checks["late rows: after each run the view == the table less its late rows, so a late row is never matched and the run after one doesn't read it; the view's rows don't change"] = \
+        all([s_a, s_b, s_c]) and seen_a == want_a == seen_b == want_b == seen_c == want_c
+    checks["late rows: pondra.flows counts each late row once for the view (late_rows 1 after GAMMA's row, 5 after HELIOS's four)"] = \
+        flows_b == 1 and flows_c == 5
+    lap("2, late rows")
+
+    # 3. A quiet key: its last row came before the watermark reached it (lateness 30 s); the other symbol's rows move the
+    # watermark past it, with no row of its own, and its match is written then
+    q("CREATE TABLE quiet_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE TABLE quiet_ref (symbol TEXT, day INT, ts TIMESTAMP, price INT)")  # the rows the watermark has read
+    q(f"CREATE MATERIALIZED VIEW quiet_v WITH (lateness = '30 seconds') AS {MX_TICKER.format(src='quiet_src')} EMIT FINAL")
+    quiet = [("QUIET", 1, 100), ("QUIET", 2, 90), ("QUIET", 3, 95), ("QUIET", 4, 96), ("QUIET", 5, 80)]  # its match ends day 4, decided by day 5
+    rise = [("RISE", d, 9 + d) for d in range(1, 11)]
+    ref1 = [r for r in quiet + rise[:5] if r[1] <= 4]  # newest day 5 less 30 s: rows up to day 4 are read
+    _mx_put(q, "quiet_src", quiet + rise[:5])
+    _mx_put(q, "quiet_ref", ref1)
+    s_q1 = _mx_settled(lake, "quiet_v", _mx_us("2026-10-01 00:04:30"))
+    before, want_q1 = q("SELECT * FROM quiet_v ORDER BY symbol, start_day"), _mx_decided(q, "quiet_ref", MX_TICKER)
+    _mx_put(q, "quiet_src", rise[5:])  # RISE only: newest day 10, watermark day 9.5, which passes QUIET's day 5
+    ref2 = [r for r in quiet + rise if r[1] <= 9]
+    _mx_put(q, "quiet_ref", [r for r in ref2 if r not in ref1])
+    s_q2 = _mx_settled(lake, "quiet_v", _mx_us("2026-10-01 00:09:30"))
+    after, want_q2 = q("SELECT * FROM quiet_v ORDER BY symbol, start_day"), _mx_decided(q, "quiet_ref", MX_TICKER)
+    info["quiet_v: rows before and after the watermark passes QUIET's day 5"] = [len(before), len(after)]
+    checks["a quiet key: its match is not written while the watermark is behind its last row, and is written once the other symbol's rows pass it, with no row of its own"] = \
+        s_q1 and s_q2 and before == want_q1 == [] and after == want_q2 and [r["symbol"] for r in after] == ["QUIET"]
+    lap("3, a quiet key")
+
+    # 4. WITHIN: a key with no new rows is written once the watermark passes its thread's interval (WA's thread starts at
+    # 1:00: ten minutes); under one MONTH a match started on 31 January stays open through 28 February
+    ten_minutes, one_month = "'10' MINUTE", "'1' MONTH"
+    q("CREATE TABLE win_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW win_v WITH (lateness = '0 seconds') AS {mx_within('win_src', ten_minutes)} EMIT FINAL")
+    _mx_put(q, "win_src", [("WA", 1, 100), ("WA", 2, 90), ("WA", 3, 95), ("WA", 4, 96)] + [("WB", d, 9 + d) for d in range(1, 5)])
+    s_w1 = _mx_settled(lake, "win_v", _mx_us("2026-10-01 00:04:00"))
+    win_1 = q("SELECT * FROM win_v ORDER BY symbol, start_ts")
+    _mx_put(q, "win_src", [("WB", d, 9 + d) for d in range(5, 13)])  # newest 12:00: WA's thread dies after 11:00
+    s_w2 = _mx_settled(lake, "win_v", _mx_us("2026-10-01 00:12:00"))
+    win_2, win_want = q("SELECT * FROM win_v ORDER BY symbol, start_ts"), q(mx_within("win_src", ten_minutes) + " ORDER BY symbol, start_ts")
+    q("CREATE TABLE month_src (symbol TEXT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW month_v WITH (lateness = '0 seconds') AS {mx_within('month_src', one_month)} EMIT FINAL")
+    q("INSERT INTO month_src VALUES ('MC', '2026-01-31 00:00:00', 100), ('MC', '2026-01-31 01:00:00', 90), "
+      "('MC', '2026-01-31 02:00:00', 95), ('MC', '2026-01-31 02:30:00', 96), ('MD', '2026-01-31 02:31:00', 10), ('MD', '2026-01-31 02:32:00', 11)")
+    s_m1 = _mx_settled(lake, "month_v", _mx_us("2026-01-31 02:32:00"))
+    month_1 = q("SELECT * FROM month_v ORDER BY symbol, start_ts")
+    q("INSERT INTO month_src VALUES ('MD', '2026-02-28 12:00:00', 20)")  # MC's thread is alive: 1 month from 31 January is 28 February
+    s_m2 = _mx_settled(lake, "month_v", _mx_us("2026-02-28 12:00:00"))
+    month_2 = q("SELECT * FROM month_v ORDER BY symbol, start_ts")
+    q("INSERT INTO month_src VALUES ('MD', '2026-03-01 00:00:00', 21)")  # past the end of 28 February: MC's thread dies
+    s_m3 = _mx_settled(lake, "month_v", _mx_us("2026-03-01 00:00:00"))
+    month_3, month_want = q("SELECT * FROM month_v ORDER BY symbol, start_ts"), q(mx_within("month_src", one_month) + " ORDER BY symbol, start_ts")
+    info["win_v (10 minutes) and month_v (1 month): rows after each commit"] = [len(win_1), len(win_2), len(month_1), len(month_2), len(month_3)]
+    checks["WITHIN 10 minutes: a key with no new rows is written once the watermark passes its thread's interval, not before, and the view == the whole query"] = \
+        s_w1 and s_w2 and win_1 == [] and win_2 == win_want and len(win_want) == 1
+    checks["WITHIN 1 MONTH: a match started on 31 January stays open through 28 February (not written at 28 February 12:00), and is written once the watermark passes its end"] = \
+        s_m1 and s_m2 and s_m3 and month_1 == [] and month_2 == [] and month_3 == month_want and len(month_3) == 1
+    lap("4, WITHIN")
+
+    # 6. PATTERN (a b): its rows a then b come in two commits, and the match is written once, never twice (a fixed-length
+    # pattern's match is decided by its last row, so the batch matcher's matches are the decided ones)
+    q("CREATE TABLE pair_src (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q(f"CREATE MATERIALIZED VIEW pair_v WITH (lateness = '0 seconds') AS SELECT symbol, start_day, end_day FROM pair_src "
+      "MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES a.day AS start_day, b.day AS end_day ONE ROW PER MATCH "
+      "AFTER MATCH SKIP PAST LAST ROW PATTERN (a b) DEFINE a AS a.price < 50, b AS b.price >= 50) EMIT FINAL")
+    _mx_put(q, "pair_src", [("KAPPA", 1, 10), ("LAMBDA", 1, 80)])  # KAPPA's a: its b is not in yet
+    s_p1 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:01:00"))
+    pair_1 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    _mx_put(q, "pair_src", [("KAPPA", 2, 60), ("LAMBDA", 2, 70)])  # KAPPA's b: the match is complete
+    s_p2 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:02:00"))
+    pair_2 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    _mx_put(q, "pair_src", [("MU", 3, 20), ("MU", 4, 60)])  # another key's match, and KAPPA's is still once
+    s_p3 = _mx_settled(lake, "pair_v", _mx_us("2026-10-01 00:04:00"))
+    pair_3 = q("SELECT * FROM pair_v ORDER BY symbol, start_day")
+    pair_want = q("SELECT symbol, start_day, end_day FROM pair_src MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+                  "MEASURES a.day AS start_day, b.day AS end_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+                  "PATTERN (a b) DEFINE a AS a.price < 50, b AS b.price >= 50) ORDER BY symbol, start_day")
+    checks["PATTERN (a b), rows a then b in two commits: the match is written once, when its b comes, and never twice"] = \
+        all([s_p1, s_p2, s_p3]) and pair_1 == [] and pair_2 == [{"symbol": "KAPPA", "start_day": 1, "end_day": 2}] and pair_3 == pair_want \
+        and len(pair_3) == 2
+    lap("6, PATTERN (a b)")
+
+    # 9. Refusals: each item of "What it takes" is refused 0A000, with the words pattern.rs and matches.rs give; UPDATE and
+    # DELETE on a source a view follows are refused too
+    q("CREATE VIEW plain_in AS SELECT * FROM late_src")
+    q("CREATE TABLE hsrc (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    q("CREATE MATERIALIZED VIEW hist_src WITH (history = 'symbol, day', sequence_by = 'ts') AS SELECT symbol, day, ts, price FROM hsrc")
+    q("CREATE TABLE keyed_src (symbol TEXT, day INT, ts TIMESTAMP, price INT, PRIMARY KEY (symbol, day))")
+    q("CREATE MATERIALIZED VIEW gb_src AS SELECT symbol, ts, price, count(*) AS n FROM late_src GROUP BY symbol, ts, price")
+
+    def mr(src="late_src", sel="symbol, start_day", measures="strt.day AS start_day", order="ts", extra="ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW", pat="(strt down+ up+)", define=MX_DEF):
+        return f"SELECT {sel} FROM {src} MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY {order} MEASURES {measures} {extra} PATTERN {pat} {define})"
+
+    def refused(label, stmt, words, code="0A000"):  # refused over HTTP, with the code (None: any) and each of the words in its message
+        status, head, text = reply(A.port, "POST", "/sql", stmt.encode())
+        sqlstate = head.get("x-pondra-sqlstate")
+        info[f"refused: {label}"] = [status, sqlstate, text[:120]]
+        return status != 200 and (code is None or sqlstate == code) and all(w in text for w in words)
+
+    def emit(name, body, with_=""):
+        return f"CREATE MATERIALIZED VIEW {name} {with_}AS {body} EMIT FINAL"
+
+    checks["refused 0A000, with its words: the input is a lake table read directly (a view as the input: reads a table directly)"] = \
+        refused("a view as the input", emit("r_in", mr("plain_in")), ["reads a table directly"])
+    around = [("a GROUP BY", mr(sel="symbol, count(*) AS n") + " GROUP BY symbol", "has a GROUP BY around the pattern"),
+              ("a window", mr(sel="symbol, start_day, row_number() OVER (PARTITION BY symbol) AS rn"), "has a window around the pattern"),
+              ("an aggregate", mr(sel="count(*) AS n"), "has an aggregate around the pattern"),
+              ("a HAVING", mr() + " HAVING 1 = 1", "has a HAVING around the pattern"),
+              ("a LIMIT", mr() + " LIMIT 3", "has a LIMIT around the pattern"),
+              ("DISTINCT", mr(sel="DISTINCT symbol, start_day"), "has DISTINCT around the pattern"),
+              ("a subquery", f"SELECT * FROM ({mr()}) AS x", "has a subquery around the pattern"),
+              ("a join", "SELECT m.symbol, m.start_day, t.price FROM late_src MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+                         "MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) "
+                         + MX_DEF + ") m JOIN late_src t ON t.symbol = m.symbol", "has a join around the pattern"),
+              ("an ORDER BY", mr() + " ORDER BY 1", "has an ORDER BY around the pattern"),
+              ("a WITH", "WITH x AS (SELECT symbol FROM late_src) " + mr(), "has a WITH around the pattern")]
+    checks["refused 0A000, with its words: around the pattern, a projection and a WHERE only (a GROUP BY, a window, an aggregate, HAVING, LIMIT, DISTINCT, a subquery, a join, an ORDER BY, a WITH)"] = \
+        all([refused(f"around: {label}", emit(f"r_a{i}", body), [words]) for i, (label, body, words) in enumerate(around)])
+    volatile = [("random() in a DEFINE", mr(define="DEFINE down AS down.price < PREV(down.price) AND random() < 2, up AS up.price > PREV(up.price)"), "has random() in a DEFINE"),
+                ("random() in a measure", mr(sel="symbol, start_day, r", measures="strt.day AS start_day, random() AS r"), "has random() in a measure"),
+                ("now() in the WHERE", mr() + " WHERE now() > TIMESTAMP '2000-01-01 00:00:00'", "has now() in a WHERE")]
+    checks["refused 0A000, with its words: no volatile function in a DEFINE, a measure or the WHERE"] = \
+        all([refused(label, emit(f"r_v{i}", body), [words]) for i, (label, body, words) in enumerate(volatile)])
+    checks["refused 0A000, with its words: ORDER BY the time alone, ascending (DESC, a second key, NULLS FIRST)"] = \
+        all([refused(label, emit(f"r_o{i}", mr(order=order)), ["orders by its time alone, ascending"])
+             for i, (label, order) in enumerate([("ORDER BY ts DESC", "ts DESC"), ("ORDER BY ts, day", "ts, day"), ("ORDER BY ts NULLS FIRST", "ts NULLS FIRST")])])
+    checks["refused 0A000, with its words: ORDER BY a date or a timestamp (ORDER BY day, an integer column)"] = \
+        refused("ORDER BY day", emit("r_oi", mr(order="day")), ["takes a date or a timestamp"])
+    checks["refused 0A000, with its words: no $ and no ^ in the pattern"] = \
+        refused("$", emit("r_d", mr(pat="(strt down+ up+ $)")), ["can't have $ or ^ in its pattern"]) and \
+        refused("^", emit("r_c", mr(pat="(^ strt down+ up+)")), ["can't have $ or ^ in its pattern"])
+    checks["refused 0A000, with its words: no NEXT"] = \
+        refused("NEXT", emit("r_n", mr(define="DEFINE down AS down.price < PREV(down.price), up AS NEXT(up.price) > up.price")), ["can't have NEXT"])
+    checks["refused 0A000, with its words: no WITH UNMATCHED ROWS"] = \
+        refused("WITH UNMATCHED ROWS", emit("r_u", mr(extra="ALL ROWS PER MATCH WITH UNMATCHED ROWS AFTER MATCH SKIP PAST LAST ROW")), ["can't take WITH UNMATCHED ROWS"])
+    options = [("refresh = 'by key'", emit("r_k", mr(), "WITH (refresh = 'by key') "), "EMIT FINAL keeps each match once"),
+               ("refresh = 'full'", emit("r_f", mr(), "WITH (refresh = 'full') "), "EMIT FINAL keeps each match once"),
+               ("lag", emit("r_l", mr(), "WITH (lag = '5 seconds') "), "EMIT FINAL keeps each match once"),
+               ("EXPECT", emit("r_e", mr(), "(CONSTRAINT pos EXPECT (start_day > 0)) "), "put expectations on a view of the rows before it")]
+    checks["refused 0A000, with its words: no refresh, lag or expectations in its WITH"] = \
+        all([refused(label, stmt, [words]) for label, stmt, words in options])
+    sources = [("a keyed table", emit("r_keyed", mr("keyed_src")), "is keyed: a new row replaces its key's row"),
+               ("a history view", emit("r_hist", mr("hist_src")), "is a history view"),
+               ("a GROUP BY view's table", emit("r_gb", mr("gb_src")), "is a GROUP BY view, whose table keeps partial rows")]
+    checks["refused 0A000, with its words: a plain table as the source, not keyed, not a GROUP BY view's table, not a history view"] = \
+        all([refused(label, stmt, [words, "write it from a table of plain rows"]) for label, stmt, words in sources])
+    checks["UPDATE and DELETE on the source are refused while the view follows it (\"can't change while these follow it\", naming late_v)"] = \
+        all([refused(label, stmt, ["can't change while these follow it", "late_v"], code=None)
+             for label, stmt in [("UPDATE", "UPDATE late_src SET price = 1 WHERE day = 1"), ("DELETE", "DELETE FROM late_src WHERE day = 1")]])
+    # (the subquery form, which the parser refuses before any of the above: recorded, not checked)
+    refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
+            f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", [], code=None)
+    lap("9, the refusals")
+    node.kill()
+
+    # 5, 7 and 8: every skip rule and the generator's queries, a restart and three nodes, and a run's cost (each its own lake)
+    for part, run in (("5, every skip rule", matches_random), ("7, a restart and three nodes", matches_restart), ("8, the cost", matches_cost)):
+        part_checks, info[part] = run()
+        checks.update(part_checks)
+        lap(part)
+    info["secs: all of the section"] = round(time.time() - start["start"], 1)
+    ok = all(checks.values())
+    print(json.dumps({"matches": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return (f"matches: the ticker as a stream (20 commits, 1,000 symbols), late rows, a quiet key, WITHIN, PATTERN (a b), the refusals, "
+            f"every skip rule, a restart, three nodes and the cost: all {len(checks)} checks pass")
+
+
+def patterns_emit_final():
+    """EMIT FINAL over a MATCH_RECOGNIZE (ADR-073 step 8, `matches.rs`): a smoke check of the run. The ticker from
+    row-patterns.mdx, PARTITION BY symbol, as a materialized view WITH (lateness = '0 seconds') ... EMIT FINAL, over two
+    symbols' rows in five commits. EMIT FINAL orders by a date or a timestamp, so the rows carry `ts`, a minute past
+    2026-10-01 00:00 for each `day`. Created before the rows, it is checked after each commit: its rows are the plain
+    query's matches that are decided, those that end before their symbol's last day (the smoke form of "before each
+    key's resume point": `$resume` isn't SQL, so the resume points are not read). Then, after the last commit, the same,
+    and no match written twice. Returns (checks, info)."""
+    checks, info = {}, {}
+    lake = new_lake()
+    node = Node(lake, A.port, tier_secs=1).start()
+    q = lambda s: sql(A.port, s)
+    acme = [(1, 12), (2, 17), (3, 19), (4, 21), (5, 25), (6, 12), (7, 15), (8, 20), (9, 24), (10, 25), (11, 19), (12, 15),
+            (13, 25), (14, 25), (15, 14), (16, 12), (17, 14), (18, 24), (19, 23), (20, 22)]  # the docs' ticker, by day
+    rng = random.Random(8)
+    beta, price = [], 50
+    for day in range(1, 21):
+        price = max(1, price + rng.randint(-4, 4))
+        beta.append((day, price))
+    rows = sorted([("ACME", d, p) for d, p in acme] + [("BETA", d, p) for d, p in beta], key=lambda r: r[1])
+    chunks = [rows[i:i + 8] for i in range(0, len(rows), 8)]
+    q("CREATE TABLE ticks (symbol TEXT, day INT, ts TIMESTAMP, price INT)")
+    plain_q = ("SELECT symbol, start_day, bottom_day, end_day FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts "
+               "MEASURES strt.day AS start_day, LAST(down.day) AS bottom_day, LAST(up.day) AS end_day ONE ROW PER MATCH "
+               "AFTER MATCH SKIP TO LAST up PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), "
+               "up AS up.price > PREV(up.price)) ORDER BY symbol, start_day")
+    view_q = plain_q.rsplit(" ORDER BY ", 1)[0]
+    q(f"CREATE MATERIALIZED VIEW dips WITH (lateness = '0 seconds') AS {view_q} EMIT FINAL")
+    rows_of_view = lambda: q("SELECT * FROM dips ORDER BY symbol, start_day")
+
+    def decided():
+        last = {r["symbol"]: r["mx"] for r in q("SELECT symbol, max(day) AS mx FROM ticks GROUP BY symbol")}
+        return [r for r in q(plain_q) if r["end_day"] < last[r["symbol"]]]
+
+    got_each = []
+    for k, chunk in enumerate(chunks, 1):
+        q("INSERT INTO ticks VALUES " + ", ".join(f"('{s}', {d}, '2026-10-01 00:{d:02d}:00', {p})" for s, d, p in chunk))
+        want = decided()
+        got = until(rows_of_view, want, 30)
+        got_each.append(got == want)
+        info[f"commit {k}: decided, written"] = [len(want), len(got)]
+    final = rows_of_view()
+    info["matches written"] = len(final)
+    checks["EMIT FINAL: after each of five commits, the view's rows are the plain query's decided matches (those ending before their symbol's last day), and at the end each match is written once"] = \
+        all(got_each) and final == decided() and len(final) > 0 and len(final) == len({(r["symbol"], r["start_day"]) for r in final})
+    node.kill()
     return checks, info
 
 
@@ -25128,7 +26269,7 @@ def memorylake():
 # first, 40 in the second and since). `--shard K/N` deals the sections out by it, so CI runs the suite in parts side
 # by side that end together. A section not listed counts as 5 s. (Dealt by the first run's table, the second's five
 # parts took 271 to 469 s, the last of them the run's last job; by this one, 402 to 421 s.)
-SECS = {"memory": 240, "patterns": 170, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
+SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
         "stopped": 82, "guesses": 45, "doors": 40, "crash": 38, "functions": 37, "backpressure": 35, "served": 33,
         "server": 30, "kafkas": 29, "finals": 28, "kafka": 28, "pace": 25, "found": 24, "tails": 20, "load": 20,
         "objects": 18, "live": 17, "refreshed": 15, "clouds": 15, "answers_big": 14, "users": 14, "workspace": 14,
@@ -25141,7 +26282,7 @@ SECS = {"memory": 240, "patterns": 170, "serverless": 143, "scale": 120, "waits"
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -25173,7 +26314,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -25186,7 +26327,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

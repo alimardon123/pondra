@@ -1379,7 +1379,10 @@
    "reads List(Utf8)",
    "misestimate Float64",
    "writes List(Utf8)",
-   "learned Utf8View"
+   "learned Utf8View",
+   "cpu_ms Int64",
+   "bytes_read Int64",
+   "peak_memory Int64"
   ],
   "pondra.kinds": [
    "kind Utf8",

@@ -123,9 +123,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
             ("csv", "terminator") => args.push(format!("new_line => {}", text(&v))),
             ("csv", "double_quote") => {} // (how quotes inside quotes are written: read either way)
             ("json", "newline_delimited") if yes => {} // (as Pondra reads them)
-            ("csv" | "json", "compression" | "file_compression_type") if !["", "uncompressed"].contains(&v.to_lowercase().as_str()) => {
-                bail!("{v} files aren't read yet: Parquet, CSV, JSON and Arrow as they are")
-            }
+            ("csv" | "json", "compression" | "file_compression_type") => args.push(format!("compression => {}", text(&v))), // (read as its reader reads: `ext_names::compression`)
             (_, k) if WRITING.contains(&k) || (format == "parquet" && (PARQUET_WRITING.contains(&k) || k.starts_with("content_defined_chunking") || PARQUET_TUNING.contains(&k))) => {} // (how files are written, or read faster: not what is read)
             _ => bail!("CREATE EXTERNAL TABLE … OPTIONS ('{k}' …): Pondra doesn't read files with it{}", if format == "csv" { " (CSV takes format.has_header, format.delimiter, format.quote, format.escape, format.comment and format.terminator)" } else { "" }),
         }
@@ -200,6 +198,9 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option
     let aliases = given.iter().map(|n| quoted(n)).collect::<Vec<_>>().join(", ");
     let rows = format!("SELECT {select} FROM ({query}) AS s({aliases})");
     let mut options = BTreeMap::from([("format".to_string(), spec.format.clone()), ("append".to_string(), "true".to_string())]);
+    if let Some(c) = spec.options.get("compression") {
+        options.insert("compression".into(), c.clone()); // (a folder of compressed files gets compressed ones: named as they are read)
+    }
     if spec.format == "csv" {
         options.insert("header".into(), spec.options.get("header").cloned().unwrap_or_else(|| "true".into()));
         if let Some(d) = spec.options.get("delim").or(spec.options.get("sep")).or(spec.options.get("delimiter")) {
