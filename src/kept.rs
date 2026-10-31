@@ -19,7 +19,7 @@ const PIPELINE: &str = "{}: pipelines come in 1.1; until then, tasks that follow
 /// What a dashboard's statements say; `{}` is the statement's words.
 const DASHBOARD: &str = "{}: dashboards come in 1.1; until then, a SQL file's Chart tab in the console draws an answer";
 /// A pipeline's STEP, where a script's statement starts.
-const STEP: &str = "STEP is a pipeline's, coming in 1.1 (CREATE PIPELINE … AS BEGIN STEP … END); in a script each statement is already a step";
+const STEP: &str = "STEP: pipelines come in 1.1";
 /// A pipeline's PARALLEL, where a script's statement starts.
 const PARALLEL: &str = "PARALLEL … END PARALLEL is a pipeline's, coming in 1.1; in a script, ASYNC … AWAIT ALL runs statements side by side, and FOR … PARALLEL n a loop's passes";
 /// A pipeline's WAIT FOR, where a script's statement starts.

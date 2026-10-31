@@ -196,6 +196,7 @@ pub(crate) enum Cmd {
     /// here too; the leader records them — over HTTP, or through the bucket if this machine can't
     /// reach it — or this process does if nobody leads.
     Sql {
+        /// The lake: a folder, s3://bucket/prefix, or `:memory:` for one held in this process's memory for its statements.
         #[arg(long, visible_alias = "lake")]
         dir: String,
         /// Other lakes to read as `name.table` (`name=dir`, repeatable).
@@ -615,7 +616,7 @@ async fn run() -> anyhow::Result<()> {
         }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
             // (the leader's work; with nobody leading, the next node to start tiers the log)
-            let store = store::open_store(&dir)?.1;
+            let store = store::open_store(&crate::memory::place(&dir))?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
                     println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
@@ -624,7 +625,7 @@ async fn run() -> anyhow::Result<()> {
             }
             let _ = attached;
         }
-        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&dir, &query, &attached).await?,
+        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {
             let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
             let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();

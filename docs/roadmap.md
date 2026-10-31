@@ -103,9 +103,12 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   `INSTALL`/`LOAD` of what is built in.
 - **J1:** the server's catalog (ADR-032 §9). **J3, J6:** reports and dashboards of Pondra's own,
   snappy at any scale. **J4:** connections (`CREATE CONNECTION`, `designs/etl-and-bi-tools.md` §3.7): a
-  connection says where a source is and a secret who may reach it; one definition in Git for every
-  environment, parameterized as Data Factory's linked services are, with `ATTACH` its one-line form and
-  table macros its datasets. **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
+  connection says where a source is, and a secret, if it has one, who may reach it (a secret with
+  `PROVIDER credential_chain` is the machine's own identity, chosen and granted, never a fallback); one
+  definition in Git for every environment, parameterized as Data Factory's linked services are, with
+  `ATTACH` its one-line form and table macros its datasets; `WITH (max_parallel = n)` caps the steps
+  that reach it at once, and its `slack`, `email` and `webhook` types are what `SEND … TO` delivers
+  through. **J5, J7:** a workspace exported whole, and ETL as code, a canvas and YAML
   over one definition, as plugins.
 - **E12:** sharing with other companies (ADR-046, proposed). **E13**'s rollups, before J6.
 - **Governance** (the owner, 2026-10-13, after single sign-on by the freeze; `reviews/platform-comparison.md`'s
@@ -115,6 +118,9 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   and adding-up views; `VARIANT` as a real type with its paths as columns (Parquet's shredding) and a
   text index.
 - ADR-051 phase 2 right after 1.0: vector and text indexes (`CREATE INDEX … USING hnsw | bm25`, `search()`), `VARIANT` stored shredded, `MAP`; trained models in SQL (E15); a managed service.
+- **Agents as a door** (the owner, 2026-10-31: after 1.0; `reviews/linkedin-posts-2026-10-30.md` A6): an agent
+  mode for `pondra sql` and the MCP tools, as DuckDB 2.0's command line has one: a compact table, errors as JSON, a
+  row cap, and an estimate before a long query from ADR-050's plans.
 
 **One ecosystem (the owner, 2026-10-03).** Every object SQL makes is a catalog entry that every
 other part (the console, the clients, the HTTP API, the tools still to come) reads through the same
