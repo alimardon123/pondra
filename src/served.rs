@@ -113,6 +113,30 @@ async fn operator_only(req: extract::Request, next: middleware::Next) -> Respons
     refused("the store of a lake is opened by the nodes that run it, with the admin token they share; a user's token (a superuser's too) can't open it")
 }
 
+/// The door a page reads its lake through: the same reads, of a lake's files and log only. A page's sign-in is
+/// checked by the guard (`Auth::needed`: an admin for `/store`).
+pub fn files_door(store: Store) -> Router { door(store).layer(middleware::from_fn(lake_files_only)) }
+
+/// Passes a page's request only when it reads one of the lake's files (GET or HEAD of an object) or lists one of its
+/// folders. The object's path is parsed as `get_at` parses it, so the door reads what this lets through.
+async fn lake_files_only(object: Option<extract::Path<String>>, Query(listing): Query<Listing>, req: extract::Request, next: middleware::Next) -> Response {
+    let reads = matches!(*req.method(), Method::GET | Method::HEAD);
+    let lake = match object {
+        Some(extract::Path(raw)) => path_of(&raw).is_ok_and(|at| crate::store::lake_file(at.as_ref())),
+        None => listing.prefix.as_deref().is_some_and(folder_of_lake),
+    };
+    if reads && lake {
+        return next.run(req).await;
+    }
+    refused("a page reads the lake's files and log through its node, never its catalog")
+}
+
+/// Whether a listing's prefix is one of the lake's folders. `Path::parse` takes the trailing slash off a prefix, so
+/// the folder is checked with it back on, the way the lake's files are named. No prefix is the whole store: refused.
+fn folder_of_lake(prefix: &str) -> bool {
+    Path::parse(prefix).is_ok_and(|at| crate::store::lake_file(&format!("{at}/")))
+}
+
 /// A refusal of the door: 403, with the header that makes the client say it as `PermissionDenied`.
 fn refused(text: &'static str) -> Response {
     let mut res = (StatusCode::FORBIDDEN, text).into_response();
@@ -1108,5 +1132,54 @@ mod tests {
         let midway: Vec<object_store::Result<Bytes>> = vec![Ok(Bytes::from_static(b"{\"path\":\"a\""))];
         let err = lines(futures::stream::iter(midway), "h:1").try_collect::<Vec<_>>().await.unwrap_err();
         assert!(matches!(err, E::Generic { .. }) && err.to_string().contains("ended midway"), "a body ending midway: {err}");
+    }
+
+    /// A page's door: the lake's files and log are read, ranged, listed and found missing as the door answers them; the
+    /// catalog, a listing with no prefix, and every write are refused, and the store is left as it was.
+    #[tokio::test]
+    async fn a_page_reads_a_lakes_files_and_log_and_nothing_else() {
+        let store: Store = Arc::new(InMemory::new());
+        store.put(&Path::from("data/t/a.parquet"), PutPayload::from_static(b"0123456789")).await.expect("a data file");
+        store.put(&Path::from("log/x.seg"), PutPayload::from_static(b"segment")).await.expect("a log file");
+        store.put(&Path::from("catalog/manifest/1"), PutPayload::from_static(b"catalog")).await.expect("a catalog object");
+        let at = serve(Router::new().nest_service("/store", files_door(store.clone()))).await;
+        let url = |rest: &str| format!("http://{at}/store{rest}");
+        let http = reqwest::Client::new();
+
+        let whole = http.get(url("/data/t/a.parquet")).send().await.expect("a get");
+        assert_eq!(whole.status().as_u16(), 200);
+        assert_eq!(whole.bytes().await.expect("the bytes").to_vec(), b"0123456789".to_vec());
+        let tail = http.get(url("/data/t/a.parquet")).header("range", "bytes=-4").send().await.expect("a ranged get");
+        assert_eq!(tail.status().as_u16(), 206);
+        let span = tail.headers().get("content-range").and_then(|v| v.to_str().ok()).map(str::to_string);
+        assert_eq!((span.as_deref(), tail.bytes().await.expect("the bytes").to_vec()), (Some("bytes 6-9/10"), b"6789".to_vec()));
+        assert_eq!(http.head(url("/data/t/a.parquet")).send().await.expect("a head").status().as_u16(), 200);
+        let log = http.get(url("/log/x.seg")).send().await.expect("a get of the log");
+        assert_eq!(log.bytes().await.expect("the bytes").to_vec(), b"segment".to_vec());
+        assert_eq!(http.get(url("/data/x")).send().await.expect("a get").status().as_u16(), 404, "a missing file");
+
+        // a listing of a folder of the lake, with its slash or without it
+        for rest in ["?prefix=data/", "?prefix=data"] {
+            let listed = http.get(url(rest)).send().await.expect("a listing");
+            assert_eq!(listed.status().as_u16(), 200, "{rest}");
+            let text = listed.text().await.expect("the listing");
+            assert!(text.contains("data/t/a.parquet") && !text.contains("catalog"), "{rest}: {text}");
+        }
+
+        // refused: the catalog, a listing of it or of the whole store, and every write
+        for (what, res) in [
+            ("a catalog object", http.get(url("/catalog/manifest/1")).send().await),
+            ("a listing of the catalog", http.get(url("?prefix=catalog/")).send().await),
+            ("a listing with no prefix", http.get(url("?delimiter=1")).send().await),
+            ("a put", http.put(url("/data/t/b.parquet")).body("new").send().await),
+            ("a delete", http.delete(url("/data/t/a.parquet")).send().await),
+            ("a copy", http.post(url("/data/t/c.parquet?from=data/t/a.parquet")).send().await),
+        ] {
+            let res = res.expect("a request");
+            assert_eq!((res.status().as_u16(), res.headers().contains_key("x-pondra-store")), (403, true), "{what}");
+        }
+        assert!(matches!(store.head(&Path::from("data/t/b.parquet")).await, Err(E::NotFound { .. })), "a refused put wrote nothing");
+        store.head(&Path::from("data/t/a.parquet")).await.expect("a refused delete deleted nothing");
+        store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused copy copied nothing");
     }
 }

@@ -106,7 +106,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "table function", family: "routine", verbs: ROUTINE, prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 6, secret: false, about: "a function that returns the rows of a table, used where a table is named", also: &["UDTF"] },
     Kind { name: "procedure", family: "routine", verbs: &["CREATE", "CREATE OR REPLACE", "CALL", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "r/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 8, secret: false, about: "a named piece of work, run with CALL as its caller", also: &["stored procedure"] },
     Kind { name: "task", family: "task", verbs: &["CREATE", "CREATE OR REPLACE", "ALTER", "EXECUTE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "j/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 9, secret: false, about: "a statement run on a schedule, or after other tasks (AFTER)", also: &["job", "schedule", "cron"] },
-    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential", "connection"] },
+    Kind { name: "secret", family: "secret", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON"], prefix: "e/", privileges: &["USAGE"], on_clone: OnClone::Leave, project: None, order: 3, secret: true, about: "credentials sealed in the lake, handed to a procedure and never shown", also: &["credential"] }, // ("connection" is 1.1's own kind: kept.rs)
     Kind { name: "user", family: "user", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: Some("users are each environment's: a project makes roles (CREATE ROLE analyst), and an environment's admin grants them (GRANT analyst TO ann)"), order: 0, secret: true, about: "a person who signs in, with a password or token, and grants", also: &["login"] },
     Kind { name: "role", family: "user", verbs: &["CREATE", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "u/", privileges: &[], on_clone: OnClone::Copy, project: None, order: 2, secret: false, about: "a group of grants, given to users", also: &["group"] },
     Kind { name: "database", family: "database", verbs: &["CREATE", "CLONE", "ATTACH", "DETACH", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "a/", privileges: &["CLONE"], on_clone: OnClone::Copy, project: Some("a database is each environment's: an attached lake or catalog goes in pondra.toml ([env.prod] attach.events = { type = \"kafka\", url = \"…\" })"), order: 0, secret: false, about: "another lake this one reads, attached by name, or a branch cloned from one", also: &["catalog", "lake", "workspace"] },
@@ -136,6 +136,28 @@ pub static PATTERNS: &[Pattern] = &[
 ];
 
 pub fn kind(name: &str) -> Option<&'static Kind> { KINDS.iter().find(|k| k.name == name) }
+
+/// The catalog's own prefixes a page's reader reads, beside the kinds': the segments that name each commit's files and
+/// log (`store::seg_key`), and the inline data of the small ones (`store::data_key`), which every query reads.
+const READER_PREFIXES: &[&str] = &["s/", "d/", "f/"]; // (`f/` is `udf::key`: a Flight function's address, which the planner registers by name)
+
+/// The catalog's own keys a page's reader reads: the commit number (`c`, `Catalog::version`), the next segment's (`n`),
+/// the block of row ids a log hands out (`b`, `log::commit`) and the lake's format stamp (`format`, `format::KEY`).
+const READER_KEYS: &[&str] = &["c", "n", "b", "format"];
+
+/// What a page may hold, and so what `/cluster/log` and `/cluster/kv` answer to a caller that isn't an operator: the
+/// prefixes of the kinds a reader's catalog reads, derived from `KINDS`, and the catalog's own keys above. A prefix that
+/// several kinds share is readable only when none of them is secret or left behind by a clone: `u/` holds users (secret)
+/// and roles (not), so it is out. Comments follow their family. Everything else is refused: the lake's keys (`z/`), the
+/// secrets (`e/`), a branch's pins and bases (`pn/`, `bs`) and the rest of the catalog's own bookkeeping.
+pub fn readable(key: &str) -> bool {
+    let may = |k: &Kind| KINDS.iter().filter(|o| o.prefix == k.prefix).all(|o| !o.secret && o.on_clone != OnClone::Leave);
+    if let Some(family) = key.strip_prefix("cm/") {
+        let family = family.split('/').next().unwrap_or_default();
+        return KINDS.iter().any(|k| k.family == family) && KINDS.iter().filter(|k| k.family == family).all(may);
+    }
+    KINDS.iter().any(|k| key.starts_with(k.prefix) && may(k)) || READER_PREFIXES.iter().any(|p| key.starts_with(p)) || READER_KEYS.contains(&key)
+}
 
 /// One object: of a lake (this one or an attached one), in a schema if its kind has them.
 pub struct Object {
@@ -1198,5 +1220,22 @@ mod tests {
         leave.sort();
         assert_eq!(leave, ["recipient", "secret", "share"]);
         assert_eq!(kinds().as_array().map(Vec::len), Some(KINDS.len() + PARTS.len() + PATTERNS.len()));
+    }
+
+    /// What a page may hold (`readable`): the tables, segments, inline data and catalog keys a reader reads, and the
+    /// kinds a page may read; never the lake's keys, secrets, users, a clone's left-behind kinds or the branch's keys.
+    #[test]
+    fn readable_is_what_a_reader_reads_and_nothing_secret() {
+        use crate::store::{data_key, seg_key};
+        assert!(readable("t/x"), "a table");
+        assert!(readable(&seg_key(0)) && readable(&seg_key(1)), "segments 0 and 1");
+        assert!(readable(&data_key(0)) && readable(&data_key(1)), "inline data 0 and 1");
+        assert!(readable("c") && readable("n") && readable("b") && readable("format"), "the catalog's own keys a reader reads");
+        for k in ["ns/s", "q/v", "v/m", "sq/s", "ix/i", "ty/t", "r/f", "j/nightly", "a/lake", "ip/okta", "f/fn", "cm/relation/t", "cm/database/d"] {
+            assert!(readable(k), "{k} is read by a page");
+        }
+        for k in ["z/auth", "u/ali", "e/key", "sh/share", "sr/recipient", "bs", "pn/x", "cm/user/ali", "cm/secret/k", "cm/share/s", "cm/recipient/r", "cm/column/t/c", "x/t/1", "dt/t/1", "dl", "m", "k/job", "quiet", ""] {
+            assert!(!readable(k), "{k} is never a page's");
+        }
     }
 }

@@ -49,6 +49,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
     crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
     crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+    crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says

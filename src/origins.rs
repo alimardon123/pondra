@@ -118,8 +118,9 @@ pub async fn door(State(origins): State<Arc<Origins>>, req: Request, next: Next)
     let mut answer = next.run(req).await;
     let headers = answer.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    // (what a page may read beyond the usual: the SQLSTATE of a refusal, and an answer's ETag for a cache)
-    headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("x-pondra-sqlstate, etag"));
+    // (what a page may read beyond the usual: the SQLSTATE of a refusal, and an answer's ETag for a cache, and the
+    // span and size of a file's range, which a Parquet reader asks for)
+    headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("x-pondra-sqlstate, etag, content-range, content-length, accept-ranges"));
     vary(answer)
 }
 
@@ -140,7 +141,8 @@ fn preflight(origin: HeaderValue) -> Response {
     let headers = answer.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD"));
-    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type"));
+    // (`range` is not a safelisted request header: a page's Parquet reads send it)
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type, range"));
     // (ten minutes: a browser asks once for a page's requests, not before each one)
     headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     answer
@@ -220,7 +222,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert_eq!(values(&res, "access-control-allow-origin"), ["https://app.example"]);
         assert_eq!(values(&res, "access-control-allow-methods"), ["GET, POST, PUT, DELETE, HEAD"]);
-        assert_eq!(values(&res, "access-control-allow-headers"), ["authorization, content-type"]);
+        assert_eq!(values(&res, "access-control-allow-headers"), ["authorization, content-type, range"]);
         assert_eq!(values(&res, "access-control-max-age"), ["600"]);
         assert!(values(&res, "vary").contains(&"origin".to_string()));
     }
@@ -230,7 +232,7 @@ mod tests {
         let res = app("https://app.example").oneshot(ask(Some("https://app.example"))).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(values(&res, "access-control-allow-origin"), ["https://app.example"]);
-        assert_eq!(values(&res, "access-control-expose-headers"), ["x-pondra-sqlstate, etag"]);
+        assert_eq!(values(&res, "access-control-expose-headers"), ["x-pondra-sqlstate, etag, content-range, content-length, accept-ranges"]);
         assert_eq!(values(&res, "vary"), ["accept-encoding", "origin"]);
         assert!(res.headers().get("access-control-allow-credentials").is_none(), "a page sends its own token, never the console's cookie");
     }

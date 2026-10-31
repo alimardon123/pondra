@@ -2,6 +2,7 @@
 //! model's endpoint), through reqwest: on a node over its own sockets, on a page over the browser's fetch. A page's fetch
 //! futures and answers aren't `Send`, while the lake's tasks and DataFusion's traits want `Send`, so a caller sends here
 //! and reads the answer here, the same on both. (The cluster's own calls are the cluster's.)
+use futures::Stream;
 use std::future::Future;
 use std::time::Duration;
 
@@ -72,6 +73,21 @@ impl Response {
         let read = async move { self.0.bytes().await.map(|b| (b.len() <= most).then(|| b.to_vec())) };
         sent(read)
     }
+
+    /// The body as it arrives, chunk by chunk: a long-lived answer (the cluster's commit stream) is read while it is open.
+    pub fn bytes_stream(self) -> impl Stream<Item = reqwest::Result<bytes::Bytes>> + Send {
+        streamed(self.0.bytes_stream())
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn streamed<S: Stream + Send>(s: S) -> S {
+    s
+}
+
+#[cfg(target_arch = "wasm32")]
+fn streamed<S: Stream>(s: S) -> OneThread<S> {
+    OneThread(s)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,6 +118,16 @@ impl<F: Future> Future for OneThread<F> {
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<F::Output> {
         // (the future is never moved out of its pin: this is a field's projection)
         unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll(cx)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<S: Stream> Stream for OneThread<S> {
+    type Item = S::Item;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<S::Item>> {
+        // (as the future above: a field's projection, the stream never moved)
+        unsafe { self.map_unchecked_mut(|s| &mut s.0) }.poll_next(cx)
     }
 }
 

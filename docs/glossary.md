@@ -26,7 +26,7 @@ Generated from `pondra.kinds` (`src/objects.rs`): don't edit it here; `python3 t
 
 **schema**: a namespace for a database's objects, named `schema.name`. Other products call it namespace, dataset.
 
-**secret**: credentials sealed in the lake, handed to a procedure and never shown. Other products call it credential, connection.
+**secret**: credentials sealed in the lake, handed to a procedure and never shown. Other products call it credential.
 
 **sequence**: numbers handed out one at a time, never twice (`nextval`). Other products call it serial, auto increment.
 

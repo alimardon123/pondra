@@ -10590,10 +10590,30 @@ def guarded():
     # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the commit stream and the replica log
     # carry the lake's keys (`z/auth`), and a raw flush or heartbeat writes what only the nodes write (L2's review, 10-31)
     nodes_own = {p: ask(P, b"" if m == "GET" else "{}", path=p, method=m, auth=boss) for p, m in
-                 (("/cluster/log", "GET"), ("/cluster/replica", "GET"), ("/cluster/commit", "POST"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
+                 (("/cluster/replica", "GET"), ("/cluster/commit", "POST"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
     info["nodes_own"] = nodes_own
-    checks["…nor a superuser's sign-in: the commit stream and the replica log (the lake's keys), a raw flush, a heartbeat, an ack: 403"] = \
+    checks["…nor a superuser's sign-in: the replica log (the lake's keys), a raw flush, a heartbeat, an ack: 403"] = \
         all(refused(v) and "this route is the nodes' own" in v for v in nodes_own.values())
+    # What a page that joined the cluster follows, a superuser's sign-in: the catalog and the commit stream, with only
+    # the keys a page may hold (`objects::readable`): never the lake's keys, its users or its secrets
+    catalog = ask(P, b"", path="/cluster/kv?from=", method="GET", auth=boss)
+    keys = [k for k, _ in catalog.get("entries", [])] if isinstance(catalog, dict) else []
+    lake_keys = ask(P, b"", path="/cluster/kv?key=z/auth", method="GET", auth=boss)
+    stream = b""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{P}/cluster/log", headers={"Authorization": boss}), timeout=2) as r:
+            while len(stream) < 1 << 20:
+                chunk = r.read1(65536)
+                if not chunk:
+                    break
+                stream += chunk
+    except Exception:
+        pass  # (the stream never ends by itself: the timeout ends the read, with what came)
+    private = ("z/", "u/", "e/", "sh/", "sr/", "bs")
+    info["joined"] = {"catalog keys": keys[:50], "z/auth": lake_keys, "stream bytes": len(stream)}
+    checks["a superuser's page reads the catalog and the commit stream without the lake's keys, users or secrets"] = \
+        any(k.startswith("t/") for k in keys) and "c" in keys and not any(k.startswith(private) for k in keys) \
+        and lake_keys == {"value": None} and len(stream) > 4 and b"z/auth" not in stream and b"u/boss" not in stream
     # A change a follower forwards runs as its user: what it reads too
     forwarded = {
         "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),

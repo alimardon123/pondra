@@ -12,6 +12,8 @@ pub(crate) mod slate;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod page;
 
+pub(crate) mod remote;
+
 /// The catalog's store as its leader opens it: SlateDB's writer on a node.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn writer(store: crate::store::Store, cache_dir: Option<std::path::PathBuf>, local: bool) -> Result<Arc<dyn Kv>, Error> {

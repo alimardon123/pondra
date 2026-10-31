@@ -1,0 +1,21 @@
+[
+ {"id": "q1_scan", "kind": "streams", "sql": "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS sum_qty, sum(l_extendedprice) AS sum_base_price, sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price, avg(l_quantity) AS avg_qty, count(*) AS count_order FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"},
+ {"id": "stream_copy", "kind": "streams", "sql": "COPY (SELECT * FROM lineitem WHERE l_quantity > 1) TO '{out}' (FORMAT parquet)"},
+ {"id": "sort_topk", "kind": "streams", "sql": "SELECT l_orderkey, l_comment FROM lineitem ORDER BY l_comment DESC, l_orderkey LIMIT 10"},
+ {"id": "groupby_60m_ints", "kind": "groupby", "sql": "SELECT count(*) AS groups, sum(s) AS total FROM (SELECT l_orderkey, l_linenumber, sum(l_quantity) AS s FROM lineitem GROUP BY l_orderkey, l_linenumber) t"},
+ {"id": "groupby_strings", "kind": "groupby", "sql": "SELECT count(*) AS groups, sum(n) AS total FROM (SELECT l_comment, count(*) AS n FROM lineitem GROUP BY l_comment) t"},
+ {"id": "count_distinct", "kind": "distinct", "sql": "SELECT count(DISTINCT l_comment) AS n FROM lineitem"},
+ {"id": "distinct_rows", "kind": "distinct", "sql": "SELECT count(*) AS n FROM (SELECT DISTINCT l_orderkey, l_partkey, l_suppkey, l_comment FROM lineitem) t"},
+ {"id": "join_build_15m", "kind": "join", "sql": "SELECT count(*) AS n, sum(length(o_comment)) AS c FROM lineitem JOIN orders ON l_orderkey = o_orderkey"},
+ {"id": "join_build_60m", "kind": "join", "sql": "SELECT count(*) AS n, sum(a.l_quantity + b.l_quantity) AS q FROM lineitem a JOIN lineitem b ON a.l_orderkey = b.l_orderkey AND a.l_linenumber = b.l_linenumber"},
+ {"id": "join3_group_1m", "kind": "join", "sql": "SELECT count(*) AS groups, sum(s) AS total FROM (SELECT c_name, sum(l_extendedprice) AS s FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey GROUP BY c_name) t"},
+ {"id": "except", "kind": "join", "sql": "SELECT count(*) AS n FROM (SELECT l_orderkey, l_suppkey FROM lineitem EXCEPT SELECT o_orderkey, o_custkey FROM orders) t"},
+ {"id": "tpch_q18", "kind": "join", "sql": "SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) AS q FROM customer, orders, lineitem WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300) AND c_custkey = o_custkey AND o_orderkey = l_orderkey GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice ORDER BY o_totalprice DESC, o_orderdate LIMIT 100"},
+ {"id": "sort_full_to_file", "kind": "sort", "sql": "COPY (SELECT * FROM lineitem ORDER BY l_comment, l_orderkey, l_linenumber) TO '{out}' (FORMAT parquet)"},
+ {"id": "window_by_order", "kind": "window", "sql": "SELECT count(*) AS n, sum(rn) AS s FROM (SELECT row_number() OVER (PARTITION BY l_orderkey ORDER BY l_linenumber) AS rn FROM lineitem) t"},
+ {"id": "window_rank_3_partitions", "kind": "window", "sql": "SELECT count(*) AS n FROM (SELECT rank() OVER (PARTITION BY l_returnflag ORDER BY l_comment) AS r FROM lineitem) t WHERE r = 1"},
+ {"id": "window_whole_partition", "kind": "window", "sql": "SELECT max(length(l_comment) + d) AS m FROM (SELECT l_comment, l_extendedprice - avg(l_extendedprice) OVER (PARTITION BY l_returnflag) AS d FROM lineitem) t"},
+ {"id": "window_over_all", "kind": "window", "sql": "SELECT max(length(l_comment) + c) AS m FROM (SELECT l_comment, count(*) OVER () AS c FROM lineitem) t"},
+ {"id": "median_3_groups", "kind": "holistic", "sql": "SELECT l_returnflag, median(l_extendedprice) AS m FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"},
+ {"id": "string_agg_3_groups", "kind": "holistic", "sql": "SELECT l_returnflag, length(string_agg(l_comment, ',')) AS len FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag"}
+]

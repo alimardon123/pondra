@@ -93,6 +93,7 @@ pub fn router(app: App) -> Router {
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
+        .route("/cluster/kv", get(kv))
         .route("/cluster/stage", post(stage))
         .route("/cluster/copy", post(copy))
         .route("/cluster/insert", post(insert_share))
@@ -101,6 +102,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
         .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), crate::cluster::of(&app).is_some_and(|c| c.serves_store))) // (a lake's store, for nodes on other machines: ADR-072 §8)
+        .nest_service("/store", crate::served::files_door(app.lake.store.clone())) // (a page's reads of the lake's files and log: an admin's sign-in, `Auth::needed`)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { crate::cluster::of(&app).map(|c| Json(c.leader_status())).ok_or(StatusCode::NOT_FOUND) }))
@@ -592,18 +594,105 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
     Ok(Json(crate::tier::run_job(&app.lake, job).await?))
 }
 
-/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one.
+/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A caller that isn't one of
+/// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`), and a follower relays the leader's
+/// (`relay`).
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
+    if !operator && !app.members.is_leader() {
+        return relay(&app).await;
+    }
     let cat = &app.lake.cat;
-    let streamed = crate::format::Streamed::to(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
+    let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
     let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
         let _ = &streamed;
-        Ok::<_, std::io::Error>(f.encode())
+        Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
     Body::from_stream(crate::drain::endless(frames)).into_response() // (never ends by itself: it ends when the node's door closes)
+}
+
+/// Is the request being served one of the nodes' own: their tokens, their key, the program that started this node
+/// (`auth::operator`), or anyone at an open node, as `guard` lets the cluster's routes through. A node that follows its
+/// leader on an open lake sends no token, and must get every key.
+async fn nodes_own(app: &App) -> bool { crate::auth::operator() || app.open().await }
+
+/// What a caller sees of one frame: a change with only the keys it may hold (`objects::readable`). The frame stays, so
+/// the ids run on without a gap.
+fn for_caller(f: Frame, operator: bool) -> Frame {
+    match f {
+        Frame::Change(d) if !operator => Frame::Change(Arc::new(d.only(crate::objects::readable))),
+        f => f,
+    }
+}
+
+/// A follower's `/cluster/log` for a page: the leader's stream, frame by frame, as `for_caller` sees it. Its request is
+/// this node's own, as `cluster::mirror` makes it (the node's key), never `to_leader`'s proxy, which buffers the body and
+/// sends the caller's.
+async fn relay(app: &App) -> Response {
+    let url = crate::tls::url(&format!("{}/cluster/log", app.members.leader().addr));
+    let Ok(res) = crate::cluster::http().get(url).send().await.and_then(|r| r.error_for_status()) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "the leader's commit stream is not reachable from here").into_response();
+    };
+    let frames = res.bytes_stream().scan(bytes::BytesMut::new(), |buf, chunk| {
+        let mut out: Vec<std::io::Result<bytes::Bytes>> = vec![];
+        match chunk {
+            Ok(c) => {
+                buf.extend_from_slice(&c);
+                loop {
+                    match Frame::take(buf) {
+                        Ok(Some(f)) => out.push(Ok(for_caller(f, false).encode())),
+                        Ok(None) => break,
+                        Err(e) => {
+                            out.push(Err(std::io::Error::other(e))); // (the body ends there: the page reconnects, and sees no gap)
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => out.push(Err(std::io::Error::other(e))),
+        }
+        futures::future::ready(Some(futures::stream::iter(out)))
+    }).flatten();
+    Body::from_stream(crate::drain::endless(frames)).into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct KvParams {
+    key: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// `GET /cluster/kv`: what a page reads of this node's catalog, as base64url of the bytes (no padding). `?key=K` answers
+/// `{"value": …}` (null when there is none), `?from=F[&to=T]` answers `{"entries": [[key, value], …]}` for the range
+/// [F, T): no `to` is to the end. A caller that isn't one of the nodes (`nodes_own`) is answered only for the keys
+/// `objects::readable` allows.
+async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Value>, Response> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+    let operator = nodes_own(&app).await;
+    let may = |k: &str| operator || crate::objects::readable(k);
+    let cat = &app.lake.cat;
+    let failed = |e: anyhow::Error| E(e).into_response();
+    if let Some(key) = p.key {
+        let value = match may(key.as_str()) {
+            true => cat.get_raw(&key).await.map_err(failed)?,
+            false => None,
+        };
+        return Ok(Json(j!({"value": value.map(|v| B64.encode(v))})));
+    }
+    // (keys are UTF-8 strings: no key sorts after U+10FFFF, which is therefore "to the end")
+    let text = |b64: &str| B64.decode(b64).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| (StatusCode::BAD_REQUEST, "a bound is base64url of a key").into_response());
+    let from = text(&p.from.ok_or_else(|| (StatusCode::BAD_REQUEST, "?key= or ?from= says what to read").into_response())?)?;
+    let to = match p.to {
+        Some(to) => text(&to)?,
+        None => "\u{10ffff}".to_string(),
+    };
+    let entries: Vec<(String, String)> = cat.scan_raw(&from, &to).await.map_err(failed)?.into_iter().filter(|(k, _)| may(k.as_str())).map(|(k, v)| (k, B64.encode(v))).collect();
+    Ok(Json(j!({"entries": entries})))
 }
 
 #[derive(Deserialize, Default)]

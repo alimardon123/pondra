@@ -2842,7 +2842,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
    the oldest. `oom::Meter` reads jemalloc's own thread counters around each poll, and DataFusion's spawned tasks are
    metered too (its join-set tracer, `oom::start`), so nothing is counted per allocation. Its future is dropped, it
-   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s while the node stays past its line, and at each look then the freed pages go back to the system at once; under the line nothing holds (held 10 s whatever came next, the next heavy query was killed: `logs/round36/bigger-than-memory/` `watch.py`). A group's `string_agg` tells the pool what its string holds and is refused by name past an eighth of a partition's share (`string_agg.rs`). The cluster's own
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
@@ -2927,11 +2927,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    concatenated views keep every batch's buffers, so below it each view column no partition key or window function
    reads is cast plain, and cast back above `HeldOutExec` (a key stays a view: the window finds its partitions by its
    ordering, which a cast hides). Its reservation is spillable, though it never spills, so `FairSpillPool` gives it a
-   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). A merge of
-   spilled runs takes at most `memory_limit / partitions / 32 MB` runs at once (4 to 64; `PONDRA_SPILL_FAN_IN`, 0 for
-   DataFusion's own, no limit): unlimited, each partition's merge reserved the whole pool and the window above it was
-   refused. Fewer runs at once means more passes, so a small node writes more spill (9M long strings: 1.3 GB at 4,
-   1.07 GB unlimited). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
+   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). The sorts
+   feeding a window run on a spill disk of their own (`store::window_sorts`, from `HeldInExec`), whose merges take at
+   most as many spilled runs as half a partition's share holds at about 4 MB a run (`merge_fan_in`: `memory_limit /
+   partitions / 8 MB`, 4 to 64): a sort's merge reserves memory no one may take back, and with as many runs as the pool
+   held the window above it was refused (at 256 MB the check below passes at 16 and is refused at 32). Every other merge
+   takes up to 512 open files over the partitions (`merge_files`, 4 to 64), bounded first by memory (a GROUP BY's merge
+   reserves from its own fair share): fewer runs at once means more passes, each writing the rows again, and at 5 runs
+   under a 2 GB cap (#150) spilling GROUP BYs and joins ran 40-90% slower (B50, 10-31). `PONDRA_SPILL_FAN_IN` sets both
+   (0: DataFusion's own, no limit). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
    watch before) and "a rank() over 3 partitions of 6M long strings…" (a 501 MB peak; refused before, 53200).
 424. **A GROUP BY over medians that ran out of memory is answered from a sort's middle rows, and only then**
    (`frugal::MiddleRows`, retry-only as invariant 422's rule). DataFusion's median holds every value of its group and
