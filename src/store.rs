@@ -615,16 +615,50 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// The cap is the free space when the first spill makes the disk, less the room a lake keeps, or the
 /// setting in GB; it is looked at again as queries start (`spill_room`). `0` turns spilling off: a
 /// query that needs it is refused (53200). A negative setting is no setting.
-fn spill_disk() -> DiskManagerBuilder {
+fn spill_disk() -> DiskManagerBuilder { spill_disk_merging(spill_fan_in().unwrap_or_else(|| merge_files(partitions()))) }
+
+/// `spill_disk`, its merges reading at most `fan_in` spilled runs at once.
+fn spill_disk_merging(fan_in: usize) -> DiskManagerBuilder {
     if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
-    // (a merge of spilled runs takes at most an eighth of its partition's share, about 4 MB a run read at once: unlimited,
-    // as DataFusion has it, each partition's merge took the whole pool and a window over its rows was refused)
-    // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
-    let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
     // (the lake's own manager holds no file: `Spills` makes the one that does, with this fan-in too, since sorts read it here)
     DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(Arc::new(Spills { fan_in, made: std::sync::OnceLock::new() }))).with_max_spill_merge_fan_in(fan_in)
+}
+
+/// `PONDRA_SPILL_FAN_IN`: how many spilled runs any merge reads at once, in place of `merge_files` and `merge_fan_in`
+/// (0 is DataFusion's own, no limit).
+fn spill_fan_in() -> Option<usize> { crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN") }
+
+/// How many spilled runs a merge reads at once, one pass whenever its memory holds them all (Alimardon, 10-31: stream, and
+/// spill as little as can be): 512 open files over `partitions`, 4 to 64. Memory bounds it before that: a GROUP BY's
+/// merge reserves from the aggregate's own fair share of the pool, and a sort's takes runs only while the pool has room.
+/// Under a 2 GB cap a GROUP BY of 34 M strings and a three-way join made 25 to 64 runs a partition: merged 5 at a time
+/// (#150) they ran 40-90% slower, writing their rows again each pass (B50, 10-31). The sorts feeding a window take fewer
+/// (`merge_fan_in`).
+fn merge_files(partitions: usize) -> usize { (512 / partitions.max(1)).clamp(4, 64) }
+
+/// How many spilled runs the merge of a sort that feeds a window reads at once (`window_sorts`), with `memory` for queries
+/// over `partitions`: as many as half a partition's share holds at about 4 MB a run (the merge reserves a run's largest
+/// batch twice, two batches deep), 4 to 64. That reservation is a sort's merge, which no one may take back, so with as
+/// many runs as the pool held the window over its rows was refused (invariant 423). Under 2 GB this is 21; at the
+/// window check's 256 MB, 8 (it passes at 16 and is refused at 32).
+fn merge_fan_in(memory: usize, partitions: usize) -> usize { (memory / partitions.max(1) / (8 << 20)).clamp(4, 64) }
+
+/// `ctx` with the spill disk of the sorts that feed a window (their merges read `merge_fan_in` runs at once) in place of
+/// the lake's; the pool, the caches and the stores as they are. `held::HeldInExec` runs its input on it. The disk is made
+/// once for the process, as its spill folder is; spills off, or a disk that can't be made, leave `ctx` as it is.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn window_sorts(ctx: Arc<datafusion::execution::TaskContext>) -> Arc<datafusion::execution::TaskContext> {
+    static DISK: std::sync::OnceLock<Option<Arc<DiskManager>>> = std::sync::OnceLock::new();
+    let disk = DISK.get_or_init(|| {
+        let fan_in = spill_fan_in().unwrap_or_else(|| merge_fan_in(memory_limit(), partitions()));
+        (spill_gb() != Some(0.0)).then(|| spill_disk_merging(fan_in).build().ok().map(Arc::new)).flatten()
+    });
+    let Some(disk) = disk else { return ctx };
+    let built = RuntimeEnvBuilder { disk_manager: Some(disk.clone()), ..RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env()) }.build_arc();
+    let Ok(rt) = built else { return ctx };
+    Arc::new(datafusion::execution::TaskContext::new(ctx.task_id(), ctx.session_id(), ctx.session_config().clone(), ctx.scalar_functions().clone(), ctx.higher_order_functions().clone(), ctx.aggregate_functions().clone(), ctx.window_functions().clone(), rt))
 }
 
 /// DataFusion's spill disk for one lake, made by its first spill (`TempFileFactory`): the same manager `spill_disk`
@@ -2875,6 +2909,20 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_read_as_many_runs_as_their_memory_and_files_allow() {
+        // (B50, 10-31: under a 2 GB cap a GROUP BY's merge took 5 runs at once and made several passes; its runs number
+        // up to 64 a partition there. A window's sorts take half a share's worth: at the window check's 256 MB it passes
+        // at 16 and is refused at 32)
+        assert_eq!(merge_files(4), 64);
+        assert_eq!(merge_files(16), 32, "512 files over the partitions");
+        assert_eq!(merge_files(256), 4, "4 at least");
+        assert_eq!(merge_fan_in(683 << 20, 4), 21);
+        assert_eq!(merge_fan_in(256 << 20, 4), 8);
+        assert_eq!(merge_fan_in(64 << 20, 4), 4, "4 at least");
+        assert_eq!(merge_fan_in(5 << 30, 4), 64, "64 at most");
+    }
 
     /// `resident` counts bytes: `/proc/self/statm` counts pages, and the page size is the OS's (64 KB on
     /// some arm64 builds), so it agrees with `VmRSS` in kilobytes. (On 4 KB pages the old constant passed
