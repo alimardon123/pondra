@@ -439,6 +439,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         _ => None,
     };
     let head = head(sql);
+    if let Some(s) = crate::extension::write(sql) {
+        return Some(s); // (INSTALL name FROM a file or URL, and UNINSTALL: `extension.rs`)
+    }
     // OR REPLACE where replacing one would lose what it holds: refused, saying why.
     static NO_REPLACE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*CREATE\s+OR\s+REPLACE\s+(SCHEMA|DATABASE|USER|ROLE|SHARE|RECIPIENT)\b").expect("a regex"));
     if let Some(c) = (head == "create").then(|| NO_REPLACE.captures(first_word(sql))).flatten() {
@@ -1631,6 +1634,11 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
                 // leader's lock only when this node leads; the pin and the ATTACH go to the leader as DDL: `backup::statement`)
                 crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => {
                     crate::backup::statement(lake, app.seq.is_some().then_some(&*app.lock), d.clone()).await?
+                }
+                // (INSTALL … FROM: the file is read and kept by the node the statement reached, as a backup's files are; the record
+                // goes to the leader from there: `extension::fetch`)
+                crate::ddl::Ddl::FetchExtension { .. } => {
+                    crate::extension::fetch(lake, app.seq.is_some().then_some(&*app.lock), d.clone()).await?
                 }
                 _ => match &app.seq {
                     Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,

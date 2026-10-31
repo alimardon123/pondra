@@ -92,7 +92,8 @@ pub fn class(sql: &str) -> &'static str {
         "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT", "PROVIDER"]) => "role",
         "ATTACH" if sql.to_uppercase().contains("TOKEN") => "role", // (a share's profile: its token is a secret)
         "ALTER" if about(&["DATABASE"]) && sql.to_lowercase().contains("protected") => "role", // (who may change a protected database's projects: ADR-058)
-        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" => "ddl",
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" | "INSTALL" | "UNINSTALL" => "ddl",
+        "FORCE" if about(&["INSTALL"]) => "ddl", // (FORCE INSTALL: an extension, as INSTALL is)
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "UPSERT" => "write",
         "CALL" | "DO" => "function",
         _ if sql.to_lowercase().contains("pondra.start(") => "function",
@@ -465,6 +466,8 @@ mod tests {
         assert_eq!(class("ALTER DATABASE prod SET (protected = false)"), "role");
         assert_eq!(class("ALTER DATABASE dev REFRESH t"), "ddl");
         assert_eq!(class("CREATE TABLE t (a INT)"), "ddl");
+        assert_eq!((class("INSTALL words FROM 'https://x.org/words.wasm'"), class("force install words"), class("UNINSTALL words")), ("ddl", "ddl", "ddl"));
+        assert_eq!(class("LOAD words"), "read");
         assert_eq!(class("insert into t values (1)"), "write");
         assert_eq!(class("CALL p(1)"), "function");
         assert_eq!(class("SELECT 1"), "read");
