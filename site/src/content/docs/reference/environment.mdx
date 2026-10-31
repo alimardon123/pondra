@@ -121,7 +121,7 @@ A query is spread over the nodes of a cluster when that is cheaper than running 
 | `PONDRA_SKEW_MB` | `64` | a partition bigger than this, and than twice the average, is shared out among nodes |
 | `PONDRA_SPILL_DIR` | `PONDRA_CACHE_DIR` when set, else the temporary folder (your cache folder where the temporary one is held in memory) | the folder a node's queries spill to when they need more than their memory: sorts, aggregations, joins and shuffles |
 | `PONDRA_SPILL_GB` | that disk's free space, less what the lake keeps for itself | how much a node's queries may spill. Past it a query is refused with SQLSTATE `53100`, saying to raise this. `0`: nothing spills, and a query that needs to is refused with `53200` |
-| `PONDRA_SPILL_FAN_IN` | the query memory a partition has, in 32 MB, from 4 to 64 | how many spilled runs a sort merges at once. More takes more memory and fewer passes; `0` is DataFusion's own, no limit, where a sort's merge can take all of the query memory |
+| `PONDRA_SPILL_FAN_IN` | 512 over the partitions, from 4 to 64; for the sorts feeding a window, the query memory a partition has in 8 MB, from 4 to 64 | how many spilled runs a merge (a sort's, a GROUP BY's) reads at once: one pass when its memory holds them all, and each pass more writes the rows again. Set, it is both numbers; `0` is DataFusion's own, no limit, where a sort's merge can take all of the query memory |
 | `PONDRA_SPILL_MB` | `64` | rows a shuffle holds in memory before they go to disk |
 | `PONDRA_LINK` | measured | the network between nodes as `ms,MB/s` (`0.5,1000`), instead of measuring it every 10 minutes |
 | `PONDRA_JOIN_ORDER` | `2` | how much cheaper a new join order must look before it is taken. `0` turns join reordering off |

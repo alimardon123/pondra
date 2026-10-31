@@ -1,0 +1,5 @@
+{"engine": "pondra", "id": "groupby_60m_ints", "kind": "groupby", "cap_gb": 2.0, "status": "ok", "rows": 1, "result": "[{\"groups\": 59986052, \"total\": 1529738036.0}]", "secs": 10.7, "peak_rss_mb": 685, "peak_spill_mb": 1624, "failcnt": 53419}
+{"engine": "pondra", "id": "groupby_strings", "kind": "groupby", "cap_gb": 2.0, "status": "ok", "rows": 1, "result": "[{\"groups\": 34378943, \"total\": 59986052}]", "secs": 25.7, "peak_rss_mb": 945, "peak_spill_mb": 2476, "failcnt": 205794}
+{"engine": "pondra", "id": "distinct_rows", "kind": "distinct", "cap_gb": 2.0, "status": "ok", "rows": 1, "result": "[{\"n\": 59986052}]", "secs": 27.2, "peak_rss_mb": 1092, "peak_spill_mb": 3779, "failcnt": 316765}
+{"engine": "pondra", "id": "join_build_15m", "kind": "join", "cap_gb": 2.0, "status": "ok", "rows": 1, "result": "[{\"n\": 59986052, \"c\": 2909059019}]", "secs": 7.9, "peak_rss_mb": 1117, "peak_spill_mb": 1506, "failcnt": 15641}
+{"engine": "pondra", "id": "join3_group_1m", "kind": "join", "cap_gb": 2.0, "status": "ok", "rows": 1, "result": "[{\"groups\": 999982, \"total\": 2293813156773.36}]", "secs": 17.0, "peak_rss_mb": 1168, "peak_spill_mb": 2248, "failcnt": 145847}
