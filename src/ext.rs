@@ -68,6 +68,11 @@ pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 
 pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 
+/// May this caller read a URL no secret covers? The program that started the node, with the node's own credentials; and on a
+/// page, anyone, since what its browser's fetch may read is any script's of the page: the browser is its fence (a page has
+/// no paths of a machine: its relative names are its lake's files, `for_caller`). `check`, `check_urls` and `check_files` ask it.
+fn reads_any_url() -> bool { owner() || cfg!(target_arch = "wasm32") }
+
 /// Is a place on this machine's own disk (no scheme, or `file://`), rather than a bucket or a server's (`s3://`, `https://`,
 /// `kafka://`)? A client may name only the places its secrets reach: a folder here is the node's owner's (`owner`). A scheme
 /// `scheme` doesn't name, such as `memory://`, counts as this machine's too, as COPY has always had it.
@@ -306,9 +311,7 @@ fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
 pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
-    // (a page reads what its browser's fetch may, as any script of the page can: the browser is its fence, and a page has
-    // no paths of a machine, since its relative names are its lake's files, `for_caller`)
-    if owner() || cfg!(target_arch = "wasm32") || spec.urls.iter().all(|u| own_file(lake, u)) {
+    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u)) {
         return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
     }
     if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
@@ -338,7 +341,7 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 /// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
 /// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
 pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
-    if owner() || cfg!(target_arch = "wasm32") { // (a page: its browser's fetch decides, as `check` says)
+    if reads_any_url() {
         return Ok(());
     }
     let asked: Vec<&str> = urls.iter().copied().filter(|u| !own_file(lake, u) && crate::catalogs::scoped(u).is_none()).collect();
@@ -365,7 +368,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 /// each must be one this caller may read, as the table is. A folder under `vouched` (a catalog's
 /// table's location, whose credentials its catalog vouched for) needs no secret.
 async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Result<()> {
-    if owner() {
+    if reads_any_url() {
         return Ok(());
     }
     let secrets = list(lake).await?;
