@@ -1,7 +1,8 @@
-"""Flink's side of `cep_bench.py` (PyFlink, a local MiniCluster, streaming mode): the ticks from their CSV files (the
+"""Flink's side of `cep_bench.py` (PyFlink, a local MiniCluster, streaming mode): the ticks from their CSV file (the
 filesystem connector), the match query into a blackhole sink, each run timed from submit to the job's end (one run, or
-three when one takes under a minute), then the query's rows, collected into a CSV file (the matches, for the comparison).
-Prints one JSON line.
+three when one takes under a minute), then the read alone (`scan_s`: the same table into a blackhole with no pattern,
+timed the same way: Flink's time to read the file), then the query's rows, collected into a CSV file (the matches, for
+the comparison). Prints one JSON line.
   flink_cep.py SPEC_JSON"""
 import csv, json, os, sys, time
 t0 = time.time()
@@ -17,7 +18,9 @@ if spec["state"] == "rocksdb":
     conf.set("taskmanager.memory.managed.size", spec["managed"])
 conf.set("table.local-time-zone", "UTC")
 env.execute_sql("SELECT 1").wait()  # (the JVM and the MiniCluster start outside the timings)
-env.execute_sql(f"CREATE TABLE ticks (symbol STRING, ts TIMESTAMP(3), price INT, WATERMARK FOR ts AS ts) "
+# (The watermark is a millisecond behind ts: many rows share one second, and a row whose ts equals the watermark is late.
+# With WATERMARK FOR ts AS ts, the rows of a second that arrive after a watermark at that second are dropped.)
+env.execute_sql(f"CREATE TABLE ticks (symbol STRING, ts TIMESTAMP(3), price INT, WATERMARK FOR ts AS ts - INTERVAL '0.001' SECOND) "
                 f"WITH ('connector'='filesystem', 'path'='{spec['dir']}', 'format'='csv')")
 
 
@@ -44,13 +47,21 @@ def why(e):
 
 q = spec["query"]
 out = {"engine": "flink", "parallelism": spec["parallelism"], "state": spec["state"], "jvm_args": os.environ.get("JVM_ARGS", ""),
-       "startup_s": round(time.time() - t0, 2), "blackhole_s": [], "failed": None}
+       "startup_s": round(time.time() - t0, 2), "blackhole_s": [], "scan_s": [], "failed": None}
 try:
     sink("match_blackhole", q)
     first = timed(f"INSERT INTO match_blackhole {q}")
     out["blackhole_s"] = [first] + ([timed(f"INSERT INTO match_blackhole {q}") for _ in range(2)] if first < 60 else [])
 except Exception as e:
     out["failed"] = f"blackhole: {why(e)}"
+if out["failed"] is None:
+    # The read alone: the same table, no pattern, timed the same way (how much of the query's time is reading the file)
+    try:
+        sink("scan_blackhole", "SELECT * FROM ticks")
+        first = timed("INSERT INTO scan_blackhole SELECT * FROM ticks")
+        out["scan_s"] = [first] + ([timed("INSERT INTO scan_blackhole SELECT * FROM ticks") for _ in range(2)] if first < 60 else [])
+    except Exception as e:
+        out["failed"] = f"scan: {why(e)}"
 if out["failed"] is None:
     # (collected, not written by a filesystem sink: that sink commits its files at checkpoints, and at a 1 s interval over
     # RocksDB state the checkpoints at 1M rows never finished)

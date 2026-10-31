@@ -3,10 +3,12 @@
 against Flink's CEP in streaming mode, and whether they find the same matches.
 
 The ticker: 1,000 symbols, a seeded price random walk each, one row per symbol per second, so N rows span N/1,000
-seconds. The rows are written once, to `ticks-K.csv` (no header) in --dir, and both engines read those files. Pondra
-loads them with one statement before its clock starts (CREATE TABLE … AS SELECT over read_csv, run by `pondra sql` on the
-lake: a node reads no local paths over HTTP), then takes them into `ticks` in 10 commits in time order. Flink reads them
-with the filesystem connector, in flink_cep.py, its own Python.
+seconds. The rows are written once, to `ticks-0.csv` (no header) in --dir, in time order, and both engines read that one
+file. Flink reads it as one split, so one source reader reads it and no reader's watermark passes a row it has yet to
+send (with several files, a reader that takes a later file first drops the earlier file's rows as late). Pondra loads
+the rows with one statement before its clock starts (CREATE TABLE … AS SELECT over read_csv, run by `pondra sql` on the
+lake: a node reads no local paths over HTTP), then takes them into `ticks` in 10 commits in time order. Flink reads the
+file with the filesystem connector, in flink_cep.py, its own Python.
 
 The query is the same text in both (MATCH): PATTERN (strt down+ up), the rising row last, which Flink 2.3 accepts;
 Flink has no PREV, so its LAST(var, 1) stands for it. The first pattern, ending in a greedy up+, is refused by Flink
@@ -18,6 +20,8 @@ Flink has no PREV, so its LAST(var, 1) stands for it. The first pattern, ending 
                 commit until its count equals the plain query's, polled every 0.2 s, 300 s at most.
   flink         the query into a blackhole sink, submit to end (median of three), and into a CSV folder, whose rows are
                 the matches: their count, and the comparison.
+  flink.scan_s  Flink's read alone: the same ticks table into a blackhole with no pattern, timed the same way (the time
+                Flink takes to read the file, of the flink time above).
   compare       the matches as sets of (symbol, start_ts, end_ts): the view, the plain query, a scan of the rows (model),
                 and Flink. Each engine runs alone, with a node or a JVM of its own.
 
@@ -31,7 +35,7 @@ import argparse, array, csv, datetime, itertools, json, os, random, shutil, stat
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 SYMBOLS = 1000
-FILES = 4          # ticks-K.csv: each a run of whole seconds, so each Flink source split reads a time range
+FILES = 1          # ticks-K.csv: one file in time order, so Flink's one split is read by one reader (see the docstring)
 SEED = 2026
 BASE = datetime.datetime(2026, 10, 30)  # (the stream's first second)
 COMMITS = 10
@@ -58,7 +62,7 @@ def ram_gb():
 
 
 def ticks(folder, n):
-    """The rows, written once: `ticks-K.csv`, each file a run of whole seconds, every symbol's row each second. Written
+    """The rows, written once: `ticks-K.csv` (one file: FILES), in time order, every symbol's row each second. Written
     again only when the folder doesn't hold this N (`rows.txt` is written last)."""
     files = [os.path.join(folder, f"ticks-{k}.csv") for k in range(FILES)]
     marker = os.path.join(folder, ".rows.txt")  # (a dot-file: Flink's file source reads every other file in the folder)
@@ -348,6 +352,9 @@ def main(argv):
             if fl.get("blackhole_s"):
                 med = round(statistics.median(fl["blackhole_s"]), 3)
                 one["flink"] |= {"median_s": med, "rows_per_s": round(n / med)}
+            if fl.get("scan_s"):
+                med = round(statistics.median(fl["scan_s"]), 3)
+                one["flink"] |= {"scan_median_s": med, "scan_rows_per_s": round(n / med)}
         if view is not None and query is not None:
             ref = model(files)
             one["compare"] = compare(view["matches"], query["matches"], ref, last, fl["matches"] if fl and "matches" in fl else None)
