@@ -94,7 +94,9 @@ pub struct Options {
     /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
     /// The store a page's member on the core's lake keeps its lake in (`open_lake`): a browser gives its private folder (OPFS), so
-    /// the page's tables are there again after a reload. None: memory. (Until P3's switch, `store` is the page's own engine's.)
+    /// the page's tables are there again after a reload. It must be the page's alone (a kept page's folder, under its Web Lock): the
+    /// page takes its term at once, since no other writer holds the term its old page left (`members::Alone::lead_owned`). None:
+    /// memory. (Until P3's switch, `store` is the page's own engine's.)
     #[cfg(feature = "lake")]
     pub lake_store: Option<crate::store::Store>,
 }

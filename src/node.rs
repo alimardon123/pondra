@@ -539,11 +539,13 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     }
     crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
     let url = crate::memory::place(":memory:");
+    let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
     if let Some(given) = store {
         crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
     }
     let store = crate::memory::store(&url);
-    let (alone, marks) = match crate::members::Alone::lead(&store).await {
+    let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
+    let (alone, marks) = match lead {
         Ok(led) => led,
         Err(e) => {
             crate::memory::forget_memory(&url);

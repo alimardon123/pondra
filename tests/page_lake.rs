@@ -1,6 +1,6 @@
 //! A page's member on the core's lake (designs/page-p3.md, pieces 1 and 5): its lake is kept in the store the page is given,
-//! so its tables are there again after a reopen; `GET /objects` is the lake's listing; a page on no store starts fresh; and
-//! one page at a time in a process. `cargo test --test page_lake`.
+//! so its tables are there again after a reopen; `GET /objects` is the lake's listing; a page on no store starts fresh; one page
+//! at a time in a process; and a kept lake's term is taken at once. `cargo test --test page_lake`.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
 use pondra::page::{Options, Page};
@@ -64,4 +64,16 @@ async fn steps() {
     let words = format!("{refused:#}");
     assert!(words.contains("close it first"), "step 4: the refusal says to close it first: {words}");
     first.close().await;
+
+    // 5. A kept page's lake takes its term at once: its page reloaded without a close, so the term is still marked alive. The
+    // next page on the same store opens at once, not after that mark goes stale (`members::Alone::lead` claims and marks it).
+    let kept: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let (_, marks) = pondra::members::Alone::lead(&kept).await.expect("step 5: a page's term is claimed and marked alive");
+    marks.abort(); // (the page never closed: its term is not released, and its last mark is fresh)
+    let started = std::time::Instant::now();
+    let mut page = Page::open_lake(&Options { lake_store: Some(kept.clone()), ..Default::default() }).await.expect("step 5: a page opens on the store its old page left alive");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "step 5: it opens at once: {:?}", started.elapsed());
+    let (status, _, body) = sql(&page, "SELECT 1").await;
+    assert_eq!(status, 200, "step 5: SELECT 1 answers: {body}");
+    page.close().await;
 }

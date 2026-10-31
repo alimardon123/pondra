@@ -105,6 +105,17 @@ pub async fn claim_one_off(store: &Store, live: impl Fn(&Term) -> Result<()>) ->
     }
 }
 
+/// The term a page takes at once on a store its caller holds alone: the next term over the newest, alive or not (`claim_one_off`
+/// waits for a live one). Only a store no other process writes may take one, a kept page's folder under its Web Lock, where the
+/// newest term's holder is gone. The old term's records stay until the next `claim` trims them.
+pub async fn claim_owned(store: &Store) -> Result<Term> {
+    loop {
+        if let Some(term) = claim(store, latest(store).await?.map_or(1, |t| t.n + 1), "").await? {
+            return Ok(term);
+        }
+    }
+}
+
 /// The numbered records under one leadership prefix (`cluster/term`, `cluster/alive` or `cluster/left`), each as its
 /// number and location. A name that isn't a number is left out.
 async fn numbered(store: &Store, prefix: &str) -> Result<Vec<(u64, Path)>> {

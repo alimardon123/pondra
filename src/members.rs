@@ -52,14 +52,25 @@ impl Alone {
             bail!("this lake is led by the node at {}, which this process can't lead beside: stop that node, or lead another lake", t.addr)
         })
         .await?;
-        let marks = terms::mark_every(store.clone(), term.n);
-        Ok((Arc::new(Alone { term }), marks))
+        Ok(led(store, term))
+    }
+
+    /// Lead the lake on `store` alone, at once: the next term over the newest, alive or not (`terms::claim_owned`). Only for a
+    /// store no other process writes (a kept page's folder, under its Web Lock). Its term is marked and released as `lead`'s.
+    pub async fn lead_owned(store: &Store) -> Result<(Arc<Alone>, JoinHandle<()>)> {
+        Ok(led(store, terms::claim_owned(store).await?))
     }
 
     /// One that claims nothing (a store with no create-if-absent put): term 0, its own leader.
     pub fn unclaimed() -> Arc<Alone> {
         Arc::new(Alone { term: Term { n: 0, addr: String::new(), lock: String::new(), bell: false } })
     }
+}
+
+/// The member led by term `term`, marked alive from now on (`terms::mark_every`): the tail of `lead` and `lead_owned`.
+fn led(store: &Store, term: Term) -> (Arc<Alone>, JoinHandle<()>) {
+    let marks = terms::mark_every(store.clone(), term.n);
+    (Arc::new(Alone { term }), marks)
 }
 
 impl Members for Alone {
