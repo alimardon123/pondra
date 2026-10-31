@@ -90,7 +90,7 @@ CASES = [
     ("postgres", "COMMIT"),
     ("postgres", "CREATE EXTENSION IF NOT EXISTS pg_trgm"),
     ("postgres", """CREATE FUNCTION order_total(cust INT) RETURNS NUMERIC LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE customer_id = cust); END; $$"""),
-    ("postgres", "LISTEN new_orders"),
+    ("postgres", "LISTEN new_orders", ("0A000", "LISTEN and NOTIFY aren't built yet")),
     ("postgres", "SELECT tablename, tableowner FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename"),
     # duckdb: queries
     ("duckdb", "FROM orders SELECT id, amount WHERE status = 'paid'"),

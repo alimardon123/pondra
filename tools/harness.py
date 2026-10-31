@@ -14093,6 +14093,23 @@ def waits():
     skip_out = code(c2, "SELECT balance FROM accounts WHERE id = 19 FOR UPDATE SKIP LOCKED")
     checks["SKIP LOCKED is refused by name (0A000), in a transaction and outside one"] = skip_in == "0A000" and skip_out == "0A000"
 
+    # Advisory locks and LISTEN/NOTIFY are Postgres's, not built here yet: a migration tool sends them first, so each is refused
+    # by name (0A000, with the feature's words in the message), in a transaction of its own and outside one.
+    def refused_in_txn(stmt):
+        """`stmt` in a transaction of its own: its SQLSTATE and message, as `failure` gives them."""
+        c2.execute("BEGIN")
+        try:
+            return failure(c2, stmt)
+        finally:
+            c2.execute("ROLLBACK")
+    refusals = {
+        "advisory locks": [refused_in_txn("SELECT pg_advisory_lock(1)"), refused_in_txn("SELECT pg_try_advisory_xact_lock(1)"), failure(c2, "SELECT pg_advisory_lock(1)")],
+        "LISTEN and NOTIFY": [refused_in_txn("LISTEN jobs"), refused_in_txn("NOTIFY jobs, 'x'"), failure(c2, "LISTEN jobs")],
+    }
+    info["advisory locks and LISTEN refusals"] = refusals
+    checks["advisory locks and LISTEN/NOTIFY are refused by name (0A000, the feature's words in the message), in a transaction and outside one"] = all(
+        sqlstate == "0A000" and name in message for name, got in refusals.items() for sqlstate, message in got)
+
     before20 = bal(20)
     plain = c2.execute("SELECT balance FROM accounts WHERE id = 20 FOR UPDATE").fetchall()
     checks["SELECT … FOR UPDATE outside a transaction is a plain read: it returns the row"] = plain == [(before20,)]
