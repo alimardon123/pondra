@@ -100,16 +100,20 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     for (name, e) in a.named {
         let value = match (name.to_lowercase().as_str(), e) {
             ("columns" | "hive_types" | "types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
-            ("types", _) => bail!("{f}: types names each column's type in a struct, types => {{'zip': 'VARCHAR'}} (DuckDB's list form isn't read)"),
+            ("types", _) => return Err(given(format!("{f}: types names each column's type in a struct, types => {{'zip': 'VARCHAR'}} (DuckDB's list form isn't read)"))),
             _ => literal(e),
         };
         options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
     }
-    ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
+    if urls.is_empty() {
+        return Err(given(format!("{f}: which files? {f}('s3://bucket/path/*.{format}')")));
+    }
     // (a name's compression, when the call doesn't give one: `read_csv('x.csv.gz')`; the files of a list must agree on it)
     if !options.contains_key("compression") {
         let named = urls.iter().map(|u| name_options(format, u)).collect::<Result<Vec<_>>>()?;
-        ensure!(named.windows(2).all(|w| w[0] == w[1]), "{f}: the files are compressed differently ({}): read each with its own {f}, or give compression => … for all of them", urls.join(", "));
+        if !named.windows(2).all(|w| w[0] == w[1]) {
+            return Err(given(format!("{f}: the files are compressed differently ({}): read each with its own {f}, or give compression => … for all of them", urls.join(", "))));
+        }
         options.extend(named.into_iter().next().unwrap_or_default());
     }
     let known: Vec<&str> = match format {
@@ -119,13 +123,19 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
         "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
         _ => LISTING_OPTIONS.to_vec(),
     };
-    ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
+    if ["delta", "iceberg"].contains(&format) && urls.len() != 1 {
+        return Err(crate::codes::coded("0A000", format!("{f}: one table at a time")));
+    }
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
-        bail!("{f} has no option {k}: {}", known.join(", "));
+        return Err(given(format!("{f} has no option {k}: {}", known.join(", "))));
     }
     if options.contains_key("types") {
-        ensure!(!options.contains_key("columns"), "{f}: types and columns: columns names every column's type, so types would do nothing");
-        ensure!(!options.get("all_varchar").is_some_and(|v| v != "false"), "{f}: types and all_varchar => true: one is enough (all_varchar reads every column as text)");
+        if options.contains_key("columns") {
+            return Err(given(format!("{f}: types and columns: columns names every column's type, so types would do nothing")));
+        }
+        if options.get("all_varchar").is_some_and(|v| v != "false") {
+            return Err(given(format!("{f}: types and all_varchar => true: one is enough (all_varchar reads every column as text)")));
+        }
     }
     Ok(Some(name(&Spec { urls, format: format.into(), options })))
 }
@@ -161,7 +171,7 @@ pub(crate) fn name_options(format: &str, url: &str) -> Result<BTreeMap<String, S
         "csv" | "json" => Ok(BTreeMap::from([("compression".to_string(), compression.to_string())])),
         "parquet" | "arrow" => {
             let end = path_of(url).rsplit('.').next().unwrap_or_default().to_string();
-            bail!("{url}: {format} files are compressed inside the file, so a name ending in .{end} isn't read as one: name the file without it")
+            Err(given(format!("{url}: {format} files are compressed inside the file, so a name ending in .{end} isn't read as one: name the file without it")))
         }
         _ => Ok(BTreeMap::new()),
     }
@@ -181,7 +191,7 @@ pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)>
         "tsv" => ("csv", BTreeMap::from([("delim".to_string(), "\t".to_string())])),
         "json" | "ndjson" | "jsonl" => ("json", BTreeMap::new()),
         "arrow" | "feather" | "ipc" => ("arrow", BTreeMap::new()), // (Arrow's file format: IPC with a footer)
-        _ => bail!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow; compressed: .csv.gz, .json.zst), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"),
+        _ => return Err(given(format!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow; compressed: .csv.gz, .json.zst), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"))),
     };
     options.extend(name_options(format, url)?);
     Ok((format.into(), options))
@@ -196,7 +206,7 @@ pub(crate) fn compression_named(c: &str) -> Result<CompressionTypeVariant> {
         "zstd" | "zst" => CompressionTypeVariant::ZSTD,
         "bzip2" | "bz2" => CompressionTypeVariant::BZIP2,
         "xz" => CompressionTypeVariant::XZ,
-        other => bail!("compression {other}: gzip, zstd, bzip2 or xz (or uncompressed)"),
+        other => return Err(given(format!("compression {other}: gzip, zstd, bzip2 or xz (or uncompressed)"))),
     })
 }
 
@@ -210,8 +220,21 @@ pub(crate) fn compression_in(options: &BTreeMap<String, String>) -> Result<Compr
 /// decoder, so a compressed file is refused by name there, as the page can't read it.
 pub(crate) fn compression(spec: &Spec) -> Result<FileCompressionType> {
     let variant = compression_in(&spec.options)?;
-    ensure!(variant == CompressionTypeVariant::UNCOMPRESSED || cfg!(feature = "server"), "{}: compressed CSV and JSON are read by the server, the shell and `pondra sql`; in the page, uncompressed", spec.urls.join(", "));
+    decoded_here(variant, cfg!(feature = "server"), &spec.urls)?;
     Ok(variant.into())
+}
+
+/// A read call refused for what it was given (its files, options or their values): 22023, as Postgres refuses a bad
+/// argument, not XX000 (audit 10-31 L12's siblings).
+fn given(message: String) -> anyhow::Error { crate::codes::coded("22023", message) }
+
+/// Whether a file compressed with `variant` can be read where `decoders` says DataFusion's are built: refused 0A000 (a feature
+/// this form lacks) when not, naming the files and the forms that read them.
+fn decoded_here(variant: CompressionTypeVariant, decoders: bool, urls: &[String]) -> Result<()> {
+    match variant == CompressionTypeVariant::UNCOMPRESSED || decoders {
+        true => Ok(()),
+        false => Err(crate::codes::coded("0A000", format!("{}: compressed CSV and JSON are read by the server, the shell and `pondra sql`; in the page, uncompressed", urls.join(", ")))),
+    }
 }
 
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
@@ -351,11 +374,11 @@ pub(crate) fn file_format(spec: &Spec, state: &dyn datafusion::catalog::Session)
             match o("new_line") {
                 None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => {} // (either, as read)
                 Some("\r" | "\\r") => f = f.with_terminator(Some(b'\r')),
-                Some(t) => bail!("new_line is \\n, \\r\\n or \\r, not {t:?}"),
+                Some(t) => return Err(given(format!("new_line is \\n, \\r\\n or \\r, not {t:?}"))),
             }
             Arc::new(f)
         }
-        f => bail!("files as {f}: parquet, csv, json or arrow"),
+        f => return Err(given(format!("files as {f}: parquet, csv, json or arrow"))),
     })
 }
 
@@ -457,7 +480,7 @@ pub fn retyped(schema: &SchemaRef, types: &[(String, DataType)]) -> Result<Schem
     for (name, t) in types {
         let Some(field) = fields.iter_mut().find(|f| f.name() == name) else {
             let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-            bail!("types names {name}, which the files don't have: their columns are {}", columns.join(", "))
+            return Err(crate::codes::coded("42703", format!("types names {name}, which the files don't have: their columns are {}", columns.join(", "))));
         };
         *field = Arc::new(field.as_ref().clone().with_data_type(t.clone()));
     }
@@ -536,11 +559,15 @@ pub fn keys(found: &[Found], spec: &Spec, hive_types: &[FieldRef], columns: &[(S
     let asked = spec.options.get("hive_partitioning").map(|v| v != "false" && v != "0").or((!hive_types.is_empty()).then_some(true));
     let names: Vec<Vec<String>> = if asked == Some(false) { vec![] } else { found.iter().map(|f| folders(&f.url, &f.object).into_iter().map(|(k, _)| k).collect()).collect() };
     let same = names.windows(2).all(|w| w[0] == w[1]);
-    ensure!(same || asked != Some(true), "{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), names[0].join("/"));
+    if !same && asked == Some(true) {
+        return Err(given(format!("{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), names[0].join("/"))));
+    }
     let folder_keys = if same { names.first().cloned().unwrap_or_default() } else { vec![] };
     let mut out: Vec<(String, String)> = vec![];
     for (i, k) in folder_keys.iter().enumerate() {
-        ensure!(!columns.iter().chain(&out).any(|(c, _)| c == k), "{k} is a folder's key and a column in the files");
+        if columns.iter().chain(&out).any(|(c, _)| c == k) {
+            return Err(crate::codes::coded("42701", format!("{k} is a folder's key and a column in the files")));
+        }
         let values: Vec<String> = found.iter().filter_map(|f| hive_value(folders(&f.url, &f.object).get(i)?.1.as_str())).collect();
         let typed = hive_types.iter().find(|f| f.name() == k).map(|f| crate::answer::type_name(f.data_type()));
         out.push((k.clone(), typed.unwrap_or_else(|| hive_type(&values).into())));
@@ -948,5 +975,19 @@ mod tests {
         assert_eq!(schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(), ["id", "name"]);
         let batches = read_files(&ctx, &[("mem:///g/a.csv.gz", "")], &schema, &spec).await.unwrap().collect().await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    #[test]
+    fn a_read_calls_refusals_carry_their_codes() {
+        // (audit 10-31 L12: a page has no decoder, so a compressed file is a feature it lacks, 0A000, not XX000)
+        let urls = ["x.csv.gz".to_string()];
+        assert_eq!(crate::codes::of(&decoded_here(CompressionTypeVariant::GZIP, false, &urls).unwrap_err()), "0A000");
+        assert!(decoded_here(CompressionTypeVariant::GZIP, true, &urls).is_ok() && decoded_here(CompressionTypeVariant::UNCOMPRESSED, false, &urls).is_ok());
+        // (its siblings: what a call is given, refused 22023, as Postgres refuses a bad argument)
+        assert_eq!(crate::codes::of(&compression_named("lzma").unwrap_err()), "22023");
+        assert_eq!(crate::codes::of(&format_of("x.txt").unwrap_err()), "22023");
+        assert_eq!(crate::codes::of(&name_options("parquet", "x.parquet.gz").unwrap_err()), "22023");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        assert_eq!(crate::codes::of(&retyped(&schema, &[("zip".into(), DataType::Utf8)]).unwrap_err()), "42703");
     }
 }
