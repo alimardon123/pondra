@@ -27,6 +27,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::cache::cache_manager::CacheManagerConfig;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::GreedyMemoryPool;
+use datafusion::execution::SessionState;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::logical_expr::dml::{InsertOp, WriteOp};
@@ -65,6 +66,11 @@ const COUNTERS_KEY: &str = "pondra.counters";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
+/// The 0A000 words of the three refusals a page makes of a statement a node may not answer, on both paths (the page's own
+/// engine's `outgoing`, and the core's `lake_outgoing`): a write that isn't a fill (`query_outgoing`), and a file named beside
+/// a node's table (`page_names`). A fill may not name its target `NODE_ROWS` (`node_rows_taken`).
+const WRITE_TO_NODE: &str = "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node";
+const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')";
 /// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
 pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
@@ -477,7 +483,97 @@ impl Page {
     /// door's: the same body, status and content type, with `x-pondra-session` and `x-pondra-notices` as HTTP adds them.
     #[cfg(feature = "lake")]
     async fn lake_sql(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
-        self.lake_said(query, headers, body).await
+        // (a plain-SQL body, as `routines::Request` reads one: its content type is absent or text. Only such a body may go to the node)
+        let plain = request_header(headers, "content-type").is_none_or(|kind| kind.starts_with("text/"));
+        let text = body.clone(); // (a `Bytes` clone is a count, not a copy: the statement takes the body)
+        let answer = self.lake_said(query, headers, body).await;
+        if !plain || self.node.is_none() || answer.header("x-pondra-sqlstate") != Some("42P01") {
+            return answer;
+        }
+        let Ok(text) = std::str::from_utf8(&text) else { return answer };
+        match self.lake_outgoing(text, param(query, "format")).await {
+            Ok(Some(instead)) => instead,
+            Ok(None) => answer, // (the node has no part in it: the lake's 42P01 stands)
+            Err(e) => failed(e),
+        }
+    }
+
+    /// What a node answers for a statement the lake can't plan because a table it names is not the page's (`lake_sql`'s 42P01),
+    /// as the page's own engine answers it (`outgoing`): a query goes to the node with the rows of the page's tables it names, and
+    /// a fill (CTAS, or INSERT … SELECT into one of the page's tables) takes the node's rows for its query and runs its write over
+    /// them on the lake. The names are read over the text as the core expands it (`plain_of`); the node is asked the text as it
+    /// is written. None when no table it names is the node's, when a fill names none, or when the text doesn't parse: the 42P01 stands.
+    #[cfg(feature = "lake")]
+    async fn lake_outgoing(&self, text: &str, format: Option<&str>) -> anyhow::Result<Option<Answer>> {
+        let Some(paged) = &self.paged else { return Ok(None) };
+        let lake = &paged.app.lake;
+        let expanded = crate::routines::expand(lake, &crate::vars::bound(text)?).await?;
+        let state = lake.session().state();
+        let Ok(statement) = parsed(&state, &expanded) else { return Ok(None) };
+        // (a name is the page's when the lake holds a table of it: a file's name is never one, and the names are the lake's own)
+        let mut have = BTreeSet::new();
+        for name in state.resolve_table_references(&statement)? {
+            if !crate::ext_names::is(name.table()) && lake.table_meta_if(name.table()).await?.is_some() {
+                have.insert(name.table().to_string());
+            }
+        }
+        let held = |name: &str| have.contains(name);
+        let tables = named(&state, &statement, &held)?;
+        let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
+        match fill_of(&state, &statement)?.filter(|(target, _, insert)| !insert || home(&state, target, &held) == Home::Page) {
+            Some((target, fill, _)) => {
+                // (the fill's query as the text writes it, when it parses: the node is asked what was written, as `outgoing` asks it)
+                let written = parsed(&state, text).ok().and_then(|as_written| fill_of(&state, &as_written).ok().flatten().map(|(_, q, _)| q.to_string()));
+                let sent = written.unwrap_or_else(|| fill.to_string());
+                let fill_tables = named(&state, &as_statement(fill), &held)?;
+                if fill_tables.iter().all(|(h, _)| *h != Home::Node) {
+                    return Ok(None);
+                }
+                if target.table() == NODE_ROWS {
+                    return Err(node_rows_taken());
+                }
+                let names = page_names(fill_tables)?;
+                let write = over_rows(&state, &statement)?;
+                let asked = self.lake_request(&sent, &names, "format=arrow").await?;
+                let answered = self.ask(asked).await?;
+                if answered.status != 200 {
+                    return Ok(Some(answered)); // (the node's refusal is the page's answer, as it is)
+                }
+                node_arrow(&answered)?;
+                let body = request_of(&write, &BTreeSet::from([NODE_ROWS.to_string()]), &[answered.body])?;
+                let headers = [("content-type".to_string(), request_body::CONTENT_TYPE.to_string())];
+                Ok(Some(self.lake_said(&format_query, &headers, body).await))
+            }
+            None => {
+                if tables.iter().all(|(h, _)| *h != Home::Node) {
+                    return Ok(None);
+                }
+                if query_of(&statement).is_none() {
+                    return Err(crate::codes::coded("0A000", WRITE_TO_NODE));
+                }
+                let names = page_names(tables)?;
+                let asked = self.lake_request(text, &names, &format_query).await?;
+                Ok(Some(self.ask(asked).await?))
+            }
+        }
+    }
+
+    /// The request a page sends its node (`Sent`): `sql`, with the rows of the page's tables `names`, each read on the lake as
+    /// `SELECT *` (an Arrow stream), within `PONDRA_WEB_SEND_MB` (`sending`). A page table the lake can't read is the statement's
+    /// own answer, sent as it is.
+    #[cfg(feature = "lake")]
+    async fn lake_request(&self, sql: &str, names: &BTreeSet<String>, query: &str) -> anyhow::Result<Sent> {
+        let mut streams = vec![];
+        for name in names {
+            let read = format!("SELECT * FROM {}", crate::ext_names::quoted(name));
+            let answer = self.lake_said("format=arrow", &[], bytes::Bytes::from(read)).await;
+            if answer.status != 200 {
+                return Err(anyhow::anyhow!(String::from_utf8_lossy(&answer.body).into_owned()));
+            }
+            streams.push(answer.body);
+        }
+        sending(streams.iter().map(|s| s.len()).sum())?;
+        Ok(Sent { query: query.to_string(), content_type: request_body::CONTENT_TYPE, body: request_of(sql, names, &streams)?, room: None })
     }
 
     /// One `/sql` request on the page's member, as `lake_sql` answers it: the page's own requests (a kept page's import, the
@@ -668,18 +764,16 @@ impl Page {
             // whether a node table is named)
             Err(_) => (text.to_string(), true),
         };
-        let statement = match self.parsed(&expanded) {
+        let (state, held) = self.reading()?;
+        let statement = match parsed(&state, &expanded) {
             Ok(statement) => statement,
             Err(_) if raw => return Ok(None),
             Err(e) => return Err(e),
         };
-        match self.fill_of(&statement)? {
-            Some((target, query)) => {
+        match fill_of(&state, &statement)?.filter(|(target, _, insert)| !insert || home(&state, target, &held) == Home::Page) {
+            Some((target, query, _)) => {
                 // (the fill's query as the text writes it, when it parses: the front's rewrites were made without the node's column types)
-                let written = match self.parsed(text) {
-                    Ok(as_written) => self.fill_of(&as_written).ok().flatten().map(|(_, q)| q.to_string()),
-                    Err(_) => None,
-                };
+                let written = parsed(&state, text).ok().and_then(|as_written| fill_of(&state, &as_written).ok().flatten().map(|(_, q, _)| q.to_string()));
                 let sent = written.unwrap_or_else(|| query.to_string());
                 self.fill_outgoing(&statement, &target, query, &sent).await
             }
@@ -690,117 +784,52 @@ impl Page {
     /// The query a statement that is not a fill sends its node, as it is written (`text`), with the page's tables it names.
     /// A write that is not a query is refused by name, before anything is sent (its words say how to write it instead).
     async fn query_outgoing(&self, text: &str, format: Option<&str>, statement: &DfStatement) -> anyhow::Result<Option<Outgoing>> {
-        let named = self.named(statement)?;
-        if named.iter().all(|(home, _)| *home != Home::Node) {
+        let (state, held) = self.reading()?;
+        let tables = named(&state, statement, &held)?;
+        if tables.iter().all(|(h, _)| *h != Home::Node) {
             return Ok(None);
         }
         if query_of(statement).is_none() {
-            return Err(crate::codes::coded("0A000", "a page sends its node queries, and the query of a CREATE TABLE … AS or an INSERT INTO one of its own tables (write INSERT INTO t WITH … SELECT, not WITH … INSERT): write into the node's tables through a client of the node"));
+            return Err(crate::codes::coded("0A000", WRITE_TO_NODE));
         }
-        let names = page_names(named)?;
+        let names = page_names(tables)?;
         let query = format.map(|f| format!("format={f}")).unwrap_or_default();
         Ok(Some(Outgoing::Query(self.sent_for(text, query, &names).await?)))
-    }
-
-    /// The fill a statement is, if it is one: the table it writes (as the planner reads its name) and the query whose rows
-    /// it takes. A `CREATE TABLE … AS` is a fill whatever its target, since a table the page doesn't have yet is the
-    /// node's by name. An `INSERT INTO` is one only when its target is one of the page's own tables.
-    fn fill_of<'a>(&self, statement: &'a DfStatement) -> anyhow::Result<Option<(TableReference, &'a Query)>> {
-        let DfStatement::Statement(s) = statement else { return Ok(None) };
-        match &**s {
-            SqlStatement::CreateTable(CreateTable { name, query: Some(query), .. }) => Ok(Some((self.table_ref(name)?, query.as_ref()))),
-            SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), .. }) => {
-                let target = self.table_ref(name)?;
-                Ok((self.home(&target)? == Home::Page).then_some((target, query.as_ref())))
-            }
-            _ => Ok(None),
-        }
     }
 
     /// A fill's send: the node is asked the fill's query alone (`fill_of`), as `sent` writes it, so a file the statement names
     /// beside the node's tables is refused, and a table named as the node's rows is refused too (the name `over_rows` gives the rows).
     async fn fill_outgoing(&self, statement: &DfStatement, target: &TableReference, query: &Query, sent: &str) -> anyhow::Result<Option<Outgoing>> {
-        let named = self.named(&as_statement(query))?;
-        if named.iter().all(|(home, _)| *home != Home::Node) {
+        let (state, held) = self.reading()?;
+        let tables = named(&state, &as_statement(query), &held)?;
+        if tables.iter().all(|(h, _)| *h != Home::Node) {
             return Ok(None);
         }
         if target.table() == NODE_ROWS {
-            return Err(crate::codes::coded("0A000", format!("{}: a page gives its node's rows this name while it fills a table, so no table it makes may have it", crate::ext_names::quoted(NODE_ROWS))));
+            return Err(node_rows_taken());
         }
-        let names = page_names(named)?;
-        let write = self.over_rows(statement)?;
+        let names = page_names(tables)?;
+        let write = over_rows(&state, statement)?;
         let sent = self.sent_for(sent, "format=arrow".to_string(), &names).await?;
         Ok(Some(Outgoing::Fill { write, sent }))
     }
 
-    /// The fill's statement with its query put for the node's rows (`rows_query`), as SQL text the page plans: a `CREATE
-    /// TABLE t AS SELECT * FROM "the node's rows"`, or an `INSERT INTO t (cols) SELECT * FROM "the node's rows"`.
-    fn over_rows(&self, statement: &DfStatement) -> anyhow::Result<String> {
-        let mut write = statement.clone();
-        if let DfStatement::Statement(s) = &mut write {
-            match &mut **s {
-                SqlStatement::CreateTable(c) => c.query = Some(self.rows_query()?),
-                SqlStatement::Insert(i) => i.source = Some(self.rows_query()?),
-                _ => {}
-            }
-        }
-        Ok(write.to_string())
-    }
-
-    /// `SELECT * FROM` the node's rows, parsed as the page's session parses SQL: the query a fill's write puts in place of
-    /// its own.
-    fn rows_query(&self) -> anyhow::Result<Box<Query>> {
-        self.query_of_text(&format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS)))
-    }
-
-    /// `sql` parsed as a query, as the page's session parses SQL (`parsed`).
-    fn query_of_text(&self, sql: &str) -> anyhow::Result<Box<Query>> {
-        let DfStatement::Statement(s) = self.parsed(sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
-        let SqlStatement::Query(query) = *s else { anyhow::bail!("{sql} is not a query") };
-        Ok(query)
-    }
-
     /// The request a page sends its node: `sql` as its JSON's `sql`, `query` as its query string, and the page's tables that
-    /// `names` name, each with its rows (`page_tables`), within `PONDRA_WEB_SEND_MB` (`within`).
+    /// `names` name, each with its rows (`page_tables`), within `PONDRA_WEB_SEND_MB` (`sending`).
     async fn sent_for(&self, sql: &str, query: String, names: &BTreeSet<String>) -> anyhow::Result<Sent> {
         let (_, page) = self.default_schema()?;
         let tables = page_tables(page.as_ref(), names).await?;
         let bytes: usize = tables.iter().flat_map(|(_, batches)| batches).map(|b| b.get_array_memory_size()).sum();
-        within(bytes, crate::env::or("PONDRA_WEB_SEND_MB", 64))?;
+        sending(bytes)?;
         let streams = tables.iter().map(|(schema, batches)| stream_of(schema, batches)).collect::<anyhow::Result<Vec<_>>>()?;
-        let quoted: Vec<String> = names.iter().map(|name| crate::ext_names::quoted(name)).collect();
-        let head = serde_json::to_vec(&json!({"sql": sql, "tables": quoted}))?;
-        Ok(Sent { query, content_type: request_body::CONTENT_TYPE, body: request_body::write(&head, &streams), room: None })
+        Ok(Sent { query, content_type: request_body::CONTENT_TYPE, body: request_of(sql, names, &streams)?, room: None })
     }
 
-    /// The statement parsed as the page's session parses it (its dialect and identifier rules).
-    fn parsed(&self, expanded: &str) -> anyhow::Result<DfStatement> {
-        let state = self.ctx.state();
-        Ok(state.sql_to_statement(expanded, &state.config().options().sql_parser.dialect)?)
-    }
-
-    /// The tables a statement names, each with its home (`Home`), as the page reads them. Each is named as SQL wrote it,
-    /// with no default schema or catalog the page's own names carry.
-    fn named(&self, statement: &DfStatement) -> anyhow::Result<Vec<(Home, String)>> {
-        let mut named = vec![];
-        for name in self.ctx.state().resolve_table_references(statement)? {
-            named.push((self.home(&name)?, name.table().to_string()));
-        }
-        Ok(named)
-    }
-
-    /// Where the table `name` is (`home_of`), with the page's default schema and catalog.
-    fn home(&self, name: &TableReference) -> anyhow::Result<Home> {
-        let state = self.ctx.state();
-        let options = state.config().options();
-        let (_, page) = self.default_schema()?;
-        Ok(home_of(name, page.as_ref(), &options.catalog.default_catalog, &options.catalog.default_schema))
-    }
-
-    /// A table's name as the planner reads it: its identifiers normalized as the page's session normalizes them.
-    fn table_ref(&self, name: &ObjectName) -> anyhow::Result<TableReference> {
-        let normalize = self.ctx.state().config().options().sql_parser.enable_ident_normalization;
-        Ok(datafusion::sql::planner::object_name_to_table_reference(name.clone(), normalize)?)
+    /// The page's session state, and whether the page's default schema holds a table of a name: what a statement's names are read
+    /// by (`named`, `home`, `fill_of`'s target).
+    fn reading(&self) -> anyhow::Result<(SessionState, impl Fn(&str) -> bool)> {
+        let page = self.default_schema()?.1;
+        Ok((self.ctx.state(), move |name: &str| page.table_exist(name)))
     }
 
     /// One request to the page's node, and its answer as the node gave it, within the room the page has for it
@@ -894,7 +923,7 @@ impl Page {
         if !expanded.to_ascii_lowercase().contains("create") {
             return None;
         }
-        match self.parsed(expanded).ok()? {
+        match parsed(&self.ctx.state(), expanded).ok()? {
             DfStatement::Statement(s) => match *s {
                 SqlStatement::CreateTable(c) if c.query.is_none() => Some(c),
                 _ => None,
@@ -912,10 +941,11 @@ impl Page {
         if !expanded.to_ascii_lowercase().contains("insert") {
             return Ok(None);
         }
-        let Ok(DfStatement::Statement(mut statement)) = self.parsed(expanded) else { return Ok(None) };
+        let (state, held) = self.reading()?;
+        let Ok(DfStatement::Statement(mut statement)) = parsed(&state, expanded) else { return Ok(None) };
         let SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), on: None, columns: names, .. }) = statement.as_mut() else { return Ok(None) };
-        let target = self.table_ref(name)?;
-        if self.home(&target)? != Home::Page {
+        let target = table_ref(&state, name)?;
+        if home(&state, &target, &held) != Home::Page {
             return Ok(None);
         }
         let Some(table) = self.default_schema()?.1.table(target.table()).await? else { return Ok(None) };
@@ -939,7 +969,7 @@ impl Page {
             *names = quoted(&named);
             return Ok(Some(statement.to_string()));
         }
-        *query = self.query_of_text(&text)?;
+        *query = query_of_text(&state, &text)?;
         *names = quoted(&columns);
         Ok(Some(statement.to_string()))
     }
@@ -985,7 +1015,7 @@ impl Page {
         if !expanded.to_ascii_lowercase().contains("update") {
             return Ok(());
         }
-        let statement = match self.parsed(expanded) {
+        let statement = match parsed(&self.ctx.state(), expanded) {
             Ok(DfStatement::Statement(s)) => *s,
             Ok(DfStatement::Explain(e)) if e.options.analyze => match *e.statement {
                 DfStatement::Statement(s) => *s,
@@ -995,7 +1025,7 @@ impl Page {
         };
         let SqlStatement::Update(Update { table: target, assignments, .. }) = statement else { return Ok(()) };
         let TableFactor::Table { name, .. } = &target.relation else { return Ok(()) };
-        let table = self.table_ref(name)?.table().to_string();
+        let table = table_ref(&self.ctx.state(), name)?.table().to_string();
         let Some(ruled) = self.ruled_of(&table) else { return Ok(()) };
         // (an ALWAYS identity is set only to DEFAULT, as a node sets it: 428C9)
         crate::rules::keys::set(&ruled.table, &set_columns(&assignments))?;
@@ -1300,7 +1330,7 @@ impl Page {
     /// the CREATE made it. A note whose text is not a CREATE TABLE, or fails to parse or to build, makes the table unread, as a bad
     /// file does (`kept` lists it by its path and the words of why).
     fn ruled_from(&self, text: &str, schema: &Schema, counted: Option<&str>) -> anyhow::Result<Ruled> {
-        let DfStatement::Statement(s) = self.parsed(text)? else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
+        let DfStatement::Statement(s) = parsed(&self.ctx.state(), text)? else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
         let SqlStatement::CreateTable(c) = *s else { anyhow::bail!("its {CREATE_KEY} note is not a CREATE TABLE") };
         let held: BTreeMap<String, counters::Counter> = match counted {
             Some(json) => serde_json::from_str(json).with_context(|| format!("its {COUNTERS_KEY} note is not a table's counters"))?,
@@ -1565,8 +1595,9 @@ impl Page {
 
     /// `text` as one SQL statement, as written or once DuckDB's forms are made SQL that parses (`friendly::text`), or None.
     fn statement_of(&self, text: &str) -> Option<SqlStatement> {
-        let parsed = self.parsed(text).ok().or_else(|| self.parsed(&crate::friendly::text(text).ok()?).ok());
-        match parsed? {
+        let state = self.ctx.state();
+        let statement = parsed(&state, text).ok().or_else(|| parsed(&state, &crate::friendly::text(text).ok()?).ok());
+        match statement? {
             DfStatement::Statement(s) => Some(*s),
             _ => None,
         }
@@ -1643,7 +1674,7 @@ impl Page {
     /// A DROP TABLE of `table` while views read it is refused in a node's words (`ddl::drop_table`); with CASCADE, those
     /// views go first, as a node drops them.
     async fn read_by(&self, table: &ObjectName, cascade: bool) -> anyhow::Result<()> {
-        let table = self.table_ref(table)?.table().to_string();
+        let table = table_ref(&self.ctx.state(), table)?.table().to_string();
         let readers = self.readers(&table)?;
         if readers.is_empty() {
             return Ok(());
@@ -1686,7 +1717,7 @@ impl Page {
 
     /// Refuses `name` when a view has it: a node's words, `before` and `after` the name.
     fn not_a_view(&self, name: &ObjectName, before: &str, after: &str) -> anyhow::Result<()> {
-        let name = self.table_ref(name)?.table().to_string();
+        let name = table_ref(&self.ctx.state(), name)?.table().to_string();
         match self.views_held().contains_key(&name) {
             true => anyhow::bail!("{before}{name}{after}"),
             false => Ok(()),
@@ -1696,7 +1727,7 @@ impl Page {
     /// A view's name as the planner reads it, in the page's one schema; a name in another schema or catalog is refused by
     /// name.
     fn view_name(&self, name: &ObjectName) -> anyhow::Result<String> {
-        let reference = self.table_ref(name)?;
+        let reference = table_ref(&self.ctx.state(), name)?;
         let state = self.ctx.state();
         let options = state.config().options();
         let here = reference.schema().is_none_or(|s| s == options.catalog.default_schema) && reference.catalog().is_none_or(|c| c == options.catalog.default_catalog);
@@ -2114,14 +2145,20 @@ fn change_of(plan: &LogicalPlan) -> Change {
     }
 }
 
-/// The rows a node answered a fill's query with, as a table the fill is planned over (`filled`): the rows of an Arrow stream,
-/// with the schema it names even when it has no rows. Any other answer is 08P01, and so is a stream that doesn't read. There
-/// is no size cap here: the page's memory line (a separate piece) stops a page that grows too far.
-fn node_rows(answer: &Answer) -> anyhow::Result<Arc<dyn TableProvider>> {
+/// A node's answer to a fill's query must be Arrow rows: any other `content-type` is 08P01, its words saying what it was.
+fn node_arrow(answer: &Answer) -> anyhow::Result<()> {
     let said = answer.header("content-type");
     if said != Some(crate::answer::content_type(Some("arrow"))) {
         return Err(crate::codes::coded("08P01", format!("the page's node answered {}, not Arrow rows", said.unwrap_or("no content-type"))));
     }
+    Ok(())
+}
+
+/// The rows a node answered a fill's query with, as a table the fill is planned over (`filled`): the rows of an Arrow stream,
+/// with the schema it names even when it has no rows. Any other answer is 08P01, and so is a stream that doesn't read. There
+/// is no size cap here: the page's memory line (a separate piece) stops a page that grows too far.
+fn node_rows(answer: &Answer) -> anyhow::Result<Arc<dyn TableProvider>> {
+    node_arrow(answer)?;
     let (schema, batches) = stream_rows(answer.body.clone()).map_err(|e| crate::codes::coded("08P01", format!("the page's node answered Arrow rows that don't read: {e:#}")))?;
     Ok(Arc::new(MemTable::try_new(schema, vec![batches])?))
 }
@@ -2193,18 +2230,97 @@ enum Home {
     Node,
 }
 
-/// The home of the table `name` names. A name carries the page's default schema and catalog, or none, and is the page's
-/// when its table is one of the page's; a file is any `ext:` name; every other table is the node's.
-fn home_of(name: &TableReference, page: &dyn SchemaProvider, catalog: &str, schema: &str) -> Home {
+/// The home of the table `name` names, given whether the page holds a table of its name (`held`). A name carries the default
+/// schema and catalog, or none, and is the page's when it is held; a file is any `ext:` name; every other table is the node's.
+fn home_of(name: &TableReference, held: bool, catalog: &str, schema: &str) -> Home {
     if crate::ext_names::is(name.table()) {
         return Home::File;
     }
     let here = name.schema().is_none_or(|s| s == schema) && name.catalog().is_none_or(|c| c == catalog);
-    if here && page.table_exist(name.table()) {
+    if here && held {
         Home::Page
     } else {
         Home::Node
     }
+}
+
+/// The home of `name` in `state`'s session, with `held` saying whether the page (or the lake) holds a table of a name.
+fn home(state: &SessionState, name: &TableReference, held: &dyn Fn(&str) -> bool) -> Home {
+    let options = state.config().options();
+    home_of(name, held(name.table()), &options.catalog.default_catalog, &options.catalog.default_schema)
+}
+
+/// The tables a statement names, each with its home (`home`), as the page reads them. Each is named as SQL wrote it, with no
+/// default schema or catalog the page's own names carry.
+fn named(state: &SessionState, statement: &DfStatement, held: &dyn Fn(&str) -> bool) -> anyhow::Result<Vec<(Home, String)>> {
+    let mut tables = vec![];
+    for name in state.resolve_table_references(statement)? {
+        tables.push((home(state, &name, held), name.table().to_string()));
+    }
+    Ok(tables)
+}
+
+/// The statement parsed as the session `state` parses it (its dialect and identifier rules).
+fn parsed(state: &SessionState, expanded: &str) -> anyhow::Result<DfStatement> {
+    Ok(state.sql_to_statement(expanded, &state.config().options().sql_parser.dialect)?)
+}
+
+/// A table's name as the planner reads it: its identifiers normalized as the session normalizes them.
+fn table_ref(state: &SessionState, name: &ObjectName) -> anyhow::Result<TableReference> {
+    let normalize = state.config().options().sql_parser.enable_ident_normalization;
+    Ok(datafusion::sql::planner::object_name_to_table_reference(name.clone(), normalize)?)
+}
+
+/// The fill a statement is, if it is one: the table it writes (as the planner reads its name), the query whose rows it takes,
+/// and whether the statement is an INSERT. A `CREATE TABLE … AS` is a fill whatever its target, since a table the page doesn't
+/// have yet is the node's by name. An `INSERT INTO` is one only when its target is one of the page's own tables, which the
+/// caller checks (`home`).
+fn fill_of<'a>(state: &SessionState, statement: &'a DfStatement) -> anyhow::Result<Option<(TableReference, &'a Query, bool)>> {
+    let DfStatement::Statement(s) = statement else { return Ok(None) };
+    match &**s {
+        SqlStatement::CreateTable(CreateTable { name, query: Some(query), .. }) => Ok(Some((table_ref(state, name)?, query.as_ref(), false))),
+        SqlStatement::Insert(Insert { table: TableObject::TableName(name), source: Some(query), .. }) => Ok(Some((table_ref(state, name)?, query.as_ref(), true))),
+        _ => Ok(None),
+    }
+}
+
+/// The fill's statement with its query put for the node's rows (`rows_query`), as SQL text the session plans: a `CREATE TABLE t
+/// AS SELECT * FROM "the node's rows"`, or an `INSERT INTO t (cols) SELECT * FROM "the node's rows"`.
+fn over_rows(state: &SessionState, statement: &DfStatement) -> anyhow::Result<String> {
+    let mut write = statement.clone();
+    if let DfStatement::Statement(s) = &mut write {
+        match &mut **s {
+            SqlStatement::CreateTable(c) => c.query = Some(rows_query(state)?),
+            SqlStatement::Insert(i) => i.source = Some(rows_query(state)?),
+            _ => {}
+        }
+    }
+    Ok(write.to_string())
+}
+
+/// `SELECT * FROM` the node's rows, parsed as the session parses SQL: the query a fill's write puts in place of its own.
+fn rows_query(state: &SessionState) -> anyhow::Result<Box<Query>> {
+    query_of_text(state, &format!("SELECT * FROM {}", crate::ext_names::quoted(NODE_ROWS)))
+}
+
+/// `sql` parsed as a query, as the session parses SQL (`parsed`).
+fn query_of_text(state: &SessionState, sql: &str) -> anyhow::Result<Box<Query>> {
+    let DfStatement::Statement(s) = parsed(state, sql)? else { anyhow::bail!("{sql} is not a statement a page's session parses") };
+    let SqlStatement::Query(query) = *s else { anyhow::bail!("{sql} is not a query") };
+    Ok(query)
+}
+
+/// The request a page sends its node (`request_body`): the JSON head with `sql` and the names `names` quoted as its tables, then
+/// one stream per name, in the names' order.
+fn request_of(sql: &str, names: &BTreeSet<String>, streams: &[impl AsRef<[u8]>]) -> anyhow::Result<bytes::Bytes> {
+    let quoted: Vec<String> = names.iter().map(|name| crate::ext_names::quoted(name)).collect();
+    let head = serde_json::to_vec(&json!({"sql": sql, "tables": quoted}))?;
+    Ok(request_body::write(&head, streams))
+}
+
+/// The refusal of a fill that names its target `NODE_ROWS`: the name the rows have while the fill is planned is the page's.
+fn node_rows_taken() -> anyhow::Error {
+    crate::codes::coded("0A000", format!("{}: a page gives its node's rows this name while it fills a table, so no table it makes may have it", crate::ext_names::quoted(NODE_ROWS)))
 }
 
 /// The query a statement is, for a page to send its node: a `SELECT`, `WITH`, `VALUES` or `EXPLAIN` of one. A write is
@@ -2229,7 +2345,7 @@ fn as_statement(query: &Query) -> DfStatement {
 /// a page sends names the page's tables and the node's, and a file is the page's to read, not the node's.
 fn page_names(named: Vec<(Home, String)>) -> anyhow::Result<BTreeSet<String>> {
     if named.iter().any(|(home, _)| *home == Home::File) {
-        return Err(crate::codes::coded("0A000", "a query a page sends its node names the page's tables and the node's, not the page's files: make the file a table first (CREATE TABLE t AS FROM 'file')"));
+        return Err(crate::codes::coded("0A000", FILE_BESIDE_NODE));
     }
     Ok(named.into_iter().filter(|(home, _)| *home == Home::Page).map(|(_, name)| name).collect())
 }
@@ -2265,6 +2381,11 @@ fn stream_of(schema: &SchemaRef, batches: &[RecordBatch]) -> anyhow::Result<Vec<
         writer.write(&over_schema(schema, batch)?)?;
     }
     Ok(writer.into_inner()?)
+}
+
+/// The bytes of a page's tables a query sends its node, within `PONDRA_WEB_SEND_MB` (`sending`), both paths' limit.
+fn sending(bytes: usize) -> anyhow::Result<()> {
+    within(bytes, crate::env::or("PONDRA_WEB_SEND_MB", 64))
 }
 
 /// The bytes of a page's tables a query sends its node, within `limit_mb` MiB (`PONDRA_WEB_SEND_MB`). The rows go in one
