@@ -18,7 +18,7 @@ use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExp
 use datafusion::logical_expr::{Expr, ExprSchemable, ScalarUDF, Signature, Volatility};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, VisitorMut};
 use datafusion::sql::sqlparser::dialect::{GenericDialect, PostgreSqlDialect};
 use datafusion::sql::sqlparser::parser::Parser;
 use jiter::{Jiter, Peek};
@@ -828,7 +828,7 @@ pub fn expression(e: &str) -> Cow<'_, str> {
 /// The statements with each JSON operator regrouped where Postgres groups it differently. None when none was.
 fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
     let mut moved = false;
-    let _ = ast::visit_expressions_mut(&mut stmts, |e| {
+    let _ = crate::walk::visit_expressions_mut(&mut stmts, |e| {
         if is_json_op(e) {
             moved |= regroup_at(e);
         }
@@ -842,7 +842,7 @@ fn regrouped(mut stmts: Vec<ast::Statement>) -> Option<String> {
 /// other JSON operator is nested, so the generic dialect reads the text the same way.
 fn questions(sql: &str) -> Option<String> {
     let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
-    let _ = stmts.visit(&mut Questions);
+    let _ = crate::walk::visit_mut(&mut stmts, &mut Questions);
     Some(written(&stmts))
 }
 
@@ -944,7 +944,7 @@ fn unnest(e: ast::Expr) -> ast::Expr {
 fn lambda_like(left: &ast::Expr, right: &ast::Expr) -> bool {
     let ast::Expr::Identifier(name) = left else { return false };
     let mut used = false;
-    let _ = ast::visit_expressions(right, |e| {
+    let _ = crate::walk::visit_expressions(right, |e| {
         used |= matches!(e, ast::Expr::Identifier(n) if n.value == name.value);
         ControlFlow::<()>::Continue(())
     });

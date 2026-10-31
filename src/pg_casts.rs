@@ -6,7 +6,7 @@ use crate::text::function;
 use anyhow::Result;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::DataType;
-use datafusion::sql::sqlparser::ast::{self, Statement, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Statement, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
@@ -158,7 +158,7 @@ pub(crate) async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statem
     }
     let mut f = Casts { types: HashMap::new(), named: vec![], labelled: vec![], typed: false, collecting: true, failed: None };
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut f); // (the first pass only collects the names)
+        let _ = crate::walk::visit_mut(s, &mut f); // (the first pass only collects the names)
     }
     if f.named.is_empty() && !f.typed {
         return Ok(read);
@@ -176,7 +176,7 @@ pub(crate) async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statem
     }
     f.collecting = false;
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut f);
+        let _ = crate::walk::visit_mut(s, &mut f);
     }
     match f.failed {
         Some(e) => Err(e),

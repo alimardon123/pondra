@@ -131,7 +131,7 @@ fn arguments(e: &ast::Expr) -> Vec<ast::Expr> {
 /// The columns an expression names.
 fn named(e: &ast::Expr) -> Vec<String> {
     let mut out = vec![];
-    let _ = ast::visit_expressions(e, |x| {
+    let _ = crate::walk::visit_expressions(e, |x| {
         match x {
             ast::Expr::Identifier(i) => out.push(name(i)),
             ast::Expr::CompoundIdentifier(p) => out.extend(p.last().map(name)),
@@ -261,7 +261,7 @@ fn window(s: &ast::Select, src: &TableMeta) -> Result<(String, String, String)> 
     };
     let column = column.with_context(|| format!("EMIT FINAL: name the window in the SELECT, as {e} AS window_start"))?;
     // (over the time column alone, as `"ts"`: worked out for the watermark and each new row)
-    let _ = ast::visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if matches!(x, ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)) {
             *x = ast::Expr::Identifier(ast::Ident::with_quote('"', time.clone()));
         }

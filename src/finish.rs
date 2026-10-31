@@ -102,7 +102,7 @@ pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>) -> Resul
     let mut finish_of = |e: &ast::Expr| -> Result<ast::Expr> {
         let mut e = e.clone();
         let mut failed = None;
-        let _ = ast::visit_expressions_mut(&mut e, |x| {
+        let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
             if let ast::Expr::Function(f) = x {
                 if f.over.is_none() && aggregates.contains(&lower(&f.name)) {
                     match parts.of(f) {
@@ -117,7 +117,7 @@ pub fn split(sql: &str, names: &[String], aggregates: &HashSet<String>) -> Resul
             ControlFlow::Continue(())
         });
         // (what's left names keys, as the partial table does: without the table they came from)
-        let _ = ast::visit_expressions_mut(&mut e, |x| {
+        let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
             if let ast::Expr::CompoundIdentifier(p) = x {
                 *x = ast::Expr::Identifier(p.last().expect("a part").clone());
             }
@@ -172,7 +172,7 @@ impl Split {
                 }
             }
         }
-        let _ = ast::visit_expressions_mut(&mut q, |x| {
+        let _ = crate::walk::visit_expressions_mut(&mut q, |x| {
             if let ast::Expr::Function(f) = x {
                 if lower(&f.name) == AVG {
                     let a = args(f);

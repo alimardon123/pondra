@@ -27,7 +27,7 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Arra
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, UInt64Type};
 use datafusion::sql::sqlparser::ast::{
     Expr, GroupByExpr, Ident, LockClause, LockType, NonBlock, ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor,
-    TransactionMode, Visit, Visitor,
+    TransactionMode, Visitor,
 };
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
@@ -1355,7 +1355,7 @@ pub async fn locked_read(app: &crate::app::App, sql: &str) -> Result<Option<Vec<
 /// is waited for, or refused at once with NOWAIT), and a lock clause in a subquery, a union or a write's query.
 fn lock_clause(stmt: &Statement) -> Result<Option<(&Query, &LockClause)>> {
     let mut count = Locking(0);
-    let _ = Visit::visit(stmt, &mut count);
+    let _ = crate::walk::visit(stmt, &mut count);
     if count.0 == 0 {
         return Ok(None);
     }

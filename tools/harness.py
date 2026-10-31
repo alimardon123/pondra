@@ -635,6 +635,31 @@ def loads():
     checks["7. pondra.loads lists each file of the table, its version and rows (a system table)"] = (
         sorted((r["file"].rsplit("/", 1)[1], r["rows"]) for r in listed) == [("a.csv", 2), ("b.csv", 1), ("c.csv", 2), ("d.csv", 1)] and all(r["version"] for r in listed))
 
+    # A batch of 16 MB or more of values is logged in row slices (`log::encode_ipc`), under one first row id (audit 10-31
+    # H1, H2): each row reads back with its own id, in the log and tiered, so a DELETE hides the row it names only; and a
+    # checked append (a table with a key) sent through a follower reaches the leader whole, not as its first slice.
+    import pyarrow as pa
+    n_big = 400000
+    big = pa.table({"id": pa.array(range(n_big), pa.int64()), "s": pa.array([f"{i:064d}" for i in range(n_big)])})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, big.schema) as w:
+        w.write_table(big)  # (one batch: about 30 MB of values, three slices on a node of three or more cores)
+    owner = {"x-pondra-owner": owner_key}
+    arrow = {**owner, "content-type": "application/vnd.apache.arrow.stream"}
+    ids = lambda t, i=0: run(f"SELECT count(*) AS n, count(DISTINCT _row_id) AS d FROM {t}", i)[0]
+    run("CREATE TABLE sliced (id BIGINT, s VARCHAR)")
+    call(A.port, "POST", "/append/sliced?producer=sliced&seq=1", sink.getvalue().to_pybytes(), headers=arrow, timeout=300)
+    logged = ids("sliced")
+    call(A.port, "POST", "/tier", headers=owner, timeout=600)
+    tiered = ids("sliced")
+    run("DELETE FROM sliced WHERE id = 5")
+    after = run("SELECT count(*) AS n, count(*) FILTER (WHERE id = 5) AS five FROM sliced")[0]
+    checks["7c. a load logged in row slices: each row its own _row_id, in the log and tiered; a DELETE hides the row it names only"] = (
+        logged == tiered == {"n": n_big, "d": n_big} and after == {"n": n_big - 1, "five": 0})
+    run("CREATE TABLE sliced_key (id BIGINT PRIMARY KEY, s VARCHAR)")
+    call(A.port + 1, "POST", "/append/sliced_key?producer=sliced_key&seq=1", sink.getvalue().to_pybytes(), headers=arrow, timeout=300)
+    checks["7d. the same load into a table with a key, sent through a follower: every row reaches the leader"] = ids("sliced_key") == {"n": n_big, "d": n_big}
+
     run("CREATE TABLE events (id BIGINT, amount BIGINT)")
     for i in range(6):
         write(f"many/f{i}.csv", "id,amount\n" + "".join(f"{i * 100 + j},{j}\n" for j in range(50)))
@@ -4682,6 +4707,20 @@ def flight():
         conn.close()
     checks["a transaction word run as SQL is refused over Flight SQL (0A000): a script's COMMIT, a block's, a CALL's and a savepoint's, in a transaction the protocol began, and the rows of those transactions are rolled back, not committed"] = \
         plain_commit == "0A000" and all(v == "0A000" for v in txn_refused.values()) and count()["n"] == rows_before_txn
+    # A `$name` declared in a transaction the protocol began is bound in the writes sent after it, as every door binds it
+    # (audit 10-31 L9: Flight's writes skipped the binding).
+    conn = adbc.connect(f"grpc://127.0.0.1:{fport}", db_kwargs={"adbc.flight.sql.authorization_header": "Bearer a"}, autocommit=False)
+    try:
+        cur = conn.cursor()
+        cur.execute("DECLARE $bump = 7")
+        cur.execute("INSERT INTO ev VALUES ('declared', $bump, TIMESTAMP '2026-09-22 10:00:00')")
+        cur.execute("UPDATE ev SET amount = amount + $bump WHERE user = 'declared'")
+        conn.commit()
+        declared = q("SELECT amount FROM ev WHERE user = 'declared'")
+    except Exception as e:  # (a refusal fails the check, it doesn't end the run)
+        declared = str(e).splitlines()[0][:200]
+    conn.close()
+    checks["a $name declared in a Flight SQL transaction is bound in its INSERT and UPDATE"] = declared == [{"amount": 14}]
     # A number with an exponent: the schema GetFlightInfo announces is the type its rows come back with (decimal(16, 0), not the planner's decimal(1, -15)).
     exp_info = client.get_flight_info(fl.FlightDescriptor.for_command(json.dumps({"sql": "SELECT 1e15 AS x"})), opts("r"))
     exp_rows = client.do_get(exp_info.endpoints[0].ticket, options=opts("r")).read_all()
@@ -4711,7 +4750,7 @@ def flight():
     follow_ms = round((lag[-1] - sent_at) * 1000) if lag else None
     print(json.dumps({"flight": checks, "follow_ms": follow_ms, "kept_gauge": {"before": gauge_before, "at_getflightinfo": gauge_before + kept_rise, "after_doget": gauge_before + kept_back}, "ok": ok}, indent=1))
     if not ok:
-        print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total)
+        print(first[:2], again[:2], after_retry, via_follower, by_user.num_rows, via_info, listed, past.num_rows, got, marks, shaken, adbc_count, ingest_back, ingested, names, total, declared)
         sys.exit(1)
     return f"Arrow Flight: pyarrow DoPut exactly-once (retried stream applied once, via a follower too), DoGet SQL, FlightInfo, ListFlights, the log as a columnar stream (a subscriber has each new commit in {follow_ms} ms), tokens and handshake; ADBC queries, writes, ingest and catalog: all {len(checks)} checks pass"
 

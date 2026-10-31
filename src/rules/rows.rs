@@ -47,7 +47,7 @@ pub(crate) fn one_row(query: &str) -> bool { plain_values(query).is_some_and(|v|
 pub(crate) fn constant_row(query: &str) -> bool {
     const TIME: [&str; 6] = ["now", "current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"];
     let Some(v) = plain_values(query).filter(|v| v.rows.len() == 1) else { return false };
-    let reads = ast::visit_expressions(&v, |e| match e {
+    let reads = crate::walk::visit_expressions(&v, |e| match e {
         ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } => std::ops::ControlFlow::Break(()),
         ast::Expr::Function(f) if !TIME.iter().any(|t| f.name.to_string().eq_ignore_ascii_case(t)) => std::ops::ControlFlow::Break(()),
         _ => std::ops::ControlFlow::Continue(()),

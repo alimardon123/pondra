@@ -312,7 +312,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
     let mut scan = Scan::default();
     for s in stmts.iter().filter(|s| !kept(s)) {
-        let _ = Visit::visit(s, &mut scan);
+        let _ = crate::walk::visit(s, &mut scan);
     }
     if !scan.found {
         return Ok(false);
@@ -320,7 +320,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     let lake_cols = lake_columns(host, &scan).await?;
     let mut r = Rewrite { lake: &lake_cols };
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut r) {
             return Err(e);
         }
     }
@@ -355,7 +355,7 @@ pub async fn open_columns<H: crate::front::Host>(host: &H, sql: &str) -> Result<
     let mut scan = Scan::default();
     {
         let query = crate::expander::parse_query(&text(sql))?;
-        let _ = Visit::visit(&query, &mut scan);
+        let _ = crate::walk::visit(&query, &mut scan);
     }
     lake_columns(host, &scan).await
 }
@@ -580,7 +580,7 @@ fn projected(s: &Select, ctx: &dyn FunctionRegistry) -> Result<()> {
     });
     for e in items.chain(s.selection.as_ref()) {
         let mut around_it = None;
-        let _ = visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             if let Expr::Function(f) = x {
                 if f.over.is_some() {
                     around_it = Some("a window");
@@ -604,7 +604,7 @@ fn projected(s: &Select, ctx: &dyn FunctionRegistry) -> Result<()> {
 /// ones (now() and the current date and time, which each run reads at its own time). The session's registry tells them.
 fn rerun_in(e: &Expr, ctx: &dyn FunctionRegistry) -> Option<String> {
     let mut found = None;
-    let _ = visit_expressions(e, |x| {
+    let _ = crate::walk::visit_expressions(e, |x| {
         if let Expr::Function(f) = x {
             let name = lower_name(f);
             let volatility = ctx
@@ -623,7 +623,7 @@ fn rerun_in(e: &Expr, ctx: &dyn FunctionRegistry) -> Option<String> {
 
 /// Whether a call to `name` (in lower case) is anywhere in `q`.
 fn has_call(q: &Query, name: &str) -> bool {
-    visit_expressions(q, |x| match x {
+    crate::walk::visit_expressions(q, |x| match x {
         Expr::Function(f) if lower_name(f) == name => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -656,7 +656,7 @@ fn look_of(measures: &[Measure], symbols: &[SymbolDefinition]) -> Result<u64> {
     let mut look = 0u64;
     for e in measures.iter().map(|m| &m.expr).chain(symbols.iter().map(|d| &d.definition)) {
         let mut err = None;
-        let _ = visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             if let Expr::Function(f) = x {
                 if lower_name(f) == "prev" {
                     match positional(f).and_then(|a| whole(a.get(1).copied())) {
@@ -1047,7 +1047,7 @@ fn one_define(e: Expr, k: usize, cx: &mut Cx, glued: &mut Vec<serde_json::Value>
 
 /// Whether a PREV, NEXT, FIRST or LAST of `e` has a CLASSIFIER() anywhere in its arguments.
 fn nav_of_classifier(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if ["first", "last", "prev", "next"].contains(&lower_name(f).as_str()) && has_classifier(x) => {
             ControlFlow::Break(())
         }
@@ -1058,7 +1058,7 @@ fn nav_of_classifier(e: &Expr) -> bool {
 
 /// Whether `e` has a CLASSIFIER() call anywhere in it.
 fn has_classifier(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if lower_name(f) == "classifier" => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -1068,7 +1068,7 @@ fn has_classifier(e: &Expr) -> bool {
 /// RUNNING takes its argument as it is (a DEFINE reads the rows so far); FINAL is for MEASURES and is refused.
 fn unwrap_running(e: &mut Expr) -> Result<()> {
     let mut err = None;
-    let _ = visit_expressions_mut(e, |x| {
+    let _ = crate::walk::visit_expressions_mut(e, |x| {
         let replacement = match x {
             Expr::Function(f) if lower_name(f) == "pondra_running" => match positional(f).and_then(|a| first_arg(&a, "RUNNING").cloned()) {
                 Ok(inner) => Some(inner),
@@ -1106,7 +1106,7 @@ fn conjuncts(e: &Expr) -> Vec<Expr> {
 /// Whether a DEFINE's expression reads the match so far: another variable's column, a navigation, an aggregate, or
 /// MATCH_NUMBER(). A PREV or NEXT of the row's own columns reads the row only, and so does CLASSIFIER().
 fn reads_match(e: &Expr, k: usize, cx: &Cx) -> bool {
-    visit_expressions(e, |x| {
+    crate::walk::visit_expressions(e, |x| {
         let reads = match x {
             Expr::CompoundIdentifier(p) => match p.as_slice() {
                 [q, _] => cx.syms.iter().position(|s| *s == ident(q)).is_some_and(|j| j != k),
@@ -1130,7 +1130,7 @@ fn reads_match(e: &Expr, k: usize, cx: &Cx) -> bool {
 fn glue_text(e: Expr, k: usize, cx: &mut Cx) -> Result<String> {
     let mut x = e;
     let mut glue = Glue { cx, k, err: None };
-    let _ = VisitMut::visit(&mut x, &mut glue);
+    let _ = crate::walk::visit_mut(&mut x, &mut glue);
     if let Some(err) = glue.err {
         return Err(err);
     }
@@ -1230,7 +1230,7 @@ fn function_slot(f: &Function, k: usize, cx: &mut Cx) -> Result<Option<String>> 
 /// The name of the first navigation or aggregate in `e` (lower case), when there is one.
 fn nested(e: &Expr) -> Option<String> {
     let mut found = None;
-    let _ = visit_expressions(e, |x| match x {
+    let _ = crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) => {
             let name = lower_name(f);
             if NAVIGATIONS.contains(&name.as_str()) || AGGREGATES.contains(&name.as_str()) {
@@ -1380,7 +1380,7 @@ fn quote(s: &str) -> String {
 fn variable_of<V: Visit + Display>(v: &V, cx: &Cx) -> Result<Option<usize>> {
     let mut found: Vec<usize> = vec![];
     let mut err = None;
-    let _ = visit_expressions(v, |e| {
+    let _ = crate::walk::visit_expressions(v, |e| {
         if let Expr::CompoundIdentifier(p) = e {
             if let [q, _] = p.as_slice() {
                 match symbol_named(&ident(q), cx) {
@@ -1418,7 +1418,7 @@ fn symbol_named(name: &str, cx: &Cx) -> Result<usize> {
 /// An expression as SQL with its variables dropped (`down.price` is `price`): the column a navigation reads.
 fn plain(e: &Expr) -> String {
     let mut e = e.clone();
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if let Some(last) = match x {
             Expr::CompoundIdentifier(p) => p.last().cloned(),
             _ => None,
@@ -1432,7 +1432,7 @@ fn plain(e: &Expr) -> String {
 
 /// Whether an expression reads the match (a navigation, CLASSIFIER or MATCH_NUMBER) anywhere in it.
 fn navigates(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if NAVIGATIONS.contains(&lower_name(f).as_str()) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -1497,7 +1497,7 @@ fn define_error(sym: &str, what: String) -> anyhow::Error {
 /// translation keeps its place among operators).
 fn written<T: VisitMut + Display>(mut x: T, cx: &mut Cx) -> Result<String> {
     let mut swap = Swap { cx, texts: vec![], err: None };
-    let _ = VisitMut::visit(&mut x, &mut swap);
+    let _ = crate::walk::visit_mut(&mut x, &mut swap);
     if let Some(e) = swap.err {
         return Err(e);
     }
@@ -1805,7 +1805,7 @@ pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
     let mut stmts = Parser::parse_sql(&GenericDialect {}, &t)?;
     let mut r = Rewrite { lake: &HashMap::new() };
     for s in stmts.iter_mut() {
-        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut r) {
             return Err(e);
         }
     }

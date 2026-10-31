@@ -129,7 +129,7 @@ impl Returning {
                 *item = SelectItem::Wildcard(o);
             }
         }
-        let _ = ast::visit_expressions_mut(&mut items, |e| {
+        let _ = crate::walk::visit_expressions_mut(&mut items, |e| {
             if let Expr::CompoundIdentifier(parts) = e {
                 if parts.len() >= 2 && ours(&parts[..parts.len() - 1]) {
                     *e = Expr::CompoundIdentifier(vec![ast::Ident::new(ROWS), parts[parts.len() - 1].clone()]);

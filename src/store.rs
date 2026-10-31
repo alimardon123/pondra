@@ -1775,9 +1775,7 @@ impl Lake {
         };
         let mut rows = vec![];
         for &(off, len, _) in parts {
-            for b in crate::log::decode(&bytes[off as usize..(off + len) as usize])? {
-                rows.push(crate::sys::expand(b)?); // (fresh row ids: one number in the log)
-            }
+            rows.extend(crate::log::decode_part(&bytes[off as usize..(off + len) as usize])?); // (fresh row ids: one number in the log)
         }
         let rows: Rows = Arc::new(rows);
         let tiered = self.cat.meta(&table_key(table)).await?.map_or(0, |t| t.tiered);

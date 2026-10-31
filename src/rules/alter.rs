@@ -67,7 +67,7 @@ pub fn used_by(table: &str, readers: &[String], drop: bool) -> anyhow::Error {
 /// CHECK's condition, and a key's or a UNIQUE's columns, which sqlparser holds as expressions. A column's own definition
 /// names it apart (`ColumnDef::name`), so a caller renames that one itself.
 pub fn rename_column_in<V: ast::VisitMut>(node: &mut V, from: &str, to: &str) {
-    let _ = ast::visit_expressions_mut(node, |x| {
+    let _ = crate::walk::visit_expressions_mut(node, |x| {
         let named = match x {
             ast::Expr::Identifier(i) => Some(i),
             ast::Expr::CompoundIdentifier(parts) => parts.last_mut(),
@@ -82,7 +82,7 @@ pub fn rename_column_in<V: ast::VisitMut>(node: &mut V, from: &str, to: &str) {
 
 /// Whether `node` (a CHECK's condition, a UNIQUE's columns) names the column `column` in an expression.
 pub fn names_column<V: ast::Visit>(node: &V, column: &str) -> bool {
-    ast::visit_expressions(node, |x| match x {
+    crate::walk::visit_expressions(node, |x| match x {
         ast::Expr::Identifier(i) if ident(i) == column => ControlFlow::Break(()),
         ast::Expr::CompoundIdentifier(parts) if parts.last().is_some_and(|i| ident(i) == column) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),

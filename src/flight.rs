@@ -594,30 +594,24 @@ const KEPT_FOR: std::time::Duration = std::time::Duration::from_secs(600);
 /// runs work does.
 fn prune_kept() { KEPT.lock().unwrap().retain(|_, (_, at, _)| at.elapsed() < KEPT_FOR); }
 
-/// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written.
+/// A write sent as SQL: a CREATE, INSERT, UPDATE, DELETE or ALTER (or a CALL). Returns the rows written. It runs as every
+/// door runs a statement (`statement::run`): its `$name`s bound from the session (a Flight transaction's `DECLARE $x` is
+/// one: audit 10-31 L9), its macros expanded, audited, checked against the caller's role.
 async fn write(app: &App, role: Role, sql: &str) -> Result<i64, Status> {
     no_sql_transaction(sql)?;
-    if crate::returning::of(sql).is_some() {
-        // (sent as an update, a write with RETURNING answers how many rows it wrote)
-        let who = crate::routines::Who { role, files: false, depth: 0 };
-        return match crate::routines::one(app, sql, who, None).await.map_err(status)? {
-            crate::routines::Outcome::Rows(b) => Ok(b.iter().map(|b| b.num_rows() as i64).sum()),
-            crate::routines::Outcome::Done(_) => Ok(0),
-        };
+    if !statement::is_write(sql) {
+        return Err(refused("22023", "not a write statement"));
     }
-    if crate::routines::runs_procedure(sql) {
-        let who = crate::routines::Who { role, files: false, depth: 0 };
-        crate::routines::one(app, sql, who, None).await.map_err(status)?;
-        return Ok(0);
-    }
-    // (read inside the audited statement, as every door's is: its lake is in scope, so a relative LOCATION is its file)
-    let done = crate::audit::statement(app, sql, async {
-        let sql = crate::routines::expand(&app.lake, sql).await.map_err(status)?;
-        let stmt = crate::write::parse(&sql).ok_or_else(|| refused("22023", "not a write statement"))?;
-        app.auth.allows(role, &stmt).map_err(denied)?;
-        crate::write::on_node(app, stmt, None).await.map_err(status)
-    });
-    Ok(done.await?["rows"].as_i64().unwrap_or(0))
+    let who = crate::routines::Who { role, files: false, depth: 0 };
+    let req = crate::routines::Request { sql: sql.to_string(), ..Default::default() };
+    let how = How { job: None, spread: None, after: None, stale: None };
+    let returning = crate::returning::of(sql).is_some();
+    Ok(match statement::run(app, req, how, who, &FlightWire).await.map_err(status)? {
+        Answer::Done(v) => v["rows"].as_i64().unwrap_or(0),
+        // (sent as an update, a write with RETURNING answers how many rows it wrote; a CALL's rows are its own)
+        got if returning => rows_of(got)?.iter().map(|b| b.num_rows() as i64).sum(),
+        _ => 0,
+    })
 }
 
 /// BEGIN, COMMIT, ROLLBACK and SAVEPOINT in SQL are refused, with or without a transaction id: a

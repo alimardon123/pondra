@@ -34,6 +34,9 @@ const lake = args.includes('--lake')
   ? resolve(args[args.indexOf('--lake') + 1])
   : resolve(dirname(fileURLToPath(import.meta.url)), '../web/lake');
 const sizes = args.includes('--sizes');
+// The most a page may download (`--sizes`: the module at brotli 11, as a server sends it), designs/page-same-core.md P4. It
+// moves down with each cut, never up without a reason in the commit that moves it.
+const BROTLI_BUDGET = 9_200_000;
 // The pondra binary the node's checks start (without it they are left out): its `serve`, on a folder and port of the run's.
 const NODE_BIN = args.includes('--node-bin') ? resolve(args[args.indexOf('--node-bin') + 1]) : null;
 // Where the module runs. Nothing below depends on it but the lake's hidden server (`lakeChecks`): Node's fetch shows
@@ -372,7 +375,8 @@ function objectsProblems(j, names, rows = {}) {
   if (JSON.stringify(listed) !== JSON.stringify(names)) problems.push(`objects ${JSON.stringify(listed)}`);
   for (const [name, count] of Object.entries(rows)) {
     const object = found.find((o) => o.name === name);
-    if (object?.rows !== count) problems.push(`${name} rows ${object?.rows}`);
+    const allowed = Array.isArray(count) ? count : [count]; // (a list: any of them)
+    if (!allowed.includes(object?.rows)) problems.push(`${name} rows ${object?.rows}`);
   }
   return problems;
 }
@@ -625,6 +629,18 @@ async function keptChecks(page, lake) {
   const noFile = await ask('kept: PUT with If-Match on a missing file', 'PUT', '/files/nothere.csv', { 'If-Match': '"v"' }, 'x\n', 'kept');
   if (noFile) judge('kept: PUT with If-Match on a missing file', noFile, { status: 412, sqlstate: null, type: TEXT });
 
+  // (b2) Two creates of one new file at once: the second finds the first's file, so one answers 200 and the other 409, and
+  // the file is the 200's body. The page's lock on the object makes the check and the write one step.
+  const raced = ['id\n1\n', 'id\n2\n'];
+  const race = await page.evaluate(async (bodies) => {
+    const enc = new TextEncoder();
+    const outs = await Promise.all(bodies.map((text) => window.kept.request('PUT', '/files/race.csv', {}, enc.encode(text))));
+    const got = await window.kept.request('GET', '/files/race.csv', {}, null);
+    return { statuses: outs.map((out) => out.status), text: new TextDecoder().decode(got.body) };
+  }, raced);
+  same('kept: two creates of one file at once', JSON.stringify(race.statuses.slice().sort((a, b) => a - b)), '[200,409]');
+  same('kept: the create that answered 200 is the file', race.text, raced[race.statuses.indexOf(200)]);
+
   // (c) A reload: the page's script runs again, and the kept page is made again from its folder.
   await page.reload({ waitUntil: 'commit' });
   await untilStarted(page);
@@ -634,11 +650,12 @@ async function keptChecks(page, lake) {
   const letters = await ask('kept after reload: FROM "a-b"', 'POST', '/sql?format=csv', undefined, 'SELECT * FROM "a-b"', 'kept');
   if (letters) judge('kept after reload: FROM "a-b"', letters, { status: 200, sqlstate: null, out: 'x\n1\n' });
   const listed = await ask('kept after reload: GET /objects', 'GET', '/objects', undefined, undefined, 'kept');
-  // k's rows are the node's number for this sequence (a CREATE of 3 rows, then an INSERT of 1): /objects counts the rows
-  // of the lake's files, not the log, so it says 3 where count(*) says 4, on a node as on this page.
+  // k's rows (a CREATE of 3 rows, then an INSERT of 1): /objects counts the rows of the lake's files, not the log, so it
+  // says 3 while the INSERT's row is in the log, as on a node, and 4 once the reopened page's first tier round (at once on
+  // open) has put it in a file. Which one this request sees is a race, so either is right.
   if (listed) {
     judge('kept after reload: GET /objects', listed, {
-      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: 3 }),
+      status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => objectsProblems(j, ['a-b', 'k'], { k: [3, 4] }),
     });
   }
   if (expected) {
@@ -1382,6 +1399,11 @@ if (sizes) {
   result.brotli_bytes = brotliCompressSync(wasm, {
     params: { [constants.BROTLI_PARAM_QUALITY]: 11, [constants.BROTLI_PARAM_SIZE_HINT]: wasm.length },
   }).length;
+  result.brotli_budget = BROTLI_BUDGET;
+  if (result.brotli_bytes > BROTLI_BUDGET) {
+    result.ok = false;
+    result.failed.push(`the module's brotli is ${result.brotli_bytes} bytes, over its budget of ${BROTLI_BUDGET}`);
+  }
 }
 console.log(JSON.stringify(result));
 process.exitCode = result.ok ? 0 : 1;

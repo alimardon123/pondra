@@ -1,4 +1,4 @@
-# 1.1's statements, refused by name at every form, in the same words (src/kept.rs): pipelines, dashboards, connections,
+# 1.1's statements, refused by name at every form, in the same words (src/kept.rs): pipelines, dashboards, connections
 # the grants on them, GRANT EXECUTE, and a pipeline's STEP, PARALLEL and WAIT FOR. The words that are also names still
 # work: a table called pipeline, dashboard or connection, and a prepared statement called pipeline.
 statement error 0A000 1\.1
@@ -55,8 +55,11 @@ CREATE CONNECTION shop TYPE postgres WITH (host = 'db', secret = shop_login)
 statement error 0A000 1\.1
 DROP CONNECTION shop
 
-statement error 0A000 1\.1
+statement error 0A000 SHOW DATABASES
 SHOW CONNECTIONS
+
+statement error 0A000 1\.1
+ATTACH 'postgres://db/shop' AS shop (TYPE postgres)
 
 statement error 0A000 1\.1
 GRANT USAGE ON CONNECTION shop TO r

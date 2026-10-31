@@ -1,7 +1,7 @@
 //! Macros, views, files, other engines' tables and FROM first, expanded in a statement's syntax tree: the front's middle pass, in every build.
 use crate::text::{args, ident, object, text};
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, visit_expressions_mut, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, TableFactor, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, TableFactor, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -136,7 +136,7 @@ pub(crate) fn params(p: &mut Parser) -> Result<Vec<Param>> {
 
 /// Does `e` hold a query of its own (its columns may be that query's)?
 fn queries_in(e: &Expr) -> bool {
-    ast::visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -159,7 +159,7 @@ fn names_in<T: ast::Visit>(body: &T) -> std::collections::HashSet<String> {
         }
     }
     let mut names = Names(Default::default());
-    let _ = body.visit(&mut names);
+    let _ = crate::walk::visit(body, &mut names);
     names.0
 }
 
@@ -224,7 +224,7 @@ pub(crate) fn named_apart(sql: &str) -> Option<String> {
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let mut names = Names(false, 0);
     for s in stmts.iter_mut().filter(|s| !matches!(s, Statement::CreateMacro { .. })) {
-        let _ = s.visit(&mut names);
+        let _ = crate::walk::visit_mut(s, &mut names);
     }
     names.0.then(|| text(&stmts))
 }
@@ -243,7 +243,7 @@ pub(crate) fn values_apart(q: &mut ast::Query, own: usize) -> bool {
         Expr::Subquery(_) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     };
-    if &*q.body as *const ast::SetExpr as usize == own || ast::visit_expressions(&v.rows, sub).is_continue() {
+    if &*q.body as *const ast::SetExpr as usize == own || crate::walk::visit_expressions(&v.rows, sub).is_continue() {
         return false;
     }
     let select = |row: &[Expr]| format!("SELECT {}", row.iter().enumerate().map(|(i, e)| format!("{e} AS column{}", i + 1)).collect::<Vec<_>>().join(", "));
@@ -291,7 +291,7 @@ fn output_names(q: &mut ast::Query) -> bool {
 /// DOUBLE) * 2` is named as `c * 2` is), lower-cased, unquoted.
 fn said(e: &Expr) -> String {
     let mut e = e.clone();
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if let Expr::Cast { expr, .. } = x {
             *x = (**expr).clone();
         }
@@ -339,15 +339,15 @@ fn casts_apart(q: &mut ast::Query) -> bool {
         let mut walk = Calls(0, each);
         for item in &mut s.projection {
             if let ast::SelectItem::UnnamedExpr(e) | ast::SelectItem::ExprWithAlias { expr: e, .. } = item {
-                let _ = e.visit(&mut walk);
+                let _ = crate::walk::visit_mut(e, &mut walk);
             }
         }
         for e in s.having.iter_mut().chain(s.qualify.iter_mut()) {
-            let _ = e.visit(&mut walk);
+            let _ = crate::walk::visit_mut(e, &mut walk);
         }
         if let Some(ast::OrderBy { kind: ast::OrderByKind::Expressions(all), .. }) = order_by {
             for o in all {
-                let _ = o.expr.visit(&mut walk);
+                let _ = crate::walk::visit_mut(&mut o.expr, &mut walk);
             }
         }
     }
@@ -355,7 +355,7 @@ fn casts_apart(q: &mut ast::Query) -> bool {
     fn casts(a: &FunctionArg) -> bool {
         let (FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }) = a else { return false };
         let (mut cast, mut column) = (false, false);
-        let _ = ast::visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             cast |= matches!(x, Expr::Cast { .. });
             column |= matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
             ControlFlow::<()>::Continue(())
@@ -503,7 +503,7 @@ fn select_names(body: &mut ast::SetExpr, sorted: &[String]) -> bool {
                 // (as written only where DataFusion can't have named another item so: it names a subquery
                 // by its column, a literal by its type, `Int64(1)`, and a cast by what it casts; but `NULL`,
                 // `count(*)` and `t.a + t.b` as they are written)
-                let unlike = key.0 || ast::visit_expressions(e, |x| match x {
+                let unlike = key.0 || crate::walk::visit_expressions(e, |x| match x {
                     Expr::Value(v) if v.value != ast::Value::Null => ControlFlow::Break(()),
                     Expr::Cast { .. } => ControlFlow::Break(()),
                     _ => ControlFlow::Continue(()),
@@ -623,7 +623,7 @@ impl<'a> Expander<'a> {
             return Ok(()); // (its columns may be its own query's)
         }
         let mut out = Ok(());
-        let _ = visit_expressions_mut(e, |x| {
+        let _ = crate::walk::visit_expressions_mut(e, |x| {
             if let Expr::Identifier(i) = x {
                 match self.owner(&ident(i)) {
                     Ok(Some(q)) => *x = Expr::CompoundIdentifier(q.0.iter().filter_map(|p| p.as_ident().cloned()).chain([i.clone()]).collect()),
@@ -646,7 +646,7 @@ impl<'a> Expander<'a> {
 
     /// The body with the arguments in its parameters' places (`p`, or `$1`), cast to their types,
     /// its own function calls expanded; and the arguments.
-    fn call<T: VisitMut + ast::Visit>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<(T, Vec<Expr>)> {
+    fn call<T: ast::VisitMut + ast::Visit>(&self, name: &str, r: &Routine, args: &[FunctionArg], mut body: T) -> Result<(T, Vec<Expr>)> {
         ensure!(self.depth < 16, "{name}: functions calling functions 16 deep (a loop?)");
         let mut values = arguments(name, r, args)?;
         if crate::text::mentions(&r.body, "from") {
@@ -655,7 +655,7 @@ impl<'a> Expander<'a> {
                 self.qualify(v).map_err(|e| e.context(format!("{name}'s argument {v}")))?;
                 // A column named by a relation the body names too would be read as the body's.
                 let mut clash = None;
-                let _ = ast::visit_expressions(v, |x| {
+                let _ = crate::walk::visit_expressions(v, |x| {
                     if let Expr::CompoundIdentifier(p) = x {
                         clash = clash.take().or_else(|| p.len().checked_sub(2).map(|i| p[i].value.to_lowercase()).filter(|q| theirs.contains(q)));
                     }
@@ -682,24 +682,24 @@ impl<'a> Expander<'a> {
         // level, and 16 levels of that never finished; counted before anything is copied)
         let sizes: HashMap<&String, usize> = values.iter().map(|(k, v)| (k, v.to_string().len())).collect();
         let mut size = 0;
-        let _ = ast::visit_expressions(&body, |e| {
+        let _ = crate::walk::visit_expressions(&body, |e| {
             size += param(e).map_or(0, |(k, _)| sizes[k]);
             ControlFlow::<()>::Continue(())
         });
         ensure!(size <= 1 << 20, "{name}: its arguments come to over 1 MB of SQL written into its body (a parameter used many times, by functions calling functions); pass the value once, from a CTE");
-        let _ = visit_expressions_mut(&mut body, |e| {
+        let _ = crate::walk::visit_expressions_mut(&mut body, |e| {
             if let Some((_, v)) = param(e) {
                 *e = grouped(v.clone());
             }
             ControlFlow::<()>::Continue(())
         });
-        if let ControlFlow::Break(e) = VisitMut::visit(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(&mut body, &mut Expander { depth: self.depth + 1, scopes: self.scopes.clone(), ..*self }) {
             return Err(e);
         }
         // (a body calling functions several times grows as theirs do: four calls, ten deep, are a
         // million expressions, which took the node's memory before anything was planned)
         let mut n = 0;
-        let _ = ast::visit_expressions(&body, |_| {
+        let _ = crate::walk::visit_expressions(&body, |_| {
             n += 1;
             if n > LARGEST { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
         });
@@ -725,11 +725,11 @@ pub(crate) async fn columns<H: crate::front::Host>(host: &H, stmts: &[Statement]
         ControlFlow::<()>::Continue(())
     };
     for s in stmts {
-        let _ = ast::visit_relations(s, &mut add);
+        let _ = crate::walk::visit_relations(s, &mut add);
     }
     for r in reading {
         if let Ok(q) = parse_query(query_text(&r.body)) {
-            let _ = ast::visit_relations(&q, &mut add);
+            let _ = crate::walk::visit_relations(&q, &mut add);
         }
     }
     host.columns(names).await
@@ -776,7 +776,7 @@ fn grouped(e: Expr) -> Expr {
 fn around(template: &str, parts: Vec<Expr>) -> Result<Expr> {
     let mut e = parse_expr(template)?;
     let mut parts: Vec<Option<Expr>> = parts.into_iter().map(Some).collect();
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if let Expr::Value(ast::ValueWithSpan { value: ast::Value::Placeholder(p), .. }) = x {
             if let Some(part) = p.strip_prefix("$_").and_then(|n| n.parse::<usize>().ok()).and_then(|n| parts.get_mut(n.wrapping_sub(1))).and_then(Option::take) {
                 *x = grouped(part);
@@ -907,7 +907,7 @@ impl VisitorMut for Expander<'_> {
                 Ok(q) => q,
                 Err(e) => return ControlFlow::Break(e.context(format!("{name}"))),
             };
-            q.visit(&mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
+            crate::walk::visit_mut(&mut q, &mut Expander { views: &NONE, depth: self.depth + 1, scopes: vec![], ..*self })?; // (its functions; its names are the lake's)
             let shown = name.0.last().and_then(|part| part.as_ident()).map_or_else(|| object(name), crate::text::ident); // (`FROM page.public.v` reads as v, as in Postgres)
             let alias = alias.clone().or_else(|| Some(ast::TableAlias { explicit: true, name: ast::Ident::new(shown), columns: vec![], at: None }));
             *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };

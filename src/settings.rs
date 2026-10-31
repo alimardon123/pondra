@@ -15,7 +15,7 @@ use crate::store::Lake;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::logical_expr::{LogicalPlan, SetVariable, Statement as Plan};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
 
@@ -164,7 +164,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             let Some(Statement::Prepare { data_types, statement, .. }) = Parser::parse_sql(&GenericDialect {}, &kept)?.pop() else { bail!("{name}: not a prepared statement (PREPARE {name} AS … makes one)") };
             let mut statement = *statement;
             let mut args = Arguments { values: parameters, types: data_types, wrong: None };
-            let _ = VisitMut::visit(&mut statement, &mut args);
+            let _ = crate::walk::visit_mut(&mut statement, &mut args);
             if let Some(e) = args.wrong {
                 bail!(e);
             }

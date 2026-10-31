@@ -28,6 +28,11 @@ And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read wi
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
 lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
 
+And every walk of the SQL tree goes through `crate::walk` (`src/walk.rs`): sqlparser's `Visit` and `VisitMut` are
+generic over the visitor, so each walk is compiled again for every visitor type. Outside walk.rs, a `use` of either
+trait, or a call of `visit_expressions`, `visit_expressions_mut`, `visit_relations`, `visit_relations_mut`,
+`visit_statements` or `visit_statements_mut` not through `walk::`, fails here by file and line.
+
 Only the standard library; it reads the source, not a build.
 """
 import argparse, os, re, sys
@@ -329,6 +334,38 @@ def clocks():
     return bad
 
 
+# A walk of the SQL tree: a `use` of sqlparser's Visit or VisitMut trait, and a call of one of its free functions
+# that isn't through `walk::` (src/walk.rs makes every walk, so the one compiled walk serves all of them).
+WALK_USE = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?use\s[^;]*;")
+WALK_TRAIT = re.compile(r"\bVisit(?:Mut)?\b")
+WALK_CALL = re.compile(r"(?<![\w:])((?:\w+::)*)(visit_(?:expressions|relations|statements)(?:_mut)?)\s*\(")
+WALK_WHY = "walk the SQL tree through crate::walk (one compiled walk; sqlparser's own compiles the whole tree again for each visitor)"
+
+
+def walks():
+    """Walks of the SQL tree outside src/walk.rs: a `use` of Visit or VisitMut, or a free walk not through `walk::`."""
+    bad = []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(base, f)
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            if rel == "walk.rs":
+                continue
+            text = open(path, encoding="utf-8").read()
+            for m in WALK_USE.finditer(text):
+                trait = WALK_TRAIT.search(m.group(0))
+                if trait:
+                    line = text.count("\n", 0, m.start() + trait.start()) + 1
+                    bad.append(f"src/{rel}:{line}: {WALK_WHY}")
+            for m in WALK_CALL.finditer(text):
+                if not m.group(1).endswith("walk::"):
+                    line = text.count("\n", 0, m.start(2)) + 1
+                    bad.append(f"src/{rel}:{line}: {WALK_WHY}")
+    return bad
+
+
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
     whatever lock it holds (`node::restart`), and the next start must still read it."""
@@ -357,7 +394,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found)
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks()
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

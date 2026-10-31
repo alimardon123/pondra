@@ -388,7 +388,7 @@ fn statements(sql: &str) -> Result<Option<String>> {
                     cols.push(e);
                 }
             }
-            let _ = visit_expressions(&aggs, |e| {
+            let _ = crate::walk::visit_expressions(&aggs, |e| {
                 if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
                     let e = e.to_string();
                     if !cols.contains(&e) {
@@ -460,7 +460,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     // (a stored view keeps its text: it is expanded as it is read, as its functions are)
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = s.visit(&mut f) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut f) {
             return Err(e);
         }
     }
@@ -471,7 +471,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     }
     f.asks = Asks::Apply(answers);
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = s.visit(&mut f) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut f) {
             return Err(e);
         }
     }
@@ -760,14 +760,14 @@ fn unalias(s: &mut Statement) -> Result<()> {
     let mut r = Renamed { alias: alias.clone(), table: table.clone(), shadow: None };
     match s {
         Statement::Delete(d) => {
-            let _ = VisitMut::visit(&mut d.selection, &mut r);
-            let _ = VisitMut::visit(&mut d.using, &mut r);
+            let _ = crate::walk::visit_mut(&mut d.selection, &mut r);
+            let _ = crate::walk::visit_mut(&mut d.using, &mut r);
             returning(&mut d.returning, &mut r);
         }
         Statement::Update(u) => {
-            let _ = VisitMut::visit(&mut u.assignments, &mut r);
-            let _ = VisitMut::visit(&mut u.from, &mut r);
-            let _ = VisitMut::visit(&mut u.selection, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.assignments, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.from, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.selection, &mut r);
             returning(&mut u.returning, &mut r);
         }
         _ => {}
@@ -780,7 +780,7 @@ fn unalias(s: &mut Statement) -> Result<()> {
 
 /// A RETURNING list's references to the alias, `t.*` too, written as the table's name (`returning.rs` reads them so).
 fn returning(items: &mut Option<Vec<SelectItem>>, r: &mut Renamed) {
-    let _ = VisitMut::visit(items, r);
+    let _ = crate::walk::visit_mut(items, r);
     for item in items.iter_mut().flatten() {
         if let SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) = item {
             if n.0.len() == 1 && n.0[0].as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(&r.alias)) {
@@ -1163,7 +1163,7 @@ fn expression(e: &mut Expr) -> Result<()> {
 /// a select's names keep its text). DataFusion plans a literal's elements with no outer columns, CTEs or
 /// parameter types (`sql_array_literal`); a call with them is planned with the query's own, as any call is.
 fn arrays(s: &mut Statement) {
-    let _ = visit_expressions_mut(s, |e| {
+    let _ = crate::walk::visit_expressions_mut(s, |e| {
         if let Expr::Array(Array { elem, .. }) = e {
             *e = make_array(std::mem::take(elem)); // (post-order: a nested literal is already a call)
         }
@@ -1313,7 +1313,7 @@ fn pivot(t: &TableFactor, found: Option<Vec<Column>>) -> Result<TableFactor> {
     };
     let mut used: Vec<String> = vec![col.to_string()];
     for a in aggregate_functions {
-        let _ = visit_expressions(&a.expr, |e| {
+        let _ = crate::walk::visit_expressions(&a.expr, |e| {
             if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
                 let e = e.to_string();
                 if !used.contains(&e) {
@@ -1424,7 +1424,7 @@ fn reference(c: &Column, cols: &[Column]) -> String {
 }
 
 fn has_columns(s: &Select) -> bool {
-    let found = |e: &Expr| visit_expressions(e, |e| match columns_call(e) {
+    let found = |e: &Expr| crate::walk::visit_expressions(e, |e| match columns_call(e) {
         Some(_) => ControlFlow::Break(()),
         None => ControlFlow::Continue(()),
     }).is_break();
@@ -1438,7 +1438,7 @@ fn has_columns(s: &Select) -> bool {
 fn substituted(e: &Expr, col: &str) -> Result<Expr> {
     let mut e = e.clone();
     let col = expr(col)?;
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if columns_call(x).is_some() {
             *x = col.clone();
         }
@@ -1452,7 +1452,7 @@ fn substituted(e: &Expr, col: &str) -> Result<Expr> {
 fn expand_columns(s: &mut Select, cols: &[Column]) -> Result<()> {
     let pattern_in = |e: &Expr| {
         let mut p = None;
-        let _ = visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             if let Some(found) = columns_call(x) {
                 p = Some(found);
                 return ControlFlow::Break(());
@@ -1572,7 +1572,7 @@ fn aliases(s: &Select) -> HashMap<String, Expr> {
         return HashMap::new();
     }
     let mut used = HashMap::new();
-    let _ = visit_expressions(w, |e| {
+    let _ = crate::walk::visit_expressions(w, |e| {
         if let Expr::Identifier(i) = e {
             if let Some(x) = named.get(&i.value.to_lowercase()).filter(|_| i.quote_style.is_none()) {
                 used.insert(i.value.to_lowercase(), (*x).clone());
@@ -1612,7 +1612,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
         }
     }
     if let Some(w) = &mut s.selection {
-        let _ = w.visit(&mut Put(&used, 0));
+        let _ = crate::walk::visit_mut(w, &mut Put(&used, 0));
     }
     Ok(())
 }
@@ -1674,7 +1674,7 @@ pub fn lambdas(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [stmt @ Statement::Query(_)] = stmts.as_mut_slice() else { return None };
     let mut found = false;
-    let _ = visit_expressions_mut(stmt, |e| {
+    let _ = crate::walk::visit_expressions_mut(stmt, |e| {
         if let Expr::Function(f) = e {
             if HIGHER.contains(&function_name(f).as_str()) {
                 if let FunctionArguments::List(l) = &mut f.args {
