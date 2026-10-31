@@ -116,6 +116,35 @@ Peak memory rises 0-15% (more runs open at once), all well under the cap. Invari
 the harness's two, at 256 MB; `win423-fan-in.jsonl`): the 3-partition window over long strings answers at fan-in 8
 and 16 and at the fix's default (8 there), and fails at 0 (DataFusion's own: one merge of every run) and 32.
 
+## string_agg and the memory watch, back to back
+
+`string_agg(l_comment, ',')` over the 3 return flags (550 MB a group) killed the node in 0.9 s, right after the median
+beside it was stopped (`pondra-55a774f.jsonl`). Two causes, both fixed with `src/string_agg.rs` and `src/oom.rs`:
+
+- DataFusion's accumulator told the pool only its strings' lengths, while a string grown by doubling holds up to twice
+  that and, as it doubles, three times. The pool is now told what the strings hold, and a group past an eighth of a
+  partition's share of the query memory is refused by name (53200).
+- A stop held the memory watch for ten seconds whatever happened next, so a heavy query started in those seconds was
+  never stopped; and the stopped query's pages stayed resident for those seconds too. Now, while a stop holds, the
+  freed pages go back to the system at each look, and once the node is under its line nothing holds.
+
+`watch.py`, one node under a 2 GB cap, the queries one after another (seconds / peak RSS MB / answer):
+
+| Query | string_agg capped, the old watch | Both fixes |
+|---|---|---|
+| string_agg, first 20 M rows | 4.8 / 1719 / 53200 (watch) | 2.7 / 1627 / 53200 by name |
+| string_agg, after 3 s | 3.5 / 2162 / **killed** | 2.2 / 1755 / 53200 |
+| string_agg, after 3 s | | 2.9 / 1745 / 53200 |
+| median | | 4.5 / 1950 / 53200 |
+| string_agg, at once | | 0.4 / 1792 / 53200 |
+| median, at once | | 1.4 / 1962 / 53200 |
+| string_agg, at once | | 3.0 / 2132 / 53200 |
+| count(*) | | 0.01 / answered |
+
+A group refused by its name needs it to pass its cap before its partial aggregate sends it on: over the whole table a
+partial sends its strings on early, under the pool's pressure, so the watch's words answer instead. Either way it is
+53200 and the node lives.
+
 ## How it was measured
 
 Same scripts as 10-16 (`pbig.py`, `others.py`, `queries.json`), the cgroup path now read from `/proc/self/cgroup` (a

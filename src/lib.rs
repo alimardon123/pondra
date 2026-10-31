@@ -14,6 +14,7 @@ pub mod env;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
+mod string_agg;
 pub mod casts;
 pub mod intervals;
 pub mod xlsx;
