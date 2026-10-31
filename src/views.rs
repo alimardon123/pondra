@@ -1019,26 +1019,34 @@ pub async fn emit_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>, seq: &Arc<cr
     Ok(())
 }
 
-/// The newest event time `table` holds in `time`, in µs: what its files' ranges say, then each
-/// log row after them, read once (kept in memory per table; it only grows, as a watermark does).
-async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
+/// The part of a table a row's progress is counted in, for the watermark: each part's newest time is kept apart, and the
+/// watermark is the least of them (`watermark`). Today a table is one part, `""`. After 1.0 a feed's rows are counted per
+/// Kafka partition (its producer `feed:{view}:{p}`, ADR-073 step 9), so a partition behind holds the watermark back
+/// rather than seeing its rows counted late; this is where that goes.
+fn part_of(_producer: Option<&str>) -> &'static str { "" }
+
+/// The newest event time of each part of `table` in `time` (`part_of`), in µs: what its files' ranges say, then each
+/// log row after them, read once (kept in memory per table; each part only grows, as a watermark does). Empty when the
+/// table has no time yet.
+async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<String, i64>> {
     use datafusion::arrow::{array::AsArray, compute::{cast, max}, datatypes::{DataType, TimeUnit, TimestampMicrosecondType}};
     use datafusion::common::ScalarValue;
     use std::sync::Mutex;
-    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, Option<i64>)>> = Default::default());
+    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, BTreeMap<String, i64>)>> = Default::default());
     let key = format!("{}|{table}|{time}", lake.url);
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
     let stored = meta.stored(time).unwrap_or(time).to_string(); // (files' ranges know it by its stored name: ADR-022)
     let upto = lake.visible();
-    let (mut seen, mut newest) = SEEN.lock().unwrap().get(&key).copied().unwrap_or((0, None));
+    let (mut seen, mut parts) = SEEN.lock().unwrap().get(&key).cloned().unwrap_or((0, BTreeMap::new()));
     let us = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let part = part_of(None);
     if seen < meta.tiered {
         // (rows went into files since: their ranges say how new they were)
         let s = crate::answer::schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(&crate::manifest::list(lake, &meta).await?, &meta.files, &s);
         if let Some((_, hi)) = ranges.get(&stored) {
-            if let ScalarValue::TimestampMicrosecond(v, _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
-                newest = newest.max(v);
+            if let ScalarValue::TimestampMicrosecond(Some(v), _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
+                parts.entry(part.to_string()).and_modify(|n| *n = (*n).max(v)).or_insert(v);
             }
         }
         seen = meta.tiered;
@@ -1046,44 +1054,55 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     if upto > seen {
         for b in crate::query::tail(lake, table, seen, Some(upto), false).await? {
             if let Some(c) = b.column_by_name(time) {
-                newest = newest.max(max(cast(c, &us)?.as_primitive::<TimestampMicrosecondType>()));
+                if let Some(v) = max(cast(c, &us)?.as_primitive::<TimestampMicrosecondType>()) {
+                    parts.entry(part.to_string()).and_modify(|n| *n = (*n).max(v)).or_insert(v);
+                }
             }
         }
         seen = upto;
     }
-    // (views run side by side: the state that read further is kept, and its newest with it)
+    // (views run side by side: the state that read further is kept, and its parts with it)
     let mut known = SEEN.lock().unwrap();
-    let kept = known.entry(key).or_insert((seen, newest));
+    let kept = known.entry(key).or_insert((seen, parts.clone()));
     if seen > kept.0 {
-        *kept = (seen, newest);
+        *kept = (seen, parts);
     }
-    let out = kept.1;
+    let out = kept.1.clone();
     drop(known);
     Ok(out)
+}
+
+/// The least watermark over `parts` (`newest_parts`), in µs: each part's newest time less the lateness, and with `idle_secs`
+/// moved on by how long that part has been quiet (`since`: the clock, in ms, from when its newest time was first seen, as
+/// `watermark` keeps it). None when there are no parts.
+fn least_of(parts: &BTreeMap<String, i64>, lateness_secs: u64, idle_secs: Option<u64>, since: impl Fn(&str, i64) -> u64, now: u64) -> Option<i64> {
+    parts.iter().map(|(part, &newest)| {
+        let wm = newest - (lateness_secs * 1_000_000) as i64;
+        let Some(idle) = idle_secs else { return wm };
+        let quiet = now.saturating_sub(since(part.as_str(), newest));
+        if quiet >= idle * 1000 { wm + (quiet * 1000) as i64 } else { wm }
+    }).min()
 }
 
 /// The watermark of a view over `table`'s `time`, in µs: its newest event time less the lateness.
 /// With `idle`, once no newer row has come for that long, it moves on with the clock from there
 /// (the leader's clock, from when it first saw that newest time), so a quiet source's last groups
 /// are kept too; off by default, since a table loaded in batches of older rows would see its next
-/// batch counted as late.
+/// batch counted as late. With several parts (`part_of`), each part's newest time less the lateness,
+/// moved on by `idle` as above, and the least of them (`least_of`).
 pub(crate) async fn watermark(lake: &Lake, table: &str, time: &str, lateness_secs: u64, idle_secs: Option<u64>) -> Result<Option<i64>> {
     use std::sync::Mutex;
     crate::per_node!(static SINCE: Mutex<std::collections::HashMap<String, (i64, u64)>> = Default::default());
-    let Some(newest) = newest(lake, table, time).await? else { return Ok(None) };
-    let wm = newest - (lateness_secs * 1_000_000) as i64;
-    let Some(idle) = idle_secs else { return Ok(Some(wm)) };
+    let parts = newest_parts(lake, table, time).await?;
     let now = crate::log::now_ms();
-    let since = {
+    Ok(least_of(&parts, lateness_secs, idle_secs, |part, newest| {
         let mut seen = SINCE.lock().unwrap();
-        let e = seen.entry(format!("{}|{table}|{time}", lake.url)).or_insert((newest, now));
+        let e = seen.entry(format!("{}|{table}|{time}|{part}", lake.url)).or_insert((newest, now));
         if newest > e.0 {
             *e = (newest, now);
         }
         e.1
-    };
-    let quiet = now.saturating_sub(since);
-    Ok(Some(if quiet >= idle * 1000 { wm + (quiet * 1000) as i64 } else { wm }))
+    }, now))
 }
 
 /// A timestamp column's values in µs.
@@ -1102,8 +1121,8 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
         Some(t) => t.clone(),
         None => event_time(crate::engine::sql(&session(lake, &v.sql, "").await?, &crate::sys::planned(&v.sql)?).await?.logical_plan(), &e.window).context("a window view whose window has no event-time column")?,
     };
-    let Some(newest) = newest(lake, &v.source, &time).await? else { return Ok(()) };
-    let upto = newest - ((e.size_secs + e.lateness_secs) * 1_000_000) as i64; // windows starting at or before this have ended
+    // (a window starting at or before `upto` has ended: the watermark, with the window's size and lateness as its lateness)
+    let Some(upto) = watermark(lake, &v.source, &time, e.size_secs + e.lateness_secs, None).await? else { return Ok(()) };
     let (producer, final_table) = (format!("emit:{view}"), format!("{view}_final"));
     let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
     if upto <= done as i64 {
@@ -1887,5 +1906,18 @@ mod tests {
         let t = turn_of(key.clone(), "b", "emission of").expect("b's first turn: no backoff of a's");
         assert_eq!(failing_of(&key, "a"), None, "a is gone: its failures went with it");
         t.ended(&Ok(()));
+    }
+
+    #[test]
+    fn the_watermark_is_the_least_of_its_parts() {
+        fn parts(v: &[(&str, i64)]) -> BTreeMap<String, i64> { v.iter().map(|(p, t)| (p.to_string(), *t)).collect() }
+        let nothing = |_: &str, _: i64| 0u64;
+        assert_eq!(least_of(&BTreeMap::new(), 0, None, nothing, 0), None, "no parts, no watermark");
+        assert_eq!(least_of(&parts(&[("", 100_000_000)]), 10, None, nothing, 0), Some(90_000_000), "one part: its newest less the lateness");
+        assert_eq!(least_of(&parts(&[("a", 100_000_000), ("b", 50_000_000)]), 0, None, nothing, 0), Some(50_000_000), "the least of two");
+        // (idle 5 s: b has been quiet for 7 s, so it moves on by 7 s; a has just moved)
+        let now: u64 = 1_000_000;
+        let since = |part: &str, _: i64| if part == "b" { now - 7_000 } else { now };
+        assert_eq!(least_of(&parts(&[("a", 100_000_000), ("b", 50_000_000)]), 0, Some(5), since, now), Some(57_000_000));
     }
 }
