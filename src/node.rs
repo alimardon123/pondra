@@ -578,7 +578,8 @@ pub fn unclaim_page() {
 /// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
 /// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it. `term` is the
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()> }
+/// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does.
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, ended: Arc<AtomicBool> }
 
 /// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
 /// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
@@ -628,7 +629,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks })
+            Ok(Paged { app, url, term, marks, ended: Default::default() })
         }
         Err(e) => {
             end_page(marks, lake, &store, term, &url).await; // (a failed open leaves nothing running)
@@ -658,8 +659,8 @@ async fn end_page(marks: tokio::task::JoinHandle<()>, lake: Option<Arc<crate::st
 /// l2-page-joins-cluster.md, J5). Its catalog is the node's (`kv::remote`, under the sign-in `auth`), its files are read from
 /// `store` (the node's lake files through its door), and its commit stream is followed (`members::follow`), with a refresh every
 /// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
-/// it changes nothing there.
-#[allow(dead_code)] // (J5b's `Page.join` is the first to call it)
+/// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
+/// closed error).
 pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
     claim_paged(line).await?;
     let url = crate::memory::place(":memory:");
@@ -681,8 +682,8 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
         Ok(app) => {
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
             let (http, auth) = (reqwest::Client::new(), auth.to_string());
-            let ended = Arc::new(std::sync::atomic::AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
-            let said = ended.clone();
+            let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
+            let (said, refreshed) = (ended.clone(), ended.clone());
             let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
                 let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
                 Box::pin(async move {
@@ -702,13 +703,17 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
             panics::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    let Some(live) = refreshing.upgrade().filter(|_| !ended.load(SeqCst)) else { return };
+                    let Some(live) = refreshing.upgrade().filter(|_| !refreshed.load(SeqCst)) else { return };
                     if let Err(e) = live.refresh().await {
+                        // (the Remote's closed error: the node refused the sign-in, so the catalog is no longer followed)
+                        if e.downcast_ref::<crate::kv::Error>().is_some_and(|k| k.closed()) {
+                            refreshed.store(true, SeqCst);
+                        }
                         eprintln!("refreshing the joined lake's catalog: {e:#}");
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks })
+            Ok(Paged { app, url, term: 0, marks, ended })
         }
         Err(e) => {
             end_page(marks, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
@@ -718,9 +723,19 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
 }
 
 impl Paged {
+    /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
+    pub fn ended(&self) -> bool {
+        self.ended.load(SeqCst)
+    }
+
+    /// Says the sign-in has ended, as a node refusing it does (`page::Page::ask`): the page answers 28000 from then on.
+    pub fn set_ended(&self) {
+        self.ended.store(true, SeqCst)
+    }
+
     /// Ends the page's member (`end_page`), so another `open_page` starts afresh.
     pub async fn close(self) {
-        let Paged { app, url, term, marks } = self;
+        let Paged { app, url, term, marks, .. } = self;
         let lake = app.lake.clone();
         drop(app);
         end_page(marks, Some(lake.clone()), &lake.store, term, &url).await;

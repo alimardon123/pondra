@@ -1,6 +1,6 @@
 //! A joined page's catalog: the node's own, read over its `GET /cluster/kv` (designs/l2-page-joins-cluster.md, J3). The node
 //! answers from its in-memory catalog, so the page sees what the node has committed. The page writes nothing here: a joined
-//! page's writes go to the node's `/sql` under its sign-in. Nothing opens a lake on this yet (J5's `Page.join` does).
+//! page's writes go to the node's `/sql` under its sign-in. `node::open_joined` opens a lake on this.
 use super::{Error, Kv, Written};
 use crate::fetch;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64U, Engine};
@@ -31,8 +31,7 @@ struct Many {
 }
 
 impl Remote {
-    /// The catalog of the node at `node`, read with the sign-in `auth`. (Nothing opens a lake on it yet: J5's `Page.join` does.)
-    #[allow(dead_code)] // (J5's `Page.join` is the first to open a lake on it)
+    /// The catalog of the node at `node`, read with the sign-in `auth`.
     pub(crate) fn new(node: &str, auth: &str) -> Remote {
         Remote { node: node.trim_end_matches('/').to_string(), auth: auth.to_string(), http: reqwest::Client::new() }
     }

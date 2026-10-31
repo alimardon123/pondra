@@ -79,6 +79,24 @@ impl Page {
         Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?, Some(held)))
     }
 
+    /// A page that follows the lake of the node at `url`, under an admin's `ps_` session `session` (from the node's `/login`):
+    /// its reads run on the page, over its own copy of the lake, and its writes go to the node, each as the node's own statement.
+    /// A transaction is refused by name (the page holds none of the node's). The node's `web_origins` must allow the page's origin.
+    /// `opts` is as `new`'s, but `node` and `token` are refused by name (the node is `url`, the sign-in `session`). A join that
+    /// fails (an address or session it refuses, a node that doesn't open the lake) is this call's error.
+    #[wasm_bindgen(js_name = join)]
+    pub async fn join(url: String, session: String, opts: JsValue) -> Result<Page, JsValue> {
+        set_panic_hook();
+        let join = pondra::page::Join::new(&url, &session).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        joined_keys_refused(&opts)?;
+        let given = Given::read(&opts)?;
+        give(given.settings)?;
+        let node = node::node(join.node().to_string(), Some(session));
+        let options = pondra::page::Options { joined: Some(join), ..options(None, Some(node)) };
+        let page = pondra::page::Page::open_lake(&options).await.map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        Ok(Page(page, None))
+    }
+
     /// The kept files this page couldn't read, each as `{file, why}`: the file's path and the words of why. Empty when
     /// it read them all, and for a page that keeps nothing. The file is left as it is, so the page can say which tables
     /// it left out.
@@ -224,6 +242,19 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
 /// watched against the line its device has (`device_line`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
     pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
+}
+
+/// Refuses `node` and `token` in a join's options by name: a join's node is its `url`, and its sign-in its `session`.
+fn joined_keys_refused(opts: &JsValue) -> Result<(), JsValue> {
+    if !opts.is_object() {
+        return Ok(());
+    }
+    for key in ["node", "token"] {
+        if js_sys::Reflect::has(opts, &key.into())? {
+            return Err(JsValue::from_str(&format!("a join takes no {key}: its node is the url, and its sign-in the session")));
+        }
+    }
+    Ok(())
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
