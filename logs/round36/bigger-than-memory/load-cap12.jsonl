@@ -1,0 +1,3 @@
+{"engine": "pondra", "id": "load_lineitem", "kind": "load", "cap_gb": 12.0, "status": "ok", "rows": null, "result": "{\"rows\": 59986052}", "secs": 21.3, "peak_rss_mb": 1462, "peak_spill_mb": 0, "failcnt": 0}
+{"engine": "pondra", "id": "load_orders", "kind": "load", "cap_gb": 12.0, "status": "ok", "rows": null, "result": "{\"rows\": 15000000}", "secs": 4.2, "peak_rss_mb": 1350, "peak_spill_mb": 0, "failcnt": 0}
+{"engine": "pondra", "id": "load_customer", "kind": "load", "cap_gb": 12.0, "status": "ok", "rows": null, "result": "{\"rows\": 1500000}", "secs": 0.7, "peak_rss_mb": 999, "peak_spill_mb": 0, "failcnt": 0}

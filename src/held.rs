@@ -328,6 +328,9 @@ impl ExecutionPlan for HeldInExec {
             MemoryLimit::Finite(bytes) => Some(bytes),
             _ => None,
         };
+        // (the sorts feeding the window merge fewer spilled runs at once, so the pool keeps room for it: `store::window_sorts`)
+        #[cfg(not(target_arch = "wasm32"))]
+        let ctx = crate::store::window_sorts(ctx);
         let s = self.input.execute(p, ctx)?;
         let Some(held) = held else { return Ok(s) }; // (run without its HeldOutExec: the input as it is)
         let schema = s.schema();
