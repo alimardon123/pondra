@@ -977,7 +977,8 @@ fn stamp_file(d: &mut DataFile, seg: u64, ms: u64) {
 /// is cut into a row slice per `SLICE` bytes of values, up to the node's partitions, and the slices are encoded
 /// at once: ZSTD compresses on one core (an SF1 HTTP load of 1M-row appends took 10.1–10.6 s whole and
 /// 7.8–9.0 s in slices, with the same log bytes). The slices' messages go in order, so the stream reads
-/// as if the batch were written whole.
+/// as if the batch were written whole, in as many batches as slices: a reader takes them all (`constraints::decode`),
+/// and a logged batch's row ids, one first id for the stream (`sys::compact`), run on across them (`decode_part`).
 pub fn encode_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     encode_sliced(batches, |values| (values / SLICE).clamp(1, slices_here()))
 }
@@ -1003,7 +1004,7 @@ fn slices_here() -> usize {
 /// slices are encoded on scoped threads, each with a dictionary tracker and a codec context of its own, and their
 /// messages are appended in row order. A schema with a dictionary column is never cut: each slice would carry its own
 /// dictionaries, which a reader takes as replacements of the first.
-fn encode_sliced(batches: &[RecordBatch], slices: impl Fn(usize) -> usize) -> Result<Vec<u8>> {
+pub(crate) fn encode_sliced(batches: &[RecordBatch], slices: impl Fn(usize) -> usize) -> Result<Vec<u8>> {
     let values: usize = batches.iter().map(values_of).fold(0, usize::saturating_add);
     let opts = IpcWriteOptions::default().try_with_compression((values >= 1024).then_some(CompressionType::ZSTD))?;
     let schema = batches[0].schema();
@@ -1081,6 +1082,18 @@ fn has_dictionary(dt: &DataType) -> bool {
 /// The batches of one Arrow IPC stream.
 pub fn decode(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
     Ok(StreamReader::try_new(ipc, None)?.collect::<Result<_, _>>()?)
+}
+
+/// The batches of one part of a segment (`pack_with`: one batch, `sys::compact`ed, maybe in row slices), as they were
+/// appended: each slice's `_row_id`s run on from the slices before it (`sys::expand`).
+pub fn decode_part(ipc: &[u8]) -> Result<Vec<RecordBatch>> {
+    let mut at = 0i64;
+    decode(ipc)?.into_iter().map(|b| {
+        let n = b.num_rows() as i64;
+        let b = crate::sys::expand(b, at);
+        at += n;
+        b
+    }).collect()
 }
 
 /// Milliseconds since the Unix epoch: the machine's clock on a node, the browser's on a page.
@@ -1167,6 +1180,23 @@ mod tests {
     fn rows_in(ipc: &[u8]) -> RecordBatch {
         let batches = decode(ipc).unwrap();
         datafusion::arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap()
+    }
+
+    #[test]
+    fn a_big_batch_logged_in_slices_reads_back_with_its_own_row_ids() {
+        // (one part is one batch whose fresh ids are one number in the stream's schema, `sys::compact`; cut into row slices,
+        // each slice's ids run on from the slices before it, not each from the first: Nexmark's q18 lost rows to the repeats)
+        let n = 1003i64;
+        let b = mixed(n);
+        let b = crate::sys::stamp(&b, 7 << 32).unwrap();
+        let logged = crate::sys::compact(&b).unwrap();
+        assert!(logged.column_by_name(crate::text::ROW_ID).is_none(), "fresh ids are one number in the log");
+        for k in [1usize, 2, 4] {
+            let parts = decode_part(&encode_sliced(std::slice::from_ref(&logged), |_| k).unwrap()).unwrap();
+            assert_eq!(parts.len(), k, "{k} slices");
+            let ids: Vec<i64> = parts.iter().flat_map(|p| p.column_by_name(crate::text::ROW_ID).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().values().to_vec()).collect();
+            assert_eq!(ids, ((7 << 32)..(7 << 32) + n).collect::<Vec<_>>(), "{k} slices: each row its own id, in order");
+        }
     }
 
     #[test]

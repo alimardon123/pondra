@@ -635,6 +635,31 @@ def loads():
     checks["7. pondra.loads lists each file of the table, its version and rows (a system table)"] = (
         sorted((r["file"].rsplit("/", 1)[1], r["rows"]) for r in listed) == [("a.csv", 2), ("b.csv", 1), ("c.csv", 2), ("d.csv", 1)] and all(r["version"] for r in listed))
 
+    # A batch of 16 MB or more of values is logged in row slices (`log::encode_ipc`), under one first row id (audit 10-31
+    # H1, H2): each row reads back with its own id, in the log and tiered, so a DELETE hides the row it names only; and a
+    # checked append (a table with a key) sent through a follower reaches the leader whole, not as its first slice.
+    import pyarrow as pa
+    n_big = 400000
+    big = pa.table({"id": pa.array(range(n_big), pa.int64()), "s": pa.array([f"{i:064d}" for i in range(n_big)])})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, big.schema) as w:
+        w.write_table(big)  # (one batch: about 30 MB of values, three slices on a node of three or more cores)
+    owner = {"x-pondra-owner": owner_key}
+    arrow = {**owner, "content-type": "application/vnd.apache.arrow.stream"}
+    ids = lambda t, i=0: run(f"SELECT count(*) AS n, count(DISTINCT _row_id) AS d FROM {t}", i)[0]
+    run("CREATE TABLE sliced (id BIGINT, s VARCHAR)")
+    call(A.port, "POST", "/append/sliced?producer=sliced&seq=1", sink.getvalue().to_pybytes(), headers=arrow, timeout=300)
+    logged = ids("sliced")
+    call(A.port, "POST", "/tier", headers=owner, timeout=600)
+    tiered = ids("sliced")
+    run("DELETE FROM sliced WHERE id = 5")
+    after = run("SELECT count(*) AS n, count(*) FILTER (WHERE id = 5) AS five FROM sliced")[0]
+    checks["7c. a load logged in row slices: each row its own _row_id, in the log and tiered; a DELETE hides the row it names only"] = (
+        logged == tiered == {"n": n_big, "d": n_big} and after == {"n": n_big - 1, "five": 0})
+    run("CREATE TABLE sliced_key (id BIGINT PRIMARY KEY, s VARCHAR)")
+    call(A.port + 1, "POST", "/append/sliced_key?producer=sliced_key&seq=1", sink.getvalue().to_pybytes(), headers=arrow, timeout=300)
+    checks["7d. the same load into a table with a key, sent through a follower: every row reaches the leader"] = ids("sliced_key") == {"n": n_big, "d": n_big}
+
     run("CREATE TABLE events (id BIGINT, amount BIGINT)")
     for i in range(6):
         write(f"many/f{i}.csv", "id,amount\n" + "".join(f"{i * 100 + j},{j}\n" for j in range(50)))
