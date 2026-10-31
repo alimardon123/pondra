@@ -337,6 +337,14 @@ fn token(w: &mut Words, create: bool) -> Result<Change> {
     Ok(Change::CreateToken { name, user, expires_secs, hash: None })
 }
 
+/// Snowflake's `TO ROLE r` (and `FROM ROLE r`): the word ROLE before the grantee is dropped, when a name follows it (a user
+/// named role is still one).
+fn role_word(w: &mut Words) {
+    if w.0.len() > 1 {
+        w.is("role");
+    }
+}
+
 /// `GRANT privileges [(columns)] ON [TABLE] t | SCHEMA s | ALL TABLES IN SCHEMA s | ALL TABLES |
 /// SECRET s TO grantees`, `GRANT roles TO users`, and REVOKE's of each, `FROM`.
 fn grant(w: &mut Words, grant: bool) -> Result<Change> {
@@ -362,6 +370,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     let to = if grant { "to" } else { "from" };
     if !w.is("on") {
         w.expect(to)?;
+        role_word(w);
         let users = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
         w.done()?;
         let roles = list.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
@@ -400,6 +409,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     ensure!(!privileges.iter().any(|p| p == "apply") || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
     ensure!(database.is_none() || privileges.iter().all(|p| p == "clone" || p == "apply"), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
     w.expect(to)?;
+    role_word(w);
     let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
     w.done()?;
     Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } })
@@ -1526,6 +1536,8 @@ mod tests {
         let g = p("GRANT SELECT (id, name) ON TABLE sales.orders TO analyst, bob");
         assert_eq!((g["on"]["name"].as_str(), g["columns"].as_array().unwrap().len(), g["to"].as_array().unwrap().len()), (Some("sales.orders"), 2, 2));
         assert_eq!(p("GRANT ALL ON ALL TABLES IN SCHEMA sales TO analyst")["privileges"].as_array().unwrap().len(), 4);
+        assert_eq!(p("GRANT SELECT ON ALL TABLES IN SCHEMA PUBLIC TO ROLE analyst")["do"], "grant"); // (Snowflake's TO ROLE)
+        assert_eq!(p("REVOKE SELECT ON ALL TABLES IN SCHEMA PUBLIC FROM ROLE analyst")["do"], "revoke");
         assert_eq!(p("GRANT USAGE ON SECRET s3_sales TO analyst")["on"]["kind"], "secret");
         assert!(p("GRANT USAGE ON TABLE t TO analyst")["error"].is_string());
         assert_eq!(p("GRANT analyst TO ann")["do"], "grant_role");

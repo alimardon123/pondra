@@ -33,7 +33,7 @@ fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list)\s*\(|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list)\s*\(|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
     });
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
@@ -72,13 +72,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, property_keys] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -273,6 +273,27 @@ fn lock_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             continue;
         };
         edits.push((t.at[i], t.end(ids[len - 1]), with.to_string()));
+    }
+    Ok(edits)
+}
+
+/// SQL Server's system variables: `@@version` (any case) at a code position (a word the tokens read: not in a string or
+/// a comment) is `version()`. Any other `@@x` is refused by name, with the way Pondra gives a setting; a call `@@x(…)` is
+/// a function's name and is left as it is.
+fn at_at_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in 0..t.toks.len() {
+        let Token::Word(w) = &t.toks[i] else { continue };
+        let Some(name) = w.value.strip_prefix("@@") else { continue };
+        if w.quote_style.is_some() || t.toks.get(t.next(i)) == Some(&Token::LParen) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("version") {
+            edits.push((t.at[i], t.end(i), "version()".to_string()));
+        } else {
+            let lower = name.to_lowercase();
+            return Err(crate::codes::coded("0A000", format!("@@{name} is SQL Server's: Pondra's settings are SHOW {lower} / current_setting('{lower}')")));
+        }
     }
     Ok(edits)
 }
@@ -1084,6 +1105,20 @@ fn args(f: &Function) -> Vec<&Expr> {
     }
 }
 
+/// SQL Server's and Snowflake's `string_agg(x, sep) WITHIN GROUP (ORDER BY y)` (`listagg` too, which is `string_agg` here):
+/// the ORDER BY is the aggregate's own, as `string_agg(x, sep ORDER BY y)` takes it. Other aggregates keep their WITHIN GROUP.
+fn within_group(f: &mut Function) -> Result<()> {
+    let n = function_name(f);
+    if f.within_group.is_empty() || !matches!(n.as_str(), "string_agg" | "listagg") {
+        return Ok(());
+    }
+    let FunctionArguments::List(list) = &mut f.args else { bail!("{n}(x, sep) WITHIN GROUP (ORDER BY y): the arguments come first") };
+    ensure!(!list.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))), "{n}: an ORDER BY among its arguments and one in WITHIN GROUP: write one of them");
+    list.clauses.push(FunctionArgumentClause::OrderBy(std::mem::take(&mut f.within_group)));
+    f.name = ObjectName::from(vec![Ident::new("string_agg")]);
+    Ok(())
+}
+
 /// One expression's own forms.
 fn expression(e: &mut Expr) -> Result<()> {
     if let Expr::Like { pattern, escape_char, .. } | Expr::ILike { pattern, escape_char, .. } = e {
@@ -1107,6 +1142,7 @@ fn expression(e: &mut Expr) -> Result<()> {
             }
         }
         Expr::Function(f) => {
+            within_group(f)?;
             let n = function_name(f);
             let a = args(f);
             match (n.as_str(), a.len()) {
@@ -1743,6 +1779,24 @@ mod tests {
             "ALTER TABLE t SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'a.b' = '1', c = 2)"
         );
         assert_eq!(text("SELECT tblproperties.x FROM tblproperties").unwrap(), "SELECT tblproperties.x FROM tblproperties");
+        // (SQL Server's @@version at a code position, any case; not in a string or a comment; another @@x refused by name)
+        assert_eq!(text("SELECT @@VERSION AS version, @@Version").unwrap(), "SELECT version() AS version, version()");
+        assert_eq!(text("SELECT '@@x', 1 -- @@y").unwrap(), "SELECT '@@x', 1 -- @@y");
+        assert!(text("SELECT @@spid").unwrap_err().to_string().contains("@@spid is SQL Server's: Pondra's settings are SHOW spid"));
+    }
+
+    #[test]
+    fn within_group_is_the_aggregates_own_order() {
+        // (SQL Server's and Snowflake's string_agg and listagg WITHIN GROUP: the ORDER BY moves into the arguments, as
+        // string_agg(x, sep ORDER BY y) has it; another aggregate keeps its WITHIN GROUP)
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("STRING_AGG(status, ', ') WITHIN GROUP (ORDER BY id)").unwrap(), "string_agg(status, ', ' ORDER BY id)");
+        assert_eq!(call("LISTAGG(status, ',') WITHIN GROUP (ORDER BY id DESC)").unwrap(), "string_agg(status, ',' ORDER BY id DESC)");
+        assert_eq!(call("percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)").unwrap(), "percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)");
+        assert!(wanted("SELECT STRING_AGG(status, ', ') WITHIN GROUP (ORDER BY id) FROM orders"));
     }
 
     #[test]

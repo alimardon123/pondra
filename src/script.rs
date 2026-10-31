@@ -167,7 +167,7 @@ fn opens(text: &str, t: &[Tok], i: usize) -> bool {
     match t.get(i + 1) {
         None => false,
         Some(x) if x.k == K::Semi => false,
-        Some(x) => !(x.k == K::Word && matches!(text[x.at..x.end].to_ascii_lowercase().as_str(), "transaction" | "work" | "isolation" | "read" | "deferrable" | "not")),
+        Some(x) => !(x.k == K::Word && matches!(text[x.at..x.end].to_ascii_lowercase().as_str(), "transaction" | "tran" | "work" | "isolation" | "read" | "deferrable" | "not")),
     }
 }
 
@@ -1468,6 +1468,8 @@ END;
         assert_eq!(split("SELECT 1; IF $n = 0 THEN PRINT 'a'; ELSE PRINT 'b'; END IF; SELECT 2").len(), 3);
         assert_eq!(split("BEGIN; INSERT INTO t VALUES (1); COMMIT;").len(), 3); // (a transaction)
         assert_eq!(split("BEGIN TRANSACTION; SELECT 1; COMMIT").len(), 3);
+        assert_eq!(split("BEGIN TRAN; SELECT 1; COMMIT").len(), 3); // (SQL Server's: a transaction, not a block)
+        assert_eq!(split("BEGIN TRAN sales; SELECT 1; COMMIT").len(), 3);
         assert_eq!(split("BEGIN SELECT 1; IF a THEN IF b THEN SELECT 2; END IF; END IF; END; SELECT 3").len(), 2);
         assert_eq!(split("CREATE PIPELINE p AS BEGIN PARALLEL STEP a AS BEGIN SELECT 1; SELECT 2; END; STEP b AS SELECT 3; END PARALLEL; END; SELECT 4").len(), 2);
         assert_eq!(split("CREATE TASK t SCHEDULE '1 hour' AS SELECT 1 AS parallel; SELECT 2").len(), 2);
