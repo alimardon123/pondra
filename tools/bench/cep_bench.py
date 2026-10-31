@@ -26,11 +26,14 @@ Flink has no PREV, so its LAST(var, 1) stands for it. The first pattern, ending 
                 and Flink. Each engine runs alone, with a node or a JVM of its own.
 
 Runs: each timing is the median of three where one run is under a minute, else one run. Prints one JSON object.
+Flink's process still running past --flink-timeout seconds (default 21600) is killed with its children: its result is
+`failed` ("did not finish in N s"), with the peak RSS so far.
 
   PONDRA_BIN=<pondra binary> cep_bench.py [--ns 100000,1000000,10000000] [--dir FOLDER] [--engines pondra,flink]
+                             [--flink-state rocksdb|heap] [--flink-timeout SECONDS]
   (Flink: PyFlink 2.3 in $FLINK_PYTHON, or /home/claude/venv-flink; the ticks are written under --dir, once per N)
 """
-import argparse, array, csv, datetime, itertools, json, os, random, shutil, statistics, subprocess, sys, tempfile, threading, time
+import argparse, array, csv, datetime, itertools, json, os, random, shutil, signal, statistics, subprocess, sys, tempfile, threading, time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -226,10 +229,26 @@ def pondra_query(n, files, port, sql=MATCH):
         shutil.rmtree(lake, ignore_errors=True)
 
 
-def flink(n, files, folder, python, state="rocksdb"):
+def kill_tree(pid):
+    """SIGKILL a process and its descendants (`children`, recursively). The list is made before the first kill: a killed
+    parent's children are re-parented, and are no longer listed under it."""
+    pids, todo = [], [pid]
+    while todo:
+        q = todo.pop()
+        pids.append(q)
+        todo += children(q)
+    for q in pids:
+        try:
+            os.kill(q, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def flink(n, files, folder, python, state="rocksdb", timeout=21600):
     """flink_cep.py in its own Python, JVM outside the timings: its JSON line, and the JVM's peak RSS. Its state: RocksDB
     (nexmark.py's default: its managed memory a third of the machine's, the JVM's heap a third) or the heap (two thirds,
-    as nexmark.py's --flink-state heap). JVM_ARGS overrides the heap."""
+    as nexmark.py's --flink-state heap). JVM_ARGS overrides the heap. Past `timeout` seconds its process tree is killed,
+    and the result is `failed` with the peak RSS so far."""
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flink_cep.py")
     out_file = folder + f"-flink-matches-{state}.csv"  # (beside the ticks, not in them: Flink's source reads its folder)
     if os.path.exists(out_file):
@@ -243,7 +262,14 @@ def flink(n, files, folder, python, state="rocksdb"):
                          env={**os.environ, "JVM_ARGS": jvm})
     peak = Peak(p.pid)
     peak.start()
-    stdout, stderr = p.communicate(timeout=6 * 3600)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(p.pid)
+        p.communicate()  # (drains the pipes and reaps the process)
+        mem = peak.finish()
+        os.unlink(f.name)
+        return {"engine": "flink", "state": state, "failed": f"did not finish in {timeout} s"} | mem
     mem = peak.finish()
     os.unlink(f.name)
     lines = [l for l in stdout.splitlines() if l.startswith("{")]
@@ -321,6 +347,7 @@ def main(argv):
     ap.add_argument("--port", type=int, default=8391)
     ap.add_argument("--prev-check", action="store_true", help="Pondra alone: the PREV form's plain matches against the LAST form's")
     ap.add_argument("--flink-state", default="rocksdb", choices=["rocksdb", "heap"], help="where Flink keeps its state")
+    ap.add_argument("--flink-timeout", type=int, default=21600, help="seconds: Flink's process past it is killed, and recorded as failed")
     a = ap.parse_args(argv)
     engines = a.engines.split(",")
     result = {"machine": {"nproc": os.cpu_count(), "ram_gb": ram_gb()}, "runs": []}
@@ -345,7 +372,7 @@ def main(argv):
                                                                                              "same_as_last_form": keys(prev["matches"]) == keys(query["matches"])}
         if "flink" in engines:
             one["loadavg_before"]["flink"] = loadavg()
-            fl = flink(n, files, folder, a.flink_python, a.flink_state)
+            fl = flink(n, files, folder, a.flink_python, a.flink_state, a.flink_timeout)
             one["flink"] = {k: v for k, v in fl.items() if k != "matches"}
             if "matches" in fl:
                 one["flink"]["matches"] = len(fl["matches"])
