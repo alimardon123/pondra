@@ -171,7 +171,7 @@ fn queries() -> &'static tokio::runtime::Runtime {
 /// holds one), and a cap could leave none for files.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn runtime() -> tokio::runtime::Builder {
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let cores = crate::env::cores();
     let most = crate::env::or("PONDRA_BLOCKING_THREADS", if cfg!(windows) { 512 } else { 16.max(4 * cores) });
     let mut b = tokio::runtime::Builder::new_multi_thread();
     b.enable_all().thread_stack_size(8 << 20).thread_keep_alive(std::time::Duration::from_secs(1)).max_blocking_threads(most);

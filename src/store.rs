@@ -712,6 +712,9 @@ pub(crate) fn spill_room() {
         return;
     }
     LOOKED.store(now, Relaxed);
+    if live_spillers().is_empty() {
+        return; // (no spill disk made yet, so nothing to size and no disk to look at: a page never makes one)
+    }
     set_room(spill_gb());
 }
 
@@ -781,9 +784,15 @@ impl std::fmt::Debug for Lake {
 /// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
+
+/// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
+/// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
+#[cfg(target_arch = "wasm32")]
+pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
 /// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
@@ -1510,10 +1519,15 @@ impl Lake {
     }
 
     /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions.
+    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
+    /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        functions(config, self.rt.clone())
+        let ctx = functions(config, self.rt.clone());
+        #[cfg(target_arch = "wasm32")]
+        let ctx = crate::in_task::planned(ctx);
+        ctx
     }
 
     /// Query memory in use, and the limit.
@@ -2794,8 +2808,13 @@ pub fn crash_rolled(point: &str) -> bool {
 pub fn partitions() -> usize {
     static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
     *PARTS.get_or_init(|| {
-        let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
-        cores.min(memory_limit() / (24 << 20)).max(2)
+        #[cfg(target_arch = "wasm32")]
+        return 1; // (a page has one thread and no runtime to start a partition's task on: `in_task.rs`)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(crate::env::cores);
+            cores.min(memory_limit() / (24 << 20)).max(2)
+        }
     })
 }
 

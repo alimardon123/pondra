@@ -65,10 +65,6 @@ const COUNTERS_KEY: &str = "pondra.counters";
 /// The name a fill's node rows have while the fill is planned (`over_rows`): a table of the statement's own, which only
 /// the statement sees. SQL writes it quoted (`ext_names::quoted`), and a fill may not make a table of this name.
 const NODE_ROWS: &str = "the node's rows";
-/// A page's memory line when `PONDRA_MEMORY_MAX_GB` isn't set: 3 GiB, a quarter below the 4 GiB a wasm32 memory ends at. The
-/// live bytes are what the program asked for, so that quarter is the room for the allocator's own footprint and for a last
-/// step that grows within one poll.
-const LINE: usize = 3 << 30;
 /// What a query the watch stopped answers (SQLSTATE 53200: `codes::of` reads "out of memory").
 const PAGE_OOM: &str = "out of memory: the page was nearly out of memory and stopped this query, the one that grew it (memory_max_gb)";
 
@@ -89,7 +85,7 @@ pub struct Options {
     /// it at each poll of a query and stops the query that grows the page past its line (`Watch`). None watches nothing.
     pub memory: Option<Memory>,
     /// The memory line the program that runs the page found for its device, in bytes (`web/`: a phone's browser gives a
-    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `LINE`.
+    /// page less than a desktop's), taken when `PONDRA_MEMORY_MAX_GB` isn't set (`memory_line`). None: `env::PAGE_LINE`.
     pub line: Option<usize>,
 }
 
@@ -166,6 +162,8 @@ pub struct Page {
     txn: std::sync::Mutex<Option<txn::Txn>>, // (the open transaction, if any: `page::txn`)
     notes: std::sync::Mutex<Vec<String>>, // (what the statement running now says beside its answer: `note`)
     types: std::sync::Mutex<BTreeMap<String, Vec<String>>>, // (each enum type's labels, by its name: `page::types`)
+    #[cfg(feature = "lake")]
+    paged: Option<crate::node::Paged>, // (the page's member on the core's lake, when `open_lake` opened one: `/sql` is answered there)
 }
 
 /// A page table's rules, made from its CREATE TABLE by the core (`rules::Table::of_create`), that statement's text, which a kept
@@ -258,6 +256,46 @@ fn refused(status: u16, words: String) -> Answer {
     Answer { status, headers: vec![("content-type", TEXT.to_string())], body: words.into() }
 }
 
+/// A `files` answer (`lake_files::Filed`) as the page's answer: the node's status and content type, and when it is a
+/// file's bytes, its `etag` (quoted) and `cache-control: no-store`, as the node's HTTP sends them.
+#[cfg(feature = "lake")]
+fn filed_answer(f: crate::lake_files::Filed) -> Answer {
+    let mut headers = vec![("content-type", f.content_type.to_string())];
+    if let Some(version) = f.etag {
+        headers.push(("etag", quoted(&version)));
+        headers.push(("cache-control", "no-store".to_string()));
+    }
+    Answer { status: f.status, headers, body: f.body }
+}
+
+/// The principal a page's member runs its requests as: this process's admin, as the page's own door (`lake_sql`, `lake_files`).
+#[cfg(feature = "lake")]
+fn lake_principal() -> crate::auth::Principal {
+    crate::auth::Principal::token(crate::auth::Role::Admin).at("page", None)
+}
+
+/// An answer `statement::sql` handed in pieces (`Rendered::Pieces`), as one body: its first piece, then each piece the rest
+/// sends, in order. A piece that fails, or a channel that closes before the answer's end, fails the answer.
+#[cfg(feature = "lake")]
+async fn collected(mut h: crate::query::Handed, content: &'static str) -> Answer {
+    let mut body = std::mem::take(&mut h.first);
+    let mut cut = false;
+    loop {
+        match h.rest.recv().await {
+            Some(Ok(piece)) => body.extend_from_slice(&piece),
+            Some(Err(_)) => {
+                cut = true;
+                break;
+            }
+            None => break,
+        }
+    }
+    if cut || !h.ended.load(std::sync::atomic::Ordering::Acquire) {
+        return failed(anyhow::anyhow!("the answer stopped before its end"));
+    }
+    Answer::ok(content, body)
+}
+
 /// An entity tag as HTTP sends it: quoted.
 fn quoted(e_tag: &str) -> String {
     format!("\"{e_tag}\"")
@@ -314,6 +352,34 @@ impl Page {
         Page::with_watch(options, watch)
     }
 
+    /// `open`, with the page's member on the core's lake (`node::open_page`, behind the `lake` feature until P3): its
+    /// `/sql` is answered by `statement::sql` as the owner's, as the HTTP door answers a node's.
+    #[cfg(feature = "lake")]
+    pub async fn open_lake(options: &Options) -> anyhow::Result<Page> {
+        let mut page = Page::open(options);
+        page.paged = Some(crate::node::open_page(options.line).await?);
+        Ok(page)
+    }
+
+    /// `open_lake`, refused by name: this build has no core's lake (build `web/` with `--features lake`).
+    #[cfg(not(feature = "lake"))]
+    pub async fn open_lake(_options: &Options) -> anyhow::Result<Page> {
+        Err(crate::codes::coded("0A000", "this page was built without the core's lake: build web/ with --features lake"))
+    }
+
+    /// Ends the page's member on the core's lake, if `open_lake` opened one: its loops, its catalog, its term and its lake in
+    /// memory (`node::Paged::close`). A page opened another way has nothing to end.
+    #[cfg(feature = "lake")]
+    pub async fn close(&mut self) {
+        if let Some(paged) = self.paged.take() {
+            paged.close().await;
+        }
+    }
+
+    /// `close`, for a build with no core's lake: nothing was opened, so nothing ends.
+    #[cfg(not(feature = "lake"))]
+    pub async fn close(&mut self) {}
+
     /// `open`, with its memory watch given: `open` reads the line from the settings, and a test gives a small one.
     fn with_watch(options: &Options, watch: Option<Watch>) -> Page {
         // (the page's catalog is `page`, as its host and `GET /objects` name it: an error then says `page.public.t`)
@@ -341,7 +407,23 @@ impl Page {
         // statement's, so a statement's `nextval` reaches the same counters)
         let ruled: Arc<std::sync::Mutex<HashMap<String, Ruled>>> = Default::default();
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::new_from_impl(counters::Nextval::new(ruled.clone())));
-        Page { ctx, files, keeps: options.store.is_some(), web: options.web.clone(), node: options.node.clone(), keeping: futures::lock::Mutex::new(()), watch, unread: vec![], ruled, views: Default::default(), txn: Default::default(), notes: Default::default(), types: Default::default() }
+        Page {
+            ctx,
+            files,
+            keeps: options.store.is_some(),
+            web: options.web.clone(),
+            node: options.node.clone(),
+            keeping: futures::lock::Mutex::new(()),
+            watch,
+            unread: vec![],
+            ruled,
+            views: Default::default(),
+            txn: Default::default(),
+            notes: Default::default(),
+            types: Default::default(),
+            #[cfg(feature = "lake")]
+            paged: None,
+        }
     }
 
     /// One request, as a node answers it (ADR-061): `method` and `path` (its query for `format=`, and nothing else
@@ -350,6 +432,10 @@ impl Page {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let answer = match (method, route) {
             ("GET", "/ready") => return Answer::ok(TEXT, "ready"),
+            #[cfg(feature = "lake")]
+            ("POST", "/sql") if self.paged.is_some() => return self.lake_sql(query, headers, body).await,
+            #[cfg(feature = "lake")]
+            ("PUT" | "GET" | "DELETE" | "POST", _) if self.paged.is_some() && route.starts_with(FILES) => return self.lake_files(method, &route[FILES.len()..], query, headers, body).await,
             ("POST", "/sql") => match std::str::from_utf8(&body) {
                 Ok(text) => self.sql(text, param(query, "format")).await,
                 Err(e) => Err(crate::codes::coded("22P02", format!("the request's body can't be read: {e}"))),
@@ -365,6 +451,77 @@ impl Page {
             }
         };
         answer.unwrap_or_else(failed)
+    }
+
+    /// `POST /sql` on the page's member (`open_lake`): the statement is `statement::sql`'s, run as the owner (`WHO` for an
+    /// admin principal of this process, as the HTTP door's `guard` gives an owner's request), and its answer is the HTTP
+    /// door's: the same body, status and content type, with `x-pondra-session` and `x-pondra-notices` as HTTP adds them.
+    #[cfg(feature = "lake")]
+    async fn lake_sql(&self, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
+        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        // (the query read as the HTTP door's `Query` reads it: decoded, and a number that doesn't parse refused 400)
+        let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let text = |name: &str| q.get(name).cloned();
+        fn number<T: std::str::FromStr>(q: &std::collections::HashMap<String, String>, name: &str) -> Result<Option<T>, String>
+        where T::Err: std::fmt::Display {
+            q.get(name).map(|v| v.parse::<T>().map_err(|e| format!("Failed to deserialize query string: {e}"))).transpose()
+        }
+        let (after, stale_ms, rows) = match (number(&q, "after"), number(&q, "stale_ms"), number(&q, "rows")) {
+            (Ok(a), Ok(s), Ok(r)) => (a, s, r),
+            (Err(e), ..) | (_, Err(e), _) | (.., Err(e)) => return refused(400, e),
+        };
+        let p = crate::statement::SqlParams { format: text("format"), job: text("job"), spread: text("spread"), catalog: text("catalog"), after, stale_ms, rows };
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            if let (Ok(name), Ok(value)) = (http::HeaderName::from_bytes(name.as_bytes()), http::HeaderValue::from_str(value)) {
+                map.append(name, value);
+            }
+        }
+        let who = lake_principal();
+        let format = p.format.clone();
+        let said = crate::auth::WHO.scope(who, Box::pin(crate::statement::sql(paged.app.clone(), p, crate::auth::Role::Admin, map, body))).await;
+        let content = crate::answer::content_type(format.as_deref());
+        let mut answer = match said.reply {
+            Ok(crate::statement::Reply::Rendered(crate::statement::Rendered::Whole(b))) => Answer::ok(content, b),
+            Ok(crate::statement::Reply::Rendered(crate::statement::Rendered::Pieces(h))) => collected(h, content).await,
+            Ok(crate::statement::Reply::Rendered(crate::statement::Rendered::Sent)) => Answer { status: 204, headers: vec![], body: bytes::Bytes::new() },
+            Ok(crate::statement::Reply::Done(v)) => match serde_json::to_vec(&v) {
+                Ok(b) => Answer::ok(JSON, b),
+                Err(e) => failed(e.into()),
+            },
+            Err(e) => failed(e),
+        };
+        if said.session.as_deref().is_some_and(crate::temp::holds) {
+            let (name, value) = crate::statement::HELD_SESSION;
+            answer = answer.with(name, value.to_string());
+        }
+        if let Some(notices) = crate::statement::notices(&said.heard) {
+            answer = answer.with("x-pondra-notices", notices);
+        }
+        answer
+    }
+
+    /// `PUT`, `GET`, `DELETE` and `POST` `/files/{path}` on the page's member (`open_lake`): the node's four requests as
+    /// `files.rs` answers them on the core's lake (`files::put`, `get`, `restore`, `remove`), run as the owner, so SQL on
+    /// the lake reads a file the page was given. Its answer has the node's status and headers (`filed_answer`).
+    #[cfg(feature = "lake")]
+    async fn lake_files(&self, method: &str, name: &str, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
+        let Some(paged) = &self.paged else { return failed(anyhow::anyhow!("the page's member on the core's lake is not open")) };
+        let q: std::collections::HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+        let if_match = request_header(headers, "if-match");
+        let lake = &paged.app.lake;
+        let done = crate::auth::WHO.scope(lake_principal(), Box::pin(async move {
+            match method {
+                "PUT" => crate::files::put(lake, name, if_match, body).await,
+                "GET" => crate::files::get(lake, name, &q).await,
+                "POST" => crate::files::restore(lake, name, &q).await,
+                _ => crate::files::remove(lake, name).await, // (DELETE)
+            }
+        })).await;
+        match done {
+            Ok(f) => filed_answer(f),
+            Err(e) => failed(e),
+        }
     }
 
     /// SQL as a node reads it: the front, then the rows of the files it names by name, planned (`planned`), then the
@@ -1637,16 +1794,14 @@ fn stopped() -> anyhow::Error {
     crate::codes::coded("53200", PAGE_OOM)
 }
 
-/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else 3 GiB (`LINE`).
+/// The page's memory line (`env::memory_line`): its own is the line its `device` has (`Options::line`), else
+/// `env::PAGE_LINE`.
 fn memory_line(device: Option<usize>) -> Option<usize> {
-    crate::env::memory_line(Some(device.unwrap_or(LINE)))
+    crate::env::memory_line(Some(device.unwrap_or(crate::env::PAGE_LINE)))
 }
 
-/// The most query memory a page's pool holds (`env::query_memory`): its share is two thirds of the line (of the default line
-/// when the watch is off, so the pool is never empty).
-fn query_memory(device: Option<usize>) -> usize {
-    crate::env::query_memory(|| memory_line(device).unwrap_or(LINE) / 3 * 2)
-}
+/// The most query memory a page's pool holds: `env::page_query_memory`, as a page's lake holds it.
+fn query_memory(device: Option<usize>) -> usize { crate::env::page_query_memory(device) }
 
 /// A table's batches, partition by partition, as its memory table holds them (`inner`); None for another provider's table.
 async fn partitions_of(table: &Arc<dyn TableProvider>) -> Option<Vec<Vec<RecordBatch>>> {

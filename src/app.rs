@@ -129,7 +129,7 @@ struct Turns {
 }
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let cores = crate::env::cores();
     let most = crate::env::or::<usize>("PONDRA_QUERIES", (4 * cores).max(16)).max(1);
     let wait = crate::env::or::<f64>("PONDRA_QUEUE_SECS", 60.0);
     Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }

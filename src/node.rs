@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
 #[cfg(feature = "doors")] pub use run::{Node, Options};
@@ -526,6 +527,77 @@ pub fn keep(app: &crate::app::App, s: &Start) {
             let l = app.lake.clone(); // (what it inherited, replayed from the WAL, into every node's view)
             crate::panics::task(async move { l.cat.checkpoint().await.map_err(|e| eprintln!("checkpoint: {e:#}")) });
         }
+    }
+}
+
+crate::per_node!(
+    /// Is a page's member open in this process (`open_page`)? Set when one opens, set back when it closes.
+    static PAGED: AtomicBool = AtomicBool::new(false));
+
+/// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
+/// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it.
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()> }
+
+/// Opens a page's member (`Paged`), its queries holding the page's share of its device's `line` (`env::device_line`):
+/// refused by name while one is open in this process, and set back if the open fails.
+pub async fn open_page(line: Option<usize>) -> anyhow::Result<Paged> {
+    if PAGED.swap(true, SeqCst) {
+        return Err(crate::codes::coded("55006", "a page on the lake is open in this module already: close it first"));
+    }
+    crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
+    let url = crate::memory::place(":memory:");
+    let store = crate::memory::store(&url);
+    let (alone, marks) = match crate::members::Alone::lead(&store).await {
+        Ok(led) => led,
+        Err(e) => {
+            crate::memory::forget_memory(&url);
+            PAGED.store(false, SeqCst);
+            return Err(e);
+        }
+    };
+    let term = alone.leader().n;
+    let start = Start::default();
+    let mut lake = None;
+    let made = async {
+        let l = crate::store::Lake::open(&url, true, false).await?;
+        lake = Some(l.clone());
+        start_app(l, alone.clone(), None, &start).await
+    }
+    .await;
+    match made {
+        Ok(app) => {
+            keep(&app, &start);
+            Ok(Paged { app, url, term, marks })
+        }
+        Err(e) => {
+            end_page(marks, lake, &store, term, &url).await; // (a failed open leaves nothing running)
+            Err(e)
+        }
+    }
+}
+
+/// Ends what `open_page` started, as a node's stop does (`node::run::Held::stop` and `Node::stop`): its term's marks, its
+/// loops, its catalog, its term, its lake in memory, and the module's per-node state, so another `open_page` starts
+/// afresh. `Paged::close` and a failed open both end this way.
+async fn end_page(marks: tokio::task::JoinHandle<()>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str) {
+    marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
+    crate::panics::abort_all();
+    if let Some(lake) = lake {
+        let _ = lake.cat.close().await;
+    }
+    crate::terms::release(store, term).await;
+    crate::memory::forget_memory(url);
+    crate::reset::reset();
+    PAGED.store(false, SeqCst);
+}
+
+impl Paged {
+    /// Ends the page's member (`end_page`), so another `open_page` starts afresh.
+    pub async fn close(self) {
+        let Paged { app, url, term, marks } = self;
+        let lake = app.lake.clone();
+        drop(app);
+        end_page(marks, Some(lake.clone()), &lake.store, term, &url).await;
     }
 }
 

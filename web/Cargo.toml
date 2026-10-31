@@ -29,6 +29,11 @@ getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 # The page's heap: std's allocator, over a memory grown in steps (src/heap.rs).
 dlmalloc = "0.2"
 
+[features]
+# The core's lake under the page (designs/page-lake-p2.md): `lake()` opens a page whose member is a node's lake in its memory.
+# Off by default: a build without it refuses `lake()` by name.
+lake = ["pondra/lake"]
+
 [profile.release]
 opt-level = "s" # (TPC-H SF1 in Node 5.2–5.4 s against "z"'s 7.7–8.0, for 5.75 MB brotli against 4.90; 3 is no faster and 2.2× the size)
 lto = true
