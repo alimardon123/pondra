@@ -1355,6 +1355,10 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
 /// their table: the INSERT goes again, without them (`on_node_as` does it at once).
 pub const AGAIN: &str = "INSERT again, its files without their system columns";
 
+/// What a member that keeps no records says of an INSERT the leader sends back `AGAIN`, instead of writing it again: its node runs
+/// the statement whole (`page::lake_sql` recognises these words, and sends the statement to the node).
+pub const NODE_RUNS: &str = "an INSERT into a table a view or a streaming task follows is run whole by the node it joined";
+
 /// The commit number and time a bulk INSERT's files are stamped with, and its block of row ids
 /// (None: its files are written without them, and take a lineage when recorded). A table views or
 /// tasks follow takes none: what follows it goes by the commit that records the files (`record`).
@@ -1492,8 +1496,8 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
 /// its view holds everything the leader had committed once the write was done (5 s at most: a
 /// view that far behind catches up by itself).
 pub async fn seen_here(app: &crate::app::App) {
-    if app.seq.is_some() || app.members.reader() {
-        return;
+    if app.seq.is_some() || app.members.reader() || !app.members.keeps_records() {
+        return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
     let asked = async { crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/visible").timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
     let Ok(upto) = asked.await else { return };
@@ -1769,6 +1773,9 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             };
             let Some(f) = f else { return Ok(j!({"duplicate": true})) };
             return match app.record_files(f).await {
+                // (a member that keeps no records, a joined page, doesn't write it again: its node runs the statement whole. The files
+                // put already are orphans, swept as a crashed follower's are)
+                Err(e) if format!("{e:#}").contains(AGAIN) && !app.members.keeps_records() => Err(crate::codes::coded("0A000", format!("{NODE_RUNS} ({e:#})"))),
                 Err(e) if format!("{e:#}").contains(AGAIN) => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await; // (this node sees the view by then: without them)
                     Box::pin(on_node_as(app, Stmt::Insert(table, query.clone()), Some(format!("{job}-again")), files)).await

@@ -7,13 +7,14 @@
 use crate::byte_range;
 use crate::fetch;
 use crate::store::lake_file;
-use crate::store_wire::{chunks, content_span, folder_of_lake, generic, listing_query, lines, object_meta, Delimited, Meta};
+use crate::store_wire::{chunks, content_span, folder_of_lake, generic, listing_query, lines, object_meta, text_of, Delimited, Meta};
+use bytes::{Bytes, BytesMut};
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use object_store::path::Path;
 use object_store::{
     CopyOptions, Error as E, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as StoreResult,
 };
 use reqwest::header::{AUTHORIZATION, RANGE};
 use std::fmt;
@@ -24,6 +25,9 @@ use url::Url;
 /// How long a request waits for its answer's headers. A body is read as it comes, each chunk within the time `store_wire`
 /// allows it.
 const WAIT: Duration = Duration::from_secs(30);
+
+/// A create-only PUT waits `WAIT` plus a second for each megabyte of its body: a 128 MB file can take longer than `WAIT`.
+const MB: usize = 1 << 20;
 
 /// A lake's store on the node at `node` (its URL, such as `https://node:7000`), read with `auth`, the `Authorization` header
 /// of every request (a page's sign-in). Nothing is connected until the first request.
@@ -66,15 +70,7 @@ impl Joined {
 
     /// `req`'s answer, waited for `WAIT` at most. The send starts here, so the request is not held across an await.
     fn sent(&self, req: reqwest::RequestBuilder, what: String) -> impl Future<Output = StoreResult<fetch::Response>> + Send {
-        let answer = fetch::send(req);
-        let at = self.at().to_string();
-        async move {
-            match tokio::time::timeout(WAIT, answer).await {
-                Ok(Ok(answer)) => Ok(answer),
-                Ok(Err(e)) => Err(generic(&at, format!("{what} failed: {e}"))),
-                Err(_) => Err(generic(&at, format!("{what}: no answer in {} s", WAIT.as_secs()))),
-            }
-        }
+        self.sent_within(req, what, WAIT)
     }
 
     /// The error for an answer that isn't a success: a 404 is `NotFound` and a 403 `PermissionDenied`, as the door says them;
@@ -86,6 +82,19 @@ impl Joined {
             404 => E::NotFound { path: path.to_string(), source: format!("{status}: {body}").into() },
             403 => E::PermissionDenied { path: path.to_string(), source: format!("{status}: {body}").into() },
             _ => generic(self.at(), format!("answered {status}: {body}")),
+        }
+    }
+
+    /// `req`'s answer, waited for `wait` at most (`sent`, with a longer wait for a body that is long to send).
+    fn sent_within(&self, req: reqwest::RequestBuilder, what: String, wait: Duration) -> impl Future<Output = StoreResult<fetch::Response>> + Send {
+        let answer = fetch::send(req);
+        let at = self.at().to_string();
+        async move {
+            match tokio::time::timeout(wait, answer).await {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(e)) => Err(generic(&at, format!("{what} failed: {e}"))),
+                Err(_) => Err(generic(&at, format!("{what}: no answer in {} s", wait.as_secs()))),
+            }
         }
     }
 
@@ -126,9 +135,23 @@ fn not_here(path: &str) -> E {
     E::NotFound { path: path.to_string(), source: "a joined page reads the lake's files and log (data/, log/) through its node, and no other path".into() }
 }
 
-/// A write: a joined page writes through its node's `/sql`, and never to its store.
+/// A write other than a create: a joined page's files are new ones only (`PutMode::Create`), and its rows go through its node's
+/// commit. Multipart, copy and delete are the node's to refuse.
 fn writes() -> E {
-    E::NotSupported { source: "a joined page writes through its node's /sql".into() }
+    E::NotSupported { source: "a joined page writes only new files of the lake (data/, log/), each once, through its node".into() }
+}
+
+/// A payload's bytes as one body: a single part as it is, several put together (one copy).
+fn body_of(payload: PutPayload) -> Bytes {
+    let mut parts: Vec<Bytes> = payload.into_iter().collect();
+    if parts.len() == 1 {
+        return parts.remove(0);
+    }
+    let mut all = BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
+    for part in parts {
+        all.extend_from_slice(&part);
+    }
+    all.freeze()
 }
 
 impl fmt::Debug for Joined {
@@ -146,8 +169,27 @@ impl fmt::Display for Joined {
 
 #[async_trait::async_trait]
 impl ObjectStore for Joined {
-    async fn put_opts(&self, _at: &Path, _payload: PutPayload, _opts: PutOptions) -> StoreResult<PutResult> {
-        Err(writes())
+    async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> StoreResult<PutResult> {
+        // (a new file of the lake only: the node's door takes `PUT /store/…` with `If-None-Match: *` for `data/` and `log/`, and
+        // refuses any other put, so nothing here overwrites a file)
+        if !matches!(opts.mode, PutMode::Create) {
+            return Err(writes());
+        }
+        if !lake_file(at.as_ref()) {
+            return Err(not_here(at.as_ref()));
+        }
+        let body = body_of(payload);
+        let wait = WAIT + Duration::from_secs(body.len().div_ceil(MB) as u64);
+        let req = self.request(reqwest::Method::PUT, self.object_url(at)?).header("if-none-match", "*").body(body);
+        let answer = self.sent_within(req, format!("PUT {at}"), wait).await?;
+        if answer.status() == reqwest::StatusCode::PRECONDITION_FAILED {
+            let body = answer.text().await.unwrap_or_default();
+            return Err(E::AlreadyExists { path: at.to_string(), source: format!("412 Precondition Failed: {body}").into() });
+        }
+        if !answer.status().is_success() {
+            return Err(self.failed(answer, at.as_ref()).await);
+        }
+        Ok(PutResult { e_tag: text_of(answer.headers(), "etag"), version: text_of(answer.headers(), "x-pondra-version"), extensions: Default::default() })
     }
 
     async fn put_multipart_opts(&self, _at: &Path, _opts: PutMultipartOptions) -> StoreResult<Box<dyn MultipartUpload>> {

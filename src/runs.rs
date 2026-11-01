@@ -153,8 +153,8 @@ type Sent = (Line, Option<tokio::sync::oneshot::Sender<()>>);
 crate::per_node!(static WRITER: std::sync::RwLock<Option<tokio::sync::mpsc::UnboundedSender<Sent>>> = std::sync::RwLock::new(None));
 
 fn log(app: &App, line: Line, done: Option<tokio::sync::oneshot::Sender<()>>) {
-    if app.log.is_none() {
-        return; // (a read-only node writes nothing)
+    if app.log.is_none() || !app.members.keeps_records() {
+        return; // (a read-only node writes nothing; a joined page's node keeps the records)
     }
     let tx = crate::reset::Once::get_or(&*WRITER, || {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -317,8 +317,8 @@ async fn stopped(app: &App, since: u64, whose: Option<&str>) -> Result<HashSet<S
     use datafusion::arrow::array::{Array, AsArray};
     use datafusion::arrow::datatypes::TimestampMicrosecondType;
     let mut newer = HashSet::new();
-    if app.log.is_none() {
-        return Ok(newer); // (a read-only node writes nothing)
+    if app.log.is_none() || !app.members.keeps_records() {
+        return Ok(newer); // (a read-only node writes nothing; a joined page's node keeps the records)
     }
     let live = app.members.nodes();
     let only = whose.map(|n| format!(" AND node = '{}'", n.replace('\'', "''"))).unwrap_or_default();

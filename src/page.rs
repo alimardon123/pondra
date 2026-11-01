@@ -296,6 +296,12 @@ fn refused_by_constraint(answer: &Answer) -> bool {
     answer.header("x-pondra-sqlstate").is_some_and(|code| code.starts_with("23"))
 }
 
+/// Whether a statement's answer says its node runs it whole (`write::NODE_RUNS`): the leader sent its INSERT back to be written
+/// again, and a joined page doesn't write it again (`own_answer`).
+fn node_runs(answer: &Answer) -> bool {
+    answer.header("x-pondra-sqlstate") == Some("0A000") && String::from_utf8_lossy(&answer.body).contains(crate::write::NODE_RUNS)
+}
+
 /// The sequence a DEFAULT `nextval('s')` counts in, as `rules::create::identity_default` writes it; None for any other DEFAULT.
 fn sequence_of(default: &str) -> Option<String> {
     Some(default.strip_prefix("nextval('")?.strip_suffix("')")?.replace("''", "'"))
@@ -483,32 +489,59 @@ impl Page {
             return self.lake_said(query, headers, body).await;
         }
         let Ok(sql) = std::str::from_utf8(&text) else { return self.lake_said(query, headers, body).await };
-        match Box::pin(self.node_part(sql, headers, param(query, "format"))).await {
-            Ok(Some(part)) => match Box::pin(self.node_answer(part, headers)).await {
+        match Box::pin(self.node_part(sql, headers, param(query, "format"), true)).await {
+            Ok(Routed::Node(part)) => match Box::pin(self.node_answer(part, headers)).await {
                 Ok(answer) => answer,
                 Err(e) => failed(e),
             },
-            Ok(None) => self.lake_said(query, headers, body).await, // (the node has no part in it: the lake runs it once, and its answer stands)
+            Ok(Routed::Own) => self.own_answer(sql, query, headers, body).await,
+            Ok(Routed::Lake) => self.lake_said(query, headers, body).await, // (the node has no part in it: the lake runs it once, and its answer stands)
             Err(e) => failed(e),
         }
     }
 
+    /// The lake's own write of a joined page (`Routed::Own`, `joined_part`): the lake runs the INSERT, and its rows and files go to the
+    /// node's commit. Once the lake answered it, the page waits until its view holds the node's commit (`seen_node_commit`), so its
+    /// next read sees the write, as a joined page's node writes do. A write the leader sends back to be written again
+    /// (`write::NODE_RUNS`) is not written again here: the node runs the statement whole, and its answer stands.
+    async fn own_answer(&self, sql: &str, query: &str, headers: &[(String, String)], body: bytes::Bytes) -> Answer {
+        let answer = self.lake_said(query, headers, body).await;
+        if node_runs(&answer) {
+            return match Box::pin(self.node_part(sql, headers, param(query, "format"), false)).await {
+                Ok(Routed::Node(part)) => match Box::pin(self.node_answer(part, headers)).await {
+                    Ok(whole) => whole,
+                    Err(e) => failed(e),
+                },
+                Ok(_) => answer,
+                Err(e) => failed(e),
+            };
+        }
+        if let (200, Some(paged)) = (answer.status, self.member.get()) {
+            seen_node_commit(&paged.app.lake).await;
+        }
+        answer
+    }
+
     /// The node's part of a plain-SQL statement (`part_of`), decided in the request's session (`statement::scoped`): its `$name`s
     /// bind, and its temporary tables are the lake's. The words the lake runs as its own (a transaction's, a setting's, a variable's)
-    /// name no table, so they are the lake's before any name is read. A joined page's statements are all routed (`joined_part`).
-    async fn node_part(&self, sql: &str, headers: &[(String, String)], format: Option<&str>) -> anyhow::Result<Option<Part>> {
-        let Some(paged) = self.member.get() else { return Ok(None) };
+    /// name no table, so they are the lake's before any name is read. A joined page's statements are all routed (`joined_part`),
+    /// and an INSERT of its own is the page's (`Routed::Own`) only when `own` says so: the superuser's join, on the page's first try.
+    async fn node_part(&self, sql: &str, headers: &[(String, String)], format: Option<&str>, own: bool) -> anyhow::Result<Routed> {
+        let Some(paged) = self.member.get() else { return Ok(Routed::Lake) };
         let joined = self.joined.is_some();
         if !joined && (crate::text::control(sql).is_some() || crate::settings::is(sql) || crate::vars::change(sql).is_some()) {
-            return Ok(None);
+            return Ok(Routed::Lake);
         }
         let token = request_header(headers, "authorization").and_then(|v| v.strip_prefix("Bearer "));
         let session = crate::temp::of(&header_map(headers))?;
         let format_query = format.map(|f| format!("format={f}")).unwrap_or_default();
         let lent = crate::auth::lent_vars(token);
         match joined {
-            true => crate::statement::scoped(session, lent, Box::pin(joined_part(&paged.app.lake, sql, format_query))).await,
-            false => crate::statement::scoped(session, lent, Box::pin(part_of(&paged.app.lake, sql, format_query))).await,
+            true => crate::statement::scoped(session, lent, Box::pin(joined_part(&paged.app.lake, sql, format_query, own && paged.superuser()))).await,
+            false => Ok(match crate::statement::scoped(session, lent, Box::pin(part_of(&paged.app.lake, sql, format_query))).await? {
+                Some(part) => Routed::Node(part),
+                None => Routed::Lake,
+            }),
         }
     }
 
@@ -943,6 +976,15 @@ enum Part {
     Fill { sent: String, names: BTreeSet<String>, write: String, format: String },
 }
 
+/// Where a statement a page runs goes (`node_part`): the node's part of it; the lake's own write of an INSERT (`Own`, a joined page's:
+/// the lake runs it as a follower does, and the page waits for its node's commit once the lake answered); or the lake's, as it runs
+/// it (None in `part_of`'s words).
+enum Routed {
+    Node(Part),
+    Own,
+    Lake,
+}
+
 /// The node's part of `sql` as the lake reads it (`node_part`, in the request's session): None when no table it names is the
 /// node's, when it is the lake's own (it neither reads nor writes one of the node's tables), or when it doesn't parse. The node is
 /// asked the text with its variables bound (`vars::bound`), as it is written.
@@ -994,24 +1036,29 @@ async fn part_of(lake: &crate::store::Lake, sql: &str, format_query: String) -> 
 /// A transaction is refused by name: the page holds none of the node's. A setting or a variable is the lake's, and so is a
 /// statement that is the session's own (its temporary tables, views and secrets). An `EXECUTE` runs its prepared text with the
 /// arguments bound, as the lake binds them (`settings::statement`, which for an EXECUTE only reads the text and runs nothing), and
-/// is routed by that text. A write goes whole to the node, with no page tables: a statement that calls `nextval` is one too, since a
-/// page can't reach the leader that numbers it. Any other statement is `part_of`'s, so a name the page lacks (an attached lake's
-/// table, which it never reads) goes to the node.
-async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String) -> anyhow::Result<Option<Part>> {
+/// is routed by that text. An INSERT the page may write itself is `Own` (`own_insert`, when `superuser`: the join is a superuser's). Any
+/// other write goes whole to the node, with no page tables: a statement that calls `nextval` is one too, since a page can't reach the
+/// leader that numbers it. Any other statement is `part_of`'s, so a name the page lacks (an attached lake's table, which it never
+/// reads) goes to the node.
+///
+/// Why the rest stays the node's: a keyed or UNIQUE write needs the leader's locks and checks (`/cluster/lock`, `/cluster/checked`),
+/// and UPDATE, DELETE and MERGE go as SQL to the leader (`/cluster/change`). A page's relay can carry them after 1.0, as it carries
+/// a superuser's INSERT now (`write::run_listed`, `Routed::Own`).
+async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String, superuser: bool) -> anyhow::Result<Routed> {
     if let Some(word) = crate::text::control(sql) {
         return Err(crate::codes::coded("0A000", format!("{word}: {JOINED_TRANSACTION}")));
     }
     let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default();
     let text = if crate::settings::is(sql) {
         if !(word.eq_ignore_ascii_case("EXECUTE") || word.eq_ignore_ascii_case("EXEC")) {
-            return Ok(None); // (a setting, a PREPARE or a DEALLOCATE: the lake's)
+            return Ok(Routed::Lake); // (a setting, a PREPARE or a DEALLOCATE: the lake's)
         }
         match crate::settings::statement(lake, sql).await? {
             crate::settings::Done::Run(run) => run,
-            crate::settings::Done::Said(_) => return Ok(None),
+            crate::settings::Done::Said(_) => return Ok(Routed::Lake),
         }
     } else if crate::vars::change(sql).is_some() {
-        return Ok(None); // (a variable's: the lake's)
+        return Ok(Routed::Lake); // (a variable's: the lake's)
     } else {
         sql.to_string()
     };
@@ -1019,13 +1066,56 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String)
     let expanded = crate::routines::expand(lake, &bound).await?;
     if let Some(stmt) = crate::write::parse(&expanded) {
         if crate::temp::own(&stmt) {
-            return Ok(None); // (the session's own: its temporary tables, views and secrets are the page's)
+            return Ok(Routed::Lake); // (the session's own: its temporary tables, views and secrets are the page's)
         }
     }
-    if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
-        return Ok(Some(Part::Query { sent: bound, names: BTreeSet::new(), format: format_query }));
+    if superuser && own_insert(lake, &expanded).await? {
+        return Ok(Routed::Own);
     }
-    part_of(lake, &text, format_query).await
+    if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
+        return Ok(Routed::Node(Part::Query { sent: bound, names: BTreeSet::new(), format: format_query }));
+    }
+    Ok(match part_of(lake, &text, format_query).await? {
+        Some(part) => Routed::Node(part),
+        None => Routed::Lake,
+    })
+}
+
+/// Whether an INSERT is the page's own to write (`joined_part`): into a table of the lake that has no key and no enforced UNIQUE
+/// (`constraints::checked`), with no RETURNING, reading only the page's own tables, and calling no sequence. Its rows and files then
+/// go to the node's commit as a follower's do (`write::run_listed`). A table the node holds, a file, or an INSERT that is not one
+/// of these is the node's.
+async fn own_insert(lake: &crate::store::Lake, expanded: &str) -> anyhow::Result<bool> {
+    if crate::seq::calls(expanded) {
+        return Ok(false);
+    }
+    let state = lake.session().state();
+    let Ok(statement) = parsed(&state, expanded) else { return Ok(false) };
+    let DfStatement::Statement(s) = &statement else { return Ok(false) };
+    let SqlStatement::Insert(insert) = &**s else { return Ok(false) };
+    if insert.returning.is_some() {
+        return Ok(false);
+    }
+    let Some((target, _, _)) = fill_of(&state, &statement)? else { return Ok(false) };
+    // (a name is the page's when the lake answers it for this session, as `part_of` decides: the target and the names it reads)
+    let mut have = BTreeSet::new();
+    for name in state.resolve_table_references(&statement)?.iter().chain(std::iter::once(&target)) {
+        if !crate::ext_names::is(name.table()) && lake_answers(lake, name.table()).await? {
+            have.insert(name.table().to_string());
+        }
+    }
+    let held = |name: &str| have.contains(name);
+    if home(&state, &target, &held) != Home::Page {
+        return Ok(false);
+    }
+    let Some(meta) = lake.table_meta_if(target.table()).await? else { return Ok(false) };
+    if !meta.key.is_empty() || crate::constraints::checked(&meta) {
+        return Ok(false);
+    }
+    // (a table function's name, such as `range`, is no table: the planner reads it from the session's functions, and the lake's own
+    // table of that name is held, so it is the page's)
+    let functions = state.table_functions();
+    Ok(named(&state, &statement, &held)?.iter().all(|(home, name)| *home == Home::Page || (*home == Home::Node && functions.contains_key(name))))
 }
 
 /// Waits until the page's lake holds the node's commit, once a joined page's write has answered (`node_answer`): its `c` is at
@@ -1279,31 +1369,63 @@ mod tests {
         let made = crate::store::Lake::open(dir.to_str().unwrap(), true, false).await?;
         let _sequencer = crate::log::Sequencer::start(made.clone(), None).await?;
         let lake = &made;
-        let Some(crate::write::Stmt::Create(c)) = crate::write::parse("CREATE TABLE t (a INT)") else { anyhow::bail!("not a CREATE TABLE") };
-        crate::write::create_table(lake, "t", &crate::write::create_spec(&c, lake, false).await?).await?;
-        let routed = |sql: &'static str| async move {
-            crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, sql, String::new()))).await.expect(sql)
-        };
-        // the page keeps what it reads from its own lake and its session, and the node has the writes
-        for (sql, node_has) in [("SELECT 1", false), ("FROM t", false), ("INSERT INTO t VALUES (1)", true), ("CREATE TABLE u (a INT)", true), ("SET x = 1", false), ("CREATE TEMP TABLE w (a INT)", false), ("SELECT nextval('s')", true)] {
-            assert_eq!(routed(sql).await.is_some(), node_has, "{sql}");
+        // a table with no key, one with a PRIMARY KEY, and one with a UNIQUE: only the first takes a superuser's INSERT of its own
+        for ddl in ["CREATE TABLE t (a INT)", "CREATE TABLE k (a INT PRIMARY KEY)", "CREATE TABLE u (a INT UNIQUE)"] {
+            let Some(crate::write::Stmt::Create(c)) = crate::write::parse(ddl) else { anyhow::bail!("not a CREATE TABLE: {ddl}") };
+            let name = ddl.split_whitespace().nth(2).unwrap_or_default();
+            crate::write::create_table(lake, name, &crate::write::create_spec(&c, lake, false).await?).await?;
         }
-        let refused = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "BEGIN", String::new()))).await.err().expect("a transaction is refused");
+        // (the kind a statement is routed to, as the page's superuser: `Own` is the lake's write of an INSERT the page keeps)
+        let kind = |r: &Routed| match r {
+            Routed::Node(_) => "node",
+            Routed::Own => "own",
+            Routed::Lake => "lake",
+        };
+        let routed = |sql: &'static str, superuser: bool| async move {
+            crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, sql, String::new(), superuser))).await.expect(sql)
+        };
+        // the page keeps what it reads from its own lake and its session, writes its own INSERTs, and the node has the rest
+        let as_superuser = [
+            ("SELECT 1", "lake"),
+            ("FROM t", "lake"),
+            ("INSERT INTO t VALUES (1)", "own"),
+            ("INSERT INTO t SELECT value, 'x' FROM range(3)", "own"),
+            ("INSERT INTO k VALUES (1)", "node"),
+            ("INSERT INTO u VALUES (1)", "node"),
+            ("INSERT INTO t VALUES (1) RETURNING a", "node"),
+            ("INSERT INTO t SELECT a FROM k", "own"),
+            ("INSERT INTO t SELECT a FROM elsewhere", "node"),
+            ("UPDATE t SET a = 2", "node"),
+            ("DELETE FROM t", "node"),
+            ("CREATE TABLE w2 (a INT)", "node"),
+            ("SET x = 1", "lake"),
+            ("CREATE TEMP TABLE w (a INT)", "lake"),
+            ("SELECT nextval('s')", "node"),
+        ];
+        for (sql, want) in as_superuser {
+            assert_eq!(kind(&routed(sql, true).await), want, "{sql}, as a superuser");
+        }
+        // (a join by a user who is no superuser: no INSERT is the page's, and every write goes whole to the node)
+        for sql in ["INSERT INTO t VALUES (1)", "INSERT INTO t SELECT value, 'x' FROM range(3)"] {
+            assert_eq!(kind(&routed(sql, false).await), "node", "{sql}, not as a superuser");
+        }
+        let refused = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "BEGIN", String::new(), true))).await.err().expect("a transaction is refused");
         assert_eq!(crate::codes::of(&refused), "0A000");
         // a prepared statement runs as its text, with its arguments bound: a write goes to the node, a read of the lake stays
         crate::statement::scoped(Some(SESSION.to_string()), None, async {
-            crate::settings::statement(lake, "PREPARE p AS INSERT INTO t VALUES ($1)").await.expect("the statement is prepared");
+            crate::settings::statement(lake, "PREPARE p AS INSERT INTO k VALUES ($1)").await.expect("the statement is prepared");
             crate::settings::statement(lake, "PREPARE q AS SELECT a FROM t").await.expect("the read is prepared");
         })
         .await;
-        let got = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "EXECUTE p(5)", String::new()))).await.expect("EXECUTE p");
+        let got = crate::statement::scoped(Some(SESSION.to_string()), None, Box::pin(joined_part(lake, "EXECUTE p(5)", String::new(), true))).await.expect("EXECUTE p");
         let shown = match &got {
-            Some(Part::Query { sent, .. }) => sent.clone(),
-            Some(Part::Fill { .. }) => "a fill".to_string(),
-            None => "none (the lake's)".to_string(),
+            Routed::Node(Part::Query { sent, .. }) => sent.clone(),
+            Routed::Node(Part::Fill { .. }) => "a fill".to_string(),
+            Routed::Own => "the lake's own write".to_string(),
+            Routed::Lake => "the lake's".to_string(),
         };
-        assert!(shown.contains("(5)") && !shown.contains('$'), "EXECUTE p is the node's write, bound: it routed {shown}");
-        assert!(routed("EXECUTE q").await.is_none(), "EXECUTE q reads the lake's own table");
+        assert!(shown.contains("(5)") && !shown.contains('$'), "EXECUTE p into a keyed table is the node's write, bound: it routed {shown}");
+        assert_eq!(kind(&routed("EXECUTE q", true).await), "lake", "EXECUTE q reads the lake's own table");
         Ok(())
     }
 }
