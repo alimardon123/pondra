@@ -80,20 +80,22 @@ async fn operator_only(req: extract::Request, next: middleware::Next) -> Respons
 pub fn files_door(store: Store) -> Router { door(store).layer(middleware::from_fn(lake_files_only)) }
 
 /// Passes a page's request only when it reads one of the lake's files (GET or HEAD of an object), lists one of its
-/// folders, or creates one of its files (a PUT with `If-None-Match: *`, which the store refuses when it is there).
-/// The object's path is parsed as `get_at` parses it, so the door reads what this lets through.
+/// folders, or creates a file a page may make (`auth::page_creates`: a segment of the log, a table's Parquet; a PUT with
+/// `If-None-Match: *`, which the store refuses when it is there). The object's path is parsed as `get_at` parses it, so
+/// the door reads and writes what this lets through.
 async fn lake_files_only(object: Option<extract::Path<String>>, Query(listing): Query<Listing>, req: extract::Request, next: middleware::Next) -> Response {
-    let (lake, file) = match object {
-        Some(extract::Path(raw)) => (path_of(&raw).is_ok_and(|at| crate::store::lake_file(at.as_ref())), true),
-        None => (listing.prefix.as_deref().is_some_and(folder_of_lake), false),
+    let at = object.map(|extract::Path(raw)| path_of(&raw).map(|at| at.to_string()).unwrap_or_default());
+    let lake = match &at {
+        Some(at) => crate::store::lake_file(at),
+        None => listing.prefix.as_deref().is_some_and(folder_of_lake),
     };
     let reads = matches!(*req.method(), Method::GET | Method::HEAD);
-    let creates = file && *req.method() == Method::PUT && text_of(req.headers(), "if-none-match").as_deref() == Some("*");
-    if lake && (reads || creates) {
+    let creates = at.as_deref().is_some_and(crate::auth::page_creates) && *req.method() == Method::PUT && text_of(req.headers(), "if-none-match").as_deref() == Some("*");
+    if (lake && reads) || creates {
         return next.run(req).await;
     }
     if !reads {
-        return refused("a page writes only new files of the lake (data/, log/), each once (If-None-Match: *)");
+        return refused("a page writes only new files of the lake, each once (If-None-Match: *): a segment of the log (log/<id>.seg) or Parquet directly in a table's folder (data/<folder>/<name>.parquet)");
     }
     refused("a page reads the lake's files and log through its node, never its catalog")
 }
@@ -1033,10 +1035,12 @@ mod tests {
         let segment = http.put(url("/log/x.seg")).header("if-none-match", "*").body("segment").send().await.expect("a put of the log");
         assert_eq!(segment.status().as_u16(), 200, "a segment of the log is stored");
 
-        let words = "a page writes only new files of the lake (data/, log/), each once (If-None-Match: *)";
+        let words = "a page writes only new files of the lake, each once (If-None-Match: *)";
         for (what, res) in [
             ("a put without the header", http.put(url("/data/t/c.parquet")).body("new").send().await),
             ("a put of the catalog", http.put(url("/catalog/x")).header("if-none-match", "*").body("new").send().await),
+            // (a published Delta view's next version, put first, would be taken for the lake's own: delta.rs `applied`)
+            ("a put of a published view's file", http.put(url("/data/t/_delta_log/00000000000000000001.json")).header("if-none-match", "*").body("{}").send().await),
             ("a delete", http.delete(url("/data/t/a.parquet")).send().await),
         ] {
             let res = res.expect("a request");
@@ -1045,6 +1049,7 @@ mod tests {
         }
         store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused put wrote nothing");
         store.head(&Path::from("catalog/x")).await.expect_err("a refused put of the catalog wrote nothing");
+        store.head(&Path::from("data/t/_delta_log/00000000000000000001.json")).await.expect_err("a refused put of a published view wrote nothing");
         store.head(&Path::from("data/t/a.parquet")).await.expect("a refused delete deleted nothing");
     }
 

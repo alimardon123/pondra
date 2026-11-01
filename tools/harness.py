@@ -10562,6 +10562,16 @@ def guarded():
         isinstance(open_stats, dict) and {"lake", "leader", "nodes", "releases", "role", "version", "term", "format", "keys"} <= set(open_stats)
     # Users: the row doors and the nodes' own routes
     b = Node(lake, P + 1, env=audit).start()  # (a follower)
+    # A follower of an open lake signs nothing, so its own flushes and files reach the leader as an open node's caller's: they
+    # are the nodes' own, never checked as a page's (L1's review of #349): an identity's sequence, DDL's history rows, a bulk
+    # INSERT's files, all from the follower
+    for q in ["CREATE TABLE ids (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)", "INSERT INTO ids (v) VALUES ('a'), ('b')",
+              "CREATE TABLE bulk (n BIGINT)", "INSERT INTO bulk SELECT value FROM range(1000)",
+              "CREATE SEQUENCE tickets", "SELECT nextval('tickets') AS t", "CREATE TABLE made_here AS SELECT value AS x FROM range(10)"]:
+        info.setdefault("open follower", {})[q] = ask(P + 1, q)
+    checks["a follower of an open lake writes as before: an identity insert, DDL, a bulk INSERT, nextval and CREATE TABLE AS, all on the follower"] = \
+        info["open follower"]["SELECT nextval('tickets') AS t"] == [{"t": 1}] \
+        and until(lambda: (ask(P, "SELECT count(*) AS n, max(id) AS top FROM ids"), ask(P, "SELECT count(*) AS n FROM bulk"), ask(P, "SELECT count(*) AS n FROM made_here")) == ([{"n": 2, "top": 2}], [{"n": 1000}], [{"n": 10}]), True, 20)
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:

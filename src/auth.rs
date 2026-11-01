@@ -226,13 +226,17 @@ const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 /// that are there, and no more. A user writes with SQL, where its grants are checked. A write token
 /// never moves a sequence or a branch's row ids, and never names an object the lake would one day
 /// delete as its own: a segment outside `log/`, a file outside its table's folder; nor adds to the
-/// lake's own records. `forced` (a caller that isn't the nodes' own: a page's, a superuser's too) runs the same checks
-/// whatever its role, as `writer` does not let a superuser by them.
+/// lake's own records. `forced` (a joined page's, a superuser's: the guard marks it, `Auth::pages_write`) runs the same
+/// checks whatever its role, as `writer` does not let a superuser by them.
 pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
     if !forced && !writer()? {
         return Ok(());
     }
-    ensure!(f.sequence.is_none() && f.blocks == 0, "moving a sequence or a branch's row ids needs an admin");
+    let moves = match forced {
+        true => "a page's flush moves no sequence and no branch's row ids: its node does (nextval, REFRESH)",
+        false => "moving a sequence or a branch's row ids needs an admin",
+    };
+    ensure!(f.sequence.is_none() && f.blocks == 0, "{moves}");
     if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
         bail!("{} is written by Pondra alone", p.table);
     }
@@ -242,8 +246,8 @@ pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
 }
 
 /// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
-/// `data/`), each in that folder, and never the lake's own records. `forced`: as for `flush_from_writer` (a page's, a
-/// superuser's too).
+/// `data/`), each in that folder, and never the lake's own records. `forced`: as for `flush_from_writer`; a page's files
+/// are also each one a page may make (`page_creates`): Parquet directly in the folder.
 pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String], forced: bool) -> Result<()> {
     if !forced && !writer()? {
         return Ok(());
@@ -257,7 +261,21 @@ pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String], fo
     };
     let home = format!("data/{folder}/");
     ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
+    ensure!(!forced || files.iter().all(|f| page_creates(f)), "a page's files are Parquet files directly in their table's folder ({home}<name>.parquet)");
     Ok(())
+}
+
+/// An object a joined page may make in the lake (through its node's `/store`, once: `served::lake_files_only`): a segment of
+/// the log (`log/<id>.seg`) or a Parquet file directly in a table's folder (`data/<folder>/<name>.parquet`). Never what
+/// the lake makes beside a table's files (a published Delta or Iceberg view's `_delta_log/` and `metadata/`, its manifests,
+/// its deletion files) nor a base's copy: one such file put first would be taken for the lake's own.
+pub fn page_creates(key: &str) -> bool {
+    let plain = |name: &str| !name.is_empty() && !name.starts_with(['.', '_']) && !name.contains('/');
+    match key.split_once('/') {
+        Some(("log", seg)) => seg.strip_suffix(".seg").is_some_and(plain),
+        Some(("data", rest)) => rest.split_once('/').is_some_and(|(folder, file)| plain(folder.trim_start_matches('_')) && file.strip_suffix(".parquet").is_some_and(plain)),
+        _ => false,
+    }
 }
 
 /// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
@@ -626,6 +644,23 @@ mod tests {
         assert!(files_from_writer("orders", None, &mine, true).is_err(), "a table that isn't there");
         assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()], true).is_err(), "the lake's records");
         assert!(files_from_writer("orders", Some("orders"), &other, false).is_ok(), "the nodes' own, unchanged");
+        let published = ["data/orders/_delta_log/00000000000000000001.json".to_string()];
+        assert!(files_from_writer("orders", Some("orders"), &published, true).is_err(), "a published view's file");
+        assert!(flush_from_writer(&Flush { blocks: 1, ..Default::default() }, true).is_err_and(|e| e.to_string().contains("a page's flush")));
+    }
+
+    /// What a page may create: a segment of the log, or Parquet directly in a table's folder (an underscore table's too);
+    /// never a published view's file, a manifest, a deletion file, a base's copy, nor anything else.
+    #[test]
+    fn a_page_creates_only_segments_and_a_tables_parquet() {
+        for key in ["log/0a1b-000000000000001.seg", "data/orders/3f2a.parquet", "data/_staging/3f2a.parquet"] {
+            assert!(page_creates(key), "{key}");
+        }
+        for key in ["data/orders/_delta_log/00000000000000000001.json", "data/orders/metadata/v1.metadata.json", "data/orders/_manifests/a.json.zst",
+                    "data/orders/_deletes/a.parquet", "data/_bases/abc/data/t/a.parquet", "data/orders/k=1/a.parquet", "data/orders/a.json",
+                    "data/orders/.a.parquet", "data/a.parquet", "log/a/b.seg", "log/.seg", "catalog/x", "data//a.parquet", "data/../a.parquet"] {
+            assert!(!page_creates(key), "{key}");
+        }
     }
 
     #[test]
