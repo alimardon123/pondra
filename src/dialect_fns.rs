@@ -11,12 +11,36 @@
 //! A name Pondra already has keeps its own meaning where its arguments say so: `decode(bytes, 'hex')`, `date_trunc('month',
 //! ts)`. MySQL's `TIMESTAMPDIFF` counts whole units and Snowflake's counts part boundaries, so it is refused by name with
 //! `date_diff`, which counts boundaries as DuckDB does.
+//!
+//! Another database's name for a function Pondra doesn't have is refused by name, with what to write (`OURS`). So is SQL
+//! Server's `FORMAT(value, 'pattern')`, which Postgres's `format` takes the other way round.
 use crate::friendly::{part_word, quote};
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::{Expr, Value, ValueWithSpan};
 
+/// Other databases' functions Pondra doesn't have, as (name, whose, what to write). `call` refuses each by name, and
+/// `friendly::wanted` looks for them, so the list is kept in one place.
+pub(crate) const OURS: &[(&str, &str, &str)] = &[
+    ("parse_json", "Snowflake", "JSON is text here: payload->>'a', json_extract(payload, '$.a.b')"),
+    ("try_parse_json", "Snowflake", "JSON is text here: payload->>'a', json_extract(payload, '$.a.b')"),
+    ("json_unquote", "MySQL", "payload->>'$.a' or json_extract_string(payload, '$.a')"),
+    ("try_to_number", "Snowflake", "TRY_CAST(s AS DECIMAL(38, 0))"),
+    ("try_to_decimal", "Snowflake", "TRY_CAST(s AS DECIMAL(38, 0))"),
+    ("try_to_numeric", "Snowflake", "TRY_CAST(s AS DECIMAL(38, 0))"),
+    ("try_to_double", "Snowflake", "TRY_CAST(s AS DOUBLE)"),
+    ("try_to_date", "Snowflake", "TRY_CAST(s AS DATE)"),
+    ("try_to_timestamp", "Snowflake", "TRY_CAST(s AS TIMESTAMP)"),
+    ("regexp_contains", "BigQuery", "regexp_like(s, re)"),
+    ("percentile_approx", "Spark", "approx_percentile_cont(x, p)"),
+    ("months_between", "Spark", "date_diff('month', a, b) (whole month boundaries; Spark's is fractional)"),
+];
+
 /// The text `name(args)` is, or None: not one of these, or not with these arguments.
 pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
+    // (a plain call of any arity: the name is refused, with what to write)
+    if let Some((_, whose, ours)) = OURS.iter().find(|(n, _, _)| *n == name) {
+        return Err(crate::codes::coded("42883", format!("{} is {whose}'s: write {ours}", name.to_uppercase())));
+    }
     let epoch = |x: &Expr| format!("date_part('epoch', {x})");
     Ok(Some(match (name, a.len()) {
         ("iff" | "iif", 3) => format!("CASE WHEN {} THEN {} ELSE {} END", a[0], a[1], a[2]),
@@ -66,6 +90,11 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
                 format!("CASE WHEN {0} IS NULL THEN NULL ELSE {1} END", a[0], quote(&chrono))
             }
         }
+        // (SQL Server's FORMAT(value, pattern): a value first, a pattern second, where Postgres's format reads the pattern first)
+        ("format", 2) => match (string(a[0]), string(a[1])) {
+            (None, Some(p)) => return Err(crate::codes::coded("0A000", format!("FORMAT(value, '{p}') is SQL Server's (Postgres's format takes its pattern first): write strftime(ts, '%Y-%m-%d') or to_char(ts, 'YYYY-MM-DD') for a date, printf('%.2f', x) for a number"))),
+            _ => return Ok(None),
+        },
         ("timestampdiff", 3) => {
             return Err(crate::codes::coded("42883", format!("TIMESTAMPDIFF counts whole units in MySQL and part boundaries in Snowflake, so it isn't taken: date_diff('{}', {}, {}) counts the boundaries, as DuckDB does", a[0].to_string().to_lowercase(), a[1], a[2])));
         }
@@ -291,6 +320,20 @@ mod tests {
         assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("pattern letter G"), "{refusal:#}");
         let refusal = try_said("DATE_FORMAT(ts, '%D')").unwrap_err();
         assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("MySQL's %D"), "{refusal:#}");
+    }
+
+    #[test]
+    fn sql_server_format_and_other_databases_names_are_refused() {
+        // (FORMAT(value, pattern) is refused; Postgres's format, its pattern first, is not)
+        let refusal = try_said("format(ts, 'yyyy')").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("FORMAT(value, 'yyyy') is SQL Server's"), "{refusal:#}");
+        assert_eq!(said("format('%s', x)"), None);
+        // (a name of OURS is refused by name, with what to write, whatever its arguments)
+        let refusal = try_said("PARSE_JSON(p)").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "42883" && refusal.to_string().contains("PARSE_JSON is Snowflake's") && refusal.to_string().contains("payload->>'a'"), "{refusal:#}");
+        let refusal = try_said("MONTHS_BETWEEN(a, b)").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "42883" && refusal.to_string().contains("date_diff('month', a, b)"), "{refusal:#}");
+        assert_eq!(said("approx_percentile_cont(x, 0.5)"), None); // (Pondra's own name is not refused)
     }
 
     #[test]
