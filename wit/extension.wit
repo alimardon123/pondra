@@ -1,9 +1,13 @@
 package pondra:extension@1.0.0;
 
 /// What every Pondra 1.x calls an extension's WebAssembly part by (ADR-075 §2). An extension never links Pondra's Rust: it
-/// exports these two, and imports only Pondra's own capabilities, each versioned on its own (none yet; `log@1` and
-/// `clock@1` come next). A Pondra loads an extension when it offers every import the extension needs (§3).
+/// exports these two, and imports only Pondra's own capabilities, each a package versioned on its own (`deps/`): 1.0 offers
+/// `pondra:log/log@1.0.0` and `pondra:clock/clock@1.0.0`. A part imports only those it uses, and a Pondra loads it when it
+/// offers every one (§3); a later capability comes as a new import, and an import's `@2` beside its `@1`, which stays.
 world extension {
+  import pondra:log/log@1.0.0;
+  import pondra:clock/clock@1.0.0;
+
   /// What the extension has, as JSON that only grows (a host passes over fields it doesn't know):
   /// `{"name": "words", "version": "0.1", "functions": [{"name": "word_count", "arguments": ["Utf8"], "returns": "Int64",
   /// "volatile": false}]}`. A type is Arrow's, written as its `DataType` displays it (`Int64`, `Float64`, `Utf8`,

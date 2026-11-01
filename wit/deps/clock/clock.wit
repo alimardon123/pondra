@@ -1,0 +1,8 @@
+package pondra:clock@1.0.0;
+
+/// The time, for an extension (ADR-075 §2, E5). Its functions are volatile, whatever `describe()` says: two nodes, or two
+/// calls, may see two times.
+interface clock {
+  /// Now: microseconds since 1970-01-01 00:00:00 UTC.
+  now: func() -> s64;
+}

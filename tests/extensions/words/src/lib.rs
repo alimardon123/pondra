@@ -7,7 +7,7 @@ use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
 use arrow_schema::{Field, Schema};
 use std::sync::Arc;
 
-wit_bindgen::generate!({ path: "../../../wit", world: "extension-with-tables" });
+wit_bindgen::generate!({ path: "../../../wit", world: "extension-with-tables", generate_all });
 
 struct Words;
 

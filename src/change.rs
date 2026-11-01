@@ -1058,6 +1058,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
                 continue;
             }
             false if crate::temp::mentioned(&n) => true, // (the session's own)
+            false if crate::path::session_view(query, &n).await => true, // (a view whose current_schema() is this session's: its leader would read it as public's)
             false => match crate::ddl::resolve(query, &n).await {
                 Ok((Some(o), t)) if std::ptr::eq(&*o, target) => {
                     renamed.insert(k, t);

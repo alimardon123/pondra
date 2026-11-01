@@ -585,8 +585,9 @@ one script's (statements sent together over HTTP).
   `crm` when read from elsewhere, and one made in `public` still reads `public` under `USE crm`.
 - `current_database()` and `current_schema()` answer the session's values at every door: this lake's
   name and `public` when there is no session. In a view they are worked out as it is read, as Postgres
-  does: a view saying `current_schema()` answers each reader's schema. A materialized view's are those
-  of the session that made it, since its rows are made then.
+  does: a view saying `current_schema()` answers each reader's schema, a macro's or a SQL function's
+  each caller's, and a change sent from a follower reads them as its session does. A materialized
+  view's are those of the session that made it, since its rows are made then.
 - A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
   console tab, the Python or JavaScript client's connection, or one script's statements.
 
@@ -858,7 +859,12 @@ columns is a table function, read as `SELECT * FROM name(…)` with literal argu
 batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
 sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
 past it) and `PONDRA_EXTENSION_SECS` for a batch (`57014`); the function's own error is `38000`, and
-the node goes on.
+the node goes on. Beyond its arguments, a part may use only what Pondra offers it, each capability
+versioned on its own: the node's log (`pondra:log/log@1.0.0`, its lines carrying the extension's name,
+at most 100 a call) and the time (`pondra:clock/clock@1.0.0`, which makes every one of its functions
+volatile). A file that needs any other, as one built for a later Pondra may, is refused at `INSTALL`
+naming it (`0A000`: `words (words-0.2.wasm) needs pondra:http/http@1.0.0, which this Pondra doesn't
+offer …`); a later 1.x keeps offering these, so a file built for this one keeps loading.
 
 ## Users and grants
 
