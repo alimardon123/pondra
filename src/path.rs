@@ -201,7 +201,7 @@ pub fn currents(lake: &Lake, sql: &str) -> String {
 /// has none, comes back as it came.
 fn currents_of(path: &Path, sql: &str) -> String {
     let Some(mut stmts) = parse_text(sql) else { return sql.to_string() };
-    let mut walk = Currents { path, changed: false };
+    let mut walk = Currents { path, changed: false, kept: false };
     for s in stmts.iter_mut() {
         let _ = crate::walk::visit_mut(s, &mut walk);
     }
@@ -211,16 +211,38 @@ fn currents_of(path: &Path, sql: &str) -> String {
     }
 }
 
-/// Writes a reader's `current_*` into a stored view's text (`currents_of`); nothing else changes.
+/// Writes a reader's `current_*` into a stored view's text (`currents_of`); nothing else changes. A statement that
+/// stores a body for its readers or callers (a view, a function, a macro) keeps its own, as `door` keeps them.
 struct Currents<'a> {
     path: &'a Path,
     changed: bool,
+    kept: bool,
+}
+
+/// Does `s` store a body whose `current_*` are its readers' or callers' (a view, not a materialized or temporary one; a
+/// function; a macro)?
+fn keeps_currents(s: &Statement) -> bool {
+    matches!(s, Statement::CreateView(v) if !v.materialized && !v.temporary)
+        || matches!(s, Statement::AlterView { .. } | Statement::CreateFunction(_) | Statement::CreateMacro { .. })
 }
 
 impl VisitorMut for Currents<'_> {
     type Break = ();
 
+    fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
+        self.kept = keeps_currents(s);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_statement(&mut self, _: &mut Statement) -> ControlFlow<()> {
+        self.kept = false;
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if self.kept {
+            return ControlFlow::Continue(());
+        }
         if let Some(w) = current_word(e) {
             *e = current_value(self.path, &w);
             self.changed = true;
@@ -234,6 +256,13 @@ impl VisitorMut for Currents<'_> {
 /// never kept. Any error says yes: the caller then neither spreads the query nor keeps its answer.
 pub async fn reads_current(lake: &Lake, sql: &str) -> bool {
     stored_current(lake, sql).await.unwrap_or(true)
+}
+
+/// Is `name` a stored view that reads `current_*` (or reads one that does), while this session's path isn't this lake's
+/// public? Its leader would read it as no session's, so a change sends its rows as this session reads them
+/// (`change::for_leader`). An error says no: the leader reads it then.
+pub async fn session_view(lake: &Lake, name: &str) -> bool {
+    current(lake).is_some() && stored_current(lake, name).await.unwrap_or(false)
 }
 
 /// `reads_current`, with its errors: the stored views `sql` names, and the views those name, read as
@@ -788,9 +817,11 @@ impl VisitorMut for Walk<'_> {
             }
             Statement::CreateFunction(f) => {
                 self.name(&mut f.name, Fam::Routine, true);
+                self.view = true; // (a function's body is its caller's: its current_schema() is read where it is called)
             }
             Statement::CreateMacro { name, .. } => {
                 self.name(name, Fam::Routine, true);
+                self.view = true; // (a macro's body is written into its caller's SQL: its current_schema() is the caller's)
             }
             Statement::Call(f) => {
                 self.name(&mut f.name, Fam::Routine, false);
@@ -808,9 +839,9 @@ impl VisitorMut for Walk<'_> {
         ControlFlow::Continue(())
     }
 
-    /// A stored view's statement ends here: what follows is the session's again.
+    /// A stored view's (or a function's or a macro's) statement ends here: what follows is the session's again.
     fn post_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
-        if matches!(s, Statement::CreateView(_) | Statement::AlterView { .. }) {
+        if matches!(s, Statement::CreateView(_) | Statement::AlterView { .. } | Statement::CreateFunction(_) | Statement::CreateMacro { .. }) {
             self.view = false;
         }
         ControlFlow::Continue(())
@@ -945,11 +976,20 @@ mod tests {
         assert!(rewrite(&crm, &none, "SELECT current_schema() AS s").contains("'crm'"));
         let two = rewrite(&crm, &none, "CREATE VIEW v AS SELECT current_schema() AS s; SELECT current_schema() AS s");
         assert!(two.contains("SELECT 'crm' AS s"), "the view's flag ends with its statement: {two}");
+        // (a macro's and a SQL function's body are their callers': current_schema() stays; a macro with no parameters
+        // is written back with its `()`, so the text parses again)
+        let m = rewrite(&crm, &none, "CREATE MACRO sch() AS current_schema(); SELECT current_schema() AS s");
+        assert!(m.contains("sch() AS current_schema()") && m.contains("SELECT 'crm' AS s"), "{m}");
+        assert!(parse_text(&m).is_some(), "{m}");
+        let f = rewrite(&crm, &none, "CREATE FUNCTION f() RETURNS VARCHAR RETURN current_schema()");
+        assert!(f.contains("current_schema()") && !f.contains("'crm'"), "{f}");
     }
 
     #[test]
     fn reads_a_stored_views_current_names_as_its_reader() {
         let crm = parse("lake", "crm");
+        let kept = currents_of(&crm, "CREATE VIEW v AS SELECT current_schema() AS s; CREATE MACRO m() AS current_schema(); SELECT current_schema() AS s");
+        assert!(kept.matches("current_schema()").count() == 2 && kept.contains("SELECT 'crm' AS s"), "a view's and a macro's are their readers': {kept}");
         let s = currents_of(&crm, "SELECT current_schema() AS s, current_database() AS d FROM crm.t");
         assert!(s.contains("'crm'") && s.contains("'lake'") && s.contains("crm.t"), "{s}");
         assert_eq!(currents_of(&crm, "SELECT 1 AS one"), "SELECT 1 AS one");

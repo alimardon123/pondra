@@ -420,7 +420,8 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
         },
     };
     let sql = crate::path::door(lake, &sql, &views.keys().cloned().collect()).await?; // (the session's search path: `path.rs`; a client's frames are views, not tables)
-    crate::front::expand(lake, &sql, views).await
+    // (a macro's body brings its `current_*` in as its caller's session has them: `door` kept them in its body)
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, views).await?))
 }
 
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
@@ -565,14 +566,16 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
-    crate::front::expand(lake, &sql, &HashMap::new()).await
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }
 
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
 /// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
 /// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
 /// (`path::currents`), as Postgres reads a view's.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> {
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
+}
 
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
 /// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW EXTENSIONS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
