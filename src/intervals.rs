@@ -53,7 +53,7 @@ fn on_a_date(mut e: RawBinaryExpr, schema: &DFSchema, interval: &dyn Fn(&Expr) -
             }))
             .unwrap_or(false)
     };
-    let at_midnight = |x: Expr| cast(x, DataType::Timestamp(TimeUnit::Nanosecond, None));
+    let at_midnight = |x: Expr| cast(x, DataType::Timestamp(TimeUnit::Microsecond, None)); // (microseconds, as DuckDB keeps them: every DATE has one, where nanoseconds end in 2262)
     match e.op {
         BinaryOperator::Plus | BinaryOperator::Minus if date(&e.left) && time(&e.right) => e.left = at_midnight(e.left),
         BinaryOperator::Plus if time(&e.left) && date(&e.right) => e.right = at_midnight(e.right),

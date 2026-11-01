@@ -23689,6 +23689,7 @@ def friendly():
         "a DATE plus or minus hours, minutes, a scaled interval, the interval first": (
             "SELECT id, CAST(ts AS DATE) + INTERVAL '1 hour' AS a, CAST(ts AS DATE) - INTERVAL '90 minutes' AS b, INTERVAL '25 hours' + CAST(ts AS DATE) AS c, "
             "CAST(ts AS DATE) + 3 * INTERVAL '30 minutes' AS e, CAST(ts AS DATE) + INTERVAL '1 day 2 hours' AS f FROM t", True, False),
+        "…a DATE past 2262 or before 1677 too (a TIMESTAMP in microseconds)": ("SELECT DATE '2300-01-01' + INTERVAL '1 hour' AS a, DATE '1600-06-01' - INTERVAL '30 minutes' AS b", True, False),
         "json_extract, json_extract_string": ("SELECT id, json_extract(j, '$.a.b') AS b, json_extract_string(j, '$.s') AS s FROM t", True, False),
         "DuckDB's ASOF JOIN … ON": ("SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
