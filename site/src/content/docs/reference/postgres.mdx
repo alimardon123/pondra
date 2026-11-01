@@ -12,7 +12,8 @@ run exactly as `POST /sql` runs them, so anything SQL does works here.
 The port also answers Postgres's catalog (`pg_catalog` and `information_schema`), so psql's `\dt`, `\d`,
 `\dv`, `\dn`, `\df`, `\l` and `\du` work, and so do SQLAlchemy's inspector, pgjdbc (DBeaver, DataGrip,
 Metabase), psqlODBC (Tableau, Excel) and dbt-postgres. [dbt and BI tools](/pondra/guides/dbt-and-bi/) has
-the settings.
+the settings. Over HTTP (`POST /sql`, the console, `pondra sql`), a query that names the catalog itself,
+`pg_catalog.pg_tables` or `FROM pg_tables`, reads the same `pg_catalog`.
 
 ```bash norun
 pondra serve lake --pg 127.0.0.1:5432

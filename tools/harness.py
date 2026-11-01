@@ -16342,8 +16342,10 @@ def sqla():
     port_rel = [list(r) for r in conn.execute(rel).fetchall()]
     port_typ = [list(r) for r in conn.execute(typ).fetchall()]
     info["catalog_postgres"] = [a[:2] + (a[2] if a[0] == 200 else a[2][:120],) for a in asked] + [port_rel, port_typ]
-    checks["POST /sql?catalog=postgres answers pg_class and information_schema as the Postgres port does; without it as before (42P01, DataFusion's types), each asked twice; catalog=x 22023"] = \
-        asked[0][1] == "42P01" and asked[2][1] == "42P01" and [list(r.values()) for r in asked[1][2]] == port_rel == [["dv", "r"]] \
+    # (pg_catalog.pg_class means only Postgres's catalog, so every request reads it; information_schema is DataFusion's
+    # unless the request speaks Postgres)
+    checks["POST /sql?catalog=postgres answers pg_class and information_schema as the Postgres port does; without it pg_catalog.pg_class too, information_schema as before (DataFusion's types), each asked twice; catalog=x 22023"] = \
+        all(a[0] == 200 and [list(r.values()) for r in a[2]] == port_rel for a in asked[:3]) and port_rel == [["dv", "r"]] \
         and asked[3][2] == asked[5][2] == [{"data_type": "Int32"}] and [list(r.values()) for r in asked[4][2]] == port_typ == [["integer"]] \
         and asked[6][:2] == (400, "22023")
 

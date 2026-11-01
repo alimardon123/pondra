@@ -89,7 +89,7 @@ CASES = [
     ("postgres", "BEGIN"),
     ("postgres", "UPDATE orders SET status = 'paid' WHERE id = 5"),
     ("postgres", "COMMIT"),
-    ("postgres", "CREATE EXTENSION IF NOT EXISTS pg_trgm"),
+    ("postgres", "CREATE EXTENSION IF NOT EXISTS pg_trgm", ("0A000", "CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm")),
     ("postgres", """CREATE FUNCTION order_total(cust INT) RETURNS NUMERIC LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE customer_id = cust); END; $$""", ("0A000", "LANGUAGE sql or python, not plpgsql")),
     ("postgres", "LISTEN new_orders", ("0A000", "LISTEN and NOTIFY aren't built yet")),
     ("postgres", "SELECT tablename, tableowner FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename"),

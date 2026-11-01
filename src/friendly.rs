@@ -77,13 +77,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b|\bcreate\s+extension\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words, extension_words] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -368,44 +368,85 @@ fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
     Ok(edits)
 }
 
+/// The first token of each statement in `t`, past whitespace and comments.
+fn statement_starts(t: &Tokens) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut start = true;
+    for (i, tok) in t.toks.iter().enumerate() {
+        match tok {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => start = true,
+            _ => {
+                if start {
+                    starts.push(i);
+                }
+                start = false;
+            }
+        }
+    }
+    starts
+}
+
 /// DuckDB's and SQLite's `PRAGMA …` where a statement starts: refused by name, with Pondra's statement for it
 /// (`PRAGMA table_info('t')` is `DESCRIBE t`; a setting is SET and SHOW).
 fn pragma_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    let mut start = true;
-    for i in 0..t.toks.len() {
-        match &t.toks[i] {
-            Token::Whitespace(_) => continue,
-            Token::SemiColon => start = true,
-            Token::Word(w) if start && w.quote_style.is_none() && w.keyword == Keyword::PRAGMA => {
-                let at = t.next(i);
-                let name = match t.toks.get(at) {
-                    Some(Token::Word(n)) => n.value.to_lowercase(),
-                    _ => String::new(),
-                };
-                // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
-                let open = t.next(at);
-                let close = (open..t.toks.len()).find(|&j| t.toks[j] == Token::RParen);
-                let table = match (t.toks.get(open), close) {
-                    (Some(Token::LParen), Some(close)) => {
-                        let raw = t.span(open + 1, close).trim();
-                        match raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-                            Some(quoted) => quoted.replace("''", "'"),
-                            None => raw.to_string(),
-                        }
-                    }
-                    _ => "t".to_string(),
-                };
-                let ours = match name.as_str() {
-                    "table_info" | "show" => format!("DESCRIBE {table}"),
-                    "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
-                    "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
-                    "version" => "SELECT version()".to_string(),
-                    _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
-                };
-                return Err(crate::codes::coded("0A000", format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}")));
-            }
-            _ => start = false,
+    for i in statement_starts(t) {
+        if !t.word(i, Keyword::PRAGMA) {
+            continue;
         }
+        let at = t.next(i);
+        let name = match t.toks.get(at) {
+            Some(Token::Word(n)) => n.value.to_lowercase(),
+            _ => String::new(),
+        };
+        // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
+        let open = t.next(at);
+        let close = (open..t.toks.len()).find(|&j| t.toks[j] == Token::RParen);
+        let table = match (t.toks.get(open), close) {
+            (Some(Token::LParen), Some(close)) => {
+                let raw = t.span(open + 1, close).trim();
+                match raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+                    Some(quoted) => quoted.replace("''", "'"),
+                    None => raw.to_string(),
+                }
+            }
+            _ => "t".to_string(),
+        };
+        let ours = match name.as_str() {
+            "table_info" | "show" => format!("DESCRIBE {table}"),
+            "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
+            "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
+            "version" => "SELECT version()".to_string(),
+            _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
+        };
+        return Err(crate::codes::coded("0A000", format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}")));
+    }
+    Ok(Vec::new())
+}
+
+/// Postgres's `CREATE EXTENSION [IF NOT EXISTS] name …` where a statement starts: refused by name, with Pondra's
+/// INSTALL and LOAD (`extension.rs`), or the functions built in for the extensions most scripts ask for.
+fn extension_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    for i in statement_starts(t) {
+        let at = t.next(i);
+        if !(t.word(i, Keyword::CREATE) && t.word(at, Keyword::EXTENSION)) {
+            continue;
+        }
+        let mut n = t.next(at);
+        if t.word(n, Keyword::IF) {
+            n = t.next(t.next(t.next(n))); // (IF NOT EXISTS)
+        }
+        let name = match t.toks.get(n) {
+            Some(Token::Word(w)) => w.value.clone(),
+            _ => "name".to_string(),
+        };
+        let ours = match name.to_lowercase().as_str() {
+            "uuid-ossp" => "gen_random_uuid() is built in".to_string(),
+            "pgcrypto" => "gen_random_uuid(), digest(text, 'sha256'), sha256() and md5() are built in".to_string(),
+            "plpgsql" => "a procedure's body is Pondra's own SQL script (CREATE PROCEDURE … AS BEGIN … END), with nothing to install".to_string(),
+            _ => format!("a Pondra extension is installed from its file, INSTALL {name} FROM 'path or URL', then LOAD {name}"),
+        };
+        return Err(crate::codes::coded("0A000", format!("CREATE EXTENSION {name} is Postgres's: {ours}")));
     }
     Ok(Vec::new())
 }
@@ -2184,6 +2225,16 @@ mod tests {
         // (a column, a string or a comment called pragma is no statement)
         assert_eq!(text("SELECT pragma FROM t -- pragma").unwrap(), "SELECT pragma FROM t -- pragma");
         assert_eq!(text("SELECT 'PRAGMA x'").unwrap(), "SELECT 'PRAGMA x'");
+    }
+
+    #[test]
+    fn create_extension_is_refused_with_install_and_load() {
+        let said = |sql: &str| text(sql).unwrap_err();
+        let e = said("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm"), "{e:#}");
+        assert!(said(r#"create extension "uuid-ossp""#).to_string().contains("CREATE EXTENSION uuid-ossp is Postgres's: gen_random_uuid() is built in"));
+        assert!(said("SELECT 1; CREATE EXTENSION pgcrypto WITH SCHEMA public").to_string().contains("digest(text, 'sha256')"));
+        assert_eq!(text("SELECT 'create extension x'").unwrap(), "SELECT 'create extension x'");
     }
 
     #[test]

@@ -36,9 +36,20 @@ pub async fn speaking<F: std::future::Future>(yes: bool, f: F) -> F::Output {
     }
 }
 
-/// Does this request speak Postgres, and this query read its catalog? (Any other query, and every query of
-/// a request that doesn't, reads as before: DataFusion's own `information_schema` over HTTP.)
-pub fn asked(sql: &str) -> bool { POSTGRES.try_with(|_| ()).is_ok() && wanted(sql) }
+/// Does this request speak Postgres, and this query read its catalog? Or does the query name the catalog itself
+/// (`pg_catalog.pg_tables`, or `FROM pg_tables`: a name that means only Postgres's catalog), whoever sends it? (Any
+/// other query, and every other query of a request that doesn't, reads as before: DataFusion's own
+/// `information_schema` over HTTP.)
+pub fn asked(sql: &str) -> bool { (POSTGRES.try_with(|_| ()).is_ok() && wanted(sql)) || names_catalog(sql) }
+
+/// `pg_catalog.` before a name, or one of `CATALOG`'s tables right after FROM or JOIN.
+fn names_catalog(sql: &str) -> bool {
+    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        let names = CATALOG.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("|");
+        regex::Regex::new(&format!(r"(?i)\bpg_catalog\s*\.\s*\w|\b(?:from|join)\s+(?:{names})\b")).expect("a regex")
+    });
+    NAMES.is_match(sql)
+}
 
 /// A query over Postgres's catalog, as the Postgres port answers it: the catalog's tables and functions in
 /// its session, `user` as `current_user`, and over tables that are always empty, no rows with the columns
@@ -1933,6 +1944,16 @@ mod tests {
     use super::*;
     use crate::users::{Grant, User};
     use datafusion::arrow::util::display::array_value_to_string;
+
+    #[test]
+    fn a_query_naming_the_catalog_reads_it_over_any_request() {
+        for sql in ["SELECT tablename FROM pg_catalog.pg_tables", "select relname from PG_CLASS c join pg_namespace n on n.oid = c.relnamespace", "SELECT * FROM pg_catalog . pg_type"] {
+            assert!(names_catalog(sql), "{sql}");
+        }
+        for sql in ["SELECT * FROM orders", "SELECT * FROM pg_tables_backup", "SELECT pg_class FROM t", "SELECT 'pg_catalog'"] {
+            assert!(!names_catalog(sql), "{sql}");
+        }
+    }
 
     #[test]
     fn postgres_from_said_datafusion_way() {
