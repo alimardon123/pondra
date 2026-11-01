@@ -2909,6 +2909,23 @@ impl Catalog {
         Ok(())
     }
 
+    /// Leader: the catalog's level-0 files waiting for compaction.
+    pub fn waiting(&self) -> usize { self.kv.waiting() }
+
+    /// A leader that lives for one statement (`pondra sql`): runs the compactor until fewer than `below` level-0 files
+    /// wait (`cap` at most), so a flush doesn't wait on it. Each one-off writer's stop leaves one level-0 file, and none
+    /// runs the compactor alone (it starts 10 s on): left so, the catalog's level 0 filled, and every write after it
+    /// waited out its flush (10 s a write). `collect`: then the memtable written out, and the garbage collector run once
+    /// (old WAL and manifests: a lake no node serves had nobody else to clear them).
+    pub async fn tidy(&self, below: usize, cap: Duration, collect: bool) -> Result<()> {
+        self.kv.compact(below, cap).await?;
+        if collect {
+            self.checkpoint().await?;
+            self.kv.collect().await;
+        }
+        Ok(())
+    }
+
     /// Leader: how long, in seconds, the catalog has held commits that no flush has persisted (0 when it has none).
     /// `/metrics` reads it. It reads `committed` and not `order`, which a commit holds while it writes: a stalled
     /// bucket must not stall the scrape that says so. `order` is `committed` + 1 once no commit is in flight, so

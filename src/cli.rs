@@ -615,15 +615,17 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
         }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
-            // (the leader's work; with nobody leading, the next node to start tiers the log)
-            let store = store::open_store(&crate::memory::place(&dir))?.1;
+            // (the leader's work: a node that runs the lake is asked; with nobody leading, this process leads for the
+            // moment, as a one-off write does, tiers the log, writes the catalog down, and ends, so a lake no node
+            // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
+            let dir = crate::memory::place(&dir);
+            let store = store::open_store(&dir)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
                     println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
-                _ => println!("{}", serde_json::json!({"checkpoint": false, "why": "no node runs this lake: the next one to start tiers its log"})),
+                _ => sql_on_guest(&dir, &query, &attached).await?,
             }
-            let _ = attached;
         }
         Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {

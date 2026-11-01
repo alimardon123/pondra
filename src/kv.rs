@@ -52,6 +52,13 @@ pub(crate) trait Kv: Send + Sync {
     async fn write(&self, puts: &[(String, Bytes)], deletes: &[String]) -> Result<Arc<dyn Written>, Error>;
     /// Writes what the memtable holds into the bucket.
     async fn checkpoint(&self) -> Result<(), Error>;
+    /// A writer's level-0 files waiting for compaction (0: none, or a store without levels).
+    fn waiting(&self) -> usize { 0 }
+    /// A writer that lives for one statement (`pondra sql`): its compactor starts now, and this waits, `cap` at
+    /// most, until fewer than `below` level-0 files wait (none of its own runs long enough to start it alone).
+    async fn compact(&self, _below: usize, _cap: std::time::Duration) -> Result<(), Error> { Ok(()) }
+    /// Its garbage collector once, now: old WAL, manifests and compacted files that no reader needs.
+    async fn collect(&self) {}
     async fn close(&self) -> Result<(), Error>;
     /// The bytes its block caches hold (`/metrics`).
     fn cached(&self) -> usize;

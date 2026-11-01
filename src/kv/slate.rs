@@ -5,7 +5,7 @@ use super::{Error, Kv, Written};
 use crate::store::Store;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use slatedb::config::{CompactorOptions, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
+use slatedb::config::{CompactionWorkerOptions, CompactorOptions, DbReaderOptions, DurabilityLevel, FlushOptions, FlushType, GarbageCollectorDirectoryOptions, GarbageCollectorOptions, ObjectStoreCacheOptions, ReadOptions, ScanOptions, Settings};
 use slatedb::{Db, DbReader, DbReaderMode, ErrorKind, WriteBatch, WriteHandle};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -38,8 +38,19 @@ impl Writer {
     /// flushed at once.
     pub(crate) async fn open(store: Store, cache_dir: Option<PathBuf>, local: bool) -> Result<Writer, Error> {
         // Poll object storage rarely when idle (that's an idle writer's request bill), but often
-        // enough that compaction keeps up with the checkpoints.
-        let compactor_options = Some(CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() });
+        // enough that compaction keeps up with the checkpoints. A one-off writer (a guest that leads) lives for
+        // its statement, and runs the compactor only when it tidies (`App::tidy_one_off`, a CHECKPOINT), and waits
+        // for it: there each of a compaction's steps (scheduled, picked up by the worker, committed) is looked for
+        // every 100 ms, not every 5 s, 5 s and 1 s, so a tidy takes about a second, not 20 (a few dozen more
+        // requests, once in 32 writes).
+        let compactor_options = Some(match crate::node::is_guest() {
+            true => {
+                let soon = Duration::from_millis(100);
+                let worker = CompactionWorkerOptions { compactions_poll_interval: soon, heartbeat_interval: Duration::from_secs(1), ..Default::default() };
+                CompactorOptions { poll_interval: soon, commit_compacted_interval: soon, worker: Some(worker), ..Default::default() }
+            }
+            false => CompactorOptions { poll_interval: Duration::from_secs(5), ..Default::default() },
+        });
         // Every commit is a write-ahead-log object: clear those, and the old manifests and compaction
         // records, every minute once a minute old, not SlateDB's every 10 minutes — thousands would sit
         // in the bucket. (On a bucket that is one more LIST a minute for the compaction records.)
@@ -121,6 +132,27 @@ impl Kv for Writer {
 
     async fn checkpoint(&self) -> Result<(), Error> {
         Ok(self.db.flush_with_options(FlushOptions { flush_type: FlushType::MemTable }).await?)
+    }
+
+    fn waiting(&self) -> usize {
+        self.db.manifest().l0().len()
+    }
+
+    async fn compact(&self, below: usize, cap: Duration) -> Result<(), Error> {
+        crate::store::serving(); // (the upkeep starts now: `upkeep`)
+        let deadline = tokio::time::Instant::now() + cap;
+        while tokio::time::Instant::now() < deadline {
+            self.db.refresh_manifest().await?; // (the compactor's work is in the manifest it wrote)
+            if self.waiting() < below {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    async fn collect(&self) {
+        (self.upkeep.1)().await;
     }
 
     async fn close(&self) -> Result<(), Error> {
@@ -232,7 +264,11 @@ impl slatedb::db_cache::DbCache for Blocks {
 fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions, local: bool) -> Upkeep {
     let compactor = slatedb::CompactorBuilder::new("catalog", store.clone()).with_options(compactor).build();
     let gc = slatedb::GarbageCollectorBuilder::new("catalog", store.clone()).with_options(gc).build();
-    let (c, g) = (compactor.clone(), gc.clone());
+    let (c, g, once) = (compactor.clone(), gc.clone(), gc.clone());
+    let once: Once = Arc::new(move || {
+        let gc = once.clone();
+        Box::pin(async move { gc.run_gc_once().await })
+    });
     let started = crate::panics::spawn(async move {
         let _ = tokio::time::timeout(Duration::from_secs(10), crate::store::SERVING.subscribe().wait_for(|s| *s)).await;
         if local {
@@ -251,13 +287,16 @@ fn upkeep(store: Store, compactor: CompactorOptions, gc: GarbageCollectorOptions
     let stop = Box::pin(async move {
         let _ = tokio::join!(compactor.stop(), gc.stop());
     });
-    Upkeep(Mutex::new(Some((started, stop))))
+    Upkeep(Mutex::new(Some((started, stop))), once)
 }
+
+/// The garbage collector run once (`Kv::collect`), kept as a function since SlateDB doesn't export its type.
+type Once = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// The upkeep, kept so a close can stop it. SlateDB runs the compactor and the collector
 /// in tasks of their own, which outlive the future that started them: stopped only with that
 /// future, they went on polling a closed lake (or one opened again) for the life of the process.
-struct Upkeep(Mutex<Option<(tokio::task::JoinHandle<()>, BoxFuture<'static, ()>)>>);
+struct Upkeep(Mutex<Option<(tokio::task::JoinHandle<()>, BoxFuture<'static, ()>)>>, Once);
 
 impl Upkeep {
     /// Stops it, once: the task that starts the two first (so neither starts after this), then both.

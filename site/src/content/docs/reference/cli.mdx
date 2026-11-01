@@ -275,17 +275,23 @@ any statement that creates a table.
 `pondra sql --dir LAKE CHECKPOINT` runs [`CHECKPOINT`](/pondra/sql/statements/) on the lake: it
 tiers the log into Parquet and writes the catalog down, so other engines read what is current. If
 a node runs the lake, the command sends the statement to it and prints the node's answer. If none
-runs, it prints this, and the next node to start tiers the log:
+runs, the command leads the lake for the moment, as a write from `pondra sql` does: it tiers the log,
+compacts the catalog, clears the catalog's old files, and ends:
 
 ```bash
 pondra sql --dir shell-lake CHECKPOINT
 ```
 
 ```text
-{"checkpoint":false,"why":"no node runs this lake: the next one to start tiers its log"}
+{"checkpoint":true,"rows_tiered":6,"rewritten":[]}
 ```
 
-With a node running, the answer is the node's, such as `{"checkpoint":true,"rows_tiered":0,"rewritten":[]}`.
+So a lake no node serves stays tidy with a scheduled `pondra sql --dir LAKE CHECKPOINT` (cron, or a
+scheduler's job). A write from `pondra sql` that leads the lake also tidies on its way out, once
+there is something to do: it compacts the catalog once 32 of its files wait, and tiers the log once
+it holds 64 segments or 100,000 rows. Under those, a write adds one log segment, which later readers
+read with the tables' files, and costs nothing more.
+
 When the lake's node has tokens, set `PONDRA_ADMIN_TOKEN` first: the command sends `PONDRA_TOKEN` or
 `PONDRA_ADMIN_TOKEN` to the node.
 
