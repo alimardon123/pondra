@@ -465,6 +465,8 @@ async fn decode(lake: &Lake, file: &DataFile, fields: &[FieldRef], deletes: bool
 /// copy per batch (TPC-H q12's build 3.4 times its memory, and slower). Slices of one array would
 /// do the first, but each batch would then count the whole file's buffer as its own, and the
 /// operators that budget their memory by what their batches hold would think them a file's size.
+/// A buffer whose bytes repeat one 16-byte piece (a batch of one value: an empty string's views, a
+/// column of zeros) is held once for every batch of the file that has it.
 fn whole(arrays: Vec<ArrayRef>) -> Vec<ArrayRef> {
     use datafusion::arrow::array::make_array;
     use datafusion::arrow::buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer};
@@ -478,13 +480,28 @@ fn whole(arrays: Vec<ArrayRef>) -> Vec<ArrayRef> {
         d.child_data().iter().for_each(|c| each(c, f));
     }
     let key = |b: &Buffer| (b.as_ptr() as usize, b.len());
+    // A buffer that repeats one 16-byte piece is fixed by its length and that piece, so two such buffers
+    // with the same ones hold the same bytes (Arrow buffers are immutable), and one copy serves both.
+    // The comparison is a memcmp that stops at the first byte breaking the pattern, so it is cheap otherwise.
+    fn repeats(s: &[u8]) -> Option<[u8; 16]> {
+        (s.len() >= 2 * ALIGN && s[16..] == s[..s.len() - 16]).then(|| s[..16].try_into().unwrap())
+    }
     let (mut at, mut distinct, mut total) = (HashMap::new(), vec![], 0);
+    let mut repeated: HashMap<(usize, [u8; 16]), usize> = HashMap::new();
     datas.iter().for_each(|d| {
         each(d, &mut |b| {
             at.entry(key(b)).or_insert_with(|| {
+                let piece = repeats(b.as_slice());
+                if let Some(&offset) = piece.and_then(|p| repeated.get(&(b.len(), p))) {
+                    return offset;
+                }
                 distinct.push(b.clone());
                 total += b.len().next_multiple_of(ALIGN);
-                total - b.len().next_multiple_of(ALIGN)
+                let offset = total - b.len().next_multiple_of(ALIGN);
+                if let Some(p) = piece {
+                    repeated.insert((b.len(), p), offset);
+                }
+                offset
             });
         })
     });
@@ -1132,6 +1149,44 @@ mod tests {
         let held_fields = hot.columns("t", &schema);
         assert_eq!(names_and_types(held_fields), vec![("i".to_string(), DataType::Int64), ("s".to_string(), DataType::Utf8View)]);
         assert!(hot.columns("t2", &schema).is_empty());
+    }
+
+    #[test]
+    fn whole_holds_a_repeated_batch_once() {
+        // Two batches of one value (7) and one counting up: the two sevens hold the same bytes, so one copy.
+        let sevens = || Arc::new(Int64Array::from(vec![7i64; 8192])) as ArrayRef;
+        let counting = Arc::new(Int64Array::from((0..8192i64).collect::<Vec<_>>())) as ArrayRef;
+        let inputs: Vec<ArrayRef> = vec![sevens(), sevens(), counting];
+        let out = whole(inputs.clone());
+        let values = |a: &ArrayRef| a.as_primitive::<Int64Type>().values().to_vec();
+        assert!(out.iter().zip(&inputs).all(|(a, b)| values(a) == values(b)));
+        let ptr = |a: &ArrayRef| a.to_data().buffers()[0].as_ptr();
+        assert_eq!(ptr(&out[0]), ptr(&out[1]));
+        assert_ne!(ptr(&out[0]), ptr(&out[2]));
+        // Two buffers of 65,536 bytes, where the inputs hold three.
+        assert_eq!(size(&out), 131072);
+        assert!(size(&out) < size(&inputs));
+
+        // Two columns of 8,192 empty strings: their views are all zero, so they share one buffer.
+        let empties = || Arc::new(StringViewArray::from_iter_values(std::iter::repeat("").take(8192))) as ArrayRef;
+        let out = whole(vec![empties(), empties()]);
+        assert_eq!(ptr(&out[0]), ptr(&out[1]));
+        assert!(out.iter().all(|a| a.len() == 8192 && a.as_string_view().iter().all(|s| s == Some(""))));
+    }
+
+    #[test]
+    fn whole_keeps_apart_buffers_that_differ_after_their_first_bytes() {
+        // Same length and same first 16 bytes, but the last value differs, so they are not one repeated piece.
+        let sevens = vec![7i64; 8192];
+        let mut last_differs = sevens.clone();
+        *last_differs.last_mut().unwrap() = 8;
+        let inputs: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(sevens.clone())) as ArrayRef, Arc::new(Int64Array::from(last_differs.clone())) as ArrayRef];
+        let out = whole(inputs);
+        let values = |a: &ArrayRef| a.as_primitive::<Int64Type>().values().to_vec();
+        assert_eq!(values(&out[0]), sevens);
+        assert_eq!(values(&out[1]), last_differs);
+        let ptr = |a: &ArrayRef| a.to_data().buffers()[0].as_ptr();
+        assert_ne!(ptr(&out[0]), ptr(&out[1]));
     }
 
     #[test]
