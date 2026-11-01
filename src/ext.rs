@@ -78,10 +78,15 @@ fn reads_any_url() -> bool { owner() || cfg!(target_arch = "wasm32") }
 /// `scheme` doesn't name, such as `memory://`, counts as this machine's too, as COPY has always had it.
 pub(crate) fn on_disk(place: &str) -> bool { scheme(place).is_none_or(|s| s == "file") }
 
-/// A place on this machine's own disk is the node's owner's to use, as COPY's is (`on_disk`, `owner`): `words` is the
-/// refusal a client gets for it, saying what it may do instead. BACKUP, RESTORE and SET LOCATION all say it this way.
+/// A folder on this machine, and a node's door (`pondra://`, which the nodes open with their admin token), are the node
+/// owner's to use (`owner`): `words` is the refusal a client gets for one, saying what it may do instead. A bucket or
+/// memory is anyone's, as the statement's role lets it be. BACKUP, RESTORE and SET LOCATION all say it this way.
 pub(crate) fn owners_only(place: &str, words: String) -> Result<()> {
-    ensure!(owner() || !on_disk(place), crate::codes::coded("42501", words));
+    let owned = match crate::store::place(place)? {
+        crate::store::Place::Folder | crate::store::Place::Served => true,
+        crate::store::Place::Memory | crate::store::Place::Bucket => false,
+    };
+    ensure!(owner() || !owned, crate::codes::coded("42501", words));
     Ok(())
 }
 

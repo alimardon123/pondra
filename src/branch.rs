@@ -179,6 +179,14 @@ pub fn rebase_file(f: &mut crate::store::DataFile, id: &str) {
 /// on another server is read with the bucket key its branch keeps (ADR-058).
 pub async fn load(lake: &Lake) -> Result<()> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
+        // (a backup keeps its bases' files as its own, under `data/_bases` (`backup::place`): one whose catalog names a base
+        // was written so, and its bases are not opened, since a read of one reads whatever path or node its catalog names)
+        if !b.lakes.is_empty() && crate::backup::frozen(lake) {
+            bail!("{} is a backup, whose base files are its own (data/_bases): its catalog names bases, so it isn't opened", lake.url);
+        }
+        for base in b.lakes.values() {
+            ensure!(same_kind(&lake.url, &base.url), "{} can't be a base of {}: a branch lives where its base does", base.url, lake.url);
+        }
         let secrets = match b.lakes.values().any(|b| b.read_only) {
             true => crate::ext::list(lake).await?,
             false => vec![],
@@ -193,6 +201,13 @@ pub async fn load(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
+/// Whether a branch at `lake` may have `base`: it lives where its base does (a folder's base is on this machine, a
+/// bucket's is in one), and a node's lake (`pondra://`) is a base only of the lake that same node serves.
+fn same_kind(lake: &str, base: &str) -> bool {
+    base.contains("://") == lake.contains("://")
+        && (!crate::store::served(base) || (crate::store::served(lake) && base.trim_end_matches('/') == lake.trim_end_matches('/')))
+}
+
 /// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock).
 pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf) -> Result<Value> {
     crate::ddl::database_name(name)?;
@@ -200,7 +215,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let (base, inherited) = base(lake, &of.from).await?;
     let away = crate::store::reach_of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;
-    ensure!(dir.contains("://") == base.contains("://"), "a branch lives where its base does: {base} is {}", if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
+    ensure!(same_kind(&dir, &base), "a branch lives where its base does: {base} is {}", if crate::store::served(&base) { "a node's lake" } else if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
     if crate::ddl::has_catalog(&dir).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
         return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await;
@@ -404,11 +419,25 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
 /// one; a branch is dropped by its owner and by nobody else. Admins and superusers are checked as
 /// before (`may`).
 pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
+    places(d)?;
     match crate::auth::limited() {
         Some(a) => user_door(lake, d, &a).await?,
         None => may(lake, d).await?,
     }
     stamp(lake, d).await
+}
+
+/// A node's lake (`pondra://host:port`) is opened with this node's admin token, so ATTACH and CREATE DATABASE name one only
+/// for the node's owner (`ext::owners_only`). A folder's and a bucket's are not decided here.
+fn places(d: &Ddl) -> Result<()> {
+    let dir = match d {
+        Ddl::Attach { dir, .. } | Ddl::CreateDatabase { dir: Some(dir), .. } => dir,
+        _ => return Ok(()),
+    };
+    if matches!(crate::store::place(dir), Ok(crate::store::Place::Served)) {
+        crate::ext::owners_only(dir, format!("ATTACH/CREATE DATABASE … '{dir}': a node's lake (pondra://) is opened with this node's admin token, so only the node's owner names it (the shell, `pondra sql`, connect())"))?;
+    }
+    Ok(())
 }
 
 /// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing

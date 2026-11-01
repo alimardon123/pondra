@@ -1079,9 +1079,10 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     if served(url) {
         anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
-    let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
+    if place(url)? == Place::Folder {
         return folder(url);
-    };
+    }
+    let (scheme, rest) = url.split_once("://").filter(|(s, _)| BUCKETS.contains(s)).expect("(a bucket: `place` refused any other URL)");
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
     let reach = reach_of(url);
@@ -1136,6 +1137,29 @@ use crate::memory::in_memory;
 
 /// Is `url` a lake served by the node that holds it (`pondra://host:port`, ADR-072 §8)?
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
+
+/// The schemes of a bucket's lake (`s3://bucket/prefix`): `open_store` and `place` both take only these.
+const BUCKETS: [&str; 5] = ["s3", "gs", "az", "abfs", "abfss"];
+
+/// The kinds of place a lake can be (`place`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place { Memory, Served, Bucket, Folder }
+
+/// What kind of place `url` is: memory, a node's lake, a bucket, or a folder on this machine (no scheme). Any other
+/// scheme is refused here, before anything is opened: a URL no door knows was once made as a folder at a relative path.
+pub(crate) fn place(url: &str) -> Result<Place> {
+    if in_memory(url) {
+        return Ok(Place::Memory);
+    }
+    if served(url) {
+        return Ok(Place::Served);
+    }
+    match url.split_once("://") {
+        None => Ok(Place::Folder),
+        Some((scheme, _)) if BUCKETS.contains(&scheme) => Ok(Place::Bucket),
+        Some(_) => Err(crate::codes::coded("22023", format!("{url} is not a place a lake can be: a folder, a bucket (s3://, gs://, az://, abfs://, abfss://), memory, or a node's lake (pondra://host:port)"))),
+    }
+}
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -3025,6 +3049,20 @@ pub fn partitions() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_place_is_a_folder_a_bucket_memory_or_a_node_and_no_other_scheme() {
+        assert_eq!(place("/a").unwrap(), Place::Folder);
+        assert_eq!(place("a/b").unwrap(), Place::Folder);
+        assert_eq!(place("s3://b/x").unwrap(), Place::Bucket);
+        assert_eq!(place("memory://x").unwrap(), Place::Memory);
+        #[cfg(feature = "doors")]
+        assert_eq!(place("pondra://h:1").unwrap(), Place::Served);
+        for url in ["https://../../x", "file:///a", "r2://b"] {
+            assert_eq!(crate::codes::of(&place(url).unwrap_err()), "22023", "{url} is no place a lake can be");
+            assert!(open_store(url).is_err(), "{url} is refused before a folder is made of it");
+        }
+    }
 
     #[test]
     fn merges_read_as_many_runs_as_their_memory_and_files_allow() {
