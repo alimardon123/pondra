@@ -36,8 +36,22 @@ pub async fn found() -> bool { runs() && exe().await.is_ok() }
 
 /// Ready to run `what` (a routine's name and kind), or why not: no `--python`.
 pub fn ready(what: &str) -> Result<()> {
-    ensure!(runs(), "{what}, so this node needs Python: it was started without --python (start it with --python <python>, or --python auto)");
+    if !runs() {
+        return Err(crate::codes::coded("0A000", format!("{what}, so this node needs Python: it was started without --python (start it with --python <python>, or --python auto)")));
+    }
     Ok(())
+}
+
+/// A worker's error `e` with its SQLSTATE: code that doesn't parse is a syntax error (42601), an interrupted one canceled
+/// (57014); what it raises as it runs is the routine's own (38000, external_routine_exception, as Postgres's PL/Python
+/// says it), the client's to fix, not a fault.
+fn raised(e: String) -> anyhow::Error {
+    let code = match () {
+        _ if ["SyntaxError", "IndentationError", "TabError"].iter().any(|w| e.starts_with(w)) => "42601",
+        _ if e.starts_with("Interrupted") => "57014", // (query_canceled: a cell interrupted from the console)
+        _ => "38000",
+    };
+    crate::codes::coded(code, e)
 }
 
 /// The Python chosen now: `--python`'s, one chosen in the console since (`choose`), or, with
@@ -522,8 +536,8 @@ pub async fn ask(packages: &str, kind: Use, head: Value, parts: Vec<Vec<u8>>, li
         Ok(a) => {
             lent.give();
             match a.0.get("error").and_then(Value::as_str) {
-                Some(e) if crate::auth::shows_code() => bail!("{e}"),
-                Some(e) => bail!("{}", crate::codes::unquoted(e)), // (S27: a caller not shown the routine's code isn't shown its lines in an error)
+                Some(e) if crate::auth::shows_code() => Err(raised(e.to_string())),
+                Some(e) => Err(raised(crate::codes::unquoted(e))), // (S27: a caller not shown the routine's code isn't shown its lines in an error)
                 None => Ok(a),
             }
         }
@@ -664,7 +678,7 @@ pub async fn ask_session(session: &str, head: Value, parts: Vec<Vec<u8>>, limit:
     }
     KERNELS.lock().unwrap().entry(session.to_string()).and_modify(|e| e.1 = Instant::now());
     match answer.0.get("error").and_then(Value::as_str) {
-        Some(e) => bail!("{e}"),
+        Some(e) => Err(raised(e.to_string())),
         None => Ok(answer),
     }
 }

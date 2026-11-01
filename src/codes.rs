@@ -223,7 +223,7 @@ pub fn http(code: &str) -> u16 {
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
-        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE)
+        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") || c.starts_with("38") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE, a Python routine's own error)
         _ => 500,                                                         // XX, 58, unknown: a real fault
     }
 }
@@ -330,6 +330,7 @@ mod tests {
         assert_eq!(h("23502"), 400); // not_null_violation
         assert_eq!(h("22P02"), 400); // invalid_text_representation
         assert_eq!(h("22003"), 400); // numeric_value_out_of_range
+        assert_eq!(h("38000"), 400); // external_routine_exception: a Python routine's own error
         assert_eq!(h("428C9"), 400); // generated_always
         assert_eq!(h("42601"), 400); // syntax_error
         assert_eq!(h("25006"), 400); // read_only_sql_transaction

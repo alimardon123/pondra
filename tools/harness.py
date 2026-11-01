@@ -6090,6 +6090,19 @@ $$""")
 raise ValueError("no such thing")
 $$""")
     checks["a Python error comes back as the error"] = "ValueError: no such thing" in err("CALL py_fail()")
+    def state(s):  # (HTTP status, SQLSTATE) of a statement the node refuses
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", "/sql", s.encode(), {"authorization": "Bearer a-tok"})
+        r = c.getresponse()
+        r.read()
+        return r.status, r.getheader("x-pondra-sqlstate")
+    q("""CREATE FUNCTION py_raise(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$
+return 1 // (x - x)
+$$""")
+    checks["a Python routine's own error is 38000 (400), not an internal one: a procedure's, a function's in a query, a DO's; code that doesn't parse is 42601"] = \
+        state("CALL py_fail()") == (400, "38000") and state("SELECT py_raise(id) AS v FROM orders WHERE id < 3") == (400, "38000") \
+        and "ZeroDivisionError" in err("SELECT py_raise(3) AS v") and state("DO LANGUAGE python $$\n1 / 0\n$$") == (400, "38000") \
+        and state("CREATE FUNCTION py_unparsed(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$\nreturn x +\n$$") == (400, "42601")
     q("""CREATE PROCEDURE py_deep(n BIGINT) LANGUAGE python AS $$
 con.call("py_deep", n + 1)
 $$""")
@@ -6420,7 +6433,7 @@ $$""")
     status, heard, out = told("CALL leak()")
     time.sleep(1)
     logged = json.dumps(q("SELECT * FROM pondra.runs WHERE routine = 'leak'"))
-    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 500 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
+    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 400 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
         and heard == ["using ***"] and "refused: ***" in str(out) and "***" in logged and "only a procedure's code" in err("SELECT 1") + str(_raises_text(lambda: call(A.port, "GET", "/secrets/smtp", headers={"authorization": "Bearer a-tok"})))
     runs = q("SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'send_report' ORDER BY started")
     checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]

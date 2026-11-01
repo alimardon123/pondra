@@ -203,7 +203,12 @@ impl AsyncScalarUDFImpl for Function {
                 None => column,
             })
         };
-        Ok(ColumnarValue::Array(go.await.map_err(|e| exec_datafusion_err!("{e:#}"))?))
+        // (a coded error keeps its SQLSTATE through DataFusion, as `codes::of` finds it as the error's source: a Python
+        // function's own error is 38000, not an internal one)
+        Ok(ColumnarValue::Array(go.await.map_err(|e| match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+            Some(c) => datafusion::error::DataFusionError::External(Box::new(crate::codes::Coded(c.0, format!("{e:#}")))),
+            None => exec_datafusion_err!("{e:#}"),
+        })?))
     }
 }
 
