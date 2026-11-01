@@ -48,6 +48,8 @@ mod friendly;
 mod matcher;
 mod pattern;
 mod lateral;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's rewrites, as friendly.rs calls them: a node's statements)
+mod lateral_join;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
 // Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.

@@ -26,7 +26,7 @@ use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 fn expr(sql: &str) -> Result<Expr> { Ok(Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_expr()?) }
-fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
+pub(crate) fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
 pub(crate) fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
@@ -35,7 +35,7 @@ pub fn wanted(sql: &str) -> bool {
     // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
     // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
+        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
     // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
     static OURS_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("|"))).expect("a regex"));
@@ -77,13 +77,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -345,6 +345,71 @@ fn property_keys(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
     Ok(edits)
 }
 
+/// SQL Server's `TOP` where it is a name (`top.amount`, `) top ON true`, `AS top`, `SELECT top FROM t`): quoted, so the
+/// parser reads an alias, a column or a table. After SELECT, DISTINCT, ALL, UPDATE, DELETE or INSERT, a `TOP` before a
+/// number or a parenthesis is SQL Server's own (`SELECT TOP 3`, `TOP (3)`, `TOP 10 PERCENT`), and is left as it is.
+fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in 0..t.toks.len() {
+        let Token::Word(w) = &t.toks[i] else { continue };
+        if w.quote_style.is_some() || !w.value.eq_ignore_ascii_case("top") {
+            continue;
+        }
+        let before = (0..i).rev().find(|&j| !matches!(t.toks[j], Token::Whitespace(_)));
+        let after = t.toks.get(t.next(i));
+        let after_select = before.is_some_and(|j| {
+            matches!(&t.toks[j], Token::Word(p) if p.quote_style.is_none() && matches!(p.keyword, Keyword::SELECT | Keyword::DISTINCT | Keyword::ALL | Keyword::UPDATE | Keyword::DELETE | Keyword::INSERT))
+        });
+        let sql_server = after_select && matches!(after, Some(Token::Number(..)) | Some(Token::LParen));
+        if !sql_server {
+            edits.push((t.at[i], t.end(i), "\"top\"".to_string()));
+        }
+    }
+    Ok(edits)
+}
+
+/// DuckDB's and SQLite's `PRAGMA …` where a statement starts: refused by name, with Pondra's statement for it
+/// (`PRAGMA table_info('t')` is `DESCRIBE t`; a setting is SET and SHOW).
+fn pragma_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut start = true;
+    for i in 0..t.toks.len() {
+        match &t.toks[i] {
+            Token::Whitespace(_) => continue,
+            Token::SemiColon => start = true,
+            Token::Word(w) if start && w.quote_style.is_none() && w.keyword == Keyword::PRAGMA => {
+                let at = t.next(i);
+                let name = match t.toks.get(at) {
+                    Some(Token::Word(n)) => n.value.to_lowercase(),
+                    _ => String::new(),
+                };
+                // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
+                let open = t.next(at);
+                let close = (open..t.toks.len()).find(|&j| t.toks[j] == Token::RParen);
+                let table = match (t.toks.get(open), close) {
+                    (Some(Token::LParen), Some(close)) => {
+                        let raw = t.span(open + 1, close).trim();
+                        match raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+                            Some(quoted) => quoted.replace("''", "'"),
+                            None => raw.to_string(),
+                        }
+                    }
+                    _ => "t".to_string(),
+                };
+                let ours = match name.as_str() {
+                    "table_info" | "show" => format!("DESCRIBE {table}"),
+                    "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
+                    "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
+                    "version" => "SELECT version()".to_string(),
+                    _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
+                };
+                return Err(crate::codes::coded("0A000", format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}")));
+            }
+            _ => start = false,
+        }
+    }
+    Ok(Vec::new())
+}
+
 /// DuckDB's `PIVOT t ON g [IN (…)] [USING agg] [GROUP BY …]` and `UNPIVOT t ON a, b [INTO NAME n
 /// VALUE v]` statements, as the standard's `SELECT * FROM t PIVOT (…)` and `UNPIVOT (…)`.
 fn statements(sql: &str) -> Result<Option<String>> {
@@ -501,7 +566,11 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
             return Err(e);
         }
     }
-    Ok(before != stmts)
+    // (after the loop above: TOP and FETCH FIRST are LIMIT by now, and `*` and ORDER BY ALL are expanded)
+    for s in stmts.iter_mut().filter(|s| !kept(s)) {
+        crate::lateral_join::rewrite(s)?;
+    }
+    Ok(before != stmts) // (a LATERAL join rewritten changes the statement, so it counts here too)
 }
 
 tokio::task_local! {
@@ -1130,7 +1199,7 @@ fn order_by_all(q: &mut Query, n: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-fn function_name(f: &Function) -> String { f.name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.to_lowercase()).unwrap_or_default() }
+pub(crate) fn function_name(f: &Function) -> String { f.name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.to_lowercase()).unwrap_or_default() }
 
 fn args(f: &Function) -> Vec<&Expr> {
     match &f.args {
@@ -2102,6 +2171,31 @@ mod tests {
         assert_eq!(text("SELECT @@VERSION AS version, @@Version").unwrap(), "SELECT version() AS version, version()");
         assert_eq!(text("SELECT '@@x', 1 -- @@y").unwrap(), "SELECT '@@x', 1 -- @@y");
         assert!(text("SELECT @@spid").unwrap_err().to_string().contains("@@spid is SQL Server's: Pondra's settings are SHOW spid"));
+    }
+
+    #[test]
+    fn pragma_is_refused_with_pondras_statement() {
+        let said = |sql: &str| text(sql).unwrap_err();
+        let e = said("PRAGMA table_info('orders')");
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE orders"), "{e:#}");
+        assert!(said("-- columns\npragma show(sales.orders)").to_string().contains("write DESCRIBE sales.orders"));
+        assert!(said("SELECT 1; PRAGMA show_tables").to_string().contains("write SHOW TABLES"));
+        assert!(said("PRAGMA threads = 4").to_string().contains("write SET threads = … to change a setting, SHOW threads to read it"));
+        // (a column, a string or a comment called pragma is no statement)
+        assert_eq!(text("SELECT pragma FROM t -- pragma").unwrap(), "SELECT pragma FROM t -- pragma");
+        assert_eq!(text("SELECT 'PRAGMA x'").unwrap(), "SELECT 'PRAGMA x'");
+    }
+
+    #[test]
+    fn top_is_a_name_unless_it_is_sql_servers_top() {
+        // (a LATERAL named top is an alias: quoted, so it parses; SELECT TOP n, TOP (n) and TOP … PERCENT are left as they are)
+        let lateral = "SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) top ON true";
+        let read = text(lateral).unwrap();
+        assert!(read.contains(r#""top".amount"#) && read.contains(r#") "top" ON true"#), "{read}");
+        assert!(Parser::parse_sql(&GenericDialect {}, &read).is_ok());
+        assert_eq!(text("SELECT TOP 3 * FROM t").unwrap(), "SELECT TOP 3 * FROM t");
+        assert_eq!(text("SELECT DISTINCT TOP (2) x FROM t").unwrap(), "SELECT DISTINCT TOP (2) x FROM t");
+        assert_eq!(text("SELECT TOP 10 PERCENT x FROM t").unwrap(), "SELECT TOP 10 PERCENT x FROM t");
     }
 
     #[test]

@@ -132,7 +132,7 @@ CASES = [
     ("duckdb", "SET threads = 4"),
     ("duckdb", "SHOW TABLES"),
     ("duckdb", "DESCRIBE orders"),
-    ("duckdb", "PRAGMA table_info('orders')"),
+    ("duckdb", "PRAGMA table_info('orders')", ("0A000", "PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE orders")),
     ("duckdb", "EXPLAIN ANALYZE SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id"),
     ("duckdb", "CREATE SCHEMA IF NOT EXISTS sales"),
     ("duckdb", "ATTACH 'archive.duckdb' AS archive (READ_ONLY)", ("58P01", "holds no lake")),

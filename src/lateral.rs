@@ -295,7 +295,7 @@ fn unouter(e: Expr, left: &DFSchema) -> Result<Expr> {
 
 /// The set functions a FROM item may call with a column (`generate_series(1, t.n)`, `range`, and
 /// `unnest(t.xs)`, which takes its one argument).
-const SET_FUNCTIONS: &[&str] = &["generate_series", "range", "unnest"];
+pub(crate) const SET_FUNCTIONS: &[&str] = &["generate_series", "range", "unnest"];
 
 /// Writes the FROM items DataFusion can't plan with a column in them as LATERAL subqueries it can:
 /// `FROM t, generate_series(1, t.n) AS g` becomes `LATERAL (SELECT unnest(generate_series(1, t.n)) AS

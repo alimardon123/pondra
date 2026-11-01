@@ -1167,7 +1167,8 @@ text is the node's own, it is shown in code:
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` while a row has NULL in `c` | refused, naming the rows: `column "c" of relation "t" contains null values (1 rows): UPDATE t SET c = … WHERE c IS NULL first` |
 | `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
-| `PRAGMA`, `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
+| `PRAGMA table_info('t')`, and DuckDB's and SQLite's other `PRAGMA`s | refused (`0A000`), naming Pondra's statement: `PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE t` (`SHOW TABLES`, `SHOW DATABASES`, `SET` and `SHOW` for a setting) |
+| `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
