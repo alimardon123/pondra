@@ -2236,6 +2236,17 @@ def serverless_guest(port):
         reply.status != 200 and rc10 == 1 and err10 == f"Error: {words}"
     node.kill()
 
+    # i. On a lake nobody leads, CREATE MATERIALIZED VIEW answers once its view is filled, with the rows already there (the
+    # guest leading the lake runs the leader's tasks while it waits; it waited ten minutes, the view empty)
+    ran("CREATE TABLE mv_src (a INT)")
+    ran("INSERT INTO mv_src VALUES (5)")
+    t0 = time.time()
+    rc11, _, err11 = run("CREATE MATERIALIZED VIEW mv_v AS SELECT a, a * 2 AS b FROM mv_src")
+    times["mv_create_s"] = round(time.time() - t0, 2)
+    rc12, out12, _ = run("SELECT b FROM mv_v")
+    checks["i on a lake nobody leads, CREATE MATERIALIZED VIEW answers within 30 s, its view filled with the rows already there"] = \
+        rc11 == 0 and times["mv_create_s"] < 30 and rc12 == 0 and shown(out12, 10)
+
     # h. `--dir :memory:`: a lake held in the process's memory for its statements, as DuckDB's `:memory:` is: they answer,
     # and nothing is written where it ran
     there = tempfile.mkdtemp(prefix="pondra-memory-")

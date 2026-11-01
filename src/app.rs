@@ -424,6 +424,11 @@ impl App {
             return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
         }
         crate::tasks::run_all(&self.lake, &*self.members, self.log()?).await?;
+        self.keep_views().await
+    }
+
+    /// The leader's turn at its views: each filled from the rows already there, stream joins, views kept by key.
+    async fn keep_views(&self) -> anyhow::Result<()> {
         match &self.seq {
             Some(seq) => {
                 crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)
@@ -431,6 +436,29 @@ impl App {
                 crate::rerun::run_all(&self.lake, seq, &self.lock).await // (and views kept by key: each in a task of its own)
             }
             None => Ok(()),
+        }
+    }
+
+    /// `ddl::settle`: waits for what `d` made to be ready. A guest that leads its lake (`pondra sql`, or a program's node,
+    /// on a lake nobody else leads) has no loop running the leader's tasks (`node.rs`: only a node that lives runs it), so
+    /// it takes the views' turns while it waits (not the scheduled tasks': it leads for a moment). A materialized view is
+    /// filled from the rows already there, and a view kept by key works its groups out, before its CREATE answers. (Its
+    /// CREATE waited ten minutes, and the view lacked those rows until a node led the lake.)
+    pub(crate) async fn settle(&self, d: &crate::ddl::Ddl) -> anyhow::Result<()> {
+        if !(crate::node::is_guest() && self.seq.is_some()) {
+            return crate::ddl::settle(&self.lake, d).await;
+        }
+        let tasks = async {
+            loop {
+                if let Err(e) = self.keep_views().await {
+                    eprintln!("keeping views failed: {e:#}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            done = crate::ddl::settle(&self.lake, d) => done,
+            _ = tasks => Ok(()), // (never: the loop runs until the wait ends)
         }
     }
 }
