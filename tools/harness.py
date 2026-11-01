@@ -16689,7 +16689,8 @@ def bytea():
     'UTF8')` is ab); base64 is written with its padding (`encode('a', 'base64')` is YQ==) and read strictly
     (`decode('invalid', 'base64')` is refused 22023, `YQ==YQ==` is two bytes); `length` over a bytea counts its bytes
     (`length('\\xc328'::bytea)` is 2) and over text its characters (`length('é')` is 1); `encode(12, 'hex')` has no
-    function to take an integer, so it is refused 42883. The answers are Postgres 16's, checked by hand."""
+    function to take an integer, so it is refused 42883. Text written into a bytea column is read as a bytea's text too
+    (`'\\x00ff'` is two bytes). The answers are Postgres 16's, checked by hand."""
     import psycopg
     lake = new_lake()
     port, pg = A.port + 1, A.port + 10
@@ -16754,6 +16755,21 @@ def bytea():
         for s, code in REFUSALS:
             check(f"HTTP refuses {s} with {code}", lambda s=s, code=code: err(s)[1] == code)
             check(f"the Postgres port refuses {s} with {code}", lambda s=s, code=code: pg_code(s) == code)
+        # Text written into a bytea column is read as Postgres reads a bytea's text (`fit::strict`): '\x00ff' is the two
+        # bytes 00 ff, over HTTP and over the port, in an INSERT and an UPDATE, as a parameter's bytes are (it was the six
+        # bytes of the text); the escape form's 'a\\b' is a\b; an odd hex digit is refused 22023, as Postgres refuses it.
+        q("CREATE TABLE bw (n INT, b BYTEA)")
+        q(r"INSERT INTO bw VALUES (1, '\x00ff'), (2, 'a\\b'), (5, 'x')")
+        q(r"UPDATE bw SET b = '\x0102' WHERE n = 5")
+        with psycopg.connect(url, autocommit=True) as conn:
+            conn.execute(r"INSERT INTO bw VALUES (3, '\x00ff')")
+            conn.execute("INSERT INTO bw VALUES (%s, %s)", (4, b"\x00\xff"))
+        written = [(r["n"], r["h"]) for r in q("SELECT n, encode(b, 'hex') AS h FROM bw ORDER BY n")]
+        info["bytea written"] = written
+        check("text into a bytea column is Postgres's bytea text (\\x00ff two bytes, a\\\\b three), over HTTP and the port, INSERT and UPDATE",
+              lambda: written == [(1, "00ff"), (2, "615c62"), (3, "00ff"), (4, "00ff"), (5, "0102")])
+        check("…and an odd hex digit is refused 22023, over HTTP and the port",
+              lambda: err(r"INSERT INTO bw VALUES (6, '\xf')")[1] == "22023" and pg_code(r"INSERT INTO bw VALUES (6, '\xf')") == "22023")
     finally:
         if node is not None:
             node.kill()

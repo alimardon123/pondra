@@ -3,8 +3,7 @@
 
 use crate::codes::coded;
 use crate::pg_bytea;
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryArray, StringBuilder};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
@@ -274,9 +273,8 @@ pub(crate) fn width(names: &[String], got: usize) -> anyhow::Error {
     }
 }
 
-/// `columns`, text as a COPY's reader gave them, as `schema`'s columns: a column already of its type as it is, a
-/// bytea's text read as Postgres reads one (`pg_bytea::parse`), and anything else cast as INSERT casts a value
-/// (`as_type`).
+/// `columns`, text as a COPY's reader gave them, as `schema`'s columns: a column already of its type as it is, and
+/// anything else cast as INSERT casts a value (`as_type`; a bytea's text is read as Postgres reads one there).
 pub(crate) fn typed(columns: Vec<ArrayRef>, schema: &SchemaRef) -> anyhow::Result<RecordBatch> {
     let cols = columns.iter().zip(schema.fields()).map(|(column, field)| as_type(column, field.as_ref())).collect::<anyhow::Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new(schema.clone(), cols)?)
@@ -288,18 +286,6 @@ fn as_type(column: &ArrayRef, field: &Field) -> anyhow::Result<ArrayRef> {
     let target = field.data_type();
     if column.data_type() == target {
         return Ok(column.clone());
-    }
-    if matches!(target, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) {
-        let texts = cast(column.as_ref(), &DataType::Utf8)?;
-        let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(texts.len());
-        for text in texts.as_string::<i32>().iter() {
-            values.push(match text {
-                Some(text) => Some(pg_bytea::parse(text).map_err(|b| coded(b.code, format!("{} (column {}: \"{text}\")", b.message, field.name())))?),
-                None => None,
-            });
-        }
-        let bytes = BinaryArray::from_iter(values.iter().map(|v| v.as_deref()));
-        return Ok(cast(&bytes, target)?);
     }
     crate::query::strict(column, target).map_err(|e| {
         let e = anyhow::Error::from(e);
