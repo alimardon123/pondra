@@ -112,6 +112,8 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `d + INTERVAL '1 hour'`, `d - n * INTERVAL '30 minutes'` | a `DATE` plus hours, minutes or seconds is a `TIMESTAMP` (the date's midnight plus them), as Postgres and DuckDB answer it; a `DATE` plus days or months is still a `DATE`. An interval times or over a number is scaled as Postgres scales one |
 | `json_extract(j, '$.a.b[0]')`, `json_extract_string(…)`, `x::JSON` | JSON as text: a path written as a literal |
 | `string_agg(x, ', ') WITHIN GROUP (ORDER BY y)`, `listagg(x, ', ') WITHIN GROUP (ORDER BY y)` | SQL Server's and Snowflake's spelling of `string_agg(x, ', ' ORDER BY y)` |
+| `SELECT TOP 3 …`, `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')`, `ARRAY_AGG(x ORDER BY y LIMIT 2)` | SQL Server's `LIMIT 3`, MySQL's `string_agg` (its separator `,` when none is given), BigQuery's first 2 of `array_agg` |
+| `INT64`, `FLOAT64`, `NUMBER(10, 2)`, `NUMBER`, `BYTEINT` | BigQuery's and Snowflake's names for `BIGINT`, `DOUBLE`, `DECIMAL(10, 2)`, `DECIMAL(38, 0)` and `TINYINT`, in a cast or a column |
 | `SELECT @@VERSION` | SQL Server's `version()`; another `@@name` is refused (`0A000`) with `SHOW name` |
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |

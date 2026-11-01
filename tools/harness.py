@@ -23747,6 +23747,11 @@ def friendly():
         "DATEADD(hour, 2, a DATE): a TIMESTAMP, as a DATE plus hours is": ("SELECT id, DATEADD(hour, 2, CAST(ts AS DATE)) AS a FROM t", "SELECT id, CAST(ts AS DATE) + INTERVAL 2 HOUR AS a FROM t"),
         "a DATE plus days or months stays a DATE": ("SELECT id, CAST(ts AS DATE) + INTERVAL '1 day' AS a, CAST(ts AS DATE) - INTERVAL '1 month' AS b FROM t",
                                                      "SELECT id, CAST(CAST(ts AS DATE) + INTERVAL '1 day' AS DATE) AS a, CAST(CAST(ts AS DATE) - INTERVAL '1 month' AS DATE) AS b FROM t"),
+        "SQL Server's SELECT TOP n: as LIMIT n": ("SELECT TOP 3 id, x FROM t ORDER BY x DESC", "SELECT id, x FROM t ORDER BY x DESC LIMIT 3"),
+        "MySQL's GROUP_CONCAT(… ORDER BY … SEPARATOR …), and its ',' when none is given": (
+            "SELECT g, GROUP_CONCAT(CAST(id AS VARCHAR) ORDER BY id SEPARATOR '; ') AS s, group_concat(CAST(k AS VARCHAR)) AS c FROM t WHERE id < 20 GROUP BY g",
+            "SELECT g, string_agg(CAST(id AS VARCHAR), '; ' ORDER BY id) AS s, string_agg(CAST(k AS VARCHAR), ',') AS c FROM t WHERE id < 20 GROUP BY g"),
+        "BigQuery's ARRAY_AGG(… ORDER BY … LIMIT n)": ("SELECT k, ARRAY_AGG(id ORDER BY x DESC LIMIT 2) AS a FROM t GROUP BY k", "SELECT k, list(id ORDER BY x DESC)[1:2] AS a FROM t GROUP BY k"),
         "MySQL's date_sub(ts, INTERVAL …): as ts - INTERVAL …": ("SELECT id, date_sub(ts, INTERVAL '1 month') AS b FROM t", "SELECT id, ts - INTERVAL '1 month' AS b FROM t"),
         "date_diff('week', …) either way: whole weeks of the days between": (
             "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t",
@@ -23761,6 +23766,19 @@ def friendly():
         checks[f"{name} == DuckDB's"] = ok
         if not ok:
             failed[name] = {"ours": [cn, got[:4]], "duckdb": [dn, want[:4]]}
+    # BigQuery's INT64 and FLOAT64, Snowflake's NUMBER(p, s), NUMBER and BYTEINT: Pondra's BIGINT, DOUBLE, DECIMAL(p, s), DECIMAL(38, 0), TINYINT
+    try:
+        typed = ours("SELECT CAST(x AS INT64) AS a, CAST(x AS FLOAT64) AS b, x::NUMBER(10,2) AS c, CAST(x AS NUMBER) AS d, CAST(k AS BYTEINT) AS e FROM t WHERE id < 50")
+        plain = ours("SELECT CAST(x AS BIGINT) AS a, CAST(x AS DOUBLE) AS b, x::DECIMAL(10,2) AS c, CAST(x AS DECIMAL(38,0)) AS d, CAST(k AS TINYINT) AS e FROM t WHERE id < 50")
+        sql(A.port, "CREATE TABLE spelled (id INT64, amount NUMBER(10,2), n NUMBER, f FLOAT64)")
+        cols = {r["column_name"]: r["data_type"] for r in sql(A.port, "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'spelled'")}
+        checks["INT64, FLOAT64, NUMBER(10,2), NUMBER and BYTEINT, in a cast and a CREATE TABLE: BIGINT, DOUBLE, DECIMAL(10,2), DECIMAL(38,0), TINYINT"] = \
+            typed == plain and len(plain[1]) > 0 and cols == {"id": "Int64", "amount": "Decimal128(10, 2)", "n": "Decimal128(38, 0)", "f": "Float64"}
+        if typed != plain or len(cols) != 4:
+            failed["spelled types"] = {"ours": [typed[0], typed[1][:3]], "plain": [plain[0], plain[1][:3]], "cols": cols}
+    except Exception as e:
+        checks["INT64, FLOAT64, NUMBER(10,2), NUMBER and BYTEINT, in a cast and a CREATE TABLE: BIGINT, DOUBLE, DECIMAL(10,2), DECIMAL(38,0), TINYINT"] = False
+        failed["spelled types"] = str(e)[:400]
     c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
     c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
     r = c.getresponse()
@@ -24084,7 +24102,7 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 15, "spark": 12, "mysql": 19, "bigquery": 13, "sqlserver": 12}
+    FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 15, "spark": 12, "mysql": 20, "bigquery": 19, "sqlserver": 13}
     XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
