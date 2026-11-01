@@ -226,9 +226,10 @@ const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 /// that are there, and no more. A user writes with SQL, where its grants are checked. A write token
 /// never moves a sequence or a branch's row ids, and never names an object the lake would one day
 /// delete as its own: a segment outside `log/`, a file outside its table's folder; nor adds to the
-/// lake's own records.
-pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
-    if !writer()? {
+/// lake's own records. `forced` (a caller that isn't the nodes' own: a page's, a superuser's too) runs the same checks
+/// whatever its role, as `writer` does not let a superuser by them.
+pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
+    if !forced && !writer()? {
         return Ok(());
     }
     ensure!(f.sequence.is_none() && f.blocks == 0, "moving a sequence or a branch's row ids needs an admin");
@@ -241,12 +242,19 @@ pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
 }
 
 /// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
-/// `data/`), each in that folder.
-pub fn files_from_writer(folder: Option<&str>, files: &[String]) -> Result<()> {
-    if !writer()? {
+/// `data/`), each in that folder, and never the lake's own records. `forced`: as for `flush_from_writer` (a page's, a
+/// superuser's too).
+pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String], forced: bool) -> Result<()> {
+    if !forced && !writer()? {
         return Ok(());
     }
-    let Some(folder) = folder else { bail!("making a table needs an admin") };
+    ensure!(!RECORDS.contains(&table), "{table} is written by Pondra alone"); // (as a flush's rows are)
+    let Some(folder) = folder else {
+        if forced {
+            bail!("{table} isn't there: a page's files go into a table that is");
+        }
+        bail!("making a table needs an admin")
+    };
     let home = format!("data/{folder}/");
     ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
     Ok(())
@@ -400,6 +408,11 @@ impl Auth {
     /// the keys `objects::readable` allows (`server::feed`, `server::kv`). The others carry the lake's keys or write what
     /// only the nodes write.
     pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka" | "/cluster/log" | "/cluster/kv") }
+
+    /// The nodes' write routes a superuser's sign-in reaches too, for a joined page's writes (a follower relays them to its
+    /// leader: `server::relay_page`). Only a superuser: these two check a write token's rights, never a user's grants, so a
+    /// Write role's sign-in is refused as it is refused now.
+    pub fn pages_write(path: &str, who: &Principal) -> bool { matches!(path, "/cluster/commit" | "/cluster/files") && who.role == Role::Admin && who.access.is_none() }
 
     /// May this role run this write? (And, for a user's request, is it granted: `check`.)
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
@@ -591,6 +604,29 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
+
+    /// A page's flush and files (`forced`) get a writer's checks whatever the role: a segment of the log only, a table's files
+    /// in its folder, the lake's own records never. The nodes' own (not forced) get none, as they had none.
+    #[test]
+    fn a_pages_flush_and_files_are_checked_as_a_writers_are() {
+        use crate::log::{Flush, Part};
+        let flush = |path: &str, table: Option<&str>| Flush {
+            path: path.into(),
+            parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None }).into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(flush_from_writer(&flush("log/a1.seg", None), true).is_ok());
+        assert!(flush_from_writer(&flush("data/t/x.seg", None), true).is_err(), "a segment outside the log");
+        assert!(flush_from_writer(&flush("", Some("pondra$audit")), true).is_err(), "the lake's records");
+        assert!(flush_from_writer(&flush("data/t/x.seg", None), false).is_ok(), "the nodes' own, unchanged");
+        let mine = ["data/orders/a.parquet".to_string()];
+        let other = ["data/hr/a.parquet".to_string()];
+        assert!(files_from_writer("orders", Some("orders"), &mine, true).is_ok());
+        assert!(files_from_writer("orders", Some("orders"), &other, true).is_err(), "a file outside the table's folder");
+        assert!(files_from_writer("orders", None, &mine, true).is_err(), "a table that isn't there");
+        assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()], true).is_err(), "the lake's records");
+        assert!(files_from_writer("orders", Some("orders"), &other, false).is_ok(), "the nodes' own, unchanged");
+    }
 
     #[test]
     fn ten_failures_refuse_the_pair_for_a_minute() {
