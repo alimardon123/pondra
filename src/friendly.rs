@@ -33,7 +33,7 @@ fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd)\s*\(|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
     });
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
@@ -630,7 +630,7 @@ impl VisitorMut for Friendly {
         if self.collecting() {
             return ControlFlow::Continue(());
         }
-        or_break(fetch(q).and_then(|_| order_by_all(q, n)))
+        or_break(top(q).and_then(|_| fetch(q)).and_then(|_| order_by_all(q, n)))
     }
 
     fn pre_visit_select(&mut self, s: &mut Select) -> ControlFlow<anyhow::Error> {
@@ -866,11 +866,20 @@ fn row_in(e: &Expr) -> Result<Option<String>> {
     Ok(Some(format!("EXISTS (SELECT 1 FROM ({subquery}) AS __in({}) WHERE {})", cols.join(", "), same.join(" AND "))))
 }
 
-/// Postgres's names for types DataFusion doesn't read as written, as the names it reads.
+/// Postgres's names for types DataFusion doesn't read as written, as the names it reads (and a few of BigQuery's and
+/// Snowflake's).
 fn spell(t: &mut DataType) {
     let spelled = match t {
         DataType::CharacterVarying(n) | DataType::CharVarying(n) => Some(DataType::Varchar(n.take())),
         DataType::Character(n) => Some(DataType::Char(n.take())),
+        // (BigQuery's INT64 and FLOAT64, Snowflake's NUMBER(p, s) (38, 0 when not given) and BYTEINT)
+        DataType::Int64 => Some(DataType::BigInt(None)),
+        DataType::Float64 => Some(DataType::Double(ExactNumberInfo::None)),
+        DataType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("number") => {
+            let at = |i: usize| args.get(i).and_then(|a| a.trim().parse::<u64>().ok());
+            Some(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(at(0).unwrap_or(38), at(1).unwrap_or(0) as i64)))
+        }
+        DataType::Custom(name, args) if args.is_empty() && name.to_string().eq_ignore_ascii_case("byteint") => Some(DataType::TinyInt(None)),
         _ => None,
     };
     if let Some(s) = spelled {
@@ -1044,6 +1053,25 @@ async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> R
     Ok(true)
 }
 
+/// SQL Server's `SELECT TOP n …` (or `TOP (n)`) as `LIMIT n`, where the query is that select. A TOP in a UNION's branch
+/// is left to DataFusion's refusal.
+fn top(q: &mut Query) -> Result<()> {
+    let SetExpr::Select(s) = &mut *q.body else { return Ok(()) };
+    let Some(t) = s.top.take() else { return Ok(()) };
+    ensure!(!t.with_ties && !t.percent, "SELECT TOP … {}: not taken; LIMIT n", if t.percent { "PERCENT" } else { "WITH TIES" });
+    let n = match t.quantity {
+        Some(TopQuantity::Expr(e)) => e,
+        Some(TopQuantity::Constant(c)) => expr(&c.to_string())?,
+        None => bail!("SELECT TOP without a number: LIMIT n"),
+    };
+    match &mut q.limit_clause {
+        None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
+        Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
+        _ => bail!("SELECT TOP and LIMIT together: write one of them (LIMIT n)"),
+    }
+    Ok(())
+}
+
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.
 fn fetch(q: &mut Query) -> Result<()> {
     let Some(f) = q.fetch.take() else { return Ok(()) };
@@ -1117,6 +1145,36 @@ fn within_group(f: &mut Function) -> Result<()> {
     list.clauses.push(FunctionArgumentClause::OrderBy(std::mem::take(&mut f.within_group)));
     f.name = ObjectName::from(vec![Ident::new("string_agg")]);
     Ok(())
+}
+
+/// MySQL's and DuckDB's `group_concat(x [ORDER BY …] [SEPARATOR ', '])`: `string_agg(x, ', ' [ORDER BY …])`, its
+/// separator `,` when none is given.
+fn group_concat(f: &mut Function) {
+    if function_name(f) != "group_concat" {
+        return;
+    }
+    let FunctionArguments::List(l) = &mut f.args else { return };
+    if l.args.len() != 1 {
+        return;
+    }
+    let sep = l.clauses.iter().position(|c| matches!(c, FunctionArgumentClause::Separator(_))).map(|i| l.clauses.remove(i));
+    let sep = match sep {
+        Some(FunctionArgumentClause::Separator(v)) => Expr::Value(v),
+        _ => expr("','").expect("a literal"),
+    };
+    l.args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(sep)));
+    f.name = ObjectName::from(vec![Ident::new("string_agg")]);
+}
+
+/// BigQuery's `array_agg(x ORDER BY y LIMIT n)`: the first `n` of the list, `array_slice(array_agg(x ORDER BY y), 1, n)`.
+fn array_agg_limit(f: &mut Function) -> Option<String> {
+    if function_name(f) != "array_agg" {
+        return None;
+    }
+    let FunctionArguments::List(l) = &mut f.args else { return None };
+    let i = l.clauses.iter().position(|c| matches!(c, FunctionArgumentClause::Limit(_)))?;
+    let FunctionArgumentClause::Limit(n) = l.clauses.remove(i) else { return None };
+    Some(format!("array_slice({f}, 1, {n})"))
 }
 
 /// A string literal's text.
@@ -1250,6 +1308,11 @@ fn expression(e: &mut Expr) -> Result<()> {
         }
         Expr::Function(f) => {
             within_group(f)?;
+            group_concat(f);
+            if let Some(text) = array_agg_limit(f) {
+                *e = expr(&text)?;
+                return Ok(());
+            }
             let n = function_name(f);
             let a = args(f);
             match (n.as_str(), a.len()) {
@@ -1927,6 +1990,27 @@ mod tests {
         let m = call("date_diff('m', a, b)").unwrap_err();
         assert!(crate::codes::of(&m) == "22023" && m.to_string().contains("'m' isn't a date part here"), "{m:#}");
         assert!(wanted("SELECT strftime(ts, '%Y') FROM t") && wanted("SELECT DATEDIFF (day, a, b) FROM t") && !wanted("SELECT epoch FROM t"));
+    }
+
+    #[test]
+    fn top_group_concat_array_agg_limit_and_other_databases_types() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("GROUP_CONCAT(status ORDER BY id SEPARATOR ', ')").unwrap(), "string_agg(status, ', ' ORDER BY id)");
+        assert_eq!(call("group_concat(status)").unwrap(), "string_agg(status, ',')");
+        assert_eq!(call("ARRAY_AGG(x ORDER BY y DESC LIMIT 2)").unwrap(), "array_slice(ARRAY_AGG(x ORDER BY y DESC), 1, 2)");
+        assert_eq!(call("CAST(x AS INT64)").unwrap(), "CAST(x AS BIGINT)");
+        assert_eq!(call("x::NUMBER(10,2)").unwrap(), "x::DECIMAL(10,2)");
+        assert_eq!(call("CAST(x AS NUMBER)").unwrap(), "CAST(x AS DECIMAL(38,0))");
+        assert_eq!(call("CAST(x AS FLOAT64)").unwrap(), "CAST(x AS DOUBLE)");
+        let mut q = query("SELECT TOP 3 id FROM t ORDER BY id DESC").unwrap();
+        top(&mut q).unwrap();
+        assert_eq!(q.to_string(), "SELECT id FROM t ORDER BY id DESC LIMIT 3");
+        let mut q = query("SELECT TOP (2) PERCENT id FROM t").unwrap();
+        assert!(top(&mut q).unwrap_err().to_string().contains("PERCENT: not taken; LIMIT n"));
+        assert!(wanted("SELECT TOP 3 id FROM t") && wanted("SELECT CAST(x AS INT64)") && wanted("SELECT GROUP_CONCAT(s) FROM t") && !wanted("SELECT topping FROM t"));
     }
 
     #[test]
