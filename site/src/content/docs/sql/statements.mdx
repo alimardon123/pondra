@@ -585,8 +585,9 @@ one script's (statements sent together over HTTP).
   `crm` when read from elsewhere, and one made in `public` still reads `public` under `USE crm`.
 - `current_database()` and `current_schema()` answer the session's values at every door: this lake's
   name and `public` when there is no session. In a view they are worked out as it is read, as Postgres
-  does: a view saying `current_schema()` answers each reader's schema. A materialized view's are those
-  of the session that made it, since its rows are made then.
+  does: a view saying `current_schema()` answers each reader's schema, a macro's or a SQL function's
+  each caller's, and a change sent from a follower reads them as its session does. A materialized
+  view's are those of the session that made it, since its rows are made then.
 - A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
   console tab, the Python or JavaScript client's connection, or one script's statements.
 

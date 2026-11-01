@@ -22019,6 +22019,25 @@ def use_path():
     sql(A.port, "CREATE VIEW crm.cs3 AS SELECT id, current_schema() AS s FROM crm.t")
     info["spread view"] = until(lambda: _try(lambda: call(A.port + 1, "POST", "/sql?spread=1", b"SELECT s, count(*) AS n FROM crm.cs3 GROUP BY s", headers=f)), [{"s": "crm", "n": 30000}], 15)
     checks["under USE crm on a follower, a view's current_schema() asked to spread is crm's on every row (30000)"] = info["spread view"] == [{"s": "crm", "n": 30000}]
+    # A change sent from a follower's session to the leader: a view it reads that says current_schema() is read as the
+    # session reads it (crm), not as the leader would with no session (public); MERGE's too.
+    sql(A.port, "CREATE TABLE crm.w (id BIGINT, s VARCHAR)")
+    sql(A.port, "INSERT INTO crm.w VALUES (1, 'x'), (2, 'x')")
+    sql(A.port, "CREATE VIEW crm.here AS SELECT current_schema() AS s")
+    on_follower = lambda body: call(A.port + 1, "POST", "/sql", body, headers=f)
+    on_follower(b"UPDATE w SET s = (SELECT s FROM here) WHERE id = 1")
+    on_follower(b"MERGE INTO w USING (SELECT 2 AS id, s FROM here) AS src ON w.id = src.id WHEN MATCHED THEN UPDATE SET s = src.s || '-m'")
+    info["follower's change through a view"] = sql(A.port, "SELECT id, s FROM crm.w ORDER BY id")
+    checks["under USE crm on a follower, an UPDATE and a MERGE reading a view's current_schema() write crm, not the leader's public"] = \
+        info["follower's change through a view"] == [{"id": 1, "s": "crm"}, {"id": 2, "s": "crm-m"}]
+    # A macro's current_schema() is its caller's: made under USE crm (crm.sch, its `()` kept as the text is written
+    # back), called under USE crm (crm) and with no session (public)
+    on_follower(b"CREATE MACRO sch() AS current_schema()")
+    on_follower(b"CREATE MACRO sch_twice() AS current_schema() || current_schema()")
+    on_follower(b"CREATE FUNCTION schf() RETURNS VARCHAR RETURN current_schema()")
+    info["macro"] = [on_follower(b"SELECT sch() AS s, sch_twice() AS t, schf() AS f"), sql(A.port, "SELECT crm.sch() AS s, crm.schf() AS f")]
+    checks["a macro with no parameters is made under USE crm, and its and a SQL function's current_schema() are their caller's (crm under USE crm, public with none)"] = \
+        info["macro"] == [[{"s": "crm", "t": "crmcrm", "f": "crm"}], [{"s": "public", "f": "public"}]]
     [n.kill() for n in trio]
     ok = all(checks.values())
     print(json.dumps({"use": checks, "ok": ok, "info": info}, indent=1, default=str))

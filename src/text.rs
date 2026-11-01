@@ -95,6 +95,14 @@ pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collec
 /// which reads back as a comment, so a minus before anything written with a minus first gets
 /// parentheses.
 pub fn sql(s: &Statement) -> String {
+    // (sqlparser writes a macro with no parameters as `CREATE MACRO m AS …`, which it doesn't read back: its `()` kept)
+    if let Statement::CreateMacro { args: None, .. } = s {
+        let mut s = s.clone();
+        if let Statement::CreateMacro { args, .. } = &mut s {
+            *args = Some(vec![]);
+        }
+        return sql(&s);
+    }
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
     let _ = crate::walk::visit_expressions(s, |e| {

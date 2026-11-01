@@ -2148,7 +2148,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 286. **A view's `current_schema()` is its reader's** (`path.rs`): `door` leaves `current_schema()`,
    `current_database()` and `current_catalog()` in a `CREATE VIEW`'s or `ALTER VIEW … AS`'s query (not a
    materialized or temporary view's: `Walk.view`), and `routines::expand_stored` puts in the reader's
-   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A query
+   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A macro's
+   or a SQL function's body keeps them too, and `routines::expand` writes in its caller's once it is
+   expanded (`currents` leaves a stored body's alone). A follower's change that reads such a view sends
+   its rows as the session reads them (`path::session_view` in `change::for_leader`). A query
    read under a path of the session's own that reads such a view (`path::reads_current`, over the
    views' stored text) runs on its node (`App::here_only`: the other nodes read it with no session)
    and is never a remembered answer (`server::query`). The Postgres port no longer puts them in itself
@@ -2156,7 +2159,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`sparksql::inline` in `door`), and `SHOW COLUMNS FROM t` is placed. `harness.py use`: "a view's
    current_schema() and current_database() are its reader's…", "a view made over Postgres keeps its
    current_schema()…", "…a view's current_schema() asked to spread is crm's on every row", "…spark_sql('…')'s
-   text reads crm.t… SHOW COLUMNS…".
+   text reads crm.t… SHOW COLUMNS…", "under USE crm on a follower, an UPDATE and a MERGE reading a view's
+   current_schema() write crm…", "a macro with no parameters is made under USE crm…".
 287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
    x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
    its leader had (`seen_here`), and in `write::by_inbox`. `CREATE TABLE … AS SELECT` defines its table first;
