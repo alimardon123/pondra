@@ -163,6 +163,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("can't cast value") || has("too large to store in a decimal") || int_overflow_text(&t) => "22003", // (Arrow's words for a number that doesn't fit: a value cast to a narrower integer, a decimal's precision, digits that overflow an integer)
         _ if has("csv error") => "22P04", // bad_copy_file_format (a file read as CSV is malformed: Arrow's words, e.g. a line with more fields than the schema has)
         _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
+        _ if has("error parsing timestamp from") => "22007", // invalid_datetime_format (to_date, to_timestamp and their other names: text their format doesn't read)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
@@ -249,6 +250,7 @@ mod tests {
         assert_eq!(of("SQL error: ParserError(\"Expected: an SQL statement, found: SELEC at Line: 1, Column: 1\")"), "42601");
         assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
+        assert_eq!(of("Execution error: Error parsing timestamp from 'not a date' using format '%Y-%m-%d': input contains invalid characters"), "22007"); // (to_date, PARSE_DATE, STR_TO_DATE)
         assert_eq!(of("orders.id is NOT NULL, and a row gives it no value"), "23502");
         assert_eq!(of("Invalid batch column at '0' has null but schema specifies non-nullable"), "23502"); // (a page's INSERT of a NULL: DataFusion's words)
         assert_eq!(of("Column 'id' is declared as non-nullable but contains null values"), "23502"); // (a page's UPDATE of one: Arrow's words)

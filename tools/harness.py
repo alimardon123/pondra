@@ -23756,6 +23756,31 @@ def friendly():
         "date_diff('week', …) either way: whole weeks of the days between": (
             "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t",
             "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t"),
+        # (other databases' names for Pondra's functions, `dialect_fns::call`; `d` a DATE in every month of a leap year)
+        "Snowflake's IFF, ZEROIFNULL, DECODE (NULL matching NULL), ARRAY_CONSTRUCT, ARRAY_SIZE, OBJECT_CONSTRUCT": (
+            "SELECT id, IFF(k > 3, 'hi', 'lo') AS a, ZEROIFNULL(n) AS z, DECODE(g, 'a', 'A', 'b', 'B', 'other') AS d, DECODE(n, NULL, 'none', 'some') AS e, "
+            "ARRAY_CONSTRUCT(k, id) AS c, ARRAY_SIZE(ARRAY_CONSTRUCT(k, id, 1)) AS s, OBJECT_CONSTRUCT('k', k, 'g', g) AS o FROM t WHERE id < 50",
+            "SELECT id, CASE WHEN k > 3 THEN 'hi' ELSE 'lo' END AS a, coalesce(n, 0) AS z, CASE g WHEN 'a' THEN 'A' WHEN 'b' THEN 'B' ELSE 'other' END AS d, "
+            "CASE WHEN n IS NULL THEN 'none' ELSE 'some' END AS e, [k, id] AS c, len([k, id, 1]) AS s, CAST(json_object('k', k, 'g', g) AS VARCHAR) AS o FROM t WHERE id < 50"),
+        "SQL Server's IIF, ISNULL, CHARINDEX, TRY_CONVERT(type, 'text'), EOMONTH, DATEPART(weekday | dayofyear | month, d)": (
+            "SELECT id, IIF(k = 0, 1, 0) AS a, ISNULL(n, -1) AS b, CHARINDEX('b', g || 'b') AS c, TRY_CONVERT(INT, '12x') AS t, TRY_CONVERT(date, '2026-03-01') AS u, EOMONTH(d) AS e, "
+            "DATEPART(weekday, d) AS w, DATEPART(dayofyear, d) AS y, DATEPART(month, d) AS m FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60) s",
+            "SELECT id, CASE WHEN k = 0 THEN 1 ELSE 0 END AS a, coalesce(n, -1) AS b, strpos(g || 'b', 'b') AS c, TRY_CAST('12x' AS INT) AS t, DATE '2026-03-01' AS u, last_day(d) AS e, "
+            "dayofweek(d) + 1 AS w, dayofyear(d) AS y, month(d) AS m FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60) s"),
+        "MySQL's UNIX_TIMESTAMP(ts), FROM_UNIXTIME, STR_TO_DATE (a date, a time); CURDATE(), GETDATE() and UNIX_TIMESTAMP() are now": (
+            "SELECT id, UNIX_TIMESTAMP(ts) AS u, FROM_UNIXTIME(1700000000) AS f, STR_TO_DATE('03/01/2026', '%m/%d/%Y') AS d, STR_TO_DATE('01.03.2026 10:11:12', '%d.%m.%Y %H:%i:%s') AS s, "
+            "CURDATE() = current_date AND GETDATE() <= now() AND UNIX_TIMESTAMP() > 1700000000 AS now FROM t WHERE id < 20",
+            "SELECT id, CAST(floor(epoch(ts)) AS BIGINT) AS u, TIMESTAMP '2023-11-14 22:13:20' AS f, DATE '2026-03-01' AS d, TIMESTAMP '2026-03-01 10:11:12' AS s, true AS now FROM t WHERE id < 20"),
+        "BigQuery's COUNTIF and SAFE_DIVIDE (NULL by zero)": (
+            "SELECT k, COUNTIF(x > 100) AS c, SAFE_DIVIDE(sum(x), sum(k)) AS r FROM t GROUP BY k",
+            "SELECT k, count(*) FILTER (WHERE x > 100) AS c, CASE WHEN sum(k) = 0 THEN NULL ELSE sum(x) / sum(k) END AS r FROM t GROUP BY k"),
+        "BigQuery's DATE(ts), DATE(y, m, d), DATE_TRUNC(d, MONTH), TIMESTAMP_TRUNC, TIMESTAMP_DIFF (whole parts, either way), FORMAT_DATE, PARSE_DATE, UNIX_SECONDS, TIMESTAMP_SECONDS": (
+            "SELECT id, DATE(ts) AS a, DATE(2026, 3, k + 1) AS b, DATE_TRUNC(d, MONTH) AS c, TIMESTAMP_TRUNC(ts, HOUR) AS h, TIMESTAMP_DIFF(ts, TIMESTAMP '2026-01-01 00:00:00', HOUR) AS dh, "
+            "TIMESTAMP_DIFF(TIMESTAMP '2026-01-01 00:10:30', ts, MINUTE) AS dm, FORMAT_DATE('%Y/%m', d) AS f, PARSE_DATE('%Y%m%d', '20260301') AS p, UNIX_SECONDS(ts) AS u, "
+            "TIMESTAMP_SECONDS(1700000000 + id) AS s FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub",
+            "SELECT id, CAST(ts AS DATE) AS a, make_date(2026, 3, k + 1) AS b, CAST(date_trunc('month', d) AS DATE) AS c, date_trunc('hour', ts) AS h, date_sub('hour', TIMESTAMP '2026-01-01 00:00:00', ts) AS dh, "
+            "date_sub('minute', ts, TIMESTAMP '2026-01-01 00:10:30') AS dm, strftime(d, '%Y/%m') AS f, CAST(strptime('20260301', '%Y%m%d') AS DATE) AS p, CAST(floor(epoch(ts)) AS BIGINT) AS u, "
+            "make_timestamp(CAST(1700000000 + id AS BIGINT) * 1000000) AS s FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub"),
     }
     for name, (q, dq) in pairs.items():
         try:
@@ -23783,7 +23808,15 @@ def friendly():
     c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
     r = c.getresponse()
     st, hd, body = r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
-    checks["date_diff('m', …): refused by name with the parts it takes (m is DuckDB's minute and SQL Server's month), 22023"] = st == 400 and hd == "22023" and "'m' isn't a date part here" in body
+    checks["date_diff('m', …): refused by name (m is DuckDB's minute and SQL Server's month), 22023"] = st == 400 and hd == "22023" and "'m' is DuckDB's minute and SQL Server's month" in body
+    c.request("POST", "/sql", b"SELECT TIMESTAMPDIFF(HOUR, ts, ts) AS d FROM t")
+    r = c.getresponse()
+    st, hd, body = r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    c.request("POST", "/sql", b"SELECT TRY_CONVERT(INT, g) AS d FROM t")
+    r = c.getresponse()
+    st2, hd2, body2 = r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    checks["TRY_CONVERT(INT, a column): refused by name, TRY_CAST named (SQL Server and MySQL put CONVERT's type on either side), 0A000"] = hd2 == "0A000" and "TRY_CAST(x AS type)" in body2
+    checks["MySQL's TIMESTAMPDIFF: refused by name (whole units in MySQL, boundaries in Snowflake), date_diff named, 42883"] = st == 404 and hd == "42883" and "date_diff('hour', ts, ts)" in body
     # SUMMARIZE: the exact columns (approximate ones and the mean's and spread's text aside)
     cn, got = ours("SUMMARIZE t")
     dn, want = theirs("SUMMARIZE t")
@@ -24102,7 +24135,7 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 15, "spark": 12, "mysql": 20, "bigquery": 19, "sqlserver": 13}
+    FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 18, "spark": 13, "mysql": 21, "bigquery": 23, "sqlserver": 17}
     XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
