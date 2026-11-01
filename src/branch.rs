@@ -201,11 +201,16 @@ pub async fn load(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
-/// Whether a branch at `lake` may have `base`: it lives where its base does (a folder's base is on this machine, a
-/// bucket's is in one), and a node's lake (`pondra://`) is a base only of the lake that same node serves.
+/// Whether a branch at `lake` may have `base`: it lives where its base does, a folder's on this machine, a bucket's in a
+/// bucket, a lake in memory's in memory (`store::place`), and a node's lake (`pondra://`) is a base only of that same lake.
+/// A catalog's bases are opened with this node's own credentials, so one named anywhere else is never opened (pass 3, S1).
 fn same_kind(lake: &str, base: &str) -> bool {
-    base.contains("://") == lake.contains("://")
-        && (!crate::store::served(base) || (crate::store::served(lake) && base.trim_end_matches('/') == lake.trim_end_matches('/')))
+    use crate::store::{place, Place};
+    match (place(lake), place(base)) {
+        (Ok(Place::Served), Ok(Place::Served)) => base.trim_end_matches('/') == lake.trim_end_matches('/'),
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock).
