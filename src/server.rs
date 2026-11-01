@@ -383,7 +383,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     };
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
-    let stoppable = stoppable(req.uri().path()); // (a query the node may stop for memory: `oom.rs`)
+    let stoppable = stoppable(req.uri().path(), req.uri().query()); // (a query the node may stop for memory: `oom.rs`)
     // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
     let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
@@ -407,10 +407,11 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
 }
 
 /// The queries the node may stop for memory (`oom.rs`): a client's query, which its client asks again
-/// or gives up on. Not the cluster's own calls, the bulk writes or a live query, which lives as long as
-/// its client.
-fn stoppable(path: &str) -> bool {
-    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/") || path.starts_with("/insert/") // (a staged INSERT too: a joined page's rows, `insert_staged`)
+/// or gives up on, and a joined page's staged INSERT (`insert_staged`), which its page sends again. Not
+/// the cluster's own calls, the other bulk writes or a live query, which lives as long as its client.
+fn stoppable(path: &str, query: Option<&str>) -> bool {
+    let staged = || path.starts_with("/insert/") && query.is_some_and(|q| q.split('&').any(|p| p == "staged=1"));
+    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/") || staged()
 }
 
 /// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,
@@ -828,16 +829,25 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
 /// page put in `stage/<slug>/<job>/` (`auth::page_creates`), as the signed-in user, through its own write (`write::on_node_as`):
 /// the table's types, NOT NULL, CHECK, keys, identity and defaults, the INSERT grant, the job's duplicate answer and the record
 /// are all this node's. The page's files are only a transport, so the node reads what they hold by position and checks it. The
-/// staged files are deleted once the INSERT has answered, whatever the answer, so a resend finds none and is answered by the job.
+/// staged files are deleted once the INSERT has answered, whatever the answer, or was stopped, so a resend finds none and is
+/// answered by the job. `files` is how many the page staged: the node takes the INSERT only when exactly those are there, so a
+/// file lost on the way (or swept: `tier::collect_orphans`) is a refusal, never a quiet loss of its rows.
 async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<Json<Value>, E> {
     #[derive(Deserialize)]
-    struct Columns { columns: Vec<String> }
+    struct Staged { columns: Vec<String>, files: u64 }
     ensure!(!app.members.reader(), "read-only node");
     let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
     let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
     ensure!(crate::auth::staged_job(job), "a staged INSERT's job is letters, digits and hyphens, 64 at most");
     crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
-    let Columns { columns } = serde_json::from_str(body)?;
+    let Staged { columns, files } = serde_json::from_str(body)?;
+    let dir = format!("stage/{slug}/{job}/");
+    let unstage = Unstage(Some((app.lake.clone(), dir.clone()))); // (whether it answers, fails or is stopped: the page's files are its transport only)
+    let there = staged_files(&app.lake, &dir).await?;
+    // (none there: a resend after its INSERT took them, which the job answers as a duplicate, or nothing to take)
+    if !there.is_empty() && there != (0..files).collect::<Vec<_>>() {
+        return Err(crate::codes::coded("55000", format!("the page staged {files} files for this INSERT and {} are here: it is sent again whole", there.len())).into());
+    }
     let meta = app.lake.table_meta(name).await?;
     let live: Vec<&str> = meta.live().map(|(_, logical, _)| logical).collect();
     if let Some(c) = columns.iter().find(|c| !live.contains(&c.as_str())) {
@@ -848,12 +858,41 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));
     app.auth.allows(who.role, &stmt)?;
     let out = crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true).await;
-    unstage(&app.lake, &format!("stage/{slug}/{job}/")).await; // (whether or not the INSERT answered: the page's files are its transport only)
+    unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
     Ok(Json(out?))
 }
 
-/// Deletes what is stored under `dir` (a staged INSERT's files, once it has answered): a failure is not the answer's, and
-/// the leader's orphan sweep takes what is left (`tier::collect_orphans`).
+/// The numbers of the staged files in `dir` (`<n>.parquet`, `auth::page_creates`), in order.
+async fn staged_files(lake: &crate::store::Lake, dir: &str) -> anyhow::Result<Vec<u64>> {
+    use futures::TryStreamExt;
+    let listed = lake.store.list(Some(&object_store::path::Path::parse(dir)?)).try_collect::<Vec<_>>().await?;
+    let mut n: Vec<u64> = listed.iter().filter_map(|o| o.location.filename()?.strip_suffix(".parquet")?.parse().ok()).collect();
+    n.sort_unstable();
+    Ok(n)
+}
+
+/// A staged INSERT's folder, deleted once its INSERT has answered (`now`), or in the background when it was dropped unanswered (a
+/// stopped INSERT: `stoppable`). A failure is not the answer's, and the leader's orphan sweep takes what is left
+/// (`tier::collect_orphans`).
+struct Unstage(Option<(Arc<crate::store::Lake>, String)>);
+
+impl Unstage {
+    async fn now(mut self) {
+        if let Some((lake, dir)) = self.0.take() {
+            unstage(&lake, &dir).await;
+        }
+    }
+}
+
+impl Drop for Unstage {
+    fn drop(&mut self) {
+        if let Some((lake, dir)) = self.0.take() {
+            crate::panics::spawn(async move { unstage(&lake, &dir).await });
+        }
+    }
+}
+
+/// Deletes what is stored under `dir`.
 async fn unstage(lake: &crate::store::Lake, dir: &str) {
     use futures::TryStreamExt;
     let Ok(at) = object_store::path::Path::parse(dir) else { return };

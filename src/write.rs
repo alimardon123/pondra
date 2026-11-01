@@ -1783,6 +1783,8 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
 /// Parquet files of about this many bytes are cut from a staged INSERT's rows: under the 64 MB a node takes a create of
 /// (`served::STAGE_MAX`), with the footer and the last row group's tail to spare.
 const STAGE_BYTES: usize = 48 << 20;
+/// How many times a staged file is sent while its node answers that it is busy (`served::busy`), a second apart.
+const STAGE_TRIES: usize = 5;
 
 /// The INSERT a joined page stages (`run_listed`): a plain INSERT whose query isn't VALUES (the node's log takes those), with the
 /// columns it names (none: the table's first ones, as many as the query's width).
@@ -1833,7 +1835,8 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         stage_put(lake, &dir, crate::tier::writer(schema.clone(), &[])?, &next).await?; // (no rows: one file of none, so the node answers it as any INSERT of none)
     }
-    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names}))?;
+    let files = next.load(std::sync::atomic::Ordering::Relaxed); // (the node takes the INSERT only when it finds exactly these)
+    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names, "files": files}))?;
     let reply = crate::dial::call(&app.members.leader().addr, call).await?;
     if reply.ok() {
         return reply.json().await;
@@ -1880,7 +1883,17 @@ async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::ar
     let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     ensure!(n < 1_000_000, "a staged INSERT takes a million files at most");
     ensure!(bytes.len() <= 64 << 20, "a staged file is past 64 MB: the INSERT's rows come in smaller files");
-    lake.put(&format!("{dir}{n}.parquet"), bytes).await.map_err(staged_refusal)
+    let (at, bytes) = (object_store::path::Path::from(format!("{dir}{n}.parquet")), Bytes::from(bytes));
+    let create = || object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
+    for _ in 1..STAGE_TRIES {
+        match lake.store.put_opts(&at, bytes.clone().into(), create()).await {
+            Err(object_store::Error::Generic { source, .. }) if source.downcast_ref::<crate::store_wire::Busy>().is_some() => {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await; // (the node's busy answer asks for a second: `served::busy`)
+            }
+            done => return done.map(|_| ()).map_err(|e| staged_refusal(e.into())),
+        }
+    }
+    lake.store.put_opts(&at, bytes.into(), create()).await.map(|_| ()).map_err(|e| staged_refusal(e.into()))
 }
 
 /// A refusal of the node's store, in the words it gave with the SQLSTATE the page answers with: a sign-in the node doesn't accept is

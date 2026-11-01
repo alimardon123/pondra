@@ -10785,26 +10785,29 @@ def guarded():
         data = r.read()
         return r.status, r.getheader("x-pondra-sqlstate"), data
     tmp = tempfile.mkdtemp()
-    def stage(select, job):
-        """The node writes `select` to a Parquet file, which is put as boss's `stage/<slug>/<job>/0.parquet` on a follower, create-only."""
+    def stage(select, job, n=0):
+        """The node writes `select` to a Parquet file, which is put as boss's `stage/<slug>/<job>/<n>.parquet` on a follower, create-only."""
         # (a COPY to a path on the server's disk is the command line's, as `pondra sql` runs it: HTTP clients are refused it)
         made = subprocess.run([BIN, "sql", "--dir", lake, f"COPY ({select}) TO '{tmp}/{job}.parquet'"], capture_output=True, text=True, timeout=120)
         if not os.path.exists(f"{tmp}/{job}.parquet"):
             raise RuntimeError(f"the node wrote no file for {job}: {made.stdout} {made.stderr}")
         with open(f"{tmp}/{job}.parquet", "rb") as f:
-            return raw(P + 1, "PUT", f"/store/stage/{slug}/{job}/0.parquet", f.read(), auth=boss, headers={"If-None-Match": "*"})
+            return raw(P + 1, "PUT", f"/store/stage/{slug}/{job}/{n}.parquet", f.read(), auth=boss, headers={"If-None-Match": "*"})
     ins = {"Content-Type": "application/json"}
     ask(P, "CREATE TABLE probe (x BIGINT)", auth=boss)
     until(lambda: not str(ask(P + 1, "INSERT INTO probe VALUES (1)", auth=boss)).startswith("ERROR"), True, 30)  # (a follower's writes reach the leader once it has the nodes' key: a 401 until then)
     staged_put = stage("SELECT 1 AS c0, 2.5 AS c1", "j1")
     before = ask(P, "SELECT count(*) AS n FROM orders", auth=boss)
-    first = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"]}).encode(), auth=boss, headers=ins)
-    again = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"]}).encode(), auth=boss, headers=ins)
+    first = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"], "files": 1}).encode(), auth=boss, headers=ins)
+    again = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"], "files": 1}).encode(), auth=boss, headers=ins)
     grown = until(lambda: ask(P, "SELECT count(*) AS n FROM orders", auth=boss), [{"n": before[0]["n"] + 1}] if isinstance(before, list) else None, 20)
     ask(P, "CREATE TABLE nn (id BIGINT NOT NULL, v DOUBLE)", auth=boss)
     stage("SELECT CAST(NULL AS BIGINT) AS c0, 2.5 AS c1", "j2")
-    nulled = raw(P + 1, "POST", "/insert/nn?job=j2&staged=1", json.dumps({"columns": ["id", "v"]}).encode(), auth=boss, headers=ins)
-    other = raw(P + 1, "PUT", f"/store/stage/{slug}/j3/0.parquet", b"x", auth=bob, headers={"If-None-Match": "*"})
+    nulled = raw(P + 1, "POST", "/insert/nn?job=j2&staged=1", json.dumps({"columns": ["id", "v"], "files": 1}).encode(), auth=boss, headers=ins)
+    other = raw(P + 1, "PUT", f"/store/stage/{'bob'.encode().hex()}/j3/0.parquet", b"x", auth=boss, headers={"If-None-Match": "*"})  # (boss, a superuser, at bob's slug)
+    stage("SELECT 2 AS c0, 3.5 AS c1", "j5", n=1)  # (file 1 of 2 only: file 0 never came)
+    short = raw(P + 1, "POST", "/insert/orders?job=j5&staged=1", json.dumps({"columns": ["id", "amount"], "files": 2}).encode(), auth=boss, headers=ins)
+    unchanged = ask(P, "SELECT count(*) AS n FROM orders", auth=boss)
     try:  # (its length says it is past 64 MB: the node answers 413 from the headers, so the body is not sent)
         c = http.client.HTTPConnection("127.0.0.1", P + 1, timeout=120)
         c.putrequest("PUT", f"/store/stage/{slug}/j4/0.parquet")
@@ -10818,11 +10821,12 @@ def guarded():
     info["staged"] = {"slug": slug, "file": staged_put[0], "insert": [first[0], first[2][:200].decode(errors="replace")],
                       "again": [again[0], again[2][:200].decode(errors="replace")], "orders": [before, grown],
                       "not null": [nulled[0], nulled[1], nulled[2][:300].decode(errors="replace")], "another slug": other[0],
-                      "over 64 MB": big[0]}
+                      "over 64 MB": big[0], "a file short": [short[0], short[1], short[2][:200].decode(errors="replace"), unchanged]}
     checks["a joined page's INSERT, staged: the node-written file under the page's own slug, /insert on a follower adds its row (200), the same call again is answered duplicate"] = \
         staged_put[0] == 200 and first[0] == 200 and isinstance(before, list) and grown == [{"n": before[0]["n"] + 1}] and again[0] == 200 and json.loads(again[2] or b"{}") == {"duplicate": True}
     checks["a staged file of another user's slug: 403; a create past 64 MB: 413; a NULL for a NOT NULL column: the node's own refusal (23502)"] = \
         other[0] == 403 and big[0] == 413 and nulled[1] == "23502" and isinstance(nulled[0], int) and nulled[0] >= 400
+    checks["a staged INSERT whose files aren't all there is refused (55000), and adds no row"] = short[1] == "55000" and unchanged == grown
     # What a page that joined the cluster follows, a superuser's sign-in: the catalog and the commit stream, with only
     # the keys a page may hold (`objects::readable`): never the lake's keys, its users or its secrets
     catalog = ask(P, b"", path="/cluster/kv?from=", method="GET", auth=boss)

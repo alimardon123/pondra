@@ -73,8 +73,8 @@ impl Joined {
         self.sent_within(req, what, WAIT)
     }
 
-    /// The error for an answer that isn't a success: a 404 is `NotFound` and a 403 `PermissionDenied`, as the door says them;
-    /// any other is generic.
+    /// The error for an answer that isn't a success: a 404 is `NotFound` and a 403 `PermissionDenied`, as the door says them,
+    /// and a 503 a generic `Busy` (sent again: `write::stage_put`); any other is generic.
     async fn failed(&self, answer: fetch::Response, path: &str) -> E {
         let status = answer.status();
         let body = answer.text().await.unwrap_or_default();
@@ -82,6 +82,7 @@ impl Joined {
             401 => E::Unauthenticated { path: path.to_string(), source: format!("{status}: {body}").into() },
             404 => E::NotFound { path: path.to_string(), source: format!("{status}: {body}").into() },
             403 => E::PermissionDenied { path: path.to_string(), source: format!("{status}: {body}").into() },
+            503 => E::Generic { store: "pondra", source: Box::new(crate::store_wire::Busy(format!("pondra://{} answered {status}: {body}", self.at()))) },
             _ => generic(self.at(), format!("answered {status}: {body}")),
         }
     }

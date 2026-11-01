@@ -826,12 +826,18 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     // since, purged): it stays while that branch's pin does (ADR-047).
     let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
-    // A joined page's staged files (`stage/`, taken by their INSERT as it runs: `server::insert_staged`) that are an hour old are
-    // a page's that never sent it, and go.
+    // A joined page's staged files (`stage/<slug>/<job>/`, taken by their INSERT as it runs: `server::insert_staged`) go a job
+    // folder at a time, once its newest file is an hour old: a page that never sent its INSERT. Never a file at a time, so a long
+    // staging loses no early file while its last ones are still coming (the INSERT also counts them: `insert_staged`).
+    let mut jobs: std::collections::HashMap<String, (i64, Vec<Path>)> = Default::default();
     for o in lake.store.list(Some(&Path::from("stage"))).try_collect::<Vec<object_store::ObjectMeta>>().await? {
-        if now as i64 - o.last_modified.timestamp_millis() > HOUR as i64 {
-            let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await;
-        }
+        let job = o.location.as_ref().rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+        let (newest, files) = jobs.entry(job).or_default();
+        *newest = (*newest).max(o.last_modified.timestamp_millis());
+        files.push(o.location);
+    }
+    for f in jobs.into_values().filter(|(newest, _)| now as i64 - newest > HOUR as i64).flat_map(|(_, files)| files) {
+        let _ = object_store::ObjectStoreExt::delete(&lake.store, &f).await;
     }
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;

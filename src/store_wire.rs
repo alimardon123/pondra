@@ -87,6 +87,17 @@ pub fn error(at: &str, status: StatusCode, headers: &HeaderMap, body: &str, path
     }
 }
 
+/// A door that answered 503 (`served::busy`: as many staged files as it takes at once), as the source of a generic failure: its
+/// sender may send again after a moment (`write::stage_put`).
+#[derive(Debug)]
+pub struct Busy(pub String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+
+impl std::error::Error for Busy {}
+
 /// A failure of this store that no variant of its own says: `pondra://host:port`, then what happened.
 pub fn generic(at: &str, what: impl std::fmt::Display) -> E {
     E::Generic { store: "pondra", source: format!("pondra://{at} {what}").into() }
