@@ -650,6 +650,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     }
     // The workspace's files (their current versions): a project's code, as the base has it.
     objects.extend(workspace(&base).await?);
+    objects.extend(crate::extension::files(&snap)); // (and each installed extension's file, as its record names it)
     use futures::{StreamExt, TryStreamExt};
     futures::stream::iter(objects).map(|p| copy(&base, lake, p)).buffer_unordered(16).try_collect::<Vec<_>>().await?;
     puts.push(("n".into(), json(&next.max(lake.cat.get::<u64>("n").await?.unwrap_or(0)))));

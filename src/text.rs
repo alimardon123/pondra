@@ -55,6 +55,15 @@ fn to_point(words: &[String]) -> bool {
     at(1) == Some("TO") || (matches!(at(1), Some("WORK" | "TRANSACTION")) && at(2) == Some("TO"))
 }
 
+/// Is a BEGIN's or COMMIT's first words SQL Server's `TRAN` (or `TRANSACTION` with a name after it)? (`words` holds at most three.)
+fn tsql_tran(words: &[String]) -> bool {
+    match words.get(1).map(String::as_str) {
+        Some("TRAN") => true,
+        Some("TRANSACTION") => words.get(2).is_some(),
+        _ => false,
+    }
+}
+
 /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
 /// (`SET TRANSACTION` is `settings.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
@@ -62,12 +71,17 @@ pub fn control(sql: &str) -> Option<&'static str> {
     let words = first_words(sql, 3);
     let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
     match words.first().map(String::as_str) {
-        Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
+        // (SQL Server's `BEGIN TRAN [name]` and `BEGIN TRANSACTION name`: a transaction, its name labelling nothing here)
+        Some("BEGIN") if rest_ok(1) || tsql_tran(&words) => Some("BEGIN"),
         Some("START") if words.get(1).map(String::as_str) == Some("TRANSACTION") => Some("BEGIN"),
-        Some("COMMIT" | "END") if rest_ok(1) => Some("COMMIT"),
+        // (SQL Server's `COMMIT TRAN [name]`: a COMMIT)
+        Some("COMMIT") if rest_ok(1) || tsql_tran(&words) => Some("COMMIT"),
+        Some("END") if rest_ok(1) => Some("COMMIT"),
         // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name: a savepoint's, not the transaction's
         Some("ROLLBACK") if to_point(&words) => Some("ROLLBACK TO"),
-        Some("ROLLBACK" | "ABORT") if rest_ok(1) => Some("ROLLBACK"),
+        // (SQL Server's `ROLLBACK TRAN` with no name is a ROLLBACK; `ROLLBACK TRAN name` is refused as it always was)
+        Some("ROLLBACK") if rest_ok(1) || (words.len() == 2 && words[1] == "TRAN") => Some("ROLLBACK"),
+        Some("ABORT") if rest_ok(1) => Some("ROLLBACK"),
         Some("SAVEPOINT") => Some("SAVEPOINT"),
         Some("RELEASE") => Some("RELEASE"),
         _ => None,

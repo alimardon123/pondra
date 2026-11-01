@@ -4,6 +4,8 @@
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::{Statement, TransactionAccessMode, TransactionIsolationLevel, TransactionMode};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+use regex::Regex;
+use std::sync::LazyLock;
 
 pub const SERIALIZABLE: &str = "SERIALIZABLE isn't kept here: REPEATABLE READ is snapshot isolation, which allows write skew; ask for it with SET TRANSACTION ISOLATION LEVEL REPEATABLE READ";
 
@@ -29,9 +31,12 @@ impl Level {
     }
 }
 
-/// The modes of a `BEGIN` (or `START TRANSACTION`) statement, as sqlparser reads them.
+/// The modes of a `BEGIN` (or `START TRANSACTION`) statement, as sqlparser reads them. SQL Server's `BEGIN TRAN [name]` is
+/// the `BEGIN TRANSACTION` it is here (its name labels nothing: sqlparser reads only the TRANSACTION form).
 pub fn begin_modes(sql: &str) -> Result<Vec<TransactionMode>> {
-    Ok(match Parser::parse_sql(&GenericDialect {}, sql)?.pop() {
+    static TRAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^((?:\s*(?:--[^\n]*\n|/\*.*?\*/))*\s*)begin\s+tran(?:saction)?(?:\s+[a-z_][a-z0-9_]*)?\s*;?\s*$").expect("a regex"));
+    let sql = TRAN.replace(sql, "${1}BEGIN TRANSACTION");
+    Ok(match Parser::parse_sql(&GenericDialect {}, &sql)?.pop() {
         Some(Statement::StartTransaction { modes, .. }) => modes,
         _ => vec![],
     })

@@ -160,6 +160,7 @@ fn kept_in(stmt: Option<Stmt>, facts: &[Constraint]) -> Stmt {
             false => Stmt::Invalid(format!("a view's facts go in its own statement: {WANT_CREATE}")),
         },
         Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+        Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
         _ => Stmt::Invalid(format!("a view's facts go in its own statement: {WANT_CREATE}")),
     }
 }
@@ -458,7 +459,7 @@ mod tests {
     /// The message a statement is refused with.
     fn refused(sql: &str) -> String {
         match crate::write::parse(sql) {
-            Some(Stmt::Invalid(e)) => e,
+            Some(Stmt::Invalid(e) | Stmt::Refused(_, e)) => e,
             _ => panic!("{sql}: not refused"),
         }
     }

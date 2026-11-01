@@ -489,6 +489,13 @@ pub fn task(p: &mut Parser, sql: &str) -> Result<(String, Task)> {
         }
     } else {
         pipeline_words(p)?; // (`ON FAILURE OF a`, `ALWAYS`, `ON FILES`, `ON CHANGE OF`, where a task's SCHEDULE or AFTER goes)
+        // (the head, before its AS: Snowflake's `SCHEDULE = '…'` or a WAREHOUSE, said with what Pondra's are)
+        let lower = sql.to_ascii_lowercase();
+        let head = lower.split(" as ").next().unwrap_or_default();
+        let eq = |word: &str| head.split_once(word).is_some_and(|(_, rest)| rest.trim_start().starts_with('='));
+        if eq("schedule") || eq("warehouse") {
+            return Err(crate::codes::coded("42601", "SCHEDULE '…' or AFTER task is missing (SCHEDULE takes no `=`: SCHEDULE '60 minutes'; a WAREHOUSE isn't Pondra's: the node runs its tasks)"));
+        }
         bail!("SCHEDULE '…' or AFTER task is missing");
     }
     if p.parse_keyword(Keyword::WHEN) {
@@ -1227,6 +1234,9 @@ mod tests {
         assert_eq!(head("CREATE TASK t ON FILES 'landing/' AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
         assert_eq!(head("CREATE TASK t AFTER a ON FILES 'landing/' AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
         assert!(head("CREATE TASK t AS SELECT 1").unwrap_err().contains("SCHEDULE '…' or AFTER task is missing"));
+        // (Snowflake's SCHEDULE = '…' and WAREHOUSE: said with what Pondra's are, as the one refusal, coded 42601)
+        assert!(head("CREATE TASK t WAREHOUSE = w SCHEDULE = '60 MINUTE' AS SELECT 1").unwrap_err().contains("SCHEDULE takes no `=`"));
+        assert!(head("CREATE TASK t WAREHOUSE = w AS SELECT 1").unwrap_err().contains("a WAREHOUSE isn't Pondra's"));
         assert_eq!(head("CREATE TASK t ON CHANGE OF sales.orders AS SELECT 1").unwrap_err(), crate::kept::ON_FILES);
     }
 

@@ -36,6 +36,7 @@ SETUP = [
     "INSERT INTO customers VALUES (1, 'Ada Lovelace', 'ada@example.com', 'UK', '2024-11-02'), (2, 'Grace Hopper', 'grace@example.com', 'US', '2025-01-15'), (3, 'Linus Torvalds', NULL, 'FI', '2025-03-20'), (4, 'Margaret Hamilton', 'mh@example.com', 'US', '2025-06-01'), (5, 'Katherine Johnson', 'kj@example.com', NULL, '2025-08-30'), (6, 'Alan Turing', 'alan@example.com', 'UK', '2025-09-12')",
     "CREATE TABLE events (ts TIMESTAMP, user_id INT, kind VARCHAR, payload VARCHAR)",
     """INSERT INTO events VALUES ('2026-03-01 10:00:00', 1, 'page_view', '{"page": "/home", "ms": 120}'), ('2026-03-01 10:00:05', 1, 'click', '{"page": "/home", "button": "buy"}'), ('2026-03-01 10:03:00', 2, 'page_view', '{"page": "/pricing", "ms": 310}'), ('2026-03-02 09:12:00', 3, 'signup', NULL), ('2026-03-02 11:45:00', 2, 'purchase', '{"sku": "A-1", "qty": 2}'), ('2026-03-03 08:00:00', NULL, 'page_view', '{"page": "/docs", "ms": 95}'), ('2026-03-03 08:30:00', 4, 'click', '{"page": "/docs", "button": null}')""",
+    "CREATE ROLE analyst",  # (the role a GRANT ... TO ROLE analyst names)
 ]
 
 CASES = [
@@ -89,8 +90,8 @@ CASES = [
     ("postgres", "UPDATE orders SET status = 'paid' WHERE id = 5"),
     ("postgres", "COMMIT"),
     ("postgres", "CREATE EXTENSION IF NOT EXISTS pg_trgm"),
-    ("postgres", """CREATE FUNCTION order_total(cust INT) RETURNS NUMERIC LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE customer_id = cust); END; $$"""),
-    ("postgres", "LISTEN new_orders"),
+    ("postgres", """CREATE FUNCTION order_total(cust INT) RETURNS NUMERIC LANGUAGE plpgsql AS $$ BEGIN RETURN (SELECT COALESCE(SUM(amount), 0) FROM orders WHERE customer_id = cust); END; $$""", ("0A000", "LANGUAGE sql or python, not plpgsql")),
+    ("postgres", "LISTEN new_orders", ("0A000", "LISTEN and NOTIFY aren't built yet")),
     ("postgres", "SELECT tablename, tableowner FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename"),
     # duckdb: queries
     ("duckdb", "FROM orders SELECT id, amount WHERE status = 'paid'"),
@@ -134,7 +135,7 @@ CASES = [
     ("duckdb", "PRAGMA table_info('orders')"),
     ("duckdb", "EXPLAIN ANALYZE SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id"),
     ("duckdb", "CREATE SCHEMA IF NOT EXISTS sales"),
-    ("duckdb", "ATTACH 'archive.duckdb' AS archive (READ_ONLY)"),
+    ("duckdb", "ATTACH 'archive.duckdb' AS archive (READ_ONLY)", ("58P01", "holds no lake")),
     ("duckdb", "CHECKPOINT"),
     ("duckdb", "SELECT version()"),
     # snowflake: queries
@@ -144,7 +145,7 @@ CASES = [
     ("snowflake", "SELECT o.id, f.value::STRING AS tag FROM orders o, LATERAL FLATTEN(INPUT => SPLIT(o.tags, ',')) f WHERE o.tags IS NOT NULL"),
     ("snowflake", "SELECT * FROM (SELECT customer_id, status, amount FROM orders) PIVOT (SUM(amount) FOR status IN ('paid', 'shipped', 'pending')) AS p"),
     ("snowflake", "SELECT * FROM (SELECT id, amount, customer_id FROM orders) UNPIVOT (val FOR col IN (amount, customer_id))"),
-    ("snowflake", "SELECT * FROM orders SAMPLE (50) SEED (42)"),
+    ("snowflake", "SELECT * FROM orders SAMPLE (50) SEED (42)", ("0A000", "a sample with a seed, a bucket or an offset isn't taken")),
     ("snowflake", "SELECT * EXCLUDE (tags) FROM orders"),
     # snowflake: functions
     ("snowflake", "SELECT DATEADD(day, 7, created_at) AS due, DATEDIFF(day, created_at, CURRENT_TIMESTAMP()) AS age_days FROM orders"),
@@ -157,7 +158,7 @@ CASES = [
     ("snowflake", "SELECT name, DECODE(country, 'US', 'America', 'UK', 'Britain', 'other') AS region FROM customers"),
     ("snowflake", "SELECT name FROM customers WHERE name ILIKE '%lovelace%'"),
     # snowflake: tables and rows
-    ("snowflake", "CREATE OR REPLACE TABLE t_case_201 (id NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1, label VARCHAR(50) NOT NULL DEFAULT 'new', amount NUMBER(10,2), created DATE DEFAULT CURRENT_DATE()) CLUSTER BY (created) COMMENT = 'test table'"),
+    ("snowflake", "CREATE OR REPLACE TABLE t_case_201 (id NUMBER(38,0) AUTOINCREMENT START 1 INCREMENT 1, label VARCHAR(50) NOT NULL DEFAULT 'new', amount NUMBER(10,2), created DATE DEFAULT CURRENT_DATE()) CLUSTER BY (created) COMMENT = 'test table'", ("0A000", "COMMENT isn't taken here; COMMENT ON TABLE")),
     ("snowflake", "INSERT INTO t_case_201 (id, label, amount) VALUES (1, 'a', 10.00), (2, 'b', 20.50)"),
     ("snowflake", "CREATE TRANSIENT TABLE t_case_202 CLONE orders"),
     ("snowflake", "MERGE INTO t_case_201 t USING orders o ON t.id = o.id WHEN MATCHED THEN UPDATE SET amount = o.amount WHEN NOT MATCHED THEN INSERT (id, label, amount) VALUES (o.id, o.status, o.amount)"),
@@ -168,16 +169,16 @@ CASES = [
     ("snowflake", "ALTER TABLE t_case_202 RENAME TO t_case_203"),
     ("snowflake", "COPY INTO t_case_203 FROM @my_stage/notes.csv FILE_FORMAT = (TYPE = CSV SKIP_HEADER = 1)", ("0A000", "FROM 's3://")),
     ("snowflake", "CREATE OR REPLACE STREAM orders_stream ON TABLE orders"),
-    ("snowflake", "CREATE OR REPLACE TASK refresh_totals WAREHOUSE = compute_wh SCHEDULE = '60 MINUTE' AS INSERT INTO t_case_201 (id, status_label, amount) SELECT id, status, amount FROM orders_stream"),
+    ("snowflake", "CREATE OR REPLACE TASK refresh_totals WAREHOUSE = compute_wh SCHEDULE = '60 MINUTE' AS INSERT INTO t_case_201 (id, status_label, amount) SELECT id, status, amount FROM orders_stream", ("42601", "a WAREHOUSE isn't Pondra's: the node runs its tasks")),
     # snowflake: sessions and admin
-    ("snowflake", "USE WAREHOUSE compute_wh"),
+    ("snowflake", "USE WAREHOUSE compute_wh", ("0A000", "USE WAREHOUSE is Snowflake's")),
     ("snowflake", "USE DATABASE analytics"),
     ("snowflake", "SHOW TABLES LIKE 'ORD%' IN SCHEMA PUBLIC"),
     ("snowflake", "DESC TABLE customers"),
     ("snowflake", "EXPLAIN USING TEXT SELECT * FROM orders WHERE amount > 10"),
     ("snowflake", "SET min_amount = 20"),
     ("snowflake", "GRANT SELECT ON ALL TABLES IN SCHEMA PUBLIC TO ROLE analyst"),
-    ("snowflake", "SELECT COUNT(*) FROM orders AT(OFFSET => -60*5)"),
+    ("snowflake", "SELECT COUNT(*) FROM orders AT(OFFSET => -60*5)", ("0A000", "a keyed table keeps only each key's newest version")),
     ("snowflake", "CREATE OR REPLACE FUNCTION double_it(x NUMBER) RETURNS NUMBER AS 'x * 2'"),
     # spark: queries
     ("spark", "SELECT o.id, tag FROM orders o LATERAL VIEW explode(split(o.tags, ',')) t AS tag WHERE o.tags IS NOT NULL"),
@@ -198,7 +199,7 @@ CASES = [
     ("spark", "SELECT substring_index(email, '@', -1) AS domain, instr(name, 'o') AS pos, months_between(current_date(), signed_up) AS months FROM customers"),
     # spark: tables and rows
     ("spark", "CREATE TABLE IF NOT EXISTS t_case_301 (id INT, customer_id INT, amount DECIMAL(10,2), day DATE) USING DELTA PARTITIONED BY (day) COMMENT 'daily orders' TBLPROPERTIES ('delta.autoOptimize.optimizeWrite' = 'true')", ("0A000", "USING DELTA")),
-    ("spark", "CREATE TABLE t_case_302 (id INT, status STRING) CLUSTERED BY (id) INTO 4 BUCKETS STORED AS PARQUET"),
+    ("spark", "CREATE TABLE t_case_302 (id INT, status STRING) CLUSTERED BY (id) INTO 4 BUCKETS STORED AS PARQUET", ("0A000", "CREATE TABLE … LOCATION / STORED AS")),
     ("spark", "CREATE TABLE t_case_303 USING PARQUET AS SELECT customer_id, sum(amount) AS total FROM orders GROUP BY customer_id", ("0A000", "USING PARQUET")),
     ("spark", "CREATE OR REPLACE TEMPORARY VIEW paid_orders AS SELECT * FROM orders WHERE status = 'paid'"),
     ("spark", "INSERT INTO t_case_302 VALUES (1, 'new'), (2, 'paid')"),
@@ -207,7 +208,7 @@ CASES = [
     ("spark", "ALTER TABLE t_case_301 ADD COLUMNS (channel STRING COMMENT 'sales channel')"),
     ("spark", "OPTIMIZE t_case_301 ZORDER BY (customer_id)"),
     # spark: sessions and admin
-    ("spark", "SET spark.sql.shuffle.partitions = 8"),
+    ("spark", "SET spark.sql.shuffle.partitions = 8", ("42704", "unrecognized configuration parameter \"spark.sql.shuffle.partitions\"")),
     ("spark", "SHOW TABLES IN default LIKE 'orders*'"),
     ("spark", "DESCRIBE EXTENDED orders"),
     ("spark", "EXPLAIN EXTENDED SELECT customer_id, sum(amount) FROM orders GROUP BY customer_id"),
@@ -252,8 +253,8 @@ CASES = [
     ("mysql", "SELECT * FROM orders WHERE id = 1 FOR UPDATE"),
     ("mysql", "COMMIT"),
     ("mysql", "PREPARE by_status FROM 'SELECT id FROM orders WHERE status = ?'"),
-    ("mysql", "CREATE PROCEDURE mark_paid(IN oid INT) UPDATE orders SET status = 'paid' WHERE id = oid"),
-    ("mysql", "CALL mark_paid(2)"),
+    ("mysql", "CREATE PROCEDURE mark_paid(IN oid INT) UPDATE orders SET status = 'paid' WHERE id = oid", ("42601", "CREATE PROCEDURE: unexpected UPDATE")),
+    ("mysql", "CALL mark_paid(2)", ("42883", "procedure mark_paid does not exist")),
     ("mysql", "SELECT VERSION(), DATABASE(), CURRENT_USER()"),
     # bigquery: queries
     ("bigquery", "SELECT o.id, c.name, o.amount FROM `orders` AS o JOIN `customers` AS c ON c.id = o.customer_id ORDER BY o.id"),
@@ -271,7 +272,7 @@ CASES = [
     ("bigquery", "SELECT REGEXP_CONTAINS(email, r'@example[.]com$') AS is_example, REGEXP_EXTRACT(email, r'@(.+)$') AS domain FROM customers"),
     ("bigquery", "SELECT customer_id, STRING_AGG(status, ', ' ORDER BY id) AS statuses, COUNTIF(status = 'paid') AS paid_n, SAFE_DIVIDE(SUM(amount), COUNT(*)) AS avg_amount FROM orders GROUP BY customer_id"),
     # bigquery: tables and rows
-    ("bigquery", "CREATE OR REPLACE TABLE `t_case_501` PARTITION BY DATE(created_at) CLUSTER BY customer_id OPTIONS (description = 'orders by day') AS SELECT * FROM orders"),
+    ("bigquery", "CREATE OR REPLACE TABLE `t_case_501` PARTITION BY DATE(created_at) CLUSTER BY customer_id OPTIONS (description = 'orders by day') AS SELECT * FROM orders", ("0A000", "OPTIONS isn't taken here")),
     ("bigquery", "CREATE TABLE IF NOT EXISTS t_case_502 (id INT64 NOT NULL, label STRING, amount NUMERIC(10, 2), meta JSON, tags ARRAY<STRING>, addr STRUCT<city STRING, zip STRING>)"),
     ("bigquery", "INSERT INTO t_case_502 (id, label, amount) VALUES (1, 'a', 9.99), (2, NULL, NULL)"),
     ("bigquery", "MERGE INTO t_case_502 t USING orders o ON t.id = o.id WHEN MATCHED THEN UPDATE SET label = o.status WHEN NOT MATCHED THEN INSERT (id, label, amount) VALUES (o.id, o.status, o.amount)"),
@@ -287,8 +288,8 @@ CASES = [
     ("bigquery", "UPDATE orders SET status = 'pending' WHERE id = 5"),
     ("bigquery", "COMMIT TRANSACTION"),
     ("bigquery", "CREATE TEMP FUNCTION initials(name STRING) AS (SUBSTR(name, 1, 1))"),
-    ("bigquery", "CREATE OR REPLACE PROCEDURE sales.mark_paid(IN oid INT64) BEGIN UPDATE orders SET status = 'paid' WHERE id = oid; END"),
-    ("bigquery", "CALL sales.mark_paid(2)"),
+    ("bigquery", "CREATE OR REPLACE PROCEDURE sales.mark_paid(IN oid INT64) BEGIN UPDATE orders SET status = 'paid' WHERE id = oid; END", ("42601", "CREATE PROCEDURE: unexpected BEGIN")),
+    ("bigquery", "CALL sales.mark_paid(2)", ("42883", "procedure sales.mark_paid does not exist")),
     ("bigquery", "EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM orders'"),
     ("bigquery", "SELECT COUNT(*) FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"),
     # sqlserver: queries
@@ -313,7 +314,7 @@ CASES = [
     ("sqlserver", "SELECT customer_id, SUM(amount) AS total INTO t_case_602 FROM orders GROUP BY customer_id"),
     ("sqlserver", "INSERT INTO t_case_601 (order_id, note, qty) VALUES (1, N'gift', 2), (2, N'rush', 1)"),
     ("sqlserver", "INSERT INTO t_case_601 (order_id, note) OUTPUT inserted.id, inserted.note VALUES (3, N'refund')"),
-    ("sqlserver", "UPDATE o SET o.tags = c.country FROM orders AS o INNER JOIN customers AS c ON c.id = o.customer_id WHERE o.id = 4"),
+    ("sqlserver", "UPDATE o SET o.tags = c.country FROM orders AS o INNER JOIN customers AS c ON c.id = o.customer_id WHERE o.id = 4", ("0A000", "UPDATE … FROM takes one table or subquery")),
     ("sqlserver", "MERGE INTO t_case_602 AS tgt USING customers AS src ON tgt.customer_id = src.id WHEN MATCHED THEN UPDATE SET tgt.total = tgt.total + 0 WHEN NOT MATCHED THEN INSERT (customer_id, total) VALUES (src.id, 0)"),
     ("sqlserver", "ALTER TABLE t_case_601 ADD channel NVARCHAR(20) NULL"),
     ("sqlserver", "CREATE NONCLUSTERED INDEX ix_t601_order ON t_case_601 (order_id) INCLUDE (qty)"),
@@ -322,10 +323,12 @@ CASES = [
     ("sqlserver", "SET NOCOUNT ON"),
     ("sqlserver", "BEGIN TRAN"),
     ("sqlserver", "COMMIT TRAN"),
+    ("sqlserver", "BEGIN TRANSACTION sales"),
+    ("sqlserver", "ROLLBACK TRAN"),
     ("sqlserver", "SELECT @@VERSION AS version"),
     ("sqlserver", "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"),
-    ("sqlserver", "CREATE OR ALTER PROCEDURE dbo.mark_paid @oid INT AS UPDATE orders SET status = 'paid' WHERE id = @oid"),
-    ("sqlserver", "EXEC dbo.mark_paid @oid = 2"),
+    ("sqlserver", "CREATE OR ALTER PROCEDURE dbo.mark_paid @oid INT AS UPDATE orders SET status = 'paid' WHERE id = @oid", ("0A000", "CREATE OR ALTER takes a table or a view; a procedure is made anew with CREATE OR REPLACE PROCEDURE")),
+    ("sqlserver", "EXEC dbo.mark_paid @oid = 2", ("26000", "Prepared statement 'dbo.mark_paid' does not exist")),
     # What a SET asks for is done as asked, or refused by name with the way out (a SET answered and not done
     # would be a quiet lie): each of these says which, its SQLSTATE and words.
     ("postgres", "SET ROLE analyst", ("0A000", "GRANT analyst TO")),

@@ -155,7 +155,8 @@ value can't change what the statement means. Integers and booleans go in as they
 `CAST` of its text, text is quoted, and a date, time, timestamp, interval, UUID, decimal or bytea is its
 literal. A value that doesn't read as its type is refused before anything runs (`22P02` or `22007`).
 A parameter's type is what the client says, or what the query implies (`WHERE id = $1` takes `id`'s
-type). Arrays of `real`, `double precision`, `integer` and `bigint` are bound as arrays, for vector search.
+type). An untyped one in arithmetic takes its other operand's type, as Postgres's does: in `$1 * 1000000 + $2`
+both are `bigint`, which is what pgbench and node-postgres send. Arrays of `real`, `double precision`, `integer` and `bigint` are bound as arrays, for vector search.
 
 ```python
 with psycopg.connect("host=localhost port=5432 user=admin dbname=lake", autocommit=True) as conn:
@@ -387,6 +388,6 @@ Python and `err.sqlstate` in JavaScript.
 | `42P07` | a table or view of that name exists |
 | `22012`, `22003`, `22P02` | division by zero, a number out of range, a value that doesn't cast |
 | `53200`, `53300` | out of memory (an answer bigger than the node's memory for queries too; a `DECLARE` past `PONDRA_CURSORS_MB`); too many queries waiting at once |
-| `0A000` | not supported: `SERIALIZABLE`, `SKIP LOCKED`, a `SCROLL` cursor, and the other refusals named in the guides |
+| `0A000` | not supported: `SERIALIZABLE`, `SKIP LOCKED`, a `SCROLL` cursor, advisory locks (`pg_advisory_lock` and the rest) and `LISTEN`/`NOTIFY` (both planned for 1.1, and each refusal says what to use until then), and the other refusals named in the guides |
 | `XX000` | anything else |
 

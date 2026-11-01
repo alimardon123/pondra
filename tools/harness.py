@@ -1747,12 +1747,15 @@ def tails():
     def pair_reader():
         c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
         while not pair_stop.is_set():
-            c.request("POST", "/sql", f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2 -- {uuid.uuid4()}".encode())  # (never a remembered answer)
+            # (a3 and w: windows over whole partitions, each answered as a GROUP BY joined back to the table read again, `frugal.rs`)
+            c.request("POST", "/sql", (f"SELECT (SELECT sum(id) FROM pa) AS a, (SELECT sum(id) FROM pb) AS b, (SELECT sum(id + 0) FROM pa) AS a2, "
+                                       f"(SELECT sum(id) FROM (SELECT id, count(*) OVER (PARTITION BY id) AS n FROM pa)) AS a3, "
+                                       f"(SELECT max(n) - count(*) FROM (SELECT count(*) OVER () AS n FROM pa)) AS w -- {uuid.uuid4()}").encode())  # (never a remembered answer)
             r = c.getresponse()
             body = json.loads(r.read())
             with pair_lock:
                 pair_reads[0] += 1
-            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2")):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
+            if r.status != 200 or not body or not (body[0].get("a") == body[0].get("b") == body[0].get("a2") == body[0].get("a3")) or body[0].get("w") not in (None, 0):  # (NULL equals NULL: the node's JSON leaves a NULL out, as before the first commit)
                 with pair_lock:
                     pair_wrong.append(body)
 
@@ -1762,7 +1765,7 @@ def tails():
     pair_stop.set()
     [t.join(60) for t in pair_threads]
     print(f"tails: pairs: {pair_reads[0]} reads, {pair_commits[0]} commits, {len(pair_wrong)} wrong {pair_wrong[:3]}, {len(pair_errors)} refused {pair_errors[:3]}")
-    pairs_name = f"a table read twice and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
+    pairs_name = f"a table read twice (a window over whole partitions too) and two tables one transaction wrote read one commit while rows land ({pair_reads[0]} reads, {pair_commits[0]} commits)"
     pairs_good = not pair_wrong and pair_reads[0] >= 200 and pair_commits[0] >= 500
     node.kill()
     checks = {
@@ -4050,7 +4053,7 @@ def scale():
         "three nodes: a self-join on sealed files by their time ranges": by_ranges,
         "shuffles (GROUP BY, joins, windows) = one node": all(same for same, *_ in shuffles.values()) and sum(sh for _, sh, *_ in shuffles.values()) >= 10,
         "outer, semi and anti joins, subqueries, CTEs and unions run across the nodes": sum(sp for _, _, sp, _ in list(shuffles.values())[14:23]) >= 9,
-        "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:]) >= 4,
+        "tables that share a key meet where they are, by its ranges": sum(r for *_, r in list(shuffles.values())[23:29]) >= 4,
         "Delta and Iceberg readers see sealed files": all(v == n_rows for v in theirs.values()),
     }
     for n in list(NODES):
@@ -4108,7 +4111,7 @@ def scale():
     got_part = answered("avg(id) OVER (PARTITION BY id % 3)", "SELECT max(length(s) + k + d) AS m FROM (SELECT s, k, id - avg(id) OVER (PARTITION BY id % 3) AS d FROM big)")
     win_peak = vm_hwm(node.p.pid)
     win_refused = refusal("SELECT max(id + n) AS m FROM (SELECT id, last_value(id) OVER (ORDER BY s ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS n FROM big)")
-    checks["a window over all rows past the memory limit answers on the frugal retry (a GROUP BY joined back); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
+    checks["a window over whole partitions past the memory limit answers (a GROUP BY joined back: at once over a table, on the frugal retry over a join); one no rewrite takes refuses (53200) and the node answers after; one that streams answers"] = (
         got_all == [{"m": want_all}]
         and got_part is not None and abs(got_part[0]["m"] - want_part) <= 1e-6
         and win_refused is not None and win_refused["sqlstate"] == "53200"  # (its sort may refuse before the window's held rows do)
@@ -4813,6 +4816,9 @@ def shuffle_checks(port):
         "by key ranges: NULL keys": "SELECT count(*) AS n, sum(qty) AS q FROM li WHERE oid IS NULL OR oid > 199990",
         # (the NULLs a LEFT JOIN pads with sit wherever the unmatched rows are: not keyed by range)
         "by key ranges: grouped by a padded key": "SELECT li.oid, count(*) AS n FROM o LEFT JOIN li ON o.id = li.oid AND li.qty = 1 GROUP BY li.oid ORDER BY n DESC, li.oid LIMIT 3",
+        # (a window over whole partitions is answered as a GROUP BY joined back, `frugal.rs`: spread as on one node)
+        "window, whole partitions": "SELECT k, id, v - avg(v) OVER (PARTITION BY k) AS d, count(*) OVER (PARTITION BY k) AS c FROM a WHERE k < 4 ORDER BY k, id",
+        "window, OVER () on every row": "SELECT max(v + c) AS m, count(*) AS n FROM (SELECT v, count(*) OVER () AS c FROM a)",
     }
     out = {}
     for name, s in queries.items():
@@ -6024,7 +6030,7 @@ $$""")
     q("DROP SCHEMA ops CASCADE")
     checks["…go with it (DROP SCHEMA … CASCADE)"] = "ops" not in json.dumps(call(A.port, "GET", "/routines", headers={"authorization": "Bearer r-tok"}))
     q("DROP MACRO big"); q("DROP PROCEDURE twice")
-    checks["DROP MACRO, DROP PROCEDURE"] = err("CALL twice(1)").endswith("no procedure twice'") or "no procedure twice" in err("CALL twice(1)")
+    checks["DROP MACRO, DROP PROCEDURE"] = "procedure twice does not exist" in err("CALL twice(1)") # (42883, as Postgres says it)
     # DO (ADR-030): a console's Python cell, from every door, as an admin. What it prints comes
     # back as notices; its last expression, a frame here, as rows; an error at the code's line.
     import urllib.request
@@ -14119,6 +14125,23 @@ def waits():
     skip_out = code(c2, "SELECT balance FROM accounts WHERE id = 19 FOR UPDATE SKIP LOCKED")
     checks["SKIP LOCKED is refused by name (0A000), in a transaction and outside one"] = skip_in == "0A000" and skip_out == "0A000"
 
+    # Advisory locks and LISTEN/NOTIFY are Postgres's, not built here yet: a migration tool sends them first, so each is refused
+    # by name (0A000, with the feature's words in the message), in a transaction of its own and outside one.
+    def refused_in_txn(stmt):
+        """`stmt` in a transaction of its own: its SQLSTATE and message, as `failure` gives them."""
+        c2.execute("BEGIN")
+        try:
+            return failure(c2, stmt)
+        finally:
+            c2.execute("ROLLBACK")
+    refusals = {
+        "advisory locks": [refused_in_txn("SELECT pg_advisory_lock(1)"), refused_in_txn("SELECT pg_try_advisory_xact_lock(1)"), failure(c2, "SELECT pg_advisory_lock(1)")],
+        "LISTEN and NOTIFY": [refused_in_txn("LISTEN jobs"), refused_in_txn("NOTIFY jobs, 'x'"), failure(c2, "LISTEN jobs")],
+    }
+    info["advisory locks and LISTEN refusals"] = refusals
+    checks["advisory locks and LISTEN/NOTIFY are refused by name (0A000, the feature's words in the message), in a transaction and outside one"] = all(
+        sqlstate == "0A000" and name in message for name, got in refusals.items() for sqlstate, message in got)
+
     before20 = bal(20)
     plain = c2.execute("SELECT balance FROM accounts WHERE id = 20 FOR UPDATE").fetchall()
     checks["SELECT … FOR UPDATE outside a transaction is a plain read: it returns the row"] = plain == [(before20,)]
@@ -15014,9 +15037,9 @@ def objects():
     http("PREPARE big (BIGINT) AS SELECT id FROM orders WHERE amount > $1 ORDER BY id", s)
     executed = http("EXECUTE big (25)", s)[2]
     script = q("SET TIME ZONE '+02:00'; SELECT TIMESTAMPTZ '2026-10-01T00:00:00Z' AS t")
-    checks["SET, SHOW, RESET, PREPARE, EXECUTE: the session's; a script is a session of its own"] = zoned == [{"t": "2026-10-01T08:00:00+08:00"}] \
+    checks["SET, SHOW, RESET, PREPARE, EXECUTE: the session's; a script is a session of its own; an unknown dotted setting is 42704"] = zoned == [{"t": "2026-10-01T08:00:00+08:00"}] \
         and other == [{"t": "2026-10-01T00:00:00Z"}] and shown == [{"name": "datafusion.execution.time_zone", "value": "+08:00"}] \
-        and executed == [{"id": 3}, {"id": 4}] and script == [{"t": "2026-10-01T02:00:00+02:00"}] and http("SET aa.bb = 1", s)[0] == 500
+        and executed == [{"id": 3}, {"id": 4}] and script == [{"t": "2026-10-01T02:00:00+02:00"}] and http("SET aa.bb = 1", s)[1] == "42704"
     spark = q("SELECT format_string('%s x %d', 'tea', 3) AS f, pmod(-7, 3) AS m, arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS fl")
     http("SET datafusion.sql_parser.dialect = 'spark'", s)
     floor_spark = http("SELECT arrow_typeof(floor(CAST(1.5 AS DOUBLE))) AS t, arrow_typeof(floor(1.5)) AS d", s)[2]  # (Spark's: a DOUBLE's floor a BIGINT, a DECIMAL's a DECIMAL of scale 0)
@@ -19476,7 +19499,8 @@ def bi():
 # The object kinds `registry()` doesn't make itself, and where each is checked (grepped: each named
 # section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
 ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
-             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso"}
+             "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso",
+             "extension": "tests/forms/extensions.slt, extension.rs's tests (an installed one runs from E2b's harness.py extensions)"}
 
 
 def registry():
@@ -22242,8 +22266,9 @@ def prepared():
     answer as the statements sent whole, in text and binary, NULLs and key lookups among them; a query
     whose table gains a column is refused once with Postgres's 0A000, then answered with it (and a key
     looked up whose row predates the column has it NULL, at every door); a FETCH is
-    described by its cursor each time; and a prepared query with a parameter takes about what the
-    statement sent whole takes (planned once a run, not three times)."""
+    described by its cursor each time; a prepared query with a parameter takes about what the
+    statement sent whole takes (planned once a run, not three times); and an untyped parameter in
+    arithmetic is a number, as psycopg's str and pgbench's variables need (`arithmetic_types`)."""
     import psycopg, statistics
     lake = new_lake()
     pg = A.port + 50
@@ -22255,6 +22280,7 @@ def prepared():
         sql(A.port, "INSERT INTO t SELECT value, chr(97 + CAST(value % 5 AS INT)) FROM range(1, 1001)")
         sql(A.port, "CREATE TABLE k (id BIGINT PRIMARY KEY, name TEXT, score DOUBLE)")
         sql(A.port, "INSERT INTO k VALUES (1, 'ann', 1.5), (2, 'bo', 2.5), (3, NULL, NULL)")
+        sql(A.port, "CREATE TABLE kv (id BIGINT PRIMARY KEY, n BIGINT)")
         queries = [
             ("SELECT id, v FROM t WHERE id = %s", [(3,), (500,), (2000,)]),
             ("SELECT count(*) AS n FROM t WHERE v = %s", [("b",), ("e",), ("z",)]),
@@ -22339,6 +22365,34 @@ def prepared():
                 c.execute("CLOSE m")
             c.rollback()
             checks["a prepared FETCH is described by its cursor each time (another DECLARE, other columns)"] = fetched == [(["id"], [(1,)]), (["id", "v"], [(1, "b")])]
+
+        # psycopg sends a str parameter untyped, and pgbench sends its variables as text: an unknown parameter in arithmetic takes
+        # the other operand's type, as Postgres's does (pg.rs `arithmetic_types`), so each is a number and not text.
+        with psycopg.connect(url, autocommit=True) as c:
+            add = "SELECT %s * 1000000000000000 + %s AS k"
+            summed = [c.execute(add, ("3", "7")).fetchone()[0], c.execute(add, ("3", "7"), prepare=True).fetchone()[0]]
+            c.execute("INSERT INTO kv VALUES (%s * 1000000000000000 + %s, 0)", ("2", "5"))
+            landed = c.execute("SELECT id FROM kv").fetchall()
+            c.execute("UPDATE kv SET n = n + %s WHERE id = %s", ("4", "2000000000000005"))
+            n = c.execute("SELECT n FROM kv WHERE id = 2000000000000005").fetchone()[0]
+        checks["an untyped str in arithmetic takes the other operand's type: SELECT %s * 1000000000000000 + %s is 3000000000000007, plain and prepared"] = summed == [3000000000000007, 3000000000000007]
+        checks["INSERT … VALUES (%s * 1000000000000000 + %s, 0) with str parameters lands id 2000000000000005"] = landed == [(2000000000000005,)]
+        checks["UPDATE kv SET n = n + %s WHERE id = %s with str parameters gives n = 4"] = n == 4
+
+        # pgbench, prepared and then extended: its script's variables in the same sum, 20 transactions into kv.
+        if shutil.which("pgbench"):
+            script = os.path.join(tempfile.mkdtemp(), "kv.sql")
+            with open(script, "w") as f:
+                f.write("\\set id random(1, 900000)\n"
+                        "INSERT INTO kv (id, n) VALUES (:client_id * 1000000000000000 + :id, 0) ON CONFLICT (id) DO NOTHING;\n")
+            for mode in ("prepared", "extended"):
+                r = subprocess.run(["pgbench", "-n", "-M", mode, "-c", "1", "-t", "20", "-h", "127.0.0.1", "-p", str(pg), "-U", "u", "lake", "-f", script],
+                                   capture_output=True, text=True, timeout=300)
+                info[f"pgbench -M {mode}"] = {"code": r.returncode, "out": r.stdout[-400:], "err": r.stderr[-400:]}
+                checks[f"pgbench -M {mode}: its script's variables in arithmetic run, 20 of 20 transactions, no failed transaction"] = (
+                    r.returncode == 0 and "processed: 20/20" in r.stdout and "failed transactions: 0" in r.stdout and "error" not in r.stderr.lower())
+        else:
+            info["pgbench"] = "not installed: not run"
 
         # What it costs: a prepared query with a parameter against the statement sent whole, taking turns.
         with psycopg.connect(url, autocommit=True) as c:
@@ -23536,8 +23590,8 @@ def friendly():
     checks["FORCE INSTALL json alone over HTTP: the command tag, and its notice in the header"] = \
         st == 200 and json.loads(body) == {"command": "INSTALL"} and json.loads(hd.get("x-pondra-notices", "[]")) == [said("json", "install")]
     st, hd, body = raw("INSTALL spatial")
-    checks["INSTALL spatial over HTTP: refused by name, naming it and the 1.1 that brings Pondra's own, SQLSTATE 0A000"] = \
-        st != 200 and hd.get("x-pondra-sqlstate") == "0A000" and "spatial" in body and "1.1" in body
+    checks["INSTALL spatial over HTTP: refused by name, naming it and how a Pondra extension is installed (from its file), SQLSTATE 0A000"] = \
+        st != 200 and hd.get("x-pondra-sqlstate") == "0A000" and "spatial isn't built into Pondra" in body and "INSTALL spatial FROM 'path or URL'" in body
     with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pg:
         told = []
         pg.add_notice_handler(lambda n: told.append(n.message_primary))
@@ -23633,6 +23687,123 @@ def attached():
     return "an attached lake read while its leader changes, tiers and purges rows: every read as of one commit"
 
 
+def recursive():
+    """WITH RECURSIVE over big graphs (L6, the recursive_builds rule in optimize.rs): each answer is DuckDB 2.0's on the
+    same rows, and the work table is the build side of a recursive term's join (EXPLAIN). The graphs are made in each
+    engine by the same SQL (integer arithmetic only), so the rows are the same; the timings are information only, beside
+    the deep reach with `SET datafusion.optimizer.join_reordering = false` (the work table built too, but the big table
+    shuffled on every iteration)."""
+    import duckdb
+    lake = new_lake()
+    node = Node(lake, A.port).start()
+    q = lambda s: call(A.port, "POST", "/sql", s.encode(), timeout=600)
+    con = duckdb.connect()
+    checks, info, seconds = {}, {"duckdb": duckdb.__version__}, {}
+    # (each engine's range() names its column: Pondra's value, DuckDB's range)
+    GRAPHS = {
+        "edges": "SELECT ((i * 7919 + 13) % 1000003) % 100000 AS src, ((i * 104729 + 7) % 1000033) % 100000 AS dst FROM (SELECT {c} AS i FROM range(0, 1000000)) AS g",
+        "deep": "SELECT i % 500000 AS src, i % 500000 + 1 + ((i * 7919 + 13) % 1000003) % 2000 AS dst FROM (SELECT {c} AS i FROM range(0, 1000000)) AS g",
+        "small": "SELECT ((i * 7919 + 13) % 1000003) % 100 AS src, ((i * 104729 + 7) % 1000033) % 100 AS dst FROM (SELECT {c} AS i FROM range(0, 100)) AS g",
+    }
+    REACH = "WITH RECURSIVE reach(n) AS (SELECT CAST({s} AS BIGINT) UNION SELECT e.dst FROM reach JOIN {g} e ON e.src = reach.n) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    PATHS = "WITH RECURSIVE reach(n, d) AS (SELECT CAST({s} AS BIGINT), 0 UNION ALL SELECT e.dst, d + 1 FROM reach JOIN edges e ON e.src = reach.n WHERE d < 4) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    SMALL = "WITH RECURSIVE reach(n) AS (SELECT CAST({s} AS BIGINT) UNION SELECT s.dst FROM reach JOIN small s ON s.src = reach.n) SELECT count(*) AS c, sum(n) AS s FROM reach"
+    WALK = ("WITH RECURSIVE t(id, depth, path) AS (SELECT id, 0, CAST(id AS VARCHAR) FROM emp WHERE boss IS NULL "
+            "UNION ALL SELECT e.id, t.depth + 1, t.path || '/' || CAST(e.id AS VARCHAR) FROM t JOIN emp e ON e.boss = t.id) "
+            "SELECT id, depth, path FROM t ORDER BY id")
+
+    def both(pondra_sql, duck_sql=None):
+        """(Pondra's rows, DuckDB's rows, both as lists of lists; Pondra's seconds, DuckDB's seconds) for one query."""
+        t = time.time()
+        got = [list(r.values()) for r in q(pondra_sql)]
+        tp = time.time() - t
+        t = time.time()
+        want = [list(r) for r in con.execute(duck_sql or pondra_sql).fetchall()]
+        return got, want, tp, time.time() - t
+
+    def build_side(text, op="HashJoinExec"):
+        """The first `op`'s first input in an EXPLAIN's indented plan: the lines under the first line below it that is two spaces deeper."""
+        lines = text.splitlines()
+        indent = lambda l: len(l) - len(l.lstrip(" "))
+        for i, l in enumerate(lines):
+            if op not in l:
+                continue
+            d, first = indent(l) + 2, []
+            for m in lines[i + 1:]:
+                if indent(m) < d or (indent(m) == d and first):
+                    break  # (the parent's next line, or the second input)
+                first.append(m)
+            return "\n".join(first)
+        return ""
+
+    try:
+        for name, body in GRAPHS.items():
+            q(f"CREATE TABLE {name} (src BIGINT, dst BIGINT)")
+            q(f"INSERT INTO {name} " + body.format(c='"value"'))
+            con.execute(f"CREATE TABLE {name} (src BIGINT, dst BIGINT)")
+            con.execute(f"INSERT INTO {name} " + body.format(c='"range"'))
+            got = [list(r.values()) for r in q(f"SELECT count(*) AS n, sum(src) AS s, sum(dst) AS d FROM {name}")]
+            want = [list(r) for r in con.execute(f"SELECT count(*), sum(src), sum(dst) FROM {name}").fetchall()]
+            checks[f"{name}: the same rows in both engines (count and sums of src and dst)"] = got == want
+        # emp: a tree rooted at 0, each employee's boss an earlier id, so all 10,000 are reached from the root
+        q("CREATE TABLE emp (id BIGINT, boss BIGINT)")
+        q("INSERT INTO emp VALUES (0, NULL)")
+        q('INSERT INTO emp SELECT i, ((i * 7919 + 13) % 1000003) % i FROM (SELECT "value" AS i FROM range(1, 10000)) AS g')
+        con.execute("CREATE TABLE emp (id BIGINT, boss BIGINT)")
+        con.execute("INSERT INTO emp VALUES (0, NULL)")
+        con.execute('INSERT INTO emp SELECT i, ((i * 7919 + 13) % 1000003) % i FROM (SELECT "range" AS i FROM range(1, 10000)) AS g')
+        hot_settled(A.port)
+        q(REACH.format(s=1, g="deep"))  # (a warm-up from a start no check uses)
+
+        # 1. reach (UNION) from three nodes on each graph; paths to depth 4 (UNION ALL, WHERE d < 4) on the shallow one
+        for g, starts in (("edges", (11, 4242, 99991)), ("deep", (0, 250001, 499999))):
+            for s in starts:
+                got, want, tp, td = both(REACH.format(s=s, g=g))
+                checks[f"reach (UNION) from node {s} on the {g} graph: count and sum of the reach = DuckDB 2.0's"] = got == want
+                seconds[f"reach from {s} on {g}: Pondra, DuckDB"] = (tp, td)
+        for s in (11, 4242, 99991):
+            got, want, tp, td = both(PATHS.format(s=s))
+            checks[f"paths to depth 4 (UNION ALL, WHERE d < 4) from node {s} on the shallow graph = DuckDB 2.0's"] = got == want
+            seconds[f"paths to depth 4 from {s} on edges: Pondra, DuckDB"] = (tp, td)
+
+        # 2. a hierarchy walk over emp with a depth and a path string; a recursive term joining small (100 rows)
+        got, want, tp, td = both(WALK)
+        checks["hierarchy walk over emp (10,000 employees): each one's depth and path = DuckDB 2.0's"] = got == want and len(want) == 10000
+        seconds["hierarchy walk over emp: Pondra, DuckDB"] = (tp, td)
+        small = [both(SMALL.format(s=s)) for s in (0, 17, 63)]
+        checks["a recursive term joining small (100 rows): count and sum of the reach from 0, 17 and 63 = DuckDB 2.0's"] = all(g == w for g, w, _, _ in small)
+        info["small: reach from 0, 17, 63 (count, sum)"] = [g for g, _, _, _ in small]
+
+        # 3. EXPLAIN: the reach over edges, whose join's first input (the build side) reads the work table and not edges
+        plan = {r["plan_type"]: r["plan"] for r in q("EXPLAIN " + REACH.format(s=5, g="edges"))}.get("physical_plan", "")
+        side = build_side(plan)
+        info["EXPLAIN: the first input of the first HashJoinExec"] = side
+        checks["EXPLAIN: the reach over edges has the work table on the build side (the HashJoinExec's first input reads it, not edges)"] = \
+            "WorkTableExec" in side and "DataSourceExec" not in side
+
+        # 4. information only: the deep reach from one start, as it is and with join_reordering off (the written order)
+        s = 300017  # (no check above uses it: a repeat of a checked query could come from the result cache)
+        t = time.time()
+        rule = [list(r.values()) for r in q(REACH.format(s=s, g="deep"))]
+        seconds[f"deep reach from {s}, as planned (the rule): Pondra"] = (time.time() - t, None)
+        t = time.time()
+        written = [list(r.values()) for r in q("SET datafusion.optimizer.join_reordering = false; " + REACH.format(s=s, g="deep"))]
+        seconds[f"deep reach from {s}, join_reordering = false: Pondra"] = (time.time() - t, None)
+        t = time.time()
+        want = [list(r) for r in con.execute(REACH.format(s=s, g="deep")).fetchall()]
+        seconds[f"deep reach from {s}: DuckDB"] = (time.time() - t, None)
+        info["deep reach from 300017: the rule and join_reordering = false agree with DuckDB"] = [rule == want, written == want]
+    finally:
+        con.close()
+        node.kill()
+    info["seconds"] = {k: [round(a, 3), None if b is None else round(b, 3)] for k, (a, b) in seconds.items()}
+    ok = all(checks.values())
+    print(json.dumps({"recursive": checks, "ok": ok, "info": info}, indent=1, default=str))
+    if not ok:
+        sys.exit(1)
+    return f"{sum(checks.values())} of {len(checks)} recursive checks"
+
+
 def dialects():
     """What people from other databases type on their first days (round 34, L6): the statements of
     `tools/dialects_check.py`, spelled as Postgres, DuckDB, Snowflake, Spark, MySQL, BigQuery and SQL
@@ -23643,8 +23814,8 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 13, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 6}
-    XX000 = 24  # (refusals that are internal errors: lower it as they get codes, never raise it)
+    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 14, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 12}
+    XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()
     q = lambda s: sql(A.port, s)
@@ -24709,8 +24880,9 @@ def matches():
     match started on 31 January stays open through 28 February. 6: PATTERN (a b), its rows in two commits, is written once.
     9: the refusals of "What it takes", each 0A000 with its words; UPDATE and DELETE on a followed source (2BP01); a subquery
     as the input, 0A000 with the pattern view's words; a view kept by key as the input. 10: a search that never ends, past
-    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 5, 7 and 8
-    (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
+    PONDRA_MATCH_HELD_ROWS, stops the view with 54000 and names its key. 11: a subquery before MATCH_RECOGNIZE over a lake
+    table answers its CTE's rows, aliased or not; a stored view shows the subquery as written; a materialized view over one is refused by name, EMIT FINAL or not.
+    5, 7 and 8 (matches_random, matches_restart, matches_cost): every skip rule and the generator's queries against the oracle of
     ef_expected after each commit, a restart mid-stream and three nodes, and a run's cost against its history and keys."""
     checks, info = {}, {}
     start = {"at": time.time(), "start": time.time()}  # (the seconds of each part, in info: `lap`)
@@ -24945,6 +25117,41 @@ def matches():
     checks["a subquery as the input is refused 0A000 with the pattern view's words (FROM t MATCH_RECOGNIZE), not GROUP BY's"] = refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
             f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
     lap("9, the refusals")
+    # 11. A subquery before MATCH_RECOGNIZE (pattern.rs `text`): it is a CTE in a derived table, so the clause reads it as a
+    # table. Over a lake table it answers what the same clause answers over a CTE of that subquery, with the input aliased, with
+    # AS, or with no alias; a stored view of it answers the same and shows its subquery as written; EMIT FINAL over a subquery
+    # with an alias is refused with the words of section 9
+    q("CREATE TABLE sub_src (symbol TEXT, day INT, ts TIMESTAMP, price INT, venue TEXT)")
+    rng11, sub_rows = random.Random(11), []
+    for s in range(40):
+        p11 = 50
+        for d in range(1, 21):
+            p11 = max(1, p11 + rng11.randint(-6, 6))
+            sub_rows.append(f"('s{s:02d}', {d}, '2026-10-01 00:{d:02d}:00', {p11}, '{'x' if d % 4 else 'y'}')")
+    q("INSERT INTO sub_src VALUES " + ", ".join(sub_rows))
+    sub_clause = ("MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES FIRST(a.ts) AS s, LAST(b.ts) AS e ONE ROW PER MATCH "
+                  "PATTERN (a b+) DEFINE b AS b.price > PREV(b.price))")
+    cte_rows = q(f"WITH t AS (SELECT * FROM sub_src WHERE venue = 'x') SELECT * FROM t {sub_clause} m ORDER BY symbol, s")
+    sub_rows_t = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m ORDER BY symbol, s")
+    sub_rows_as = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') AS t {sub_clause} AS m ORDER BY symbol, s")
+    sub_rows_bare = q(f"SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') {sub_clause} m ORDER BY symbol, s")
+    info["11: matches of the CTE, the subquery aliased t, AS t, and with no alias"] = [len(cte_rows), len(sub_rows_t), len(sub_rows_as), len(sub_rows_bare)]
+    checks["a subquery before MATCH_RECOGNIZE over a lake table answers the rows its CTE answers, with the input aliased or not, with AS or without"] = \
+        len(cte_rows) > 0 and sub_rows_t == cte_rows and sub_rows_as == cte_rows and sub_rows_bare == cte_rows
+    q(f"CREATE VIEW sub_v AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m")
+    view_rows = q("SELECT * FROM sub_v ORDER BY symbol, s")
+    view_def = q("SHOW CREATE VIEW sub_v")[0]["definition"]
+    info["11: the view's definition"] = view_def
+    checks["a stored view of a subquery before MATCH_RECOGNIZE answers its CTE's rows, and shows its subquery as written (no __mr_input)"] = \
+        view_rows == cte_rows and "FROM (SELECT * FROM sub_src WHERE venue = 'x') t MATCH_RECOGNIZE" in view_def and "__mr_input" not in view_def
+    checks["a materialized view (not EMIT FINAL) over a subquery before MATCH_RECOGNIZE is refused 0A000 by name, with what to write"] = \
+        refused("a materialized view over a subquery", f"CREATE MATERIALIZED VIEW sub_mv AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m",
+                ["a materialized view over a MATCH_RECOGNIZE of a subquery", "FROM t MATCH_RECOGNIZE"])
+    checks["EMIT FINAL over a subquery with an alias is refused 0A000 with the pattern view's words, as without one"] = \
+        refused("a subquery with an alias as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq2 AS SELECT * FROM (SELECT * FROM late_src) t "
+                f"MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
+                f"PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])
+    lap("11, a subquery as the input")
     node.kill()
 
     # 10. A search that never ends: one key holds 100 rows of an open search, past PONDRA_MATCH_HELD_ROWS (50 here, its own node),
@@ -26707,7 +26914,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -26739,7 +26946,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -26752,7 +26959,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

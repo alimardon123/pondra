@@ -13,9 +13,11 @@ use datafusion::datasource::physical_plan::{FileScanConfigBuilder, ParquetSource
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::recursive_query::RecursiveQueryExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
+use datafusion::physical_plan::work_table::WorkTableExec;
 use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion::physical_plan::{aggregates::AggregateExec, filter::FilterExec, joins::HashJoinExec, ExecutionPlan, PhysicalExpr};
 use datafusion::prelude::SessionConfig;
@@ -1117,6 +1119,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
+    rules.insert(at + 3, Arc::new(RecursiveBuilds)); // (before the exchanges: EnforceDistribution adds the coalesce a CollectLeft build needs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(AndsOnce)); // (last: the filters are where they will run)
     // (the hot columns are the node's)
@@ -1650,6 +1653,60 @@ fn partitioned(j: &HashJoinExec) -> Result<Arc<dyn ExecutionPlan>> {
 fn rows(p: &Arc<dyn ExecutionPlan>) -> Option<usize> {
     use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
     StatisticsContext::new().compute(p.as_ref(), &StatisticsArgs::new()).ok().and_then(|s| s.num_rows.get_value().copied())
+}
+
+/// A recursive query runs its recursive term again on every iteration, and a hash join in that term
+/// builds its table on the side DataFusion's sizes pick. The work table has no statistics, so they can
+/// pick the side that doesn't read it, and the table was built again each time: a reach query over 1 M
+/// edges built 1 M rows 320 times on a deep graph (3.9 s; 0.35 s with the work table built, DuckDB 2.0
+/// 0.16 s). On a shallow graph of six iterations it was 0.201 s, and 0.065 s (DuckDB 0.10 s).
+///
+/// So a hash join in a recursive term is swapped when its build side doesn't read the work table, its
+/// probe side does, its build side is estimated at 100,000 rows or more, and its inputs can swap (not a
+/// NOT IN). A small build side takes a couple of milliseconds to build, so DataFusion keeps the sides
+/// it picked for it. The swap keeps the join's mode: a CollectLeft join builds the work table once per
+/// iteration and probes the big table where it lies, with no shuffle of it (`SET
+/// datafusion.optimizer.join_reordering = false` builds on the work table too, but hashes the big table
+/// across the threads on every iteration: 1.37 s on the deep graph).
+#[derive(Debug)]
+struct RecursiveBuilds;
+
+impl PhysicalOptimizerRule for RecursiveBuilds {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        plan.transform_up(|p| {
+            let Some(r) = p.downcast_ref::<RecursiveQueryExec>() else { return Ok(Transformed::no(p)) };
+            // (only the recursive term: the static one runs once, and keeps the sides DataFusion gave it)
+            let term = r.recursive_term().clone().transform_down(|t| {
+                let Some(j) = t.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(t)) };
+                if !work_probed(j)? {
+                    return Ok(Transformed::no(t));
+                }
+                Ok(Transformed::yes(j.swap_inputs(*j.partition_mode())?))
+            })?;
+            if !term.transformed {
+                return Ok(Transformed::no(p));
+            }
+            // (RecursiveQueryExec's own rebuild gives its work table to the term's WorkTableExec again)
+            let children = vec![Arc::clone(r.static_term()), term.data];
+            Ok(Transformed::yes(replace_children_if_necessary(p.clone(), children)?))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "recursive_builds"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// Does a hash join of a recursive term probe with the work table and build on a side that doesn't
+/// read it, on a build side of 100,000 rows or more, and can its inputs swap (`RecursiveBuilds`)?
+fn work_probed(j: &HashJoinExec) -> Result<bool> {
+    let reads_work = |p: &Arc<dyn ExecutionPlan>| p.exists(|p| Ok(p.is::<WorkTableExec>()));
+    Ok(j.join_type().supports_swap() && !j.null_aware && !reads_work(j.left())? && reads_work(j.right())? && rows(j.left()).is_some_and(|n| n >= 100_000))
 }
 
 /// `x IN (SELECT k … GROUP BY k HAVING …)`: the few groups a HAVING keeps are the hash table, the
@@ -2814,6 +2871,111 @@ mod tests {
         ] {
             let (plan, out) = ands_once_of(&ctx, sql).await;
             assert!(Arc::ptr_eq(&predicate_of(&plan).unwrap(), &predicate_of(&out).unwrap()), "{sql}: left as it is");
+        }
+    }
+
+    /// A session with the physical rules too (`physical_rules()`, as the engine has them), without the one named.
+    fn physical_session(without: Option<&str>) -> datafusion::prelude::SessionContext {
+        use datafusion::execution::SessionStateBuilder;
+        let state = SessionStateBuilder::new()
+            .with_config(config(SessionConfig::new()))
+            .with_default_features()
+            .with_analyzer_rules(analyzer_rules())
+            .with_optimizer_rules(rules())
+            .with_physical_optimizer_rules(physical_rules().into_iter().filter(|r| Some(r.name()) != without).collect())
+            .build();
+        datafusion::prelude::SessionContext::new_with_state(state)
+    }
+
+    /// A table of `n` (src, dst) rows over `nodes` nodes, pseudo-random (a hash of the row number), as BIGINT columns.
+    fn edge_batch(n: u64, nodes: u64) -> datafusion::arrow::array::RecordBatch {
+        use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        let mix = |x: u64| {
+            let z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let z = (z ^ (z >> 29)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z ^ (z >> 32)
+        };
+        let column = |offset: u64| -> ArrayRef { Arc::new(Int64Array::from((0..n).map(|i| (mix(i + offset) % nodes) as i64).collect::<Vec<_>>())) };
+        let schema = Arc::new(Schema::new(vec![Field::new("src", DataType::Int64, false), Field::new("dst", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![column(0), column(n)]).unwrap()
+    }
+
+    /// The build side (the left input) of the first hash join in a physical plan.
+    fn build_side_of(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        match plan.downcast_ref::<HashJoinExec>() {
+            Some(j) => Some(Arc::clone(j.left())),
+            None => plan.children().into_iter().find_map(build_side_of),
+        }
+    }
+
+    /// A query's physical plan as `displayable` shows it (inputs indented).
+    async fn plan_text(ctx: &datafusion::prelude::SessionContext, sql: &str) -> String {
+        use datafusion::physical_plan::displayable;
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        text
+    }
+
+    /// A query's physical plan as text, and whether its first hash join builds on a side that reads the work table.
+    async fn builds_on_work_table(ctx: &datafusion::prelude::SessionContext, sql: &str) -> (String, bool) {
+        use datafusion::physical_plan::displayable;
+        let plan = ctx.sql(sql).await.unwrap().create_physical_plan().await.unwrap();
+        let build = build_side_of(&plan).expect("a hash join in the plan");
+        let text = displayable(plan.as_ref()).indent(true).to_string();
+        let builds = build.exists(|p| Ok(p.is::<WorkTableExec>())).unwrap();
+        (text, builds)
+    }
+
+    /// A recursive reach over `edges` (200,000 rows, 20,000 nodes): its recursive term's join builds on the work
+    /// table rather than on the edges, and the answer is the one `join_reordering = false` gives (the written order).
+    #[tokio::test]
+    async fn a_recursive_term_builds_on_its_work_table() {
+        let reach = "WITH RECURSIVE reach(n) AS (SELECT 0 UNION SELECT e.dst FROM reach JOIN edges e ON e.src = reach.n) SELECT n FROM reach ORDER BY n";
+        let (ctx, plain, written) = (physical_session(None), physical_session(Some("recursive_builds")), physical_session(Some("recursive_builds")));
+        let edges = edge_batch(200_000, 20_000);
+        for c in [&ctx, &plain, &written] {
+            c.register_batch("edges", edges.clone()).unwrap();
+        }
+        written.sql("SET datafusion.optimizer.join_reordering = false").await.unwrap().collect().await.unwrap();
+        let (plain_text, plain_builds) = builds_on_work_table(&plain, reach).await;
+        assert!(!plain_builds, "DataFusion builds on the edges without the rule:\n{plain_text}");
+        let (text, builds) = builds_on_work_table(&ctx, reach).await;
+        assert!(builds, "the join builds on the work table:\n{text}");
+        let (written_text, written_builds) = builds_on_work_table(&written, reach).await;
+        assert!(written_builds, "join_reordering = false builds on the work table:\n{written_text}");
+        let (got, want) = (answer(&ctx, reach).await, answer(&written, reach).await);
+        assert!(got.1.len() > 1_000, "the reach is most of the graph: {} rows", got.1.len());
+        assert_eq!(got, want, "the answer with the rule and with join_reordering = false");
+    }
+
+    /// Over `small` (100 rows) the plan is as DataFusion makes it: the same plan with and without the rule.
+    #[tokio::test]
+    async fn a_recursive_join_over_a_small_table_is_not_swapped() {
+        let reach = "WITH RECURSIVE reach(n) AS (SELECT 0 UNION SELECT s.dst FROM reach JOIN small s ON s.src = reach.n) SELECT n FROM reach ORDER BY n";
+        let (ctx, plain) = (physical_session(None), physical_session(Some("recursive_builds")));
+        let small = edge_batch(100, 30);
+        for c in [&ctx, &plain] {
+            c.register_batch("small", small.clone()).unwrap();
+        }
+        assert_eq!(plan_text(&ctx, reach).await, plan_text(&plain, reach).await, "the plan over 100 rows is DataFusion's");
+        assert_eq!(answer(&ctx, reach).await, answer(&plain, reach).await, "the answer");
+    }
+
+    /// A join outside any recursive query over `edges` is the same plan with and without the rule.
+    #[tokio::test]
+    async fn a_join_outside_a_recursive_query_is_untouched() {
+        let (ctx, plain) = (physical_session(None), physical_session(Some("recursive_builds")));
+        let (edges, small) = (edge_batch(200_000, 20_000), edge_batch(100, 30));
+        for c in [&ctx, &plain] {
+            c.register_batch("edges", edges.clone()).unwrap();
+            c.register_batch("small", small.clone()).unwrap();
+        }
+        for sql in [
+            "SELECT count(*) AS c FROM edges e JOIN small s ON e.src = s.src",
+            "SELECT count(*) AS c FROM small s JOIN edges e ON e.src = s.src",
+        ] {
+            assert_eq!(plan_text(&ctx, sql).await, plan_text(&plain, sql).await, "{sql}");
         }
     }
 }

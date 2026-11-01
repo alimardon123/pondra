@@ -34,6 +34,8 @@ A number that is left unset, or set to something that is not a number, takes its
 | `PONDRA_WEB_ORIGINS` | none | the origins whose pages may call this node from a browser (a page with a node, `new Page({node})`), separated by commas (`https://app.example, http://localhost:5173`), or `*` for any. The node answers their preflights and names them in `Access-Control-Allow-Origin`. On a node with no sign-in, only origins named here pass its cross-site guard, never `*` |
 | `PONDRA_AUDIT` | `role,ddl,function` | what the [audit log](/pondra/guides/security/#the-audit-log) keeps, by class: `role`, `ddl`, `function`, `write`, `read`, `misc`, `all`, or `off`. Refusals are always kept |
 | `PONDRA_AUDIT_DAYS` | `90` | how many days `pondra.audit` keeps. Read when the log is first made |
+| `PONDRA_ALLOW_UNSIGNED_EXTENSIONS` | off | `true`: this node may install an extension whose file no one signed (`INSTALL name FROM 'file or URL'`). Every extension is unsigned until 1.0, so an admin starts the node with it to try one. Off, the install is refused by name |
+| `PONDRA_EXTENSION_FILE_MB` | `64` | the most a `.wasm` extension file may be when it is installed |
 | `PONDRA_HISTORY` | on | `off`: this node writes nothing to `pondra.history`, the row every statement leaves |
 | `PONDRA_HISTORY_RATE` | `500` | at most this many rows a second a node in `pondra.history`; past it, fast statements that went well are counted in one row (`class = 'skipped'`). Slow and failed ones are always written |
 | `PONDRA_HISTORY_DAYS` | `7` | how many days `pondra.history` keeps. Read when it is first made |

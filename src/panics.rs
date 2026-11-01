@@ -103,6 +103,12 @@ pub(crate) fn running() -> bool {
     !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
+/// Is a request the watch stopped still running: its future is dropped at its next poll, and until then its memory
+/// is still its own (`oom::pick` stops no other meanwhile).
+pub(crate) fn stopping() -> bool {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).values().any(|r| r.stopped)
+}
+
 /// Gives each request that started while the watch waited (no reading: `oom::seen` was `usize::MAX`) the
 /// reading of the watch's look after it started, which the watch calls before any stop decision. The
 /// others keep theirs. Only the watch's loop calls it: a request's `noted` is one reading, never a file read.

@@ -113,6 +113,7 @@ pub static KINDS: &[Kind] = &[
     Kind { name: "share", family: "share", verbs: &["CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "COMMENT ON", "SHOW CREATE"], prefix: "sh/", privileges: READ, on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "tables handed to other companies at published versions, through links that end", also: &["Delta Share", "data share"] },
     Kind { name: "recipient", family: "recipient", verbs: &["CREATE", "ALTER", "DROP", "COMMENT ON"], prefix: "sr/", privileges: &[], on_clone: OnClone::Leave, project: Some(SHARES_PROJECT), order: 0, secret: false, about: "a company that a share is granted to, with the token it reads with", also: &["data consumer"] },
     Kind { name: "identity provider", family: "identity provider", verbs: &["CREATE", "CREATE OR REPLACE", "DROP", "COMMENT ON", "SHOW CREATE"], prefix: "ip/", privileges: &[], on_clone: OnClone::Copy, project: Some("an identity provider is each environment's, as its users are: CREATE IDENTITY PROVIDER in each database"), order: 0, secret: false, about: "the company's sign-in (Okta, Entra ID, Google, Keycloak), whose tokens sign people in at every door", also: &["single sign-on", "SSO", "OpenID Connect", "OIDC", "security integration"] },
+    Kind { name: "extension", family: "extension", verbs: &["INSTALL", "UNINSTALL", "LOAD"], prefix: "xt/", privileges: &[], on_clone: OnClone::Copy, project: Some("an extension is an admin's: INSTALL name FROM 'file or URL'; a project pins them after 1.0"), order: 0, secret: false, about: "functions in a WebAssembly file, installed once and kept in the lake", also: &["plugin"] },
 ];
 
 /// The parts: stored inside one object, and listed beside the kinds.
@@ -195,7 +196,7 @@ type Lister = for<'a> fn(&'a Lake) -> BoxFuture<'a, Result<Vec<Object>>>;
 
 /// Each family's objects, read from the catalog alone (no query run).
 static FAMILIES: &[(&str, Lister)] = &[("schema", schemas), ("relation", relations), ("relation", sequences), ("relation", indexes), ("type", types), ("routine", routines), ("task", tasks), ("secret", secrets), ("user", users), ("database", databases),
-    ("share", shares), ("recipient", recipients), ("identity provider", providers)];
+    ("share", shares), ("recipient", recipients), ("identity provider", providers), ("extension", extensions)];
 
 /// Every object of this lake and the lakes attached to it, with its comment, as the caller may see
 /// them (a user limited by grants: the tables it may read, and no secrets, users or roles).
@@ -377,6 +378,17 @@ fn secrets(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
         let mut out = vec![];
         for (name, l) in lakes(lake).await {
             out.extend(crate::ext::list(&l).await?.into_iter().map(|(n, _)| Object::new("secret", &name, &n, None))); // (values are never shown)
+        }
+        Ok(out)
+    })
+}
+
+/// Installed extensions of this lake and those attached (`extension.rs`): by name, their records are read with `SHOW EXTENSIONS`.
+fn extensions(lake: &Lake) -> BoxFuture<'_, Result<Vec<Object>>> {
+    Box::pin(async move {
+        let mut out = vec![];
+        for (name, l) in lakes(lake).await {
+            out.extend(crate::extension::listed(&l).await?.into_iter().map(|(n, _)| Object::new("extension", &name, &n, None)));
         }
         Ok(out)
     })
@@ -772,9 +784,10 @@ pub fn statement(sql: &str) -> Option<crate::write::Stmt> {
                 Stmt::Ddl(vec![Ddl::Object(Op::OrAlterTable { name: crate::text::object(&t.name), sql: plain })])
             }
             Some(Stmt::Invalid(e)) => Stmt::Invalid(e),
+            Some(Stmt::Refused(c, e)) => Stmt::Refused(c, e),
             _ => Stmt::Invalid("CREATE OR ALTER TABLE takes the table's columns (… AS SELECT makes it anew: CREATE OR REPLACE TABLE)".into()),
         }),
-        w => Some(Stmt::Invalid(format!("CREATE OR ALTER {w}: tables and views (CREATE OR REPLACE {w} makes one anew)"))),
+        w => Some(Stmt::Refused("0A000", format!("CREATE OR ALTER takes a table or a view; a {} is made anew with CREATE OR REPLACE {w}", w.to_lowercase()))),
     }
 }
 
@@ -1199,7 +1212,7 @@ mod tests {
     fn statements_and_names() {
         let ddl = |s: &str| match statement(s) {
             Some(crate::write::Stmt::Ddl(d)) => serde_json::to_value(&d[0]).unwrap(),
-            Some(crate::write::Stmt::Invalid(e)) => j!({"error": e}),
+            Some(crate::write::Stmt::Invalid(e) | crate::write::Stmt::Refused(_, e)) => j!({"error": e}),
             _ => j!(null),
         };
         assert_eq!(ddl("COMMENT ON TABLE sales.Orders IS 'one row per order'")["text"], "one row per order");

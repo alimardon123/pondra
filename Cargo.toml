@@ -20,7 +20,7 @@ server = ["lake", "doors", "datafusion/compression"]
 lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
         "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka",
         "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier",
-        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom"]
+        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom", "dep:wasmtime"]
 # What listens and how a node is run: the HTTP, Postgres, Kafka and Flight doors, the cluster's own calls, the command
 # line and the service. A module is `lake` unless it is one of these; what reaches outside to answer a statement (Python,
 # Git, another Kafka cluster, a function's Flight server) is lake, and on a page it is the platform's or refused by name.
@@ -90,6 +90,7 @@ tokio = { version = "1", features = ["sync", "rt"] } # (asof.rs's OnceCell in ev
 # memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+wasmtime = { version = "50", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "anyhow", "parallel-compilation"], optional = true } # extensions' WebAssembly parts, sandboxed (`wasm.rs`, ADR-075 §2); a page's host comes after 1.0
 moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 # Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
 arrow-flight = { version = "59", features = ["flight-sql"], optional = true }

@@ -1,0 +1,10 @@
+# DuckDB's extension statements and Pondra's UNINSTALL, answered the same on every form (ADR-075 §6): a built-in name is a
+# notice, another name is refused by name, and an extension that isn't installed can't be uninstalled.
+statement ok
+INSTALL httpfs
+
+statement error 0A000
+INSTALL nope
+
+statement error 42704
+UNINSTALL nope

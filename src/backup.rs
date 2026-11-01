@@ -737,11 +737,22 @@ async fn copy_all(from: &Lake, to: &Store, objects: Vec<(String, String, Wanted)
         .await
 }
 
-/// The workspace's files (`files/`, their kept versions too): each one that is new or changed since
-/// the last run, and none that the source deleted. (Not in the catalog: a run copies them as they
-/// are when it gets to them.)
+/// The workspace's files (`files/`, their kept versions too) and the extensions' (`ext/`, each named
+/// by its hash, so an earlier run's record finds its own): each one that is new or changed since the
+/// last run, and none that the source deleted. (Not in the catalog: a run copies them as they are
+/// when it gets to them.)
 async fn workspace(from: &Lake, to: &Store) -> Result<(u64, u64)> {
-    let folder = Path::from("files");
+    let (mut copied, mut bytes) = (0, 0);
+    for folder in ["files", "ext"] {
+        let (c, b) = folder_of(from, to, folder).await?;
+        (copied, bytes) = (copied + c, bytes + b);
+    }
+    Ok((copied, bytes))
+}
+
+/// One folder of `workspace`'s.
+async fn folder_of(from: &Lake, to: &Store, folder: &str) -> Result<(u64, u64)> {
+    let folder = Path::from(folder);
     let theirs: Vec<object_store::ObjectMeta> = from.store.list(Some(&folder)).try_collect().await?;
     let mine: std::collections::HashMap<String, object_store::ObjectMeta> = to.list(Some(&folder)).map_ok(|o| (o.location.to_string(), o)).try_collect().await?;
     let changed: Vec<_> = theirs.iter().filter(|o| mine.get(&o.location.to_string()).is_none_or(|m| m.size != o.size || m.last_modified < o.last_modified)).collect();

@@ -1,0 +1,25 @@
+# A Pondra extension for the host's tests (`src/wasm.rs`): three scalar functions over Arrow. Built to
+# tests/fixtures/words-0.1.wasm by tools/extension_fixture.sh; a guest of its own, outside the node's workspace.
+[package]
+name = "words"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc"] }
+arrow-array = { version = "59", default-features = false }
+arrow-ipc = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]

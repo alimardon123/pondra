@@ -114,14 +114,14 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     }
     Some(match what {
         // (a refusal is said as it is, the pipeline's words; any other mistake gets the usage too)
-        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| { let said = if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }; Stmt::of_error(&e, said) }, |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
                 true => "CREATE PROCEDURE name($p TYPE [= …], …) AS BEGIN … END, or LANGUAGE python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
+            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::of_error(&e, format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
         }
     })
 }
@@ -215,12 +215,14 @@ fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routin
         }
     }
     let t = if rest { Token::EOF } else { p.next_token().token };
-    ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
+    if !matches!(t, Token::EOF | Token::SemiColon) {
+        return Err(crate::codes::coded("42601", format!("unexpected {t}")));
+    }
     r.body = body.context("no body: AS $$ … $$, or RETURN expression")?;
     r.language = match r.language.as_str() {
         "" | "sql" => "sql".into(),
         "python" | "python3" | "plpython3u" | "plpythonu" | "plpython" => "python".into(),
-        l => bail!("LANGUAGE sql or python, not {l}"),
+        l => return Err(crate::codes::coded("0A000", format!("LANGUAGE sql or python, not {l}"))),
     };
     ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
     ensure!(!rest || r.language == "sql", "a Python procedure's body is a string: LANGUAGE python AS $$ … $$");
@@ -573,7 +575,7 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
 pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
 
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
-/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
+/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW EXTENSIONS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
 /// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
@@ -585,7 +587,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
     if let Some(q) = crate::settings::show(sql) {
         return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|extensions|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     if let Some(q) = show_shares(sql) {
         return Some(q);
     }
@@ -597,6 +599,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
         "schemas" => format!("SELECT catalog_name AS lake, schema_name AS name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') AND schema_name NOT LIKE 'pg_temp%'{like} ORDER BY 1, 2"),
         "databases" => format!("SELECT DISTINCT catalog_name AS name FROM information_schema.schemata WHERE true{like} ORDER BY 1"),
         "secrets" => format!("SELECT * FROM secrets() WHERE true{like} ORDER BY name"),
+        "extensions" => format!("SELECT * FROM extensions() WHERE true{like} ORDER BY name"),
         "users" => format!("SELECT * FROM pondra.users WHERE kind <> 'role'{like} ORDER BY name"),
         "roles" => format!("SELECT * FROM pondra.users WHERE kind = 'role'{like} ORDER BY name"),
         "grants" => format!("SELECT * FROM pondra.grants WHERE true{like} ORDER BY 1, 2"),
@@ -879,6 +882,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
     for (part, _) in &parts {
         match crate::write::parse(part) {
             Some(Stmt::Invalid(why)) => bail!("{why}"),
+            Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
                 app.auth.allows(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
@@ -1065,8 +1069,9 @@ pub fn do_of(sql: &str) -> Option<(String, String)> {
 /// every statement), cast to their parameters' types.
 async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Result<(String, Routine, RecordBatch)> {
     ensure!(who.depth < 16, "{name}: procedures calling procedures 16 deep (a loop?)");
-    let local = crate::ddl::local(&app.lake, name).with_context(|| format!("no procedure {name}"))?;
-    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().with_context(|| format!("no procedure {name}"))?;
+    let missing = || crate::codes::coded("42883", format!("procedure {name} does not exist"));
+    let local = crate::ddl::local(&app.lake, name).ok_or_else(missing)?;
+    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().ok_or_else(missing)?;
     let values = arguments(name, &r, args)?;
     let select = r.params.iter().map(|p| match &p.ty {
         Some(t) if !crate::text::loose(Some(t)) => format!("CAST(({}) AS {t}) AS \"{}\"", values[&p.name], p.name),
