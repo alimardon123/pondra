@@ -461,6 +461,81 @@ impl PhysicalOptimizerRule for LeanSorts {
     }
 }
 
+/// An aggregate that keeps every value of its group to pick from them (`keeps_every_value`: a median) is
+/// planned in one step: its rows go to their group's partition (`SinglePartitioned`) or, with no GROUP BY,
+/// to one (`Single`), and each group's values are held there once. DataFusion plans every aggregate in two steps, a partial
+/// one on each partition and a final one: for these the partial step's state is a copy of all its values, which the final
+/// step copies again, so the same values were held two or three times over and the copying took most of the time (a median
+/// of 60 M values in 3 groups: 8.2 s on four partitions, 2.0 s on one; past 2 GB of memory only on its frugal retry).
+/// Before `EnsureRequirements`, which then sends the rows where the one step asks for them, as it does for one partition.
+#[derive(Debug)]
+pub struct HeldOnce;
+
+/// Whether an aggregate keeps every value it was given to pick from them, so a partial step saves nothing: its DISTINCT form
+/// keeps each value once, and a partial step can save much there, so it is left as it is. (`array_agg` and `string_agg` keep
+/// every value too, as their answer: they are left as they are until measured. `percentile_cont` keeps every value as well,
+/// but measured it was slower in one step than in two: 1.3 s against 1.1 s, a p90 of 60 M values in 3 groups.)
+fn keeps_every_value(a: &datafusion::physical_expr::aggregate::AggregateFunctionExpr) -> bool {
+    !a.is_distinct() && a.fun().name() == "median"
+}
+
+/// A median of a DECIMAL that fits in 64 bits (precision 18 or less, as TPC-H's prices) over the same values as 64-bit
+/// decimals: it holds each in 8 bytes, not 16, and its middle value is the same number (the mean of two middle values too:
+/// their sum fits in 64 bits, and both halve it the same way). The answer is cast back to the column's type (`recast`).
+/// Any other aggregate as it is.
+fn narrowed(a: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>, schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>> {
+    let [arg] = &a.expressions()[..] else { return Ok(Arc::clone(a)) };
+    let (DataType::Decimal128(precision, scale), "median", false) = (arg.data_type(schema)?, a.fun().name(), a.is_distinct()) else { return Ok(Arc::clone(a)) };
+    if precision > 18 || !a.order_bys().is_empty() {
+        return Ok(Arc::clone(a));
+    }
+    let narrow = cast(Arc::clone(arg), schema, DataType::Decimal64(precision, scale))?;
+    let built = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(Arc::new(a.fun().clone()), vec![narrow]).schema(Arc::clone(schema)).alias(a.name()).build()?;
+    Ok(Arc::new(built))
+}
+
+impl PhysicalOptimizerRule for HeldOnce {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+        plan.transform_down(|node| {
+            let Some(last) = node.downcast_ref::<AggregateExec>() else { return Ok(Transformed::no(node)) };
+            let mode = match last.mode() {
+                AggregateMode::Final => AggregateMode::Single,
+                AggregateMode::FinalPartitioned => AggregateMode::SinglePartitioned,
+                _ => return Ok(Transformed::no(node)),
+            };
+            let Some(first) = last.input().downcast_ref::<AggregateExec>() else { return Ok(Transformed::no(node)) };
+            // (a grouping set's partial step makes its groups: left as it is)
+            if *first.mode() != AggregateMode::Partial || !first.group_expr().is_single() || !first.aggr_expr().iter().any(|a| keeps_every_value(a)) {
+                return Ok(Transformed::no(node));
+            }
+            let input_schema = first.input_schema();
+            let aggregates = first.aggr_expr().iter().map(|a| narrowed(a, &input_schema)).collect::<Result<Vec<_>>>()?;
+            let one: Arc<dyn ExecutionPlan> = Arc::new(
+                AggregateExec::try_new(mode, first.group_expr().clone(), aggregates, first.filter_expr().to_vec(), first.input().clone(), input_schema)?.with_limit_options(last.limit_options()),
+            );
+            let wanted = node.schema();
+            if one.schema().fields().len() != wanted.fields().len() {
+                return Ok(Transformed::no(node)); // (never seen: the one step answers what the two did)
+            }
+            let out = recast(&one, |i, _| wanted.field(i).data_type().clone())?; // (a narrowed median's answer, back in its type)
+            if out.schema().fields() != wanted.fields() {
+                return Ok(Transformed::no(node));
+            }
+            Ok(Transformed::yes(out))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "held_once"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,5 +877,114 @@ mod tests {
         assert_eq!(text.matches("HeldOutExec").count(), 1, "{text}");
         assert_eq!(text.matches("CAST(s@2 AS Utf8)").count(), 1, "{text}");
         Ok(())
+    }
+
+    /// A session of `partitions` with DataFusion's physical rules, and `HeldOnce` before `EnsureRequirements` when `once`.
+    fn aggregating(partitions: usize, once: bool) -> SessionContext {
+        let mut rules = PhysicalOptimizer::new().rules;
+        if once {
+            let at = rules.iter().position(|r| r.name() == "EnsureRequirements").expect("DataFusion's EnsureRequirements");
+            rules.insert(at, Arc::new(HeldOnce));
+        }
+        let config = SessionConfig::new().with_target_partitions(partitions).with_batch_size(1024);
+        SessionContext::new_with_state(SessionStateBuilder::new().with_config(config).with_default_features().with_physical_optimizer_rules(rules).build())
+    }
+
+    /// 40,000 rows over four partitions: a group `g` of 3 (and NULL), an integer, a decimal, a float with NULLs, a string.
+    fn measured() -> AnyResult<MemTable> {
+        use datafusion::arrow::array::{Decimal128Array, Float64Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("i", DataType::Int64, false),
+            Field::new("d", DataType::Decimal128(15, 2), false),
+            Field::new("f", DataType::Float64, true),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let mut parts = vec![vec![]; 4];
+        for b in 0..40 {
+            let ids: Vec<i64> = (b * 1000..b * 1000 + 1000).map(|n| (n * 7919) % 40_009).collect();
+            let g = ids.iter().map(|n| (n % 7 != 6).then_some(n % 3));
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from_iter(g)),
+                Arc::new(Int64Array::from(ids.clone())),
+                Arc::new(Decimal128Array::from_iter_values(ids.iter().map(|n| (*n as i128) * 37 % 1_000_003)).with_precision_and_scale(15, 2)?),
+                Arc::new(Float64Array::from_iter(ids.iter().map(|n| (n % 5 != 0).then_some(*n as f64 / 8.0)))),
+                Arc::new(StringArray::from_iter_values(ids.iter().map(|n| format!("s{}", n % 50)))),
+            ];
+            parts[(b % 4) as usize].push(RecordBatch::try_new(schema.clone(), columns)?);
+        }
+        Ok(MemTable::try_new(schema, parts)?)
+    }
+
+    /// An answer as text, row by row, in the order it came.
+    async fn shown(ctx: &SessionContext, sql: &str) -> AnyResult<Vec<String>> {
+        let batches = answer(ctx, sql).await?;
+        let text = datafusion::arrow::util::pretty::pretty_format_batches(&batches)?.to_string();
+        Ok(text.lines().map(str::to_string).collect())
+    }
+
+    #[tokio::test]
+    async fn an_aggregate_that_keeps_every_value_is_planned_in_one_step() -> AnyResult<()> {
+        let ctx = aggregating(4, true);
+        ctx.register_table("m", Arc::new(measured()?))?;
+        let grouped = planned(&ctx, "SELECT g, median(i) AS m FROM m GROUP BY g").await?;
+        assert!(grouped.contains("mode=SinglePartitioned") && !grouped.contains("mode=Partial"), "{grouped}");
+        assert!(grouped.contains("RepartitionExec: partitioning=Hash([g@0], 4)"), "each group's rows go to one partition: {grouped}");
+        // (a DECIMAL(15, 2)'s median holds 64-bit values, and its answer is cast back above the aggregate)
+        let priced = ctx.sql("SELECT g, median(d) AS m FROM m GROUP BY g").await?.create_physical_plan().await?;
+        let mut held = vec![];
+        priced.apply(|n| {
+            if let Some(a) = n.downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>() {
+                held.extend(a.schema().fields().iter().skip(1).map(|f| f.data_type().clone()));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(held, [DataType::Decimal64(15, 2)], "{}", displayable(priced.as_ref()).indent(true));
+        assert_eq!(priced.schema().field(1).data_type(), &DataType::Decimal128(15, 2));
+        let whole = planned(&ctx, "SELECT median(i) AS m, sum(i) AS s FROM m").await?;
+        assert!(whole.contains("mode=Single,") || whole.contains("mode=Single "), "{whole}");
+        assert!(!whole.contains("mode=Partial"), "{whole}");
+        for (sql, why) in [
+            ("SELECT g, sum(i) AS s FROM m GROUP BY g", "a sum's partial step saves its work"),
+            ("SELECT g, median(DISTINCT i) AS m FROM m GROUP BY g", "a DISTINCT keeps each value once"),
+            ("SELECT g, i % 2 AS r, median(i) AS m FROM m GROUP BY ROLLUP (g, i % 2)", "a grouping set's partial step makes its groups"),
+            ("SELECT g, array_agg(i) AS a FROM m GROUP BY g", "array_agg is left as it is"),
+        ] {
+            let plan = planned(&ctx, sql).await?;
+            assert!(plan.contains("mode=Partial"), "{why}: {plan}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_aggregate_in_one_step_answers_as_in_two() -> AnyResult<()> {
+        let (once, twice) = (aggregating(4, true), aggregating(4, false));
+        for ctx in [&once, &twice] {
+            ctx.register_table("m", Arc::new(measured()?))?;
+        }
+        for sql in [
+            "SELECT g, median(i) AS mi, median(d) AS md, median(f) AS mf, count(*) AS n FROM m GROUP BY g ORDER BY g",
+            "SELECT median(i) AS mi, median(d) AS md, median(f) AS mf, sum(d) AS s, count(f) AS n FROM m",
+            "SELECT g, i % 4 AS r, median(i) AS m, avg(f) AS a FROM m GROUP BY g, i % 4 ORDER BY g, r",
+            "SELECT g, median(i) FILTER (WHERE i % 2 = 0) AS even, median(i) AS every FROM m GROUP BY g ORDER BY g",
+            "SELECT g FROM m GROUP BY g HAVING median(i) > 20000 ORDER BY g",
+            "SELECT g, percentile_cont(0.9) WITHIN GROUP (ORDER BY f) AS p FROM m GROUP BY g ORDER BY g",
+            "SELECT g, array_agg(i ORDER BY i DESC) AS top FROM m WHERE i < 400 GROUP BY g ORDER BY g",
+            "SELECT g, string_agg(s, ',' ORDER BY s, i) AS all_s FROM m WHERE i < 300 GROUP BY g ORDER BY g",
+            "SELECT array_length(array_agg(s), 1) AS n FROM m",
+            "SELECT g, median(i) AS m FROM m WHERE i < 0 GROUP BY g",
+            "SELECT median(i) AS m FROM m WHERE i < 0",
+            "SELECT k, median(i) AS m FROM (SELECT g % 2 AS k, i FROM m) GROUP BY k ORDER BY k LIMIT 1",
+        ] {
+            assert_eq!(shown(&once, sql).await?, shown(&twice, sql).await?, "{sql}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn held_once_is_before_the_exchanges() {
+        let names: Vec<String> = crate::optimize::physical_rules().iter().map(|r| r.name().to_string()).collect();
+        let (held, exchanges) = (names.iter().position(|n| n == "held_once"), names.iter().position(|n| n == "EnsureRequirements"));
+        assert!(held.is_some() && exchanges.is_some() && held < exchanges, "{names:?}");
     }
 }
