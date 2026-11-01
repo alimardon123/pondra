@@ -9,7 +9,7 @@ An **extension** adds functions to SQL that you write in Rust. You build it once
 an admin installs it with one statement. After that every node and every session has its functions,
 and every later Pondra 1.x loads the same file. It needs no rebuild of Pondra or of the extension.
 
-```sql
+```sql norun
 INSTALL hello FROM 's3://my-bucket/hello-0.1.wasm';
 SELECT greet(name), add(2, 3) FROM people;
 SELECT * FROM count_to(3);
@@ -87,7 +87,7 @@ pondra_extension::export!(hello);
 Build for `wasm32-unknown-unknown`, then make the module a component with
 [`wasm-tools`](https://github.com/bytecodealliance/wasm-tools):
 
-```bash
+```bash norun
 rustup target add wasm32-unknown-unknown
 cargo install wasm-tools
 cargo build --release --target wasm32-unknown-unknown
@@ -99,7 +99,7 @@ it once per Pondra release and keeps the compiled code in its cache folder (`PON
 
 ## Install it
 
-```sql
+```sql norun
 INSTALL hello FROM '/path/on/the/node/hello-0.1.wasm';
 INSTALL hello FROM 'https://example.com/hello-0.1.wasm' VERSION '0.1';
 SHOW EXTENSIONS;
