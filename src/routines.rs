@@ -280,6 +280,12 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::text::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::text::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
     ensure!(r.kind != Kind::Procedure || !crate::git::is_own(crate::text::split(&name).1), "{name}: git_checkout, git_status, git_commit, git_pull and git_pull_request are Pondra's own procedures (CALL git_commit('sales', 'message'))");
+    // (a function by an installed extension's function's name would be replaced by it in every query that names it: `clash`
+    // refuses the other order at INSTALL)
+    let short = crate::text::split(&name).1;
+    if let Some((ext, _)) = crate::extension::listed(lake).await?.into_iter().find(|(_, x)| r.kind != Kind::Procedure && x.functions.iter().any(|f| f.name == short)) {
+        return Err(crate::codes::coded("42723", format!("{name}: the extension {ext} has a function {short}; UNINSTALL it, or name this function otherwise")));
+    }
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());

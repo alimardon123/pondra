@@ -63,6 +63,10 @@ pub struct View {
     /// A MATCH_RECOGNIZE with EMIT FINAL (`matches.rs`): each match written once, when it is decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matches: Option<crate::matches::Matches>,
+    /// The plain views (`CREATE VIEW`) written into its query when it was made (`written_in`): while it reads them, they
+    /// can't be replaced or dropped (`made_from`), or it would go on with their old query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -465,18 +469,21 @@ pub(crate) async fn replaced(lake: &Lake, table: &str) -> Result<Option<String>>
 /// that text. A recursive CTE stays as written (a view can't follow one), and so does a query that isn't one SELECT; a
 /// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000). A query with a
 /// MATCH_RECOGNIZE stays as written too: `pattern.rs` reads its input as written (a CTE, or a subquery it refuses by name).
-pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
+pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> { Ok(writing_in(lake, sql).await?.0) }
+
+/// `written_in`, with the plain views written in, by their names in the catalog (each once, in order).
+async fn writing_in(lake: &Lake, sql: &str) -> Result<(String, Vec<String>)> {
     use datafusion::sql::sqlparser::ast::{Query, Statement, TableAlias, TableFactor, VisitorMut};
     use std::collections::HashMap;
     use std::ops::ControlFlow;
     if crate::text::contains_ci(sql, "match_recognize") {
-        return Ok(sql.to_string()); // (written in, its CTE would be a subquery before the pattern: `pattern::refused`'s case)
+        return Ok((sql.to_string(), vec![])); // (written in, its CTE would be a subquery before the pattern: `pattern::refused`'s case)
     }
-    let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok(sql.to_string()) };
-    let [Statement::Query(q)] = &mut parsed[..] else { return Ok(sql.to_string()) };
+    let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok((sql.to_string(), vec![])) };
+    let [Statement::Query(q)] = &mut parsed[..] else { return Ok((sql.to_string(), vec![])) };
     let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false).await?.into_iter().collect();
     if q.with.is_none() && views.is_empty() {
-        return Ok(sql.to_string()); // (nothing to write in: the text as written)
+        return Ok((sql.to_string(), vec![])); // (nothing to write in: the text as written)
     }
     /// The CTEs in scope (innermost last), each its query (written in already) and its columns' names; the plain views by
     /// name; and, for each query entered, whether it opened a scope.
@@ -485,6 +492,7 @@ pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
         opened: Vec<bool>,
         views: &'a HashMap<String, String>,
         depth: usize,
+        read: &'a std::cell::RefCell<Vec<String>>,
     }
     impl VisitorMut for In<'_> {
         type Break = anyhow::Error;
@@ -525,7 +533,10 @@ pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
             let (q, columns) = match cte {
                 Some((q, columns)) => (q.clone(), columns.clone()),
                 None => {
-                    let Some(text) = self.views.get(&n).or_else(|| self.views.get(n.strip_prefix("public.").unwrap_or(&n))) else { return ControlFlow::Continue(()) };
+                    let Some((stored, text)) = self.views.get_key_value(&n).or_else(|| self.views.get_key_value(n.strip_prefix("public.").unwrap_or(&n))) else { return ControlFlow::Continue(()) };
+                    if !self.read.borrow().contains(stored) {
+                        self.read.borrow_mut().push(stored.clone());
+                    }
                     if self.depth > 16 {
                         return ControlFlow::Break(anyhow::anyhow!("{n}: views read each other more than 16 deep"));
                     }
@@ -534,7 +545,7 @@ pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
                         Err(e) => return ControlFlow::Break(e.context(format!("the view {n}"))),
                     };
                     // (a plain view sees no CTE of the query that reads it)
-                    let mut inner = In { scopes: vec![], opened: vec![], views: self.views, depth: self.depth + 1 };
+                    let mut inner = In { scopes: vec![], opened: vec![], views: self.views, depth: self.depth + 1, read: self.read };
                     crate::walk::visit_mut(&mut q, &mut inner)?;
                     (q, vec![])
                 }
@@ -549,10 +560,11 @@ pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> {
             ControlFlow::Continue(())
         }
     }
-    if let ControlFlow::Break(e) = crate::walk::visit_mut(q.as_mut(), &mut In { scopes: vec![], opened: vec![], views: &views, depth: 0 }) {
+    let read = std::cell::RefCell::new(vec![]);
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(q.as_mut(), &mut In { scopes: vec![], opened: vec![], views: &views, depth: 0, read: &read }) {
         return Err(e);
     }
-    Ok(q.to_string())
+    Ok((q.to_string(), read.into_inner()))
 }
 
 /// The table a view follows, by its name in this lake (`ddl::resolve`): refused 0A000 when it names another lake's.
@@ -567,8 +579,40 @@ pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
-    let written_in = written_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
-    let sql = written_in.as_str();
+    let (written_in, from) = writing_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
+    Box::pin(made(lake, name, &written_in, sql, o)).await?;
+    if written_in != sql {
+        as_written(lake, name, sql, from).await?;
+    }
+    Ok(())
+}
+
+/// What a view was made from, kept once it is made (audit 11-01 M5): the plain views written into its query, which can't
+/// be replaced or dropped while it reads them (`made_from`), and its query as written, which `SHOW CREATE` and the listings
+/// show (`View::query`). (A view that keeps each group or match once, or sessions, shows its query its own way: `once::written`.)
+async fn as_written(lake: &Lake, name: &str, sql: &str, from: Vec<String>) -> Result<()> {
+    for key in [view_key(name), view_key(&crate::once::open(name))] {
+        let Some(mut v) = lake.cat.get::<View>(&key).await? else { continue };
+        let plain = v.once.is_none() && v.sessions.is_none() && v.matches.is_none();
+        if v.from == from && (!plain || v.written.as_deref() == Some(sql)) {
+            return Ok(()); // (made again, the same)
+        }
+        v.from = from;
+        if plain {
+            v.written = Some(sql.to_string());
+        }
+        return lake.cat.commit(vec![(key, json(&v))], &[]).await;
+    }
+    Ok(())
+}
+
+/// The materialized views made from plain view `name` (`View::from`), as a refusal names them.
+pub(crate) async fn made_from(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    Ok(lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.from.iter().any(|f| f == name)).map(|(k, _)| format!("materialized view {}", k[2..].strip_suffix("$open").unwrap_or(&k[2..]))).collect())
+}
+
+/// `create`'s view, of its query with its CTEs and plain views written in (`sql`); `as_written` is the query as written.
+async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) -> Result<()> {
     if o.once {
         return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
     }
@@ -588,7 +632,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
         let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
         let kept = v.rerun.as_ref().map(|r| if r.full.is_some() { Refresh::Full } else { Refresh::ByKey }).unwrap_or(Refresh::Incremental);
-        let same = v.query() == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep)
+        let same = (v.query() == sql || v.query() == as_written) && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep)
             && refresh.is_none_or(|r| r == kept) && v.rerun.as_ref().and_then(|r| r.lag_secs) == lag_secs;
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
@@ -770,7 +814,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
     let written = finish.is_some().then(|| written.to_string());
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from: vec![] })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -906,7 +950,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, &with, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -1792,7 +1836,7 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, sql, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
@@ -1994,6 +2038,8 @@ mod tests {
         assert_eq!(w("WITH a AS (SELECT x FROM a) SELECT x FROM a").await?, "SELECT x FROM (SELECT x FROM a) AS a", "inside it, a is the table");
         assert_eq!(w("SELECT x FROM vy").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a WHERE x > 1) AS vx) AS vy");
         assert_eq!(first_table(&w("SELECT x FROM vy").await?)?, "a");
+        assert_eq!(writing_in(&lake, "SELECT x FROM vy JOIN vx USING (x)").await?.1, ["vy", "vx"], "the plain views written in, each once");
+        assert!(writing_in(&lake, "WITH vx AS (SELECT 1 AS x) SELECT x FROM vx").await?.1.is_empty(), "a CTE is no plain view");
         let recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
         assert_eq!(w(recursive).await?, recursive);
         let pattern = "WITH t AS (SELECT * FROM a WHERE x > 1) SELECT * FROM t MATCH_RECOGNIZE (ORDER BY x PATTERN (b+) DEFINE b AS true) m";

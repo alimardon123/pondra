@@ -5955,9 +5955,29 @@ def fills():
     checks["a view whose filling fails: CREATE says so within 10 s, pondra.flows has its error, its source changes once it is dropped"] = (
         "is made, but filling it from" in said and "notes" in said and took < 10 and len(flow) == 1 and bool(flow[0].get("error"))
         and "still being filled" in held and held.startswith("409") and after == [{"s": "7"}, {"s": "8"}])
+    # A view made from a plain view keeps what it was made from (audit 11-01 M5): the plain view's query was written into
+    # its own, so the plain view can't be replaced, renamed or dropped while it is read (2BP01, naming the view), and SHOW
+    # CREATE shows the query as it was written. Once the view is dropped, so can the plain view be.
+    q("CREATE VIEW big_notes AS SELECT s FROM notes WHERE s > '7'")
+    q("CREATE MATERIALIZED VIEW from_plain AS SELECT count(*) AS n FROM big_notes")
+    refused = {}
+    for what, s in [("drop", "DROP VIEW big_notes"), ("replace", "CREATE OR REPLACE VIEW big_notes AS SELECT s FROM notes"), ("rename", "ALTER VIEW big_notes RENAME TO bn")]:
+        try:
+            q(s)
+            refused[what] = "(done)"
+        except RuntimeError as e:
+            refused[what] = str(e)[:240]
+    same = q("CREATE OR REPLACE VIEW big_notes AS SELECT s FROM notes WHERE s > '7'")  # (the same query: nothing changes)
+    shown = q("SHOW CREATE MATERIALIZED VIEW from_plain")[0]["definition"]
+    rows = until(lambda: q("SELECT n FROM from_plain"), [{"n": 1}], secs=20)
+    q("DROP MATERIALIZED VIEW from_plain")
+    q("DROP VIEW big_notes")
+    made_from = {"refused": refused, "same_again": same, "shown": shown, "rows": rows}
+    checks["a view made from a plain view: the plain view can't be replaced, renamed or dropped while it reads it (409, naming the view), SHOW CREATE shows the query as written, and both drop after"] = (
+        all(r.startswith("409") and "materialized view from_plain" in r for r in refused.values()) and "FROM big_notes" in shown and rows == [{"n": 1}])
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"fills": checks, "rows": count, "bad_fill": bad_fill, "ok": ok}, indent=1))
+    print(json.dumps({"fills": checks, "rows": count, "bad_fill": bad_fill, "made_from": made_from, "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
     return f"views filled from existing rows while {count:,} rows streamed in, made again, and through a leader restart: all {len(checks)} checks pass"
@@ -16849,7 +16869,8 @@ def extensions():
     log works, its functions volatile and its lines in the node's log; a branch keeps the extension and its file; UNINSTALL
     takes the functions away on every node. A non-owner may
     not install from a path on the node's machine, and a node started without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL
-    by the variable's name."""
+    by the variable's name, and runs none another node installed. A record a raw request built, and a file swapped under its
+    hash, are refused."""
     fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tests/fixtures/extensions/words-0.1.wasm")
     lake, owner_key = new_lake(), uuid.uuid4().hex
     cache = tempfile.mkdtemp(prefix="pondra-ext-cache-")
@@ -16918,10 +16939,36 @@ def extensions():
         q("UNINSTALL words")
         gone = lambda i: "word_count" in refused("SELECT word_count('a b') AS n", i)
         checks["UNINSTALL takes its functions away on every node"] = all(until(lambda i=i: gone(i), True, 15) for i in range(3))
+        # (audit 11-01 H1: a record is checked by the leader that keeps it and by each node that loads it, not only at INSTALL)
+        q(f"INSTALL words FROM '{fixture}'")
+        words = q("SHOW EXTENSIONS")[-1]
+
+        def raw_install(record):
+            """The status, SQLSTATE and words of a `/cluster/ddl` request carrying a record its caller built."""
+            c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+            c.request("POST", "/cluster/ddl", json.dumps({"op": "install_extension", "name": "words", "record": record}).encode(), {**admin, "content-type": "application/json"})
+            r = c.getresponse()
+            return f"{r.status} {r.getheader('x-pondra-sqlstate')}: {r.read().decode(errors='replace')}"
+        record = {"version": words["version"], "sha256": words["sha256"], "bytes": words["bytes"], "from": "built", "by": "a", "at_ms": 0}
+        checks["a raw /cluster/ddl record naming a path for its file is refused (XX001), and one naming a built-in's function name (42723)"] = \
+            "XX001" in raw_install({**record, "sha256": "../../../../tmp/elsewhere"}) and \
+            "42723" in raw_install({**record, "functions": [{"name": "upper", "arguments": ["Utf8"], "returns": "Utf8"}]}) and \
+            q("SELECT word_count('a b c') AS n") == [{"n": 3}]
+        if not lake.startswith("s3://"):
+            # a bucket writer swaps the file under the record's hash: a node that loads it now refuses it
+            kept = os.path.join(lake, "ext", "words", words["version"], words["sha256"] + ".wasm")
+            nodes[1].kill()
+            shutil.copyfile(os.path.join(fixtures, "clocked-0.1.wasm"), kept)
+            nodes[1] = Node(lake, A.port + 1, env=env, admin_token="a", read_token="rtok").start()
+            e = refused("SELECT word_count('a b') AS n", 1)
+            checks["a node loading an extension whose file was swapped refuses it (XX001)"] = "XX001" in e and "isn't the one installed" in e
+            shutil.copyfile(fixture, kept)
         nodes[2].kill()
         bare = Node(lake, A.port + 2, env={k: v for k, v in env.items() if k != "PONDRA_ALLOW_UNSIGNED_EXTENSIONS"}, admin_token="a").start()
         nodes[2] = bare
         checks["a node without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL by the variable's name"] = "PONDRA_ALLOW_UNSIGNED_EXTENSIONS" in refused(f"INSTALL words FROM '{fixture}'", 2)
+        e = refused("SELECT word_count('a b') AS n", 2)
+        checks["a node without PONDRA_ALLOW_UNSIGNED_EXTENSIONS runs no extension another node installed (0A000)"] = "0A000" in e and "PONDRA_ALLOW_UNSIGNED_EXTENSIONS" in e
     finally:
         for n in nodes:
             n.kill()

@@ -718,7 +718,7 @@ DROP SCHEMA sales CASCADE;
 |---|---|
 | Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(c1, c2, … \| PRIMARY KEY (…) NOT ENFORCED, UNIQUE (…) NOT ENFORCED, FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED)] AS SELECT …`: a query run over the tables as they are when read. A select list may name a measure with `expr AS MEASURE name` ([measures and key facts](/pondra/guides/measures/)). `OR REPLACE` is how a stored view's query changes; `ALTER VIEW … AS SELECT` is refused |
 | Key facts | `ALTER VIEW v ADD [CONSTRAINT [IF NOT EXISTS] name] PRIMARY KEY (…) \| UNIQUE (…) \| FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED` and `ALTER VIEW v DROP CONSTRAINT [IF EXISTS] name`: facts about the view's rows, never checked. A materialized view takes the same with `ALTER MATERIALIZED VIEW` ([measures and key facts](/pondra/guides/measures/#key-facts-on-views)) |
-| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). Its query may read a CTE (`WITH t AS (…)`) or a plain view: each is written in where it is read, as a subquery, and a plain view as it is when the materialized view is made; a write in its `WITH` is refused (`0A000`). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/windows/#windows-each-group-once-its-over)) |
+| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). Its query may read a CTE (`WITH t AS (…)`) or a plain view: each is written in where it is read, as a subquery, and a plain view as it is when the materialized view is made. While the materialized view reads a plain view, that view can't be replaced, renamed or dropped (`2BP01`, naming the materialized view), and `SHOW CREATE` shows the query as written. A write in its `WITH` is refused (`0A000`). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/windows/#windows-each-group-once-its-over)) |
 | Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Refresh | `REFRESH MATERIALIZED VIEW [CONCURRENTLY] v`: taken, and nothing to do, since the view is current as rows arrive (dbt sends it) |
@@ -861,9 +861,12 @@ their values.
 Only an admin installs an extension, and a node takes one only when it runs with
 `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
 the node that got the statement (a path on its machine from the program that started it, or a URL a
-secret covers), and every node sees the record; a branch and a backup carry the file with it. The
-file says its version and its functions, which a query then calls by name in every session, on every
-node; a name another function has already is refused at `INSTALL` (`42723`). A function the file gives
+secret covers), and every node sees the record; a branch and a backup carry the file with it. Each node
+checks the file against the record's SHA-256 as it loads it, and runs it only when it was started with
+the variable too: a file that isn't the one installed is refused (`XX001`), and so is a call on a node
+without the variable (`0A000`). The file says its version and its functions, which a query then calls by
+name in every session, on every node; a name another function has already, a table function's too, is
+refused at `INSTALL` (`42723`), and so is a `CREATE FUNCTION` by the name of an extension's function. A function the file gives
 columns is a table function, read as `SELECT * FROM name(…)` with literal arguments: its rows come a
 batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
 sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
