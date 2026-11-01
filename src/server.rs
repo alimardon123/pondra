@@ -7,7 +7,7 @@ use crate::store::*;
 use crate::tasks::Task;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -495,7 +495,8 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
     Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
-/// Followers forward metadata writes to the leader, unchanged.
+/// Followers forward metadata writes to the leader, unchanged. The leader checks the caller's own sign-in (security pass 3,
+/// K1): only the cluster's own calls go with the node's credential; anyone else's goes on with theirs.
 async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response {
     if app.seq.is_some() {
         return next.run(req).await;
@@ -503,15 +504,29 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
     if app.members.reader() {
         return E(anyhow::anyhow!("read-only node")).into_response();
     }
-    proxy(&app.members.leader().addr, req).await.unwrap_or_else(|e| E(e).into_response())
+    let operator = crate::auth::operator(); // (read now, while the request's scope holds: `auth::WHO`)
+    let as_caller = if operator || app.open().await {
+        None // (the cluster itself, or an open node: the node's own credential, as `nodes_own` says)
+    } else {
+        match req.headers().get(axum::http::header::AUTHORIZATION) {
+            Some(v) => Some(v.clone()),
+            None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
+        }
+    };
+    proxy(&app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
 }
 
-async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
+/// Sends `req` to the leader at `addr`. `as_caller`: the caller's own `Authorization`, which replaces the node's default one
+/// (`cluster::http`; reqwest fills a default header only when the request lacks it). None: the node's own credential.
+async fn proxy(addr: &str, req: Request, as_caller: Option<HeaderValue>) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = crate::tls::url(&format!("{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str())));
     let mut out = crate::cluster::http().request(parts.method, url).body(axum::body::to_bytes(body, usize::MAX).await?);
     if let Some(ct) = parts.headers.get("content-type") {
         out = out.header("content-type", ct);
+    }
+    if let Some(v) = as_caller {
+        out = out.header(axum::http::header::AUTHORIZATION, v);
     }
     let res = out.send().await?;
     // (the leader's answer as it is: its status, content type and the x-pondra- headers, the SQLSTATE and notices among
