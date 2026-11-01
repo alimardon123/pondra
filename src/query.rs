@@ -544,6 +544,18 @@ impl TableProvider for Table {
     }
 }
 
+/// Is a table one of the lake's own append tables as a query reads it (`Pruned`), under the wrappers a session puts
+/// around it (`Guarded`, `Table`)?
+pub(crate) fn lakes_own(p: &dyn TableProvider) -> bool {
+    if let Some(g) = p.downcast_ref::<Guarded>() {
+        return lakes_own(g.inner.as_ref());
+    }
+    if let Some(t) = p.downcast_ref::<Table>() {
+        return lakes_own(t.0.as_ref());
+    }
+    p.is::<Pruned>()
+}
+
 /// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)? As a
 /// word: a column of the query's own named `dbt_is_deleted` isn't it (dbt's snapshots write one).
 pub fn names_deleted(text: &str) -> bool { text.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|w| w == "_deleted") }
