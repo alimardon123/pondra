@@ -584,7 +584,10 @@ one script's (statements sent together over HTTP).
   `--memory-gb` ([`PONDRA_MEMORY_GB`](/pondra/reference/environment/) and the other settings there),
   and refused here.
 - `COPY … FROM STDIN`, `COPY … TO STDOUT`, `DISCARD` and `CLOSE` are the Postgres port's: see
-  [Postgres](/pondra/reference/postgres/).
+  [Postgres](/pondra/reference/postgres/). Over HTTP, the console and `pondra sql`, the two `COPY`s are refused
+  (`0A000`) naming what to write there: the query as CSV (`POST /sql?format=csv`) or `COPY … TO 's3://…'`, and
+  `COPY INTO t FROM 'path or URL'` or `POST /append/t`. So is Postgres's `COPY t FROM 'file'`, a file of its own
+  server's: `COPY INTO t FROM 'path or URL'` loads one.
 - `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
   functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
@@ -1175,6 +1178,7 @@ text is the node's own, it is shown in code:
 | `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
 | `PRAGMA table_info('t')`, and DuckDB's and SQLite's other `PRAGMA`s | refused (`0A000`), naming Pondra's statement: `PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE t` (`SHOW TABLES`, `SHOW DATABASES`, `SET` and `SHOW` for a setting) |
+| `UPSERT INTO t …` | CockroachDB's, refused (`0A000`) naming Pondra's two upserts: `INSERT OR REPLACE INTO t …`, or `INSERT INTO t … ON CONFLICT (key) DO UPDATE SET …` |
 | `CREATE EXTENSION name` | refused (`0A000`), naming Pondra's way: `CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm` (for `uuid-ossp` and `pgcrypto`, the functions built in) |
 | `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |

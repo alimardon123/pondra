@@ -83,13 +83,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b|\bcreate\s+extension\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b|\bcreate\s+extension\b|\bupsert\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words, extension_words] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words, extension_words, upsert_words] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -432,6 +432,24 @@ fn pragma_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
 
 /// Postgres's `CREATE EXTENSION [IF NOT EXISTS] name …` where a statement starts: refused by name, with Pondra's
 /// INSTALL and LOAD (`extension.rs`), or the functions built in for the extensions most scripts ask for.
+/// `UPSERT INTO t …`, CockroachDB's, refused by name (0A000) with Pondra's two upserts (a plain INSERT of a key that is
+/// there is refused, so neither is read in its place).
+fn upsert_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let named = |i: usize, word: &str| matches!(t.toks.get(i), Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word));
+    for i in statement_starts(t) {
+        if !named(i, "upsert") {
+            continue;
+        }
+        let into = t.next(i);
+        let name = match (t.word(into, Keyword::INTO), t.toks.get(t.next(into))) {
+            (true, Some(Token::Word(w))) => w.to_string(),
+            _ => "t".to_string(),
+        };
+        return Err(crate::codes::coded("0A000", format!("UPSERT is CockroachDB's: write INSERT OR REPLACE INTO {name} …, or INSERT INTO {name} … ON CONFLICT (key) DO UPDATE SET …")));
+    }
+    Ok(vec![])
+}
+
 fn extension_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
     for i in statement_starts(t) {
         let at = t.next(i);
@@ -2290,6 +2308,14 @@ mod tests {
         // (a column, a string or a comment called pragma is no statement)
         assert_eq!(text("SELECT pragma FROM t -- pragma").unwrap(), "SELECT pragma FROM t -- pragma");
         assert_eq!(text("SELECT 'PRAGMA x'").unwrap(), "SELECT 'PRAGMA x'");
+    }
+
+    #[test]
+    fn upsert_is_refused_naming_pondras_upserts() {
+        let e = text("UPSERT INTO orders VALUES (5, 'new')").unwrap_err();
+        assert_eq!(crate::codes::of(&e), "0A000");
+        assert_eq!(e.to_string(), "UPSERT is CockroachDB's: write INSERT OR REPLACE INTO orders …, or INSERT INTO orders … ON CONFLICT (key) DO UPDATE SET …");
+        assert!(text("SELECT upsert FROM t").is_ok() && text("SELECT 1; upsert into t values (1)").is_err(), "a column called upsert is a name");
     }
 
     #[test]

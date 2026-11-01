@@ -82,7 +82,7 @@ CASES = [
     ("postgres", "INSERT INTO orders (id, customer_id, amount, status, created_at, tags) VALUES (2, 2, 40.00, 'delivered', now(), NULL) ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, amount = EXCLUDED.amount"),
     ("postgres", "UPDATE orders SET tags = c.country FROM customers c WHERE c.id = orders.customer_id AND orders.id = 4"),
     ("postgres", "DELETE FROM t_case_1 t USING orders o WHERE t.order_id = o.id AND o.status = 'refunded'"),
-    ("postgres", "COPY (SELECT id, name, country FROM customers ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+    ("postgres", "COPY (SELECT id, name, country FROM customers ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER true)", ("0A000", "COPY … TO STDOUT is the Postgres port's")),
     # postgres: sessions and admin
     ("postgres", "SET search_path TO public, pg_catalog"),
     ("postgres", "EXPLAIN ANALYZE SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id"),
@@ -121,7 +121,7 @@ CASES = [
     ("duckdb", "INSERT OR REPLACE INTO t_case_101 VALUES (1, 'paid', 9.5), (2, 'vip', 4.0)"),
     ("duckdb", "INSERT INTO t_case_101 VALUES (4, 'vip', 7.0) RETURNING *"),
     ("duckdb", "INSERT INTO t_case_101 VALUES (3, 'gift', 1.5) ON CONFLICT (id) DO UPDATE SET score = excluded.score"),
-    ("duckdb", "UPSERT INTO t_case_101 VALUES (5, 'new', 0.5)"),
+    ("duckdb", "UPSERT INTO t_case_101 VALUES (5, 'new', 0.5)", ("0A000", "UPSERT is CockroachDB's: write INSERT OR REPLACE INTO t_case_101")),
     ("duckdb", "UPDATE orders SET tags = 'uk-buyer' FROM customers c WHERE c.id = orders.customer_id AND c.country = 'UK' AND orders.id = 1"),
     ("duckdb", "DELETE FROM t_case_101 USING customers c WHERE t_case_101.id = c.id AND c.country IS NULL"),
     ("duckdb", "ALTER TABLE t_case_101 ALTER COLUMN label TYPE VARCHAR"),

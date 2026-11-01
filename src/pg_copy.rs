@@ -3,8 +3,8 @@
 
 use crate::codes::coded;
 use crate::pg_bytea;
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::arrow::array::{Array, ArrayRef, StringBuilder};
+use datafusion::arrow::datatypes::{Field, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -305,6 +305,8 @@ pub(crate) fn not_one_byte(sql: &str) -> Option<anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::array::{Int64Array, StringArray};
     use datafusion::arrow::datatypes::Schema;
 
