@@ -44,7 +44,7 @@ use datafusion::common::{project_schema, stats::Precision, ColumnStatistics, Sca
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::physical_expr::{DynamicFilterTracking, PhysicalExpr};
-use datafusion::physical_optimizer::pruning::{PruningPredicateBuilder, PruningStatistics};
+use datafusion::physical_optimizer::pruning::{PruningPredicate, PruningPredicateBuilder, PruningStatistics};
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::{empty::EmptyExec, execution_plan::replace_children_if_necessary, union::UnionExec, ExecutionPlan};
 use datafusion::physical_plan::projection::{all_alias_free_columns, new_projections_for_columns};
@@ -790,6 +790,8 @@ struct HotSource {
     stats: Arc<[std::sync::OnceLock<Arc<Statistics>>]>,
     /// What the planner knows of each column (`Known`), by name.
     known: Arc<HashMap<String, Known>>,
+    /// The pruning predicate built from `predicate`, once it is (`None`: it couldn't be built, so every batch is kept).
+    pruning: Arc<std::sync::OnceLock<Option<Arc<PruningPredicate>>>>,
 }
 
 impl HotSource {
@@ -806,6 +808,7 @@ impl HotSource {
             fetch: None,
             predicate: None,
             known,
+            pruning: Default::default(),
         }
     }
 
@@ -853,17 +856,23 @@ impl DataSource for HotSource {
         let files = self.files.clone();
         // (a fetch counts the rows it reads, so none is skipped then)
         let mut skip = match (&self.predicate, self.fetch) {
-            (Some(predicate), None) => Some(Skip {
-                predicate: predicate.clone(),
-                tracking: DynamicFilterTracking::classify(predicate),
-                schema: self.schema.clone(),
-                files: files.clone(),
-                list: list.clone(),
-                keep: None,
-                next: 0,
-                gap: 1,
-                stats: Default::default(),
-            }),
+            (Some(predicate), None) => {
+                let tracking = DynamicFilterTracking::classify(predicate);
+                // (a predicate with no dynamic filter is the same for every partition, so they share one pruning predicate)
+                let shared = (!tracking.contains_dynamic_filter()).then(|| self.pruning.clone());
+                Some(Skip {
+                    predicate: predicate.clone(),
+                    tracking,
+                    shared,
+                    schema: self.schema.clone(),
+                    files: files.clone(),
+                    list: list.clone(),
+                    keep: None,
+                    next: 0,
+                    gap: 1,
+                    stats: Default::default(),
+                })
+            }
             _ => None,
         };
         let (mut left, mut at) = (self.fetch, 0); // (the rows a fetch has left, and the next batch of the list)
@@ -989,7 +998,7 @@ impl DataSource for HotSource {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(below));
         }
         let predicate = datafusion::physical_expr::conjunction(self.predicate.iter().cloned().chain(useful));
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(below).with_updated_node(Arc::new(HotSource { predicate: Some(predicate), ..self.clone() }) as Arc<dyn DataSource>))
+        Ok(FilterPushdownPropagation::with_parent_pushdown_result(below).with_updated_node(Arc::new(HotSource { predicate: Some(predicate), pruning: Default::default(), ..self.clone() }) as Arc<dyn DataSource>))
     }
     fn apply_expressions(&self, _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>) -> datafusion::error::Result<TreeNodeRecursion> {
         // (the predicate isn't shown: a join or an aggregate builds its dynamic filter only for a
@@ -1046,10 +1055,12 @@ crate::per_node!(
     pub static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0));
 
 /// Which of a partition's batches its scan's predicate may match, worked out again when a dynamic
-/// filter in it moves.
+/// filter in it moves. A predicate with no dynamic filter is built into its pruning predicate once for the whole scan
+/// and shared by its partitions (`shared`); one with a dynamic filter is built again as the filter moves.
 struct Skip {
     predicate: Arc<dyn PhysicalExpr>,
     tracking: DynamicFilterTracking,
+    shared: Option<Arc<std::sync::OnceLock<Option<Arc<PruningPredicate>>>>>, // (the scan's pruning predicate, when the predicate is static)
     schema: SchemaRef,
     files: Arc<Vec<Held>>,
     list: Vec<(u32, u32)>, // the partition's batches, as (file, batch), in the order it reads them
@@ -1067,7 +1078,12 @@ impl Skip {
         };
         if again {
             // (a predicate the ranges can't decide, or that fails to build, keeps every batch)
-            let keep: Vec<bool> = PruningPredicateBuilder::new().with_file_schema(self.schema.clone()).build(self.predicate.clone()).and_then(|p| p.prune(self).ok()).unwrap_or_default();
+            let build = || PruningPredicateBuilder::new().with_file_schema(self.schema.clone()).build(self.predicate.clone());
+            let pruning = match &self.shared {
+                Some(once) => once.get_or_init(build).clone(),
+                None => build(),
+            };
+            let keep: Vec<bool> = pruning.and_then(|p| p.prune(&*self).ok()).unwrap_or_default();
             // Looking again costs as much as a batch: soon at first, then ever later (a top-N
             // moves its bound after every batch; read in its order, the first batches set it).
             self.next = i + self.gap;
@@ -1224,6 +1240,39 @@ mod tests {
 
         assert_eq!(source.partition_statistics(None).unwrap().num_rows, Precision::Exact(18));
         assert_eq!(source.partition_statistics(Some(1)).unwrap().num_rows, Precision::Exact(7));
+    }
+
+    #[test]
+    fn a_static_predicate_is_built_once_for_every_partition() {
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_expr::expressions::{binary, col, lit};
+        // Two files of two batches of four rows (0..16 in all, in order), each with the column's ranges as a scan holds them.
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, false)]));
+        let file = |from: i64| {
+            let arrays: Vec<ArrayRef> = (0..2i64).map(|b| Arc::new(Int64Array::from_iter_values(from + 4 * b..from + 4 * b + 4)) as ArrayRef).collect();
+            let ranges_of = HashMap::from([("i".to_string(), ranges(&arrays).expect("a range for i"))]);
+            Held { columns: vec![Arc::new(arrays)], rows: Arc::new(vec![4, 4]), ranges: Arc::new(ranges_of) }
+        };
+        let files = vec![file(0), file(8)];
+        // Batches 0 and 2 go to partition 0 (0..4 and 8..12), batches 1 and 3 to partition 1 (4..8 and 12..16).
+        assert_eq!(deal(&files, 2), vec![vec![(0, 0), (1, 0)], vec![(0, 1), (1, 1)]]);
+
+        let source = HotSource::new(schema.clone(), files, 2, Default::default());
+        // The filter `i >= 12`, pushed into the source: a static predicate on a column with ranges, so it takes it.
+        let filter = binary(col("i", &schema).unwrap(), Operator::GtEq, lit(12i64), &schema).unwrap();
+        let pushed = source.try_pushdown_filters(vec![filter], &datafusion::common::config::ConfigOptions::default()).unwrap();
+        let updated = pushed.updated_node.expect("the source takes the filter");
+        let filtered = updated.downcast_ref::<HotSource>().expect("a hot source");
+        assert!(filtered.pruning.get().is_none()); // (nothing is built until a partition is read)
+
+        let rows = |source: &dyn DataSource, p: usize| -> Vec<i64> {
+            let stream = source.open(p, Arc::new(datafusion::execution::TaskContext::default())).unwrap();
+            let batches = futures::executor::block_on(datafusion::physical_plan::common::collect(stream)).unwrap();
+            batches.iter().flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec()).collect()
+        };
+        assert_eq!(rows(filtered, 0), Vec::<i64>::new()); // (0..4 and 8..12 are below 12: both skipped)
+        assert_eq!(rows(filtered, 1), [12, 13, 14, 15]); // (4..8 is skipped; 12..16 is kept whole, as no filter above it runs here)
+        assert!(matches!(filtered.pruning.get(), Some(Some(_)))); // (built by the first partition read, and the second shares it)
     }
 
     #[test]
