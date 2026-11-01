@@ -563,7 +563,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     if takes_back {
         crate::views::can_follow(lake, &table, append).await?;
         if let Some(v) = crate::views::filling(lake, &table).await? {
-            bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+            return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"))); // (it reads them as they were; 40001 as the others say it: try again)
         }
     }
     // A plain INSERT's keys must be new (23505: `constraints.rs`), and so must the keys a MERGE inserts. One that matches on

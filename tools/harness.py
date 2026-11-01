@@ -5916,9 +5916,33 @@ def fills():
             checks[f"per_user{n} == its query (:{port})"] = until(lambda: q(f"SELECT user, n, s FROM per_user{n} ORDER BY user", port), source(port), secs=20) == source(port)
             checks[f"evens{n} == its query (:{port})"] = until(lambda: q(f"SELECT count(*) AS n, sum(a2) AS s FROM evens{n}", port), evens(port), secs=20) == evens(port)
     count = q("SELECT count(*) AS n FROM events")[0]["n"]
+    # A view whose filling fails (a row its query can't cast) is refused by name in seconds, its error in pondra.flows, not
+    # waited for (it was 10 minutes); its source's rows can't change while it waits to be filled, and can once it is dropped.
+    q("CREATE TABLE notes (s VARCHAR)")
+    q("INSERT INTO notes VALUES ('7'), ('x')")
+    t0 = time.time()
+    try:
+        q("CREATE MATERIALIZED VIEW bad_fill AS SELECT CAST(s AS INT) AS n FROM notes")
+        said = "(made, and said nothing)"
+    except RuntimeError as e:
+        said = str(e)
+    took = round(time.time() - t0, 1)
+    flow = q("SELECT error FROM pondra.flows WHERE name = 'bad_fill'")
+    try:
+        q("UPDATE notes SET s = '8' WHERE s = 'x'")
+        held = "(changed)"
+    except RuntimeError as e:
+        held = str(e)
+    q("DROP MATERIALIZED VIEW bad_fill")
+    q("UPDATE notes SET s = '8' WHERE s = 'x'")
+    after = q("SELECT s FROM notes ORDER BY s")
+    bad_fill = {"said": said[:300], "seconds": took, "flow": flow, "held": held[:200], "after": after}
+    checks["a view whose filling fails: CREATE says so within 10 s, pondra.flows has its error, its source changes once it is dropped"] = (
+        "is made, but filling it from" in said and "notes" in said and took < 10 and len(flow) == 1 and bool(flow[0].get("error"))
+        and "still being filled" in held and held.startswith("409") and after == [{"s": "7"}, {"s": "8"}])
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"fills": checks, "rows": count, "ok": ok}, indent=1))
+    print(json.dumps({"fills": checks, "rows": count, "bad_fill": bad_fill, "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
     return f"views filled from existing rows while {count:,} rows streamed in, made again, and through a leader restart: all {len(checks)} checks pass"
