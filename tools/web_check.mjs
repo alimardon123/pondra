@@ -11,7 +11,8 @@
 // its folder has expected.json (made by tools/web_lake.py): a Delta table a node published, read over a web server that
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
-// (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name, and a page past its
+// (web/demo/index.html, `demoChecks`) in a browser of its own, and a page in a Worker that spills past its pool to the browser's
+// storage (`spillWorkerChecks`); in Node the kept page is refused by name, and a page past its
 // memory line is checked in a child process of its own (`memoryChecks`). With `--node-bin` a page joins a follower of a node's
 // lake (`joinRun`): two nodes on one folder, the page's reads and writes, what never reaches it, and a non-superuser's refusal.
 // A module holds one page at a time, so each check frees the page it made before the next makes one. A check that needs a
@@ -364,6 +365,49 @@ function pageHtml(bare) {
 const PAGE = pageHtml(false);
 const PAGE_BARE = pageHtml(true);
 
+// The queries a page in a Worker runs past its pool (`spillWorkerChecks`), each with its answer. The sort and the join are the
+// ones the page's pool can't hold: the join's keys are sparse and unordered, so a dense key's perfect hash join (which fits) and
+// `range()`'s declared order (a sort-merge join that sorts nothing) are both avoided.
+const WORKER_QUERIES = [
+  ['sort', 'SELECT value FROM range(20000000) ORDER BY value DESC OFFSET 19999999', 'value\n0\n'],
+  ['aggregate', 'SELECT count(*) AS n FROM (SELECT value % 10000000 AS k FROM range(20000000) GROUP BY 1)', 'n\n10000000\n'],
+  ['join', 'SELECT count(*) AS n FROM (SELECT value * 7919 % 5000000 * 1000003 AS k FROM range(5000000)) a JOIN (SELECT value * 7919 % 5000000 * 1000003 AS k FROM range(5000000)) b ON a.k = b.k', 'n\n5000000\n'],
+  ['one', 'SELECT 1 AS n', 'n\n1\n'],
+];
+// The Worker's page (`/spill-worker.js`): the module in a Worker, its page with a pool of 0.1 GB under a 1 GB line, each query
+// answered and posted with its ms, the bytes it spilled (`spilledBytes`) and the spill file's size after it (`spillFileBytes`).
+// Then each EXPLAIN of the sort and the join, and the folder's files after the page is closed.
+const SPILL_WORKER = `
+import init, { Page, spilledBytes, spillFileBytes } from '/pkg/pondra_web.js';
+await init();
+try {
+  const page = new Page({ memory_max_gb: 1, memory_gb: 0.1 });
+  for (const [name, sql] of ${JSON.stringify(WORKER_QUERIES.map(([name, sql]) => [name, sql]))}) {
+    const before = spilledBytes();
+    const started = performance.now();
+    const a = await page.request('POST', '/sql?format=csv', {}, sql);
+    const ms = Number((performance.now() - started).toFixed(1));
+    postMessage({ name, status: a.status, headers: a.headers, text: new TextDecoder().decode(a.body), ms, spilled: spilledBytes() - before, file: spillFileBytes() });
+  }
+  for (const [name, sql] of ${JSON.stringify(WORKER_QUERIES.filter(([name]) => name === 'sort' || name === 'join').map(([name, sql]) => [name, sql]))}) {
+    const a = await page.request('POST', '/sql?format=csv', {}, 'EXPLAIN ' + sql);
+    postMessage({ plan: name, text: new TextDecoder().decode(a.body) });
+  }
+  await page.close();
+  page.free();
+  const names = [];
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('.pondra-spill');
+    for await (const [name, handle] of dir.entries()) names.push(handle.kind + ':' + name);
+  } catch (e) {
+    // (no folder: none was made, or it is gone)
+  }
+  postMessage({ done: true, folder: names, file: spillFileBytes(), spilled: spilledBytes() });
+} catch (e) {
+  postMessage({ error: String(e) });
+}
+`;
+
 // The page's server on 127.0.0.1: the page at `/`, and the --pkg folder's files under `/pkg/`. The .wasm goes as
 // `application/wasm`, which a browser needs to compile it while it streams in.
 async function serveSite() {
@@ -391,6 +435,7 @@ async function servePage(req, res) {
   if (pathname === '/demo/' || pathname === '/demo/index.html') {
     return send(res, 200, 'text/html; charset=utf-8', await readFile(DEMO, 'utf8'));
   }
+  if (pathname === '/spill-worker.js') return send(res, 200, MODULE_TYPES['.js'], SPILL_WORKER);
   const name = /^\/pkg\/([\w.-]+)$/.exec(pathname)?.[1];
   const type = name && MODULE_TYPES[extname(name)];
   const body = type ? await readFile(join(pkg, name)).catch(() => null) : null;
@@ -574,6 +619,135 @@ async function spillChecks() {
     console.error(`spill: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
   }
   if (failed.length === before) report.spill = 'a sort past its 0.1 GB pool with no folder to spill to stopped with 53200 naming memory_gb, and the next query answered';
+}
+
+// A page in a dedicated Worker spills past its pool to the browser's private storage (designs/l2-page-spill.md, S1): the sort,
+// the aggregate and the join that the pool can't hold run in the Worker with their answers, each with the bytes it spilled, and
+// the page answers its next query. The same sort on the main thread (a bare tab of its own: the module has its settings once
+// per module) is refused 53200, its words naming the Worker. Chromium only, in a persistent context of its own: an incognito
+// context may keep the origin's storage in memory under a small quota, so the check could pass without touching the disk.
+const WORKER_LIMIT_MS = 300_000; // (a query's time limit: a trapped Worker answers nothing, and would hang the check)
+async function spillWorkerChecks() {
+  const before = failed.length;
+  let chromium;
+  try {
+    chromium = await playwrightChromium();
+  } catch (e) {
+    failed.push('spill worker');
+    console.error(`spill worker: ${e}`);
+    return;
+  }
+  const site = await serveSite();
+  const origin = `http://127.0.0.1:${site.port}`;
+  const profile = await mkdtemp(join(tmpdir(), 'pondra-web-spill-'));
+  let context = null;
+  try {
+    context = await chromium.launchPersistentContext(profile, { headless: true });
+    const tab = await context.newPage();
+    watch(tab);
+    const messages = []; // (the Worker's posts, as the tab passes them here)
+    await tab.exposeFunction('spillReport', (message) => {
+      messages.push(message);
+    });
+    await tab.goto(`${origin}/?bare`, { waitUntil: 'commit' });
+    await untilStarted(tab);
+    const estimate = await tab.evaluate(storageEstimate);
+    report.spill_worker = { estimate };
+
+    // The main thread: the same settings, its sort refused and the next query answered.
+    const main = await tab.evaluate(async (sql) => {
+      const page = new window.Page({ memory_max_gb: 1, memory_gb: 0.1 });
+      const ask = async (text) => {
+        const a = await page.request('POST', '/sql?format=csv', {}, text);
+        return { status: a.status, headers: a.headers, text: new TextDecoder().decode(a.body) };
+      };
+      const past = await ask(sql);
+      const after = await ask('SELECT 1 AS n');
+      await page.close();
+      page.free();
+      return { past, after };
+    }, WORKER_QUERIES[0][1]);
+    judge('spill worker: a sort past its pool on the main thread', asJudged(main.past), { status: 503, sqlstate: '53200', says: 'Worker' });
+    judge("spill worker: the main thread's next query", asJudged(main.after), { status: 200, sqlstate: null, out: 'n\n1\n' });
+    report.spill_worker.main_thread = main.past.text;
+
+    // The Worker: its queries one at a time, each answered within its time limit, then its EXPLAINs and its close.
+    await tab.evaluate(() => {
+      const worker = new Worker('/spill-worker.js', { type: 'module' });
+      worker.onmessage = (e) => window.spillReport(e.data);
+      worker.onerror = (e) => window.spillReport({ error: e.message || 'the worker failed' });
+      worker.onmessageerror = () => window.spillReport({ error: 'a message from the worker could not be read' });
+    });
+    const times = {};
+    const plans = {};
+    let finished = null;
+    for (const [name, , want] of WORKER_QUERIES) {
+      const m = await nextMessage(messages);
+      if (!m || m.error || m.name !== name) {
+        failed.push(`spill worker: ${name}`);
+        console.error(`spill worker: ${name} answered ${m ? JSON.stringify(m.error ?? m.name) : 'nothing within 5 min'}`);
+        break;
+      }
+      judge(`spill worker: ${name}`, asJudged(m), { status: 200, sqlstate: null, out: want });
+      if (name !== 'one' && !(m.spilled > 0)) {
+        failed.push(`spill worker: ${name} spilled nothing`);
+        console.error(`spill worker: ${name} spilled nothing (spilledBytes did not move)`);
+      }
+      times[name] = { ms: m.ms, spilled_mb: Number((m.spilled / 2 ** 20).toFixed(1)) };
+      if (name === 'one') same('spill worker: spillFileBytes() after the last query', m.file, 0);
+    }
+    if (failed.length === before) {
+      for (const name of ['sort', 'join']) {
+        const m = await nextMessage(messages);
+        if (!m || m.error || m.plan !== name) {
+          failed.push(`spill worker: EXPLAIN ${name}`);
+          break;
+        }
+        plans[name] = m.text.split('\n').filter((line) => line.includes('SortExec') || line.includes('HashJoinExec'));
+      }
+      const sortPlan = plans.sort ?? [];
+      if (!(sortPlan.length > 0 && sortPlan.every((line) => !/TopK|fetch=\d/.test(line)))) {
+        failed.push('spill worker: EXPLAIN of the sort shows a SortExec with no fetch');
+        console.error(`spill worker: EXPLAIN of the sort: ${JSON.stringify(sortPlan)}`);
+      }
+      if (!(plans.join ?? []).some((line) => line.includes('HashJoinExec'))) {
+        failed.push('spill worker: EXPLAIN of the join shows a HashJoinExec');
+        console.error(`spill worker: EXPLAIN of the join: ${JSON.stringify(plans.join ?? [])}`);
+      }
+      finished = await nextMessage(messages);
+      if (!finished || finished.error || !finished.done) {
+        failed.push('spill worker: the page closed');
+        console.error(`spill worker: after its queries: ${JSON.stringify(finished?.error ?? finished ?? 'nothing within 5 min')}`);
+      } else {
+        same('spill worker: the .pondra-spill folder after close holds no file', JSON.stringify(finished.folder), '[]');
+      }
+    }
+    report.spill_worker = { ...report.spill_worker, queries: times, plans, folder_after_close: finished?.folder ?? null };
+    if (failed.length === before) report.spill_worker.run = `a page in a Worker spilled past its 0.1 GB pool and answered each query`;
+  } catch (e) {
+    failed.push('spill worker');
+    console.error(`spill worker: threw ${e}`);
+  } finally {
+    await context?.close();
+    await site.close();
+    await rm(profile, { recursive: true, force: true });
+  }
+}
+
+// `navigator.storage.estimate()` of the tab's origin, in MB: the room a page's spill file is capped by (half of the free part).
+async function storageEstimate() {
+  const { quota, usage } = await navigator.storage.estimate();
+  return { quota_mb: Math.round(quota / 2 ** 20), usage_mb: Math.round(usage / 2 ** 20) };
+}
+
+// The Worker's next post, or null after WORKER_LIMIT_MS: a post comes within the limit, or the query has hung.
+async function nextMessage(messages) {
+  const until = Date.now() + WORKER_LIMIT_MS;
+  while (messages.length === 0) {
+    if (Date.now() > until) return null;
+    await pause(20);
+  }
+  return messages.shift();
 }
 
 // A node's answer past the room a page has for it is not read (the node's `big` is a view of 20 M rows, 160 MB as Arrow and
@@ -1682,6 +1856,7 @@ try {
   if (IN_BROWSER) {
     await keptChecks(await target.tab('kept'), lake);
     await demoChecks(target.page);
+    await spillWorkerChecks();
   } else {
     await keptRefused(target.Page);
     await memoryChecks();

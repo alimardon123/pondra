@@ -6,10 +6,13 @@
 //! on their keys, so no row is held. The answers are the same; only how much is kept at once changes. Over a table's
 //! rows as they are read, it does so in every session: the table read twice streams, where the window sorts them all.
 //! A median holds every value of its group, which a spill can't help. `MiddleRows` answers a GROUP BY over medians
-//! from a sort instead: each group's values numbered in order, the one or two in the middle kept.
+//! from a sort instead: each group's values numbered in order, the one or two in the middle kept. A hash join holds its
+//! build side, which can't spill: over one partition, where DataFusion's planner makes every join a hash join,
+//! `SpillingJoins` makes it a sort-merge join, as the planner does over more.
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::{ConfigExtension, ConfigOptions};
-use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{extensions_options, Column, NullEquality, Result};
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions_aggregate::sum::sum_udaf;
@@ -17,6 +20,10 @@ use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::{AggregateFunction, Sort, WindowFunction, WindowFunctionDefinition};
 use datafusion::logical_expr::{cast, lit, Aggregate, Distinct, Expr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, Window, WindowFrameBound};
 use datafusion::optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::ExecutionPlan;
+use std::sync::Arc;
 
 extensions_options! {
     /// The frugal session's switch, set by `query::frugal`.
@@ -40,6 +47,39 @@ pub fn mark(o: &mut ConfigOptions) {
 /// Whether a session's options are frugal's.
 pub fn is_on(o: &ConfigOptions) -> bool {
     o.extensions.get::<Frugal>().is_some_and(|f| f.on)
+}
+
+/// A frugal session's hash joins of one partition, as sort-merge joins. DataFusion's planner makes a join a sort-merge
+/// join (`prefer_hash_join` off, `query::frugal`) only over more than one partition, so a page's retry (one partition,
+/// `store::partitions`) or one after `SET threads = 1` held its join's build side again, and was refused again
+/// ("Failed to allocate … for HashJoinInput"). Placed right after `JoinSelection`, so `EnsureRequirements` sorts each side
+/// by the keys, and those sorts spill. Not over more partitions, where the planner made them already; and not a
+/// null-aware join (`NOT IN`), which DataFusion keeps a hash join for its answers, or one a sort-merge join can't take.
+#[derive(Debug)]
+pub struct SpillingJoins;
+
+impl PhysicalOptimizerRule for SpillingJoins {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        if !is_on(config) || config.execution.target_partitions > 1 {
+            return Ok(plan);
+        }
+        Ok(plan.transform_up(|p| {
+            let Some(join) = p.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(p)) };
+            if join.null_aware || join.projection.is_some() {
+                return Ok(Transformed::no(p));
+            }
+            // (a side of more than one partition is merged into one by `EnsureRequirements`, and on a page in its task, `in_task.rs`)
+            let sorted = vec![SortOptions::default(); join.on().len()];
+            match SortMergeJoinExec::try_new(join.left().clone(), join.right().clone(), join.on().to_vec(), join.filter().cloned(), *join.join_type(), sorted, join.null_equality()) {
+                Ok(merge) => Ok(Transformed::yes(Arc::new(merge) as Arc<dyn ExecutionPlan>)),
+                Err(_) => Ok(Transformed::no(p)), // (a join type or key it can't take: the hash join, as before)
+            }
+        })?.data)
+    }
+
+    fn name(&self) -> &str { "spilling_joins" }
+
+    fn schema_check(&self) -> bool { true }
 }
 
 /// The aggregates a window can be answered with as a GROUP BY. Each gives every row of a partition the same answer,
@@ -571,6 +611,27 @@ mod tests {
             assert!(!rows(&want).is_empty(), "{sql}");
             assert_same(&want, &got, sql);
         }
+    }
+
+    /// A frugal session of one partition (a page's, or after `SET threads = 1`) joins with a sort-merge join, as one of
+    /// more does: DataFusion plans a join of one partition as a hash join, which can't spill, whatever `prefer_hash_join`
+    /// says. The answer is the same, and on a page the repartition into one partition under each sort runs in its task.
+    #[tokio::test]
+    async fn a_frugal_join_of_one_partition_is_a_sort_merge_join() {
+        let state = SessionStateBuilder::new()
+            .with_config(crate::optimize::config(SessionConfig::new().with_target_partitions(1)))
+            .with_default_features()
+            .with_physical_optimizer_rules(crate::optimize::physical_rules())
+            .build();
+        let ctx = crate::in_task::planned(SessionContext::new_with_state(state)); // (as a page plans: `t`'s three partitions merged in this task)
+        ctx.register_table("t", Arc::new(table())).unwrap();
+        let sql = "SELECT count(*) AS n FROM t a JOIN t b ON a.g = b.g";
+        assert!(plan(&ctx, sql).await.contains("HashJoinExec"), "{sql}");
+        let want = answer(&ctx, sql).await;
+        crate::query::frugal(&ctx);
+        let text = plan(&ctx, sql).await;
+        assert!(text.contains("SortMergeJoin") && !text.contains("HashJoinExec") && !text.contains("RepartitionExec"), "{text}");
+        assert_same(&want, &answer(&ctx, sql).await, sql);
     }
 
     /// No rows: one row of NULL for the whole table either way, and no rows for the groups.

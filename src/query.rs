@@ -1490,6 +1490,7 @@ pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resourc
 
 /// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), sorts
 /// keeping 1 MB aside to merge, and the rewrites in `frugal.rs` (a window over whole partitions as a GROUP BY).
+/// Over one partition, where DataFusion plans every join as a hash join, `frugal::SpillingJoins` makes them sort-merge joins.
 pub fn frugal(ctx: &SessionContext) {
     let state = ctx.state_ref();
     let mut state = state.write();

@@ -54,6 +54,10 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
+    // (a page's spill is written uncompressed: arrow-ipc 59 writes a compressed buffer's length as a `usize`, 4 bytes on
+    // wasm32, and reads it back as 8, so a page couldn't read an LZ4 spill it wrote ("Invalid uncompressed length"); 60 fixes it)
+    #[cfg(target_arch = "wasm32")]
+    let config = config.set_str("datafusion.execution.spill_compression", "uncompressed");
     config
 }
 
@@ -1121,6 +1125,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let sides = rules.iter().position(|r| r.name() == "join_selection").unwrap_or(0);
     rules.insert(sides, Arc::new(FilterShares { apart: true })); // (the joins' sides are picked by their inputs' sizes)
     let at = sides + 2;
+    rules.insert(at, Arc::new(crate::frugal::SpillingJoins)); // (a frugal retry's joins of one partition: right after JoinSelection, before the rules that read its hash joins)
+    let at = at + 1;
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
