@@ -20,19 +20,26 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 
 | Type | Also written | Holds |
 |---|---|---|
-| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | | 8, 16, 32 and 64-bit integers |
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | `INT1`, `SHORT`, `LONG` | 8, 16, 32 and 64-bit integers |
+| `TINYINT UNSIGNED`, …, `BIGINT UNSIGNED` | `UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT` | integers of no sign |
 | `REAL`, `DOUBLE` | | 32 and 64-bit floating point |
 | `DECIMAL(p, s)` | | exact numbers; `0.07` in SQL is a decimal |
-| `VARCHAR` | `TEXT`, `STRING` | text |
+| `VARCHAR` | `TEXT`, `STRING`, `BPCHAR` | text |
 | `VARCHAR(n)` | `CHARACTER VARYING(n)`, `NVARCHAR(n)` | text of at most `n` characters |
 | `UUID` | | a uuid, kept as text written one way: lower case with hyphens |
-| `BOOLEAN` | | true or false |
-| `DATE`, `TIME`, `TIMESTAMP` | | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
+| `BOOLEAN` | `LOGICAL` | true or false |
+| `DATE`, `TIME`, `TIMESTAMP` | `DATETIME`, `TIMESTAMP_NTZ`; `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS` for `TIMESTAMP(0)`, `(3)`, `(9)` | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, kept and shown in UTC with its zone: `2026-09-29T05:00:00Z` |
 | `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
 | `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/sql/functions/)) |
 | `type[]` | | a list of one type |
 | an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
+
+A type Pondra doesn't have is refused by name (`0A000`), with what to write instead: DuckDB's `HUGEINT` and
+`VARINT` (`DECIMAL(38, 0)`), `BIT` and `VARBIT` (`BOOLEAN`, or `BYTEA` for bits), `TIMETZ` (`TIME`, or
+`TIMESTAMPTZ` for an instant), `MONEY` (`DECIMAL(19, 4)`), SQL Server's `DATETIME2`, `DATETIMEOFFSET` and
+`UNIQUEIDENTIFIER`, and MySQL's `TINYTEXT`, `LONGBLOB` and `YEAR` and their kind. A function's parameters and what it
+returns are spelled the same way.
 
 A `DOUBLE` or `REAL` that meets a decimal, a column or a number such as `0.5`, makes it a `DOUBLE`, as
 Postgres and DuckDB do: `x > 0.5` and `x * 1.5` on a `DOUBLE` column are worked out in doubles. An
@@ -577,7 +584,10 @@ one script's (statements sent together over HTTP).
   `--memory-gb` ([`PONDRA_MEMORY_GB`](/pondra/reference/environment/) and the other settings there),
   and refused here.
 - `COPY … FROM STDIN`, `COPY … TO STDOUT`, `DISCARD` and `CLOSE` are the Postgres port's: see
-  [Postgres](/pondra/reference/postgres/).
+  [Postgres](/pondra/reference/postgres/). Over HTTP, the console and `pondra sql`, the two `COPY`s are refused
+  (`0A000`) naming what to write there: the query as CSV (`POST /sql?format=csv`) or `COPY … TO 's3://…'`, and
+  `COPY INTO t FROM 'path or URL'` or `POST /append/t`. So is Postgres's `COPY t FROM 'file'`, a file of its own
+  server's: `COPY INTO t FROM 'path or URL'` loads one.
 - `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
   functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
@@ -1168,6 +1178,7 @@ text is the node's own, it is shown in code:
 | `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
 | `PRAGMA table_info('t')`, and DuckDB's and SQLite's other `PRAGMA`s | refused (`0A000`), naming Pondra's statement: `PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE t` (`SHOW TABLES`, `SHOW DATABASES`, `SET` and `SHOW` for a setting) |
+| `UPSERT INTO t …` | CockroachDB's, refused (`0A000`) naming Pondra's two upserts: `INSERT OR REPLACE INTO t …`, or `INSERT INTO t … ON CONFLICT (key) DO UPDATE SET …` |
 | `CREATE EXTENSION name` | refused (`0A000`), naming Pondra's way: `CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm` (for `uuid-ossp` and `pgcrypto`, the functions built in) |
 | `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |

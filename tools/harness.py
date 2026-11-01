@@ -5509,7 +5509,7 @@ def copies():
     text, CSV and binary, each read back as the rows went in; the ADBC Postgres driver, which reads
     every result as `COPY (query) TO STDOUT (FORMAT binary)`, gets them as Arrow. `COPY FROM` reads
     the text format as Postgres 16 does (escapes, octal and hex, an escaped delimiter) and loads bytea
-    in text and CSV; COPY TO piped back gives the rows. The end marker `\\.` ends the data in any chunk, a blank CSV
+    in text and CSV; COPY TO piped back gives the rows; over HTTP the same COPYs are refused by name. The end marker `\\.` ends the data in any chunk, a blank CSV
     line is a row, and a number out of its type's range is 22003. A row past 64 MB is refused (54000) as it comes, and the
     connection goes on; 40 MB of rows in 64 KB frames loads every row."""
     import io, psycopg, adbc_driver_postgresql.dbapi as adbc
@@ -5658,6 +5658,16 @@ def copies():
         bulk.update(secs=round(time.time() - t0, 2), rows_sent=n, rowcount=cur.rowcount,
                     loaded=list(c.execute("SELECT count(*), CAST(sum(id) AS BIGINT), max(id) FROM bulk40").fetchone()))
     bulk_ok = bulk["loaded"] == [n, n * (n - 1) // 2, n - 1] and bulk["rowcount"] == n
+    # (over HTTP, which has no client stream: COPY … TO STDOUT and FROM STDIN, and Postgres's COPY t FROM 'file', refused by
+    # name (0A000) with what to write there; the port's COPY above is the same statement, answered)
+    off_port = {}
+    for q_, words in (("COPY (SELECT 1 AS n) TO STDOUT WITH (FORMAT csv)", "POST /sql?format=csv"), ("COPY bulk40 FROM STDIN", "COPY INTO bulk40 FROM"),
+                      ("COPY bulk40 FROM '/tmp/rows.csv'", "COPY INTO bulk40 FROM 'path or URL'")):
+        hc = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+        hc.request("POST", "/sql", q_.encode())
+        r_ = hc.getresponse()
+        b_ = r_.read().decode()
+        off_port[q_] = r_.status != 200 and r_.getheader("x-pondra-sqlstate") == "0A000" and words in b_
     node.kill()
     checks = {"COPY FROM STDIN, text and CSV": (text_in, csv_in) == (1000, 1000),
               "COPY FROM's end marker, blank lines and out-of-range values as Postgres 16 answers them (rows, or the SQLSTATE with nothing written)": edge_ok,
@@ -5672,11 +5682,12 @@ def copies():
                   longs["text"] == "54000" and longs["text_then_select_1"] == 1 and longs["text_secs"] <= 10,
               "COPY FROM a row past 64 MB, CSV (a quote open over 70 MB of lines) in 64 KB frames: refused with 54000, and the connection runs SELECT 1 after":
                   longs["csv"] == "54000" and longs["csv_then_select_1"] == 1 and longs["csv_secs"] <= 10,
-              "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok}
+              "COPY FROM 40 MB of rows in 64 KB frames: every row loads (count, sum and max of id)": bulk_ok,
+              "over HTTP, COPY … TO STDOUT, FROM STDIN and FROM a server's file: refused by name with what to write there, 0A000": all(off_port.values())}
     out = {"passed": all(checks.values()), "checks": checks,
            "info": {"compared": f"{len(cases)} COPY FROM cases (text, CSV, CSV HEADER; one or two columns; int, smallint, bigint, numeric(3,1)) "
                                 "with Postgres 16's rows or SQLSTATE, and 10 rows, a marker, then 34 MB after a 32 MB chunk, against the rows loaded",
-                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk}}
+                    "loaded_in_big_copy": len(big_rows), "mismatched": mismatched, "past_64_mb": longs, "bulk_40_mb": bulk, "off_port": off_port}}
     print(json.dumps({"copies": out}))
     if not out["passed"]:
         sys.exit(1)
@@ -23963,7 +23974,8 @@ def friendly():
     columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
     list, a CASE and an aggregate, NULLs and all; array literals reading the outer query's columns
     and the CTEs around them (`ANY([z.n])`, a CTE in an element), which DataFusion planned without
-    them (`friendly.rs`: an array literal is make_array)."""
+    them (`friendly.rs`: an array literal is make_array); DuckDB's names for types Pondra has (DATETIME, UBIGINT, BLOB…)
+    in a table and a function, and a type Pondra hasn't (HUGEINT, DATETIME2, BIT, MONEY) refused by name."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -24186,6 +24198,37 @@ def friendly():
     except Exception as e:
         checks["INT64, FLOAT64, NUMBER(10,2), NUMBER and BYTEINT, in a cast and a CREATE TABLE: BIGINT, DOUBLE, DECIMAL(10,2), DECIMAL(38,0), TINYINT"] = False
         failed["spelled types"] = str(e)[:400]
+    # DuckDB's own names for types Pondra has (friendly.rs DUCKDB_TYPES): the same table, made and filled in both, answers
+    # as DuckDB's does; a function's parameter and RETURNS take them too (routines.rs); a type Pondra hasn't is refused by
+    # name, 0A000, in a table, a cast and a function
+    try:
+        duck_ddl = ["CREATE TABLE dt (a DATETIME, b UBIGINT, c BLOB, d LOGICAL, e UINTEGER, f INT1, g BPCHAR, h TIMESTAMP_MS, i SHORT, j LONG)",
+                    "INSERT INTO dt VALUES (TIMESTAMP '2026-01-02 03:04:05', 18000000000000000000, NULL, true, 4000000000, -5, 'x', TIMESTAMP '2026-01-02 03:04:05.123', -300, 9000000000),"
+                    " (NULL, 7, NULL, false, 0, 127, 'yz', NULL, NULL, -1)"]
+        for s_ in duck_ddl:
+            sql(A.port, s_)
+            duck.execute(s_)
+        q_ = "SELECT a, b, c IS NULL AS c, d, e, f, g, h, i, j FROM dt ORDER BY f"
+        (cn, got), (dn, want) = ours(q_), theirs(q_)
+        sql(A.port, "CREATE FUNCTION later(x DATETIME, n UINTEGER) RETURNS DATETIME AS x + INTERVAL '1 day' * CAST(n AS INT)")
+        moved = sql(A.port, "SELECT later(a, 2) AS m FROM dt WHERE a IS NOT NULL")
+        codes_ = {}
+        for q2 in ("CREATE TABLE ht (n HUGEINT)", "SELECT CAST(1 AS DATETIME2) AS x", "CREATE FUNCTION f_bit(b BIT) RETURNS INT AS 1", "CREATE TABLE mt (m MONEY)"):
+            c2 = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+            c2.request("POST", "/sql", q2.encode())
+            r2 = c2.getresponse()
+            codes_[q2] = (r2.status, r2.getheader("x-pondra-sqlstate"), r2.read().decode()[:200])
+        checks["DuckDB's DATETIME, UBIGINT, BLOB, LOGICAL, UINTEGER, INT1, BPCHAR, TIMESTAMP_MS, SHORT, LONG: a table == DuckDB's, and a function's types"] = \
+            got == want and cn == dn and len(want) == 2 and [list(r.values()) for r in moved] == [["2026-01-04T03:04:05"]]
+        checks["HUGEINT, DATETIME2, BIT and MONEY: refused by name with what to write, 0A000, in a table, a cast and a function"] = \
+            all(st_ != 200 and hd_ == "0A000" and "write" in b_ for st_, hd_, b_ in codes_.values())
+        if not (got == want and cn == dn):
+            failed["duckdb types"] = {"ours": [cn, got], "duckdb": [dn, want], "moved": moved}
+        if not checks[list(checks)[-1]]:
+            failed["refused types"] = codes_
+    except Exception as e:
+        checks["DuckDB's DATETIME, UBIGINT, BLOB, LOGICAL, UINTEGER, INT1, BPCHAR, TIMESTAMP_MS, SHORT, LONG: a table == DuckDB's, and a function's types"] = False
+        failed["duckdb types"] = str(e)[:400]
     c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
     c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
     r = c.getresponse()
@@ -24202,7 +24245,7 @@ def friendly():
     # (11-01 audit L1, M6, M7: each refusal with its SQLSTATE, never XX000)
     coded = {"SELECT TOP 10 PERCENT id FROM t": "0A000", "SELECT id FROM t FETCH FIRST 10 PERCENT ROWS ONLY": "0A000", "SELECT TOP 2 id FROM t LIMIT 3": "42601",
              "SELECT string_agg(g, ',' ORDER BY id) WITHIN GROUP (ORDER BY id) AS s FROM t": "42601", "SELECT DATEDIFF(week, ts, ts) AS w FROM t": "22023",
-             "SELECT strftime(ts, '%F') AS f FROM t": "22023"}
+             "SELECT strftime(ts, '%F') AS f FROM t": "22023", "UPSERT INTO t VALUES (1)": "0A000"}
     got_codes = {}
     for q_, want_ in coded.items():
         c.request("POST", "/sql", q_.encode())

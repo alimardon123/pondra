@@ -82,7 +82,7 @@ CASES = [
     ("postgres", "INSERT INTO orders (id, customer_id, amount, status, created_at, tags) VALUES (2, 2, 40.00, 'delivered', now(), NULL) ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, amount = EXCLUDED.amount"),
     ("postgres", "UPDATE orders SET tags = c.country FROM customers c WHERE c.id = orders.customer_id AND orders.id = 4"),
     ("postgres", "DELETE FROM t_case_1 t USING orders o WHERE t.order_id = o.id AND o.status = 'refunded'"),
-    ("postgres", "COPY (SELECT id, name, country FROM customers ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER true)"),
+    ("postgres", "COPY (SELECT id, name, country FROM customers ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER true)", ("0A000", "COPY … TO STDOUT is the Postgres port's")),
     # postgres: sessions and admin
     ("postgres", "SET search_path TO public, pg_catalog"),
     ("postgres", "EXPLAIN ANALYZE SELECT o.id, c.name FROM orders o JOIN customers c ON c.id = o.customer_id"),
@@ -121,7 +121,7 @@ CASES = [
     ("duckdb", "INSERT OR REPLACE INTO t_case_101 VALUES (1, 'paid', 9.5), (2, 'vip', 4.0)"),
     ("duckdb", "INSERT INTO t_case_101 VALUES (4, 'vip', 7.0) RETURNING *"),
     ("duckdb", "INSERT INTO t_case_101 VALUES (3, 'gift', 1.5) ON CONFLICT (id) DO UPDATE SET score = excluded.score"),
-    ("duckdb", "UPSERT INTO t_case_101 VALUES (5, 'new', 0.5)"),
+    ("duckdb", "UPSERT INTO t_case_101 VALUES (5, 'new', 0.5)", ("0A000", "UPSERT is CockroachDB's: write INSERT OR REPLACE INTO t_case_101")),
     ("duckdb", "UPDATE orders SET tags = 'uk-buyer' FROM customers c WHERE c.id = orders.customer_id AND c.country = 'UK' AND orders.id = 1"),
     ("duckdb", "DELETE FROM t_case_101 USING customers c WHERE t_case_101.id = c.id AND c.country IS NULL"),
     ("duckdb", "ALTER TABLE t_case_101 ALTER COLUMN label TYPE VARCHAR"),
@@ -233,7 +233,7 @@ CASES = [
     ("mysql", "SELECT CONCAT_WS(' ', name, CONCAT('<', email, '>')) AS contact, SUBSTRING_INDEX(email, '@', -1) AS domain, LPAD(id, 6, '0') AS code FROM customers"),
     ("mysql", "SELECT name FROM customers WHERE REGEXP_LIKE(name, '^[A-Z]') AND CHAR_LENGTH(name) > 5"),
     # mysql: tables and rows
-    ("mysql", "CREATE TABLE IF NOT EXISTS t_case_401 (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, order_id INT NOT NULL, note VARCHAR(255) DEFAULT NULL, flag TINYINT(1) DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_order (order_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='test'"),
+    ("mysql", "CREATE TABLE IF NOT EXISTS t_case_401 (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, order_id INT NOT NULL, note VARCHAR(255) DEFAULT NULL, flag TINYINT(1) DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, KEY idx_order (order_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='test'", ("0A000", "a table's options go in WITH")),
     ("mysql", "CREATE TABLE t_case_402 (id INT PRIMARY KEY, customer_id INT, CONSTRAINT fk_cust FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE) ENGINE=InnoDB"),
     ("mysql", "CREATE TEMPORARY TABLE t_case_403 AS SELECT customer_id, COUNT(*) AS n FROM orders GROUP BY customer_id"),
     ("mysql", "INSERT INTO t_case_401 (order_id, note) VALUES (1, 'gift'), (2, NULL)"),
@@ -310,7 +310,7 @@ CASES = [
     ("sqlserver", "SELECT customer_id, STRING_AGG(status, ', ') WITHIN GROUP (ORDER BY id) AS statuses FROM orders GROUP BY customer_id"),
     ("sqlserver", "SELECT JSON_VALUE(payload, '$.page') AS page, j.[key], j.value FROM events AS e CROSS APPLY OPENJSON(e.payload) AS j WHERE e.kind = 'page_view'"),
     # sqlserver: tables and rows
-    ("sqlserver", "CREATE TABLE t_case_601 (id INT IDENTITY(1,1) PRIMARY KEY, order_id INT NOT NULL REFERENCES orders(id), note NVARCHAR(50) NULL, qty INT CONSTRAINT ck_qty CHECK (qty > 0) DEFAULT 1, created_at DATETIME2 DEFAULT SYSDATETIME(), flag BIT NOT NULL DEFAULT 0)"),
+    ("sqlserver", "CREATE TABLE t_case_601 (id INT IDENTITY(1,1) PRIMARY KEY, order_id INT NOT NULL REFERENCES orders(id), note NVARCHAR(50) NULL, qty INT CONSTRAINT ck_qty CHECK (qty > 0) DEFAULT 1, created_at DATETIME2 DEFAULT SYSDATETIME(), flag BIT NOT NULL DEFAULT 0)", ("0A000", "DATETIME2 is SQL Server's: write TIMESTAMP")),
     ("sqlserver", "SELECT customer_id, SUM(amount) AS total INTO t_case_602 FROM orders GROUP BY customer_id"),
     ("sqlserver", "INSERT INTO t_case_601 (order_id, note, qty) VALUES (1, N'gift', 2), (2, N'rush', 1)"),
     ("sqlserver", "INSERT INTO t_case_601 (order_id, note) OUTPUT inserted.id, inserted.note VALUES (3, N'refund')"),

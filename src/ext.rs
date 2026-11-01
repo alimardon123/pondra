@@ -1129,20 +1129,36 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
         return None;
     }
     let invalid = |e: String| Some(crate::write::Stmt::Invalid(format!("COPY … TO 'url' (FORMAT parquet, …): {e}")));
-    let query = match p.consume_token(&Token::LParen) {
+    let (query, table) = match p.consume_token(&Token::LParen) {
         true => match p.parse_query().and_then(|q| p.expect_token(&Token::RParen).map(|_| q)) {
-            Ok(q) => q.to_string(),
+            Ok(q) => (q.to_string(), None),
             Err(e) => return invalid(e.to_string()),
         },
         false => match p.parse_object_name(false) {
-            Ok(t) => format!("SELECT * FROM {t}"),
+            Ok(t) => (format!("SELECT * FROM {t}"), Some(t.to_string())),
             Err(e) => return invalid(e.to_string()),
         },
     };
+    // (COPY … FROM STDIN and TO STDOUT are the Postgres port's, which `pg.rs` takes before this; another door has no
+    // client stream for them, and Postgres's COPY t FROM 'file' reads its own server's file: each refused by name)
+    let refused = |words: String| Some(crate::write::Stmt::Refused("0A000", words));
     if !p.parse_keyword(Keyword::TO) {
-        return None; // (COPY … FROM: the Postgres port's)
+        if p.consume_token(&Token::LParen) {
+            let _ = p.parse_comma_separated(|p| p.parse_identifier()).and_then(|_| p.expect_token(&Token::RParen)); // (a column list, `t (a, b)`)
+        }
+        if !p.parse_keyword(Keyword::FROM) {
+            return None;
+        }
+        let t = table.unwrap_or_else(|| "t".into());
+        return match p.parse_keyword(Keyword::STDIN) {
+            true => refused(format!("COPY {t} FROM STDIN is the Postgres port's (psql, a driver's copy): elsewhere, COPY INTO {t} FROM 'path or URL' loads files, and POST /append/{t} appends rows")),
+            false => refused(format!("COPY {t} FROM a file reads a file of Postgres's own server: write COPY INTO {t} FROM 'path or URL'")),
+        };
     }
-    let Ok(to) = p.parse_literal_string() else { return None }; // (TO STDOUT)
+    if p.parse_keyword(Keyword::STDOUT) {
+        return refused("COPY … TO STDOUT is the Postgres port's (psql, a driver's copy): elsewhere, run the query as CSV (POST /sql?format=csv), or COPY it TO 's3://…' (FORMAT csv)".into());
+    }
+    let Ok(to) = p.parse_literal_string() else { return None };
     let mut options = BTreeMap::new();
     // DataFusion's words for the same: STORED AS csv, PARTITIONED BY (…), OPTIONS ('format.has_header' 'false', …).
     loop {
@@ -1708,6 +1724,19 @@ impl datafusion::catalog::TableProvider for Secrets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_to_stdout_and_from_stdin_off_the_port_are_refused_by_name() {
+        let said = |sql: &str| match statement(sql) {
+            Some(crate::write::Stmt::Refused(code, words)) => (code, words),
+            _ => panic!("{sql}: not refused"),
+        };
+        let (code, words) = said("COPY (SELECT id FROM customers) TO STDOUT WITH (FORMAT csv, HEADER true)");
+        assert!(code == "0A000" && words.contains("POST /sql?format=csv"), "{words}");
+        assert!(said("COPY orders (id, amount) FROM STDIN").1.contains("COPY INTO orders FROM 'path or URL' loads files, and POST /append/orders"));
+        assert!(said("COPY orders FROM '/srv/orders.csv'").1.starts_with("COPY orders FROM a file reads a file of Postgres's own server"));
+        assert!(matches!(statement("COPY orders TO 's3://b/o.parquet' (FORMAT parquet)"), Some(crate::write::Stmt::CopyTo(..))), "a COPY to a file is as it was");
+    }
 
     #[test]
     fn a_machine_key_file_is_whole_or_refused() {
