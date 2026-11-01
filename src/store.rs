@@ -2494,6 +2494,21 @@ impl Catalog {
     /// Leader: the last committed write.
     pub fn committed(&self) -> u64 { self.committed.load(Relaxed) }
 
+    /// Do this node's reads include commit `c` (its leader's `committed`)? The leader's, once it committed it; a follower's
+    /// whole catalog in memory, once the stream brought it; between seeds, once our view has it, or the stream laid over the
+    /// view does (`overlay_ok`). A view's mark moves at `settle`. (Commits, not log segments: a CREATE TABLE adds none.)
+    pub fn holds(&self, c: u64) -> bool {
+        if self.kv.is_writer() {
+            return self.committed() >= c;
+        }
+        let _o = self.overlay.lock().unwrap(); // (under the lock: see `apply`)
+        let (view, streamed) = (self.view.0.load(Relaxed), self.streamed.load(Relaxed));
+        match self.mirror.load(Relaxed) {
+            true => streamed >= c,
+            false => view >= c || (self.overlay_ok(view) && streamed >= c),
+        }
+    }
+
     fn apply(&self, d: &Delta) {
         let mut o = self.overlay.lock().unwrap();
         if d.id <= self.pruned.load(Relaxed) {

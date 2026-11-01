@@ -441,10 +441,17 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
     lake.caught.send_replace(false);
     crate::panics::spawn(async move {
         let (since, mut said) = (tokio::time::Instant::now(), 0);
-        let url = crate::tls::url(&format!("{}/cluster/visible", leader.addr));
+        // (its last commit; a leader older than this one tells only its log's end, which a table's commit doesn't move)
+        let ask = |path: &str| {
+            let url = crate::tls::url(&format!("{}{path}", leader.addr));
+            async move { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }
+        };
         let upto = loop {
-            if let Ok(upto) = async { http().get(&url).timeout(Duration::from_secs(2)).send().await?.error_for_status()?.json::<u64>().await }.await {
-                break Some(upto);
+            if let Ok(c) = ask("/cluster/committed").await {
+                break Some((true, c));
+            }
+            if let Ok(upto) = ask("/cluster/visible").await {
+                break Some((false, upto));
             }
             if since.elapsed() < Duration::from_secs(30) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -461,7 +468,12 @@ pub fn catch_up(lake: Arc<Lake>, store: Store, leader: Term) {
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
         match upto {
-            Some(upto) => {
+            Some((true, c)) => {
+                if !crate::write::holds(&lake, c, Duration::from_secs(30)).await {
+                    eprintln!("this node's catalog hasn't reached its leader's commit {c} in 30 s: answering from it anyway");
+                }
+            }
+            Some((false, upto)) => {
                 let mut hwm = lake.hwm.subscribe();
                 if tokio::time::timeout(Duration::from_secs(30), async { while lake.visible() < upto { let _ = tokio::time::timeout(Duration::from_millis(50), hwm.changed()).await; } }).await.is_err() {
                     eprintln!("this node's catalog hasn't reached its leader's commit {upto} in 30 s: answering from it anyway");

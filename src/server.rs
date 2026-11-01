@@ -108,6 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { crate::cluster::of(&app).map(|c| Json(c.leader_status())).ok_or(StatusCode::NOT_FOUND) }))
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
+        .route("/cluster/committed", get(|State(app): State<App>| async move { Json(app.lake.cat.committed()) })) // (the leader's last commit: `write::seen_here`, `cluster::catch_up`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg_rest::rest())
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)

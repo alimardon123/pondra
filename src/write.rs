@@ -1491,18 +1491,46 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
 }
 
 /// A write done through a follower is in its reads before it answers: the next statement on this
-/// node sees it (a script's INSERT, then its SELECT), as on the leader. The follower waits until
-/// its view holds everything the leader had committed once the write was done (5 s at most: a
-/// view that far behind catches up by itself).
+/// node sees it (a script's INSERT, then its SELECT; a CREATE TABLE … AS's INSERT into the table it
+/// made), as on the leader. The follower waits until it holds everything the leader had committed
+/// once the write was done (5 s at most: a view that far behind catches up by itself). By commit: a
+/// node just started, before it follows the stream, answered a CREATE TABLE … AS with "no table" for
+/// seconds, since a table's commit adds no log segment, which is all a leader older than this one
+/// can tell (`/cluster/visible`, still asked of it).
 pub async fn seen_here(app: &crate::app::App) {
     if app.seq.is_some() || app.members.reader() || !app.members.keeps_records() {
         return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
-    let asked = async { crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/visible").timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
-    let Ok(upto) = asked.await else { return };
-    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
-    while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let leader = &app.members.leader().addr;
+    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
+    let cap = std::time::Duration::from_secs(5);
+    match ask("/cluster/committed").await {
+        Ok(c) => {
+            holds(&app.lake, c, cap).await;
+        }
+        Err(_) => {
+            let Ok(upto) = ask("/cluster/visible").await else { return };
+            let deadline = datafusion::common::instant::Instant::now() + cap;
+            while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+    }
+}
+
+/// Waits, `cap` at most, until this node's reads include its leader's commit `c` (`Catalog::holds`), moving its view's mark
+/// as it goes when the stream isn't the whole catalog here. Does it hold `c` now?
+pub(crate) async fn holds(lake: &Lake, c: u64, cap: std::time::Duration) -> bool {
+    let deadline = datafusion::common::instant::Instant::now() + cap;
+    loop {
+        if lake.cat.holds(c) {
+            return true;
+        }
+        if datafusion::common::instant::Instant::now() >= deadline {
+            return false;
+        }
+        let _ = lake.cat.settle().await; // (the mirror's: nothing to do)
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
