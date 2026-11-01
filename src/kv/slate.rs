@@ -58,7 +58,7 @@ impl Writer {
         // On a local disk, where listing costs nothing, the WAL goes every 5 s and the compactor's
         // replaced files a minute on, not five: a minute of WAL is a file per commit (100 MB at 400
         // commits a second), and a disk they filled had no room to flush the catalog, so nothing
-        // could ever clear it. (A follower reads the files of a manifest it polled 250 ms ago.)
+        // could ever clear it. (A follower reads the files of a manifest it polled a second ago at most: `store::FOLLOWER_POLL`.)
         let every = |interval: u64, min_age: u64| Some(GarbageCollectorDirectoryOptions { interval: Some(Duration::from_secs(interval)), min_age: Duration::from_secs(min_age), dry_run: false });
         let gc = crate::env::parse("PONDRA_GC_SECS");
         let (wal, secs) = (gc.unwrap_or(if local { 5 } else { 60 }), gc.unwrap_or(60));
@@ -313,7 +313,7 @@ impl Upkeep {
 /// SlateDB's compactor pins the files each compaction replaces with a checkpoint for 15 minutes
 /// (for a scan still reading them), whatever the collector is told: under a stream of small
 /// commits that is a GB of a local disk, and a small disk it filled stayed full that long. On a
-/// local disk every node polls its view every 250 ms and a scan takes far less than a minute, so
+/// local disk every node polls its view at least every second and a scan takes far less than a minute, so
 /// such a checkpoint (unnamed, 15 minutes) goes a minute on; the collector then takes its files.
 async fn unpin(store: Store) {
     let admin = slatedb::admin::Admin::builder("catalog", store).build();

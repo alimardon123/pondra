@@ -1354,6 +1354,12 @@ pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionCo
 /// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
 pub const READER_POLL: Duration = Duration::from_millis(250);
 
+/// How often a node that follows the leader's commit stream polls the bucket for newer manifests. Once seeded it answers
+/// every read from the stream (`Catalog::seed`): its own view only lets it drop the inline data it holds, and catches it up
+/// after a gap in the stream. Each poll is two GETs (the next manifest, and SlateDB's GC boundary), so every 250 ms was
+/// 480 GETs a minute a follower, idle or not (reviews/storage-requests-2026-11-01.md); every second is 120.
+pub const FOLLOWER_POLL: Duration = Duration::from_secs(1);
+
 /// A guest that reads reads one snapshot, for one statement, and never polls: its life is far shorter than this.
 pub const READER_ONE_SNAPSHOT: Duration = Duration::from_secs(3600);
 

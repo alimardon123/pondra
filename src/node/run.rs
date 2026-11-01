@@ -231,8 +231,10 @@ impl Node {
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || (lives && cluster.leader_alive().await));
         // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`;
         // an inbox guest polls as a follower does: its `seen_there` waits for the leader's mark, which a snapshot never shows)
+        // (a node that follows the commit stream answers from it, and polls less: `FOLLOWER_POLL`)
         let poll = match guest {
             Some(Guest::Reads) if !streamed => store::READER_ONE_SNAPSHOT,
+            None if streamed => store::FOLLOWER_POLL,
             _ => store::READER_POLL,
         };
         let opened = match beside.keep(streamed).await {
