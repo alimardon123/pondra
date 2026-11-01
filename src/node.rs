@@ -706,7 +706,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 })
             };
-            let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}));
+            let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
             panics::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;

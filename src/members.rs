@@ -92,33 +92,47 @@ pub enum Open {
 /// Follow a lake's commit stream: a node's member and a page's both read it this way, one connection at a time. Each
 /// change is held and each commit applied, and a connection that ends or fails is tried again 500 ms later. `frame` sees
 /// every frame before the lake takes it (a node keeps its replica there), and `down` runs when a connection ends or
-/// fails, before that wait. A change no newer than the last one is skipped: a reconnect replays some. The loop ends when
-/// `lake` is gone (checked as a frame arrives) or `open` says `Stop`.
+/// fails, before that wait. A change no newer than the last one is skipped: a reconnect replays some. A new term's
+/// `Start` drops the changes the old leader left uncommitted, and starts the ids again. With `resend`, each frame the
+/// lake took is relayed on to the pages that follow it (`Catalog::relay`; never a `Start`, nor a commit or durable
+/// point they have had). The loop ends when `lake` is gone (checked as a frame arrives) or `open` says `Stop`.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a node's `cluster::mirror` calls it; a page's join will too)
 pub async fn follow(
     lake: Weak<Lake>,
     open: impl Fn() -> BoxFuture<'static, Result<fetch::Response, Open>> + Send,
     mut frame: impl FnMut(&Frame, &Lake) + Send,
     mut down: impl FnMut() + Send,
+    resend: bool,
 ) {
     let mut last = 0; // the last change we got (a reconnect replays some we have)
+    let mut term = None; // the leader's term, as its `Start` says
+    let mut relayed = (0, 0); // the last commit and durable point relayed (`relays`)
     while lake.strong_count() > 0 {
         match open().await {
             Ok(r) => {
                 let mut frames = Box::pin(frames(r.bytes_stream()));
                 while let Some(Ok(f)) = frames.next().await {
+                    let Some(live) = lake.upgrade() else { return };
+                    if let Frame::Start { term: t, .. } = &f {
+                        if term.replace(*t) != Some(*t) {
+                            last = 0;
+                            live.drop_pending();
+                        }
+                    }
                     if let Frame::Change(d) = &f {
                         if d.id <= last {
                             continue;
                         }
                         last = d.id;
                     }
-                    let Some(live) = lake.upgrade() else { return };
                     frame(&f, &live);
-                    match f {
-                        Frame::Change(d) => live.hold(d),
-                        Frame::Committed(upto) => live.commit_upto(upto),
+                    match &f {
+                        Frame::Change(d) => live.hold(d.clone()),
+                        Frame::Committed(upto) => live.commit_upto(*upto),
                         Frame::Start { .. } | Frame::Durable(_) => {}
+                    }
+                    if resend && relays(&f, &mut relayed) {
+                        live.cat.relay(f);
                     }
                 }
             }
@@ -130,8 +144,28 @@ pub async fn follow(
     }
 }
 
+/// Whether `follow` relays a frame the lake took (`resend`): every change (one at or below the last was skipped before it),
+/// and a commit or durable point past the last one relayed, so a reconnect's replay isn't sent again. Never a `Start`: the
+/// follower's own feed writes that, with its own `replicated`.
+fn relays(f: &Frame, relayed: &mut (u64, u64)) -> bool {
+    match f {
+        Frame::Change(_) => true,
+        Frame::Committed(upto) => {
+            let fresh = *upto > relayed.0;
+            relayed.0 = relayed.0.max(*upto);
+            fresh
+        }
+        Frame::Durable(upto) => {
+            let fresh = *upto > relayed.1;
+            relayed.1 = relayed.1.max(*upto);
+            fresh
+        }
+        Frame::Start { .. } => false,
+    }
+}
+
 /// A commit stream's frames, read from a body's chunks as each one completes. A chunk that fails, or a frame that doesn't
-/// parse, ends the stream with that error: `follow` and a follower's relay (`server::relay`) both read it this way.
+/// parse, ends the stream with that error: `follow` reads it (a node's mirror, and a joined page's follow).
 pub fn frames<E>(chunks: impl Stream<Item = std::result::Result<bytes::Bytes, E>> + Send) -> impl Stream<Item = Result<Frame>> + Send
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -212,6 +246,21 @@ mod tests {
         let unknown = futures::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[1, 0, 0, 0, 9]))]);
         let got: Vec<Result<Frame>> = frames(unknown).collect().await;
         assert!(got.len() == 1 && got[0].is_err(), "a frame of an unknown kind ends it");
+    }
+
+    /// A relay sends each change, and each commit or durable point past the last one sent, never a `Start`.
+    #[test]
+    fn a_relay_sends_changes_and_new_points_but_no_start() {
+        let mut sent = (0, 0);
+        let change = Frame::Change(Arc::new(crate::store::Delta { id: 4, puts: vec![], deletes: vec![] }));
+        assert!(!relays(&Frame::Start { term: 4, replicated: true }, &mut sent), "a follower's own feed writes its Start");
+        assert!(relays(&change, &mut sent));
+        assert!(relays(&Frame::Committed(3), &mut sent));
+        assert!(!relays(&Frame::Committed(3), &mut sent), "a reconnect's replay is not sent again");
+        assert!(!relays(&Frame::Committed(2), &mut sent));
+        assert!(relays(&Frame::Durable(3), &mut sent));
+        assert!(!relays(&Frame::Durable(3), &mut sent));
+        assert_eq!(sent, (3, 3));
     }
 
     #[tokio::test]

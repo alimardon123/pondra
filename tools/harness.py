@@ -10867,6 +10867,25 @@ def guarded():
     checks["a superuser's page reads the catalog and the commit stream without the lake's keys, users or secrets"] = \
         any(k.startswith("t/") for k in keys) and "c" in keys and not any(k.startswith(private) for k in keys) \
         and lake_keys == {"value": None} and len(stream) > 4 and b"z/auth" not in stream and b"u/boss" not in stream
+    # The catalog in pages (brief P-C): `limit` answers a page of keys with `more` and `at`; walked to its end, a range lists
+    # each key once, in order; with no `limit` a small range answers whole, as it always did
+    b64 = lambda s: base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+    paged = ask(P, b"", path=f"/cluster/kv?from={b64('')}&limit=2", method="GET", auth=boss)
+    small = ask(P, b"", path=f"/cluster/kv?from={b64('c')}&to={b64('c' + chr(0))}", method="GET", auth=boss)
+    walk, frm = [], ""
+    for _ in range(10000):
+        page = ask(P, b"", path=f"/cluster/kv?from={frm}&limit=2", method="GET", auth=boss)
+        if not isinstance(page, dict):
+            break
+        walk += [k for k, _ in page.get("entries", [])]
+        if not page.get("more"):
+            break
+        frm = b64(page["entries"][-1][0] + chr(0))
+    info["kv pages"] = {"limit=2": paged, "small, no limit": small, "walked keys": len(walk)}
+    checks["/cluster/kv?from=…&limit=2 as boss gives 2 entries and more: true; with no limit the same small range answers whole; walked to its end, each key comes once, in order (P-C)"] = \
+        isinstance(paged, dict) and len(paged.get("entries", [])) == 2 and paged.get("more") is True and isinstance(paged.get("at"), int) \
+        and isinstance(small, dict) and [k for k, _ in small.get("entries", [])] == ["c"] and small.get("more") is False \
+        and len(walk) > 2 and walk == sorted(set(walk)) and "c" in walk
     # A change a follower forwards runs as its user: what it reads too
     forwarded = {
         "reads what it may not": ask(P + 1, "UPDATE orders SET amount = (SELECT max(salary) FROM hr) WHERE id = 7", auth=bob),

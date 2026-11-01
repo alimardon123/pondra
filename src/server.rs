@@ -595,16 +595,15 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
     Ok(Json(crate::tier::run_job(&app.lake, job).await?))
 }
 
-/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A caller that isn't one of
-/// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`), and a follower relays the leader's
-/// (`relay`). Its sign-in revoked or expired, the stream ends (`ends_when_revoked`).
+/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A follower's are the leader's
+/// frames as it relayed them (`members::follow`, `Catalog::relay`), so a page that joins a follower reads the leader's
+/// stream from its own node, and the leader serves one stream per follower, not per page. A caller that isn't one of
+/// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`). Its sign-in revoked or expired, the
+/// stream ends (`ends_when_revoked`).
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let revoked = ends_when_revoked(app.clone(), operator, header);
-    if !operator && !app.members.is_leader() {
-        return relay(&app, revoked).await;
-    }
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
@@ -650,31 +649,28 @@ fn for_caller(f: Frame, operator: bool) -> Frame {
     }
 }
 
-/// A follower's `/cluster/log` for a page: the leader's stream, frame by frame, as `for_caller` sees it. Its request is
-/// this node's own, as `cluster::mirror` makes it (the node's key), never `to_leader`'s proxy, which buffers the body and
-/// sends the caller's. A bad chunk or frame ends the body there: the page reconnects, and sees no gap.
-async fn relay(app: &App, revoked: impl std::future::Future<Output = ()> + Send + 'static) -> Response {
-    let url = crate::tls::url(&format!("{}/cluster/log", app.members.leader().addr));
-    let Ok(res) = crate::cluster::http().get(url).send().await.and_then(|r| r.error_for_status()) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "the leader's commit stream is not reachable from here").into_response();
-    };
-    let frames = crate::members::frames(res.bytes_stream())
-        .map(|f| f.map(|f| for_caller(f, false).encode()).map_err(std::io::Error::other));
-    Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (a sign-in revoked ends it too: `ends_when_revoked`)
-}
-
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct KvParams {
     key: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    limit: Option<usize>,
+    since: Option<u64>,
 }
 
+/// A page of a range on `GET /cluster/kv`: at most this many keys, and past about this many bytes of values it ends (after
+/// at least one key). A range past these bounds without a `limit` is refused (413): an old page asks whole, and is told to ask in pages.
+const KV_KEYS: usize = 5_000;
+const KV_BYTES: usize = 8 << 20;
+
 /// `GET /cluster/kv`: what a page reads of this node's catalog, as base64url of the bytes (no padding). `?key=K` answers
-/// `{"value": …}` (null when there is none), `?from=F[&to=T]` answers `{"entries": [[key, value], …]}` for the range
-/// [F, T): no `to` is to the end. A caller that isn't one of the nodes (`nodes_own`) is answered only for the keys
-/// `objects::readable` allows.
+/// `{"value": …}` (null when there is none), `?from=F[&to=T][&limit=N]` answers `{"entries": [[key, value], …], "more": …,
+/// "at": …}` for the range [F, T): no `to` is to the end. `limit` (1 to 5,000) is the page's keys at most; `more` says keys
+/// follow it, which the next request asks for (from the last key + `"\0"`, the same `to`), and `at` is the commit the
+/// page was read as of. A range's later pages ask `since=` the first page's `at`, and `moved` says a key the caller may
+/// see in the range changed after that commit (then the range starts over). A caller that isn't one of the nodes
+/// (`nodes_own`) is answered only for the keys `objects::readable` allows.
 async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Value>, Response> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
     let operator = nodes_own(&app).await;
@@ -695,8 +691,33 @@ async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Va
         Some(to) => text(&to)?,
         None => "\u{10ffff}".to_string(),
     };
-    let entries: Vec<(String, String)> = cat.scan_raw(&from, &to).await.map_err(failed)?.into_iter().filter(|(k, _)| may(k.as_str())).map(|(k, v)| (k, B64.encode(v))).collect();
-    Ok(Json(j!({"entries": entries})))
+    // (one more key than a page holds, so that `more` is known; no `limit` is the whole range, if it fits a page's bounds)
+    let asked = p.limit.map_or(KV_KEYS, |n| n.clamp(1, KV_KEYS));
+    let (got, at) = cat.scan_page(&from, &to, asked + 1, &may).await.map_err(failed)?;
+    let (kept, more) = match p.limit {
+        Some(_) => {
+            let (mut kept, mut bytes, mut more) = (Vec::new(), 0, got.len() > asked);
+            for (k, v) in got.into_iter().take(asked) {
+                if !kept.is_empty() && bytes + v.len() > KV_BYTES {
+                    more = true; // (the rest of the range is the next page's)
+                    break;
+                }
+                bytes += v.len();
+                kept.push((k, v));
+            }
+            (kept, more)
+        }
+        None => {
+            if got.len() > asked || got.iter().map(|(_, v)| v.len()).sum::<usize>() > KV_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "this range is more than 5,000 keys or 8 MB: read it in pages, with ?limit=N, and from the last key + \"\\0\" for as long as `more` is true").into_response());
+            }
+            (got, false)
+        }
+    };
+    // (`since`: a page after the first of a range asks whether the keys it may see moved since that first page's `at`)
+    let moved = p.since.is_some_and(|since| cat.moved_since(&from, &to, since, at, &may));
+    let entries: Vec<(String, String)> = kept.into_iter().map(|(k, v)| (k, B64.encode(v))).collect();
+    Ok(Json(j!({"entries": entries, "more": more, "at": at, "moved": moved})))
 }
 
 #[derive(Deserialize, Default)]
