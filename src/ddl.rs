@@ -1122,7 +1122,7 @@ pub(crate) async fn still(lake: &Lake, tables: &[String]) -> Result<crate::log::
 /// Send `tables`' rows in the log to files, up to its end now.
 async fn to_files(lake: &Lake, tables: &[String]) -> Result<()> {
     for t in tables {
-        while !crate::tier::tier_table(lake, t, lake.visible(), &["here".to_string()], "here").await?.1 {}
+        crate::tier::all_to_files(lake, t, lake.visible(), &["here".to_string()], "here").await?;
     }
     Ok(())
 }
