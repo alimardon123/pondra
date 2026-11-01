@@ -617,12 +617,47 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// query that needs it is refused (53200). A negative setting is no setting.
 fn spill_disk() -> DiskManagerBuilder { spill_disk_merging(spill_fan_in().unwrap_or_else(|| merge_files(partitions()))) }
 
+/// The spill factory a page in a Worker gives the core (`give_spills`, wasm32): the lakes that open while it is set spill through
+/// it (`spill_disk_merging`). Not `per_node!`: a freed page's member closes in the background, and its `reset()` would wipe the
+/// factory of the page made after it (node.rs's CLAIMED says the same of the claim).
+static SPILL_FACTORY: Mutex<Option<Arc<dyn TempFileFactory>>> = Mutex::new(None);
+
+/// Gives the core the factory a page's spill file comes from (wasm32: `web/`'s `spill.rs`), for the lakes that open while it is
+/// set. True when it is given; false when one is set already, which a page never leaves behind (it takes its own back, `take_spills`).
+#[cfg(target_arch = "wasm32")]
+pub fn give_spills(factory: Arc<dyn TempFileFactory>) -> bool {
+    let mut given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if given.is_some() {
+        return false;
+    }
+    *given = Some(factory);
+    true
+}
+
+/// Takes back the factory `give_spills` gave, when it is this one (`Arc::ptr_eq`): a page ends with its own and leaves another's be.
+#[cfg(target_arch = "wasm32")]
+pub fn take_spills(factory: &Arc<dyn TempFileFactory>) {
+    let mut given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if given.as_ref().is_some_and(|g| Arc::ptr_eq(g, factory)) {
+        *given = None;
+    }
+}
+
 /// `spill_disk`, its merges reading at most `fan_in` spilled runs at once.
 fn spill_disk_merging(fan_in: usize) -> DiskManagerBuilder {
-    // (a page has no folder to spill to: its OPFS spill comes with a factory the page gives the core (designs/l2-page-spill.md,
-    // S1), and until then a query past its pool is refused (53200) rather than trapping the module in `spill_folder`)
-    if spill_gb() == Some(0.0) || cfg!(target_arch = "wasm32") {
+    if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
+    }
+    // (a page on wasm has no folder to spill to: it spills through the factory it gave the core before this lake opened
+    // (`give_spills`), and with none it has no disk, so a query past its pool is refused (53200) rather than trapping the module
+    // in `spill_folder`. Only a lake that opens while the factory is set spills through it: `Custom` reserves the sorts' spill
+    // memory, so a page with none keeps its pool as it was (designs/l2-page-spill.md, S1).)
+    if cfg!(target_arch = "wasm32") {
+        let given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        return match given {
+            Some(factory) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(factory)).with_max_spill_merge_fan_in(fan_in),
+            None => DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        };
     }
     // (the lake's own manager holds no file: `Spills` makes the one that does, with this fan-in too, since sorts read it here)
     DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(Arc::new(Spills { fan_in, made: std::sync::OnceLock::new() }))).with_max_spill_merge_fan_in(fan_in)

@@ -41,6 +41,14 @@ pub(crate) fn call_method(object: &JsValue, name: &str) -> Result<JsValue, Strin
     function(object, name)?.call0(object).map_err(js_words)
 }
 
+/// Calls `object`'s method `name` with `args` now, and gives what it answers: a synchronous method, as a sync access handle's
+/// `write` is. A throw is the JavaScript error itself, so a caller can read its `name`.
+pub(crate) fn call_with(object: &JsValue, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    let method = js_sys::Reflect::get(object, &name.into())?.dyn_into::<js_sys::Function>()?;
+    let args: js_sys::Array = args.iter().collect();
+    method.apply(object, &args)
+}
+
 /// Calls `object`'s method `name` with `args` and awaits what it answers. A method that answers a promise is awaited;
 /// one that answers a value (`slice`) is awaited as that value, since `Promise.resolve` makes either a promise.
 pub(crate) async fn awaited(object: &JsValue, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {

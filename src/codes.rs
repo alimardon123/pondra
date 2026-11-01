@@ -65,7 +65,7 @@ const SPILL_SAYS: &[(&str, &str)] = &[
 
 /// What a spill that is off says, in the setting a user can change: a page's query pool, `memory_gb`, or a node's `PONDRA_SPILL_GB`.
 #[cfg(target_arch = "wasm32")]
-const DISABLED: &str = "(nothing spills to disk on a page: raise memory_gb, up to memory_max_gb, to hold more in memory)";
+const DISABLED: &str = "(nothing spills to disk on a page outside a Worker: run it in a Worker (new Worker(…, { type: 'module' })) to spill to the browser's storage, or raise memory_gb, up to memory_max_gb)";
 #[cfg(not(target_arch = "wasm32"))]
 const DISABLED: &str = "(nothing spills to disk: PONDRA_SPILL_GB is 0)";
 

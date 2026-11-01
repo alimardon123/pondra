@@ -184,7 +184,7 @@ impl ObjectStore for Opfs {
 
 /// Why a step of a store's work failed: the object is not there (the browser's `NotFoundError`, or `TypeMismatchError`,
 /// a file where a folder is or the other way), or the browser's words.
-enum Failed {
+pub(crate) enum Failed {
     Missing,
     Words(String),
 }
@@ -271,7 +271,7 @@ async fn file_at(dir: &JsValue, name: &str, create: bool) -> Result<JsValue, Fai
 }
 
 /// The `{create}` option of getDirectoryHandle and getFileHandle.
-fn create_option(create: bool) -> Result<JsValue, String> {
+pub(crate) fn create_option(create: bool) -> Result<JsValue, String> {
     let options = JsValue::from(js_sys::Object::new());
     js::set(&options, "create", create)?;
     Ok(options)
@@ -561,7 +561,7 @@ async fn files_under(folder: String, names: Vec<String>) -> Result<Vec<ObjectMet
 
 /// A folder's entries as (name, handle), in the order the browser gives them. Left out: a write in progress (a name with
 /// `#`) and Chromium's file for an open writable (`.crswap`), which are not objects yet.
-async fn entries(dir: &JsValue) -> Result<Vec<(String, JsValue)>, Failed> {
+pub(crate) async fn entries(dir: &JsValue) -> Result<Vec<(String, JsValue)>, Failed> {
     let iterator = js::call_method(dir, "entries")?;
     let mut found = vec![];
     loop {
