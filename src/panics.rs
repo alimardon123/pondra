@@ -136,8 +136,12 @@ tokio::task_local! {
 /// its groups' values) is stopped by the watch, and was answered 53200 with no second try (B50 under 2 GB, 10-31).
 /// Outside a request the node may stop, and inside another first try, `f` runs as it is. Stopped, it returns once the
 /// node's memory has come back under its line (`oom::come_back`): [`Stopped::Again`], and the request may be stopped
-/// again; [`Stopped::Over`] if the memory stayed over it, and the request ends out of memory.
-pub async fn first_try<T>(f: impl Future<Output = T>) -> Result<T, Stopped> {
+/// again; [`Stopped::Over`] if the memory stayed over it, and the request ends out of memory. A try that ended in a
+/// way the caller tries again (`again`: the pool refused it) waits the same way, the request held as stopped meanwhile,
+/// and is answered as it ended whether or not the memory came back (it was tried again before the watch could stop it).
+/// (Refused by the pool at the line, the median's first try ended on its own, and the watch stopped the request whole
+/// for that try's memory as its second try began: harness scale, 11-01.)
+pub async fn first_try<T>(f: impl Future<Output = T>, again: impl Fn(&T) -> bool) -> Result<T, Stopped> {
     let Ok(id) = REQUEST.try_with(|id| *id) else { return Ok(f.await) };
     let (f, handle) = futures::future::abortable(f);
     let mine = match RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
@@ -151,11 +155,18 @@ pub async fn first_try<T>(f: impl Future<Output = T>) -> Result<T, Stopped> {
     if !mine {
         return out.map_err(|_| Stopped::Over); // (never stopped: only a registered try is)
     }
-    let noted = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id).map_or(usize::MAX, |r| r.noted);
-    let back = out.is_ok() || crate::oom::come_back(noted).await;
+    let tried_again = out.as_ref().map_or(true, &again);
+    let noted = match RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        Some(r) => {
+            r.first_try = None;
+            r.stopped |= tried_again; // (its memory is going: the watch stops nothing for it, this request included)
+            r.noted
+        }
+        None => usize::MAX,
+    };
+    let back = !tried_again || crate::oom::come_back(noted).await;
     if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
-        r.first_try = None;
-        r.stopped &= !back; // (its try and the try's memory gone: the request may be stopped again, whole)
+        r.stopped &= !(back || out.is_ok()); // (its try and the try's memory gone: the request may be stopped again, whole)
     }
     match out {
         Ok(v) => Ok(v),
@@ -419,10 +430,10 @@ mod tests {
             let (tried, mut told) = tokio::sync::watch::channel(0);
             let twice = tokio::spawn(work(true, async move {
                 let first = first_try(async {
-                    assert_eq!(first_try(async { 1 }).await, Ok(1), "a try inside a first try runs as it is");
+                    assert_eq!(first_try(async { 1 }, |_| false).await, Ok(1), "a try inside a first try runs as it is");
                     let _ = tried.send(1);
                     std::future::pending::<()>().await
-                }).await;
+                }, |_| false).await;
                 let _ = tried.send(2);
                 std::future::pending::<()>().await;
                 first
@@ -432,7 +443,19 @@ mod tests {
             told.wait_for(|n| *n == 2).await.expect("the request goes on after its first try");
             assert_eq!(stop_one(later(), 0), Some(false), "past its first try, the request is stopped");
             assert_eq!(twice.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
-            assert_eq!(first_try(async { 7 }).await, Ok(7), "outside a request, a first try just runs");
+            assert_eq!(first_try(async { 7 }, |_| false).await, Ok(7), "outside a request, a first try just runs");
+            // A first try that ends in a way its caller tries again (the pool refused it) is answered as it ended, once its
+            // memory has gone, and its request may then be stopped whole, as after a stopped try.
+            let (tried, mut told) = tokio::sync::watch::channel(0);
+            let refused = tokio::spawn(work(true, async move {
+                let first = first_try(async { 8 }, |n| *n == 8).await;
+                let _ = tried.send(1);
+                std::future::pending::<()>().await;
+                first
+            }));
+            told.wait_for(|n| *n == 1).await.expect("the first try ends");
+            assert_eq!(stop_one(later(), 0), Some(false), "after a try tried again, the request is stopped whole");
+            assert_eq!(refused.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
         });
     }
 }

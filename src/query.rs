@@ -1514,7 +1514,7 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
-    match crate::panics::first_try(work(ctx.clone())).await {
+    match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
         Ok(Err(e)) if exhausted(&e) && handed().is_none() => {}
         Ok(r) => return r,
         Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
