@@ -1514,8 +1514,9 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
+    let mut one_part = false;
     match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
-        Ok(Err(e)) if exhausted(&e) && handed().is_none() => {}
+        Ok(Err(e)) if exhausted(&e) && handed().is_none() => one_part = merging_a_sort(&e),
         Ok(r) => return r,
         Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
         Err(_) => {
@@ -1526,7 +1527,20 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &Sessi
     }
     let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
     frugal(&copy);
+    if one_part {
+        copy.state_ref().write().config_mut().options_mut().execution.target_partitions = 1;
+    }
     work(copy).await
+}
+
+/// Whether the pool refused a sort's merge: a partition's merge of its spilled runs, or the merge of the partitions'
+/// sorted streams into one. A sort spills, but those merges hold a batch of every stream they read, and with four
+/// partitions each holding its share the last one was refused: under a 2 GB cap a sort of 60 M rows by a string to a
+/// file failed so with or without compressed spill, and on one partition it answered (100.6 s, 3.6 GB spilled; DuckDB
+/// 78 s, 10.9 GB). So such a query runs again on one partition: it has the pool to itself, and no merge across.
+fn merging_a_sort(e: &anyhow::Error) -> bool {
+    let words = format!("{e:#}");
+    words.contains("SortPreservingMergeExec") || words.contains("ExternalSorterMerge")
 }
 
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
@@ -1619,9 +1633,10 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, keep, Facts, FactsMemo, Tail};
+    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
+    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
     /// A version's facts, told apart by their row count.
@@ -1726,6 +1741,26 @@ mod tests {
         assert!(!exhausted(&anyhow::Error::new(cap)));
         // The memory watch's stop (`oom::OOM`) says "out of memory", not "Resources exhausted": not retried either.
         assert!(!exhausted(&anyhow::anyhow!("{}", crate::oom::OOM)));
+    }
+
+    /// A query whose sort's merge the pool refused runs again frugally on one partition; one refused elsewhere, frugally on
+    /// as many as it had. The words are DataFusion's as B50's sorts were refused.
+    #[tokio::test]
+    async fn a_sort_whose_merge_was_refused_runs_again_on_one_partition() {
+        let refused = |what: &str| anyhow::Error::new(DataFusionError::ResourcesExhausted(format!("Failed to allocate additional 43.0 MB for {what} with 125.1 MB already allocated for this reservation - 15.6 MB remain available for the total memory pool: fair(pool_size: 682.7 MB)")));
+        for (what, parts) in [("SortPreservingMergeExec[0]", 1), ("ExternalSorterMerge[1]", 1), ("HashJoinInput[2]", 4)] {
+            let ctx = SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_target_partitions(4));
+            let tries = std::sync::Mutex::new(vec![]);
+            let out = frugally(&ctx, |c| {
+                let mut tries = tries.lock().expect("the tries");
+                tries.push((c.state().config().target_partitions(), retrying(&c)));
+                let first = tries.len() == 1;
+                async move { if first { Err(refused(what)) } else { Ok(()) } }
+            }).await;
+            assert!(out.is_ok(), "{what}: the retry answers");
+            assert_eq!(*tries.lock().expect("the tries"), vec![(4, false), (parts, true)], "{what}");
+            assert_eq!(ctx.state().config().target_partitions(), 4, "{what}: the first session is as it was");
+        }
     }
 
     /// A tail of `form` at mark `of` through segment `through`, `bytes` long (the cache keeps only sizes here).
