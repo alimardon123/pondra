@@ -1,0 +1,379 @@
+{
+ "versions": {
+  "pondra": "0.34.0",
+  "duckdb": "v1.5.4",
+  "arrow": "21.2.0"
+ },
+ "data": "/tmp/claude-0/sf1",
+ "note": "DuckDB's file is dropped once its table is made (dropFile), as a page's is: this run's DuckDB memory after load is not comparable with run2's.",
+ "runs": 3,
+ "timeout": 600,
+ "open": {
+  "pondra": 939.3,
+  "duckdb": 2920
+ },
+ "load": {
+  "pondra": 19263.4,
+  "duckdb": 11175.2
+ },
+ "rows_loaded": {
+  "customer": 150000,
+  "lineitem": 6001215,
+  "nation": 25,
+  "orders": 1500000,
+  "part": 200000,
+  "partsupp": 800000,
+  "region": 5,
+  "supplier": 10000
+ },
+ "rows_loaded_equal": true,
+ "memory": {
+  "pondra": {
+   "after_load_mb": 1205.4,
+   "peak_mb": 2181.1
+  },
+  "duckdb": {
+   "after_load_mb": 2102.6,
+   "peak_mb": 2103.5
+  }
+ },
+ "total": {
+  "p": 3788.6000000000004,
+  "d": 4058.3,
+  "same": 22
+ },
+ "failures": [],
+ "what": "TPC-H SF1 in the page (Chromium, the wasm module) against DuckDB-WASM 1.5.4, each query's median of 3, same run, main 2241782 (11-01, L2's P4 gates: reviews/l2-p4-gates-1101.md). Answers compared row by row; rows left out here (the full run is /mnt/project-files/l2-wip/p4/).",
+ "queries": {
+  "q1": {
+   "pondra": {
+    "q": "q1",
+    "ms": 519.6,
+    "cols": 10,
+    "maxrss_mb": 1603.3
+   },
+   "duckdb": {
+    "q": "q1",
+    "ms": 357.1,
+    "cols": 10,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q2": {
+   "pondra": {
+    "q": "q2",
+    "ms": 50.1,
+    "cols": 8,
+    "maxrss_mb": 1619.7
+   },
+   "duckdb": {
+    "q": "q2",
+    "ms": 27.6,
+    "cols": 8,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q3": {
+   "pondra": {
+    "q": "q3",
+    "ms": 169.1,
+    "cols": 4,
+    "maxrss_mb": 1667.7
+   },
+   "duckdb": {
+    "q": "q3",
+    "ms": 85.4,
+    "cols": 4,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q4": {
+   "pondra": {
+    "q": "q4",
+    "ms": 136.9,
+    "cols": 2,
+    "maxrss_mb": 1718.1
+   },
+   "duckdb": {
+    "q": "q4",
+    "ms": 138.6,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q5": {
+   "pondra": {
+    "q": "q5",
+    "ms": 139.6,
+    "cols": 2,
+    "maxrss_mb": 1762.5
+   },
+   "duckdb": {
+    "q": "q5",
+    "ms": 123.4,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q6": {
+   "pondra": {
+    "q": "q6",
+    "ms": 102.4,
+    "cols": 1,
+    "maxrss_mb": 1762.6
+   },
+   "duckdb": {
+    "q": "q6",
+    "ms": 71.7,
+    "cols": 1,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q7": {
+   "pondra": {
+    "q": "q7",
+    "ms": 193.1,
+    "cols": 4,
+    "maxrss_mb": 1763.2
+   },
+   "duckdb": {
+    "q": "q7",
+    "ms": 104.8,
+    "cols": 4,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q8": {
+   "pondra": {
+    "q": "q8",
+    "ms": 79.3,
+    "cols": 2,
+    "maxrss_mb": 1810
+   },
+   "duckdb": {
+    "q": "q8",
+    "ms": 69.2,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q9": {
+   "pondra": {
+    "q": "q9",
+    "ms": 258.1,
+    "cols": 3,
+    "maxrss_mb": 1883.4
+   },
+   "duckdb": {
+    "q": "q9",
+    "ms": 389.6,
+    "cols": 3,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q10": {
+   "pondra": {
+    "q": "q10",
+    "ms": 239.2,
+    "cols": 8,
+    "maxrss_mb": 1884.5
+   },
+   "duckdb": {
+    "q": "q10",
+    "ms": 288.3,
+    "cols": 8,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q11": {
+   "pondra": {
+    "q": "q11",
+    "ms": 25.4,
+    "cols": 2,
+    "maxrss_mb": 1885.6
+   },
+   "duckdb": {
+    "q": "q11",
+    "ms": 15.4,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q12": {
+   "pondra": {
+    "q": "q12",
+    "ms": 147.9,
+    "cols": 3,
+    "maxrss_mb": 1927.2
+   },
+   "duckdb": {
+    "q": "q12",
+    "ms": 295.8,
+    "cols": 3,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q13": {
+   "pondra": {
+    "q": "q13",
+    "ms": 344.9,
+    "cols": 2,
+    "maxrss_mb": 2037.2
+   },
+   "duckdb": {
+    "q": "q13",
+    "ms": 351.5,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q14": {
+   "pondra": {
+    "q": "q14",
+    "ms": 41.3,
+    "cols": 1,
+    "maxrss_mb": 2037.2
+   },
+   "duckdb": {
+    "q": "q14",
+    "ms": 130.2,
+    "cols": 1,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q15": {
+   "pondra": {
+    "q": "q15",
+    "ms": 82.8,
+    "cols": 5,
+    "maxrss_mb": 2037.6
+   },
+   "duckdb": {
+    "q": "q15",
+    "ms": 96.3,
+    "cols": 5,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q16": {
+   "pondra": {
+    "q": "q16",
+    "ms": 77.1,
+    "cols": 4,
+    "maxrss_mb": 2043.9
+   },
+   "duckdb": {
+    "q": "q16",
+    "ms": 69.8,
+    "cols": 4,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q17": {
+   "pondra": {
+    "q": "q17",
+    "ms": 62.9,
+    "cols": 1,
+    "maxrss_mb": 2046.5
+   },
+   "duckdb": {
+    "q": "q17",
+    "ms": 61.5,
+    "cols": 1,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q18": {
+   "pondra": {
+    "q": "q18",
+    "ms": 319.8,
+    "cols": 6,
+    "maxrss_mb": 2152.5
+   },
+   "duckdb": {
+    "q": "q18",
+    "ms": 377.6,
+    "cols": 6,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q19": {
+   "pondra": {
+    "q": "q19",
+    "ms": 251.1,
+    "cols": 1,
+    "maxrss_mb": 2154.5
+   },
+   "duckdb": {
+    "q": "q19",
+    "ms": 372.4,
+    "cols": 1,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q20": {
+   "pondra": {
+    "q": "q20",
+    "ms": 193.3,
+    "cols": 2,
+    "maxrss_mb": 2180.3
+   },
+   "duckdb": {
+    "q": "q20",
+    "ms": 186.1,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q21": {
+   "pondra": {
+    "q": "q21",
+    "ms": 318,
+    "cols": 2,
+    "maxrss_mb": 2180.8
+   },
+   "duckdb": {
+    "q": "q21",
+    "ms": 404,
+    "cols": 2,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  },
+  "q22": {
+   "pondra": {
+    "q": "q22",
+    "ms": 36.7,
+    "cols": 3,
+    "maxrss_mb": 2181.1
+   },
+   "duckdb": {
+    "q": "q22",
+    "ms": 42,
+    "cols": 3,
+    "maxrss_mb": 2103.5
+   },
+   "same": true
+  }
+ }
+}
