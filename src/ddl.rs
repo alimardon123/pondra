@@ -1,5 +1,5 @@
 //! Schemas, names, and the statements that shape a lake: `CREATE`/`DROP SCHEMA`, `DROP TABLE`,
-//! `CREATE VIEW` (a stored query), `CREATE MATERIALIZED VIEW` (a live view, `views.rs`) and
+//! `CREATE VIEW` (a stored query), `CREATE MATERIALIZED VIEW` (a query kept current, `views.rs`) and
 //! `DROP VIEW`.
 //!
 //! A lake is a database, and its tables live in schemas: `public` unless one is named. Inside the

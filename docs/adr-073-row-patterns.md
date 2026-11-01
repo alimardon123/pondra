@@ -169,7 +169,7 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
 ## Phases (all before the freeze)
 
 1. Steps 1, 2, 4 and 6: conditions on the row and its neighbours, every pattern operator, both
-   `ROWS PER MATCH`, every skip rule, the measures, spread. A live view needs `rerun::window`'s
+   `ROWS PER MATCH`, every skip rule, the measures, spread. A materialized view needs `rerun::window`'s
    change (step 7).
 2. Steps 3 and 5: conditions reading the match so far, and `WITHIN`.
 3. Step 8 with L1's view runs (dealt to every node, roadmap task "view runs on every node"), then
@@ -182,7 +182,7 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
     against Pondra on random sequences and random patterns (every operator, every skip rule, both
     row modes, empty matches), as `random_sql.py` checks against DuckDB.
   - Every example in Trino's and Oracle's documentation, with their published answers.
-  - The same on three nodes == one node, over Postgres, in a stored view, a live view through
+  - The same on three nodes == one node, over Postgres, in a stored view, a materialized view through
     changes and a restart, and an `EMIT FINAL` view through a leader's kill: each match once.
 - **Against Flink 2.3** (`tools/bench/patterns.py`, Flink's own CEP examples and a stock ticker of
   10M rows over 1,000 symbols):
