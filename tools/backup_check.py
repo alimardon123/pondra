@@ -354,8 +354,9 @@ def scheduled_backup(bin, work, ports):
 
 def task_not_the_owners(bin, work, port):
     """A task a superuser that isn't the node's owner made (without the task's owner mark) runs as that superuser: its BACKUP into a folder on
-    this machine is refused 42501 when it runs (`backup::owners_only`), the run fails with the refusal's words, and nothing is
-    written there."""
+    this machine is refused 42501 when it runs (`backup::owners_only`), the run fails with the refusal's words, naming
+    CREATE OR REPLACE TASK as how a task becomes the owner's (a task made before tasks carried the mark fails the same way), and
+    nothing is written there."""
     lake, bkt = os.path.join(work, "task-theirs", "lake"), os.path.join(work, "task-theirs", "bk")
     n = Node(bin, lake, port, work).start()
     try:
@@ -370,7 +371,7 @@ def task_not_the_owners(bin, work, port):
     finally:
         n.stop()
     error = failed[0].get("error") or "" if failed else ""
-    return {"ok": made[0] == 200 and bool(failed) and "server's own disk" in error and not os.path.exists(bkt),
+    return {"ok": made[0] == 200 and bool(failed) and "server's own disk" in error and "CREATE OR REPLACE TASK theirs" in error and not os.path.exists(bkt),
             "created": made[0], "run_error": error[-300:], "folder_written": os.path.exists(bkt)}
 
 

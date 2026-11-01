@@ -868,6 +868,12 @@ async fn run_tick(app: &App, name: &str, task: &Task, tick: Tick) {
             }
         }
     };
+    // A task that runs as no one's is refused a path on the server's own disk (`ext::owners_only`): one made before tasks
+    // carried their owner's mark (#308), or by another, says how it becomes the owner's (audit 11-01 L11).
+    let out = out.map_err(|e| match crate::codes::of(&e) == "42501" && !crate::ext::owner() {
+        true => crate::codes::coded("42501", format!("{}. Task {name} runs as no one's: only a task its owner made (CREATE OR REPLACE TASK {name} … from the owner's shell: `pondra`, `pondra sql`, `connect()`), on its schedule or the owner's EXECUTE TASK, runs as the owner", crate::codes::words(&e))),
+        false => e,
+    });
     if let Err(e) = &out {
         eprintln!("task {name}, tick {}: {e:#}", tick.at);
         if let Some(p) = &task.with.on_failure {

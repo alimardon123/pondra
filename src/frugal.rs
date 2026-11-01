@@ -73,7 +73,8 @@ impl OptimizerRule for WholePartition {
 /// frugal session, any such window. In any session, one over a table's rows as they are read (`read_alone`): the
 /// table read twice streams, where the window sorts and holds every row (a whole-partition `avg() OVER` of 60M rows
 /// under 2 GB spilled 4.6 GB and took 58 s, B50 10-31). One over a join or a GROUP BY is left to the window unless
-/// memory runs out, since its input would be worked out twice.
+/// memory runs out, since its input would be worked out twice; and so is one over files named by path or URL, which
+/// would be fetched twice (`read_again_alike`).
 fn rewritten(plan: &LogicalPlan, config: &dyn OptimizerConfig) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Window(window) = plan else { return Ok(None) };
     let frugal = is_on(&config.options());
@@ -137,11 +138,25 @@ fn any_node(plan: &LogicalPlan, bad: impl Fn(&LogicalPlan) -> bool) -> Result<bo
     Ok(found)
 }
 
-/// Whether a plan is a table's rows as they are read: scans, filters, projections and aliases, nothing that works
-/// rows out of others (a join, a GROUP BY, a window, a union) and so would cost as much again when read twice.
+/// Whether a plan is a table's rows as they are read: scans of tables read again alike (`read_again_alike`), filters,
+/// projections and aliases, nothing that works rows out of others (a join, a GROUP BY, a window, a union) and so would
+/// cost as much again when read twice.
 fn read_alone(plan: &LogicalPlan) -> Result<bool> {
-    let other = |n: &LogicalPlan| !matches!(n, LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_));
+    let other = |n: &LogicalPlan| match n {
+        LogicalPlan::TableScan(t) => !read_again_alike(t),
+        LogicalPlan::Filter(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => false,
+        _ => true,
+    };
     Ok(!any_node(plan, other)?)
+}
+
+/// Whether a scan, read a second time, gives the same rows as cheaply: one of the lake's own tables, which a query reads
+/// as of one commit however often it reads it (`session_at`, invariant 265), from its hot columns once they are read; or
+/// a table held in memory. Files named by path or URL (`read_parquet('s3://…/*')`, a CSV folder, a web page) are
+/// fetched again, so a window over them that has the memory it needs is cheaper left as it is (audit 11-01 M12); the
+/// frugal retry still rewrites it, as one listing serves the whole statement (`ext::LISTED`).
+fn read_again_alike(t: &datafusion::logical_expr::TableScan) -> bool {
+    datafusion::datasource::source_as_provider(&t.source).is_ok_and(|p| crate::query::lakes_own(p.as_ref()) || p.is::<datafusion::datasource::MemTable>())
 }
 
 /// Whether a node gives other rows, or other values, when it is read again. A row limit or a DISTINCT ON picks its
@@ -552,6 +567,23 @@ mod tests {
             assert!(plan(&frugal, sql).await.contains("WindowAggExec"), "{sql}");
             assert!(plan(&plain, sql).await.contains("WindowAggExec"), "{sql}");
         }
+    }
+
+    /// A window over files named by path is left to the window in a plain session, as they would be fetched twice; the
+    /// frugal retry still rewrites it (audit 11-01 M12).
+    #[tokio::test]
+    async fn files_named_by_path_are_rewritten_only_when_frugal() {
+        let file = std::env::temp_dir().join(format!("frugal-{}.csv", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "k,g\n1,1\n2,1\n3,2\n").unwrap();
+        let sql = "SELECT k, count(*) OVER (PARTITION BY g) AS n FROM f";
+        for frugal in [false, true] {
+            let ctx = session(frugal);
+            ctx.register_csv("f", file.to_str().unwrap(), datafusion::prelude::CsvReadOptions::new()).await.unwrap();
+            assert_eq!(plan(&ctx, sql).await.contains("WindowAggExec"), !frugal, "frugal: {frugal}");
+            let n: Vec<String> = rows(&answer(&ctx, &format!("{sql} ORDER BY k")).await).into_iter().map(|(text, _)| text.join(",")).collect();
+            assert_eq!(n, ["1,2", "2,2", "3,1"], "frugal: {frugal}");
+        }
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Each median query answers as the plain session does: groups of odd and even sizes, ties, NULLs in the values
