@@ -371,7 +371,7 @@ def run():
                 row[q] = {"error": r.get("error", "not run")}
                 continue
             ok = q not in ref or "rows" not in ref[q] or same(r["rows"], ref[q]["rows"])
-            row[q] = {"hot": round(min(r["times"]), 3), "first": round(r["times"][0], 3), "same_as_duckdb": ok}
+            row[q] = {"hot": round(min(r["times"]), 3), "first": round(r["times"][0], 3), "times": [round(t, 3) for t in r["times"]], "same_as_duckdb": ok}
         good = [v for v in row.values() if "hot" in v]
         row["total_hot"] = round(sum(v["hot"] for v in good), 2) if len(good) == len(qs) else None
         row["answers_match"] = sum(1 for v in good if v["same_as_duckdb"])
