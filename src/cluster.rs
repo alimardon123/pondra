@@ -533,7 +533,7 @@ pub fn mirror(lake: Arc<Lake>, leader: String, me: String, replica: Option<Arc<R
             }
         })
     };
-    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed)));
+    crate::panics::spawn(members::follow(Arc::downgrade(&lake), open, frame, || STREAM_DOWN.store(true, std::sync::atomic::Ordering::Relaxed), true));
 }
 
 /// One HTTP client (connection pool) for all node-to-node traffic. It carries this process's

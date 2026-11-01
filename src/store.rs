@@ -1466,6 +1466,12 @@ impl Lake {
         self.cat.pending.lock().unwrap().insert(d.id, d);
     }
 
+    /// Follower: a new leader's term began (`members::follow`): the changes the old one streamed and never committed are
+    /// not the new one's, so they go.
+    pub fn drop_pending(&self) {
+        self.cat.pending.lock().unwrap().clear();
+    }
+
     /// Follower: lay the committed changes (up to `upto`) over our view of the catalog.
     pub fn commit_upto(&self, upto: u64) {
         let ready: Vec<Arc<Delta>> = {
@@ -2368,10 +2374,21 @@ impl Catalog {
     /// What the catalog's block caches hold, in bytes.
     pub fn cached(&self) -> usize { self.kv.cached() }
 
-    /// Leader: the recent frames plus a receiver for every frame from now on.
+    /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
+    /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
     pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {
         let rx = self.feed.subscribe();
         (self.recent.lock().unwrap().0.iter().map(|(_, f)| f.clone()).collect(), rx)
+    }
+
+    /// Follower: relay a frame of the leader's stream as it came (`members::follow`, with `resend`), so the pages that
+    /// follow this node get it from `subscribe`, as the leader's followers get its own. A new term's `Start` says whether
+    /// this node's own commits are replicated, as its feed's first `Start` does, never the leader's.
+    pub(crate) fn relay(&self, f: Frame) {
+        self.send(match f {
+            Frame::Start { term, .. } => Frame::Start { term, replicated: self.replicas > 1 },
+            f => f,
+        });
     }
 
     /// Inline data (`d/`) that one of the last 64 commits wrote: it never changes, so the frame's copy is always good.
@@ -2699,20 +2716,28 @@ impl Catalog {
 
     /// `scan`, the values as they are kept (JSON), for a caller that decodes only what it hasn't.
     pub async fn scan_raw(&self, from: &str, to: &str) -> Result<BTreeMap<String, Bytes>> {
+        Ok(self.scan_raw_at(from, to).await?.0)
+    }
+
+    /// `scan_raw`, and the commit the entries are read as of (`at`): the lake as of commit `at`, which a page of a range
+    /// is checked against (`kv`, `Remote::scan`). A mirror answers as of its last streamed commit; a view alone as of its own.
+    pub async fn scan_raw_at(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
         if from >= to {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), self.at_now().await?));
         }
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
-        let decode = |all: BTreeMap<String, Bytes>| -> Result<BTreeMap<String, Bytes>> { Ok(all) };
         if self.kv.is_writer() && !self.mirror.load(Relaxed) {
-            return decode(self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?);
+            // (`at` first: a commit after it that the scan sees is one a later page's `moved_since` counts)
+            let at = self.committed.load(Relaxed);
+            let all = self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?;
+            return Ok((all, at));
         }
         {
             let o = self.overlay.lock().unwrap();
             if self.mirror.load(Relaxed) {
                 // The in-memory catalog (scans never cover inline segment data).
                 let hits = o.range(from.to_string()..to.to_string()).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?)));
-                return decode(hits.collect());
+                return Ok((hits.collect(), self.streamed.load(Relaxed)));
             }
         }
         let _pin = self.pin();
@@ -2732,26 +2757,73 @@ impl Catalog {
                             None => all.remove(k),
                         };
                     }
-                    return decode(all); // = the lake as of commit `streamed`
+                    return Ok((all, streamed)); // = the lake as of commit `streamed`
                 }
                 streamed
             };
-            if before >= streamed || before < self.hold.load(Relaxed) {
-                return decode(all); // our view alone: newer than the stream (or the stream has a gap)
+            // Our view alone, when the stream is newer than it or has a gap, and the view stood still while we read it (as
+            // the loop below requires: a view that moved mid-read is read again).
+            if (before >= streamed || before < self.hold.load(Relaxed)) && before == after {
+                return Ok((all, before)); // our view alone: newer than the stream (or the stream has a gap)
             }
             tokio::time::sleep(Duration::from_millis(1)).await; // our view passed the stream mid-read: again
         }
+    }
+
+    /// The commit a read takes right now, when it lays nothing over our view: the mirror's last streamed commit, else the view's.
+    async fn at_now(&self) -> Result<u64> {
+        if self.mirror.load(Relaxed) {
+            return Ok(self.streamed.load(Relaxed));
+        }
+        self.view_now().await
+    }
+
+    /// The first `n` entries with keys in [from, to) that `keep` allows, in key order, and the commit they are read as of
+    /// (`scan_raw_at`'s `at`): one page of a range (`kv`). In memory it takes only those `n` (the overlay's range, filtered
+    /// and `take`n), so keys `keep` refuses don't cost a page; without the whole catalog here, it reads all of the range.
+    pub async fn scan_page(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
+        if from >= to {
+            return Ok((Vec::new(), self.at_now().await?));
+        }
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap();
+            let page = o.range(from.to_string()..to.to_string()).filter(|(k, _)| keep(k.as_str())).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).take(n).collect();
+            return Ok((page, self.streamed.load(Relaxed)));
+        }
+        let (all, at) = self.scan_raw_at(from, to).await?;
+        Ok((all.into_iter().filter(|(k, _)| keep(k.as_str())).take(n).collect(), at))
+    }
+
+    /// Whether a commit between `since` and `at` put or deleted a key in [from, to) that `keep` allows, as far as the changes
+    /// `recent` holds say (the leader's own, or a follower's relayed ones): a range read partly as of `since` and partly as of
+    /// `at` is then torn (`kv`'s `since`). Only the commits after the older of the two and up to the newer count: later ones
+    /// are in neither read. One change per commit, so a commit missing from `recent` (aged out, or a follower's reconnect
+    /// that left a hole) counts as moved: it can't tell.
+    pub fn moved_since(&self, from: &str, to: &str, since: u64, at: u64, keep: impl Fn(&str) -> bool) -> bool {
+        let (after, upto) = (since.min(at), since.max(at));
+        if after == upto {
+            return false;
+        }
+        let within = |k: &str| k >= from && k < to && keep(k);
+        let r = self.recent.lock().unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut touched = false;
+        for (_, f) in r.0.iter() {
+            if let Frame::Change(d) = f {
+                if d.id > after && d.id <= upto {
+                    ids.insert(d.id);
+                    touched = touched || d.puts.iter().any(|(k, _)| within(k)) || d.deletes.iter().any(|k| within(k));
+                }
+            }
+        }
+        touched || (ids.len() as u64) < upto - after
     }
 
     /// The first `n` entries with keys in [from, to), in key order: a commit's bounded look at a range
     /// (producers' expiries, the old marks' pass). In memory it takes only those `n` (the overlay's range,
     /// `take`), never a copy of the whole range; without the whole catalog here, it reads all of it.
     pub async fn scan_first(&self, from: &str, to: &str, n: usize) -> Result<Vec<(String, Bytes)>> {
-        if self.mirror.load(Relaxed) {
-            let o = self.overlay.lock().unwrap();
-            return Ok(o.range(from.to_string()..to.to_string()).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).take(n).collect());
-        }
-        Ok(self.scan_raw(from, to).await?.into_iter().take(n).collect())
+        Ok(self.scan_page(from, to, n, |_| true).await?.0)
     }
 
     /// The producers' marks (`p/` keys) and the expiries (`g/` keys) the catalog holds, when it holds the whole catalog in
@@ -3048,6 +3120,50 @@ mod tests {
         assert_eq!(lake.cat.tallies().map(|t| t.1), Some(5), "five expiries; `h/x` is neither");
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// `scan_page` pages a range by the keys `keep` allows: nothing lost or doubled, the keys it refuses between the pages
+    /// don't stop it, and every page reads the one commit (on a memory lake, which the overlay answers).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_page_pages_a_range_past_the_keys_it_refuses() -> Result<()> {
+        let url = format!("memory://scan-page-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false).await?;
+        lake.cat.commit((0..12u8).map(|i| (format!("g/{i:02}"), vec![i])).collect(), &[]).await?;
+        let may = |k: &str| !matches!(k, "g/03" | "g/04" | "g/05" | "g/10");
+        let (mut got, mut from, mut ats) = (Vec::new(), "g/".to_string(), Vec::new());
+        loop {
+            let (page, at) = lake.cat.scan_page(&from, "g0", 3, may).await?;
+            ats.push(at);
+            let Some(last) = page.last().map(|(k, _)| k.clone()) else { break };
+            from = format!("{last}\0"); // (the next key past this page's last)
+            got.extend(page.into_iter().map(|(k, _)| k));
+        }
+        assert_eq!(got, ["g/00", "g/01", "g/02", "g/06", "g/07", "g/08", "g/09", "g/11"], "the kept keys, once each, in order");
+        assert!(ats.iter().all(|&a| a == lake.cat.committed()) && ats.len() == 4, "three pages and the empty one, all as of the one commit");
+        crate::memory::forget_memory(&url);
+        Ok(())
+    }
+
+    /// `moved_since`: a commit outside the range doesn't move a read of it since an earlier commit, and one inside does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moved_since_sees_a_commit_in_the_range_and_not_one_outside() -> Result<()> {
+        let url = format!("memory://moved-since-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false).await?;
+        lake.cat.commit(vec![("g/1".to_string(), vec![1])], &[]).await?;
+        let since = lake.cat.committed();
+        lake.cat.commit(vec![("h/x".to_string(), vec![2])], &[]).await?;
+        let all = |_: &str| true;
+        let mid = lake.cat.committed();
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "a commit outside the range doesn't move it");
+        lake.cat.commit(vec![("g/2".to_string(), vec![3])], &[]).await?;
+        let now = lake.cat.committed();
+        assert!(lake.cat.moved_since("g/", "g0", since, now, all), "a commit inside it does");
+        assert!(lake.cat.moved_since("g/", "g0", now, since, all), "read the other way round too");
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "one past both reads is in neither");
+        assert!(!lake.cat.moved_since("g/", "g0", since, now, |k: &str| k != "g/2"), "one the reader may not see doesn't");
+        assert!(lake.cat.moved_since("x/", "x0", now, now + 2, all), "commits `recent` doesn't hold can't be told apart");
+        crate::memory::forget_memory(&url);
         Ok(())
     }
 
