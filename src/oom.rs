@@ -29,7 +29,7 @@ pub(crate) const PAGE_OOM: &str = "out of memory: the page was nearly out of mem
 /// How long a stop holds the watch while the node stays over its line: the node's allocator gives freed
 /// pages back over about ten seconds (`main.rs`), so resident memory falls after a stop, and a second stop
 /// would be for memory the first one already let go. Once under the line, nothing holds.
-const HOLD: Duration = Duration::from_secs(10);
+pub(crate) const HOLD: Duration = Duration::from_secs(10);
 
 /// How long a request must have run to be stopped: one that has only just started did not grow the
 /// memory the watch sees, and its own cost is still arriving. (A second let `array_agg` of 30M values
@@ -412,14 +412,29 @@ pub struct Running {
     pub stop: Option<futures::future::AbortHandle>,
     pub stopped: bool,
     /// What the request's polls have allocated, less what they freed (its [`Meter`]'s counter): set only for
-    /// a request the node may stop, and 0 for the rest.
+    /// a request the node may stop, and 0 for the rest. The request's polls and each task or blocking closure
+    /// it spawned hold it ([`charge`], [`TRACER`]), so this entry's is the last one once they have all ended.
     pub used: Option<Arc<AtomicI64>>,
+    /// When a stopped request's own future ended while work it spawned was still running: the entry stays,
+    /// stopped, until that work has ended too (`panics::stopping`).
+    pub left: Option<Instant>,
 }
 
 impl Running {
     fn used(&self) -> i64 {
         self.used.as_ref().map_or(0, |u| u.load(Relaxed))
     }
+
+    /// Is work the request spawned still running: a task or a blocking closure holds its counter.
+    pub(crate) fn spawned(&self) -> bool {
+        self.used.as_ref().is_some_and(|u| Arc::strong_count(u) > 1)
+    }
+}
+
+/// The memory counter of the request the current task is part of (a test's stand-in for a task it spawned).
+#[cfg(test)]
+pub(crate) fn counter() -> Option<Arc<AtomicI64>> {
+    REQUEST.try_with(Arc::clone).ok()
 }
 
 /// The request to stop, of those that may be stopped, have run for [`FIRST`], and started at least `margin`
@@ -427,9 +442,9 @@ impl Running {
 /// most, if that is at least `margin`: the request that grew the node. Otherwise the oldest, as before: the
 /// growth was elsewhere (an operator that doesn't count what it holds, or no counters at all), and age is
 /// then all there is to go on. None when no request qualifies. Of requests that tie, the lower id (the
-/// map's first) is the older, and is taken. None too while a request stopped before is still running: it goes
-/// at its next poll, and until then it may still be growing the node (its answer's last steps run in one poll),
-/// so the memory over the line is still its own. (Under the line for a moment after its stop and over it again
+/// map's first) is the older, and is taken. None too while a request stopped before is still running, or the work
+/// it spawned is (`panics::stopping`): it goes at its next poll, and until then it may still be growing the node
+/// (its answer's last steps run in one poll), so the memory over the line is still its own. (Under the line for a moment after its stop and over it again
 /// before it had gone, the watch stopped the older cheap request beside it, by age: CI, 10-31.)
 pub fn pick(running: &std::collections::BTreeMap<u64, Running>, now: Instant, resident: usize, margin: usize) -> Option<u64> {
     if running.values().any(|r| r.stopped) {
@@ -459,7 +474,7 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None, left: None }
     }
 
     // A request that has allocated `used` bytes so far (its meter's counter).

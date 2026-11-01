@@ -45,7 +45,17 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {
         fn drop(&mut self) {
-            RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+            let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+            match running.get_mut(&self.0) {
+                // (stopped, its tasks end at their next poll, and until then they may still grow the node: their
+                // last polls took the node over its line again after the stop, and the watch stopped the cheap
+                // query beside it, by age: CI, 11-01)
+                Some(r) if r.stopped && r.spawned() => r.left = Some(Instant::now()),
+                _ => {
+                    running.remove(&self.0);
+                }
+            }
+            drop(running);
             if let Some(t) = self.1.take() {
                 t.abort();
             }
@@ -65,7 +75,7 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
-        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, used });
+        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, used, left: None });
         long
     };
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
@@ -103,10 +113,14 @@ pub(crate) fn running() -> bool {
     !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
-/// Is a request the watch stopped still running: its future is dropped at its next poll, and until then its memory
-/// is still its own (`oom::pick` stops no other meanwhile).
+/// Is a request the watch stopped still running, or work it spawned (a DataFusion task ends at its next poll): until
+/// it has all ended, the memory is still its own (`oom::pick` stops no other meanwhile). A stopped request whose own
+/// future and spawned work have ended leaves here, as one does whose spawned work runs past [`crate::oom::HOLD`] (a
+/// blocking closure runs to its end). Only the watch's loop calls it, at each look.
 pub(crate) fn stopping() -> bool {
-    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).values().any(|r| r.stopped)
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    running.retain(|_, r| r.left.is_none_or(|at| r.spawned() && at.elapsed() < crate::oom::HOLD));
+    running.values().any(|r| r.stopped)
 }
 
 /// Gives each request that started while the watch waited (no reading: `oom::seen` was `usize::MAX`) the
@@ -286,8 +300,8 @@ mod tests {
     // keeps the others'; the entries are this test's own, with no stop, so no other test can stop them)
     #[test]
     fn a_request_that_started_unread_takes_the_watchs_next_reading() {
-        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, used: None };
-        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, used: None };
+        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, used: None, left: None };
+        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, used: None, left: None };
         RUNNING.lock().unwrap().insert(u64::MAX - 1, unread);
         RUNNING.lock().unwrap().insert(u64::MAX, read);
         note(7 << 20);
@@ -316,6 +330,35 @@ mod tests {
             assert_eq!(stoppable.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
             assert!(!stop_one(later(), 0), "a stopped request is not stopped again");
             assert_eq!(work(true, async { 5 }).await, Ok(5), "a request that ends on its own answers");
+            // A stopped request whose spawned work still runs holds the stop until that work has ended: the cheap
+            // request beside it is not stopped meanwhile, and is once the work is done (and the memory still over).
+            let cheap = tokio::spawn(work(true, std::future::pending::<()>()));
+            let (done, held) = tokio::sync::oneshot::channel::<()>();
+            let grower = tokio::spawn(work(true, async move {
+                let used = crate::oom::counter().expect("a stoppable request's counter");
+                tokio::spawn(async move {
+                    let _used = used; // (as a DataFusion task holds it: `oom::TRACER`)
+                    let _ = held.await;
+                });
+                std::future::pending::<()>().await
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            {
+                let mut running = RUNNING.lock().unwrap();
+                let first = running.values_mut().find(|r| r.stop.is_some()).expect("the cheap one");
+                first.used.as_ref().expect("its counter").store(-(1 << 40), std::sync::atomic::Ordering::Relaxed); // (it freed, not grew)
+                let last = running.values_mut().last().expect("the grower");
+                last.used.as_ref().expect("its counter").store(1 << 40, std::sync::atomic::Ordering::Relaxed);
+            }
+            assert!(stop_one(later(), 0), "the grower is stopped");
+            assert_eq!(grower.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
+            assert!(stopping(), "its spawned work still runs: the stop holds");
+            assert!(!stop_one(later(), 0), "the cheap one is not stopped for the grower's memory");
+            drop(done);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(!stopping(), "its spawned work has ended: the grower has left");
+            assert!(stop_one(later(), 0), "a stop now takes the cheap one, the one left");
+            assert_eq!(cheap.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
         });
     }
 }
