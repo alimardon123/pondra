@@ -1676,6 +1676,9 @@ async function joinChecks(target, a, b) {
   const retSql = "INSERT INTO idt (v) SELECT 'ret' RETURNING id";
   const retIns = await ask(`joined: ${retSql}`, 'POST', '/sql', undefined, retSql, 'joined');
   if (retIns) judge(`joined: ${retSql}`, retIns, { status: 200, sqlstate: null });
+  const noneSql = "INSERT INTO idt (v) SELECT 'none' WHERE false";
+  const noneIns = await ask(`joined: ${noneSql}`, 'POST', '/sql', undefined, noneSql, 'joined');
+  if (noneIns) judge(`joined: ${noneSql}`, noneIns, { status: 200, sqlstate: null }); // (no rows: one staged file of none, answered as any INSERT of none)
   const idCount = await ask('joined: SELECT id, v FROM idt ORDER BY id', 'POST', '/sql?format=csv', undefined, 'SELECT id, v FROM idt ORDER BY id', 'joined');
   if (idCount) judge('joined: SELECT id, v FROM idt ORDER BY id', idCount, { status: 200, sqlstate: null, out: 'id,v\n1,q\n2,q\n3,val\n4,ret\n' });
   const keySql = "INSERT INTO keyed (k, v) SELECT 1, 'again'";

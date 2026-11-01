@@ -1830,6 +1830,9 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let next = std::sync::atomic::AtomicU64::new(0);
     let partitions = df.execute_stream_partitioned().await?;
     futures::future::try_join_all(partitions.into_iter().map(|rows| stage_stream(lake, &dir, schema.clone(), rows, &next))).await?;
+    if next.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        stage_put(lake, &dir, crate::tier::writer(schema.clone(), &[])?, &next).await?; // (no rows: one file of none, so the node answers it as any INSERT of none)
+    }
     let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names}))?;
     let reply = crate::dial::call(&app.members.leader().addr, call).await?;
     if reply.ok() {

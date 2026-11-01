@@ -118,9 +118,10 @@ pub async fn door(State(origins): State<Arc<Origins>>, req: Request, next: Next)
     let mut answer = next.run(req).await;
     let headers = answer.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    // (what a page may read beyond the usual: the SQLSTATE of a refusal, and an answer's ETag for a cache, and the
-    // span and size of a file's range, which a Parquet reader asks for)
-    headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("x-pondra-sqlstate, etag, content-range, content-length, accept-ranges"));
+    // (what a page may read beyond the usual: the SQLSTATE of a refusal, and an answer's ETag for a cache, the span and
+    // size of a file's range, which a Parquet reader asks for, and the size, time and version a lake's object is read
+    // with through `/store`, which its client takes from every GET and HEAD: `store_wire::object_meta`)
+    headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("x-pondra-sqlstate, etag, content-range, content-length, accept-ranges, x-pondra-size, x-pondra-modified-ns, x-pondra-version"));
     vary(answer)
 }
 
@@ -233,7 +234,7 @@ mod tests {
         let res = app("https://app.example").oneshot(ask(Some("https://app.example"))).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(values(&res, "access-control-allow-origin"), ["https://app.example"]);
-        assert_eq!(values(&res, "access-control-expose-headers"), ["x-pondra-sqlstate, etag, content-range, content-length, accept-ranges"]);
+        assert_eq!(values(&res, "access-control-expose-headers"), ["x-pondra-sqlstate, etag, content-range, content-length, accept-ranges, x-pondra-size, x-pondra-modified-ns, x-pondra-version"]);
         assert_eq!(values(&res, "vary"), ["accept-encoding", "origin"]);
         assert!(res.headers().get("access-control-allow-credentials").is_none(), "a page sends its own token, never the console's cookie");
     }
