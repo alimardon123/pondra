@@ -1537,22 +1537,33 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
             seq.number().await?; // (a commit: the sequencer sets `upto` in it)
             continue;
         };
-        // The source as it was at `upto`: its rows (and changes) from then, none from after.
-        // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
-        // of that row later takes this one back — `{view}$deleted` names the source's version)
-        let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
-        let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
-        let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
-        let out = match rows.iter().any(|b| b.num_rows() > 0) {
-            true => view_rows(lake, &v, &meta, &rows, false).await?,
-            false => RecordBatch::new_empty(crate::answer::schema(&meta.columns)?),
-        };
-        let (out, failed) = expected(name, &v, out, true)?;
-        if let Some(failed) = failed {
-            log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
-        }
-        log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
+        // (a filling that fails is tried again after its backoff, and its error is the view's in `pondra.flows`, and
+        // `ddl::settle`'s: CREATE says so instead of waiting for it; the views after it are filled meanwhile)
+        let Some(turn) = turn(lake, name, identity(&v), "filling materialized view") else { continue };
+        let out = fill_one(lake, log, name, &v, upto, producer).await;
+        turn.ended(&out);
     }
+    Ok(())
+}
+
+/// Fills view `name` (`v`) from its source's rows up to `upto`, once: its rows appended under `producer` (`fill:{name}`),
+/// seq 1, and the rows its expectations refused under `{producer}:expect`.
+async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto: u64, producer: String) -> Result<()> {
+    // The source as it was at `upto`: its rows (and changes) from then, none from after.
+    // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
+    // of that row later takes this one back — `{view}$deleted` names the source's version)
+    let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
+    let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
+    let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
+    let out = match rows.iter().any(|b| b.num_rows() > 0) {
+        true => view_rows(lake, v, &meta, &rows, false).await?,
+        false => RecordBatch::new_empty(crate::answer::schema(&meta.columns)?),
+    };
+    let (out, failed) = expected(name, v, out, true)?;
+    if let Some(failed) = failed {
+        log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
+    }
+    log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
     Ok(())
 }
 

@@ -824,6 +824,10 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
             if let Some(e) = view.rerun.as_ref().and_then(|_| crate::rerun::failing(lake, &name, crate::views::identity(&view))) {
                 bail!("{name} is made, but its first run fails: {e}");
             }
+            if let Some(e) = view.fill.as_ref().and_then(|_| crate::views::failing(lake, &name, crate::views::identity(&view))) {
+                // (its filling is tried again, and changes of its source's rows wait for it: DROP it, or fix what it reads)
+                bail!("{name} is made, but filling it from {}'s rows fails: {e}; changes of those rows wait until it is filled, or dropped", view.source);
+            }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         return Ok(());

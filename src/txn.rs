@@ -1074,7 +1074,7 @@ async fn autocommit_as(app: &crate::app::App, stmt: &Stmt, job: &str, owner: &st
         if old.iter().any(|b| b.num_rows() > 0) {
             crate::views::can_follow(lake, &name, false).await?;
             if let Some(v) = crate::views::filling(lake, &name).await? {
-                bail!("materialized view {v} is still being filled from {name}'s rows: change them once it is (in a moment)");
+                return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {name}'s rows: change them once it is (in a moment)")));
             }
         }
         // (the lock's grant brought the job's own append in, if it landed while this waited: as `insert_as` checks it)
