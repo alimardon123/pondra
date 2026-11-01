@@ -441,7 +441,11 @@ pub struct Running {
     pub noted: usize,
     /// How to stop it, when it may be stopped (the node has a line: `panics::work`).
     pub stop: Option<futures::future::AbortHandle>,
+    /// Stopped by the watch, and its memory still its own until its stopped work has ended: no stop is made meanwhile.
     pub stopped: bool,
+    /// Between its first try and its second, waiting for the first try's memory to go (`panics::first_try`): the watch
+    /// doesn't stop it, and may stop another.
+    pub resting: bool,
     /// What the request's polls have allocated, less what they freed (its [`Meter`]'s counter): set only for
     /// a request the node may stop, and 0 for the rest. The request's polls and each task or blocking closure
     /// it spawned hold it ([`charge`], [`TRACER`]), so this entry's is the last one once they have all ended.
@@ -461,7 +465,13 @@ impl Running {
 
     /// Is work the request spawned still running: a task or a blocking closure holds its counter.
     pub(crate) fn spawned(&self) -> bool {
-        self.used.as_ref().is_some_and(|u| Arc::strong_count(u) > 1)
+        self.holders() > 1
+    }
+
+    /// How many hold the request's counter: this entry, the request's future while it runs, and each task or blocking
+    /// closure it spawned that hasn't ended.
+    pub(crate) fn holders(&self) -> usize {
+        self.used.as_ref().map_or(0, Arc::strong_count)
     }
 }
 
@@ -486,7 +496,7 @@ pub fn pick(running: &std::collections::BTreeMap<u64, Running>, now: Instant, re
     }
     let fit: Vec<(&u64, &Running)> = running
         .iter()
-        .filter(|(_, r)| r.stop.is_some() && !r.stopped)
+        .filter(|(_, r)| r.stop.is_some() && !r.stopped && !r.resting)
         .filter(|(_, r)| now.saturating_duration_since(r.since) >= FIRST)
         .filter(|(_, r)| r.noted.saturating_add(margin) <= resident)
         .collect();
@@ -508,7 +518,7 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None, left: None, first_try: None }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, resting: false, used: None, left: None, first_try: None }
     }
 
     // A request that has allocated `used` bytes so far (its meter's counter).
@@ -585,6 +595,10 @@ mod tests {
         assert_eq!(pick(&runs(vec![near(), grown]), now, LINE, MARGIN), Some(5), "the one that grew is chosen past the others");
         let unread = Running { noted: usize::MAX, ..req(start, 0) };
         assert_eq!(pick(&runs(vec![(6, unread)]), now, LINE, MARGIN), None, "no reading yet (it started while the watch waited): passed over");
+        // (audit 11-01 H5: a request between its tries, its first try's memory going, isn't stopped, and holds no stop)
+        let resting = || (7, Running { resting: true, used: Some(Arc::new(AtomicI64::new(LINE as i64))), ..req(start, 0) });
+        assert_eq!(pick(&runs(vec![resting()]), now, LINE, MARGIN), None, "resting between its tries");
+        assert_eq!(pick(&runs(vec![resting(), (8, grew(start + Duration::from_secs(1), 0, MARGIN))]), now, LINE, MARGIN), Some(8), "the one beside it that grew is stopped");
     }
 
     #[test]

@@ -41,8 +41,10 @@ const DELTA_WRITES: &[&str] = &["appendOnly", "invariants", "checkConstraints", 
 
 /// `COPY … TO '<folder>' (FORMAT delta | iceberg)` (ADR-028): a table of that format there, made
 /// if the folder holds none; one that is there takes APPEND (rows added) or OVERWRITE (its rows
-/// replaced), as a folder of files does. Polars' `write_delta` and Spark's `format("delta")`.
-pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool) -> Result<Value> {
+/// replaced), as a folder of files does. Polars' `write_delta` and Spark's `format("delta")`. `job` names the commit, so a
+/// try of the same statement again finds it and answers a duplicate (`query::frugally`'s retry).
+#[allow(clippy::too_many_arguments)]
+pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, df: datafusion::prelude::DataFrame, to: &str, format: &str, append: bool, overwrite: bool, job: &str) -> Result<Value> {
     let root = crate::ddl::full(to)?; // (a folder named relatively: from where the node runs; Iceberg's location is absolute)
     let root = root.as_str();
     let (store, dir) = crate::ext::store(lake, &format!("{root}/")).await?;
@@ -52,7 +54,6 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
     };
     let marker = if format == "delta" { "/_delta_log/" } else { "/metadata/" };
     let table = there.iter().any(|o| o.location.as_ref().contains(marker));
-    let job = uuid::Uuid::new_v4().to_string();
     match table {
         true => ensure!(append || overwrite, "COPY … TO {to}: a {format} table is there already: APPEND adds to it, OVERWRITE replaces its rows"),
         false => {
@@ -77,8 +78,8 @@ pub async fn copy_table(lake: &Lake, ctx: &datafusion::prelude::SessionContext, 
     }
     let replace = table && overwrite;
     match format {
-        "delta" => delta(lake, root, df, &job, replace).await,
-        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, &job, replace).await,
+        "delta" => delta(lake, root, df, job, replace).await,
+        _ => iceberg(lake, &crate::ext_names::Spec { urls: vec![root.to_string()], format: format.into(), options: Default::default() }, df, job, replace).await,
     }
 }
 

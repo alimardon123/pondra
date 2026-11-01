@@ -794,11 +794,15 @@ async fn commit(lake: &Arc<Lake>, next: &mut u64, block: &mut u64, producers: &m
             continue;
         }
         if f.reserve > 0 || f.block || f.blocks > 0 {
-            // (numbers no segment will take: gaps in the log's sequence, which nothing minds)
+            // (numbers no segment will take: gaps in the log's sequence, which nothing minds; never so many that the commit
+            // numbers would pass what a `_version` holds (i64), or wrap and be used again: audit 11-01 H3)
+            let (Some(after), Some(blocks)) = (next.checked_add(f.reserve).filter(|n| *n <= i64::MAX as u64), block.checked_add(f.block as u64).and_then(|b| b.checked_add(f.blocks)).filter(|b| *b <= i64::MAX as u64)) else {
+                replies.push((reply, Outcome::Refused(format!("a flush may not reserve {} numbers and {} blocks past {} and {}", f.reserve, f.blocks, *next, *block))));
+                continue;
+            };
             takes = Some(takes.unwrap_or(true));
             let ack = Ack { seg: *next, ms: now_ms(), block: *block, ..Default::default() };
-            *next += f.reserve;
-            *block += f.block as u64 + f.blocks;
+            (*next, *block) = (after, blocks);
             replies.push((reply, Outcome::Acks(vec![ack])));
             continue;
         }
