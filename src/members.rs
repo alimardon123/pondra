@@ -5,7 +5,7 @@ use crate::fetch;
 use crate::store::{Frame, Lake, Store};
 use crate::terms::{self, Term};
 use anyhow::{bail, Result};
-use futures::{future::BoxFuture, StreamExt};
+use futures::{future::BoxFuture, Stream, StreamExt};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -105,23 +105,20 @@ pub async fn follow(
     while lake.strong_count() > 0 {
         match open().await {
             Ok(r) => {
-                let (mut body, mut buf) = (r.bytes_stream(), bytes::BytesMut::new());
-                while let Some(Ok(chunk)) = body.next().await {
-                    buf.extend_from_slice(&chunk);
-                    while let Ok(Some(f)) = Frame::take(&mut buf) {
-                        if let Frame::Change(d) = &f {
-                            if d.id <= last {
-                                continue;
-                            }
-                            last = d.id;
+                let mut frames = Box::pin(frames(r.bytes_stream()));
+                while let Some(Ok(f)) = frames.next().await {
+                    if let Frame::Change(d) = &f {
+                        if d.id <= last {
+                            continue;
                         }
-                        let Some(live) = lake.upgrade() else { return };
-                        frame(&f, &live);
-                        match f {
-                            Frame::Change(d) => live.hold(d),
-                            Frame::Committed(upto) => live.commit_upto(upto),
-                            Frame::Start { .. } | Frame::Durable(_) => {}
-                        }
+                        last = d.id;
+                    }
+                    let Some(live) = lake.upgrade() else { return };
+                    frame(&f, &live);
+                    match f {
+                        Frame::Change(d) => live.hold(d),
+                        Frame::Committed(upto) => live.commit_upto(upto),
+                        Frame::Start { .. } | Frame::Durable(_) => {}
                     }
                 }
             }
@@ -131,6 +128,26 @@ pub async fn follow(
         down();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// A commit stream's frames, read from a body's chunks as each one completes. A chunk that fails, or a frame that doesn't
+/// parse, ends the stream with that error: `follow` and a follower's relay (`server::relay`) both read it this way.
+pub fn frames<E>(chunks: impl Stream<Item = std::result::Result<bytes::Bytes, E>> + Send) -> impl Stream<Item = Result<Frame>> + Send
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let chunks = Box::pin(chunks);
+    futures::stream::try_unfold((chunks, bytes::BytesMut::new()), |(mut chunks, mut buf)| async move {
+        loop {
+            if let Some(f) = Frame::take(&mut buf)? {
+                return anyhow::Ok(Some((f, (chunks, buf))));
+            }
+            match chunks.next().await {
+                Some(chunk) => buf.extend_from_slice(&chunk?),
+                None => return anyhow::Ok(None),
+            }
+        }
+    })
 }
 
 impl Members for Alone {
@@ -172,6 +189,29 @@ mod tests {
     #[test]
     fn cut_off_is_cannot_connect_now() {
         assert_eq!(crate::codes::of(&anyhow::anyhow!("{}", CUT_OFF_SAYS)), "57P03");
+    }
+
+    /// `frames` reads whole frames out of chunks cut anywhere; a chunk that fails, or a frame of an unknown kind, ends it with
+    /// that error.
+    #[tokio::test]
+    async fn frames_read_across_cut_chunks_and_a_failure_ends_them() {
+        let mut wire = Frame::Start { term: 3, replicated: true }.encode().to_vec();
+        wire.extend_from_slice(&Frame::Committed(9).encode());
+        let cut: Vec<std::io::Result<bytes::Bytes>> = wire.chunks(3).map(|c| Ok(bytes::Bytes::copy_from_slice(c))).collect();
+        let got: Vec<Result<Frame>> = frames(futures::stream::iter(cut)).collect().await;
+        assert_eq!(got.len(), 2);
+        assert!(matches!(got[0], Ok(Frame::Start { term: 3, replicated: true })));
+        assert!(matches!(got[1], Ok(Frame::Committed(9))));
+
+        let start = Frame::Start { term: 1, replicated: false }.encode();
+        let failed = futures::stream::iter(vec![Ok(start.clone()), Err(std::io::Error::other("cut off")), Ok(start)]);
+        let got: Vec<Result<Frame>> = frames(failed).collect().await;
+        assert_eq!(got.len(), 2, "the failure is the last thing read");
+        assert!(got[1].is_err());
+
+        let unknown = futures::stream::iter(vec![Ok::<_, std::io::Error>(bytes::Bytes::from_static(&[1, 0, 0, 0, 9]))]);
+        let got: Vec<Result<Frame>> = frames(unknown).collect().await;
+        assert!(got.len() == 1 && got[0].is_err(), "a frame of an unknown kind ends it");
     }
 
     #[tokio::test]

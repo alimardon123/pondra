@@ -650,11 +650,13 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 
 /// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A caller that isn't one of
 /// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`), and a follower relays the leader's
-/// (`relay`).
+/// (`relay`). Its sign-in revoked or expired, the stream ends (`ends_when_revoked`).
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
+    let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let revoked = ends_when_revoked(app.clone(), operator, header);
     if !operator && !app.members.is_leader() {
-        return relay(&app).await;
+        return relay(&app, revoked).await;
     }
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
@@ -665,7 +667,26 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
         let _ = &streamed;
         Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
-    Body::from_stream(crate::drain::endless(frames)).into_response() // (never ends by itself: it ends when the node's door closes)
+    Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `drain::endless`)
+}
+
+/// Resolves once a caller that isn't one of the nodes no longer qualifies for the commit stream: its sign-in is revoked, is no
+/// longer a superuser's, or has expired. Checked every 5 s, so a stream ends within that, with the guard's test for
+/// `/cluster/log` (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier). A
+/// node never ends; a caller with no sign-in ends at once.
+async fn ends_when_revoked(app: App, operator: bool, header: Option<String>) {
+    if operator {
+        return futures::future::pending().await;
+    }
+    let Some(header) = header else { return };
+    let need = crate::auth::Auth::needed("/cluster/log", "GET");
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let who = crate::users::who_at(&app.lake, &app.auth, Some(header.as_str()), false).await;
+        if !who.is_some_and(|p| p.role >= need && p.access.is_none()) {
+            return;
+        }
+    }
 }
 
 /// Is the request being served one of the nodes' own: their tokens, their key, the program that started this node
@@ -684,33 +705,15 @@ fn for_caller(f: Frame, operator: bool) -> Frame {
 
 /// A follower's `/cluster/log` for a page: the leader's stream, frame by frame, as `for_caller` sees it. Its request is
 /// this node's own, as `cluster::mirror` makes it (the node's key), never `to_leader`'s proxy, which buffers the body and
-/// sends the caller's.
-async fn relay(app: &App) -> Response {
+/// sends the caller's. A bad chunk or frame ends the body there: the page reconnects, and sees no gap.
+async fn relay(app: &App, revoked: impl std::future::Future<Output = ()> + Send + 'static) -> Response {
     let url = crate::tls::url(&format!("{}/cluster/log", app.members.leader().addr));
     let Ok(res) = crate::cluster::http().get(url).send().await.and_then(|r| r.error_for_status()) else {
         return (StatusCode::SERVICE_UNAVAILABLE, "the leader's commit stream is not reachable from here").into_response();
     };
-    let frames = res.bytes_stream().scan(bytes::BytesMut::new(), |buf, chunk| {
-        let mut out: Vec<std::io::Result<bytes::Bytes>> = vec![];
-        match chunk {
-            Ok(c) => {
-                buf.extend_from_slice(&c);
-                loop {
-                    match Frame::take(buf) {
-                        Ok(Some(f)) => out.push(Ok(for_caller(f, false).encode())),
-                        Ok(None) => break,
-                        Err(e) => {
-                            out.push(Err(std::io::Error::other(e))); // (the body ends there: the page reconnects, and sees no gap)
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => out.push(Err(std::io::Error::other(e))),
-        }
-        futures::future::ready(Some(futures::stream::iter(out)))
-    }).flatten();
-    Body::from_stream(crate::drain::endless(frames)).into_response()
+    let frames = crate::members::frames(res.bytes_stream())
+        .map(|f| f.map(|f| for_caller(f, false).encode()).map_err(std::io::Error::other));
+    Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (a sign-in revoked ends it too: `ends_when_revoked`)
 }
 
 #[derive(Deserialize, Default)]
