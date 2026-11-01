@@ -2,14 +2,16 @@
 //! `friendly::expression`, so every door and every form reads them alike):
 //! - Snowflake's `IFF`, `ZEROIFNULL`, `DECODE(x, a, ra, b, rb, …, else)`, `ARRAY_CONSTRUCT`, `ARRAY_SIZE`, `OBJECT_CONSTRUCT`;
 //! - SQL Server's `IIF`, `ISNULL(a, b)`, `CHARINDEX(sub, s)`, `TRY_CONVERT(type, 'text')`, `GETDATE()`, `EOMONTH(d)`, `DATEPART(part, d)`;
-//! - MySQL's `CURDATE()`, `UNIX_TIMESTAMP([ts])`, `STR_TO_DATE(s, '%m/%d/%Y')` (its `FROM_UNIXTIME(n)` is Pondra's own);
+//! - MySQL's `CURDATE()`, `UNIX_TIMESTAMP([ts])`, `STR_TO_DATE(s, '%m/%d/%Y')`, `DATE_FORMAT(ts, '%Y-%m-%d %H:%i')` (its
+//!   `FROM_UNIXTIME(n)` is Pondra's own);
+//! - Spark's `date_format(ts, 'yyyy-MM-dd HH:mm')`, Java's letters (a `%` in the format is MySQL's, as above);
 //! - BigQuery's `COUNTIF`, `SAFE_DIVIDE`, `DATE(ts)`, `DATE_TRUNC(d, MONTH)`, `TIMESTAMP_TRUNC(ts, HOUR)`,
 //!   `TIMESTAMP_DIFF(a, b, HOUR)`, `FORMAT_DATE(fmt, d)`, `PARSE_DATE(fmt, s)`, `UNIX_SECONDS(ts)`, `TIMESTAMP_SECONDS(n)`.
 //!
 //! A name Pondra already has keeps its own meaning where its arguments say so: `decode(bytes, 'hex')`, `date_trunc('month',
 //! ts)`. MySQL's `TIMESTAMPDIFF` counts whole units and Snowflake's counts part boundaries, so it is refused by name with
 //! `date_diff`, which counts boundaries as DuckDB does.
-use crate::friendly::part_word;
+use crate::friendly::{part_word, quote};
 use anyhow::Result;
 use datafusion::sql::sqlparser::ast::{Expr, Value, ValueWithSpan};
 
@@ -50,8 +52,19 @@ pub fn call(name: &str, a: &[&Expr]) -> Result<Option<String>> {
         ("timestamp_seconds", 1) => format!("from_unixtime({})", a[0]), // (MySQL's FROM_UNIXTIME is Pondra's own)
         ("str_to_date", 2) => {
             let Some(f) = string(a[1]) else { return Ok(None) };
-            let (chrono, time) = mysql_format(f);
-            format!("{}({}, '{}')", if time { "to_timestamp" } else { "to_date" }, a[0], chrono.replace('\'', "''"))
+            let (chrono, time) = mysql_format(f)?;
+            format!("{}({}, {})", if time { "to_timestamp" } else { "to_date" }, a[0], quote(&chrono))
+        }
+        // (a format with a `%` is MySQL's, else Spark's; a column of formats is DataFusion's. A format with no code in it
+        // (only literal text, as `'''Q'''`) is that text, not Pondra's `to_char` template, where Q is a quarter)
+        ("date_format", 2) => {
+            let Some(f) = string(a[1]) else { return Ok(None) };
+            let chrono = if f.contains('%') { mysql_format(f)?.0 } else { java_format(f)? };
+            if chrono.contains('%') {
+                format!("to_char({}, {})", a[0], quote(&chrono))
+            } else {
+                format!("CASE WHEN {0} IS NULL THEN NULL ELSE {1} END", a[0], quote(&chrono))
+            }
         }
         ("timestampdiff", 3) => {
             return Err(crate::codes::coded("42883", format!("TIMESTAMPDIFF counts whole units in MySQL and part boundaries in Snowflake, so it isn't taken: date_diff('{}', {}, {}) counts the boundaries, as DuckDB does", a[0].to_string().to_lowercase(), a[1], a[2])));
@@ -125,8 +138,9 @@ fn bare_part(e: &Expr) -> Option<&'static str> {
     })
 }
 
-/// MySQL's date format as chrono's (`%i` minutes, `%s` seconds, `%M` a month's name, …), and whether it reads a time.
-fn mysql_format(f: &str) -> (String, bool) {
+/// MySQL's date format as chrono's (`%i` minutes, `%s` seconds, `%M` a month's name, …), and whether it reads a time. A
+/// code Pondra has none for (`%D`, `%V`, `%X`) is refused by name; a letter MySQL doesn't list is written as itself.
+fn mysql_format(f: &str) -> Result<(String, bool)> {
     let (mut out, mut time, mut chars) = (String::new(), false, f.chars());
     while let Some(c) = chars.next() {
         if c != '%' {
@@ -134,7 +148,7 @@ fn mysql_format(f: &str) -> (String, bool) {
             continue;
         }
         let Some(k) = chars.next() else {
-            out.push('%');
+            out.push_str("%%");
             break;
         };
         let (s, t) = match k {
@@ -159,9 +173,14 @@ fn mysql_format(f: &str) -> (String, bool) {
             'b' => ("%b", false),
             'a' => ("%a", false),
             'j' => ("%j", false),
+            'U' => ("%U", false),
+            'u' => ("%W", false),
+            'v' => ("%V", false),
+            'x' => ("%G", false),
+            'w' => ("%w", false),
+            'D' | 'V' | 'X' => return Err(crate::codes::coded("22023", format!("MySQL's %{k} isn't taken: Pondra has no code for it (write it apart with CASE)"))),
             '%' => ("%%", false),
             _ => {
-                out.push('%');
                 out.push(k);
                 continue;
             }
@@ -169,7 +188,74 @@ fn mysql_format(f: &str) -> (String, bool) {
         out.push_str(s);
         time |= t;
     }
-    (out, time)
+    Ok((out, time))
+}
+
+/// Spark's date pattern (Java's letters) as chrono's, which `to_char` reads: `yyyy-MM-dd HH:mm:ss.SSS` is
+/// `%Y-%m-%d %H:%M:%S.%3f`. A run of one letter is one field; `'text'` is literal text and `''` one quote. Another
+/// letter or count is refused by name.
+fn java_format(f: &str) -> Result<String> {
+    let (mut out, mut quoted, mut chars) = (String::new(), false, f.chars().peekable());
+    while let Some(c) = chars.next() {
+        if c == '\'' {
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                push_text(&mut out, '\'');
+            } else {
+                quoted = !quoted;
+            }
+        } else if quoted || !c.is_ascii_alphabetic() {
+            push_text(&mut out, c);
+        } else {
+            let mut n = 1;
+            while chars.peek() == Some(&c) {
+                chars.next();
+                n += 1;
+            }
+            out.push_str(java_field(c, n)?);
+        }
+    }
+    Ok(out)
+}
+
+/// A literal character in chrono's format: `%` is `%%`.
+fn push_text(out: &mut String, c: char) {
+    if c == '%' {
+        out.push_str("%%");
+    } else {
+        out.push(c);
+    }
+}
+
+/// One of Java's fields, a letter `c` written `n` times, as chrono's code.
+fn java_field(c: char, n: usize) -> Result<&'static str> {
+    Ok(match (c, n) {
+        ('y', 2) => "%y",
+        ('y', _) => "%Y",
+        ('M', 1) => "%-m",
+        ('M', 2) => "%m",
+        ('M', 3) => "%b",
+        ('M', 4) => "%B",
+        ('d', 1) => "%-d",
+        ('d', 2) => "%d",
+        ('H', 1) => "%-H",
+        ('H', 2) => "%H",
+        ('h', 1) => "%-I",
+        ('h', 2) => "%I",
+        ('m', 1) => "%-M",
+        ('m', 2) => "%M",
+        ('s', 1) => "%-S",
+        ('s', 2) => "%S",
+        ('S', 3) => "%3f",
+        ('S', 6) => "%6f",
+        ('S', 9) => "%9f",
+        ('a', _) => "%p",
+        ('E', 1..=3) => "%a",
+        ('E', 4) => "%A",
+        ('D', 1) => "%-j",
+        ('D', 3) => "%j",
+        _ => return Err(crate::codes::coded("22023", format!("date_format's pattern letter {c} isn't taken: yyyy MM dd HH mm ss SSS a EEE are, or write strftime(ts, '%Y-%m-%d')"))),
+    })
 }
 
 #[cfg(test)]
@@ -177,7 +263,10 @@ mod tests {
     use super::*;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
-    fn said(sql: &str) -> Option<String> {
+    fn said(sql: &str) -> Option<String> { try_said(sql).unwrap() }
+
+    /// The call's text, or its refusal.
+    fn try_said(sql: &str) -> Result<Option<String>> {
         let e = Parser::new(&GenericDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap();
         let Expr::Function(f) = &e else { panic!("{sql}") };
         let name = f.name.to_string().to_lowercase();
@@ -188,7 +277,20 @@ mod tests {
             }).collect(),
             _ => vec![],
         };
-        call(&name, &args).unwrap()
+        call(&name, &args)
+    }
+
+    #[test]
+    fn date_format_is_mysqls_or_sparks() {
+        assert_eq!(said("DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s %M %W')").unwrap(), "to_char(ts, '%Y-%m-%d %H:%M:%S %B %A')");
+        assert_eq!(said("date_format(ts, 'yyyy-MM-dd HH:mm:ss.SSS')").unwrap(), "to_char(ts, '%Y-%m-%d %H:%M:%S.%3f')");
+        assert_eq!(said("date_format(ts, 'dd MMM yyyy ''at'' h a')").unwrap(), "to_char(ts, '%d %b %Y at %-I %p')");
+        assert_eq!(said("date_format(ts, '''Q''')").unwrap(), "CASE WHEN ts IS NULL THEN NULL ELSE 'Q' END"); // (Q is literal here, not a quarter)
+        assert_eq!(said("date_format(ts, fmt)"), None); // (a column of formats is DataFusion's)
+        let refusal = try_said("date_format(ts, 'G')").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("pattern letter G"), "{refusal:#}");
+        let refusal = try_said("DATE_FORMAT(ts, '%D')").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "22023" && refusal.to_string().contains("MySQL's %D"), "{refusal:#}");
     }
 
     #[test]
