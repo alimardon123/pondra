@@ -87,7 +87,7 @@ pub(crate) enum Cmd {
         #[arg(long, default_value_t = node::Start::default().backlog)]
         backlog: u64,
         /// Lakes on object storage: where this node keeps its local SSD copy of recent objects
-        /// (default: <temp dir>/pondra-cache).
+        /// (default: <temp dir>/pondra-cache-<uid>, the user's own).
         #[arg(long)]
         cache_dir: Option<String>,
         /// Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of the free

@@ -534,11 +534,28 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
 fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
 
+/// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
+/// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
+/// (`memory::own_dir`: the temp dir is shared, so a folder with a predictable name may be another user's).
+pub(crate) fn cache_base() -> std::io::Result<std::path::PathBuf> {
+    match crate::env::get("PONDRA_CACHE_DIR") {
+        Some(dir) => Ok(std::path::PathBuf::from(dir)),
+        None => crate::memory::own_dir(&std::env::temp_dir(), "pondra-cache"),
+    }
+}
+
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
-/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under the temp dir, 20 GB, or a quarter of the free disk
+/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under `cache_base`, 20 GB, or a quarter of the free disk
 /// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
 fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
-    let dir = crate::env::get("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+    let dir = match cache_base() {
+        Ok(dir) => dir,
+        Err(e) => {
+            static SAID: std::sync::Once = std::sync::Once::new(); // (the same for every lake, so said once)
+            SAID.call_once(|| eprintln!("no SSD tier ({e}): lakes on object storage read the bucket without one"));
+            return None;
+        }
+    };
     let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
         Some(gb) => gb << 30,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
@@ -1110,6 +1127,13 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
 /// A folder's store, made if it isn't there.
 #[cfg(not(target_arch = "wasm32"))]
 fn folder(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    // (a folder made here is its user's alone: other users would read its catalog and keys; one already there keeps its permissions)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(url)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(url)?;
     let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
     // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
