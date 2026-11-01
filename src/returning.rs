@@ -216,7 +216,7 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
     let Some(meta) = app.lake.cat.meta(&crate::store::table_key(&name)).await? else {
         return Err(crate::codes::coded("42P01", format!("no table {table} (RETURNING answers for this database's own tables)")));
     };
-    let columns: Vec<(String, String)> = meta.logical_columns().into_iter().filter(|(c, _)| c != "_deleted").collect();
+    let columns: Vec<(String, String)> = meta.sql_columns().into_iter().filter(|(c, _)| c != "_deleted").collect(); // (SQL's order)
     Ok((name, crate::answer::schema(&columns)?))
 }
 

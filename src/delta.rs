@@ -427,13 +427,15 @@ const MAPPING_ID: &str = "delta.columnMapping.id";
 /// sees, under SQL's names, each with its id (its place among the stored columns) and the name
 /// the files hold it under — Delta's column mapping, by name.
 fn table_schema(meta: &TableMeta, mapped: bool) -> Option<String> {
+    // (listed in SQL's order, `TableMeta::in_order`: a reader finds a column by its name, or by its physical name when mapped)
+    let order = meta.in_order();
     if !mapped {
-        return schema_string(&meta.columns.iter().filter(|(c, _)| !meta.marker(c)).cloned().collect::<Vec<_>>());
+        return schema_string(&order.into_iter().filter(|(c, _)| !meta.marker(c)).cloned().collect::<Vec<_>>());
     }
-    let live: Vec<(String, String)> = meta.live().filter(|(s, _, _)| !meta.marker(s)).map(|(_, n, t)| (n.to_string(), t.to_string())).collect();
-    let mut schema: Value = serde_json::from_str(&schema_string(&live)?).ok()?;
-    let ids = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).map(|(i, (c, _))| (i + 1, c));
-    for (f, (id, stored)) in schema["fields"].as_array_mut()?.iter_mut().zip(ids) {
+    let mut live: Vec<(usize, &str, &str)> = meta.columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).map(|(i, (c, t))| (i + 1, c.as_str(), t.as_str())).collect();
+    live.sort_by_key(|(_, c, _)| order.iter().position(|(s, _)| s == c));
+    let mut schema: Value = serde_json::from_str(&schema_string(&live.iter().map(|(_, c, t)| (meta.name_of(c).to_string(), t.to_string())).collect::<Vec<_>>())?).ok()?;
+    for (f, (id, stored, _)) in schema["fields"].as_array_mut()?.iter_mut().zip(&live) {
         f["metadata"] = json!({(MAPPING_ID): id, "delta.columnMapping.physicalName": stored});
     }
     Some(schema.to_string())

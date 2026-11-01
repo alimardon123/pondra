@@ -8,7 +8,7 @@
 //! - SQL Server's `CREATE [NON]CLUSTERED INDEX`, `SET NOCOUNT ON` and its kind, `DECLARE @x`,
 //!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting;
 //! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, `REPLACE INTO`,
-//!   `ALTER TABLE t CHANGE / MODIFY …`, `ADD COLUMN … AFTER c / FIRST` (a column is added last here), and `DATABASE()`,
+//!   `ALTER TABLE t CHANGE / MODIFY …` (Pondra's `ALTER COLUMN c TYPE …`, `ALTER COLUMN c AFTER b`), and `DATABASE()`,
 //!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
 //! - SQL Server's `OUTPUT inserted.…`, which would otherwise run with the clause left out, and `OPTION (…)`;
 //! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`.
@@ -40,7 +40,7 @@ fn refusal(sql: &str) -> Option<String> {
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
             r"|\boutput\s+(?:inserted|deleted)\s*\.|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
-            r"|\breplace\s+into\b|\balter\s+table\b[^;]*\b(?:after|first)\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b"))
+            r"|\breplace\s+into\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b"))
             .expect("a regex")
     });
     if !LOOK.is_match(sql) {
@@ -181,14 +181,7 @@ fn statement(s: &[Token]) -> Option<String> {
             let (t, after) = name(s, at);
             match w(after).as_deref() {
                 Some("CHANGE") => Some(format!("ALTER TABLE … CHANGE is MySQL's: write ALTER TABLE {t} RENAME COLUMN a TO b, then ALTER TABLE {t} ALTER COLUMN b TYPE type")),
-                Some("MODIFY") => Some(format!("ALTER TABLE … MODIFY is MySQL's: write ALTER TABLE {t} ALTER COLUMN c TYPE type (SET NOT NULL, SET DEFAULT v)")),
-                Some("ADD") => {
-                    // (past the column's name and its type's first word: `ADD COLUMN after INT` names a column `after`)
-                    let mut i = after + 1 + usize::from(is(after + 1, "COLUMN"));
-                    i += if is(i, "IF") && is(i + 1, "NOT") && is(i + 2, "EXISTS") { 3 } else { 0 };
-                    let placed = (i + 2..s.len()).find(|&j| is(j, "AFTER") && matches!(s.get(j + 1), Some(Token::Word(_))) || is(j, "FIRST") && matches!(s.get(j + 1), None | Some(Token::Comma)))?;
-                    Some(format!("ADD COLUMN … {} is MySQL's: a column is added after the others here (a SELECT, or a view, puts columns in any order)", w(placed).unwrap_or_default()))
-                }
+                Some("MODIFY") => Some(format!("ALTER TABLE … MODIFY is MySQL's: write ALTER TABLE {t} ALTER COLUMN c TYPE type (SET NOT NULL, SET DEFAULT v; AFTER b or FIRST moves it)")),
                 _ => None,
             }
         }
@@ -223,8 +216,6 @@ mod tests {
         assert!(said("SELECT [o].[id] FROM [dbo].[orders] AS [o]").starts_with("[o] is SQL Server's quoting of a name: write \"o\""));
         assert!(said("SELECT 1; SET NOCOUNT ON").starts_with("SET NOCOUNT"), "any statement of a script");
         assert_eq!(said("REPLACE INTO t_case_401 (id, note) VALUES (1, 'refund')"), "REPLACE INTO is MySQL's: write INSERT OR REPLACE INTO t_case_401 …, or INSERT INTO t_case_401 … ON CONFLICT (key) DO UPDATE SET …");
-        assert!(said("ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note").starts_with("ADD COLUMN … AFTER is MySQL's: a column is added after the others here"));
-        assert!(said("ALTER TABLE t ADD c INT FIRST").starts_with("ADD COLUMN … FIRST is MySQL's"));
         assert!(said("INSERT INTO t (a, b) OUTPUT inserted.id, inserted.b VALUES (3, N'x')").starts_with("OUTPUT inserted.… is SQL Server's: end the statement with RETURNING"));
         assert!(said("DELETE FROM t OUTPUT deleted.* WHERE a = 1").starts_with("OUTPUT deleted.…"));
         assert!(said("WITH n AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM n WHERE n < 5) SELECT n FROM n OPTION (MAXRECURSION 10)").ends_with("leave it out (WITH RECURSIVE … stops when a pass adds no rows)"));
@@ -244,7 +235,8 @@ mod tests {
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
             "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP MACRO m(x) AS x + 1", "CREATE OR REPLACE TEMPORARY FUNCTION f(x INT) RETURN x", "ALTER TABLE t ADD COLUMN after INT",
-            "ALTER TABLE t ADD COLUMN first INT", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
+            "ALTER TABLE t ADD COLUMN first INT", "ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note", "ALTER TABLE t ADD c INT FIRST", "ALTER TABLE t ALTER COLUMN c AFTER b",
+            "ALTER TABLE t ALTER c FIRST", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
             "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
         ] {
             assert_eq!(refusal(sql), None, "{sql}");

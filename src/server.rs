@@ -876,6 +876,11 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
+    // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
+    let query = match app.lake.table_meta_if(name).await? {
+        Some(m) if !m.shown.is_empty() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query).await?, &query).await?,
+        _ => query,
+    };
     let ctx = session(&app.lake, &query, "").await?;
     match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, crate::write::stamp(&app.lake, &name, Some(&app.to())).await?).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
@@ -1051,10 +1056,12 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let lake = &app.lake;
     let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
+    // (SQL's order, for a table that moved a column: as `SELECT *` lists them)
+    let in_order = |b: RecordBatch| -> anyhow::Result<RecordBatch> { if meta.shown.is_empty() { Ok(b) } else { Ok(crate::answer::batch_reordered(&b, &meta.sql_order())?) } };
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
-        let row = row.map(|r| meta.to_logical(&r)).transpose()?;
+        let row = row.map(|r| meta.to_logical(&r).and_then(in_order)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
         w.write_batches(&row.iter().collect::<Vec<_>>())?;
         w.finish()?;
@@ -1080,7 +1087,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
         false => format!("{} ", latest_sql(&meta, "__raw", false, false)).replace(" GROUP BY ", &format!(" WHERE {where_} GROUP BY ")),
     };
     let shown = |b: &RecordBatch| b.project(&(0..b.num_columns()).filter(|&i| b.schema().field(i).name() != "_deleted").collect::<Vec<_>>());
-    let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?)).collect::<anyhow::Result<Vec<_>>>()?;
+    let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?).and_then(in_order)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
     w.write_batches(&batches.iter().collect::<Vec<_>>())?;
     w.finish()?;
@@ -1227,6 +1234,10 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
                     true => crate::change::feed(&app.lake, &name, after, Some(now)).await,
                     false => tail(&app.lake, &name, after, Some(now), false).await,
                 };
+                let rows = match rows {
+                    Ok(b) => sql_ordered(&app.lake, &name, b).await, // (a table that moved a column: SQL's order)
+                    e => e,
+                };
                 let chunk = rows.and_then(|b| ndjson(&b)).map(mark);
                 return Some((chunk.map_err(|e| std::io::Error::other(e.to_string())), (app, hwm, now, name)));
             }
@@ -1234,6 +1245,14 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
         }
     });
     Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))))).into_response() // (never ends by itself: `drain::endless`)
+}
+
+/// A table's rows (`tail`'s, the change feed's) with its columns in SQL's order (`TableMeta::sql_order`), the system
+/// columns where they are; as they are for a table that never moved a column.
+async fn sql_ordered(lake: &crate::store::Lake, table: &str, batches: Vec<RecordBatch>) -> anyhow::Result<Vec<RecordBatch>> {
+    let Some(meta) = lake.table_meta_if(table).await?.filter(|m| !m.shown.is_empty()) else { return Ok(batches) };
+    let order = meta.sql_order();
+    Ok(batches.iter().map(|b| crate::answer::batch_reordered(b, &order)).collect::<Result<_, _>>()?)
 }
 
 fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {

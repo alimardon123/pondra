@@ -240,7 +240,7 @@ CASES = [
     ("mysql", "REPLACE INTO t_case_401 (id, order_id, note) VALUES (1, 1, 'refund')", ("0A000", "REPLACE INTO is MySQL's: write INSERT OR REPLACE INTO t_case_401")),
     ("mysql", "INSERT IGNORE INTO customers (id, name, email, country, signed_up) VALUES (1, 'Ada Lovelace', 'ada@example.com', 'UK', '2024-11-02')"),
     ("mysql", "INSERT INTO orders (id, customer_id, amount, status, created_at, tags) VALUES (1, 1, 120.50, 'paid', '2026-01-05 09:15:00', 'vip,repeat') ON DUPLICATE KEY UPDATE status = VALUES(status)"),
-    ("mysql", "ALTER TABLE t_case_401 ADD COLUMN channel VARCHAR(20) AFTER note", ("0A000", "ADD COLUMN … AFTER is MySQL's: a column is added after the others here")),
+    ("mysql", "ALTER TABLE t_case_402 ADD COLUMN channel VARCHAR(20) AFTER id"),
     ("mysql", "ALTER TABLE t_case_401 CHANGE COLUMN flag is_flagged TINYINT(1) NOT NULL DEFAULT 0", ("0A000", "ALTER TABLE … CHANGE is MySQL's")),
     ("mysql", "UPDATE orders o JOIN customers c ON c.id = o.customer_id SET o.tags = 'uk' WHERE c.country = 'UK' AND o.id = 1", ("0A000", "UPDATE … JOIN … SET is MySQL's")),
     ("mysql", "DELETE t FROM t_case_402 t JOIN customers c ON c.id = t.customer_id WHERE c.country IS NULL", ("0A000", "DELETE t FROM … JOIN is MySQL's and SQL Server's")),

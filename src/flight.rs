@@ -769,7 +769,7 @@ async fn log_stream(app: App, table: String, after: Option<u64>, columns: Option
     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
     let pick: Vec<usize> = match &columns {
         Some(cols) => cols.iter().map(|c| full.index_of(c).map_err(|_| refused("42703", format!("no column {c}")))).collect::<Result<_, _>>()?,
-        None => (0..full.fields().len()).collect(),
+        None => meta.sql_order().iter().filter_map(|c| full.index_of(c).ok()).collect(), // (SQL's order, as `SELECT *` reads them)
     };
     let schema = Arc::new(full.project(&pick).map_err(status)?);
     let after = after.unwrap_or_else(|| app.lake.visible());
@@ -1050,7 +1050,7 @@ impl FlightSqlService for Sql {
         let (mut b, lake) = (q.into_builder(), &self.0.lake);
         for (key, meta) in lake.cat.scan::<TableMeta>("t/", "t0").await.map_err(status)?.into_iter().filter(|(k, _)| !crate::sys::hidden(k)) {
             let (schema, table) = crate::text::split(&key[2..]);
-            let columns = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
+            let columns = crate::answer::schema(&meta.sql_columns()).map_err(status)?; // (SQL's order)
             b.append(crate::ddl::lake_name(lake), schema, table, "TABLE", &columns).map_err(status)?;
         }
         for (key, _) in lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await.map_err(status)? {
@@ -1118,8 +1118,9 @@ impl FlightService for Door {
                     crate::auth::check_all(&crate::auth::catalog_name(table)).map_err(denied)?;
                     let meta = app.lake.cat.meta(&table_key(table)).await.map_err(status)?.ok_or_else(|| refused("42P01", format!("no table {table}")))?;
                     let full = crate::answer::schema(&meta.logical_columns()).map_err(status)?;
-                    let pick = json.columns.iter().flatten().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
-                    if json.columns.is_some() { full.project(&pick).map_err(status)? } else { full.as_ref().clone() }
+                    let order = meta.sql_order(); // (no columns asked: SQL's order, as the log stream sends them)
+                    let pick = json.columns.as_ref().unwrap_or(&order).iter().filter_map(|c| full.index_of(c).ok()).collect::<Vec<_>>();
+                    full.project(&pick).map_err(status)?
                 }
                 _ => return Err(refused("22023", "{\"sql\": …} or {\"table\": …}")),
             };

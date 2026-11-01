@@ -168,7 +168,7 @@ async fn point_of(lake: &Lake, sql: &str) -> Result<Option<Point>> {
     cols.sort();
     let mut key: Vec<&String> = meta.key.iter().collect();
     key.sort();
-    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || meta.order.is_some() || meta.ttl.is_some() { // (renamed columns, event-time order, a TTL: SQL answers it)
+    if meta.key.is_empty() || !meta.merge.is_empty() || cols != key || meta.mapped() || !meta.shown.is_empty() || meta.order.is_some() || meta.ttl.is_some() { // (renamed or moved columns, event-time order, a TTL: SQL answers it)
         return Ok(None);
     }
     let names: Vec<String> = match s.projection.as_slice() {
