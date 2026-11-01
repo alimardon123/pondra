@@ -1058,16 +1058,18 @@ async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> R
 fn top(q: &mut Query) -> Result<()> {
     let SetExpr::Select(s) = &mut *q.body else { return Ok(()) };
     let Some(t) = s.top.take() else { return Ok(()) };
-    ensure!(!t.with_ties && !t.percent, "SELECT TOP … {}: not taken; LIMIT n", if t.percent { "PERCENT" } else { "WITH TIES" });
+    if t.with_ties || t.percent {
+        return Err(crate::codes::coded("0A000", format!("SELECT TOP … {}: not taken; LIMIT n", if t.percent { "PERCENT" } else { "WITH TIES" })));
+    }
     let n = match t.quantity {
         Some(TopQuantity::Expr(e)) => e,
         Some(TopQuantity::Constant(c)) => expr(&c.to_string())?,
-        None => bail!("SELECT TOP without a number: LIMIT n"),
+        None => return Err(crate::codes::coded("42601", "SELECT TOP without a number: LIMIT n")),
     };
     match &mut q.limit_clause {
         None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
         Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
-        _ => bail!("SELECT TOP and LIMIT together: write one of them (LIMIT n)"),
+        _ => return Err(crate::codes::coded("42601", "SELECT TOP and LIMIT together: write one of them (LIMIT n)")),
     }
     Ok(())
 }
@@ -1075,12 +1077,14 @@ fn top(q: &mut Query) -> Result<()> {
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.
 fn fetch(q: &mut Query) -> Result<()> {
     let Some(f) = q.fetch.take() else { return Ok(()) };
-    ensure!(!f.with_ties && !f.percent, "FETCH FIRST … {}: not taken; LIMIT n", if f.percent { "PERCENT" } else { "WITH TIES" });
+    if f.with_ties || f.percent {
+        return Err(crate::codes::coded("0A000", format!("FETCH FIRST … {}: not taken; LIMIT n", if f.percent { "PERCENT" } else { "WITH TIES" })));
+    }
     let n = f.quantity.unwrap_or_else(|| expr("1").expect("a literal"));
     match &mut q.limit_clause {
         None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
         Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
-        _ => bail!("FETCH FIRST and LIMIT together: write one of them (LIMIT n, or FETCH FIRST n ROWS ONLY)"),
+        _ => return Err(crate::codes::coded("42601", "FETCH FIRST and LIMIT together: write one of them (LIMIT n, or FETCH FIRST n ROWS ONLY)")),
     }
     Ok(())
 }
@@ -1140,8 +1144,10 @@ fn within_group(f: &mut Function) -> Result<()> {
     if f.within_group.is_empty() || !matches!(n.as_str(), "string_agg" | "listagg") {
         return Ok(());
     }
-    let FunctionArguments::List(list) = &mut f.args else { bail!("{n}(x, sep) WITHIN GROUP (ORDER BY y): the arguments come first") };
-    ensure!(!list.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))), "{n}: an ORDER BY among its arguments and one in WITHIN GROUP: write one of them");
+    let FunctionArguments::List(list) = &mut f.args else { return Err(crate::codes::coded("42601", format!("{n}(x, sep) WITHIN GROUP (ORDER BY y): the arguments come first"))) };
+    if list.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))) {
+        return Err(crate::codes::coded("42601", format!("{n}: an ORDER BY among its arguments and one in WITHIN GROUP: write one of them")));
+    }
     list.clauses.push(FunctionArgumentClause::OrderBy(std::mem::take(&mut f.within_group)));
     f.name = ObjectName::from(vec![Ident::new("string_agg")]);
     Ok(())
@@ -1217,6 +1223,48 @@ pub(crate) fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
     }))
 }
 
+/// Whose format codes a `strftime` or `strptime` takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Codes {
+    DuckDb,
+    Sqlite,
+}
+use Codes::{DuckDb, Sqlite};
+
+/// A format in DuckDB's codes (or SQLite's) as chrono's, which `to_char` and `to_timestamp` read. Most are the same;
+/// DuckDB's `%f` is microseconds, `%g` milliseconds and `%n` nanoseconds (chrono's `%6f`, `%3f`, `%9f`), its `%c` and
+/// `%x` ISO's date and time; SQLite's `%f` is the seconds with their milliseconds. A code the other database hasn't is
+/// refused by name (22023), as DuckDB refuses it.
+fn strftime_codes(f: &str, from: Codes, call: &str) -> Result<String> {
+    const SAME: &str = "aAwdbhBmyYHIpMSjUWXGVuzZ";
+    const SQLITE_TOO: &str = "eFkPlRsTg";
+    let (mut out, mut chars) = (String::new(), f.chars().peekable());
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let dash = chars.next_if_eq(&'-').is_some();
+        let k = chars.next().unwrap_or('%');
+        let code = match (from, k) {
+            (_, '%') => "%%".to_string(),
+            (DuckDb, 'f') => "%6f".into(),
+            (DuckDb, 'g') => "%3f".into(),
+            (DuckDb, 'n') => "%9f".into(),
+            (DuckDb, 'c') => "%Y-%m-%d %H:%M:%S".into(),
+            (DuckDb, 'x') => "%Y-%m-%d".into(),
+            (Sqlite, 'f') => "%S%.3f".into(),
+            (_, k) if SAME.contains(k) || (from == Sqlite && SQLITE_TOO.contains(k)) => format!("%{}{k}", if dash { "-" } else { "" }),
+            (_, k) => {
+                let whose = if from == DuckDb { "DuckDB's" } else { "SQLite's" };
+                return Err(crate::codes::coded("22023", format!("{call}: %{}{k} isn't one of {whose} format codes (%Y %m %d %H %M %S %f, …)", if dash { "-" } else { "" })));
+            }
+        };
+        out += &code;
+    }
+    Ok(out)
+}
+
 /// DuckDB's `strftime(ts, '%Y-%m')` (SQLite's `strftime('%Y', ts)` too), `strptime(text, format)`, `epoch(ts)` and
 /// `regexp_extract(s, pattern[, group[, flags]])` (the group's text, '' with no match); `date_diff(part, a, b)` (also
 /// `datediff`: Snowflake's and SQL Server's), the part boundaries from `a` to `b` as DuckDB counts them (a week is 7 of
@@ -1225,11 +1273,16 @@ pub(crate) fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
 /// stay as they are, `date_add`'s days as an INT (a literal is a BIGINT, which Spark's doesn't take).
 fn dates(name: &str, a: &[&Expr]) -> Result<Option<String>> {
     Ok(Some(match (name, a.len()) {
+        // (each format's codes as chrono's: DuckDB's `%f` is microseconds, SQLite's seconds with milliseconds)
         ("strftime", 2) => match (string_of(a[0]), string_of(a[1])) {
-            (Some(f), None) if f.contains('%') => format!("to_char({}, {})", a[1], a[0]),
+            (Some(f), None) if f.contains('%') => format!("to_char({}, {})", a[1], quote(&strftime_codes(f, Sqlite, name)?)),
+            (_, Some(f)) => format!("to_char({}, {})", a[0], quote(&strftime_codes(f, DuckDb, name)?)),
             _ => format!("to_char({}, {})", a[0], a[1]),
         },
-        ("strptime", 2) => format!("to_timestamp({}, {})", a[0], a[1]),
+        ("strptime", 2) => match string_of(a[1]) {
+            Some(f) => format!("to_timestamp({}, {})", a[0], quote(&strftime_codes(f, DuckDb, name)?)),
+            None => format!("to_timestamp({}, {})", a[0], a[1]),
+        },
         ("epoch", 1) => format!("date_part('epoch', {})", a[0]),
         ("regexp_extract", 2..=4) => {
             let group = match a.get(2) {
@@ -1249,6 +1302,11 @@ fn dates(name: &str, a: &[&Expr]) -> Result<Option<String>> {
         }
         ("date_diff" | "datediff", 3) => {
             let Some(part) = part_word(a[0], name)? else { return Ok(None) };
+            // (the part a bare word: Snowflake's and SQL Server's DATEDIFF, which count week boundaries, from Monday in
+            // Snowflake and from Sunday in SQL Server; DuckDB's `date_diff('week', …)` counts whole weeks)
+            if part == "week" && matches!(a[0], Expr::Identifier(i) if i.quote_style.is_none()) {
+                return Err(crate::codes::coded("22023", format!("{name}(week, a, b) counts Sundays crossed in SQL Server and Mondays in Snowflake, so it isn't guessed: date_diff('week', a, b) counts whole weeks, as DuckDB does, and date_diff('day', date_trunc('week', a), date_trunc('week', b)) / 7 the Mondays crossed")));
+            }
             let (from, to) = (a[1], a[2]);
             let at = |p: &str, x: &Expr| format!("date_part('{p}', {x})");
             let n = match part {
@@ -2016,6 +2074,15 @@ mod tests {
         assert!(call("DATEDIFF(y, a, b)").unwrap_err().to_string().contains("'y' is DuckDB's year and SQL Server's day of the year"));
         assert!(call("date_diff('fortnight', a, b)").unwrap_err().to_string().contains("'fortnight' isn't a date part here"));
         assert!(wanted("SELECT strftime(ts, '%Y') FROM t") && wanted("SELECT DATEDIFF (day, a, b) FROM t") && !wanted("SELECT epoch FROM t"));
+        // (11-01 audit M6, M7: DuckDB's and SQLite's codes as chrono's; a part-first week refused by name)
+        assert_eq!(call("strftime(ts, '%S.%f %g %n %c|%x %-d %%')").unwrap(), "to_char(ts, '%S.%6f %3f %9f %Y-%m-%d %H:%M:%S|%Y-%m-%d %-d %%')");
+        assert_eq!(call("strftime('%H:%M:%f %s', ts)").unwrap(), "to_char(ts, '%H:%M:%S%.3f %s')");
+        assert_eq!(call("strptime(s, '%d.%m.%Y %H:%M:%S.%f')").unwrap(), "to_timestamp(s, '%d.%m.%Y %H:%M:%S.%6f')");
+        let f = call("strftime(ts, '%F')").unwrap_err();
+        assert!(crate::codes::of(&f) == "22023" && f.to_string().contains("%F isn't one of DuckDB's format codes"), "{f:#}");
+        let w = call("DATEDIFF(week, a, b)").unwrap_err();
+        assert!(crate::codes::of(&w) == "22023" && w.to_string().contains("Sundays crossed in SQL Server and Mondays in Snowflake"), "{w:#}");
+        assert!(call("datediff('week', a, b)").is_ok()); // (DuckDB's, the part a string)
     }
 
     #[test]
@@ -2035,7 +2102,10 @@ mod tests {
         top(&mut q).unwrap();
         assert_eq!(q.to_string(), "SELECT id FROM t ORDER BY id DESC LIMIT 3");
         let mut q = query("SELECT TOP (2) PERCENT id FROM t").unwrap();
-        assert!(top(&mut q).unwrap_err().to_string().contains("PERCENT: not taken; LIMIT n"));
+        let e = top(&mut q).unwrap_err();
+        assert!(e.to_string().contains("PERCENT: not taken; LIMIT n") && crate::codes::of(&e) == "0A000", "{e:#}"); // (11-01 audit L1: coded, not XX000)
+        let mut q = query("SELECT TOP 2 id FROM t LIMIT 3").unwrap();
+        assert_eq!(crate::codes::of(&top(&mut q).unwrap_err()), "42601");
         assert!(wanted("SELECT TOP 3 id FROM t") && wanted("SELECT CAST(x AS INT64)") && wanted("SELECT GROUP_CONCAT(s) FROM t") && !wanted("SELECT topping FROM t"));
     }
 

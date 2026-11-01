@@ -424,9 +424,39 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
 /// The refusal of a view that takes each row once (`what`: sessions, stream joins, pattern views with EMIT FINAL)
-/// over `source`, a view kept by key: its rows are replaced as their groups are worked out again (0A000).
-pub(crate) fn kept_by_key(source: &str, name: &str, what: &str) -> anyhow::Error {
-    coded("0A000", format!("{source} is kept by key: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {source}'s own source"))
+/// over `source`, whose rows are replaced: `kept`, a view kept by key, or a view that follows one row by row
+/// (`replaced`). Its rows are replaced as their groups are worked out again (0A000).
+pub(crate) fn kept_by_key(source: &str, kept: &str, name: &str, what: &str) -> anyhow::Error {
+    coded("0A000", format!("{}: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {kept}'s own source", replaced_said(source, kept)))
+}
+
+/// `source`, whose rows `kept`'s replace, in words: "a is kept by key", or "b follows a, which is kept by key".
+pub(crate) fn replaced_said(source: &str, kept: &str) -> String {
+    match source == kept {
+        true => format!("{source} is kept by key"),
+        false => format!("{source} follows {kept}, which is kept by key"),
+    }
+}
+
+/// The view kept by key whose replaced rows reach `table`'s: itself, or one it follows through views that derive their
+/// rows from it as they come (`View::inline`: row by row, or adding up). Their rows are replaced, or taken back, as its
+/// groups are worked out again, so what takes each row once (sessions, stream joins, pattern views, windows) can't
+/// follow any of them. None for a table, or for a view whose rows are its own (sessions, a stream join, matches: none
+/// of which follows such a view).
+pub(crate) async fn replaced(lake: &Lake, table: &str) -> Result<Option<String>> {
+    let mut t = table.to_string();
+    for _ in 0..64 {
+        // (64: views follow views in a chain that ends; a loop can't be made, as a view follows a table that exists)
+        let Some(v) = lake.cat.get::<View>(&view_key(&t)).await? else { return Ok(None) };
+        if v.rerun.is_some() {
+            return Ok(Some(t));
+        }
+        if !v.inline() {
+            return Ok(None);
+        }
+        t = v.source;
+    }
+    Ok(None)
 }
 
 /// A view's query with its CTEs (`WITH t AS (…) … FROM t`) and the plain views it reads (`CREATE VIEW`) written in where
@@ -580,8 +610,10 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     };
     ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
-    if upstream.as_ref().is_some_and(|u| u.rerun.is_some()) && sessions.is_some() {
-        return Err(kept_by_key(&source, name, "sessions"));
+    // (a view kept by key, or one that follows such a view row by row: its rows are replaced as their groups are worked out again)
+    let replaced_by = replaced(lake, &source).await?;
+    if let (Some(k), Some(_)) = (&replaced_by, &sessions) {
+        return Err(kept_by_key(&source, k, name, "sessions"));
     }
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
@@ -669,18 +701,23 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     // (row by row over a table, or over a view that is, or one kept by key, whose rows change:
     // then a row keeps its first source row's id)
     let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids || u.rerun.is_some());
-    if upstream.as_ref().is_some_and(|u| u.rerun.is_some()) {
+    if let Some(k) = &replaced_by {
         // (its rows are replaced as their groups are worked out again: what follows must take them back)
+        let again = match k == &source {
+            true => format!("{source} runs its query again"),
+            false => format!("{source} follows {k}, which runs its query again"),
+        };
         let subtracts = !merge.is_empty() && alone(&plan, true) && merge.values().all(|f| ["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) && merge.values().any(|f| f == "count");
         if !(ids || subtracts) && plain && refresh.is_none() {
-            let why = format!("{source} runs its query again, replacing its rows, and only a view row by row or of sums and counts takes them back");
+            let why = format!("{again}, replacing its rows, and only a view row by row or of sums and counts takes them back");
             return match fits {
                 true => rerun(crate::rerun::How::ByKey, Some(format!("{why}: the groups a change touches are worked out again"))).await,
                 false => whole(why).await,
             };
         }
-        ensure!(emit.is_none() && keep.is_none() && history.is_none() && (ids || subtracts),
-            "{source} runs its query again: its rows are replaced as it works them out, so a view of it takes rows back: row by row, or a GROUP BY of sums and counts (with count(*)), or one that runs its query again itself (WITH (refresh = 'full'))");
+        if !(emit.is_none() && keep.is_none() && history.is_none() && (ids || subtracts)) {
+            return Err(coded("0A000", format!("{again}: its rows are replaced as it works them out, so a view of it takes rows back: row by row, or a GROUP BY of sums and counts (with count(*)), or one that runs its query again itself (WITH (refresh = 'full'))")));
+        }
     }
     ensure!(expect.is_empty() || merge.is_empty(), "{name} is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of {source} without GROUP BY, which {name} then follows)");
     if let Some(h) = &history {
@@ -1066,7 +1103,7 @@ async fn bounded_by(secs: u64, f: impl std::future::Future<Output = Result<()>>)
     }
     tokio::time::timeout(std::time::Duration::from_secs(secs), crate::audit::stoppable(flag, f))
         .await
-        .unwrap_or_else(|_| Err(coded("57014", format!("a run went past {secs} s (PONDRA_VIEW_RUN_SECS) and was stopped"))))
+        .unwrap_or_else(|_| Err(coded("57014", format!("a run went past {secs} s (PONDRA_VIEW_RUN_SECS) and was stopped; it is tried again later, and stopped again if it takes as long: a view whose whole run takes longer needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"))))
 }
 
 /// Start `name`'s run if it is its turn here: in a task of its own on the queries' runtime (invariant 231), once a slot is
@@ -1739,9 +1776,8 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let named = if tables.is_empty() { "none".to_string() } else { tables.join(", ") };
     ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins {source} with one other append table of this lake (the append tables it reads: {named})");
     for t in &tables {
-        let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.rerun.is_some());
-        if kept {
-            return Err(kept_by_key(t, name, "stream joins"));
+        if let Some(k) = replaced(lake, t).await? {
+            return Err(kept_by_key(t, &k, name, "stream joins"));
         }
     }
     for (i, t) in tables.iter().enumerate() {
@@ -2009,6 +2045,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(crate::codes::of(&err), "57014");
+        assert!(err.to_string().contains("needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"), "{err:#}"); // (11-01 audit L10: says what to do)
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its deadline, not when it would end");
         assert!(flag.lock().unwrap().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)));
         assert!(bounded_by(0, async { Ok(()) }).await.is_ok(), "0: no limit");

@@ -112,6 +112,12 @@ answer as of your own write. `WITH (lag = '1 minute')` works it out at most once
 `WITH (refresh = 'by key')` keeps a grouped view this way if it reads one table, with no join or
 subquery, and selects the columns it groups by.
 
+A view kept by key replaces its rows as it works their groups out again, and so does a view that
+follows it row by row. A view of either takes those rows back: one row by row, a `GROUP BY` of sums
+and counts, or one kept by key itself (a `max` over it is). What takes each row once is refused
+by name (`0A000`): a window or session with `EMIT FINAL`, a stream join and a pattern view. Make
+those from the table the view kept by key reads.
+
 Windows split by a column the view selects are kept by key too, a key at a time: the latest row of
 each user, the top three of each page. So are windows over tables joined on that column, such as
 each auction's winning bid from `auctions JOIN bids ON auctions.id = bids.auction`.

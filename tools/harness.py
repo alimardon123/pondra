@@ -23729,6 +23729,9 @@ def friendly():
             "SELECT id, CAST(ts AS DATE) + INTERVAL '1 hour' AS a, CAST(ts AS DATE) - INTERVAL '90 minutes' AS b, INTERVAL '25 hours' + CAST(ts AS DATE) AS c, "
             "CAST(ts AS DATE) + 3 * INTERVAL '30 minutes' AS e, CAST(ts AS DATE) + INTERVAL '1 day 2 hours' AS f FROM t", True, False),
         "…a DATE past 2262 or before 1677 too (a TIMESTAMP in microseconds)": ("SELECT DATE '2300-01-01' + INTERVAL '1 hour' AS a, DATE '1600-06-01' - INTERVAL '30 minutes' AS b", True, False),
+        "strftime and strptime in DuckDB's codes: %f microseconds, %g milliseconds, %c and %x ISO's (chrono reads them otherwise)": (
+            "SELECT strftime(TIMESTAMP '2026-03-01 10:11:12.123456', '%S.%f|%g|%c|%x|%-d|%j') AS f, strptime('2026-03-01 10:11:12.123456', '%Y-%m-%d %H:%M:%S.%f') AS p, "
+            "strptime('01/03/2026 10:11:12.345', '%d/%m/%Y %H:%M:%S.%g') AS q", True, False),
         "json_extract, json_extract_string": ("SELECT id, json_extract(j, '$.a.b') AS b, json_extract_string(j, '$.s') AS s FROM t", True, False),
         "DuckDB's ASOF JOIN … ON": ("SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
@@ -23856,6 +23859,20 @@ def friendly():
     st2, hd2, body2 = r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
     checks["TRY_CONVERT(INT, a column): refused by name, TRY_CAST named (SQL Server and MySQL put CONVERT's type on either side), 0A000"] = hd2 == "0A000" and "TRY_CAST(x AS type)" in body2
     checks["MySQL's TIMESTAMPDIFF: refused by name (whole units in MySQL, boundaries in Snowflake), date_diff named, 42883"] = st == 404 and hd == "42883" and "date_diff('hour', ts, ts)" in body
+    # (11-01 audit L1, M6, M7: each refusal with its SQLSTATE, never XX000)
+    coded = {"SELECT TOP 10 PERCENT id FROM t": "0A000", "SELECT id FROM t FETCH FIRST 10 PERCENT ROWS ONLY": "0A000", "SELECT TOP 2 id FROM t LIMIT 3": "42601",
+             "SELECT string_agg(g, ',' ORDER BY id) WITHIN GROUP (ORDER BY id) AS s FROM t": "42601", "SELECT DATEDIFF(week, ts, ts) AS w FROM t": "22023",
+             "SELECT strftime(ts, '%F') AS f FROM t": "22023"}
+    got_codes = {}
+    for q_, want_ in coded.items():
+        c.request("POST", "/sql", q_.encode())
+        r = c.getresponse()
+        r.read()
+        got_codes[q_] = (r.status, r.getheader("x-pondra-sqlstate"))
+    checks["refused with their codes: TOP … PERCENT and FETCH … PERCENT 0A000, TOP with LIMIT and two ORDER BYs of WITHIN GROUP 42601, DATEDIFF(week, …) and a code DuckDB hasn't (%F) 22023"] = \
+        all(st_ != 200 and hd_ == coded[q_] for q_, (st_, hd_) in got_codes.items())
+    if not checks[list(checks)[-1]]:
+        failed["coded refusals"] = got_codes
     # SUMMARIZE: the exact columns (approximate ones and the mean's and spread's text aside)
     cn, got = ours("SUMMARIZE t")
     dn, want = theirs("SUMMARIZE t")
@@ -25473,6 +25490,17 @@ def matches():
     q("CREATE MATERIALIZED VIEW r_bk WITH (refresh = 'by key') AS SELECT symbol, day, ts, max(price) AS price FROM late_src GROUP BY symbol, day, ts")
     checks["a view kept by key as the input is refused 0A000 (\"is kept by key\", its own source)"] = \
         refused("over a view kept by key", emit("r_kb", mr("r_bk")), ["is kept by key", "Make r_kb from r_bk's own source"])
+    # (11-01 audit H7: a row-by-row view of a view kept by key has its rows replaced too, so each refusal reaches through it)
+    q("CREATE MATERIALIZED VIEW r_rows AS SELECT symbol, day, ts, price FROM r_bk WHERE price > 0")
+    through = "r_rows follows r_bk, which is kept by key"
+    checks["…and a row-by-row view of one: a pattern view, sessions and a stream join over it are refused 0A000 (\"r_rows follows r_bk, which is kept by key\", r_bk's own source)"] = all([
+        refused("a pattern view over a row-by-row view of a view kept by key", emit("r_kb2", mr("r_rows")), [through, "pattern views with EMIT FINAL take each row once", "Make r_kb2 from r_bk's own source"]),
+        refused("sessions over it", "CREATE MATERIALIZED VIEW r_ses AS SELECT symbol, count(*) AS n FROM r_rows GROUP BY symbol, SESSION(ts, INTERVAL '1 minute') EMIT FINAL", [through, "sessions take each row once"]),
+        refused("a stream join with it", "CREATE MATERIALIZED VIEW r_sj WITH (join = 'streams') AS SELECT a.symbol, b.price FROM late_src a JOIN r_rows b ON a.symbol = b.symbol", [through, "stream joins take each row once"])])
+    checks["…a window over it is refused 0A000, and a GROUP BY max over it is kept by key itself (it was followed row by row, its replaced rows counted twice)"] = \
+        refused("a window over it", "CREATE MATERIALIZED VIEW r_win AS SELECT date_bin(INTERVAL '1 minute', ts) AS m, count(*) AS n FROM r_rows GROUP BY 1 EMIT FINAL", ["r_rows follows r_bk, which runs its query again"]) and \
+        q("CREATE MATERIALIZED VIEW r_top AS SELECT symbol, max(price) AS p FROM r_rows GROUP BY symbol") is not None and \
+        [r["refresh"] for r in sql(A.port, "SELECT refresh FROM pondra.flows WHERE name = 'r_top'")] == ["by key"]
     # (the subquery form, which the parser refuses before any of the above: with the pattern view's words, not GROUP BY's)
     checks["a subquery as the input is refused 0A000 with the pattern view's words (FROM t MATCH_RECOGNIZE), not GROUP BY's"] = refused("a subquery as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq AS SELECT * FROM (SELECT * FROM late_src) MATCH_RECOGNIZE "
             f"(PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW PATTERN (strt down+ up+) {MX_DEF}) EMIT FINAL", ["reads a lake table by its name", "FROM t MATCH_RECOGNIZE"])

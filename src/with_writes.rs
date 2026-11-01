@@ -353,8 +353,8 @@ async fn write_columns(app: &App, sql: &str) -> Result<Option<SchemaRef>> {
     }
 }
 
-/// The schema a query answers with, planned and not run (`flight::planned` does the same, and is private there).
-async fn planned(app: &App, sql: &str) -> Result<SchemaRef> {
+/// The schema a query answers with, planned and not run (here, and for Flight's empty answers and its plans: `flight.rs`).
+pub(crate) async fn planned(app: &App, sql: &str) -> Result<SchemaRef> {
     let ctx = crate::query::session(&app.lake, sql, "").await?;
     let df = crate::engine::sql(&ctx, &crate::sys::planned(sql)?).await?;
     Ok(Arc::new(crate::answer::arrow_schema(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow())))
