@@ -739,6 +739,7 @@ fn named(installed: Vec<(String, Installed)>, text: &str) -> Vec<(String, Instal
 
 /// Where a record says its file came from: the file or URL as INSTALL named it, without a URL's query or fragment (a presigned
 /// URL's signature is a credential, and the record is shown to every reader by `extensions()`).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
 fn kept_from(from: &str) -> String { from.split(['?', '#']).next().unwrap_or(from).to_string() }
 
 /// The file's own name (`words-0.1.wasm`), for what is said of it: the part after its last `/`, before any `?` or `#`.
@@ -995,6 +996,8 @@ mod tests {
         use datafusion::arrow::array::{AsArray, Int64Array};
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        // (each node asks the switch as it loads a part, the node this test is included: `unsigned_allowed`)
+        std::env::set_var("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", "true");
         let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
         install(&lake, "words", record).await?;
         let run = |sql: &'static str| {
