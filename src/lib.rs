@@ -44,6 +44,7 @@ mod front;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
 mod dialect_fns;
+mod dialect_stmts;
 mod friendly;
 mod matcher;
 mod pattern;

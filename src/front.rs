@@ -69,6 +69,7 @@ pub enum Relation<H: ?Sized> {
 /// The front:
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     crate::kept::refused(sql)?; // (1.1's statements, refused by name at every door in the same words: `kept.rs`)
+    crate::dialect_stmts::refused(sql)?; // (another database's statement for what Pondra writes otherwise, in every form: `dialect_stmts.rs`)
     crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, and a materialized view over one of a subquery: refused by name with what to write, `pattern.rs`)
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),

@@ -351,6 +351,7 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as `statement::run` refuses them: `dialect_stmts.rs`)
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
             let tag = c.tag();
