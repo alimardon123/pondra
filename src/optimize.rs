@@ -1143,6 +1143,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let requirements = rules.iter().position(|r| r.name() == "EnsureRequirements").unwrap_or(0);
     rules.insert(requirements, Arc::new(crate::held::HeldOnce)); // (before the exchanges: they then send each group's rows to one partition)
     rules.push(Arc::new(crate::held::LeanSorts)); // (a sort of strings hands up its own rows' strings: `held::LeanExec`)
+    rules.push(Arc::new(crate::held::HeldValues)); // (after the exchanges: its pair goes around the aggregate, above them)
     rules.push(Arc::new(crate::held::Windows)); // (last: nothing after it moves a window)
     rules
 }

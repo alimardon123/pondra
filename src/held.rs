@@ -479,18 +479,21 @@ fn keeps_every_value(a: &datafusion::physical_expr::aggregate::AggregateFunction
     !a.is_distinct() && a.fun().name() == "median"
 }
 
-/// A median of a DECIMAL that fits in 64 bits (precision 18 or less, as TPC-H's prices) over the same values as 64-bit
-/// decimals: it holds each in 8 bytes, not 16, and its middle value is the same number (the mean of two middle values too:
-/// their sum fits in 64 bits, and both halve it the same way). The answer is cast back to the column's type (`recast`).
-/// Any other aggregate as it is.
-fn narrowed(a: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>, schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>> {
+/// A median held in chunks (`median::ChunkedMedian`): the pool counts what it holds. Of a DECIMAL that fits in 64 bits
+/// (precision 18 or less, as TPC-H's prices) over the same values as 64-bit decimals: it holds each in 8 bytes, not 16, and
+/// its middle value is the same number (the mean of two middle values too: their sum fits in 64 bits, and both halve it the
+/// same way). The answer is cast back to the column's type (`recast`). Any other aggregate as it is.
+fn held_median(a: &Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>, schema: &datafusion::arrow::datatypes::SchemaRef) -> Result<Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>> {
     let [arg] = &a.expressions()[..] else { return Ok(Arc::clone(a)) };
-    let (DataType::Decimal128(precision, scale), "median", false) = (arg.data_type(schema)?, a.fun().name(), a.is_distinct()) else { return Ok(Arc::clone(a)) };
-    if precision > 18 || !a.order_bys().is_empty() {
+    if !keeps_every_value(a) || !a.order_bys().is_empty() {
         return Ok(Arc::clone(a));
     }
-    let narrow = cast(Arc::clone(arg), schema, DataType::Decimal64(precision, scale))?;
-    let built = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(Arc::new(a.fun().clone()), vec![narrow]).schema(Arc::clone(schema)).alias(a.name()).build()?;
+    let arg = match arg.data_type(schema)? {
+        DataType::Decimal128(precision, scale) if precision <= 18 => cast(Arc::clone(arg), schema, DataType::Decimal64(precision, scale))?,
+        _ => Arc::clone(arg),
+    };
+    let chunked = Arc::new(datafusion::logical_expr::AggregateUDF::new_from_impl(crate::median::ChunkedMedian::default()));
+    let built = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(chunked, vec![arg]).schema(Arc::clone(schema)).alias(a.name()).build()?;
     Ok(Arc::new(built))
 }
 
@@ -510,7 +513,7 @@ impl PhysicalOptimizerRule for HeldOnce {
                 return Ok(Transformed::no(node));
             }
             let input_schema = first.input_schema();
-            let aggregates = first.aggr_expr().iter().map(|a| narrowed(a, &input_schema)).collect::<Result<Vec<_>>>()?;
+            let aggregates = first.aggr_expr().iter().map(|a| held_median(a, &input_schema)).collect::<Result<Vec<_>>>()?;
             let one: Arc<dyn ExecutionPlan> = Arc::new(
                 AggregateExec::try_new(mode, first.group_expr().clone(), aggregates, first.filter_expr().to_vec(), first.input().clone(), input_schema)?.with_limit_options(last.limit_options()),
             );
@@ -535,6 +538,135 @@ impl PhysicalOptimizerRule for HeldOnce {
         true
     }
 }
+
+/// An aggregate that keeps every value of its group (`keeps_every_value`) runs with no disk to spill to, so DataFusion
+/// counts what it holds as memory that can't spill, and the pool lets it take what the query memory has free; past
+/// that it is refused at once, and answered on the frugal retry's sort (invariant 424). Its spill helps nothing: a
+/// median's group needs all its values back at once, and spilling its state copied them twice over first. As memory
+/// that may spill, the pool (DataFusion's `FairSpillPool`) gave it an even share with every other operator that may
+/// spill, the idle ones too: a median over 3 groups of 60 M values, 480 MB, had an eighth of a 683 MB pool on four
+/// partitions (half of it on one, the sort above it taking the other half), so it was refused and answered on the
+/// retry under a 2 GB cap, in 19-40 s (DuckDB 2.0.0: 2.8-3.3 s; this way, in chunks, `median::ChunkedMedian`, 0.8-1.2 s). `HeldValuesExec` above the aggregate runs it so; `HeldValuesInExec`
+/// below it runs its input in the query's own context again, so the exchange and scan below spill as before. Last
+/// (`optimize::physical_rules`), after the exchanges are in.
+#[derive(Debug)]
+pub struct HeldValues;
+
+impl PhysicalOptimizerRule for HeldValues {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, _: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+        plan.transform_up(|node| {
+            let Some(agg) = node.downcast_ref::<AggregateExec>() else { return Ok(Transformed::no(node)) };
+            let one_step = matches!(agg.mode(), AggregateMode::Single | AggregateMode::SinglePartitioned) && !agg.group_expr().is_empty();
+            if !one_step || !agg.aggr_expr().iter().any(|a| keeps_every_value(a)) || agg.input().is::<HeldValuesInExec>() {
+                return Ok(Transformed::no(node)); // (with no GROUP BY its memory can't spill already)
+            }
+            let input: Arc<dyn ExecutionPlan> = Arc::new(HeldValuesInExec { input: agg.input().clone() });
+            let held: Arc<dyn ExecutionPlan> = Arc::new(HeldValuesExec { input: replace_children_if_necessary(node.clone(), vec![input])? });
+            Ok(Transformed::yes(held))
+        })
+        .data()
+    }
+
+    fn name(&self) -> &str {
+        "held_values"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+/// The query's own context, kept in the one `HeldValuesExec` hands its aggregate, for `HeldValuesInExec` to give back.
+#[derive(Debug)]
+struct QueryContext(Arc<TaskContext>);
+
+/// Above an aggregate that keeps every value: runs it with no disk to spill to (`HeldValues`).
+#[derive(Debug)]
+pub struct HeldValuesExec {
+    input: Arc<dyn ExecutionPlan>,
+}
+
+/// Below that aggregate: runs its input in the query's own context again (`HeldValues`).
+#[derive(Debug)]
+pub struct HeldValuesInExec {
+    input: Arc<dyn ExecutionPlan>,
+}
+
+impl DisplayAs for HeldValuesExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "HeldValuesExec")
+    }
+}
+
+impl DisplayAs for HeldValuesInExec {
+    fn fmt_as(&self, _: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "HeldValuesInExec")
+    }
+}
+
+/// The `ExecutionPlan` of an operator that hands up its input's rows as they are (in the same order and partitions,
+/// with the same statistics), and runs it in the context `context` makes of the one it is given.
+macro_rules! passing {
+    ($exec:ident, $context:expr) => {
+        impl ExecutionPlan for $exec {
+            fn name(&self) -> &str {
+                stringify!($exec)
+            }
+
+            fn properties(&self) -> &Arc<PlanProperties> {
+                self.input.properties()
+            }
+
+            fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+                vec![&self.input]
+            }
+
+            fn apply_expressions(&self, _: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>) -> Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+                Ok(Arc::new($exec { input: one_input(children)? }))
+            }
+
+            fn maintains_input_order(&self) -> Vec<bool> {
+                vec![true]
+            }
+
+            fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+                vec![false]
+            }
+
+            fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+                vec![ChildStats::At(partition)]
+            }
+
+            fn statistics_from_inputs(&self, input_stats: &[Arc<Statistics>], _: &StatisticsArgs) -> Result<Arc<Statistics>> {
+                Ok(input_stats[0].clone())
+            }
+
+            fn cardinality_effect(&self) -> CardinalityEffect {
+                CardinalityEffect::Equal
+            }
+
+            fn execute(&self, p: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+                let context: fn(Arc<TaskContext>) -> Arc<TaskContext> = $context;
+                self.input.execute(p, context(ctx))
+            }
+        }
+    };
+}
+
+passing!(HeldValuesExec, |ctx| {
+    use datafusion::execution::disk_manager::{DiskManager, DiskManagerMode};
+    let Ok(no_disk) = DiskManager::builder().with_mode(DiskManagerMode::Disabled).build() else { return ctx };
+    let runtime = Arc::new(datafusion::execution::runtime_env::RuntimeEnv { disk_manager: Arc::new(no_disk), ..ctx.runtime_env().as_ref().clone() });
+    let config = ctx.session_config().clone().with_extension(Arc::new(QueryContext(ctx.clone())));
+    Arc::new(TaskContext::new(ctx.task_id(), ctx.session_id(), config, ctx.scalar_functions().clone(), ctx.higher_order_functions().clone(), ctx.aggregate_functions().clone(), ctx.window_functions().clone(), runtime))
+});
+
+passing!(HeldValuesInExec, |ctx| ctx.session_config().get_extension::<QueryContext>().map_or(ctx, |own| own.0.clone()));
 
 #[cfg(test)]
 mod tests {
@@ -978,6 +1110,38 @@ mod tests {
         ] {
             assert_eq!(shown(&once, sql).await?, shown(&twice, sql).await?, "{sql}");
         }
+        Ok(())
+    }
+
+    /// A session over a `FairSpillPool` of `pool` bytes on four partitions, its medians in one step (`HeldOnce`), and their
+    /// values held as memory that can't spill when `held` (`HeldValues`).
+    fn fair_session(pool: usize, held: bool) -> AnyResult<SessionContext> {
+        use datafusion::execution::memory_pool::FairSpillPool;
+        let rt = RuntimeEnvBuilder::new().with_memory_pool(Arc::new(FairSpillPool::new(pool))).build_arc()?;
+        let mut rules = PhysicalOptimizer::new().rules;
+        let at = rules.iter().position(|r| r.name() == "EnsureRequirements").expect("DataFusion's EnsureRequirements");
+        rules.insert(at, Arc::new(HeldOnce));
+        if held {
+            rules.push(Arc::new(HeldValues));
+        }
+        let mut config = SessionConfig::new().with_target_partitions(4);
+        config.options_mut().execution.sort_spill_reservation_bytes = 1 << 20; // (the sort's merge reserves 10 MB by default)
+        Ok(SessionContext::new_with_state(SessionStateBuilder::new().with_config(config).with_runtime_env(rt).with_default_features().with_physical_optimizer_rules(rules).build()))
+    }
+
+    #[tokio::test]
+    async fn a_median_over_few_big_groups_takes_what_the_pool_has_free() -> AnyResult<()> {
+        // 3 groups of 200,000 values: 2 MB each held, 6 MB in all, in a 12 MB pool. As memory that may spill each of the
+        // aggregates, exchanges and sorts here had an even share of it, less than a group's 2 MB.
+        let sql = "SELECT g, median(v) AS m, count(*) AS n FROM (SELECT value % 3 AS g, value AS v FROM generate_series(1, 600000)) GROUP BY g ORDER BY g";
+        let roomy = shown(&fair_session(512 << 20, false)?, sql).await?;
+        let held = fair_session(12 << 20, true)?;
+        let plan = planned(&held, sql).await?;
+        let at = |s: &str| plan.find(s).unwrap_or_else(|| panic!("no {s}: {plan}"));
+        assert!(at("HeldValuesExec") < at("AggregateExec: mode=SinglePartitioned") && at("AggregateExec: mode=SinglePartitioned") < at("HeldValuesInExec") && at("HeldValuesInExec") < at("RepartitionExec: partitioning=Hash"), "{plan}");
+        assert_eq!(shown(&held, sql).await?, roomy);
+        assert!(refusal(&fair_session(12 << 20, false)?, sql).await.is_some(), "an even share for its values is too little");
+        assert!(!planned(&held, "SELECT g, sum(v) AS s FROM (SELECT value % 3 AS g, value AS v FROM generate_series(1, 9)) GROUP BY g").await?.contains("HeldValues"), "a sum's values may spill");
         Ok(())
     }
 

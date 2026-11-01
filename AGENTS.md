@@ -3037,6 +3037,22 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    320 MB under it (never under 70%): at 85% of a 1 GB line, a query passed it by 11% while the columns went (CI). Harness `hot` (a 1 GB line: the
    columns trimmed and the query answered; past the line, one stop near it); `cargo test --lib oom:: hot::`;
    `logs/round36/singlenode-clickbench-10m-half-ram.json` (6.99 s from memory, was 7.79).
+436. **A median's values count as memory that can't spill** (`held::HeldValues`). DataFusion's pool (`FairSpillPool`)
+   gives each operator that may spill an even share of the query memory, idle ones counted: a median over 3 groups of
+   60 M values planned in one step (`held::HeldOnce`) on four partitions had an eighth of a 683 MB pool for its 480 MB
+   of values beside the exchanges and sorts, was refused, and answered on the frugal retry's sort (invariant 424) in
+   19-40 s under a 2 GB cap; DuckDB 2.0.0 takes 2.8-3.3 s on the same box. Its spill helps nothing (a group needs all
+   its values back at once, and spilling its state copied them twice over first), so `HeldValuesExec` above the
+   aggregate runs it with no disk to spill to: DataFusion then counts it as memory that can't spill, which takes what
+   the pool has free, and past that refuses it at once, for the retry. `HeldValuesInExec` below it runs its input in
+   the query's own context, so the exchange and the scan below spill as before. Placed last
+   (`optimize::physical_rules`), after the exchanges are in; spread queries pass both through (`spmd.rs`). Its values
+   are held in chunks of 64 K (`median::ChunkedMedian`), not DataFusion's arrays that double: those copied each time
+   and freed the old one late, so the node's memory reached twice what the pool counted and passed its line first.
+   Its middle is picked from the values between two sampled bounds, not a copy of the group in one array (that copy,
+   uncounted, got a 2 GB run stopped); the answer is DataFusion's (`cargo test --lib median::`).
+   0.8-1.2 s now (`logs/round36/median-3-groups-2gb.json`). `cargo test --lib held:: median::`; `harness.py scale`
+   (its medians: 72 M values past a 0.5 GB pool still answer on the retry, no try stopped by the watch).
 ## Tests: run these before and after any change
 
 ```bash
