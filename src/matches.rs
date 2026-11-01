@@ -79,8 +79,8 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     let source = crate::views::followed(lake, &open.table).await?;
     takes(source == open.table, format!("{}: a view follows the table by its name in this lake: write {source}", open.table))?;
     let src: TableMeta = table_meta(lake, &source).await?.logical(); // (SQL's names)
-    if lake.cat.get::<View>(&crate::views::view_key(&source)).await?.is_some_and(|u| u.rerun.is_some()) {
-        return Err(crate::views::kept_by_key(&source, name, "pattern views with EMIT FINAL"));
+    if let Some(k) = crate::views::replaced(lake, &source).await? {
+        return Err(crate::views::kept_by_key(&source, &k, name, "pattern views with EMIT FINAL"));
     }
     if let Some(u) = crate::rerun::unfollow(&src) {
         return Err(coded("0A000", format!("{}, so {name} follows its rows as they come: write it from a table of plain rows", u.said(&source))));

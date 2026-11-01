@@ -413,11 +413,7 @@ async fn kept(app: &App, sql: &str, who: crate::routines::Who, txn: Option<&[u8]
 /// the session, macros, `FROM t`, `pondra.git_status`), then planned, not run.
 async fn plan_schema(app: &App, sql: &str) -> anyhow::Result<Schema> { planned(app, &crate::routines::expand(&app.lake, &crate::vars::bound(sql)?).await?).await }
 
-async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> {
-    let ctx = crate::query::session(&app.lake, sql, "").await?;
-    let df = crate::engine::sql(&ctx, &crate::sys::planned(sql)?).await?;
-    Ok(crate::answer::arrow_schema(crate::query::run_schema(&ctx, df.logical_plan())?.as_arrow()))
-}
+async fn planned(app: &App, sql: &str) -> anyhow::Result<Schema> { Ok(crate::with_writes::planned(app, sql).await?.as_ref().clone()) }
 
 /// A write's answer, as its ticket and its flight's info give it: one row, `rows`, the count written.
 fn rows_schema() -> Schema { Schema::new(vec![Field::new("rows", DataType::Int64, false)]) }

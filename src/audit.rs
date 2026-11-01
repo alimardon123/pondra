@@ -95,6 +95,7 @@ pub fn class(sql: &str) -> &'static str {
         "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" | "INSTALL" | "UNINSTALL" => "ddl",
         "FORCE" if about(&["INSTALL"]) => "ddl", // (FORCE INSTALL: an extension, as INSTALL is)
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "UPSERT" => "write",
+        "WITH" if crate::with_writes::of(sql).is_some() => "write", // (`WITH d AS (DELETE …) INSERT …`: its writes, by their CTEs)
         "CALL" | "DO" => "function",
         _ if sql.to_lowercase().contains("pondra.start(") => "function",
         "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "END" | "DISCARD" | "DEALLOCATE" | "USE" => "misc",
@@ -461,6 +462,8 @@ mod tests {
     #[test]
     fn classes_and_redaction() {
         assert_eq!(class("CREATE USER ana PASSWORD 'x'"), "role");
+        assert_eq!(class("WITH d AS (DELETE FROM t WHERE id = 1 RETURNING *) INSERT INTO gone SELECT * FROM d"), "write"); // (11-01 audit M4)
+        assert_eq!(class("WITH d AS (SELECT 1) SELECT * FROM d"), "read");
         assert_eq!(class("create or replace secret s (type s3, secret 'y')"), "role");
         assert_eq!(class("GRANT SELECT ON t TO ana"), "role");
         assert_eq!(class("ALTER DATABASE prod SET (protected = false)"), "role");
