@@ -16760,7 +16760,8 @@ def extensions():
     log works, its functions volatile and its lines in the node's log; a branch keeps the extension and its file; UNINSTALL
     takes the functions away on every node. A non-owner may
     not install from a path on the node's machine, and a node started without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL
-    by the variable's name."""
+    by the variable's name, and runs none another node installed. A record a raw request built, and a file swapped under its
+    hash, are refused."""
     fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tests/fixtures/extensions/words-0.1.wasm")
     lake, owner_key = new_lake(), uuid.uuid4().hex
     cache = tempfile.mkdtemp(prefix="pondra-ext-cache-")
@@ -16829,10 +16830,36 @@ def extensions():
         q("UNINSTALL words")
         gone = lambda i: "word_count" in refused("SELECT word_count('a b') AS n", i)
         checks["UNINSTALL takes its functions away on every node"] = all(until(lambda i=i: gone(i), True, 15) for i in range(3))
+        # (audit 11-01 H1: a record is checked by the leader that keeps it and by each node that loads it, not only at INSTALL)
+        q(f"INSTALL words FROM '{fixture}'")
+        words = q("SHOW EXTENSIONS")[-1]
+
+        def raw_install(record):
+            """The status, SQLSTATE and words of a `/cluster/ddl` request carrying a record its caller built."""
+            c = http.client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+            c.request("POST", "/cluster/ddl", json.dumps({"op": "install_extension", "name": "words", "record": record}).encode(), {**admin, "content-type": "application/json"})
+            r = c.getresponse()
+            return f"{r.status} {r.getheader('x-pondra-sqlstate')}: {r.read().decode(errors='replace')}"
+        record = {"version": words["version"], "sha256": words["sha256"], "bytes": words["bytes"], "from": "built", "by": "a", "at_ms": 0}
+        checks["a raw /cluster/ddl record naming a path for its file is refused (XX001), and one naming a built-in's function name (42723)"] = \
+            "XX001" in raw_install({**record, "sha256": "../../../../tmp/elsewhere"}) and \
+            "42723" in raw_install({**record, "functions": [{"name": "upper", "arguments": ["Utf8"], "returns": "Utf8"}]}) and \
+            q("SELECT word_count('a b c') AS n") == [{"n": 3}]
+        if not lake.startswith("s3://"):
+            # a bucket writer swaps the file under the record's hash: a node that loads it now refuses it
+            kept = os.path.join(lake, "ext", "words", words["version"], words["sha256"] + ".wasm")
+            nodes[1].kill()
+            shutil.copyfile(os.path.join(fixtures, "clocked-0.1.wasm"), kept)
+            nodes[1] = Node(lake, A.port + 1, env=env, admin_token="a", read_token="rtok").start()
+            e = refused("SELECT word_count('a b') AS n", 1)
+            checks["a node loading an extension whose file was swapped refuses it (XX001)"] = "XX001" in e and "isn't the one installed" in e
+            shutil.copyfile(fixture, kept)
         nodes[2].kill()
         bare = Node(lake, A.port + 2, env={k: v for k, v in env.items() if k != "PONDRA_ALLOW_UNSIGNED_EXTENSIONS"}, admin_token="a").start()
         nodes[2] = bare
         checks["a node without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL by the variable's name"] = "PONDRA_ALLOW_UNSIGNED_EXTENSIONS" in refused(f"INSTALL words FROM '{fixture}'", 2)
+        e = refused("SELECT word_count('a b') AS n", 2)
+        checks["a node without PONDRA_ALLOW_UNSIGNED_EXTENSIONS runs no extension another node installed (0A000)"] = "0A000" in e and "PONDRA_ALLOW_UNSIGNED_EXTENSIONS" in e
     finally:
         for n in nodes:
             n.kill()

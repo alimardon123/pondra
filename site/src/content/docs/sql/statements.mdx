@@ -857,9 +857,12 @@ their values.
 Only an admin installs an extension, and a node takes one only when it runs with
 `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
 the node that got the statement (a path on its machine from the program that started it, or a URL a
-secret covers), and every node sees the record; a branch and a backup carry the file with it. The
-file says its version and its functions, which a query then calls by name in every session, on every
-node; a name another function has already is refused at `INSTALL` (`42723`). A function the file gives
+secret covers), and every node sees the record; a branch and a backup carry the file with it. Each node
+checks the file against the record's SHA-256 as it loads it, and runs it only when it was started with
+the variable too: a file that isn't the one installed is refused (`XX001`), and so is a call on a node
+without the variable (`0A000`). The file says its version and its functions, which a query then calls by
+name in every session, on every node; a name another function has already, a table function's too, is
+refused at `INSTALL` (`42723`), and so is a `CREATE FUNCTION` by the name of an extension's function. A function the file gives
 columns is a table function, read as `SELECT * FROM name(…)` with literal arguments: its rows come a
 batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
 sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
