@@ -102,6 +102,8 @@ pub struct Pin {
     pub at_ms: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lease: bool, // (a branch on another server's: it renews it, and it goes when it isn't renewed: `lapse`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>, // (the limited user who made it, a CLONE grant's: it renews only its own pins; none for the cluster's, an admin's, a superuser's)
 }
 
 /// `CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`.
@@ -332,11 +334,23 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Res
     let mut ms = ms.unwrap_or(now.saturating_sub(MARGIN_MS));
     // (a user who may only clone is a server elsewhere's: its pin is a lease, and once one, always)
     let mut lease = lease || crate::auth::limited().and_then(|a| a.clones()).is_some();
+    // (a user who may only clone makes the pins it makes its own: it renews those alone, so it is never given
+    // another branch's key, nor makes another's pin a lease)
+    let limited = crate::auth::limited().is_some();
+    let me = match limited {
+        true => crate::auth::current().map(|p| p.name),
+        false => None,
+    };
+    let mut by = me.clone();
     if let Some(p) = lake.cat.get::<Pin>(&key).await? {
+        ensure!(!limited || p.by == me, crate::codes::coded("42501", format!("permission denied: {branch} is pinned by another; a CLONE grant renews only the pins it made")));
         ms = ms.min(p.ms);
         lease |= p.lease;
+        if !limited {
+            by = p.by; // (a cluster's or an admin's renewal keeps who made the pin)
+        }
     }
-    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease }))], &[]).await?;
+    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease, by }))], &[]).await?;
     let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
     // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
     if let Some(s) = crate::auth::limited().and_then(|a| a.clones()).filter(|s| !s.is_empty()) {
@@ -414,7 +428,9 @@ pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
 /// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing
 /// else of its through).
 async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
-    if let Ddl::CreateDatabase { clone: Some(of), .. } = d {
+    if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {
+        // (a branch's files go beside its base's, on its base's server: a folder or a URL named here would be opened with this node's own credentials)
+        ensure!(dir.is_none(), crate::codes::coded("42501", "permission denied: a branch made with CLONE lives beside the database it is made on; LOCATION is a superuser's choice"));
         return clone_as(lake, of, a);
     }
     if let Ddl::DropDatabase { name, if_exists } = d {
@@ -891,4 +907,22 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     crate::views::forget(lake); // (the sequencer's views as they are now: invariant 77)
     crate::log::forget_producers(fills);
     Ok(j!({"refreshed": all, "from": me.base}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pin_with_no_maker_has_no_by_key_and_old_pins_read_back() {
+        let p = Pin { lake: "_base/x".into(), ms: 1, at_ms: 2, lease: false, by: None };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("by").is_none(), "{v}");
+        let old: Pin = serde_json::from_str(r#"{"lake":"_base/x","ms":1,"at_ms":2}"#).unwrap();
+        assert!(old.by.is_none());
+        assert!(!old.lease);
+        let made = Pin { by: Some("ann".into()), ..p };
+        let back: Pin = serde_json::from_value(serde_json::to_value(&made).unwrap()).unwrap();
+        assert_eq!(back.by.as_deref(), Some("ann"));
+    }
 }

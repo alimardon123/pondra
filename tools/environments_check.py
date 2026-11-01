@@ -615,6 +615,17 @@ def across_check(bin, work, port):
         drop = json.dumps({"op": "drop_table", "name": "sales.orders", "if_exists": True})
         status, _ = raw(port, "POST", "/cluster/ddl", drop, {"Authorization": f"Bearer {dev_token}", "Content-Type": "application/json"})
         checks["dev_server's token, which made ali's pin, can't drop prod's table over /cluster/ddl"] = status != 200 and refused(prod, "SELECT count(*) FROM sales.orders") == ""
+        # A second user granted CLONE takes ali's pin, which dev_server made: refused, with no key of ali's given (a CLONE
+        # grant renews only the pins its own user made: `branch::pin`).
+        prod.q("CREATE USER eve LOGIN")
+        prod.q("GRANT CLONE ON DATABASE prod TO eve")
+        eve_token = prod.q("CREATE TOKEN second FOR USER eve")["token"]
+        status, text = raw(port, "POST", "/cluster/ddl", json.dumps({"op": "pin", "lake": ali_lake, "ms": None}), {"Authorization": f"Bearer {eve_token}", "Content-Type": "application/json"})
+        checks["a CLONE user can't take another's pin: its key isn't given and the pin isn't made a lease"] = status != 200 and "pb_" not in text
+        # A branch of a CLONE user takes no LOCATION: dana names a folder on dev's disk, refused before anything is made there.
+        outside = f"{work}/outside"
+        status, text = raw(port + 1, "POST", "/sql", f"CREATE DATABASE beside LOCATION '{outside}' CLONE prod", dana)
+        checks["a CLONE user's branch takes no LOCATION: it lives beside its base"] = status != 200 and "LOCATION" in text and not keys(outside)
 
         ali.stop()
         dev.q("DROP DATABASE ali")
