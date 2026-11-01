@@ -23677,6 +23677,14 @@ def friendly():
         "max_by, arg_min, min_by (named as written)": ("SELECT g, max_by(id, x), arg_min(id, x), min_by(k, x) FROM t GROUP BY g", True, False),
         "max_by over NULLs": ("SELECT k, max_by(id, n) AS a, arg_max(id, n) AS b FROM t GROUP BY k", True, False),
         "string_split": ("SELECT string_split(g || ',' || k, ',') AS s FROM t", True, False),
+        # (DuckDB's dates and patterns, `friendly::dates`)
+        "split, strftime, strptime, epoch": ("SELECT id, split(g || ',' || k, ',') AS p, strftime(ts, '%Y-%m-%d %H:%M') AS s, epoch(ts) AS e, strptime('01/03/2026 10:30', '%d/%m/%Y %H:%M') AS d FROM t", True, False),
+        "regexp_extract: a group, the whole match, '' with no match, NULL for NULL": (r"""SELECT id, regexp_extract(j, '"s": "(v\d)"', 1) AS s, regexp_extract(g, 'b') AS b, regexp_extract(g, '(x)?', 1) AS none, regexp_extract(CASE WHEN k = 0 THEN NULL ELSE g END, 'a|b') AS n FROM t""", True, False),
+        "date_diff by part: the boundaries crossed, either way": ("SELECT id, date_diff('day', TIMESTAMP '2026-01-01 23:00:00', ts) AS d, date_diff('hour', TIMESTAMP '2026-01-01 00:30:00', ts) AS h, "
+                                                                 "date_diff('minute', ts, TIMESTAMP '2026-01-01 00:00:30') AS mi, date_diff('second', TIMESTAMP '2026-01-01 00:00:00.5', ts) AS s, "
+                                                                 "date_diff('month', DATE '2025-11-30', ts) AS m, date_diff('week', DATE '2025-12-20', ts) AS w, date_diff('quarter', DATE '2025-09-30', ts) AS q, "
+                                                                 "datediff('year', DATE '2024-12-31', ts) AS y, date_diff('millisecond', TIMESTAMP '2026-01-01 00:00:00.0005', ts) AS ms FROM t", True, False),
+        "date_add with an INTERVAL": ("SELECT id, date_add(ts, INTERVAL 7 DAY) AS a FROM t", True, False),
         "json_extract, json_extract_string": ("SELECT id, json_extract(j, '$.a.b') AS b, json_extract_string(j, '$.s') AS s FROM t", True, False),
         "DuckDB's ASOF JOIN … ON": ("SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
@@ -23723,6 +23731,33 @@ def friendly():
         checks[f"{name} == DuckDB's"] = ok
         if not ok:
             failed[name] = {"ours": [cn, got[:4]], "duckdb": [dn, want[:4]]}
+    # Snowflake's and SQL Server's DATEDIFF and DATEADD, the part written as a word: as DuckDB's spelled its way
+    pairs = {
+        "DATEDIFF(day, a, b), datediff(hh, …): as date_diff('day', …), date_diff('hour', …)": (
+            "SELECT id, DATEDIFF(day, TIMESTAMP '2026-01-01 23:00:00', ts) AS d, datediff(hh, TIMESTAMP '2026-01-01 00:30:00', ts) AS h FROM t",
+            "SELECT id, date_diff('day', TIMESTAMP '2026-01-01 23:00:00', ts) AS d, date_diff('hour', TIMESTAMP '2026-01-01 00:30:00', ts) AS h FROM t"),
+        "DATEADD(day, 7, ts), dateadd('week', 2, ts), timestampadd(hour, -3, ts): as ts + INTERVAL …": (
+            "SELECT id, DATEADD(day, 7, ts) AS a, dateadd('week', 2, ts) AS b, timestampadd(hour, -3, ts) AS c, DATEADD(quarter, 1, ts) AS q FROM t",
+            "SELECT id, ts + INTERVAL 7 DAY AS a, ts + INTERVAL 14 DAY AS b, ts - INTERVAL 3 HOUR AS c, ts + INTERVAL 3 MONTH AS q FROM t"),
+        "MySQL's date_sub(ts, INTERVAL …): as ts - INTERVAL …": ("SELECT id, date_sub(ts, INTERVAL '1 month') AS b FROM t", "SELECT id, ts - INTERVAL '1 month' AS b FROM t"),
+        "date_diff('week', …) either way: whole weeks of the days between": (
+            "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t",
+            "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t"),
+    }
+    for name, (q, dq) in pairs.items():
+        try:
+            (cn, got), (dn, want) = ours(q), theirs(dq)
+            ok = sorted(got, key=repr) == sorted(want, key=repr) and cn == dn and len(want) > 0
+        except Exception as e:
+            ok, cn, got, dn, want = False, str(e)[:400], [], [], []
+        checks[f"{name} == DuckDB's"] = ok
+        if not ok:
+            failed[name] = {"ours": [cn, got[:4]], "duckdb": [dn, want[:4]]}
+    c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+    c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
+    r = c.getresponse()
+    st, hd, body = r.status, r.getheader("x-pondra-sqlstate"), r.read().decode()
+    checks["date_diff('m', …): refused by name with the parts it takes (m is DuckDB's minute and SQL Server's month), 22023"] = st == 400 and hd == "22023" and "'m' isn't a date part here" in body
     # SUMMARIZE: the exact columns (approximate ones and the mean's and spread's text aside)
     cn, got = ours("SUMMARIZE t")
     dn, want = theirs("SUMMARIZE t")
@@ -24041,7 +24076,7 @@ def dialects():
     FROM, DELETE, INSERT … ON CONFLICT and MERGE, its own columns kept apart from the system ones
     (`change::select_as` named both `__o_created_at`, and every change of such a table failed)."""
     import dialects_check
-    FLOOR = {"postgres": 41, "duckdb": 31, "snowflake": 14, "spark": 10, "mysql": 19, "bigquery": 12, "sqlserver": 12}
+    FLOOR = {"postgres": 42, "duckdb": 35, "snowflake": 15, "spark": 12, "mysql": 19, "bigquery": 13, "sqlserver": 12}
     XX000 = 0  # (refusals that are internal errors: lower it as they get codes, never raise it)
     lake = new_lake()
     node = Node(lake, A.port).start()

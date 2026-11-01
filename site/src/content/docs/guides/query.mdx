@@ -88,7 +88,8 @@ SELECT count(*) FROM orders USING SAMPLE 50%;
 
 The standard's `PIVOT (… FOR … IN (…))` and `UNPIVOT (… FOR … IN (…))` work too, and so do
 `FETCH FIRST n ROWS ONLY`, `TABLESAMPLE`, `LAMBDA x: …`, `arg_max`, `arg_min`, `min_by`, `list()`,
-`string_split`, `json_extract` and `json_extract_string`, `({'a': 1}).a`, and DuckDB's
+`string_split`, `json_extract` and `json_extract_string`, `strftime`, `strptime`, `epoch`, `regexp_extract`,
+`date_diff('day', a, b)` (and Snowflake's `DATEDIFF(day, a, b)` and `DATEADD(day, 7, ts)`), `({'a': 1}).a`, and DuckDB's
 `ASOF JOIN … ON a.k = b.k AND a.t >= b.t` (only matched rows; `ASOF LEFT JOIN` keeps the rest).
 
 <Aside type="caution">
