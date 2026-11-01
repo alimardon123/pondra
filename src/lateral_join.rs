@@ -416,9 +416,9 @@ mod tests {
 
     #[test]
     fn top_n_per_group_is_a_left_join_on_a_numbered_subquery() {
-        let (changed, sql) = rewritten("SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) top ON true");
+        let (changed, sql) = rewritten("SELECT c.name, best.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) best ON true");
         assert!(changed);
-        assert!(sql.contains("top.__lk1 = c.id"), "{sql}");
+        assert!(sql.contains("best.__lk1 = c.id"), "{sql}");
         assert!(sql.contains("row_number() OVER (PARTITION BY o.customer_id ORDER BY o.amount DESC)"), "{sql}");
         assert!(sql.contains("__lrn <= 1"), "{sql}");
         assert!(!sql.contains("LATERAL"), "{sql}");
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn what_the_rewrite_does_not_take_stays_as_written() {
-        let outer = "SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (";
+        let outer = "SELECT c.name, best.amount FROM customers c LEFT JOIN LATERAL (";
         for inner in [
             "SELECT * FROM orders o WHERE o.customer_id = c.id LIMIT 1",
             "SELECT count(*) AS amount FROM orders o WHERE o.customer_id = c.id",
@@ -455,13 +455,13 @@ mod tests {
             "SELECT o.amount AS x FROM orders o WHERE o.customer_id = c.id ORDER BY x LIMIT 1",
             "SELECT unnest(o.tags) AS amount FROM orders o WHERE o.customer_id = c.id LIMIT 2",
         ] {
-            let sql = format!("{outer}{inner}) top ON true");
+            let sql = format!("{outer}{inner}) best ON true");
             let (changed, text) = rewritten(&sql);
             assert!(!changed, "{sql}");
             assert_eq!(text, Parser::parse_sql(&GenericDialect {}, &sql).unwrap()[0].to_string());
         }
         // (a `*` in the outer query would show the columns the rewrite adds)
-        let star = "SELECT * FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id LIMIT 1) top ON true";
+        let star = "SELECT * FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id LIMIT 1) best ON true";
         assert!(!rewritten(star).0);
     }
 }
