@@ -10768,39 +10768,85 @@ def guarded():
         "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
     # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the replica log carries the lake's keys
     # (`z/auth`), and a heartbeat or an ack writes what only the nodes write (L2's review, 10-31). A superuser's flush and
-    # files are a joined page's writes, which a follower relays to the leader (`server::relay`), checked below
+    # files are the nodes' own too: a superuser's are refused at those routes, on a follower and on the leader, as a page's are
     nodes_own = {p: ask(P, b"" if m == "GET" else "{}", path=p, method=m, auth=boss) for p, m in
                  (("/cluster/replica", "GET"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
     info["nodes_own"] = nodes_own
     checks["…nor a superuser's sign-in: the replica log (the lake's keys), a heartbeat, an ack: 403"] = \
         all(refused(v) and "this route is the nodes' own" in v for v in nodes_own.values())
-    # A joined page's writes, through its node: a superuser's flush and files on a follower are answered by the leader (not a
-    # 403); a Write role's are refused as before; a new lake file through /store is stored once (the second is 412, the bytes stay)
+    # The nodes' routes are the nodes' and the write tokens' only: a superuser's flush and files are refused there on a follower and on
+    # the leader (403, the node's words). A joined page's INSERT goes through /insert, staged (below)
     until(lambda: isinstance(ask(P + 1, b"", path="/whoami", method="GET", auth=boss), dict), True, 20)  # (the follower has the new superuser)
-    # (and the nodes' key, which the lake has once it has users: a relay sent before the follower has it is the leader's 401)
-    until(lambda: isinstance(ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss), dict), True, 20)
+    who = ask(P + 1, b"", path="/whoami", method="GET", auth=boss)
+    slug = who.get("slug") if isinstance(who, dict) else None
     page = {
         "a superuser's flush, on a follower": ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss),
         "a superuser's files, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g6", "columns": [["id", "BIGINT"], ["amount", "DOUBLE"]], "files": []}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
+        "a superuser's flush, on the leader": ask(P, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss),
+        "a superuser's files, on the leader": ask(P, json.dumps({"table": "orders", "job": "g9", "columns": [], "files": []}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
         "a Write role's files, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g7", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
-        # a superuser's page gets a writer's checks, on the follower (before it relays: the leader sees the nodes' key) and on the leader
-        "a file outside the table's folder, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g8", "columns": [], "files": [{"path": "data/hr/x.parquet", "rows": 1, "bytes": 1}]}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
-        "a file outside the table's folder, on the leader": ask(P, json.dumps({"table": "orders", "job": "g9", "columns": [], "files": [{"path": "data/hr/x.parquet", "rows": 1, "bytes": 1}]}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
-        "rows for the audit log, on a follower": ask(P + 1, flush({"path": "", "parts": [{"table": "pondra$audit", "off": 0, "len": 0, "rows": 0, "src": None}]}), path="/cluster/commit", auth=boss),
-        "a segment outside the log, on a follower": ask(P + 1, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=boss),
-        "a new file, through /store": ask(P, b"guarded", path="/store/data/guarded/a.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
-        "the same file again": ask(P, b"other", path="/store/data/guarded/a.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
-        "what the file holds": ask(P, b"", path="/store/data/guarded/a.parquet", method="GET", auth=boss),
+        "a data file, through /store": ask(P, b"guarded", path="/store/data/guarded/a.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
+        "a staged file, through /store": ask(P + 1, b"guarded", path=f"/store/stage/{slug}/g1/0.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
+        "the same staged file again": ask(P + 1, b"other", path=f"/store/stage/{slug}/g1/0.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
     }
     info["page writes"] = page
-    checks["a joined page's writes: a superuser's flush and files reach the leader through a follower (answered, not refused); a Write role's files: 403; a new lake file through /store stored once (the second 412, the bytes stay)"] = \
-        isinstance(page["a superuser's flush, on a follower"], dict) and "Acks" in page["a superuser's flush, on a follower"] \
-        and not str(page["a superuser's files, on a follower"]).startswith(("ERROR 401", "ERROR 403")) \
-        and refused(page["a Write role's files, on a follower"]) and "this route is the nodes' own" in str(page["a Write role's files, on a follower"]) \
-        and page["a new file, through /store"] == b"" and str(page["the same file again"]).startswith("ERROR 412") and page["what the file holds"] == b"guarded"
-    checks["a superuser's page gets a writer's checks: a file outside its table's folder (on a follower, and on the leader), the audit log's rows, a segment outside log/: refused by name"] = \
-        all("a table's files are in its folder" in str(page[k]) for k in ("a file outside the table's folder, on a follower", "a file outside the table's folder, on the leader")) \
-        and "written by Pondra alone" in str(page["rows for the audit log, on a follower"]) and "a segment of the log" in str(page["a segment outside the log, on a follower"])
+    checks["a superuser's flush and files at /cluster/commit and /cluster/files: 403 on a follower and on the leader, the node's own words; a Write role's files: 403; a staged file through /store stored once (the second 412), a lake data file through /store: 403"] = \
+        all(refused(page[k]) and "this route is the nodes' own" in str(page[k]) for k in ("a superuser's flush, on a follower", "a superuser's files, on a follower", "a superuser's flush, on the leader", "a superuser's files, on the leader", "a Write role's files, on a follower")) \
+        and refused(page["a data file, through /store"]) and page["a staged file, through /store"] == b"" and str(page["the same staged file again"]).startswith("ERROR 412")
+    # A joined page's INSERT, staged (brief P-B): boss's page stages a Parquet file under its own slug (the node writes it: COPY), and the
+    # follower's /insert/orders?staged=1 runs the INSERT from it as boss, then the staged files go, so a resend is a duplicate. A NULL for
+    # a NOT NULL column is the node's own refusal (its SQLSTATE), a PUT under another user's slug is 403, and a create past 64 MB is 413
+    import tempfile
+    def raw(port, method, path, body=b"", auth=None, headers=None):
+        """(status, the x-pondra-sqlstate header, the body) of one request, whatever its status."""
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
+        c.request(method, path, body, {**(headers or {}), **({"Authorization": auth} if auth else {})})
+        r = c.getresponse()
+        data = r.read()
+        return r.status, r.getheader("x-pondra-sqlstate"), data
+    tmp = tempfile.mkdtemp()
+    def stage(select, job, n=0):
+        """The node writes `select` to a Parquet file, which is put as boss's `stage/<slug>/<job>/<n>.parquet` on a follower, create-only."""
+        # (a COPY to a path on the server's disk is the command line's, as `pondra sql` runs it: HTTP clients are refused it)
+        made = subprocess.run([BIN, "sql", "--dir", lake, f"COPY ({select}) TO '{tmp}/{job}.parquet'"], capture_output=True, text=True, timeout=120)
+        if not os.path.exists(f"{tmp}/{job}.parquet"):
+            raise RuntimeError(f"the node wrote no file for {job}: {made.stdout} {made.stderr}")
+        with open(f"{tmp}/{job}.parquet", "rb") as f:
+            return raw(P + 1, "PUT", f"/store/stage/{slug}/{job}/{n}.parquet", f.read(), auth=boss, headers={"If-None-Match": "*"})
+    ins = {"Content-Type": "application/json"}
+    ask(P, "CREATE TABLE probe (x BIGINT)", auth=boss)
+    until(lambda: not str(ask(P + 1, "INSERT INTO probe VALUES (1)", auth=boss)).startswith("ERROR"), True, 30)  # (a follower's writes reach the leader once it has the nodes' key: a 401 until then)
+    staged_put = stage("SELECT 1 AS c0, 2.5 AS c1", "j1")
+    before = ask(P, "SELECT count(*) AS n FROM orders", auth=boss)
+    first = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"], "files": 1}).encode(), auth=boss, headers=ins)
+    again = raw(P + 1, "POST", "/insert/orders?job=j1&staged=1", json.dumps({"columns": ["id", "amount"], "files": 1}).encode(), auth=boss, headers=ins)
+    grown = until(lambda: ask(P, "SELECT count(*) AS n FROM orders", auth=boss), [{"n": before[0]["n"] + 1}] if isinstance(before, list) else None, 20)
+    ask(P, "CREATE TABLE nn (id BIGINT NOT NULL, v DOUBLE)", auth=boss)
+    stage("SELECT CAST(NULL AS BIGINT) AS c0, 2.5 AS c1", "j2")
+    nulled = raw(P + 1, "POST", "/insert/nn?job=j2&staged=1", json.dumps({"columns": ["id", "v"], "files": 1}).encode(), auth=boss, headers=ins)
+    other = raw(P + 1, "PUT", f"/store/stage/{'bob'.encode().hex()}/j3/0.parquet", b"x", auth=boss, headers={"If-None-Match": "*"})  # (boss, a superuser, at bob's slug)
+    stage("SELECT 2 AS c0, 3.5 AS c1", "j5", n=1)  # (file 1 of 2 only: file 0 never came)
+    short = raw(P + 1, "POST", "/insert/orders?job=j5&staged=1", json.dumps({"columns": ["id", "amount"], "files": 2}).encode(), auth=boss, headers=ins)
+    unchanged = ask(P, "SELECT count(*) AS n FROM orders", auth=boss)
+    try:  # (its length says it is past 64 MB: the node answers 413 from the headers, so the body is not sent)
+        c = http.client.HTTPConnection("127.0.0.1", P + 1, timeout=120)
+        c.putrequest("PUT", f"/store/stage/{slug}/j4/0.parquet")
+        for k, v in (("Authorization", boss), ("If-None-Match", "*"), ("Content-Length", str((64 << 20) + 1))):
+            c.putheader(k, v)
+        c.endheaders()
+        r = c.getresponse()
+        big = (r.status, r.getheader("x-pondra-sqlstate"), r.read())
+    except Exception as e:
+        big = (None, None, str(e).encode())
+    info["staged"] = {"slug": slug, "file": staged_put[0], "insert": [first[0], first[2][:200].decode(errors="replace")],
+                      "again": [again[0], again[2][:200].decode(errors="replace")], "orders": [before, grown],
+                      "not null": [nulled[0], nulled[1], nulled[2][:300].decode(errors="replace")], "another slug": other[0],
+                      "over 64 MB": big[0], "a file short": [short[0], short[1], short[2][:200].decode(errors="replace"), unchanged]}
+    checks["a joined page's INSERT, staged: the node-written file under the page's own slug, /insert on a follower adds its row (200), the same call again is answered duplicate"] = \
+        staged_put[0] == 200 and first[0] == 200 and isinstance(before, list) and grown == [{"n": before[0]["n"] + 1}] and again[0] == 200 and json.loads(again[2] or b"{}") == {"duplicate": True}
+    checks["a staged file of another user's slug: 403; a create past 64 MB: 413; a NULL for a NOT NULL column: the node's own refusal (23502)"] = \
+        other[0] == 403 and big[0] == 413 and nulled[1] == "23502" and isinstance(nulled[0], int) and nulled[0] >= 400
+    checks["a staged INSERT whose files aren't all there is refused (55000), and adds no row"] = short[1] == "55000" and unchanged == grown
     # What a page that joined the cluster follows, a superuser's sign-in: the catalog and the commit stream, with only
     # the keys a page may hold (`objects::readable`): never the lake's keys, its users or its secrets
     catalog = ask(P, b"", path="/cluster/kv?from=", method="GET", auth=boss)
@@ -10837,7 +10883,7 @@ def guarded():
     theirs = ask(P, b"", path=f"/sql/pages/{pages}", method="GET", auth=boss)
     info["pages"] = {"bob's": mine, "boss's": theirs}
     checks["a page of an answer is read only by whoever asked for it: another user gets 410"] = \
-        isinstance(mine, dict) and mine.get("rows") == [[7], [8]] and str(theirs).startswith("ERROR 410")
+        isinstance(mine, dict) and mine.get("rows") == [[1], [7], [8]] and str(theirs).startswith("ERROR 410")  # (1: the staged INSERT's row)
     # /stats: an unsigned caller gets every field but the cluster's names and addresses (lake, leader, nodes,
     # releases), which a signed-in caller gets (here a user; the admin token is checked on node c below)
     names = {"lake", "leader", "nodes", "releases"}

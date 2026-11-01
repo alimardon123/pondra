@@ -1553,6 +1553,9 @@ async function otherOriginCheck(target, node) {
 const JOIN_SETUP = [
   'CREATE TABLE ev (id BIGINT, v VARCHAR)',
   "INSERT INTO ev VALUES (1, 'a')",
+  'CREATE TABLE idt (id BIGINT GENERATED ALWAYS AS IDENTITY, v VARCHAR)',
+  'CREATE TABLE keyed (k BIGINT PRIMARY KEY, v VARCHAR)',
+  "INSERT INTO keyed VALUES (1, 'one')",
   "CREATE SECRET s3x (TYPE s3, KEY_ID 'k', SECRET 'pondra-sealed-j6', SCOPE 's3://nowhere')",
   "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER",
 ];
@@ -1661,6 +1664,28 @@ async function joinChecks(target, a, b) {
   if (counted100k) judge('joined: SELECT count(*) FROM ev after the bulk INSERT', counted100k, { status: 200, sqlstate: null, out: 'count(*)\n100003\n' });
   const aCount100k = await ask('A: SELECT count(*) FROM ev after the bulk INSERT', 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, 'SELECT count(*) FROM ev', undefined, a);
   if (aCount100k) judge('A: SELECT count(*) FROM ev after the bulk INSERT', aCount100k, { status: 200, sqlstate: null, out: 'count(*)\n100003\n' });
+
+  // (c3) The page's other INSERTs, each as the node answers it (brief P-B): an identity table's INSERT with a column list (the node
+  // gives the identity), a VALUES INSERT, a RETURNING one (the node's answer), and a key that exists in a keyed table (23505).
+  const idSql = "INSERT INTO idt (v) SELECT 'q' FROM range(2)";
+  const idIns = await ask(`joined: ${idSql}`, 'POST', '/sql', undefined, idSql, 'joined');
+  if (idIns) judge(`joined: ${idSql}`, idIns, { status: 200, sqlstate: null });
+  const valSql = "INSERT INTO idt (v) VALUES ('val')";
+  const valIns = await ask(`joined: ${valSql}`, 'POST', '/sql', undefined, valSql, 'joined');
+  if (valIns) judge(`joined: ${valSql}`, valIns, { status: 200, sqlstate: null });
+  const retSql = "INSERT INTO idt (v) SELECT 'ret' RETURNING id";
+  const retIns = await ask(`joined: ${retSql}`, 'POST', '/sql', undefined, retSql, 'joined');
+  if (retIns) judge(`joined: ${retSql}`, retIns, { status: 200, sqlstate: null });
+  const noneSql = "INSERT INTO idt (v) SELECT 'none' WHERE false";
+  const noneIns = await ask(`joined: ${noneSql}`, 'POST', '/sql', undefined, noneSql, 'joined');
+  if (noneIns) judge(`joined: ${noneSql}`, noneIns, { status: 200, sqlstate: null }); // (no rows: one staged file of none, answered as any INSERT of none)
+  const idCount = await ask('joined: SELECT id, v FROM idt ORDER BY id', 'POST', '/sql?format=csv', undefined, 'SELECT id, v FROM idt ORDER BY id', 'joined');
+  if (idCount) judge('joined: SELECT id, v FROM idt ORDER BY id', idCount, { status: 200, sqlstate: null, out: 'id,v\n1,q\n2,q\n3,val\n4,ret\n' });
+  const keySql = "INSERT INTO keyed (k, v) SELECT 1, 'again'";
+  const keyIns = await ask(`joined: ${keySql}`, 'POST', '/sql', undefined, keySql, 'joined');
+  if (keyIns) judge(`joined: ${keySql}`, keyIns, { sqlstate: '23505', error: true });
+  const keyCount = await ask('joined: SELECT count(*) FROM keyed after the refused key', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM keyed', 'joined');
+  if (keyCount) judge('joined: SELECT count(*) FROM keyed after the refused key', keyCount, { status: 200, sqlstate: null, out: 'count(*)\n1\n' });
 
   // (d) A transaction is refused by name: each statement is the node's own, run on its own.
   const begun = await ask('joined: BEGIN', 'POST', '/sql', undefined, 'BEGIN', 'joined');

@@ -145,6 +145,19 @@ crate::per_node!(static PAGE_NODE: std::sync::Mutex<Option<(String, String)>> = 
 /// A joined page's node is `node` (its origin, no trailing `/`), and the page's calls to it carry `auth`.
 pub fn set_page(node: String, auth: String) { *PAGE_NODE.lock().unwrap_or_else(|e| e.into_inner()) = Some((node, auth)); }
 
+/// The node a joined page follows and its sign-in, as `set_page` set them.
+pub fn page_node() -> Option<(String, String)> { PAGE_NODE.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+
+// The slug of the user a joined page follows for, as its node's `/whoami` says it (`node::open_joined`): the folder its staged
+// rows go in, `stage/<slug>/` (`write::staged`). None until the node has said it.
+crate::per_node!(static PAGE_SLUG: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None));
+
+/// The slug of a joined page's user, as its node said it (`node::open_joined`).
+pub fn set_page_slug(slug: Option<String>) { *PAGE_SLUG.lock().unwrap_or_else(|e| e.into_inner()) = slug; }
+
+/// The slug a joined page stages its rows under, if its node gave one.
+pub fn page_slug() -> Option<String> { PAGE_SLUG.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+
 /// The dial of a build with no doors, which is a page's: it reaches its joined node over `fetch` with the page's sign-in, and
 /// no other member. Unset (no page joined a node), it reaches no member at all, and says so by name.
 #[cfg_attr(feature = "doors", allow(dead_code))]

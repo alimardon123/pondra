@@ -312,8 +312,8 @@ fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
 pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
-    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u)) {
-        return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
+    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u) || own_stage(lake, u)) {
+        return Ok(()); // (the lake's own files, or the caller's own staged rows: whoever reads the lake reads them, as GET /files/… does)
     }
     if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
         if crate::catalogs::signed(lake, name, url).await? {
@@ -329,6 +329,15 @@ pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
 /// through `files/%2E%2E/` would reach past the grants on the lake's tables.
 fn own_file(lake: &Lake, u: &str) -> bool {
     let area = format!("{}/files/", lake.url.trim_end_matches('/'));
+    u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
+}
+
+/// Is `u` in the caller's own staged rows (`stage/<its slug>/`, `auth::page_creates`): the folder a joined page stages its
+/// INSERT's files in, which only its own user's staged INSERT reads (`server::insert_staged`)? Nobody else's slug is read, and
+/// no `..` either. A caller with no slug reads none.
+fn own_stage(lake: &Lake, u: &str) -> bool {
+    let Some(me) = crate::auth::current().and_then(|p| crate::auth::slug(&p)) else { return false };
+    let area = format!("{}/stage/{me}/", lake.url.trim_end_matches('/'));
     u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
 }
 
@@ -1697,6 +1706,27 @@ mod tests {
         let files = format!("{}/files", lake.url.trim_end_matches('/'));
         assert!(own_file(&lake, &format!("{files}/orders.csv")));
         assert!(!own_file(&lake, &format!("{files}/%2E%2E/catalog")), "an escaped .. reaches past files/");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn own_stage_takes_only_the_callers_slug_and_no_escaped_dot_dot() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, access: None, door: "http", from: None, operator: false };
+        assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
+        crate::auth::WHO
+            .scope(ali, async {
+                assert!(own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "the caller's own staged rows");
+                assert!(!own_stage(&lake, &format!("{stage}/626f62/j1/*.parquet")), "another user's slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/%2E%2E/%2E%2E/files/x.parquet")), "an escaped .. reaches past the slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/../../files/x.parquet")), "a plain .. reaches past the slug");
+                assert!(!own_file(&lake, &format!("{stage}/616c69/j1/*.parquet")), "not the lake's files");
+            })
+            .await;
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

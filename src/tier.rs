@@ -826,6 +826,19 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     // since, purged): it stays while that branch's pin does (ADR-047).
     let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
+    // A joined page's staged files (`stage/<slug>/<job>/`, taken by their INSERT as it runs: `server::insert_staged`) go a job
+    // folder at a time, once its newest file is an hour old: a page that never sent its INSERT. Never a file at a time, so a long
+    // staging loses no early file while its last ones are still coming (the INSERT also counts them: `insert_staged`).
+    let mut jobs: std::collections::HashMap<String, (i64, Vec<Path>)> = Default::default();
+    for o in lake.store.list(Some(&Path::from("stage"))).try_collect::<Vec<object_store::ObjectMeta>>().await? {
+        let job = o.location.as_ref().rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+        let (newest, files) = jobs.entry(job).or_default();
+        *newest = (*newest).max(o.last_modified.timestamp_millis());
+        files.push(o.location);
+    }
+    for f in jobs.into_values().filter(|(newest, _)| now as i64 - newest > HOUR as i64).flat_map(|(_, files)| files) {
+        let _ = object_store::ObjectStoreExt::delete(&lake.store, &f).await;
+    }
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     for (n, d) in crate::ddl::dropped(lake).await? {
@@ -918,7 +931,7 @@ impl Seen {
 /// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
 /// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
 /// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
-fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
+pub(crate) fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
     let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));

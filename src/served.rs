@@ -27,13 +27,20 @@ use object_store::{
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use url::Url;
 
 const MIB: u64 = 1 << 20;
 /// A PUT's body past this is refused: a merge's file is 256 MB at most.
 const MAX_BODY: u64 = 1 << 30;
+/// A page's staged file (`auth::page_creates`) past this is refused (413): `body_of` holds it whole, so four at once (`STAGING`)
+/// are 256 MB.
+const STAGE_MAX: u64 = 64 * MIB;
+/// How many of a node's creates of staged files run at once; one that waits `STAGE_WAIT` for a turn is answered 503.
+const STAGING: usize = 4;
+const STAGE_WAIT: Duration = Duration::from_secs(20);
 /// An answer at least this long is streamed, not read into one buffer.
 const STREAM_FROM: u64 = 8 * MIB;
 /// A listing's query: `prefix`, `offset` (the objects after it) or `delimiter` (any value).
@@ -75,15 +82,19 @@ async fn operator_only(req: extract::Request, next: middleware::Next) -> Respons
     refused("the store of a lake is opened by the nodes that run it, with the admin token they share; a user's token (a superuser's too) can't open it")
 }
 
-/// The door a page reads and writes its lake through: the same reads, of a lake's files and log only, and a PUT of one new
-/// file of it (`put_object`'s create). A page's sign-in is checked by the guard (`Auth::needed`: an admin for `/store`).
-pub fn files_door(store: Store) -> Router { door(store).layer(middleware::from_fn(lake_files_only)) }
+/// The door a page reads and writes its lake through: the same reads, of a lake's files and log only, and a create of one of its
+/// own staged files (`auth::page_creates`, once each). At most `STAGING` creates run at once on this node.
+pub fn files_door(store: Store) -> Router {
+    let turns = Arc::new(Semaphore::new(STAGING));
+    door(store).layer(middleware::from_fn_with_state(turns, lake_files_only))
+}
 
 /// Passes a page's request only when it reads one of the lake's files (GET or HEAD of an object), lists one of its
-/// folders, or creates a file a page may make (`auth::page_creates`: a segment of the log, a table's Parquet; a PUT with
-/// `If-None-Match: *`, which the store refuses when it is there). The object's path is parsed as `get_at` parses it, so
-/// the door reads and writes what this lets through.
-async fn lake_files_only(object: Option<extract::Path<String>>, Query(listing): Query<Listing>, req: extract::Request, next: middleware::Next) -> Response {
+/// folders, or creates a file of its own staged rows (`auth::page_creates`: a PUT with `If-None-Match: *`, which the store
+/// refuses when it is there). A create takes one of the `turns`, and waits `STAGE_WAIT` for it at most (503 past that: a
+/// page's client sends a create once and waits for its answer). The object's path is parsed as `get_at` parses it, so the
+/// door reads and writes what this lets through.
+async fn lake_files_only(State(turns): State<Arc<Semaphore>>, object: Option<extract::Path<String>>, Query(listing): Query<Listing>, req: extract::Request, next: middleware::Next) -> Response {
     let at = object.map(|extract::Path(raw)| path_of(&raw).map(|at| at.to_string()).unwrap_or_default());
     let lake = match &at {
         Some(at) => crate::store::lake_file(at),
@@ -91,13 +102,25 @@ async fn lake_files_only(object: Option<extract::Path<String>>, Query(listing): 
     };
     let reads = matches!(*req.method(), Method::GET | Method::HEAD);
     let creates = at.as_deref().is_some_and(crate::auth::page_creates) && *req.method() == Method::PUT && text_of(req.headers(), "if-none-match").as_deref() == Some("*");
-    if (lake && reads) || creates {
+    if creates {
+        let Ok(Ok(_turn)) = tokio::time::timeout(STAGE_WAIT, turns.acquire_owned()).await else { return busy() };
+        return next.run(req).await;
+    }
+    if lake && reads {
         return next.run(req).await;
     }
     if !reads {
-        return refused("a page writes only new files of the lake, each once (If-None-Match: *): a segment of the log (log/<id>.seg) or Parquet directly in a table's folder (data/<folder>/<name>.parquet)");
+        return refused("a page writes only its own staged files of the lake, each once (If-None-Match: *): stage/<its slug>/<job>/<n>.parquet");
     }
     refused("a page reads the lake's files and log through its node, never its catalog")
+}
+
+/// A 503 for a create that waited too long for one of the `STAGING` turns: the page sends it again.
+fn busy() -> Response {
+    let mut res = (StatusCode::SERVICE_UNAVAILABLE, "this node is taking as many staged files as it can at once: try again").into_response();
+    res.headers_mut().insert("x-pondra-store", HeaderValue::from_static("1"));
+    res.headers_mut().insert("retry-after", HeaderValue::from_static("1"));
+    res
 }
 
 /// A refusal of the door: 403, with the header that makes the client say it as `PermissionDenied`.
@@ -269,7 +292,8 @@ async fn put_object(State(store): State<Store>, extract::Path(raw): extract::Pat
 
 async fn put_at(store: &Store, raw: &str, headers: &HeaderMap, body: Body) -> Result<Response, Response> {
     let at = path_of(raw)?;
-    let payload = body_of(headers, body).await?;
+    let cap = if crate::auth::page_creates(at.as_ref()) { STAGE_MAX } else { MAX_BODY };
+    let payload = body_of(headers, body, cap).await?;
     let put = store.put_opts(&at, payload, PutOptions { mode: write_mode(headers), ..Default::default() }).await.map_err(answer_error)?;
     let mut res = StatusCode::OK.into_response();
     if let Some(e_tag) = &put.e_tag {
@@ -291,11 +315,10 @@ fn write_mode(headers: &HeaderMap) -> PutMode {
     }
 }
 
-/// A PUT's body in the frames it arrived in (held once, never copied into one buffer); past
-/// `MAX_BODY`, 413 as soon as it is known.
-async fn body_of(headers: &HeaderMap, body: Body) -> Result<PutPayload, Response> {
-    let too_big = || (StatusCode::PAYLOAD_TOO_LARGE, format!("a body past {MAX_BODY} bytes is refused")).into_response();
-    if text_of(headers, "content-length").and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| n > MAX_BODY) {
+/// A PUT's body in the frames it arrived in (held once, never copied into one buffer); past `max`, 413 as soon as it is known.
+async fn body_of(headers: &HeaderMap, body: Body, max: u64) -> Result<PutPayload, Response> {
+    let too_big = || (StatusCode::PAYLOAD_TOO_LARGE, format!("a body past {max} bytes is refused")).into_response();
+    if text_of(headers, "content-length").and_then(|n| n.parse::<u64>().ok()).is_some_and(|n| n > max) {
         return Err(too_big());
     }
     let mut frames = Vec::new();
@@ -304,7 +327,7 @@ async fn body_of(headers: &HeaderMap, body: Body) -> Result<PutPayload, Response
     while let Some(frame) = data.next().await {
         let frame = frame.map_err(|e| bad(format!("the body couldn't be read: {e}")))?;
         total += frame.len() as u64;
-        if total > MAX_BODY {
+        if total > max {
             return Err(too_big());
         }
         frames.push(frame);
@@ -1016,29 +1039,39 @@ mod tests {
         store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused copy copied nothing");
     }
 
-    /// A page's door takes a new file of the lake once (a PUT with `If-None-Match: *`: the second is 412 and the bytes stay), and
-    /// refuses a PUT without the header, a PUT of the catalog and a DELETE, each with the door's words; nothing it refused is written.
+    /// The user a page's requests are for in these tests (its slug is `616c69`).
+    fn ali() -> crate::auth::Principal {
+        crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Admin, access: None, door: "http", from: None, operator: false }
+    }
+
+    /// A request as a user's: the guard sets the principal, which `files_door` reads.
+    async fn as_ali(req: extract::Request, next: middleware::Next) -> Response { crate::auth::WHO.scope(ali(), next.run(req)).await }
+
+    /// A page's door takes a create of its own staged file once (a PUT with `If-None-Match: *`: the second is 412 and the bytes
+    /// stay), refuses another user's slug, a PUT without the header, a PUT of the catalog, of the lake's files and of its log,
+    /// and a DELETE, each with the door's words; a create past 64 MB is 413. Nothing refused is written.
     #[tokio::test]
-    async fn a_page_writes_only_new_files_of_the_lake() {
+    async fn a_page_stages_only_its_own_files_once() {
         let store: Store = Arc::new(InMemory::new());
         store.put(&Path::from("data/t/a.parquet"), PutPayload::from_static(b"0123456789")).await.expect("a data file");
-        let at = serve(Router::new().nest_service("/store", files_door(store.clone()))).await;
+        let at = serve(Router::new().nest_service("/store", files_door(store.clone())).layer(middleware::from_fn(as_ali))).await;
         let url = |rest: &str| format!("http://{at}/store{rest}");
         let http = reqwest::Client::new();
 
-        let made = http.put(url("/data/t/b.parquet")).header("if-none-match", "*").body("new").send().await.expect("a put");
-        assert_eq!(made.status().as_u16(), 200, "a new file is stored");
-        let again = http.put(url("/data/t/b.parquet")).header("if-none-match", "*").body("newer").send().await.expect("a second put");
+        let made = http.put(url("/stage/616c69/j1/0.parquet")).header("if-none-match", "*").body("new").send().await.expect("a put");
+        assert_eq!(made.status().as_u16(), 200, "its own staged file is stored");
+        let again = http.put(url("/stage/616c69/j1/0.parquet")).header("if-none-match", "*").body("newer").send().await.expect("a second put");
         assert_eq!(again.status().as_u16(), 412, "a file that is there is not overwritten");
-        let kept = store.get(&Path::from("data/t/b.parquet")).await.expect("the file").bytes().await.expect("the bytes");
+        let kept = store.get(&Path::from("stage/616c69/j1/0.parquet")).await.expect("the file").bytes().await.expect("the bytes");
         assert_eq!(kept.to_vec(), b"new".to_vec(), "the second put wrote nothing");
-        let segment = http.put(url("/log/x.seg")).header("if-none-match", "*").body("segment").send().await.expect("a put of the log");
-        assert_eq!(segment.status().as_u16(), 200, "a segment of the log is stored");
 
-        let words = "a page writes only new files of the lake, each once (If-None-Match: *)";
+        let words = "a page writes only its own staged files of the lake";
         for (what, res) in [
-            ("a put without the header", http.put(url("/data/t/c.parquet")).body("new").send().await),
+            ("another user's slug", http.put(url("/stage/626f62/j1/0.parquet")).header("if-none-match", "*").body("new").send().await),
+            ("a put without the header", http.put(url("/stage/616c69/j1/1.parquet")).body("new").send().await),
             ("a put of the catalog", http.put(url("/catalog/x")).header("if-none-match", "*").body("new").send().await),
+            ("a put of the lake's files", http.put(url("/data/t/c.parquet")).header("if-none-match", "*").body("new").send().await),
+            ("a put of the log", http.put(url("/log/x.seg")).header("if-none-match", "*").body("segment").send().await),
             // (a published Delta view's next version, put first, would be taken for the lake's own: delta.rs `applied`)
             ("a put of a published view's file", http.put(url("/data/t/_delta_log/00000000000000000001.json")).header("if-none-match", "*").body("{}").send().await),
             ("a delete", http.delete(url("/data/t/a.parquet")).send().await),
@@ -1047,8 +1080,14 @@ mod tests {
             assert_eq!((res.status().as_u16(), res.headers().contains_key("x-pondra-store")), (403, true), "{what}");
             assert!(res.text().await.expect("the words").contains(words), "{what}: the door says what a page may write");
         }
-        store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused put wrote nothing");
+        // a create past 64 MB (a body of chunks, so its length is not known up front): 413, and nothing is written
+        let chunks = (0..64).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 1 << 20]))).chain(std::iter::once(Ok(Bytes::from_static(b"!"))));
+        let big = http.put(url("/stage/616c69/j2/0.parquet")).header("if-none-match", "*").body(reqwest::Body::wrap_stream(futures::stream::iter(chunks))).send().await.expect("a big put");
+        assert_eq!(big.status().as_u16(), 413, "a staged file past 64 MB is refused");
+        store.head(&Path::from("stage/616c69/j2/0.parquet")).await.expect_err("a refused create wrote nothing");
+        store.head(&Path::from("stage/626f62/j1/0.parquet")).await.expect_err("another user's slug wrote nothing");
         store.head(&Path::from("catalog/x")).await.expect_err("a refused put of the catalog wrote nothing");
+        store.head(&Path::from("data/t/c.parquet")).await.expect_err("a refused put of the lake's files wrote nothing");
         store.head(&Path::from("data/t/_delta_log/00000000000000000001.json")).await.expect_err("a refused put of a published view wrote nothing");
         store.head(&Path::from("data/t/a.parquet")).await.expect("a refused delete deleted nothing");
     }
