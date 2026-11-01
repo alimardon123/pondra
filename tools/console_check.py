@@ -1013,17 +1013,26 @@ def folders_checks(browser, port, show):
     moved = until(lambda: sorted(x[0] for x in in_lake("misc")), ["files/misc/blob.bin", "files/misc/new.txt"])
     titles = until(lambda: "new.txt" in p.locator("#tabbar .tab .tn").all_inner_texts() and "old.txt" not in p.locator("#tabbar .tab .tn").all_inner_texts(), True)
     checks["a file renamed from its ⋯ moves its open tab to the new name"] = moved == ["files/misc/blob.bin", "files/misc/new.txt"] and titles is True and pg.tab()[0] == "new.txt"
-    # dragging: a file onto a folder moves it (its tab follows), a folder onto another moves all it holds, files from this computer dropped on a folder go in it
-    pg.workspace("misc", "new.txt").drag_to(folder("archive"))
-    dragged = until(lambda: [x[0] for x in in_lake("archive") if x[0].endswith("new.txt")], ["files/archive/new.txt"])
+    # dragging: a file onto a folder moves it (its tab follows), a folder onto another moves all it holds, files from this computer dropped on a folder go in it.
+    # A move puts the file at its new path and then deletes the old one, and the tree is drawn again from a new listing, with the folder it went to
+    # open (its rows push the ones below down). So each step waits for the move to be whole in the lake and in the tree before the next drag starts.
+    row_at = lambda k: ws.locator(f'.row[data-dir="{k}"]' if k.endswith("/") else f'.row[data-key="file:{k}"]')
+    drawn = lambda here, gone: until(lambda: all(row_at(k).count() == 1 for k in here) and all(row_at(k).count() == 0 for k in gone))
+    pg.workspace("misc", "new.txt")
+    drawn(["misc/new.txt", "archive/"], [])
+    row_at("misc/new.txt").drag_to(row_at("archive/"))
+    dragged = until(lambda: ([x[0] for x in in_lake("archive") if x[0].endswith("new.txt")], [x[0] for x in in_lake("misc") if x[0].endswith("new.txt")]), (["files/archive/new.txt"], [])) == (["files/archive/new.txt"], [])
     followed = until(lambda: p.evaluate("pondra.state.doc?.path"), "archive/new.txt")
-    folder("misc").drag_to(folder("archive"))
-    nested = until(lambda: [x[0] for x in in_lake("archive/misc")], ["files/archive/misc/blob.bin"]) == ["files/archive/misc/blob.bin"] and in_lake("misc") == []
-    folder("archive").evaluate("""r => { const dt = new DataTransfer(); dt.items.add(new File(['a,b\\n1,2\\n'], 'dropped.csv', { type: 'text/csv' }));
+    drawn(["archive/new.txt", "misc/"], ["misc/new.txt"])
+    row_at("misc/").drag_to(row_at("archive/"))
+    nested = until(lambda: ([x[0] for x in in_lake("archive/misc")], in_lake("misc")), (["files/archive/misc/blob.bin"], [])) == (["files/archive/misc/blob.bin"], [])
+    drawn(["archive/misc/blob.bin"], ["misc/"])
+    p.evaluate("""() => { const r = document.querySelector('#workspace .row[data-dir="archive/"]'), dt = new DataTransfer(); // (found and dropped on in one go: a row drawn again between the two would take no events)
+      dt.items.add(new File(['a,b\\n1,2\\n'], 'dropped.csv', { type: 'text/csv' }));
       for (const t of ['dragover', 'drop']) r.dispatchEvent(new DragEvent(t, { bubbles: true, cancelable: true, dataTransfer: dt })); }""")
     landed = until(lambda: "files/archive/dropped.csv" in [x[0] for x in in_lake("archive")])
     checks["dragged in the Workspace: a file onto a folder is moved (its tab follows), a folder onto another with all it holds; files from this computer dropped on a folder go in it"] = \
-        dragged == ["files/archive/new.txt"] and followed == "archive/new.txt" and nested and landed is True
+        dragged and followed == "archive/new.txt" and nested and landed is True
     # a view dragged to the other pane by its head, and back by its tab
     if p.locator("#right").is_hidden():
         p.locator("#panes button").nth(2).click()
