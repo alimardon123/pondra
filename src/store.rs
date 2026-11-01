@@ -2382,9 +2382,13 @@ impl Catalog {
     }
 
     /// Follower: relay a frame of the leader's stream as it came (`members::follow`, with `resend`), so the pages that
-    /// follow this node get it from `subscribe`, as the leader's followers get its own.
+    /// follow this node get it from `subscribe`, as the leader's followers get its own. A new term's `Start` says whether
+    /// this node's own commits are replicated, as its feed's first `Start` does, never the leader's.
     pub(crate) fn relay(&self, f: Frame) {
-        self.send(f);
+        self.send(match f {
+            Frame::Start { term, .. } => Frame::Start { term, replicated: self.replicas > 1 },
+            f => f,
+        });
     }
 
     /// Inline data (`d/`) that one of the last 64 commits wrote: it never changes, so the frame's copy is always good.
@@ -2723,8 +2727,10 @@ impl Catalog {
         }
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
         if self.kv.is_writer() && !self.mirror.load(Relaxed) {
+            // (`at` first: a commit after it that the scan sees is one a later page's `moved_since` counts)
+            let at = self.committed.load(Relaxed);
             let all = self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?;
-            return Ok((all, self.committed.load(Relaxed)));
+            return Ok((all, at));
         }
         {
             let o = self.overlay.lock().unwrap();
@@ -2788,24 +2794,29 @@ impl Catalog {
         Ok((all.into_iter().filter(|(k, _)| keep(k.as_str())).take(n).collect(), at))
     }
 
-    /// Whether a commit after `since` put or deleted a key in [from, to) that `keep` allows, as far as the changes `recent`
-    /// holds say (the leader's own, or a follower's relayed ones). A range read as of `since` is then stale: `kv`'s `since`.
-    /// What `recent` no longer holds, or none of it while `at` is past `since`, counts as moved: it can't tell.
+    /// Whether a commit between `since` and `at` put or deleted a key in [from, to) that `keep` allows, as far as the changes
+    /// `recent` holds say (the leader's own, or a follower's relayed ones): a range read partly as of `since` and partly as of
+    /// `at` is then torn (`kv`'s `since`). Only the commits after the older of the two and up to the newer count: later ones
+    /// are in neither read. One change per commit, so a commit missing from `recent` (aged out, or a follower's reconnect
+    /// that left a hole) counts as moved: it can't tell.
     pub fn moved_since(&self, from: &str, to: &str, since: u64, at: u64, keep: impl Fn(&str) -> bool) -> bool {
-        if at <= since {
+        let (after, upto) = (since.min(at), since.max(at));
+        if after == upto {
             return false;
         }
-        let r = self.recent.lock().unwrap();
-        let changes: Vec<&Delta> = r.0.iter().filter_map(|(_, f)| match f {
-            Frame::Change(d) => Some(d.as_ref()),
-            _ => None,
-        }).collect();
-        let Some(first) = changes.first().map(|d| d.id) else { return true };
-        if since + 1 < first {
-            return true; // (commits between `since` and the first change held are gone)
-        }
         let within = |k: &str| k >= from && k < to && keep(k);
-        changes.iter().filter(|d| d.id > since).any(|d| d.puts.iter().any(|(k, _)| within(k)) || d.deletes.iter().any(|k| within(k)))
+        let r = self.recent.lock().unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut touched = false;
+        for (_, f) in r.0.iter() {
+            if let Frame::Change(d) = f {
+                if d.id > after && d.id <= upto {
+                    ids.insert(d.id);
+                    touched = touched || d.puts.iter().any(|(k, _)| within(k)) || d.deletes.iter().any(|k| within(k));
+                }
+            }
+        }
+        touched || (ids.len() as u64) < upto - after
     }
 
     /// The first `n` entries with keys in [from, to), in key order: a commit's bounded look at a range
@@ -3143,10 +3154,15 @@ mod tests {
         let since = lake.cat.committed();
         lake.cat.commit(vec![("h/x".to_string(), vec![2])], &[]).await?;
         let all = |_: &str| true;
-        assert!(!lake.cat.moved_since("g/", "g0", since, lake.cat.committed(), all), "a commit outside the range doesn't move it");
+        let mid = lake.cat.committed();
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "a commit outside the range doesn't move it");
         lake.cat.commit(vec![("g/2".to_string(), vec![3])], &[]).await?;
-        assert!(lake.cat.moved_since("g/", "g0", since, lake.cat.committed(), all), "a commit inside it does");
-        assert!(!lake.cat.moved_since("g/", "g0", since, lake.cat.committed(), |k: &str| k != "g/2"), "one the reader may not see doesn't");
+        let now = lake.cat.committed();
+        assert!(lake.cat.moved_since("g/", "g0", since, now, all), "a commit inside it does");
+        assert!(lake.cat.moved_since("g/", "g0", now, since, all), "read the other way round too");
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "one past both reads is in neither");
+        assert!(!lake.cat.moved_since("g/", "g0", since, now, |k: &str| k != "g/2"), "one the reader may not see doesn't");
+        assert!(lake.cat.moved_since("x/", "x0", now, now + 2, all), "commits `recent` doesn't hold can't be told apart");
         crate::memory::forget_memory(&url);
         Ok(())
     }

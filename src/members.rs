@@ -93,9 +93,11 @@ pub enum Open {
 /// change is held and each commit applied, and a connection that ends or fails is tried again 500 ms later. `frame` sees
 /// every frame before the lake takes it (a node keeps its replica there), and `down` runs when a connection ends or
 /// fails, before that wait. A change no newer than the last one is skipped: a reconnect replays some. A new term's
-/// `Start` drops the changes the old leader left uncommitted, and starts the ids again. With `resend`, each frame the
-/// lake took is relayed on to the pages that follow it (`Catalog::relay`; never a `Start`, nor a commit or durable
-/// point they have had). The loop ends when `lake` is gone (checked as a frame arrives) or `open` says `Stop`.
+/// `Start` drops the changes the old leader left uncommitted, and starts the ids again; so does any `Start` after a
+/// connection's first frame (a follower relays a new term's mid-stream, after the old term's frames its `recent` keeps,
+/// while its own first `Start` may already name either term). With `resend`, each frame the lake took is relayed on to
+/// the pages that follow it (`Catalog::relay`: a `Start` only when the term changes, and no commit or durable point
+/// they have had). The loop ends when `lake` is gone (checked as a frame arrives) or `open` says `Stop`.
 #[cfg_attr(not(feature = "doors"), allow(dead_code))] // (a node's `cluster::mirror` calls it; a page's join will too)
 pub async fn follow(
     lake: Weak<Lake>,
@@ -106,19 +108,22 @@ pub async fn follow(
 ) {
     let mut last = 0; // the last change we got (a reconnect replays some we have)
     let mut term = None; // the leader's term, as its `Start` says
-    let mut relayed = (0, 0); // the last commit and durable point relayed (`relays`)
+    let mut relayed = Relayed::default(); // what was relayed (`relays`)
     while lake.strong_count() > 0 {
         match open().await {
             Ok(r) => {
                 let mut frames = Box::pin(frames(r.bytes_stream()));
+                let mut first = true; // (this connection's first frame: its node's own `Start`)
                 while let Some(Ok(f)) = frames.next().await {
                     let Some(live) = lake.upgrade() else { return };
                     if let Frame::Start { term: t, .. } = &f {
-                        if term.replace(*t) != Some(*t) {
+                        let new = term.replace(*t) != Some(*t);
+                        if new || !first {
                             last = 0;
                             live.drop_pending();
                         }
                     }
+                    first = false;
                     if let Frame::Change(d) = &f {
                         if d.id <= last {
                             continue;
@@ -144,23 +149,38 @@ pub async fn follow(
     }
 }
 
+/// What `follow` relayed (`resend`): the leader's term, and the last commit and durable point.
+#[derive(Default)]
+struct Relayed {
+    term: Option<u64>,
+    committed: u64,
+    durable: u64,
+}
+
 /// Whether `follow` relays a frame the lake took (`resend`): every change (one at or below the last was skipped before it),
-/// and a commit or durable point past the last one relayed, so a reconnect's replay isn't sent again. Never a `Start`: the
-/// follower's own feed writes that, with its own `replicated`.
-fn relays(f: &Frame, relayed: &mut (u64, u64)) -> bool {
+/// and a commit or durable point past the last one relayed, so a reconnect's replay isn't sent again. A `Start` only when the
+/// term changes (the first is not: the follower's own feed writes its `Start`); it then goes into `recent` in order, so a page
+/// reading the old term's frames there resets on it (`follow`), and the new term's points are new again.
+fn relays(f: &Frame, relayed: &mut Relayed) -> bool {
     match f {
         Frame::Change(_) => true,
         Frame::Committed(upto) => {
-            let fresh = *upto > relayed.0;
-            relayed.0 = relayed.0.max(*upto);
+            let fresh = *upto > relayed.committed;
+            relayed.committed = relayed.committed.max(*upto);
             fresh
         }
         Frame::Durable(upto) => {
-            let fresh = *upto > relayed.1;
-            relayed.1 = relayed.1.max(*upto);
+            let fresh = *upto > relayed.durable;
+            relayed.durable = relayed.durable.max(*upto);
             fresh
         }
-        Frame::Start { .. } => false,
+        Frame::Start { term, .. } => {
+            let changed = relayed.term.replace(*term).is_some_and(|was| was != *term);
+            if changed {
+                (relayed.committed, relayed.durable) = (0, 0);
+            }
+            changed
+        }
     }
 }
 
@@ -248,19 +268,22 @@ mod tests {
         assert!(got.len() == 1 && got[0].is_err(), "a frame of an unknown kind ends it");
     }
 
-    /// A relay sends each change, and each commit or durable point past the last one sent, never a `Start`.
+    /// A relay sends each change, each commit or durable point past the last one sent, and a `Start` only when the term changes.
     #[test]
-    fn a_relay_sends_changes_and_new_points_but_no_start() {
-        let mut sent = (0, 0);
+    fn a_relay_sends_changes_new_points_and_a_new_term() {
+        let mut sent = Relayed::default();
         let change = Frame::Change(Arc::new(crate::store::Delta { id: 4, puts: vec![], deletes: vec![] }));
-        assert!(!relays(&Frame::Start { term: 4, replicated: true }, &mut sent), "a follower's own feed writes its Start");
+        assert!(!relays(&Frame::Start { term: 4, replicated: true }, &mut sent), "a follower's own feed writes its first Start");
         assert!(relays(&change, &mut sent));
         assert!(relays(&Frame::Committed(3), &mut sent));
         assert!(!relays(&Frame::Committed(3), &mut sent), "a reconnect's replay is not sent again");
         assert!(!relays(&Frame::Committed(2), &mut sent));
         assert!(relays(&Frame::Durable(3), &mut sent));
         assert!(!relays(&Frame::Durable(3), &mut sent));
-        assert_eq!(sent, (3, 3));
+        assert!(!relays(&Frame::Start { term: 4, replicated: true }, &mut sent), "a reconnect to the same term");
+        assert!(relays(&Frame::Start { term: 5, replicated: true }, &mut sent), "a new term goes out mid-stream");
+        assert!(relays(&Frame::Committed(3), &mut sent), "the new term's points are new");
+        assert!(relays(&Frame::Durable(2), &mut sent));
     }
 
     #[tokio::test]
