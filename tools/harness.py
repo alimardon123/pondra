@@ -10615,6 +10615,8 @@ def guarded():
     # A joined page's writes, through its node: a superuser's flush and files on a follower are answered by the leader (not a
     # 403); a Write role's are refused as before; a new lake file through /store is stored once (the second is 412, the bytes stay)
     until(lambda: isinstance(ask(P + 1, b"", path="/whoami", method="GET", auth=boss), dict), True, 20)  # (the follower has the new superuser)
+    # (and the nodes' key, which the lake has once it has users: a relay sent before the follower has it is the leader's 401)
+    until(lambda: isinstance(ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss), dict), True, 20)
     page = {
         "a superuser's flush, on a follower": ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss),
         "a superuser's files, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g6", "columns": [["id", "BIGINT"], ["amount", "DOUBLE"]], "files": []}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
