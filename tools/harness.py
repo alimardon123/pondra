@@ -10862,6 +10862,13 @@ def guarded():
     checks["a superuser's flush and files at /cluster/commit and /cluster/files: 403 on a follower and on the leader, the node's own words; a Write role's files: 403; a staged file through /store stored once (the second 412), a lake data file through /store: 403"] = \
         all(refused(page[k]) and "this route is the nodes' own" in str(page[k]) for k in ("a superuser's flush, on a follower", "a superuser's files, on a follower", "a superuser's flush, on the leader", "a superuser's files, on the leader", "a Write role's files, on a follower")) \
         and refused(page["a data file, through /store"]) and page["a staged file, through /store"] == b"" and str(page["the same staged file again"]).startswith("ERROR 412")
+    # A blob URL is a browser tab's own file, read by its page alone: a node refuses it by name, as boss and as a user, before any file
+    # is looked at (`off_page`, ext.rs). A name the node sees as a file reader's URL is no path, no lake file and no secret's scope.
+    blob_read = "SELECT * FROM read_csv('blob:nodedata:x')"
+    blob_said = {"boss": ask(P, blob_read, auth=boss), "bob": ask(P, blob_read, auth=bob)}
+    info["blob"] = blob_said
+    checks["a blob: URL read by a node is refused by name, as boss and as a user (the page reads its own file alone)"] = \
+        all(isinstance(v, str) and v.startswith("ERROR ") and "only that tab's page reads it" in v for v in blob_said.values())
     # A joined page's INSERT, staged (brief P-B): boss's page stages a Parquet file under its own slug (the node writes it: COPY), and the
     # follower's /insert/orders?staged=1 runs the INSERT from it as boss, then the staged files go, so a resend is a duplicate. A NULL for
     # a NOT NULL column is the node's own refusal (its SQLSTATE), a PUT under another user's slug is 403, and a create past 64 MB is 413

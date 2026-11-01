@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
-use crate::ext_names::{quoted, scheme};
+use crate::ext_names::{is_blob, quoted, scheme};
 use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
@@ -82,6 +82,14 @@ pub(crate) fn on_disk(place: &str) -> bool { scheme(place).is_none_or(|s| s == "
 /// refusal a client gets for it, saying what it may do instead. BACKUP, RESTORE and SET LOCATION all say it this way.
 pub(crate) fn owners_only(place: &str, words: String) -> Result<()> {
     ensure!(owner() || !on_disk(place), crate::codes::coded("42501", words));
+    Ok(())
+}
+
+/// A blob URL on a native build (a node, the shell, `pondra sql`): refused by name, for the owner and for any client alike.
+/// Only a page's tab reads its own blob (`blob_with`, wasm32), so nothing off the page may read one, and no secret covers one.
+/// On a page there is nothing to refuse.
+fn off_page(u: &str) -> Result<()> {
+    ensure!(!(cfg!(not(target_arch = "wasm32")) && is_blob(u)), crate::codes::coded("0A000", format!("{u}: a blob: URL is a browser tab's own file: only that tab's page reads it")));
     Ok(())
 }
 
@@ -230,6 +238,7 @@ const PARQUET_TUNING: [&str; 8] = ["pushdown_filters", "reorder_filters", "enabl
 /// so its relative name stays as written and is read where it reads every relative name, in the
 /// lake's files (`for_caller`), as a view over `'x.csv'` is; one that leaves them is refused here.
 fn located(l: &str) -> Result<String> {
+    off_page(l)?;
     if scheme(l).is_some() {
         return Ok(l.to_string());
     }
@@ -300,6 +309,7 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
 /// relative names are read where a page reads them: in the lake's files (`lake_files::relative`, `PUT /files/…`'s
 /// place). A URL with a scheme, or an absolute path, stays as it is, and `check` decides it.
 fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
+    spec.urls.iter().try_for_each(|u| off_page(u))?; // (before `lake_files::relative` could make a blob URL a lake's file)
     if owner() {
         return Ok(spec);
     }
@@ -312,6 +322,7 @@ fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
 pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
+    spec.urls.iter().try_for_each(|u| off_page(u))?;
     if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u) || own_stage(lake, u)) {
         return Ok(()); // (the lake's own files, or the caller's own staged rows: whoever reads the lake reads them, as GET /files/… does)
     }
@@ -351,6 +362,7 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 /// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
 /// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
 pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
+    urls.iter().try_for_each(|u| off_page(u))?; // (as `check` does: before anything is listed, for the owner too)
     if reads_any_url() {
         return Ok(());
     }
@@ -363,6 +375,7 @@ pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
 }
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
+    off_page(u)?;
     match scheme(u).filter(|s| *s != "file") {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
@@ -522,6 +535,9 @@ fn root(url: &str) -> Option<String> {
 /// DataFusion reads `url` through a store for its bucket, made with the secret covering it (or,
 /// for the node's owner, the node's own credentials). The lake's own bucket keeps its store.
 pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
+    if is_blob(url) {
+        return register_blob(lake, url).await; // (before any secret is listed or covers it)
+    }
     let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file" && s != "kafka")) else { return Ok(()) }; // (this machine's: DataFusion's own; a topic: a Kafka client's)
     let lake_root = self::root(&lake.url);
     let attached: Vec<Option<String>> = lake.attached.read().unwrap().iter().map(|(_, o)| self::root(&o.url)).collect();
@@ -542,6 +558,21 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
 }
+
+/// A blob URL's store, registered under `blob://` bare, which every blob's stand-in (`ext_names::stand_in`) is read through.
+/// Nothing is listed, covered or unsealed for it, and the store is not wrapped in `CachedStore` (which keeps ranges up to
+/// 512 MB, a second copy of a file the tab holds already): `bridge::Bridge` offers it to DataFusion, uncached. Off the page
+/// it is refused (`off_page`).
+#[cfg(target_arch = "wasm32")]
+async fn register_blob(lake: &Lake, url: &str) -> Result<()> {
+    let store = BLOB.get().with_context(|| format!("{url}: no blob store is set for this page"))?;
+    lake.rt.register_object_store(&url::Url::parse("blob://")?, Arc::new(crate::bridge::Bridge(store.clone())));
+    Ok(())
+}
+
+/// Off the page a blob URL is refused by name (`off_page`), before any store is looked for.
+#[cfg(not(target_arch = "wasm32"))]
+async fn register_blob(_: &Lake, url: &str) -> Result<()> { off_page(url) }
 
 /// The store `url` is read through (made as `register` makes it), and its path there.
 pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
@@ -593,6 +624,17 @@ static WEB: std::sync::OnceLock<Web> = std::sync::OnceLock::new();
 #[cfg(target_arch = "wasm32")]
 pub fn web_with(web: Web) {
     let _ = WEB.set(web);
+}
+
+/// A page's store of its blob URLs, the tab's own files (web/'s `fetch.rs`, `Blob`): one store for every blob, since a blob's
+/// stand-in names its URL (`ext_names::blob_of`). Set once per module, as `web_with` is.
+#[cfg(target_arch = "wasm32")]
+static BLOB: std::sync::OnceLock<Arc<dyn object_store::ObjectStore>> = std::sync::OnceLock::new();
+
+/// Gives a page the store its blob URLs are read through (`register_blob`). Set once per module; a later call changes nothing.
+#[cfg(target_arch = "wasm32")]
+pub fn blob_with(store: Arc<dyn object_store::ObjectStore>) {
+    let _ = BLOB.set(store);
 }
 
 /// A store for a bucket, container or host, with a secret's settings or the environment's.
@@ -694,6 +736,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             let b = HttpBuilder::new().with_url(url.as_str()).with_client_options(options);
             Arc::new(if public { b.with_http_connector(crate::public::Connector { headers }) } else { b }.build()?)
         }
+        "blob" => bail!("a blob: URL is a browser tab's own file: only that tab's page reads it"), // (`register_blob` reads one; no store is built for it)
         s => bail!("{s}:// isn't read (s3, r2, gs, az, abfss, https)"),
     })
 }
@@ -1256,6 +1299,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
     let scope = params.remove("scope");
     ensure!(t != "git" || scope.is_some(), "a git secret says where its token may go: SCOPE 'https://github.com/acme'");
     if let Some(s) = &scope {
+        ensure!(!is_blob(s), crate::codes::coded("0A000", format!("{s}: a blob: URL is a browser tab's own file: only that tab's page reads it, so no secret's SCOPE may be one")));
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
     let (sealed, key) = seal_new(&serde_json::to_vec(&params)?)?;
@@ -1792,6 +1836,32 @@ mod tests {
         assert_eq!(crate::codes::of(&err), "42P01");
         assert!(said.contains("files/missing.csv") && !said.contains(&lake.url), "{said}");
 
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A blob URL is a tab's own file: off the page, a node refuses it by name, as the owner and as a client alike, before any
+    /// lake file or secret is looked at (`off_page`). `LOCATION` and `CREATE SECRET … SCOPE` refuse it the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blob_url_is_refused_by_name_off_the_page() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-blob-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        for owner in [true, false] {
+            for sql in ["SELECT * FROM read_csv('blob:https://o/6f1c')", "SELECT * FROM read_csv('blob:nodedata:6f1c')", "SELECT * FROM read_csv('BLOB:https://o/6f1c')"] {
+                let err = run(&lake, owner, sql).await.unwrap_err();
+                assert_eq!(crate::codes::of(&err), "0A000", "{sql} as owner {owner}");
+                assert!(crate::codes::words(&err).contains("a blob: URL is a browser tab's own file: only that tab's page reads it"), "{}", crate::codes::words(&err));
+            }
+        }
+        assert!(scope(true, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as the owner");
+        assert!(scope(false, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as a client");
+        for owner in [true, false] {
+            let listed = scope(owner, check_urls(&lake, &["blob:https://o/6f1c"])).await.unwrap_err();
+            assert_eq!(crate::codes::of(&listed), "0A000", "check_urls as owner {owner}: {listed}");
+        }
+        let scoped = BTreeMap::from([("type".to_string(), "s3".to_string()), ("scope".to_string(), "blob:https://o/".to_string())]);
+        assert!(made("s", scoped).is_err(), "a secret's SCOPE is no blob");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

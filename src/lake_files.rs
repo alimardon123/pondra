@@ -23,9 +23,10 @@ pub fn leaves(path: &str) -> bool {
 /// A name a client or a page writes in SQL (`'orders.csv'`, `'./d/*.parquet'`), as a URL in a folder's own files: `root`
 /// (ending in `/`: the lake's URL, or a page's `mem:///`) then `files/`. None for a name that already says where it is:
 /// one with a scheme (`s3://`, `https://`) or an absolute path (`/x`, `\x`, `C:/x`), which the caller reads as it always
-/// did. A name that leaves its folder is refused: a file is read where the caller is, and never outside `files/`.
+/// did. A name that leaves its folder is refused: a file is read where the caller is, and never outside `files/`. A blob URL
+/// (`blob:nodedata:x`, which has no `://`) is a tab's own file, never a lake's, so it is none of these names.
 pub fn relative(root: &str, name: &str) -> Option<anyhow::Result<String>> {
-    if name.contains("://") || is_absolute(name) {
+    if name.contains("://") || crate::ext_names::is_blob(name) || is_absolute(name) {
         return None;
     }
     let name = name.strip_prefix("./").unwrap_or(name);
