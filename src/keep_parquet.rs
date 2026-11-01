@@ -2,7 +2,6 @@
 //! copied, undecoded, into files of ours, which take our footer. `plan` cuts a file's row groups into kept files, or
 //! says why the file isn't kept (in words; the file is then written as today, and no error reaches the user). `copy`
 //! writes one cut as one file. `keep` does both for a whole file in memory, for the tests.
-#![cfg_attr(not(test), allow(dead_code))] // (K2 calls it from `write::ctas` and removes this line)
 
 use crate::adopt::same;
 use anyhow::{ensure, Result};
@@ -13,7 +12,9 @@ use datafusion::parquet::basic::{ColumnOrder, Compression, SortOrder, Type as Ph
 use datafusion::parquet::column::page::PageReader;
 use datafusion::parquet::column::writer::ColumnCloseResult;
 use datafusion::parquet::errors::ParquetError;
-use datafusion::parquet::file::metadata::{ColumnChunkMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use datafusion::parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
+#[cfg(test)]
+use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::parquet::file::reader::{ChunkReader, Length};
 use datafusion::parquet::file::serialized_reader::SerializedPageReader;
@@ -182,6 +183,7 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
 
 /// Every cut of a whole file that `plan` allows, copied (tests, and a file already in memory). `Ok(Err(why))` when the
 /// file isn't kept; `Err` only when a chunk can't be read (`copy`).
+#[cfg(test)]
 pub(crate) fn keep(file: Bytes, table: &Schema, limits: &Limits) -> Result<Result<Vec<Kept>, String>> {
     let md = match ParquetMetaDataReader::new().with_page_index_policy(PageIndexPolicy::Optional).parse_and_finish(&file) {
         Ok(md) => md,

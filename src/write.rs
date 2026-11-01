@@ -1213,6 +1213,11 @@ impl Files {
 
     /// Where its files are.
     pub fn paths(&self) -> Vec<String> { self.files.iter().map(|f| f.path.clone()).collect() }
+
+    /// The files an INSERT wrote without rows (`keep_load`: a Parquet file's copy), as `write_rows` would have given them.
+    pub(crate) fn new(table: &str, job: &str, columns: Vec<(String, String)>, files: Vec<DataFile>) -> Self {
+        Files { table: table.into(), job: job.into(), columns, files }
+    }
 }
 
 /// Run the query here and write its rows as Parquet into the table's folder (None: this job was
@@ -1233,7 +1238,7 @@ pub async fn write_files(lake: &Lake, ctx: &SessionContext, table: &str, query: 
 }
 
 /// Whether the leader has recorded this INSERT's files already.
-async fn recorded(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some()) }
+pub(crate) async fn recorded(lake: &Lake, job: &str) -> Result<bool> { Ok(lake.cat.get::<u64>(&producer_key(&format!("job:{job}"))).await?.is_some()) }
 
 /// Has a job's plain INSERT (its log flush, producer `sql:{job}`) been recorded? A retry of it is a
 /// duplicate, so the key check doesn't meet the job's own rows.
@@ -1752,11 +1757,17 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             rows_sql(m, &stmt)? // (a RETURNING's rows: worked out here)
         }
         (_, Stmt::Insert(_, query)) => {
-            let to = app.to();
-            let stamped = stamp(lake, &table, Some(&to)).await?;
-            let f = match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none()).await? {
-                Some(f) => f,
-                None => write_files(lake, &open(session(lake, query, "").await?), &table, query, &job, stamped).await?,
+            // A CREATE TABLE … AS FROM a Parquet file keeps its row groups, or the rows are written as always (`keep_load`).
+            let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref()).await {
+                Some(f) => Some(f),
+                None => {
+                    let to = app.to();
+                    let stamped = stamp(lake, &table, Some(&to)).await?;
+                    match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none()).await? {
+                        Some(f) => f,
+                        None => write_files(lake, &open(session(lake, query, "").await?), &table, query, &job, stamped).await?,
+                    }
+                }
             };
             let Some(f) = f else { return Ok(j!({"duplicate": true})) };
             return match app.record_files(f).await {
@@ -2329,6 +2340,9 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
             Ok(Some(Request::Flush(encode_flush(&pack(target, &[append]).await?)?.into())))
         }
         (_, Stmt::Insert(_, sql)) => {
+            if let Some(f) = crate::keep_load::kept(query, target, table, sql, job, stored.as_ref()).await {
+                return Ok(Some(Request::Files(f))); // (a Parquet file's row groups kept: `keep_load`)
+            }
             let ctx = open(session(query, sql, "").await?);
             Ok(write_files(target, &ctx, table, sql, job, stamp(target, table, None).await?).await?.map(Request::Files))
         }
