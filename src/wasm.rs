@@ -3,7 +3,6 @@
 //! by its SHA-256 (`compiled`), and each call runs in a store of its own, so no call sees another's memory and a part holds
 //! nothing between batches. A part imports nothing yet: one that imports what this Pondra doesn't offer is refused by the
 //! import's name when it is loaded (ADR-075 §3). Arguments and answers cross as Arrow IPC.
-#![cfg_attr(not(test), allow(dead_code))] // (E2b registers its functions in every session; until then its tests call it)
 use crate::codes::coded;
 use anyhow::{bail, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef};
@@ -17,13 +16,27 @@ use wasmtime::{Config, Engine, Store};
 
 wasmtime::component::bindgen!({ path: "wit", world: "extension" });
 
-/// One scalar function an extension has, as its `describe()` says.
+/// The world of an extension with table functions too (`open`, `next`, `close`): asked for only when `describe()` names one.
+mod tables {
+    wasmtime::component::bindgen!({ path: "wit", world: "extension-with-tables" });
+}
+
+/// One function an extension has, as its `describe()` says: a scalar's answer is `returns`; a table function's rows have
+/// `columns` (and its `returns` is Null).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
     pub name: String,
     pub arguments: Vec<DataType>,
     pub returns: DataType,
     pub volatile: bool,
+    pub columns: Vec<(String, DataType)>,
+}
+
+impl Function {
+    pub fn is_table(&self) -> bool { !self.columns.is_empty() }
+
+    /// A table function's rows' schema.
+    pub fn schema(&self) -> Arc<Schema> { Arc::new(Schema::new(self.columns.iter().map(|(n, t)| Field::new(n, t.clone(), true)).collect::<Vec<_>>())) }
 }
 
 /// An extension's WebAssembly part, compiled and ready to call: its name and version, and its functions.
@@ -31,21 +44,88 @@ pub struct Loaded {
     pub name: String,
     pub version: String,
     pub functions: Vec<Function>,
-    pre: ExtensionPre<()>,
+    pre: ExtensionPre<Held>,
+    tables: Option<tables::ExtensionWithTablesPre<Held>>,
 }
 
 impl std::fmt::Debug for Loaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{} {}", self.name, self.version) }
 }
 
-/// The process's Wasmtime: compiled code is the engine's, so one is shared by every node in a process.
+/// How often the engine's epoch ticks: a call past its time is stopped within a tick of it, at its next loop or call.
+const TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The process's Wasmtime: compiled code is the engine's, so one is shared by every node in a process. Its epoch ticks on a
+/// thread of its own (`TICK`), which is how a call that runs past its time is stopped (epoch interruption, E2c).
 fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::new();
         config.wasm_component_model(true);
-        Engine::new(&config).expect("Wasmtime's engine")
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).expect("Wasmtime's engine");
+        let ticking = engine.weak();
+        std::thread::Builder::new()
+            .name("pondra-wasm-epoch".into())
+            .spawn(move || {
+                while let Some(engine) = ticking.upgrade() {
+                    engine.increment_epoch();
+                    drop(engine);
+                    std::thread::sleep(TICK);
+                }
+            })
+            .expect("the extensions' clock thread");
+        engine
     })
+}
+
+/// A call's limits: its part's memory (`PONDRA_EXTENSION_MB`, 256), and its time for one batch (`PONDRA_EXTENSION_SECS`, 30),
+/// each the node's admin's, read when the call starts (`now`).
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub mb: usize,
+    pub secs: u64,
+}
+
+impl Limits {
+    pub fn now() -> Self { Limits { mb: crate::env::or("PONDRA_EXTENSION_MB", 256usize), secs: crate::env::or("PONDRA_EXTENSION_SECS", 30u64).max(1) } }
+}
+
+/// What a call's store holds: its memory's limit, and whether the call reached it.
+struct Held {
+    max_bytes: usize,
+    full: bool,
+}
+
+impl wasmtime::ResourceLimiter for Held {
+    fn memory_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        if desired > self.max_bytes {
+            self.full = true; // (said by `stopped`: the call fails, the node goes on)
+            wasmtime::bail!("an extension's memory past {} MB", self.max_bytes >> 20);
+        }
+        Ok(true)
+    }
+    fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> { Ok(desired <= 1 << 20) }
+}
+
+/// A store for one call: nothing kept from another, its limits set.
+fn store(limits: Limits) -> Store<Held> {
+    let mut store = Store::new(engine(), Held { max_bytes: limits.mb << 20, full: false });
+    store.limiter(|held| held);
+    store.set_epoch_deadline(limits.secs * 1000 / TICK.as_millis() as u64);
+    store
+}
+
+/// A call that stopped, said by why: past its time (57014, as a cancelled statement is), past its memory (53200, out of
+/// memory), or a trap of its own (38000, as its own error is).
+fn stopped(store: &Store<Held>, limits: Limits, name: &str, function: &str, e: wasmtime::Error) -> anyhow::Error {
+    if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+        return coded("57014", format!("{name}'s {function} ran past {} s, its time for one batch (PONDRA_EXTENSION_SECS)", limits.secs));
+    }
+    if store.data().full {
+        return coded("53200", format!("{name}'s {function} passed {} MB, an extension's memory (PONDRA_EXTENSION_MB)", limits.mb));
+    }
+    coded("38000", format!("{name}'s {function} stopped: {e:#}"))
 }
 
 /// Where compiled parts are kept: `PONDRA_CACHE_DIR`, else the user's cache folder; in a folder per Wasmtime release, whose
@@ -89,16 +169,27 @@ fn compiled(bytes: &[u8], sha256: &str) -> Result<Component> {
 /// is refused saying why.
 pub fn load(bytes: &[u8], sha256: &str) -> Result<Loaded> {
     let component = compiled(bytes, sha256)?;
-    let linker: Linker<()> = Linker::new(engine()); // (no imports yet: `log@1` and `clock@1` come in E5)
+    let linker: Linker<Held> = Linker::new(engine()); // (no imports yet: `log@1` and `clock@1` come in E5)
     let ty = component.component_type();
     if let Some((import, _)) = ty.imports(engine()).next() {
         return Err(coded("0A000", format!("the extension needs {import}, which this Pondra doesn't offer")));
     }
-    let pre = ExtensionPre::new(linker.instantiate_pre(&component)?)?;
-    let mut store = Store::new(engine(), ());
-    let said = pre.instantiate(&mut store)?.call_describe(&mut store)?;
+    let instance_pre = linker.instantiate_pre(&component)?;
+    let pre = ExtensionPre::new(instance_pre.clone())?;
+    let limits = Limits::now();
+    let mut store = store(limits);
+    let said = match pre.instantiate(&mut store).and_then(|i| i.call_describe(&mut store)) {
+        Ok(said) => said,
+        Err(e) => return Err(stopped(&store, limits, "the extension", "describe()", e)),
+    };
     let (name, version, functions) = described(&said)?;
-    Ok(Loaded { name, version, functions, pre })
+    let tables = match functions.iter().filter(|f| f.is_table()).map(|f| f.name.as_str()).collect::<Vec<_>>() {
+        none if none.is_empty() => None,
+        named => Some(tables::ExtensionWithTablesPre::new(instance_pre).map_err(|e| {
+            coded("22023", format!("{name}'s describe() names table functions ({}), but it doesn't export open, next and close: {e:#}", named.join(", ")))
+        })?),
+    };
+    Ok(Loaded { name, version, functions, pre, tables })
 }
 
 /// `describe()`'s JSON: the name, version and functions, each type Arrow's as written (`Int64`, `Utf8`). Fields a host
@@ -113,7 +204,12 @@ fn described(json: &str) -> Result<(String, String, Vec<Function>)> {
     let mut functions = vec![];
     for f in v["functions"].as_array().map(Vec::as_slice).unwrap_or_default() {
         let arguments = f["arguments"].as_array().map(Vec::as_slice).unwrap_or_default().iter().map(ty).collect::<Result<_>>()?;
-        functions.push(Function { name: text(f, "name")?, arguments, returns: ty(&f["returns"])?, volatile: f["volatile"].as_bool().unwrap_or(false) });
+        let mut columns = vec![];
+        for c in f["columns"].as_array().map(Vec::as_slice).unwrap_or_default() {
+            columns.push((text(c, "name")?, ty(&c["type"])?));
+        }
+        let returns = if columns.is_empty() { ty(&f["returns"])? } else { DataType::Null };
+        functions.push(Function { name: text(f, "name")?, arguments, returns, volatile: f["volatile"].as_bool().unwrap_or(false), columns });
     }
     Ok((text(&v, "name")?, text(&v, "version")?, functions))
 }
@@ -122,7 +218,10 @@ impl Loaded {
     /// Calls `function` over `columns`, one per argument, cast to the types `describe()` gave: its one column of answers, as
     /// many as the rows. The function's own error, a trap or an answer of the wrong type or length fails the call with its
     /// words.
-    pub fn call(&self, function: &str, columns: &[ArrayRef], rows: usize) -> Result<ArrayRef> {
+    pub fn call(&self, function: &str, columns: &[ArrayRef], rows: usize) -> Result<ArrayRef> { self.call_with(function, columns, rows, Limits::now()) }
+
+    /// `call`, within `limits`.
+    pub fn call_with(&self, function: &str, columns: &[ArrayRef], rows: usize, limits: Limits) -> Result<ArrayRef> {
         let f = self.functions.iter().find(|f| f.name == function).with_context(|| format!("{} has no function {function}", self.name))?;
         if columns.len() != f.arguments.len() {
             bail!("{function} takes {} arguments, not {}", f.arguments.len(), columns.len());
@@ -130,9 +229,12 @@ impl Loaded {
         let cast = columns.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
         let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
         let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(rows)))?;
-        let mut store = Store::new(engine(), ());
-        let instance = self.pre.instantiate(&mut store)?;
-        let out = instance.call_call(&mut store, function, &ipc(&batch)?).map_err(|e| anyhow::anyhow!("{}'s {function} stopped: {e:#}", self.name))?;
+        let mut store = store(limits);
+        let batch = ipc(&batch)?;
+        let out = match self.pre.instantiate(&mut store).and_then(|i| i.call_call(&mut store, function, &batch)) {
+            Ok(out) => out,
+            Err(e) => return Err(stopped(&store, limits, &self.name, function, e)),
+        };
         let out = out.map_err(|said| coded("38000", format!("{}'s {function}: {said}", self.name)))?;
         let column = StreamReader::try_new(out.as_slice(), None)?.next().context("an answer with no batch")??.columns().first().cloned().context("an answer with no column")?;
         if column.len() != rows || column.data_type() != &f.returns {
@@ -140,6 +242,80 @@ impl Loaded {
         }
         Ok(column)
     }
+}
+
+impl Loaded {
+    /// Starts a call of the table function `function` with its arguments, one value each, cast to the types `describe()`
+    /// gave: its rows, read a batch at a time (`Rows::next`). The call keeps its store until it is dropped, within `limits`:
+    /// its memory for the whole call, its time for each batch.
+    pub fn rows(&self, function: &str, arguments: &[ArrayRef], limits: Limits) -> Result<Rows> {
+        let f = self.functions.iter().find(|f| f.name == function && f.is_table()).with_context(|| format!("{} has no table function {function}", self.name))?;
+        let pre = self.tables.as_ref().with_context(|| format!("{} has no table function {function}", self.name))?;
+        if arguments.len() != f.arguments.len() {
+            bail!("{function} takes {} arguments, not {}", f.arguments.len(), arguments.len());
+        }
+        let cast = arguments.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
+        let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(1)))?;
+        let (bytes, mut store) = (ipc(&batch)?, store(limits));
+        let opened = pre.instantiate(&mut store).and_then(|i| Ok((i.call_open(&mut store, function, &bytes)?, i)));
+        let (handle, instance) = match opened {
+            Ok((handle, instance)) => (handle.map_err(|said| coded("38000", format!("{}'s {function}: {said}", self.name)))?, instance),
+            Err(e) => return Err(stopped(&store, limits, &self.name, function, e)),
+        };
+        Ok(Rows { store, instance, handle, name: self.name.clone(), function: function.to_string(), schema: f.schema(), limits, open: true })
+    }
+}
+
+/// A table function's call in progress: its store, held until its rows are read or it is dropped.
+pub struct Rows {
+    store: Store<Held>,
+    instance: tables::ExtensionWithTables,
+    handle: u32,
+    name: String,
+    function: String,
+    schema: Arc<Schema>,
+    limits: Limits,
+    open: bool,
+}
+
+impl Rows {
+    /// The next batch, in the columns `describe()` gave, or None once the call has given them all. A batch of other columns
+    /// fails the call, as a trap or the function's own error does.
+    pub fn next(&mut self) -> Result<Option<RecordBatch>> {
+        if !self.open {
+            return Ok(None);
+        }
+        self.store.set_epoch_deadline(self.limits.secs * 1000 / TICK.as_millis() as u64); // (its time is each batch's)
+        let out = match self.instance.call_next(&mut self.store, self.handle) {
+            Ok(out) => out,
+            Err(e) => {
+                self.open = false; // (a trapped instance is called no more)
+                return Err(stopped(&self.store, self.limits, &self.name, &self.function, e));
+            }
+        };
+        let Some(bytes) = out.map_err(|said| coded("38000", format!("{}'s {}: {said}", self.name, self.function)))? else {
+            self.close();
+            return Ok(None);
+        };
+        let got = StreamReader::try_new(bytes.as_slice(), None)?.next().context("a batch with no rows")??;
+        let types = |s: &Schema| s.fields().iter().map(|f| f.data_type().clone()).collect::<Vec<_>>();
+        if types(&got.schema()) != types(&self.schema) {
+            bail!("{}'s {} gave columns of {:?}, not {:?}", self.name, self.function, types(&got.schema()), types(&self.schema));
+        }
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), got.columns().to_vec())?)) // (its names as describe() gave them)
+    }
+
+    fn close(&mut self) {
+        if std::mem::take(&mut self.open) {
+            self.store.set_epoch_deadline(1000 / TICK.as_millis() as u64); // (a second to let go)
+            let _ = self.instance.call_close(&mut self.store, self.handle);
+        }
+    }
+}
+
+impl Drop for Rows {
+    fn drop(&mut self) { self.close() } // (a query that stops reading lets the call go)
 }
 
 /// A batch as Arrow IPC stream bytes, the world's own form.
@@ -157,7 +333,8 @@ mod tests {
     use super::*;
     use datafusion::arrow::array::{Int64Array, StringArray};
 
-    /// `tests/extensions/words`, built by tools/extension_fixture.sh: word_count, shout and boom (and spin and hog, for limits).
+    /// `tests/extensions/words`, built by tools/extension_fixture.sh: word_count, shout and boom (spin and hog, for limits;
+    /// words_of and series, tables).
     const WORDS: &[u8] = include_bytes!("../tests/fixtures/extensions/words-0.1.wasm");
 
     fn words() -> Loaded { load(WORDS, "words-test").unwrap() }
@@ -166,8 +343,9 @@ mod tests {
     fn a_part_says_what_it_has() {
         let w = words();
         assert_eq!((w.name.as_str(), w.version.as_str()), ("words", "0.1"));
-        assert_eq!(w.functions[0], Function { name: "word_count".into(), arguments: vec![DataType::Utf8], returns: DataType::Int64, volatile: false });
-        assert_eq!(w.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["word_count", "shout", "boom", "spin", "hog"]);
+        assert_eq!(w.functions[0], Function { name: "word_count".into(), arguments: vec![DataType::Utf8], returns: DataType::Int64, volatile: false, columns: vec![] });
+        assert_eq!(w.functions[5].columns, [("word".to_string(), DataType::Utf8), ("place".to_string(), DataType::Int64)], "a table function's columns");
+        assert_eq!(w.functions.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["word_count", "shout", "boom", "spin", "hog", "words_of", "series"]);
     }
 
     #[test]
@@ -192,6 +370,47 @@ mod tests {
         assert!(w.call("nope", &[], 0).unwrap_err().to_string().contains("words has no function nope"));
         let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
         assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "a failed call leaves nothing behind");
+    }
+
+    /// A runaway call is stopped at its time, and one that takes too much memory at its limit, each failing alone with its
+    /// code; the part answers the next call.
+    #[test]
+    fn a_runaway_or_a_hog_fails_alone() {
+        let w = words();
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let started = std::time::Instant::now();
+        let e = w.call_with("spin", &[n.clone()], 1, Limits { mb: 256, secs: 1 }).unwrap_err();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("57014", "words's spin ran past 1 s, its time for one batch (PONDRA_EXTENSION_SECS)".to_string()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its time: {:?}", started.elapsed());
+        let big: ArrayRef = Arc::new(Int64Array::from(vec![64]));
+        let e = w.call_with("hog", &[big.clone()], 1, Limits { mb: 32, secs: 30 }).unwrap_err();
+        assert_eq!((crate::codes::of(&e), format!("{e:#}")), ("53200", "words's hog passed 32 MB, an extension's memory (PONDRA_EXTENSION_MB)".to_string()));
+        assert_eq!(w.call("hog", &[big], 1).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().value(0), 64 << 20, "under the default 256 MB it answers");
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
+        assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "the part goes on");
+    }
+
+    /// A table function's rows come a batch at a time, in its columns, until there are none; a call let go before its end
+    /// leaves the part as it was.
+    #[test]
+    fn a_table_function_gives_its_rows_a_batch_at_a_time() {
+        use datafusion::arrow::array::AsArray;
+        let w = words();
+        let n: ArrayRef = Arc::new(Int64Array::from(vec![2500]));
+        let mut rows = w.rows("series", &[n.clone()], Limits::now()).unwrap();
+        let (mut batches, mut sum) = (0, 0i64);
+        while let Some(b) = rows.next().unwrap() {
+            assert_eq!(b.schema().field(0).name(), "i");
+            batches += 1;
+            sum += b.column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().iter().flatten().sum::<i64>();
+        }
+        assert_eq!((batches, sum), (3, 2500 * 2501 / 2), "1,000 a batch");
+        assert!(rows.next().unwrap().is_none(), "and none after its end");
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["to be or not"]));
+        let got = w.rows("words_of", &[text], Limits::now()).unwrap().next().unwrap().unwrap();
+        assert_eq!((got.num_rows(), got.column(0).as_string::<i32>().value(3)), (4, "not"));
+        drop(w.rows("series", &[n], Limits::now()).unwrap()); // (let go unread)
+        assert!(w.rows("word_count", &[], Limits::now()).err().unwrap().to_string().contains("no table function word_count"));
     }
 
     #[test]
