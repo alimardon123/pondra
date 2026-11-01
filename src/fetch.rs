@@ -48,6 +48,11 @@ impl Response {
         self.0.error_for_status().map(Response)
     }
 
+    /// reqwest's error for a 4xx or 5xx status, the body still unread (a `dial::Reply` keeps its failure this way).
+    pub fn error_for_status_ref(&self) -> Option<reqwest::Error> {
+        self.0.error_for_status_ref().err()
+    }
+
     pub fn text(self) -> impl Future<Output = reqwest::Result<String>> + Send {
         sent(self.0.text())
     }

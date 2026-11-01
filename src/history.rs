@@ -291,8 +291,8 @@ struct Line {
 /// A statement a door ran has ended (`audit::statement`): its row, and a line in the node's log
 /// when it was slow.
 pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
-    if !on() || app.log.is_none() {
-        return; // (a read-only node writes nothing)
+    if !on() || app.log.is_none() || !app.members.keeps_records() {
+        return; // (a read-only node writes nothing, and a joined page's node keeps the records)
     }
     let slow = took >= slow();
     if !slow && outcome == "ok" && note.learned.is_empty() && skipped() {

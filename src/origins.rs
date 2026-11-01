@@ -141,8 +141,9 @@ fn preflight(origin: HeaderValue) -> Response {
     let headers = answer.headers_mut();
     headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
     headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD"));
-    // (`range` is not a safelisted request header: a page's Parquet reads send it)
-    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type, range"));
+    // (`range` and `if-none-match` are not safelisted request headers: a page's Parquet reads send the first, and a joined
+    // page's new lake files the second, so its node's `/store` makes each once: `served::lake_files_only`)
+    headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("authorization, content-type, range, if-none-match"));
     // (ten minutes: a browser asks once for a page's requests, not before each one)
     headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     answer
@@ -222,7 +223,7 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
         assert_eq!(values(&res, "access-control-allow-origin"), ["https://app.example"]);
         assert_eq!(values(&res, "access-control-allow-methods"), ["GET, POST, PUT, DELETE, HEAD"]);
-        assert_eq!(values(&res, "access-control-allow-headers"), ["authorization, content-type, range"]);
+        assert_eq!(values(&res, "access-control-allow-headers"), ["authorization, content-type, range, if-none-match"]);
         assert_eq!(values(&res, "access-control-max-age"), ["600"]);
         assert!(values(&res, "vary").contains(&"origin".to_string()));
     }

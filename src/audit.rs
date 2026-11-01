@@ -414,8 +414,8 @@ fn log(app: &App, class: &'static str, statement: String, outcome: &'static str,
 crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
 fn write(app: &App, line: Line) {
-    if app.log.is_none() {
-        return; // (a read-only node writes nothing: its own log says it)
+    if app.log.is_none() || !app.members.keeps_records() {
+        return; // (a read-only node writes nothing: its own log says it; a joined page's node keeps the records)
     }
     let tx = WRITER.get_or(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
     let _ = tx.send(line);

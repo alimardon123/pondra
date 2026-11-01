@@ -1449,7 +1449,7 @@ async function joinChecks(target, a, b) {
     console.error(`Page.join(B, boss): ${joined.error}`);
     return;
   }
-  const measured = { fresh_ms: null, p50_before_ms: p50Before, p50_after_ms: null };
+  const measured = { fresh_ms: null, p50_before_ms: p50Before, p50_after_ms: null, load_ms: null };
 
   // (a) The page reads A's table: A's row, as csv.
   const read = await ask('joined: SELECT id, v FROM ev', 'POST', '/sql?format=csv', undefined, 'SELECT id, v FROM ev ORDER BY id', 'joined');
@@ -1475,6 +1475,18 @@ async function joinChecks(target, a, b) {
   if (counted) judge('joined: SELECT count(*) FROM ev after its INSERT', counted, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
   const aCount = await ask('A: SELECT count(*) FROM ev', 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, 'SELECT count(*) FROM ev', undefined, a);
   if (aCount) judge('A: SELECT count(*) FROM ev', aCount, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
+
+  // (c2) A bulk INSERT … SELECT the page writes itself (its files are put through its node's store, its commit through the node):
+  // answered 200, and the page's count and A's are 100003 right after. `load_ms` is the page's time for the statement.
+  const bulkSql = "INSERT INTO ev SELECT value + 10, 'r' FROM range(100000)";
+  const loadStarted = performance.now();
+  const loaded = await ask(`joined: ${bulkSql}`, 'POST', '/sql', undefined, bulkSql, 'joined');
+  measured.load_ms = Number((performance.now() - loadStarted).toFixed(1));
+  if (loaded) judge(`joined: ${bulkSql}`, loaded, { status: 200, sqlstate: null });
+  const counted100k = await ask('joined: SELECT count(*) FROM ev after the bulk INSERT', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM ev', 'joined');
+  if (counted100k) judge('joined: SELECT count(*) FROM ev after the bulk INSERT', counted100k, { status: 200, sqlstate: null, out: 'count(*)\n100003\n' });
+  const aCount100k = await ask('A: SELECT count(*) FROM ev after the bulk INSERT', 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, 'SELECT count(*) FROM ev', undefined, a);
+  if (aCount100k) judge('A: SELECT count(*) FROM ev after the bulk INSERT', aCount100k, { status: 200, sqlstate: null, out: 'count(*)\n100003\n' });
 
   // (d) A transaction is refused by name: each statement is the node's own, run on its own.
   const begun = await ask('joined: BEGIN', 'POST', '/sql', undefined, 'BEGIN', 'joined');

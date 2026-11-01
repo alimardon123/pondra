@@ -18,6 +18,9 @@ pub trait Members: Send + Sync + 'static {
     fn leader(&self) -> &Term;
     /// It never leads, runs tasks or takes writes.
     fn reader(&self) -> bool;
+    /// It keeps the lake's own records (`pondra$history`, `pondra$audit`, `pondra$runs`) and waits for the leader's view after its
+    /// writes (`write::seen_here`). A node does; a joined page's member writes its rows and files through its node, which keeps them.
+    fn keeps_records(&self) -> bool { true }
     /// It writes through the lake's inbox: its leader is alive but doesn't answer from here (`Cluster::guest`), so a
     /// statement's writes are sent to the leader through the bucket (`write::by_inbox`).
     fn by_inbox(&self) -> bool { false }
@@ -138,9 +141,9 @@ impl Members for Alone {
     fn as_any(&self) -> &dyn std::any::Any { self }
 }
 
-/// A page that joined a cluster (`node::open_joined`): a reader that never leads, runs tasks or takes writes. Its leader is
-/// the node it joined, at term 0 (a term it claims nothing of: the cluster's terms start at 1), so it follows that node's
-/// commit stream rather than a term's.
+/// A page that joined a cluster (`node::open_joined`): a follower that never leads, runs tasks or keeps the lake's records. Its
+/// leader is the node it joined, at term 0 (a term it claims nothing of: the cluster's terms start at 1), so it follows that
+/// node's commit stream rather than a term's. It writes its own rows and files (`page::joined_part`), which its node commits.
 pub struct Joined {
     term: Term,
 }
@@ -155,7 +158,8 @@ impl Joined {
 impl Members for Joined {
     fn me(&self) -> &str { "" }
     fn leader(&self) -> &Term { &self.term }
-    fn reader(&self) -> bool { true }
+    fn reader(&self) -> bool { false }
+    fn keeps_records(&self) -> bool { false }
     fn nodes(&self) -> Vec<String> { vec![] }
     fn as_any(&self) -> &dyn std::any::Any { self }
 }

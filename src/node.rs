@@ -579,7 +579,7 @@ pub fn unclaim_page() {
 /// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it. `term` is the
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
 /// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does.
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, ended: Arc<AtomicBool> }
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, ended: Arc<AtomicBool>, superuser: bool }
 
 /// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
 /// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
@@ -629,7 +629,7 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks, ended: Default::default() })
+            Ok(Paged { app, url, term, marks, ended: Default::default(), superuser: false })
         }
         Err(e) => {
             end_page(marks, lake, &store, term, &url).await; // (a failed open leaves nothing running)
@@ -667,6 +667,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     crate::memory::give(&url, store);
     let store = crate::memory::store(&url);
     let node = node.trim_end_matches('/').to_string();
+    crate::dial::set_page(node.clone(), auth.to_string()); // (the page's calls go to this node, with this sign-in: `dial::Paged`)
     let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));
     let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
     let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
@@ -680,6 +681,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     .await;
     match made {
         Ok(app) => {
+            let superuser = whoami_superuser(&node, auth).await; // (before `open` below takes the node)
             let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
             let (http, auth) = (reqwest::Client::new(), auth.to_string());
             let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
@@ -713,7 +715,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks, ended })
+            Ok(Paged { app, url, term: 0, marks, ended, superuser })
         }
         Err(e) => {
             end_page(marks, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
@@ -722,7 +724,26 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
     }
 }
 
+/// Whether the sign-in a joined page follows its node with is a superuser's, as the node's `GET /whoami` says it (read once, as
+/// `open_joined` opens the member): only a superuser's INSERTs are the page's own to write (`page::joined_part`), since the node
+/// takes a superuser's commit and files alone (`Auth::pages_write`). Not known (no answer in 10 s, or a sign-in refused): it is not.
+async fn whoami_superuser(node: &str, auth: &str) -> bool {
+    let asked = crate::fetch::send(crate::ext::bare().get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
+    let answer = async {
+        let r = asked.await.ok().filter(|r| r.status().is_success())?;
+        let who: serde_json::Value = r.json().await.ok()?;
+        who["superuser"].as_bool()
+    };
+    tokio::time::timeout(Duration::from_secs(10), answer).await.ok().flatten().unwrap_or(false)
+}
+
 impl Paged {
+    /// Whether the sign-in a joined page follows its node with is a superuser's (`whoami_superuser`). Always false for a page of
+    /// its own, which has no node to write through.
+    pub fn superuser(&self) -> bool {
+        self.superuser
+    }
+
     /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
     pub fn ended(&self) -> bool {
         self.ended.load(SeqCst)
