@@ -6,10 +6,10 @@
 //!    one to notice;
 //! 2. new requests are turned away with an answer a client retries elsewhere (HTTP 503 with
 //!    `Retry-After`; a new Postgres connection is refused, a new statement on an open one answered
-//!    57P01), except the cluster's own calls, which a leader's followers and a query's other nodes
-//!    still need;
-//! 3. requests in flight at every door that has them (HTTP, each Postgres statement) finish, for up
-//!    to `PONDRA_DRAIN_SECS` (30). Only those that came before the signal are waited for: a leader's
+//!    57P01; a new Kafka connection is closed at once, and an open one before its next request),
+//!    except the cluster's own calls, which a leader's followers and a query's other nodes still need;
+//! 3. requests in flight at every door that has them (HTTP, each Postgres statement, each Kafka produce
+//!    and offset commit until its answer is written) finish, for up to `PONDRA_DRAIN_SECS` (30). Only those that came before the signal are waited for: a leader's
 //!    followers keep sending it flushes until it steps down, and on a bucket one is always in flight,
 //!    so waiting for none held a leader the whole 30 s (and a scheduler's kill came first);
 //! 4. then the leader checkpoints its catalog. Everything acknowledged was durable already
@@ -79,6 +79,10 @@ impl Busy {
     /// The request's count, held again by the body of an answer sent in pieces, which goes on after its response: counted
     /// whatever the drain says, so it is taken only while the request's own `Busy` (`panics::door`) is held.
     pub fn carried() -> Busy { let count = in_flight(); count.fetch_add(1, SeqCst); Busy(Some(count)) }
+
+    /// Whether it is counted: false for a request that came once the drain began, which a door then doesn't take
+    /// (Kafka's: `kafka::conn`).
+    pub fn counted(&self) -> bool { self.0.is_some() }
 }
 
 impl Drop for Busy {

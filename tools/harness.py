@@ -2739,9 +2739,71 @@ def kafka():
         p.produce("events", value=b"{}", on_delivery=lambda err, msg: failed.append(err is not None))
         p.flush(6)
     checks["wrong password / read token refused"] = failed == [True, True] and sql_("SELECT count(*) AS n FROM events")[0]["n"] == n + 1000
+    # Told to stop (SIGTERM), the node drains its Kafka door as it does the others (`kafka::conn`): a new connection is
+    # closed at once, and a request on a connection opened before isn't taken (no answer, the connection closed), so a
+    # producer that isn't idempotent sends it to another broker and it is written once, not cut off half done. A long
+    # query keeps the node draining meanwhile; after a restart the table holds the produce sent before the stop alone.
+    def kconn():
+        s = socket.create_connection(("127.0.0.1", kport), timeout=10)
+        def req(key, ver, body):  # the answer's body, or None when the node closed the connection
+            head = struct.pack(">hhih", key, ver, 7, 1) + b"t"
+            try:
+                s.sendall(struct.pack(">i", len(head) + len(body)) + head + body)
+                got = s.recv(4)
+                if len(got) < 4:
+                    return None
+                size, data = struct.unpack(">i", got)[0], b""
+                while len(data) < size:
+                    chunk = s.recv(size - len(data))
+                    if not chunk:
+                        return None
+                    data += chunk
+                return data[4:]
+            except OSError:
+                return None
+        return s, req
+    def plain_batch(rows):  # (not idempotent: no producer id, so a retry would be written again)
+        b = DefaultRecordBatchBuilder(magic=2, compression_type=0, is_transactional=False, producer_id=-1, producer_epoch=-1, base_sequence=-1, batch_size=1 << 20)
+        for k, r in enumerate(rows):
+            b.append(k, timestamp=int(time.time() * 1000), key=None, value=json.dumps(r).encode(), headers=[])
+        return bytes(b.build())
+    def signed_in(req):
+        mech, auth = b"PLAIN", b"\0writer\0w-tok"
+        return req(17, 1, struct.pack(">h", len(mech)) + mech) is not None and (req(36, 0, struct.pack(">i", len(auth)) + auth) or b"\1")[:2] == b"\0\0"
+    produced_error = lambda resp: None if resp is None else struct.unpack(">h", resp[4 + 2 + len("events") + 4 + 4:4 + 2 + len("events") + 4 + 4 + 2])[0]
+    before_drain = sql_("SELECT count(*) AS n FROM events")[0]["n"]
+    kept, kept_req = kconn()
+    kept_in = signed_in(kept_req)
+    sent_before = produced_error(kept_req(*produce("events", plain_batch([{"user": "drain", "amount": 1}]))))
+    holding = {}
+    long_query = threading.Thread(target=lambda: holding.update(answer=_try(lambda: sql_("SELECT sum(value % 7) AS s FROM generate_series(1, 4000000000)"))))
+    long_query.start()
+    time.sleep(1.5)  # (the query is running when the signal comes, so the node drains while it does)
+    node.p.send_signal(signal.SIGTERM)
+    time.sleep(0.5)
+    fresh, fresh_req = None, None
+    try:
+        fresh, fresh_req = kconn()
+        fresh_answer = fresh_req(18, 0, b"")  # ApiVersions v0
+    except OSError:
+        fresh_answer = None
+    sent_during = kept_req(*produce("events", plain_batch([{"user": "drain", "amount": 1}])))
+    still_running = long_query.is_alive()
+    for s_ in (kept, fresh):
+        if s_ is not None:
+            s_.close()
+    long_query.join()
+    exit_code = node.p.wait(120)
+    node = Node(lake, A.port, kafka=f"127.0.0.1:{kport}", changelog_secs=600, **tokens).start()
+    after_drain = sql_("SELECT count(*) AS n, count(*) FILTER (WHERE user = 'drain') AS d FROM events")[0]
+    drained = {"signed_in": kept_in, "produce_before": sent_before, "fresh_connection": fresh_answer is not None, "produce_while_stopping": sent_during is not None,
+               "query_still_running": still_running, "exit": exit_code, "rows": [before_drain, after_drain]}
+    checks["stopping, the Kafka door takes no new connection and no new request (the connection closes unanswered, nothing written); a produce sent before is kept"] = (
+        kept_in and sent_before == 0 and fresh_answer is None and sent_during is None and still_running and exit_code == 0
+        and after_drain == {"n": before_drain + 1, "d": 1})
     node.kill()
     ok = all(checks.values())
-    print(json.dumps({"kafka": checks, "librdkafka_20k_events_s": round(librdkafka_s, 2), "ok": ok}, indent=1))
+    print(json.dumps({"kafka": checks, "librdkafka_20k_events_s": round(librdkafka_s, 2), "drained": drained, "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
     return f"Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all {len(checks)} checks pass"

@@ -104,6 +104,9 @@ pub async fn serve(app: App, addr: String, advertise: String) -> Result<()> {
     let me = Arc::new(Broker { id, host: host.into(), port: port.parse()? });
     ME.set_once(serde_json::json!({"id": me.id, "host": me.host, "port": me.port}));
     while let Some((socket, _)) = doors.next().await {
+        if crate::drain::draining() {
+            continue; // (a node stopping takes no new client: the socket closes, and the client tries another broker)
+        }
         let (app, me) = (app.clone(), me.clone());
         crate::panics::task(async move { conn(app, me, socket).await.map_err(|e| eprintln!("kafka client: {e:#}")) });
     }
@@ -114,16 +117,24 @@ type Reply = BoxFuture<'static, Option<Vec<u8>>>; // a response frame, or None (
 
 /// One client connection. Requests are read and started in order (produced rows are queued at
 /// once), and their responses are written in that order as each completes: many in flight.
+///
+/// A node stopping (`drain.rs`) takes no request after the drain began: the connection closes once the answers to
+/// those it took are written, and the client sends the next one to another broker (it was never applied, so a
+/// producer that isn't idempotent writes it once). Each request it took that changes something (a produce, an offset
+/// commit) holds the drain (`drain::Busy`) until its answer is written, so an acknowledged write is never cut off
+/// before its client hears of it and sends it again. A fetch's long poll and a group's join wait on others, not on
+/// the node, and aren't held: cut off, they lose nothing, and held they would hold the drain for their whole wait.
 async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()> {
     let peer = socket.peer();
     let from = Some(peer.addr);
     let (mut rd, mut wr) = tokio::io::split(socket);
-    let (tx, mut rx) = mpsc::channel::<Reply>(64);
+    let (tx, mut rx) = mpsc::channel::<(Reply, Option<crate::drain::Busy>)>(64);
     let writer = crate::panics::task(async move {
-        while let Some(reply) = rx.recv().await {
+        while let Some((reply, busy)) = rx.recv().await {
             if let Some(frame) = reply.await {
                 wr.write_all(&frame).await?;
             }
+            drop(busy); // (written: the drain may go on)
         }
         anyhow::Ok(())
     });
@@ -133,8 +144,13 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         ensure!((0..=most).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
         rd.read_exact(&mut buf).await?;
+        let key = buf.get(..2).map_or(-1, |k| i16::from_be_bytes([k[0], k[1]]));
+        let busy = matches!(key, PRODUCE | OFFSET_COMMIT).then(crate::drain::Busy::new);
+        if crate::drain::draining() || busy.as_ref().is_some_and(|b| !b.counted()) {
+            break; // (stopping: not taken, see above)
+        }
         let reply = request(&app, &me, &mut who, &peer, Bytes::from(buf)).await?;
-        if tx.send(reply).await.is_err() {
+        if tx.send((reply, busy)).await.is_err() {
             break;
         }
     }
