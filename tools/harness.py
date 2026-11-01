@@ -23980,6 +23980,20 @@ def friendly():
             "SELECT id, CAST(ts AS DATE) AS a, make_date(2026, 3, k + 1) AS b, CAST(date_trunc('month', d) AS DATE) AS c, date_trunc('hour', ts) AS h, date_sub('hour', TIMESTAMP '2026-01-01 00:00:00', ts) AS dh, "
             "date_sub('minute', ts, TIMESTAMP '2026-01-01 00:10:30') AS dm, strftime(d, '%Y/%m') AS f, CAST(strptime('20260301', '%Y%m%d') AS DATE) AS p, CAST(floor(epoch(ts)) AS BIGINT) AS u, "
             "make_timestamp(CAST(1700000000 + id AS BIGINT) * 1000000) AS s FROM (SELECT *, make_date(2024, 1 + id % 12, 1 + id % 28) AS d FROM t WHERE id < 60 OR id % 97 = 0) sub"),
+        # (a LATERAL correlated by equalities, as a join: `lateral_join.rs`. The ORDER BY keys are never NULL: DuckDB puts
+        # NULLs last in a DESC and Pondra first, so `n` is left out. The same text for both)
+        "LEFT JOIN LATERAL … ON true, LIMIT 2 with a WHERE and a tie-breaker (the top two per key)": (
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t) a LEFT JOIN LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.x > 50 ORDER BY t.x DESC, t.id LIMIT 2) b ON true",
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t) a LEFT JOIN LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.x > 50 ORDER BY t.x DESC, t.id LIMIT 2) b ON true"),
+        "CROSS JOIN LATERAL without a LIMIT": (
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t WHERE k < 4) a CROSS JOIN LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.id < 100) b",
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t WHERE k < 4) a CROSS JOIN LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.id < 100) b"),
+        "the comma form, FROM a, LATERAL (…) b, with a LIMIT": (
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t) a, LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.x > 900 ORDER BY t.x DESC, t.id LIMIT 3) b",
+            "SELECT a.k, b.id FROM (SELECT DISTINCT k FROM t) a, LATERAL (SELECT t.id FROM t WHERE t.k = a.k AND t.x > 900 ORDER BY t.x DESC, t.id LIMIT 3) b"),
+        "a LEFT JOIN LATERAL with a condition on its own column, and a LATERAL named top (SQL Server's TOP read as a name)": (
+            "SELECT a.k, top.x FROM (SELECT DISTINCT k FROM t WHERE k > 2) a LEFT JOIN LATERAL (SELECT t.id, t.x FROM t WHERE t.k = a.k ORDER BY t.x DESC, t.id LIMIT 2) top ON top.x > 1000",
+            "SELECT a.k, top.x FROM (SELECT DISTINCT k FROM t WHERE k > 2) a LEFT JOIN LATERAL (SELECT t.id, t.x FROM t WHERE t.k = a.k ORDER BY t.x DESC, t.id LIMIT 2) top ON top.x > 1000"),
     }
     for name, (q, dq) in pairs.items():
         try:
