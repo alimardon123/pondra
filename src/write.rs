@@ -1615,12 +1615,14 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     }
     let named = job.is_some(); // (a job a client sent: its retry may be a duplicate already committed)
     let (lake, job) = (&app.lake, job.unwrap_or_else(crate::log::auto_job));
-    // (a guest whose leader doesn't answer from here writes through the bucket's inbox, one request at a time: `by_inbox`)
-    if app.members.by_inbox() {
-        return by_inbox(app, stmt, &job, files).await;
+    // (a guest whose leader doesn't answer from here writes through the bucket's inbox, one request at a time: `by_inbox`;
+    // it reads as a reader does. What the inbox can't carry is refused by name before anything is read or written)
+    let inbox = app.members.by_inbox();
+    if inbox {
+        not_by_inbox(&stmt)?;
+    } else {
+        ensure!(!app.members.reader(), "read-only node"); // (above a view of a folder's write: a reader writes no file either)
     }
-    // (above a view of a folder's write: a reader writes no file either)
-    ensure!(!app.members.reader(), "read-only node");
     if let Some((query, to, options)) = crate::ext::view_write(&app.lake, &stmt).await? {
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me()).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
@@ -1629,7 +1631,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
             if !is_there(&app.lake, &t).await? {
-                seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had)
+                seen_here(app).await; // (a table just made through another node: this one holds it once it holds what its leader had; a reader, and so a guest by the inbox, waits for nothing)
                 if !is_there(&app.lake, &t).await? {
                     return Err(no_table(&t));
                 }
@@ -1638,37 +1640,16 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
         s => s,
     };
+    if let Stmt::Ddl(ddls) = stmt {
+        return ddl_listed(app, ddls, &job, files).await;
+    }
+    if inbox {
+        return by_inbox(app, stmt, &job, files).await;
+    }
     if let Stmt::CopyInto(table, from, options) = &stmt {
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
     let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
-    if let Stmt::Ddl(ddls) = stmt {
-        let mut out = j!({});
-        for mut d in ddls {
-            crate::branch::door(lake, &mut d).await?; // (a branch: who may make or drop one, and its owner; another database's sign-in: users::across)
-            out = match &d {
-                // (a backup or a restore's files are read and written here, by the node the statement reached and under its own owner: the
-                // leader's lock only when this node leads; the pin and the ATTACH go to the leader as DDL: `backup::statement`)
-                crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => {
-                    crate::backup::statement(lake, app.seq.is_some().then_some(&*app.lock), d.clone()).await?
-                }
-                // (INSTALL … FROM: the file is read and kept by the node the statement reached, as a backup's files are; the record
-                // goes to the leader from there: `extension::fetch`)
-                crate::ddl::Ddl::FetchExtension { .. } => {
-                    crate::extension::fetch(lake, app.seq.is_some().then_some(&*app.lock), d.clone()).await?
-                }
-                _ => match &app.seq {
-                    Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
-                    None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
-                },
-            };
-            app.settle(&d).await?; // (ATTACH, DETACH: here at once; a guest leading its lake runs the leader's tasks meanwhile)
-            if let Some(n) = out["notice"].as_str() {
-                crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, through this door)
-            }
-        }
-        return Ok(out);
-    }
     // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, on this node.
     if let Stmt::Create(c) = &stmt {
         if let Some(out) = Box::pin(existing(app, c)).await? {
@@ -1986,31 +1967,11 @@ pub async fn lead_only(dir: &str) -> Result<()> {
 /// guest reads as a reader does, and each request of the statement goes to the leader as a one-off writer sends it
 /// (`through_bucket_one`): over HTTP if this machine reaches the leader after all, else through the bucket's inbox, where the
 /// leader records it, or this process leads for a moment. The statement has had the steps `run_listed` takes before this
-/// (the door, the identity check). What the inbox can't carry is refused by name first: a RETURNING, a COPY INTO, and a
-/// transaction (`txn::begin`). Each statement of a text has its own part of `job` (`script.rs`), so a run again with the
-/// same job records each one once.
+/// (the door, the identity check, `not_by_inbox`'s refusals, a view of a folder's write, an INSERT's whole rows, and the
+/// DDL: `ddl_listed`). Each statement of a text has its own part of `job` (`script.rs`), so a run again with the same job
+/// records each one once.
 async fn by_inbox(app: &crate::app::App, stmt: Stmt, job: &str, files: bool) -> Result<Value> {
     let lake = &app.lake;
-    if crate::returning::asked() {
-        return Err(crate::codes::coded("0A000", "RETURNING needs the lake's leader, which is alive but doesn't answer from here: send the write without RETURNING, and read its rows with a SELECT"));
-    }
-    if matches!(stmt, Stmt::CopyInto(..)) {
-        return Err(crate::codes::coded("0A000", "COPY INTO needs the lake's leader, which is alive but doesn't answer from here: load the files with INSERT INTO … SELECT … FROM '…' instead"));
-    }
-    if let Some((query, to, options)) = crate::ext::view_write(lake, &stmt).await? {
-        let out = crate::copy::copy_to(lake, &query, &to, &options, &app.members.nodes(), app.members.me()).await?; // (a view of a folder: a new file in it)
-        return Ok(j!({"rows": out["copied"]}));
-    }
-    let stmt = match stmt {
-        Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(lake, &t, &names, &query).await?),
-        Stmt::Insert(t, query) => {
-            if !is_there(lake, &t).await? {
-                return Err(no_table(&t));
-            }
-            Stmt::Insert(t, query)
-        }
-        s => s,
-    };
     if let Stmt::Create(c) = &stmt {
         if matches!(there(lake, c).await?, Some(true)) {
             return Ok(j!({"table": object(&c.name), "exists": true})); // (CREATE TABLE IF NOT EXISTS of one that's there)
@@ -2030,27 +1991,50 @@ async fn by_inbox(app: &crate::app::App, stmt: Stmt, job: &str, files: bool) -> 
             let (if_not_exists, name) = (c.if_not_exists, object(&c.name));
             raced(if_not_exists, &name, through_bucket_one(lake, Stmt::Create(c), job, files).await) // (a plain CREATE TABLE: its definition carries the job)
         }
-        Stmt::Ddl(ddls) => {
-            let mut out = j!({});
-            for mut d in ddls {
-                crate::branch::door(lake, &mut d).await?; // (a branch: who may make or drop one, and its owner, as `run_listed` asks)
-                // (a backup or restore runs here, as the node the statement reached would run it: this process's owner, no lock (it
-                // leads nothing), the pin and the ATTACH sent to the leaders (`backup::statement`); the inbox would record it under
-                // the leader's own owner, which is none)
-                out = if matches!(d, crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. }) {
-                    crate::backup::statement(lake, None, d.clone()).await?
-                } else {
-                    through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files).await?
-                };
-                app.settle(&d).await?; // (ATTACH, DETACH: here at once, as `run_listed` settles them)
-                if let Some(n) = out["notice"].as_str() {
-                    crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, as `run_listed` tells it)
-                }
-            }
-            Ok(out)
-        }
         stmt => through_bucket_one(lake, stmt, job, files).await,
     }
+}
+
+/// What a guest's write through the inbox can't carry, refused by name before anything is read or written: a RETURNING
+/// and a COPY INTO (a transaction: `txn::begin`).
+fn not_by_inbox(stmt: &Stmt) -> Result<()> {
+    if crate::returning::asked() {
+        return Err(crate::codes::coded("0A000", "RETURNING needs the lake's leader, which is alive but doesn't answer from here: send the write without RETURNING, and read its rows with a SELECT"));
+    }
+    if matches!(stmt, Stmt::CopyInto(..)) {
+        return Err(crate::codes::coded("0A000", "COPY INTO needs the lake's leader, which is alive but doesn't answer from here: load the files with INSERT INTO … SELECT … FROM '…' instead"));
+    }
+    Ok(())
+}
+
+/// A text's DDL, one statement at a time, at both doors of a write (`run_listed`, and a guest's `by_inbox`). Each passes the
+/// branch door (who may make or drop a branch, and its owner; another database's sign-in: `users::across`). A backup's or a
+/// restore's files, and an INSTALL … FROM's file, are read and written here, by the node the statement reached and under its
+/// own owner, with the leader's lock only when this node leads; what they record goes to the leader from there
+/// (`backup::statement`, `extension::fetch`), since the inbox would record it under the leader's owner and read the file on
+/// the leader's machine. The rest is carried out here when this node leads, else posted to the leader, or sent through the
+/// bucket's inbox (`through_bucket_one`). Each is settled before the next (ATTACH, DETACH: here at once; a materialized
+/// view: filled, `App::settle`), and its notice told here (carried out on the leader, perhaps over HTTP).
+async fn ddl_listed(app: &crate::app::App, ddls: Vec<crate::ddl::Ddl>, job: &str, files: bool) -> Result<Value> {
+    let (lake, lock) = (&app.lake, app.seq.is_some().then_some(&*app.lock));
+    let mut out = j!({});
+    for mut d in ddls {
+        crate::branch::door(lake, &mut d).await?;
+        out = match &d {
+            crate::ddl::Ddl::BackupDatabase { .. } | crate::ddl::Ddl::RestoreDatabase { .. } => crate::backup::statement(lake, lock, d.clone()).await?,
+            crate::ddl::Ddl::FetchExtension { .. } => crate::extension::fetch(lake, lock, d.clone()).await?,
+            _ if app.members.by_inbox() => through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files).await?,
+            _ => match &app.seq {
+                Some(seq) => ddl_here(lake, seq, &app.lock, d.clone()).await?,
+                None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
+            },
+        };
+        app.settle(&d).await?;
+        if let Some(n) = out["notice"].as_str() {
+            crate::routines::heard(n);
+        }
+    }
+    Ok(out)
 }
 
 /// One request of a statement, sent as `by_inbox` describes: to the lake it writes (an attached lake's leader, if the name is

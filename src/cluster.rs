@@ -64,8 +64,8 @@ impl Cluster {
     pub async fn join(store: &Store, addr: &str, reader: bool, may_lead: bool, serves_store: bool) -> Result<Arc<Cluster>> {
         let (mut said, mut taken_back) = (false, false);
         let leader = loop {
-            let latest_term = match latest(store).await {
-                Ok(t) => t,
+            let now = match holder(store).await {
+                Ok(h) => h,
                 // (the holder went away since it answered: look again, rather than end the node)
                 Err(_) if !may_lead => {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -73,10 +73,10 @@ impl Cluster {
                 }
                 Err(e) => return Err(e),
             };
-            match latest_term {
-                Some(t) if reader => break t, // (we only read anyway)
-                None if reader => break Term { n: 0, addr: String::new(), lock: String::new(), bell: false },
-                Some(t) if !may_lead && !t.addr.is_empty() && alive(store, &t).await => break t,
+            match now {
+                Holder::Led(t) | Holder::Recording(t) | Holder::Free(Some(t)) if reader => break t, // (we only read anyway)
+                Holder::Free(None) if reader => break Term { n: 0, addr: String::new(), lock: String::new(), bell: false },
+                Holder::Led(t) if !may_lead => break t,
                 _ if !may_lead => {
                     // (the node that serves this store leads it: wait for it, never take its place)
                     if !std::mem::replace(&mut said, true) {
@@ -84,10 +84,10 @@ impl Cluster {
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                // (ours. A term that stepped down is over, and taken again it would look dead to
-                // everyone (`alive`): a new one, below. One we're coming back to after our own restart
-                // is taken back: the exec let go of its lock)
-                Some(t) if t.addr == addr && !stepped_down(store, t.n).await => {
+                // (ours, alive or not. A term that stepped down is over, and taken again it would look dead to everyone
+                // (`alive`): a new one, below. One we're coming back to after our own restart is taken back: the exec let
+                // go of its lock)
+                Holder::Led(t) | Holder::Free(Some(t)) if t.addr == addr && !stepped_down(store, t.n).await => {
                     if coming_back(&t) {
                         relock(&t);
                         taken_back = true;
@@ -98,14 +98,14 @@ impl Cluster {
                     }
                 }
                 // (a leader elsewhere that doesn't answer from here, and didn't mark itself when we rang, is gone: the next
-                // term, below. Following it would wait for it instead)
-                Some(t) if alive(store, &t).await && !t.addr.is_empty() => {
+                // term, once it looks dead. Following it would wait for it instead)
+                Holder::Led(t) => {
                     if answers(&t).await || !deaf(store, &t).await {
                         break t;
                     }
                 }
-                Some(t) if t.addr.is_empty() && alive(store, &t).await => wait_for(store, &t).await, // a `pondra sql` INSERT is recording: wait
-                t => {
+                Holder::Recording(t) => wait_for(store, &t).await, // a `pondra sql` INSERT is recording: wait
+                Holder::Free(t) => {
                     if let Some(t) = claim(store, t.map_or(1, |t| t.n + 1), addr).await? {
                         break t; // (or someone else just did: look again)
                     }
