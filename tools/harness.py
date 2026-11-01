@@ -25260,6 +25260,9 @@ def matches():
     checks["a materialized view (not EMIT FINAL) over a subquery before MATCH_RECOGNIZE is refused 0A000 by name, with what to write"] = \
         refused("a materialized view over a subquery", f"CREATE MATERIALIZED VIEW sub_mv AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m",
                 ["a materialized view over a MATCH_RECOGNIZE of a subquery", "FROM t MATCH_RECOGNIZE"])
+    checks["a materialized view (not EMIT FINAL) whose MATCH_RECOGNIZE reads a CTE is refused 0A000 by name, with what to write"] = \
+        refused("a materialized view over a CTE", f"CREATE MATERIALIZED VIEW sub_mv AS WITH t AS (SELECT * FROM sub_src WHERE venue = 'x') SELECT * FROM t {sub_clause} m",
+                ["a materialized view over a MATCH_RECOGNIZE of a CTE", "FROM t MATCH_RECOGNIZE"])
     checks["EMIT FINAL over a subquery with an alias is refused 0A000 with the pattern view's words, as without one"] = \
         refused("a subquery with an alias as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq2 AS SELECT * FROM (SELECT * FROM late_src) t "
                 f"MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
