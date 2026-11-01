@@ -1179,10 +1179,10 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
     } else {
         match p.parse_literal_string() {
             Ok(path) if path.starts_with('@') => {
-                // (Snowflake's stage: Pondra has none, it reads the files where they are)
+                // (Snowflake's stage: Pondra has none, it reads the files where they are; a connection's '@name/path' is 1.1's)
                 let stage = path.split('/').next().unwrap_or(&path);
                 return Some(crate::write::Stmt::Invalid(format!(
-                    "COPY INTO {table} FROM {stage}: a stage isn't supported; name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                    "COPY INTO {table} FROM {stage}: a stage isn't supported (a connection's '@name/path' comes in 1.1); name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
                 )));
             }
             Ok(path) => Source::Path(path),
