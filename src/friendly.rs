@@ -33,7 +33,7 @@ fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list)\s*\(|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd)\s*\(|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
     });
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
@@ -1119,6 +1119,113 @@ fn within_group(f: &mut Function) -> Result<()> {
     Ok(())
 }
 
+/// A string literal's text.
+fn string_of(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s),
+        _ => None,
+    }
+}
+
+/// A date part as DuckDB, Snowflake and SQL Server spell it (`'day'`, `dd`, `HOURS`): its name in `date_trunc`, or
+/// None for any other expression (a column holding the part is DuckDB's, not taken). A string that isn't a part is
+/// refused by name (`m` is DuckDB's minute and SQL Server's month, so it is neither here).
+fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
+    let (w, word) = match e {
+        Expr::Identifier(i) if i.quote_style.is_none() => (i.value.to_lowercase(), true),
+        _ => match string_of(e) {
+            Some(s) => (s.trim().to_lowercase(), false),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(match w.as_str() {
+        "year" | "years" | "y" | "yr" | "yrs" | "yy" | "yyyy" => "year",
+        "quarter" | "quarters" | "q" | "qq" | "qtr" => "quarter",
+        "month" | "months" | "mon" | "mons" | "mm" => "month",
+        "week" | "weeks" | "w" | "wk" | "wks" | "ww" => "week",
+        "day" | "days" | "d" | "dd" | "dayofmonth" => "day",
+        "hour" | "hours" | "h" | "hh" | "hr" | "hrs" => "hour",
+        "minute" | "minutes" | "mi" | "min" | "mins" | "n" => "minute",
+        "second" | "seconds" | "s" | "ss" | "sec" | "secs" => "second",
+        "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => "millisecond",
+        "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "mcs" => "microsecond",
+        _ if word => return Ok(None),
+        _ => return Err(crate::codes::coded("22023", format!("{call}: '{w}' isn't a date part here: year, quarter, month, week, day, hour, minute, second, millisecond or microsecond"))),
+    }))
+}
+
+/// DuckDB's `strftime(ts, '%Y-%m')` (SQLite's `strftime('%Y', ts)` too), `strptime(text, format)`, `epoch(ts)` and
+/// `regexp_extract(s, pattern[, group[, flags]])` (the group's text, '' with no match); `date_diff(part, a, b)` (also
+/// `datediff`: Snowflake's and SQL Server's), the part boundaries from `a` to `b` as DuckDB counts them (a week is 7 of
+/// the days between, whole ones); `dateadd(part, n, ts)` (Snowflake's and SQL Server's, and `timestampadd`); `date_add(ts, INTERVAL …)` and
+/// `date_sub` (DuckDB's and MySQL's). The text each is, or None: Spark's own `date_add(d, n)` and `datediff(end, start)`
+/// stay as they are, `date_add`'s days as an INT (a literal is a BIGINT, which Spark's doesn't take).
+fn dates(name: &str, a: &[&Expr]) -> Result<Option<String>> {
+    Ok(Some(match (name, a.len()) {
+        ("strftime", 2) => match (string_of(a[0]), string_of(a[1])) {
+            (Some(f), None) if f.contains('%') => format!("to_char({}, {})", a[1], a[0]),
+            _ => format!("to_char({}, {})", a[0], a[1]),
+        },
+        ("strptime", 2) => format!("to_timestamp({}, {})", a[0], a[1]),
+        ("epoch", 1) => format!("date_part('epoch', {})", a[0]),
+        ("regexp_extract", 2..=4) => {
+            let group = match a.get(2) {
+                None => 1,
+                Some(Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. })) => match n.parse::<u64>() {
+                    Ok(g) => g + 1,
+                    Err(_) => return Ok(None),
+                },
+                Some(_) => return Ok(None), // (DuckDB's list of names for a struct: not taken)
+            };
+            let pattern = match string_of(a[1]) {
+                Some(p) => quote(&format!("({p})")), // (the whole match is the first group: the pattern's own come after)
+                None => format!("concat('(', {}, ')')", a[1]),
+            };
+            let flags = a.get(3).map(|f| format!(", {f}")).unwrap_or_default();
+            format!("coalesce(regexp_match({s}, {pattern}{flags})[{group}], CASE WHEN ({s}) IS NOT NULL THEN '' END)", s = a[0])
+        }
+        ("date_diff" | "datediff", 3) => {
+            let Some(part) = part_word(a[0], name)? else { return Ok(None) };
+            let (from, to) = (a[1], a[2]);
+            let at = |p: &str, x: &Expr| format!("date_part('{p}', {x})");
+            let n = match part {
+                "year" => format!("{} - {}", at("year", to), at("year", from)),
+                "quarter" => format!("({} * 4 + {}) - ({} * 4 + {})", at("year", to), at("quarter", to), at("year", from), at("quarter", from)),
+                "month" => format!("({} * 12 + {}) - ({} * 12 + {})", at("year", to), at("month", to), at("year", from), at("month", from)),
+                _ => {
+                    let scale = match part {
+                        "day" | "week" => " / 86400",
+                        "hour" => " / 3600",
+                        "minute" => " / 60",
+                        "millisecond" => " * 1000",
+                        "microsecond" => " * 1000000",
+                        _ => "",
+                    };
+                    let unit = if part == "week" { "day" } else { part };
+                    let n = format!("round((date_part('epoch', date_trunc('{unit}', {to})) - date_part('epoch', date_trunc('{unit}', {from}))){scale})");
+                    match part {
+                        "week" => format!("trunc({n} / 7)"), // (whole weeks of the days between, as DuckDB counts them)
+                        _ => n,
+                    }
+                }
+            };
+            format!("CAST({n} AS BIGINT)")
+        }
+        ("dateadd" | "date_add" | "timestampadd" | "timeadd", 3) => {
+            let Some(part) = part_word(a[0], name)? else { return Ok(None) };
+            let (n, one) = match part {
+                "quarter" => (format!("CAST({} AS BIGINT) * 3", a[1]), "month"),
+                "week" => (format!("CAST({} AS BIGINT) * 7", a[1]), "day"),
+                p => (format!("CAST({} AS BIGINT)", a[1]), p),
+            };
+            format!("({}) + {n} * INTERVAL '1 {one}'", a[2])
+        }
+        ("date_add" | "date_sub", 2) if matches!(a[1], Expr::Interval(_)) => format!("({}) {} {}", a[0], if name == "date_add" { "+" } else { "-" }, a[1]),
+        ("date_add" | "date_sub", 2) if !matches!(a[1], Expr::Cast { .. }) => format!("{name}({}, CAST({} AS INT))", a[0], a[1]),
+        _ => return Ok(None),
+    }))
+}
+
 /// One expression's own forms.
 fn expression(e: &mut Expr) -> Result<()> {
     if let Expr::Like { pattern, escape_char, .. } | Expr::ILike { pattern, escape_char, .. } = e {
@@ -1155,7 +1262,13 @@ fn expression(e: &mut Expr) -> Result<()> {
                     };
                     *e = expr(&format!("first_value({x} ORDER BY {by} {} NULLS LAST) FILTER (WHERE {only})", if desc { "DESC" } else { "ASC" }))?;
                 }
-                ("string_split" | "str_split", 2) => f.name = ObjectName::from(vec![Ident::new("string_to_array")]),
+                ("string_split" | "str_split" | "split", 2) => f.name = ObjectName::from(vec![Ident::new("string_to_array")]),
+                // (DuckDB's dates and patterns, and the part-first DATEDIFF and DATEADD of Snowflake and SQL Server: `dates`)
+                ("strftime" | "strptime" | "epoch" | "regexp_extract" | "date_diff" | "datediff" | "dateadd" | "date_add" | "date_sub" | "timestampadd" | "timeadd", _) => {
+                    if let Some(text) = dates(&n, &a)? {
+                        *e = expr(&text)?;
+                    }
+                }
                 ("list", 1) => f.name = ObjectName::from(vec![Ident::new("array_agg")]), // (DuckDB's name for it)
                 ("apply" | "list_apply" | "array_apply", 2) => f.name = ObjectName::from(vec![Ident::new("array_transform")]),
                 ("filter", 2) if matches!(a[1], Expr::BinaryOp { op: BinaryOperator::Arrow, .. }) => f.name = ObjectName::from(vec![Ident::new("array_filter")]),
@@ -1785,6 +1898,35 @@ mod tests {
         assert_eq!(text("SELECT @@VERSION AS version, @@Version").unwrap(), "SELECT version() AS version, version()");
         assert_eq!(text("SELECT '@@x', 1 -- @@y").unwrap(), "SELECT '@@x', 1 -- @@y");
         assert!(text("SELECT @@spid").unwrap_err().to_string().contains("@@spid is SQL Server's: Pondra's settings are SHOW spid"));
+    }
+
+    #[test]
+    fn duckdbs_dates_and_patterns_and_the_part_first_datediff() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("strftime(created_at, '%Y-%m-%d')").unwrap(), "to_char(created_at, '%Y-%m-%d')");
+        assert_eq!(call("strftime('%Y', created_at)").unwrap(), "to_char(created_at, '%Y')");
+        assert_eq!(call("strptime('01/03/2026', '%d/%m/%Y')").unwrap(), "to_timestamp('01/03/2026', '%d/%m/%Y')");
+        assert_eq!(call("epoch(ts)").unwrap(), "date_part('epoch', ts)");
+        assert_eq!(call("split(tags, ',')").unwrap(), "string_to_array(tags, ',')");
+        assert_eq!(call("regexp_extract(email, '@(.+)$', 1)").unwrap(), "coalesce(regexp_match(email, '(@(.+)$)')[2], CASE WHEN (email) IS NOT NULL THEN '' END)");
+        assert_eq!(call("regexp_extract(email, p)").unwrap(), "coalesce(regexp_match(email, concat('(', p, ')'))[1], CASE WHEN (email) IS NOT NULL THEN '' END)");
+        assert!(call("date_diff('week', a, b)").unwrap().starts_with("CAST(trunc(round((date_part('epoch', date_trunc('day', b))"));
+        assert_eq!(call("date_diff('day', a, b)").unwrap(), "CAST(round((date_part('epoch', date_trunc('day', b)) - date_part('epoch', date_trunc('day', a))) / 86400) AS BIGINT)");
+        assert_eq!(call("DATEDIFF(month, a, b)").unwrap(), "CAST((date_part('year', b) * 12 + date_part('month', b)) - (date_part('year', a) * 12 + date_part('month', a)) AS BIGINT)");
+        assert_eq!(call("DATEADD(week, 2, ts)").unwrap(), "(ts) + CAST(2 AS BIGINT) * 7 * INTERVAL '1 day'");
+        assert_eq!(call("date_add(d, INTERVAL 7 DAY)").unwrap(), "(d) + INTERVAL 7 DAY");
+        assert_eq!(call("date_sub(d, INTERVAL '1 month')").unwrap(), "(d) - INTERVAL '1 month'");
+        // (Spark's own: its days as an INT, once; a column holding the part is left as written)
+        assert_eq!(call("date_add(d, 7)").unwrap(), "date_add(d, CAST(7 AS INT))");
+        assert_eq!(call("date_add(d, CAST(7 AS INT))").unwrap(), "date_add(d, CAST(7 AS INT))");
+        assert_eq!(call("datediff(b, a)").unwrap(), "datediff(b, a)");
+        assert_eq!(call("date_diff(unit, a, b)").unwrap(), "date_diff(unit, a, b)");
+        let m = call("date_diff('m', a, b)").unwrap_err();
+        assert!(crate::codes::of(&m) == "22023" && m.to_string().contains("'m' isn't a date part here"), "{m:#}");
+        assert!(wanted("SELECT strftime(ts, '%Y') FROM t") && wanted("SELECT DATEDIFF (day, a, b) FROM t") && !wanted("SELECT epoch FROM t"));
     }
 
     #[test]
