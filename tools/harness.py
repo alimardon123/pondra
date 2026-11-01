@@ -7985,7 +7985,7 @@ HOT_HELD_BYTES = 100 << 20  # what the cache must hold of `hw` before the second
 
 def hot_under_line():
     """Under a memory line below three fifths of RAM, the decoded columns are let go before a query is stopped
-    (`oom.rs`, the one watch: past seven tenths of the line it gives the cache back, past the line it stops a query).
+    (`oom.rs`, the one watch: past 85% of the line it gives the cache back, past the line it stops a query).
     A node with PONDRA_MEMORY_MAX_GB=1 and a 2 GB cache holds a table's four BIGINT columns (twenty bulk INSERTs of a
     million rows, a file each, about 32 MB decoded each), then a query that grows the node outside the query pool
     (array_agg over HOT_LINE_ROWS values in three groups, as `scale`'s memory-line check) must answer with the model's

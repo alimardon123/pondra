@@ -91,7 +91,7 @@ writes hands each job the one it needs as `PONDRA_TOKEN`; Pondra itself never re
 | `PONDRA_CACHE_DIR` | `<temp dir>/pondra-cache-<uid>` (0700, the node's user's alone) | where a node keeps its local SSD copy of a lake's recent objects, what a shuffle spills, and a follower's copy of the log with `--ack replicated`. The same as `--cache-dir` |
 | `PONDRA_CACHE_GB` | 20, or a quarter of the free disk if that is less | the size of that SSD copy. `0` turns it off. The same as `--cache-gb` |
 | `PONDRA_CACHE_MB` | `1024` | the query read cache in memory |
-| `PONDRA_HOT_GB` | a quarter of the query memory | the most the cache of hot columns may hold |
+| `PONDRA_HOT_GB` | half of the machine's memory; a page, and `pondra sql`: within the query memory | the most the cache of hot columns (the columns queries read lately, kept decoded) may hold. It sits beside the query memory, as an in-memory engine's tables do, and gives way to queries: past 85% of `PONDRA_MEMORY_MAX_GB` the least lately read columns are let go, before any query is stopped. `0` turns it off |
 | `PONDRA_FILES_CACHE_MB` | `512` | the memory cache for files read from outside the lake, such as attached Delta and Iceberg tables and URLs |
 | `PONDRA_FUNCTION_CACHE_MB` | `256` | the memory for answers a function keeps with `cache = '…'` |
 | `PONDRA_TEMP_MB` | `1024` | the memory all temporary tables on a node may hold together. A change past it is refused |

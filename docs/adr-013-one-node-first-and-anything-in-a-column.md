@@ -183,7 +183,11 @@ functions.
 
 - The hot columns are memory: a quarter of the query budget by default, out of it rather than on
   top of it, and given back when the node's own memory runs high. `PONDRA_HOT_GB=0` turns them
-  off, and the numbers above are reported both ways.
+  off, and the numbers above are reported both ways. (Since 2026-11-01: half of RAM by default,
+  beside the query budget, as DuckDB holds its tables, and given back past 85% of the memory line
+  rather than seven tenths. Inside a third of RAM, ClickBench's 10 M rows, 7.3 GB decoded, didn't
+  fit on a 15 GB machine, and DuckDB held them in 7.9 GB. Where no memory watch runs, `pondra sql`
+  and a page, the columns stay inside the query budget.)
 - LZ4 files are about a third bigger than ZSTD(1) ones. `PONDRA_CODEC=zstd` is one flag away.
 - `VARIANT` is JSON text, not a shredded variant: `json_get` parses at read time. A shredded
   variant needs Arrow to have the type.
