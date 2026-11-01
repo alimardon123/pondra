@@ -810,13 +810,13 @@ DROP TABLE ledger;
 UNDROP TABLE ledger;
 ```
 
-## Streams and live views
+## Streams and materialized views
 
 Views that stay current as rows arrive: any query, windows and sessions by event time, stream joins, flows, feeds from Kafka and live answers.
 
 ### Views kept current
 
-A materialized view is any query the node keeps current in the same commit as the rows, so a read never lags the table: here the two biggest clicks. [Views kept current](/pondra/guides/views/#keep-a-query-up-to-date)
+A materialized view is any query the node keeps current as rows arrive. Most take each write in the same commit as the rows, so a read never lags the table; a few, such as this top two, catch up a moment after the commit. [Views kept current](/pondra/guides/views/#keep-a-query-up-to-date)
 
 ```sql
 CREATE TABLE clicks (user VARCHAR, page VARCHAR, ts TIMESTAMP, amount BIGINT);
