@@ -6,7 +6,7 @@ use crate::query::{latest_sql, raw, session, tail};
 use crate::store::*;
 use crate::tasks::Task;
 use axum::body::{Body, Bytes};
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -49,7 +49,7 @@ pub fn router(app: App) -> Router {
         .merge(leader_only)
         .route("/append/{name}", post(append))
         .route("/insert/{name}", post(insert))
-        .route("/cluster/files", post(files).route_layer(middleware::from_fn_with_state(app.clone(), relay_page))) // (a joined page's, relayed: `relay_page`)
+        .route("/cluster/files", post(files))
         .route("/", get(crate::console::page))
         .route("/sql", post(sql))
         .route("/sql/pages/{id}", get(page))
@@ -91,7 +91,7 @@ pub fn router(app: App) -> Router {
         }))
         .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
-        .route("/cluster/commit", post(commit).route_layer(middleware::from_fn_with_state(app.clone(), relay_page))) // (a joined page's, relayed: `relay_page`)
+        .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))
         .route("/cluster/stage", post(stage))
@@ -360,20 +360,13 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         };
     }
     // (the cluster's routes are the nodes' own: their tokens, their key, the program that started this one, anyone at an
-    // open node. A user's sign-in, a superuser's too, reaches only what `Auth::users_reach` names, and a superuser's the
-    // joined page's writes (`Auth::pages_write`, relayed by a follower): the rest carry the lake's keys (the commit stream,
-    // the replica log) or write what only the nodes write (a raw flush, the audit's own tables, acks and beats). Checked
-    // before `AS_USER`, which makes a node's call its user's)
-    if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) && !crate::auth::Auth::pages_write(req.uri().path(), &who) {
-        let why = "this route is the nodes' own: a user's sign-in reaches the cluster's routes only for a branch's pin, and a superuser's for a page's writes";
+    // open node. A user's sign-in, a superuser's too, reaches only what `Auth::users_reach` names: the rest carry the
+    // lake's keys (the commit stream, the replica log) or write what only the nodes write (a raw flush, the audit's own
+    // tables, acks and beats). Checked before `AS_USER`, which makes a node's call its user's)
+    if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) {
+        let why = "this route is the nodes' own: a user's sign-in, a superuser's too, reaches the cluster's routes only for a branch's pin";
         crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await; // (audited, as every refusal is)
         return (StatusCode::FORBIDDEN, why).into_response();
-    }
-    // (and a page's write is marked so: only it gets a writer's checks whatever its role (`relay_page`, `commit`, `files`).
-    // Not an open node's caller, whose role is Admin too: a follower of an open lake signs nothing, and its own flushes move
-    // sequences and record history)
-    if !(who.operator || open) && crate::auth::Auth::pages_write(req.uri().path(), &who) {
-        req.extensions_mut().insert(PageWrite);
     }
     // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. Only from the nodes (their key, the
     // admin token, the program that started this one) and only to `/cluster/*`; any other caller is itself, so a token
@@ -417,7 +410,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
 /// or gives up on. Not the cluster's own calls, the bulk writes or a live query, which lives as long as
 /// its client.
 fn stoppable(path: &str) -> bool {
-    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/")
+    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/") || path.starts_with("/insert/") // (a staged INSERT too: a joined page's rows, `insert_staged`)
 }
 
 /// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,
@@ -498,7 +491,7 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
         crate::auth::Role::Read => "read",
         crate::auth::Role::None => "none",
     };
-    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "open": app.open().await}))
+    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
 /// Followers forward metadata writes to the leader, unchanged.
@@ -510,53 +503,6 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
         return E(anyhow::anyhow!("read-only node")).into_response();
     }
     proxy(&app.members.leader().addr, req).await.unwrap_or_else(|e| E(e).into_response())
-}
-
-/// A call the guard let through as a joined page's write (a superuser's sign-in on `/cluster/commit` or `/cluster/files`,
-/// `Auth::pages_write`): it gets a writer's checks whatever its role, and a follower relays it (`relay_page`).
-#[derive(Clone, Copy)]
-struct PageWrite;
-
-/// A joined page's flush or files (`PageWrite`) reach the leader from a follower, as `to_leader` sends the metadata
-/// writes. The checks on them run here first: the leader sees the nodes' key, not the page's, so it would take them for
-/// the nodes' own. Then the follower answers once its own view holds what the leader had committed (`write::seen_here`),
-/// so the page reads its write back. Every other call (the nodes' own, a write token's, an open node's) is answered here
-/// as it was.
-async fn relay_page(State(app): State<App>, req: Request, next: Next) -> Response {
-    if app.seq.is_some() || req.extensions().get::<PageWrite>().is_none() {
-        return next.run(req).await;
-    }
-    if app.members.reader() {
-        return E(anyhow::anyhow!("read-only node")).into_response();
-    }
-    let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, 1 << 30).await {
-        Ok(bytes) => bytes, // (as `Bytes` takes it on the leader: 1 GiB at most)
-        Err(e) => return E(e.into()).into_response(),
-    };
-    let denied = if parts.uri.path() == "/cluster/files" {
-        match serde_json::from_slice::<crate::write::Files>(&bytes) {
-            Ok(f) => check_files(&app, &f, true).await.err(),
-            Err(e) => Some(e.into()),
-        }
-    } else {
-        match decode_flush(bytes.clone()) {
-            Ok(f) => crate::auth::flush_from_writer(&f, true).err(),
-            Err(e) => Some(e),
-        }
-    };
-    if let Some(e) = denied {
-        return E(e).into_response();
-    }
-    match proxy(&app.members.leader().addr, Request::from_parts(parts, Body::from(bytes))).await {
-        Ok(res) => {
-            if res.status().is_success() {
-                crate::write::seen_here(&app).await; // (the leader's commit is here before the page's answer)
-            }
-            res
-        }
-        Err(e) => E(e).into_response(),
-    }
 }
 
 async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
@@ -598,10 +544,10 @@ async fn beat(State(app): State<App>, Query(p): Query<BeatParams>, headers: axum
 }
 
 /// A follower's flush, to be sequenced (leader only).
-async fn commit(State(app): State<App>, page: Option<Extension<PageWrite>>, body: Bytes) -> Result<Json<crate::log::Outcome>, E> {
+async fn commit(State(app): State<App>, body: Bytes) -> Result<Json<crate::log::Outcome>, E> {
     let seq = app.seq.as_ref().ok_or_else(|| anyhow::anyhow!("not the leader"))?;
     let flush = decode_flush(body)?;
-    crate::auth::flush_from_writer(&flush, page.is_some())?; // (a write token's: rows, and no more; a page's, whatever its role: the same)
+    crate::auth::flush_from_writer(&flush)?; // (a write token's: rows, and no more)
     Ok(Json(seq.submit(flush).await?))
 }
 
@@ -848,14 +794,18 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
 #[derive(Deserialize)]
 struct InsertParams {
     job: String,
+    staged: Option<u8>, // (1: the body is the columns of rows a joined page staged, `insert_staged`; else it is SQL)
 }
 
 /// Bulk `INSERT INTO name <body SQL>`: this node runs the query and writes the Parquet (no log);
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
-/// the table if missing.
-async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
+/// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
+async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
     let start = std::time::Instant::now();
-    let out = insert_rows(&app, &name, p, query).await;
+    let out = match p.staged {
+        Some(1) => insert_staged(&app, &name, &p.job, &body).await,
+        _ => insert_rows(&app, &name, p, body).await,
+    };
     crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
@@ -874,16 +824,50 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     }
 }
 
-/// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
-async fn files(State(app): State<App>, page: Option<Extension<PageWrite>>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
-    check_files(&app, &f, page.is_some()).await?; // (a write token's: into its table's folder; a page's, whatever its role)
-    Ok(Json(app.record_files(f).await?))
+/// A joined page's rows, staged (`staged=1`): this node runs `INSERT INTO name (columns) SELECT c0 AS "a", … FROM` the files the
+/// page put in `stage/<slug>/<job>/` (`auth::page_creates`), as the signed-in user, through its own write (`write::on_node_as`):
+/// the table's types, NOT NULL, CHECK, keys, identity and defaults, the INSERT grant, the job's duplicate answer and the record
+/// are all this node's. The page's files are only a transport, so the node reads what they hold by position and checks it. The
+/// staged files are deleted once the INSERT has answered, whatever the answer, so a resend finds none and is answered by the job.
+async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<Json<Value>, E> {
+    #[derive(Deserialize)]
+    struct Columns { columns: Vec<String> }
+    ensure!(!app.members.reader(), "read-only node");
+    let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
+    let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
+    ensure!(crate::auth::staged_job(job), "a staged INSERT's job is letters, digits and hyphens, 64 at most");
+    crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
+    let Columns { columns } = serde_json::from_str(body)?;
+    let meta = app.lake.table_meta(name).await?;
+    let live: Vec<&str> = meta.live().map(|(_, logical, _)| logical).collect();
+    if let Some(c) = columns.iter().find(|c| !live.contains(&c.as_str())) {
+        return Err(crate::codes::coded("42703", format!("{name} has no column {c}")).into());
+    }
+    let picks: Vec<String> = columns.iter().enumerate().map(|(i, c)| format!("c{i} AS \"{}\"", c.replace('"', "\"\""))).collect();
+    let url = format!("{}/stage/{slug}/{job}/*.parquet", app.lake.url.trim_end_matches('/')).replace('\'', "''");
+    let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));
+    app.auth.allows(who.role, &stmt)?;
+    let out = crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true).await;
+    unstage(&app.lake, &format!("stage/{slug}/{job}/")).await; // (whether or not the INSERT answered: the page's files are its transport only)
+    Ok(Json(out?))
 }
 
-/// The checks on a file record (`auth::files_from_writer`), against the table's folder as this node has it.
-async fn check_files(app: &App, f: &crate::write::Files, forced: bool) -> anyhow::Result<()> {
+/// Deletes what is stored under `dir` (a staged INSERT's files, once it has answered): a failure is not the answer's, and
+/// the leader's orphan sweep takes what is left (`tier::collect_orphans`).
+async fn unstage(lake: &crate::store::Lake, dir: &str) {
+    use futures::TryStreamExt;
+    let Ok(at) = object_store::path::Path::parse(dir) else { return };
+    let Ok(listed) = lake.store.list(Some(&at)).try_collect::<Vec<_>>().await else { return };
+    for o in listed {
+        let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await;
+    }
+}
+
+/// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
+async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
     let meta = app.lake.cat.meta(&table_key(f.table())).await?;
-    crate::auth::files_from_writer(f.table(), meta.as_ref().map(|m| m.folder(f.table())), &f.paths(), forced)
+    crate::auth::files_from_writer(f.table(), meta.as_ref().map(|m| m.folder(f.table())), &f.paths())?; // (a write token's: into its table's folder)
+    Ok(Json(app.record_files(f).await?))
 }
 
 /// Body: `{"source": "events", "target": "per_user", "sql": "SELECT … FROM events …"}`.

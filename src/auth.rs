@@ -226,18 +226,13 @@ const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 /// that are there, and no more. A user writes with SQL, where its grants are checked. A write token
 /// never moves a sequence or a branch's row ids, and never names an object the lake would one day
 /// delete as its own: a segment outside `log/`, a file outside its table's folder; nor adds to the
-/// lake's own records. `forced` (a joined page's, a superuser's: the guard marks it, `Auth::pages_write`) runs the same
-/// checks whatever its role, as `writer` does not let a superuser by them.
-pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
-    if !forced && !writer()? {
+/// lake's own records.
+pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
+    if !writer()? {
         return Ok(());
     }
-    let moves = match forced {
-        true => "a page's flush moves no sequence and no branch's row ids or commit numbers: its node does (nextval, REFRESH)",
-        false => "moving a sequence or a branch's row ids or commit numbers needs an admin",
-    };
     // (a reserve past one is a branch's REFRESH skipping the numbers its base took: the leader's own, never a writer's)
-    ensure!(f.sequence.is_none() && f.blocks == 0 && f.reserve <= 1, "{moves}");
+    ensure!(f.sequence.is_none() && f.blocks == 0 && f.reserve <= 1, "moving a sequence or a branch's row ids or commit numbers needs an admin");
     if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
         bail!("{} is written by Pondra alone", p.table);
     }
@@ -246,38 +241,37 @@ pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
     Ok(())
 }
 
-/// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
-/// `data/`), each in that folder, and never the lake's own records. `forced`: as for `flush_from_writer`; a page's files
-/// are also each one a page may make (`page_creates`): Parquet directly in the folder.
-pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String], forced: bool) -> Result<()> {
-    if !forced && !writer()? {
+/// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under `data/`), each in that folder,
+/// and never the lake's own records.
+pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String]) -> Result<()> {
+    if !writer()? {
         return Ok(());
     }
     ensure!(!RECORDS.contains(&table), "{table} is written by Pondra alone"); // (as a flush's rows are)
-    let Some(folder) = folder else {
-        if forced {
-            bail!("{table} isn't there: a page's files go into a table that is");
-        }
-        bail!("making a table needs an admin")
-    };
+    let Some(folder) = folder else { bail!("making a table needs an admin") };
     let home = format!("data/{folder}/");
     ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
-    ensure!(!forced || files.iter().all(|f| page_creates(f)), "a page's files are Parquet files directly in their table's folder ({home}<name>.parquet)");
     Ok(())
 }
 
-/// An object a joined page may make in the lake (through its node's `/store`, once: `served::lake_files_only`): a segment of
-/// the log (`log/<id>.seg`) or a Parquet file directly in a table's folder (`data/<folder>/<name>.parquet`). Never what
-/// the lake makes beside a table's files (a published Delta or Iceberg view's `_delta_log/` and `metadata/`, its manifests,
-/// its deletion files) nor a base's copy: one such file put first would be taken for the lake's own.
+/// A caller's slug: the one folder of its own a joined page stages its rows in, `stage/<slug>/` (`page_creates`). The user
+/// name in hex, one-to-one and safe in any key. None for a principal with no name of its own (a token, an open node).
+pub fn slug(p: &Principal) -> Option<String> { (!p.operator && !p.name.is_empty()).then(|| crate::text::hex(p.name.as_bytes())) }
+
+/// An object a joined page may make in the lake (through its node's `/store`, once: `served::lake_files_only`): a file of its
+/// own staged rows, `stage/<slug>/<job>/<n>.parquet`, where `<slug>` is the caller's own (`slug`: another's is refused, and a
+/// caller with none stages nothing), `<job>` is `[A-Za-z0-9-]{1,64}` and `<n>` is at most six digits. The node's INSERT reads
+/// those files and then deletes them (`server::insert`).
 pub fn page_creates(key: &str) -> bool {
-    let plain = |name: &str| !name.is_empty() && !name.starts_with(['.', '_']) && !name.contains('/');
-    match key.split_once('/') {
-        Some(("log", seg)) => seg.strip_suffix(".seg").is_some_and(plain),
-        Some(("data", rest)) => rest.split_once('/').is_some_and(|(folder, file)| plain(folder.trim_start_matches('_')) && file.strip_suffix(".parquet").is_some_and(plain)),
-        _ => false,
-    }
+    let Some(me) = current().and_then(|p| slug(&p)) else { return false };
+    let mut parts = key.split('/');
+    let (Some("stage"), Some(who), Some(job), Some(file), None) = (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else { return false };
+    let n = file.strip_suffix(".parquet").unwrap_or_default();
+    who == me && staged_job(job) && (1..=6).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
 }
+
+/// A job name a staged INSERT takes: letters, digits and hyphens, 64 at most (it is a folder's name in `stage/`).
+pub fn staged_job(job: &str) -> bool { !job.is_empty() && job.len() <= 64 && job.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') }
 
 /// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
 fn writer() -> Result<bool> {
@@ -427,11 +421,6 @@ impl Auth {
     /// the keys `objects::readable` allows (`server::feed`, `server::kv`). The others carry the lake's keys or write what
     /// only the nodes write.
     pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka" | "/cluster/log" | "/cluster/kv") }
-
-    /// The nodes' write routes a superuser's sign-in reaches too, for a joined page's writes (a follower relays them to its
-    /// leader: `server::relay_page`). Only a superuser: these two check a write token's rights, never a user's grants, so a
-    /// Write role's sign-in is refused as it is refused now.
-    pub fn pages_write(path: &str, who: &Principal) -> bool { matches!(path, "/cluster/commit" | "/cluster/files") && who.role == Role::Admin && who.access.is_none() }
 
     /// May this role run this write? (And, for a user's request, is it granted: `check`.)
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
@@ -624,44 +613,54 @@ mod tests {
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
 
-    /// A page's flush and files (`forced`) get a writer's checks whatever the role: a segment of the log only, a table's files
-    /// in its folder, the lake's own records never. The nodes' own (not forced) get none, as they had none.
+    /// A write token's flush and files are checked (`writer`): a segment of the log only, a table's files in its folder, the
+    /// lake's own records never. With no sign-in (the nodes' own), neither is checked, as before.
     #[test]
-    fn a_pages_flush_and_files_are_checked_as_a_writers_are() {
+    fn a_writers_flush_and_files_are_checked_and_the_nodes_own_are_not() {
         use crate::log::{Flush, Part};
         let flush = |path: &str, table: Option<&str>| Flush {
             path: path.into(),
             parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None }).into_iter().collect(),
             ..Default::default()
         };
-        assert!(flush_from_writer(&flush("log/a1.seg", None), true).is_ok());
-        assert!(flush_from_writer(&flush("data/t/x.seg", None), true).is_err(), "a segment outside the log");
-        assert!(flush_from_writer(&flush("", Some("pondra$audit")), true).is_err(), "the lake's records");
-        assert!(flush_from_writer(&flush("data/t/x.seg", None), false).is_ok(), "the nodes' own, unchanged");
         let mine = ["data/orders/a.parquet".to_string()];
         let other = ["data/hr/a.parquet".to_string()];
-        assert!(files_from_writer("orders", Some("orders"), &mine, true).is_ok());
-        assert!(files_from_writer("orders", Some("orders"), &other, true).is_err(), "a file outside the table's folder");
-        assert!(files_from_writer("orders", None, &mine, true).is_err(), "a table that isn't there");
-        assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()], true).is_err(), "the lake's records");
-        assert!(files_from_writer("orders", Some("orders"), &other, false).is_ok(), "the nodes' own, unchanged");
-        let published = ["data/orders/_delta_log/00000000000000000001.json".to_string()];
-        assert!(files_from_writer("orders", Some("orders"), &published, true).is_err(), "a published view's file");
-        assert!(flush_from_writer(&Flush { blocks: 1, ..Default::default() }, true).is_err_and(|e| e.to_string().contains("a page's flush")));
+        futures::executor::block_on(WHO.scope(Principal::of(Role::Write), async {
+            assert!(flush_from_writer(&flush("log/a1.seg", None)).is_ok());
+            assert!(flush_from_writer(&flush("data/t/x.seg", None)).is_err(), "a segment outside the log");
+            assert!(flush_from_writer(&flush("", Some("pondra$audit"))).is_err(), "the lake's records");
+            assert!(flush_from_writer(&Flush { reserve: 1, ..Default::default() }).is_ok(), "a bulk INSERT's stamp takes one number");
+            assert!(flush_from_writer(&Flush { reserve: 2, ..Default::default() }).is_err(), "more than one is the leader's own");
+            assert!(files_from_writer("orders", Some("orders"), &mine).is_ok());
+            assert!(files_from_writer("orders", Some("orders"), &other).is_err(), "a file outside the table's folder");
+            assert!(files_from_writer("orders", None, &mine).is_err(), "a table that isn't there");
+            assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()]).is_err(), "the lake's records");
+        }));
+        assert!(flush_from_writer(&flush("data/t/x.seg", None)).is_ok(), "the nodes' own, with no sign-in: unchanged");
+        assert!(files_from_writer("orders", Some("orders"), &other).is_ok(), "the nodes' own, unchanged");
     }
 
-    /// What a page may create: a segment of the log, or Parquet directly in a table's folder (an underscore table's too);
-    /// never a published view's file, a manifest, a deletion file, a base's copy, nor anything else.
+    /// What a joined page stages (`page_creates`): Parquet in its own slug's folder, `stage/<slug>/<job>/<n>.parquet`, for the
+    /// user the request is for. Another's slug, a job name outside `[A-Za-z0-9-]{1,64}`, a file number past six digits, any
+    /// other key, a token's and a caller with no name are all refused.
     #[test]
-    fn a_page_creates_only_segments_and_a_tables_parquet() {
-        for key in ["log/0a1b-000000000000001.seg", "data/orders/3f2a.parquet", "data/_staging/3f2a.parquet"] {
-            assert!(page_creates(key), "{key}");
-        }
-        for key in ["data/orders/_delta_log/00000000000000000001.json", "data/orders/metadata/v1.metadata.json", "data/orders/_manifests/a.json.zst",
-                    "data/orders/_deletes/a.parquet", "data/_bases/abc/data/t/a.parquet", "data/orders/k=1/a.parquet", "data/orders/a.json",
-                    "data/orders/.a.parquet", "data/a.parquet", "log/a/b.seg", "log/.seg", "catalog/x", "data//a.parquet", "data/../a.parquet"] {
-            assert!(!page_creates(key), "{key}");
-        }
+    fn a_page_stages_only_its_own_files() {
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, access: None, door: "http", from: None, operator: false };
+        assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
+        assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
+        let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));
+        futures::executor::block_on(WHO.scope(user("ali"), async {
+            for key in ["stage/616c69/j1/0.parquet", "stage/616c69/auto-3f2a/123456.parquet", "stage/616c69/a-b-C9/7.parquet"] {
+                assert!(page_creates(key), "{key}");
+            }
+            for key in ["stage/626f62/j1/0.parquet", "stage/616c69/j_1/0.parquet", "stage/616c69/j.1/0.parquet", "stage/616c69//0.parquet",
+                        "stage/616c69/j1/1234567.parquet", "stage/616c69/j1/.parquet", "stage/616c69/j1/a.csv", "stage/616c69/j1/0.parquet/x",
+                        "stage/616c69/j1", "stage/616c69/j1/0.parquet/", "data/orders/3f2a.parquet", "log/0a1b.seg", "stage/616c69/j1/../0.parquet", long.as_str()] {
+                assert!(!page_creates(key), "{key}");
+            }
+        }));
+        assert!(!futures::executor::block_on(WHO.scope(user(""), async { page_creates("stage/616c69/j1/0.parquet") })), "a caller with no name stages nothing");
+        assert!(!page_creates("stage/616c69/j1/0.parquet"), "no sign-in: nothing is staged");
     }
 
     #[test]

@@ -79,6 +79,7 @@ impl Joined {
         let status = answer.status();
         let body = answer.text().await.unwrap_or_default();
         match status.as_u16() {
+            401 => E::Unauthenticated { path: path.to_string(), source: format!("{status}: {body}").into() },
             404 => E::NotFound { path: path.to_string(), source: format!("{status}: {body}").into() },
             403 => E::PermissionDenied { path: path.to_string(), source: format!("{status}: {body}").into() },
             _ => generic(self.at(), format!("answered {status}: {body}")),
@@ -170,13 +171,13 @@ impl fmt::Display for Joined {
 #[async_trait::async_trait]
 impl ObjectStore for Joined {
     async fn put_opts(&self, at: &Path, payload: PutPayload, opts: PutOptions) -> StoreResult<PutResult> {
-        // (a new file of the lake only: the node's door takes `PUT /store/…` with `If-None-Match: *` for `data/` and `log/`, and
+        // (a new file only: the node's door takes `PUT /store/…` with `If-None-Match: *` for the page's own staged rows, and
         // refuses any other put, so nothing here overwrites a file)
         if !matches!(opts.mode, PutMode::Create) {
             return Err(writes());
         }
-        if !lake_file(at.as_ref()) {
-            return Err(not_here(at.as_ref()));
+        if !lake_file(at.as_ref()) && !at.as_ref().starts_with("stage/") {
+            return Err(not_here(at.as_ref())); // (a page's staged rows, `stage/`: the node takes them only from its own user, `auth::page_creates`)
         }
         let body = body_of(payload);
         let wait = WAIT + Duration::from_secs(body.len().div_ceil(MB) as u64);

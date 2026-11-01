@@ -1355,10 +1355,6 @@ pub async fn record(lake: &Lake, f: Files, seq: &Sequencer) -> Result<Value> {
 /// their table: the INSERT goes again, without them (`on_node_as` does it at once).
 pub const AGAIN: &str = "INSERT again, its files without their system columns";
 
-/// What a member that keeps no records says of an INSERT the leader sends back `AGAIN`, instead of writing it again: its node runs
-/// the statement whole (`page::lake_sql` recognises these words, and sends the statement to the node).
-pub const NODE_RUNS: &str = "an INSERT into a table a view or a streaming task follows is run whole by the node it joined";
-
 /// The commit number and time a bulk INSERT's files are stamped with, and its block of row ids
 /// (None: its files are written without them, and take a lineage when recorded). A table views or
 /// tasks follow takes none: what follows it goes by the commit that records the files (`record`).
@@ -1627,6 +1623,13 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         let out = crate::copy::copy_to(&app.lake, &query, &to, &options, &app.members.nodes(), app.members.me()).await?; // (a view of a folder: a new file in it)
         return Ok(j!({"rows": out["copied"]}));
     }
+    // A joined page's query INSERT is staged (`stage_insert`): its rows are written here as the page's own files, and its node writes
+    // and checks them as it checks any INSERT. Before `whole_rows`, which would run the table's defaults and sequences here.
+    if !app.members.keeps_records() {
+        if let Some((table, names, query)) = staging(&stmt) {
+            return stage_insert(app, table, names, query, &job, files).await;
+        }
+    }
     let stmt = match stmt {
         Stmt::InsertInto(t, names, query) => Stmt::Insert(t.clone(), whole_rows(&app.lake, &t, &names, &query).await?),
         Stmt::Insert(t, query) => {
@@ -1754,9 +1757,6 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
             };
             let Some(f) = f else { return Ok(j!({"duplicate": true})) };
             return match app.record_files(f).await {
-                // (a member that keeps no records, a joined page, doesn't write it again: its node runs the statement whole. The files
-                // put already are orphans, swept as a crashed follower's are)
-                Err(e) if format!("{e:#}").contains(AGAIN) && !app.members.keeps_records() => Err(crate::codes::coded("0A000", format!("{NODE_RUNS} ({e:#})"))),
                 Err(e) if format!("{e:#}").contains(AGAIN) => {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await; // (this node sees the view by then: without them)
                     Box::pin(on_node_as(app, Stmt::Insert(table, query.clone()), Some(format!("{job}-again")), files)).await
@@ -1776,6 +1776,120 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     let n = rows.rows().num_rows();
     let ack = app.log()?.append_shaped(table, Src { producer: format!("sql:{job}"), seq: 1, prev: None }, rows).await?;
     Ok(if ack.duplicate { j!({"duplicate": true}) } else { j!({"rows": n}) })
+}
+
+// ---------------------------------------------------------------- a joined page's INSERT, staged
+
+/// Parquet files of about this many bytes are cut from a staged INSERT's rows: under the 64 MB a node takes a create of
+/// (`served::STAGE_MAX`), with the footer and the last row group's tail to spare.
+const STAGE_BYTES: usize = 48 << 20;
+
+/// The INSERT a joined page stages (`run_listed`): a plain INSERT whose query isn't VALUES (the node's log takes those), with the
+/// columns it names (none: the table's first ones, as many as the query's width).
+fn staging(stmt: &Stmt) -> Option<(&str, &[String], &str)> {
+    match stmt {
+        Stmt::Insert(t, q) if crate::rules::rows::plain_values(q).is_none() => Some((t.as_str(), &[] as &[String], q.as_str())),
+        Stmt::InsertInto(t, names, q) if crate::rules::rows::plain_values(q).is_none() => Some((t.as_str(), names.as_slice(), q.as_str())),
+        _ => None,
+    }
+}
+
+/// The folder name of a staged INSERT's job (`auth::staged_job`): the job itself when the folder takes it, else the SHA-256 of it
+/// in hex (the same for the same job, and a folder name the node takes).
+fn stage_job(job: &str) -> String {
+    if crate::auth::staged_job(job) {
+        return job.to_string();
+    }
+    crate::text::hex(&crate::crypto::sha256(job.as_bytes()))
+}
+
+/// A joined page's query INSERT, staged: its query's rows are written as Parquet files in the page's own `stage/<slug>/<job>/`,
+/// named `c0…cn` by position and with no default, rule or cast (the node runs those, as it runs any INSERT's), and then its node
+/// writes them into the table: `POST /insert/{table}?job=…&staged=1` with the columns (`server::insert_staged`). The answer is the
+/// node's. A refusal keeps its SQLSTATE: the node's own for the rows, and 28000 or 42501 for the sign-in and the staged files.
+async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], query: &str, job: &str, files: bool) -> Result<Value> {
+    let lake = &app.lake;
+    let slug = crate::dial::page_slug().context("a joined page stages its rows under its user's folder, and its node gave it none")?;
+    let stage = stage_job(job);
+    let ctx = session(lake, query, "").await?;
+    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    in_order(&ctx);
+    let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
+    let width = df.schema().fields().len();
+    let live: Vec<String> = lake.table_meta(table).await?.live().map(|(_, logical, _)| logical.to_string()).collect();
+    let names: Vec<String> = match names.is_empty() {
+        true if width > live.len() => return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({width} given, {table} has {})", live.len()))),
+        true => live[..width].to_vec(),
+        false if names.len() > width => return Err(crate::codes::coded("42601", "INSERT has more target columns than expressions")),
+        false if names.len() < width => return Err(crate::codes::coded("42601", "INSERT has more expressions than target columns")),
+        false => names.to_vec(),
+    };
+    let fields: Vec<datafusion::arrow::datatypes::Field> = df.schema().fields().iter().enumerate().map(|(i, f)| datafusion::arrow::datatypes::Field::new(format!("c{i}"), f.data_type().clone(), true)).collect();
+    let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+    let dir = format!("stage/{slug}/{stage}/");
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let partitions = df.execute_stream_partitioned().await?;
+    futures::future::try_join_all(partitions.into_iter().map(|rows| stage_stream(lake, &dir, schema.clone(), rows, &next))).await?;
+    let call = crate::dial::Call::json(format!("/insert/{}?job={stage}&staged=1", percent_encoding::utf8_percent_encode(table, percent_encoding::NON_ALPHANUMERIC)), &j!({"columns": names}))?;
+    let reply = crate::dial::call(&app.members.leader().addr, call).await?;
+    if reply.ok() {
+        return reply.json().await;
+    }
+    let (status, sqlstate) = (reply.status, reply.sqlstate.clone());
+    let said = reply.text().await.unwrap_or_default();
+    let code = match status {
+        401 => "28000",
+        403 => "42501",
+        _ => sqlstate.as_deref().and_then(crate::codes::received).unwrap_or("XX000"),
+    };
+    Err(crate::codes::coded(code, said))
+}
+
+/// One partition's rows, written as the staged files of `dir`: each file is cut once it holds `STAGE_BYTES` and put as the next.
+async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: datafusion::execution::SendableRecordBatchStream, next: &std::sync::atomic::AtomicU64) -> Result<()> {
+    use futures::StreamExt;
+    let mut open: Option<datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>> = None;
+    while let Some(batch) = rows.next().await.transpose()? {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let batch = RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?;
+        if open.is_none() {
+            open = Some(crate::tier::writer(schema.clone(), &[])?); // (the properties `write_files`' files have: no system columns, no statistics kept)
+        }
+        let w = open.as_mut().expect("a file is open");
+        w.write(&batch)?;
+        if w.bytes_written() + w.in_progress_size() >= STAGE_BYTES {
+            stage_put(lake, dir, open.take().expect("a file is open"), next).await?;
+        }
+    }
+    if let Some(w) = open.take() {
+        stage_put(lake, dir, w, next).await?;
+    }
+    Ok(())
+}
+
+/// One staged file, finished, put as the next `<n>.parquet` of `dir`: a create, so a file that is there is an earlier try's and is
+/// refused, not overwritten.
+async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
+    w.finish()?;
+    let bytes = std::mem::take(w.inner_mut());
+    let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ensure!(n < 1_000_000, "a staged INSERT takes a million files at most");
+    ensure!(bytes.len() <= 64 << 20, "a staged file is past 64 MB: the INSERT's rows come in smaller files");
+    lake.put(&format!("{dir}{n}.parquet"), bytes).await.map_err(staged_refusal)
+}
+
+/// A refusal of the node's store, in the words it gave with the SQLSTATE the page answers with: a sign-in the node doesn't accept is
+/// 28000, one that may not write is 42501 (the page asks `/whoami` again then), and a file already there is an earlier try's.
+fn staged_refusal(e: anyhow::Error) -> anyhow::Error {
+    let mapped = match e.downcast_ref::<object_store::Error>() {
+        Some(object_store::Error::Unauthenticated { source, .. }) => Some(crate::codes::coded("28000", source.to_string())),
+        Some(object_store::Error::PermissionDenied { source, .. }) => Some(crate::codes::coded("42501", source.to_string())),
+        Some(object_store::Error::AlreadyExists { .. }) => Some(crate::codes::coded("55006", "a staged file of this job is still there from an earlier try: its INSERT wasn't taken, and the node's sweep removes it within an hour")),
+        _ => None,
+    };
+    mapped.unwrap_or(e)
 }
 
 /// The name a write's table is attached under (`crm` of `crm.customers`, `crm.s.t`).

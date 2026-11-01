@@ -826,6 +826,13 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     // since, purged): it stays while that branch's pin does (ADR-047).
     let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
+    // A joined page's staged files (`stage/`, taken by their INSERT as it runs: `server::insert_staged`) that are an hour old are
+    // a page's that never sent it, and go.
+    for o in lake.store.list(Some(&Path::from("stage"))).try_collect::<Vec<object_store::ObjectMeta>>().await? {
+        if now as i64 - o.last_modified.timestamp_millis() > HOUR as i64 {
+            let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await;
+        }
+    }
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     for (n, d) in crate::ddl::dropped(lake).await? {
@@ -918,7 +925,7 @@ impl Seen {
 /// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
 /// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
 /// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
-fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
+pub(crate) fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
     let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));
