@@ -37,6 +37,12 @@ pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
+    // (a type DuckDB names otherwise, or one Pondra refuses by name: `DUCKDB_TYPES`, `OTHER_TYPES`, and the ones sqlparser
+    // reads as its own)
+    static TYPES: LazyLock<Regex> = LazyLock::new(|| {
+        let names: Vec<&str> = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).collect();
+        Regex::new(&format!(r"(?i)\b(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)\b", names.join("|"))).expect("a regex")
+    });
     // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
     static OURS_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("|"))).expect("a regex"));
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
@@ -52,7 +58,7 @@ pub fn wanted(sql: &str) -> bool {
     });
     // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
     static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -841,15 +847,21 @@ impl VisitorMut for Friendly {
         match s {
             Statement::CreateTable(c) => {
                 for col in c.columns.iter_mut() {
-                    spell(&mut col.data_type); // (a JSON column keeps its type: `pg_casts::rewrite` holds it as text, checked)
+                    // (a JSON column keeps its type: `pg_casts::rewrite` holds it as text, checked)
+                    if let Err(e) = spell(&mut col.data_type) {
+                        return ControlFlow::Break(e);
+                    }
                 }
             }
             Statement::AlterTable(a) => {
                 for op in a.operations.iter_mut() {
-                    match op {
+                    let spelled = match op {
                         AlterTableOperation::AddColumn { column_def, .. } => spell(&mut column_def.data_type),
                         AlterTableOperation::AlterColumn { op: AlterColumnOperation::SetDataType { data_type, .. }, .. } => spell(data_type),
-                        _ => {}
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = spelled {
+                        return ControlFlow::Break(e);
                     }
                 }
             }
@@ -981,9 +993,35 @@ fn row_in(e: &Expr) -> Result<Option<String>> {
     Ok(Some(format!("EXISTS (SELECT 1 FROM ({subquery}) AS __in({}) WHERE {})", cols.join(", "), same.join(" AND "))))
 }
 
+/// DuckDB's names for types Pondra has under another name (each DuckDB's own alias: DATETIME is TIMESTAMP, …), by their
+/// lower-cased name as sqlparser leaves it (a type it doesn't know is `Custom`).
+const DUCKDB_TYPES: &[(&str, &str)] = &[("datetime", "TIMESTAMP"), ("bpchar", "VARCHAR"), ("logical", "BOOLEAN"), ("int1", "TINYINT"), ("short", "SMALLINT"),
+    ("long", "BIGINT"), ("utinyint", "TINYINT UNSIGNED"), ("usmallint", "SMALLINT UNSIGNED"), ("uinteger", "INT UNSIGNED"), ("ubigint", "BIGINT UNSIGNED"),
+    ("timestamp_s", "TIMESTAMP(0)"), ("timestamp_ms", "TIMESTAMP(3)"), ("timestamp_ns", "TIMESTAMP(9)"), ("blob", "BYTEA"),
+    ("varbinary", "BYTEA"), ("binary", "BYTEA")];
+
+/// Types Pondra doesn't have, refused by name (0A000) with what to write: (name, whose, what Pondra has).
+const OTHER_TYPES: &[(&str, &str, &str)] = &[("hugeint", "DuckDB's 128-bit integer", "DECIMAL(38, 0)"), ("uhugeint", "DuckDB's 128-bit integer", "DECIMAL(38, 0)"),
+    ("varint", "DuckDB's integer of any size", "DECIMAL(38, 0)"), ("bit", "a bit string in Postgres and DuckDB, and SQL Server's boolean", "BOOLEAN, or BYTEA for bits"),
+    ("bitstring", "DuckDB's bit string", "BYTEA"), ("varbit", "Postgres's bit string", "BYTEA"), ("timetz", "a time of day with a zone", "TIME, or TIMESTAMPTZ for an instant"),
+    ("datetime2", "SQL Server's", "TIMESTAMP"), ("smalldatetime", "SQL Server's", "TIMESTAMP"), ("datetimeoffset", "SQL Server's", "TIMESTAMPTZ"),
+    ("uniqueidentifier", "SQL Server's", "UUID"), ("money", "SQL Server's and Postgres's", "DECIMAL(19, 4)"), ("smallmoney", "SQL Server's", "DECIMAL(10, 4)"),
+    ("tinytext", "MySQL's", "TEXT"), ("mediumtext", "MySQL's", "TEXT"), ("longtext", "MySQL's", "TEXT"), ("tinyblob", "MySQL's", "BYTEA"),
+    ("mediumblob", "MySQL's", "BYTEA"), ("longblob", "MySQL's", "BYTEA"), ("year", "MySQL's", "SMALLINT")];
+
 /// Postgres's names for types DataFusion doesn't read as written, as the names it reads (and a few of BigQuery's and
-/// Snowflake's).
-fn spell(t: &mut DataType) {
+/// Snowflake's, and DuckDB's own aliases, `DUCKDB_TYPES`); a type Pondra doesn't have is refused by name (`OTHER_TYPES`).
+fn spell(t: &mut DataType) -> Result<()> {
+    let named = |name: &str| -> Result<Option<DataType>> {
+        let lower = name.to_lowercase();
+        if let Some((_, ours)) = DUCKDB_TYPES.iter().find(|(n, _)| *n == lower) {
+            return Ok(Some(datatype(ours)?));
+        }
+        if let Some((n, whose, ours)) = OTHER_TYPES.iter().find(|(n, _, _)| *n == lower) {
+            return Err(crate::codes::coded("0A000", format!("{} is {whose}: write {ours}", n.to_uppercase())));
+        }
+        Ok(None)
+    };
     let spelled = match t {
         DataType::CharacterVarying(n) | DataType::CharVarying(n) => Some(DataType::Varchar(n.take())),
         DataType::Character(n) => Some(DataType::Char(n.take())),
@@ -995,12 +1033,39 @@ fn spell(t: &mut DataType) {
             Some(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(at(0).unwrap_or(38), at(1).unwrap_or(0) as i64)))
         }
         DataType::Custom(name, args) if args.is_empty() && name.to_string().eq_ignore_ascii_case("byteint") => Some(DataType::TinyInt(None)),
+        // (DuckDB's names sqlparser reads as its own types, and the ones it leaves as written; Spark's and Snowflake's
+        // TIMESTAMP_NTZ is TIMESTAMP too, nearly free and common in their DDL)
+        DataType::Datetime(p) | DataType::TimestampNtz(p) => Some(DataType::Timestamp(*p, TimezoneInfo::None)),
+        DataType::Blob(_) | DataType::Binary(_) | DataType::Varbinary(_) => Some(DataType::Bytea),
+        DataType::UTinyInt => Some(DataType::TinyIntUnsigned(None)),
+        DataType::USmallInt => Some(DataType::SmallIntUnsigned(None)),
+        DataType::UBigInt => Some(DataType::BigIntUnsigned(None)),
+        DataType::HugeInt => named("hugeint")?,
+        DataType::UHugeInt => named("uhugeint")?,
+        DataType::Bit(_) => named("bit")?,
+        DataType::BitVarying(_) => named("varbit")?,
+        DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => named("timetz")?,
+        DataType::Custom(name, args) if args.is_empty() => named(&name.to_string())?,
         _ => None,
     };
     if let Some(s) = spelled {
         *t = s;
     }
+    Ok(())
 }
+
+/// A type as a routine's parameter or its RETURNS writes it (routines.rs keeps types as text), spelled as a column's
+/// type is: DuckDB's DATETIME is TIMESTAMP, and a type Pondra doesn't have is refused by name. A type `spell` leaves
+/// is kept as written.
+pub(crate) fn spelled(t: &str) -> Result<String> {
+    let Ok(mut ty) = datatype(t) else { return Ok(t.to_string()) };
+    let was = ty.clone();
+    spell(&mut ty)?;
+    Ok(if ty == was { t.to_string() } else { ty.to_string() })
+}
+
+/// The type `sql` names (`TIMESTAMP(3)`, `INT UNSIGNED`), as sqlparser reads it.
+fn datatype(sql: &str) -> Result<DataType> { Ok(Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_data_type()?) }
 
 /// A string literal written the way its type reads it, where DataFusion doesn't read Postgres's
 /// spelling: a timestamp's zone of one hour digit (`-0`, `+5`) gets two (`-00:00`, `+05:00`), since
@@ -1037,7 +1102,7 @@ fn numeric(t: &DataType) -> bool { matches!(t, DataType::Numeric(_) | DataType::
 fn typed_literal(e: &mut Expr) -> Result<Option<String>> {
     match e {
         Expr::Cast { data_type, expr: inner, .. } => {
-            spell(data_type);
+            spell(data_type)?;
             match inner.as_mut() {
                 Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => literal(data_type, s),
                 // (`1E-7::numeric`: the number itself, as its plain digits)
@@ -1051,7 +1116,7 @@ fn typed_literal(e: &mut Expr) -> Result<Option<String>> {
             }
         }
         Expr::TypedString(TypedString { data_type, value, .. }) => {
-            spell(data_type);
+            spell(data_type)?;
             let Value::SingleQuotedString(s) = &mut value.value else { return Ok(None) };
             literal(data_type, s)
         }
@@ -2311,6 +2376,25 @@ mod tests {
         let mut q = query("SELECT TOP 2 id FROM t LIMIT 3").unwrap();
         assert_eq!(crate::codes::of(&top(&mut q).unwrap_err()), "42601");
         assert!(wanted("SELECT TOP 3 id FROM t") && wanted("SELECT CAST(x AS INT64)") && wanted("SELECT GROUP_CONCAT(s) FROM t") && !wanted("SELECT topping FROM t"));
+    }
+
+    #[test]
+    fn duckdbs_type_names_are_pondras_and_others_are_refused_by_name() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("CAST(x AS DATETIME)").unwrap(), "CAST(x AS TIMESTAMP)");
+        assert_eq!(call("CAST(x AS UBIGINT)").unwrap(), "CAST(x AS BIGINT UNSIGNED)");
+        assert_eq!(call("CAST(x AS UINTEGER)").unwrap(), "CAST(x AS INT UNSIGNED)");
+        assert_eq!(call("CAST(x AS TIMESTAMP_MS)").unwrap(), "CAST(x AS TIMESTAMP(3))");
+        assert_eq!(call("x::BLOB").unwrap(), "x::BYTEA");
+        assert_eq!(call("CAST(x AS LOGICAL)").unwrap(), "CAST(x AS BOOLEAN)");
+        let e = call("CAST(x AS HUGEINT)").unwrap_err();
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("HUGEINT is DuckDB's 128-bit integer: write DECIMAL(38, 0)"), "{e:#}");
+        assert!(call("CAST(x AS DATETIME2)").unwrap_err().to_string().contains("DATETIME2 is SQL Server's: write TIMESTAMP"));
+        assert!(call("CAST(x AS TIME WITH TIME ZONE)").unwrap_err().to_string().contains("TIMETZ is a time of day with a zone"));
+        assert!(wanted("CREATE TABLE t (a UBIGINT, b DATETIME)") && wanted("SELECT CAST(x AS hugeint)") && !wanted("SELECT datetimes FROM t"));
     }
 
     #[test]

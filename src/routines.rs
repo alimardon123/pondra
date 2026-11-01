@@ -276,6 +276,7 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
 
 /// Leader: keep a function or procedure (`ddl::apply`).
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
+    let r = spelled(r)?;
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::text::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::text::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
@@ -293,6 +294,21 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     check(lake, &name, &r).await?;
     lake.cat.commit(vec![(key(&name), json(&r))], &[]).await?;
     Ok(j!({r.what(): name}))
+}
+
+/// Its types spelled as a column's are (`friendly::spelled`): each parameter's, and what it returns.
+fn spelled(mut r: Routine) -> Result<Routine> {
+    for p in &mut r.params {
+        p.ty = p.ty.as_deref().map(crate::friendly::spelled).transpose()?;
+    }
+    r.returns = match r.returns.as_deref() {
+        Some(t) if t.starts_with("TABLE") => {
+            let cols = columns_of(t)?.into_iter().map(|(c, t)| Ok(format!("{} {}", ast::Ident::with_quote('"', c), crate::friendly::spelled(&t)?))).collect::<Result<Vec<_>>>()?;
+            Some(format!("TABLE ({})", cols.join(", ")))
+        }
+        t => t.map(crate::friendly::spelled).transpose()?,
+    };
+    Ok(r)
 }
 
 /// A body that reads, parameters named once, and a function that hides none of SQL's own.
@@ -1319,6 +1335,19 @@ mod tests {
         assert_eq!(body("d ? 'a'"), "jsonb_exists(d, 'a')", "an expression stays one, unnamed");
         assert_eq!(body("SELECT d ? 'a'"), r#"SELECT jsonb_exists(d, 'a') AS "?column?""#);
         assert_eq!(body("x + 1"), "x + 1", "nothing of JSON's: as written");
+    }
+
+    #[test]
+    fn a_routines_types_are_spelled_as_a_columns_are() {
+        let param = |ty: &str| Param { name: "x".into(), ty: Some(ty.into()), default: None };
+        let r = |params: Vec<Param>, returns: &str| Routine { kind: Kind::Macro, params, language: "sql".into(), body: "x".into(), returns: Some(returns.into()), with: Options::default() };
+        let s = spelled(r(vec![param("DATETIME"), param("DECIMAL(10,2)")], "UBIGINT")).unwrap();
+        assert_eq!(s.params.iter().map(|p| p.ty.clone().unwrap()).collect::<Vec<_>>(), ["TIMESTAMP", "DECIMAL(10,2)"], "a type spell leaves stays as written");
+        assert_eq!(s.returns.as_deref(), Some("BIGINT UNSIGNED"));
+        let s = spelled(r(vec![], r#"TABLE ("a" BLOB, "b" INT)"#)).unwrap();
+        assert_eq!(s.returns.as_deref(), Some(r#"TABLE ("a" BYTEA, "b" INT)"#));
+        let e = spelled(r(vec![param("HUGEINT")], "INT")).unwrap_err();
+        assert_eq!(e.to_string(), "HUGEINT is DuckDB's 128-bit integer: write DECIMAL(38, 0)");
     }
 
     #[test]

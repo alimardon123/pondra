@@ -23940,7 +23940,8 @@ def friendly():
     columns of one name on both sides of a join mixed up); `IN` and `EXISTS` subqueries in a SELECT
     list, a CASE and an aggregate, NULLs and all; array literals reading the outer query's columns
     and the CTEs around them (`ANY([z.n])`, a CTE in an element), which DataFusion planned without
-    them (`friendly.rs`: an array literal is make_array)."""
+    them (`friendly.rs`: an array literal is make_array); DuckDB's names for types Pondra has (DATETIME, UBIGINT, BLOB…)
+    in a table and a function, and a type Pondra hasn't (HUGEINT, DATETIME2, BIT, MONEY) refused by name."""
     import datetime, decimal, duckdb, pyarrow as pa
     lake = new_lake()
     import psycopg
@@ -24163,6 +24164,37 @@ def friendly():
     except Exception as e:
         checks["INT64, FLOAT64, NUMBER(10,2), NUMBER and BYTEINT, in a cast and a CREATE TABLE: BIGINT, DOUBLE, DECIMAL(10,2), DECIMAL(38,0), TINYINT"] = False
         failed["spelled types"] = str(e)[:400]
+    # DuckDB's own names for types Pondra has (friendly.rs DUCKDB_TYPES): the same table, made and filled in both, answers
+    # as DuckDB's does; a function's parameter and RETURNS take them too (routines.rs); a type Pondra hasn't is refused by
+    # name, 0A000, in a table, a cast and a function
+    try:
+        duck_ddl = ["CREATE TABLE dt (a DATETIME, b UBIGINT, c BLOB, d LOGICAL, e UINTEGER, f INT1, g BPCHAR, h TIMESTAMP_MS, i SHORT, j LONG)",
+                    "INSERT INTO dt VALUES (TIMESTAMP '2026-01-02 03:04:05', 18000000000000000000, NULL, true, 4000000000, -5, 'x', TIMESTAMP '2026-01-02 03:04:05.123', -300, 9000000000),"
+                    " (NULL, 7, NULL, false, 0, 127, 'yz', NULL, NULL, -1)"]
+        for s_ in duck_ddl:
+            sql(A.port, s_)
+            duck.execute(s_)
+        q_ = "SELECT a, b, c IS NULL AS c, d, e, f, g, h, i, j FROM dt ORDER BY f"
+        (cn, got), (dn, want) = ours(q_), theirs(q_)
+        sql(A.port, "CREATE FUNCTION later(x DATETIME, n UINTEGER) RETURNS DATETIME AS x + INTERVAL '1 day' * CAST(n AS INT)")
+        moved = sql(A.port, "SELECT later(a, 2) AS m FROM dt WHERE a IS NOT NULL")
+        codes_ = {}
+        for q2 in ("CREATE TABLE ht (n HUGEINT)", "SELECT CAST(1 AS DATETIME2) AS x", "CREATE FUNCTION f_bit(b BIT) RETURNS INT AS 1", "CREATE TABLE mt (m MONEY)"):
+            c2 = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
+            c2.request("POST", "/sql", q2.encode())
+            r2 = c2.getresponse()
+            codes_[q2] = (r2.status, r2.getheader("x-pondra-sqlstate"), r2.read().decode()[:200])
+        checks["DuckDB's DATETIME, UBIGINT, BLOB, LOGICAL, UINTEGER, INT1, BPCHAR, TIMESTAMP_MS, SHORT, LONG: a table == DuckDB's, and a function's types"] = \
+            got == want and cn == dn and len(want) == 2 and [list(r.values()) for r in moved] == [["2026-01-04T03:04:05"]]
+        checks["HUGEINT, DATETIME2, BIT and MONEY: refused by name with what to write, 0A000, in a table, a cast and a function"] = \
+            all(st_ != 200 and hd_ == "0A000" and "write" in b_ for st_, hd_, b_ in codes_.values())
+        if not (got == want and cn == dn):
+            failed["duckdb types"] = {"ours": [cn, got], "duckdb": [dn, want], "moved": moved}
+        if not checks[list(checks)[-1]]:
+            failed["refused types"] = codes_
+    except Exception as e:
+        checks["DuckDB's DATETIME, UBIGINT, BLOB, LOGICAL, UINTEGER, INT1, BPCHAR, TIMESTAMP_MS, SHORT, LONG: a table == DuckDB's, and a function's types"] = False
+        failed["duckdb types"] = str(e)[:400]
     c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=60)
     c.request("POST", "/sql", b"SELECT date_diff('m', ts, ts) AS d FROM t")
     r = c.getresponse()
