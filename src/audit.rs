@@ -398,6 +398,29 @@ fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<boo
     (written, ended)
 }
 
+/// A statement a joined page ran, as its node writes it (`page_records::record`, under the sign-in's name, as the door
+/// `page`): its line when its class is written, and always when refused.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_statement(app: &App, class: &'static str, sql: &str, outcome: &'static str, message: Option<String>, ms: i64) {
+    if kept(classes(), class, outcome) {
+        log(app, class, redacted(sql, class), outcome, message, Some(ms));
+    }
+}
+
+/// Whether a line of `class` and `outcome` is written, given the classes a node writes (`written`, and a refusal always).
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `page_statement`)
+fn kept(list: &[String], class: &str, outcome: &str) -> bool {
+    !list.iter().any(|c| c == "off") && (outcome == "refused" || list.iter().any(|c| c == class || c == "all"))
+}
+
+/// A line the node writes as itself about a joined page's statements it did not record (`page_records::record`).
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_note(app: &App, message: String) {
+    if on() {
+        write(app, Line { at: crate::log::now_ms(), user: String::new(), door: "node", from: None, class: "access", statement: "page statements".into(), outcome: "refused", message: Some(message), ms: None });
+    }
+}
+
 /// A request at the sharing door (`sharing.rs`), by a recipient: always written, as refusals are.
 pub fn shared(app: &App, recipient: &str, from: Option<std::net::SocketAddr>, what: &str, outcome: &'static str, message: Option<String>) {
     if on() {
@@ -481,6 +504,19 @@ mod tests {
         assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
         assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
+    }
+
+    /// A joined page's line is written by its node by the node's own classes (`page_statement`): with the read class off, an ok
+    /// SELECT is no audit line (its history row is kept all the same), a DDL is one, and a refusal always is.
+    #[test]
+    fn a_pages_line_is_written_by_the_nodes_classes_and_a_refusal_always() {
+        let list = |s: &str| s.split(',').map(str::to_string).collect::<Vec<_>>();
+        let node = list("role,ddl,function,write");
+        assert!(!kept(&node, "read", "ok"), "the read class off: an ok SELECT is no line");
+        assert!(kept(&node, "ddl", "ok"), "a DDL the node's class writes");
+        assert!(kept(&node, "read", "refused"), "a refusal is written whatever its class");
+        assert!(!kept(&list("off"), "ddl", "ok"), "off writes nothing at all");
+        assert!(kept(&list("all"), "read", "ok"), "all writes every class");
     }
 
     #[tokio::test]

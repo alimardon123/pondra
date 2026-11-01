@@ -10780,7 +10780,8 @@ def guarded():
     the cluster's nodes only to a signed-in caller; rows through /append and /insert are in the audit log;
     rows through Flight's DoPut and Kafka's produce are taken as through /append, and a hidden table's rows
     stream only to a superuser and are written by no statement; a keyed table's loads ask UPDATE too, rows
-    marked deleted and another engine's commit taking rows out ask DELETE (S11)."""
+    marked deleted and another engine's commit taking rows out ask DELETE (S11); a joined page's own statements are written by its
+    node as the sign-in's, from a superuser only (M8)."""
     import base64
     import pyarrow as pa, pyarrow.flight as fl, confluent_kafka as ck
     P = A.port
@@ -11211,6 +11212,42 @@ def guarded():
     checks["an open GET /cluster/log ends when its sign-in stops being a superuser's: NOSUPERUSER ends the leader's stream and the follower's within 12 s, and a new one is refused (H4)"] = \
         flowing is True and not str(revoked).startswith("ERROR") and set(ended_after) == {"leader", "follower"} \
         and all(v <= 12 for v in ended_after.values()) and again.get("status") in (401, 403)
+    # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
+    # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
+    # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
+    def records(auth, lines, port=P):
+        body = json.dumps({"lines": lines, "dropped": 0}).encode()
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            c.request("POST", "/cluster/records", body, {"Authorization": auth, "Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, r.read()[:300].decode(errors="replace")
+        finally:
+            c.close()
+    line = lambda statement: {"statement": statement, "outcome": "ok", "error": None, "ms": 3}
+    node_key = next(iter(re.findall(r"pn_[A-Za-z0-9_-]+", subprocess.run([BIN, "catalog", "--dir", lake, "z/"], capture_output=True, text=True).stdout)), "")
+    m8 = {}
+    # (the page's own name, door and class for the line are not the node's: it writes the sign-in's, and its own class)
+    said_by_page = {**line("CREATE TABLE m8 (a INT)"), "user": "mallory", "door": "http", "class": "read"}
+    m8["superuser"] = records(boss, [said_by_page])
+    m8["the nodes' key"] = records(f"Bearer {node_key}", [line("CREATE TABLE m8k (a INT)")])
+    m8["a user with grants"] = records(bob, [line("CREATE TABLE m8g (a INT)")])
+    m8["257 lines"] = records(boss, [line("SELECT 1 AS m8n") for _ in range(257)])
+    m8["a read, with the read class off"] = records(boss, [line("SELECT 1 AS m8q")])
+    info["M8"] = {k: list(v) for k, v in m8.items()}
+    audited = until(lambda: ask(P, "SELECT \"user\", door, class, outcome FROM pondra.audit WHERE statement = 'CREATE TABLE m8 (a INT)'", auth=boss),
+                    [{"user": "boss", "door": "page", "class": "ddl", "outcome": "ok"}], 20)
+    recorded_read = until(lambda: ask(P, "SELECT \"user\", door, class FROM pondra.history WHERE door = 'page' AND statement = 'SELECT 1 AS m8q'", auth=boss),
+                          [{"user": "boss", "door": "page", "class": "read"}], 20)
+    info["M8"]["audit"] = audited
+    info["M8"]["history of a read"] = recorded_read
+    checks["M8: a superuser's joined page sends its lines: an audit line of class ddl as the sign-in (boss, door page, the node's class, whatever the page said of them); a read with the read class off is a history row only (no audit line); the same lines with the nodes' key, a user with grants or 257 lines are 403, 403 and 413"] = \
+        m8["superuser"][0] == 200 and audited == [{"user": "boss", "door": "page", "class": "ddl", "outcome": "ok"}] \
+        and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE \"user\" = 'mallory'", auth=boss) == [{"n": 0}] \
+        and m8["the nodes' key"][0] == 403 and m8["a user with grants"][0] == 403 and m8["257 lines"][0] == 413 \
+        and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE statement = 'CREATE TABLE m8k (a INT)' OR statement = 'CREATE TABLE m8g (a INT)'", auth=boss) == [{"n": 0}] \
+        and m8["a read, with the read class off"][0] == 200 and recorded_read == [{"user": "boss", "door": "page", "class": "read"}] \
+        and ask(P, "SELECT count(*) AS n FROM pondra.audit WHERE statement = 'SELECT 1 AS m8q'", auth=boss) == [{"n": 0}]
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()
