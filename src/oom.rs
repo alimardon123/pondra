@@ -12,7 +12,7 @@
 //! less (a median from a sort's middle rows, `frugal.rs`); a second stop takes the request. Which request grew it is
 //! read from the allocator (`Meter`): each request is charged what its own polls allocated, less what
 //! they freed, so a long cheap request started early is not stopped for a query that grew the node.
-//! The one watch lets the hot columns (`hot.rs`) go first, past 85% of the line, since a column
+//! The one watch lets the hot columns (`hot.rs`) go first, under the line (`of_line`), since a column
 //! is decoded again when it is read; it stops a query only past the line itself.
 use std::future::Future;
 use std::pin::Pin;
@@ -131,20 +131,23 @@ pub(crate) async fn come_back(_: usize) -> bool {
     true
 }
 
-/// The resident memory past which the hot columns are given back: 85% of the line, so the cache goes
-/// before a query is stopped. With no line (a host's process, or `PONDRA_MEMORY_MAX_GB=0`), 85% of the
+/// The resident memory past which the hot columns are given back, before a query is stopped (`of_line`). With no line (a host's process, or `PONDRA_MEMORY_MAX_GB=0`), 85% of the
 /// line the machine would have (85% of its memory): the host's memory isn't ours to stop queries for,
 /// but our own cache is ours to drop.
 pub fn trim_line() -> Option<usize> {
     line().or_else(|| Some(crate::store::ram()? / 20 * 17)).map(of_line)
 }
 
-/// 85% of a line: with the default line (85% of RAM), 72% of RAM. The hot columns take up to half of RAM
-/// (`Hot::new`), so queries have a fifth of RAM beside them before any column is given back, and an eighth
-/// more before the line, where a query is stopped. (At seven tenths of the line, 60% of RAM, the columns
-/// were given back as soon as a query took a tenth: TPC-H's and ClickBench's columns came and went.)
+/// 85% of a line, or 320 MB under it where that is lower, and never under 70% of it. With the default line
+/// (85% of RAM) on a machine of 3 GB or more, 72% of RAM: the hot columns take up to half of RAM (`Hot::new`),
+/// so queries have a fifth of RAM beside them before any column is given back, and an eighth more before the
+/// line, where a query is stopped. (At seven tenths of the line, 60% of RAM, the columns were given back as
+/// soon as a query took a tenth: TPC-H's and ClickBench's columns came and went.) Under a small line, 15% of
+/// it was too near: a query growing as fast as the watch looks for (`RATE`, 320 MB in 40 ms) passed a 1 GB line
+/// by 11% while the columns were being given back (`harness hot`, on a GitHub runner); 320 MB under it is
+/// what it grows in the 40 ms the trim and its purge take.
 fn of_line(line: usize) -> usize {
-    line / 20 * 17
+    line.saturating_sub(320 << 20).clamp(line / 10 * 7, line / 20 * 17)
 }
 
 /// Does the watch run in this process (`start`)? Where it doesn't, nothing gives the hot columns back.
@@ -625,9 +628,10 @@ mod tests {
     }
 
     #[test]
-    fn the_watch_gives_the_cache_back_past_85_hundredths_of_the_line() {
+    fn the_watch_gives_the_cache_back_past_85_hundredths_of_the_line_or_320_mb_under_a_small_one() {
         assert_eq!(of_line(20 << 30), 17 << 30);
-        assert_eq!(of_line(LINE), LINE / 20 * 17);
+        assert_eq!(of_line(2 << 30), (2 << 30) - (320 << 20), "320 MB under a 2 GB line: 84%");
+        assert_eq!(of_line(1 << 30), (1 << 30) / 10 * 7, "never under seven tenths of the line");
     }
 
     // (only where the counters are: jemalloc's, on Linux with glibc; elsewhere `thread_net` is 0)

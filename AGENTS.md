@@ -2852,8 +2852,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
    below half the line and stopping only after a second, CI's runner reached 1.75 GB), and "the memory watch stops the
    request that grew the node, not an older cheap one beside it…" (the cheap one was stopped by age). The same one watch gives the
-   hot columns back first, past 85% of the line (`oom::trim_line`; of 85% of the machine's memory where there is no
-   line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
+   hot columns back first, past 85% of the line, or 320 MB under a small one and never under 70% (`oom::trim_line`; of
+   85% of the machine's memory where there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
    decoded again and a query can't. After a trim it has jemalloc give its free pages back (`oom::purge`) and reads
    resident memory again, never crediting what was freed: a query growing meanwhile takes those very pages, and with a
    credit the node passed its line by what the cache gave back. A request takes the watch's last reading as it starts
@@ -3033,7 +3033,8 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    columns from Parquet, while DuckDB held its tables in 7.9 GB. `PONDRA_HOT_GB` still sets the budget. Where no watch runs
    (`oom::watching`: `pondra sql`, a page), nothing would give the columns back, so they stay inside what queries don't
    reserve. At 70% of the line (60% of RAM) a full cache was trimmed as soon as a query took a tenth of RAM; at 85% (72%)
-   queries have a fifth of RAM beside it first, and the line is still an eighth further. Harness `hot` (a 1 GB line: the
+   queries have a fifth of RAM beside it first, and the line is still an eighth further. Under a small line the trim stays
+   320 MB under it (never under 70%): at 85% of a 1 GB line, a query passed it by 11% while the columns went (CI). Harness `hot` (a 1 GB line: the
    columns trimmed and the query answered; past the line, one stop near it); `cargo test --lib oom:: hot::`;
    `logs/round36/singlenode-clickbench-10m-half-ram.json` (6.99 s from memory, was 7.79).
 ## Tests: run these before and after any change
