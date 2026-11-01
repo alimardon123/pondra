@@ -12,7 +12,8 @@
 // lists nothing, each read compared with the node's own answer for the same bytes. In Chromium a kept page (`Page.kept`,
 // its files and tables in the origin's private file system) is checked with reloads, then the demo page
 // (web/demo/index.html, `demoChecks`) in a browser of its own; in Node the kept page is refused by name, and a page past its
-// memory line is checked in a child process of its own (`memoryChecks`).
+// memory line is checked in a child process of its own (`memoryChecks`). With `--node-bin` a page joins a follower of a node's
+// lake (`joinRun`): two nodes on one folder, the page's reads and writes, what never reaches it, and a non-superuser's refusal.
 // A module holds one page at a time, so each check frees the page it made before the next makes one. A check that needs a
 // page while another lives has a tab of its own, on the bare page (`/?bare`: the module with no page of its own).
 import { spawn } from 'node:child_process';
@@ -143,6 +144,37 @@ async function openInNode() {
       pages.set('pondra', new Page());
       return { refused, reopened: pages.get('pondra') instanceof Page };
     },
+    // A page joined to the node at `url` under `session` (`Page.join`), as `name`: the module's pages are closed and freed
+    // first, as `withNode` frees them. `error` is the words of a join that fails (null when it joined), and `asked` the fetches
+    // the join made (the module calls the global `fetch` as it makes one).
+    joinAs: async (name, url, session) => {
+      for (const before of pages.values()) {
+        await before.close();
+        before.free();
+      }
+      pages.clear();
+      const sent = globalThis.fetch;
+      let asked = 0;
+      globalThis.fetch = (...args) => {
+        asked++;
+        return sent(...args);
+      };
+      try {
+        pages.set(name, await Page.join(url, session));
+        return { error: null, asked };
+      } catch (e) {
+        return { error: String(e), asked };
+      } finally {
+        globalThis.fetch = sent;
+      }
+    },
+    // Closes and frees the joined page `name`: its member ends, and the module has no page of that name after.
+    closeAs: async (name) => {
+      const page = pages.get(name);
+      pages.delete(name);
+      await page.close();
+      page.free();
+    },
     close: async () => {
       for (const last of pages.values()) {
         await last.close();
@@ -215,6 +247,32 @@ async function openInBrowser() {
         window.pondra = new window.Page();
         return { refused, reopened: window.pondra instanceof window.Page };
       }),
+      // A page joined to the node at `url` under `session`, in a tab of its own (a module has one page per tab), as `name`:
+      // `error` and `asked` as in Node, the fetches counted on the tab's `fetch`.
+      joinAs: async (name, url, session) => {
+        const made = await tab(name);
+        return made.evaluate(async ({ name, url, session }) => {
+          const sent = window.fetch;
+          let asked = 0;
+          window.fetch = (...args) => {
+            asked++;
+            return sent.apply(window, args);
+          };
+          try {
+            window[name] = await window.Page.join(url, session);
+            return { error: null, asked };
+          } catch (e) {
+            return { error: String(e), asked };
+          } finally {
+            window.fetch = sent;
+          }
+        }, { name, url, session });
+      },
+      closeAs: (name) => tabs.get(name).evaluate(async (name) => {
+        await window[name].close();
+        window[name].free();
+        delete window[name];
+      }, name),
       close: () => closeAll(browser, site),
     };
   } catch (e) {
@@ -496,6 +554,26 @@ async function memoryChecks() {
     console.error(`memory: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
   }
   if (failed.length === before) report.memory = 'a query past its 0.1 GB line stopped with 53200, and the next one answered';
+}
+
+// A page's query past its query pool (`memory_gb`) with no folder to spill to is refused, not a trap of the module: a full sort of
+// 20 M rows past a 0.1 GB pool (under a 1 GB line, so the pool runs out first) answers 53200 naming the page's setting, and the
+// page answers its next query. In a child process of its own, as `memoryChecks`: `inChild` runs Node in either form, so this runs in
+// Node only (the Chromium run has no check of its own for it).
+async function spillChecks() {
+  const answers = await inChild('spill', '{ memory_max_gb: 1, memory_gb: 0.1 }', `
+    const past = await answer('SELECT value FROM range(20000000) ORDER BY random() OFFSET 19999999'); // (no LIMIT: with one it is a top-k, which holds its rows)
+    const after = await answer('SELECT 1 AS n');
+    return { past, after };
+  `);
+  if (!answers) return;
+  const before = failed.length;
+  judge('spill: a sort past its pool', asJudged(answers.past), { status: 503, sqlstate: '53200', says: 'memory_gb' });
+  if (answers.after.status !== 200 || answers.after.text !== 'n\n1\n') {
+    failed.push('spill: the next query');
+    console.error(`spill: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
+  }
+  if (failed.length === before) report.spill = 'a sort past its 0.1 GB pool with no folder to spill to stopped with 53200 naming memory_gb, and the next query answered';
 }
 
 // A node's answer past the room a page has for it is not read (the node's `big` is a view of 20 M rows, 160 MB as Arrow and
@@ -1296,19 +1374,231 @@ async function otherOriginCheck(target, node) {
   }
 }
 
+// A's statements while it is open (no user yet): a table and a row, a secret, and the superuser, the lake's first user, which
+// closes the node to anyone without a sign-in (`App::open`). The rest go as boss, with Basic (`JOIN_AS_BOSS`).
+const JOIN_SETUP = [
+  'CREATE TABLE ev (id BIGINT, v VARCHAR)',
+  "INSERT INTO ev VALUES (1, 'a')",
+  "CREATE SECRET s3x (TYPE s3, KEY_ID 'k', SECRET 'pondra-sealed-j6', SCOPE 's3://nowhere')",
+  "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER",
+];
+const JOIN_AS_BOSS = [
+  "CREATE USER rd PASSWORD 'rd-password-1'",
+  'GRANT SELECT ON ev TO rd',
+];
+const BOSS_BASIC = `Basic ${Buffer.from('boss:boss-password-1').toString('base64')}`;
+// What the page's objects and a node's catalog never name: the secret, its value, and the superuser.
+const SECRET_WORDS = ['s3x', 'pondra-sealed-j6', 'boss'];
+
+// The page joined to a follower (J6, `Page.join`): node A on a fresh folder, given JOIN_SETUP; node B on the same folder, a
+// follower; the page joins B under an admin's session. Both nodes are stopped, and the folder removed, however the run ends.
+// `report.join` is left out when a node didn't start.
+async function joinRun(target) {
+  const a = await startNode(target.origin);
+  if (!a) {
+    report.join = 'left out: the node did not start';
+    return;
+  }
+  let b = null;
+  try {
+    if (!(await joinSetup(a))) return;
+    b = await startNode(target.origin, a.folder);
+    if (!b) {
+      report.join = 'left out: the second node did not start';
+      return;
+    }
+    await joinChecks(target, a, b);
+  } finally {
+    if (b) await b.stop();
+    await a.stop();
+  }
+}
+
+// A's statements (`JOIN_SETUP`, then `JOIN_AS_BOSS` with Basic), each judged; false when one fails, and the run stops there.
+async function joinSetup(a) {
+  const before = failed.length;
+  for (const text of JOIN_SETUP) {
+    const made = await ask(`A: ${text}`, 'POST', '/sql', undefined, text, undefined, a);
+    if (made) judge(`A: ${text}`, made, { status: 200, sqlstate: null });
+    if (failed.length > before) return false;
+  }
+  for (const text of JOIN_AS_BOSS) {
+    const made = await ask(`A: ${text}`, 'POST', '/sql', { Authorization: BOSS_BASIC }, text, undefined, a);
+    if (made) judge(`A: ${text}`, made, { status: 200, sqlstate: null });
+    if (failed.length > before) return false;
+  }
+  return true;
+}
+
+// The checks on the joined page and on B, in order: B's p50 before the join and after the page is closed (the page is closed
+// between the two), the page's reads and writes, what it is never given, and a non-superuser's refusal. Each is judged, and the
+// report names the run when all of them pass; the numbers are reported either way.
+async function joinChecks(target, a, b) {
+  const before = failed.length;
+  if (!(await untilClosed(b))) {
+    failed.push('B has the lake\'s users');
+    console.error('B has the lake\'s users: it did not answer an unsigned /sql 401 within 30 s');
+    return;
+  }
+  const session = await loginAs('B: POST /login as boss', 'boss', 'boss-password-1', b);
+  if (session === null) return;
+  const p50Before = await p50Of(b, BOSS_BASIC); // (B with no page of its own yet)
+  const joined = await target.joinAs('joined', b.url, session);
+  if (joined.error !== null) {
+    failed.push('Page.join(B, boss)');
+    console.error(`Page.join(B, boss): ${joined.error}`);
+    return;
+  }
+  const measured = { fresh_ms: null, p50_before_ms: p50Before, p50_after_ms: null };
+
+  // (a) The page reads A's table: A's row, as csv.
+  const read = await ask('joined: SELECT id, v FROM ev', 'POST', '/sql?format=csv', undefined, 'SELECT id, v FROM ev ORDER BY id', 'joined');
+  if (read) judge('joined: SELECT id, v FROM ev', read, { status: 200, sqlstate: null, out: 'id,v\n1,a\n' });
+
+  // (b) Freshness: A's second row, once A has answered it, is counted by the page within 1000 ms (fresh_ms).
+  const inserted = await ask("A: INSERT INTO ev VALUES (2, 'b')", 'POST', '/sql', { Authorization: BOSS_BASIC }, "INSERT INTO ev VALUES (2, 'b')", undefined, a);
+  if (inserted) {
+    judge("A: INSERT INTO ev VALUES (2, 'b')", inserted, { status: 200, sqlstate: null });
+    const seen = await untilCounted(target, 'joined', 2, performance.now(), 1000);
+    measured.fresh_ms = seen.ms === null ? null : Number(seen.ms.toFixed(1));
+    if (seen.ms !== null) passed++;
+    else {
+      failed.push("joined: A's second row is counted within 1000 ms");
+      console.error(`joined: A's second row is counted within 1000 ms: the page counted ${seen.count}`);
+    }
+  }
+
+  // (c) The page's own write comes back: its next count is 3, and A's is 3 too.
+  const wrote = await ask("joined: INSERT INTO ev VALUES (3, 'c')", 'POST', '/sql', undefined, "INSERT INTO ev VALUES (3, 'c')", 'joined');
+  if (wrote) judge("joined: INSERT INTO ev VALUES (3, 'c')", wrote, { status: 200, sqlstate: null });
+  const counted = await ask('joined: SELECT count(*) FROM ev', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM ev', 'joined');
+  if (counted) judge('joined: SELECT count(*) FROM ev after its INSERT', counted, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
+  const aCount = await ask('A: SELECT count(*) FROM ev', 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, 'SELECT count(*) FROM ev', undefined, a);
+  if (aCount) judge('A: SELECT count(*) FROM ev', aCount, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
+
+  // (d) A transaction is refused by name: each statement is the node's own, run on its own.
+  const begun = await ask('joined: BEGIN', 'POST', '/sql', undefined, 'BEGIN', 'joined');
+  if (begun) judge('joined: BEGIN', begun, { status: 501, sqlstate: '0A000', says: 'a transaction through a client of the node' });
+
+  // (e) Nothing secret reaches the page or the catalog a page reads: no secret, no user, and z/auth has no value.
+  const objects = await ask('joined: GET /objects', 'GET', '/objects', undefined, undefined, 'joined');
+  if (objects) {
+    judge('joined: GET /objects', objects, { status: 200, sqlstate: null, type: JSON_TYPE });
+    const text = dec.decode(objects.body);
+    same('joined: GET /objects names no secret and no user', JSON.stringify(SECRET_WORDS.filter((w) => text.includes(w))), '[]');
+  }
+  const zAuth = Buffer.from('z/auth').toString('base64url');
+  const kv = await ask('B: GET /cluster/kv?key=z/auth with the session', 'GET', `/cluster/kv?key=${zAuth}`, { Authorization: `Bearer ${session}` }, undefined, undefined, b);
+  if (kv) judge('B: GET /cluster/kv?key=z/auth with the session', kv, { status: 200, sqlstate: null, type: JSON_TYPE, json: (j) => (j.value === null ? [] : [`value ${JSON.stringify(j)}`]) });
+
+  // (h) Closing the page leaves B as it was: its p50 after is within 1.5 times its p50 before, plus 2 ms.
+  await target.closeAs('joined');
+  const p50After = await p50Of(b, BOSS_BASIC);
+  measured.p50_after_ms = p50After;
+  if (p50Before !== null && p50After !== null && p50After <= p50Before * 1.5 + 2) passed++;
+  else {
+    failed.push('B: p50 after the page is closed is within 1.5 × its p50 before + 2 ms');
+    console.error(`B: p50 after the page is closed is within 1.5 × its p50 before + 2 ms: before ${p50Before} ms, after ${p50After} ms`);
+  }
+
+  // (f) A non-superuser can't join, and can't read the node's catalog key either.
+  const reader = await loginAs('B: POST /login as rd', 'rd', 'rd-password-1', b);
+  if (reader !== null) {
+    const readerJoin = await target.joinAs('reader', b.url, reader);
+    if (readerJoin.error !== null && readerJoin.error.includes('403')) passed++;
+    else {
+      failed.push('Page.join(B, rd) is refused, naming 403');
+      console.error(`Page.join(B, rd) is refused, naming 403: ${readerJoin.error ?? 'it joined'}`);
+    }
+    if (readerJoin.error === null) await target.closeAs('reader');
+    const readerKv = await ask('B: GET /cluster/kv?key=Yw as rd', 'GET', '/cluster/kv?key=Yw', { Authorization: `Bearer ${reader}` }, undefined, undefined, b);
+    if (readerKv) judge('B: GET /cluster/kv?key=Yw as rd', readerKv, { status: 403, sqlstate: null });
+  }
+
+  // (g) A token is refused by name, with no request made.
+  const token = await target.joinAs('token', b.url, 'pk_x');
+  if (token.error !== null && token.error.includes('a ps_ session') && token.asked === 0) passed++;
+  else {
+    failed.push("Page.join(B, 'pk_x') is refused by name, with no request");
+    console.error(`Page.join(B, 'pk_x'): ${token.error ?? 'it joined'}, ${token.asked} requests made`);
+  }
+
+  const where = IN_BROWSER ? `from ${target.origin}` : '(Node)';
+  report.join = failed.length === before ? { run: `a page joined to a follower of the node on its folder ${where}`, ...measured } : measured;
+}
+
+// Waits until B answers an unsigned `/sql` 401: a node with the lake's users (an open one answers 200). The request waits for
+// B to catch up with A (`guard`), so a sign-in after this is not refused for a user B hasn't replayed yet. Up to 30 s.
+async function untilClosed(node) {
+  const until = Date.now() + 30_000;
+  while (Date.now() < until) {
+    const answer = await node.request('POST', '/sql', undefined, 'SELECT 1').catch(() => null);
+    if (answer?.status === 401) return true;
+    await pause(100);
+  }
+  return false;
+}
+
+// A user's session at the node `from` (`POST /login`): its `ps_` token, judged as one; null when the answer has none.
+async function loginAs(name, user, password, from) {
+  const answer = await ask(name, 'POST', '/login', { 'content-type': JSON_TYPE }, JSON.stringify({ user, password }), undefined, from);
+  if (!answer) return null;
+  judge(name, answer, { status: 200, sqlstate: null, json: (j) => (String(j.token).startsWith('ps_') ? [] : [`body ${JSON.stringify(j)}`]) });
+  try {
+    return JSON.parse(dec.decode(answer.body)).token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// B's p50 of 40 `POST /sql SELECT count(*) FROM ev` (Basic), in ms: the mean of the 20th and 21st of the 40 times, sorted. Each
+// answer must be 200 (one check). Null when a request failed (`ask` names it).
+async function p50Of(node, basic) {
+  const times = [];
+  const bad = [];
+  for (let i = 0; i < 40; i++) {
+    const started = performance.now();
+    const answer = await ask('B: SELECT count(*) FROM ev (p50)', 'POST', '/sql', { Authorization: basic }, 'SELECT count(*) FROM ev', undefined, node);
+    if (!answer) return null;
+    times.push(performance.now() - started);
+    if (answer.status !== 200) bad.push(answer.status);
+  }
+  same('B: its 40 counts answer 200', JSON.stringify(bad), '[]');
+  times.sort((x, y) => x - y);
+  return Number(((times[19] + times[20]) / 2).toFixed(2));
+}
+
+// Polls the page's count of `ev` every 20 ms until it is `want`, for up to `within` ms from `from`: where it was seen (ms from
+// `from`, null when it wasn't in time) and the last count the page answered.
+async function untilCounted(target, on, want, from, within) {
+  let count = null;
+  for (;;) {
+    const answer = await ask(`${on}: SELECT count(*) FROM ev (poll)`, 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM ev', on, target);
+    if (!answer) return { ms: null, count };
+    count = Number(dec.decode(answer.body).split('\n')[1]);
+    const ms = performance.now() - from;
+    if (count === want) return { ms, count };
+    if (ms > within) return { ms: null, count };
+    await pause(20);
+  }
+}
+
 // A node of the run's own: `pondra serve` on a folder and a free port. Its origins are those a browser page may call it
-// from (`PONDRA_WEB_ORIGINS`), when there are any. Returns { url, request, stop }, or null after naming the failure: the
-// node exited, or did not answer `/stats` within 60 s.
-async function startNode(origins) {
+// from (`PONDRA_WEB_ORIGINS`), when there are any. On `folder` when one is given (another node's: this node doesn't remove it),
+// else on a folder of its own. Returns { url, folder, request, stop }, or null after naming the failure: the node exited, or
+// did not answer `/stats` within 60 s.
+async function startNode(origins, folder) {
   const port = await closedPort();
-  const folder = await mkdtemp(join(tmpdir(), 'pondra-web-node-'));
-  const node = spawnNode(origins, folder, port);
+  const own = folder === undefined;
+  const dir = own ? await mkdtemp(join(tmpdir(), 'pondra-web-node-')) : folder;
+  const removed = own ? dir : null;
+  const node = spawnNode(origins, dir, port);
   const why = await untilNodeAnswers(node);
   if (why === null) {
     const { url } = node;
-    return { url, request: (method, path, headers, body) => nodeRequest(url, method, path, headers, body), stop: () => endNode(node, folder) };
+    return { url, folder: dir, request: (method, path, headers, body) => nodeRequest(url, method, path, headers, body), stop: () => endNode(node, removed) };
   }
-  await endNode(node, folder);
+  await endNode(node, removed);
   failed.push('the node starts');
   console.error(`the node starts: ${why}: ${node.stderr}`);
   return null;
@@ -1360,10 +1650,10 @@ async function nodeRequest(url, method, path, headers, body) {
   return { status: answer.status, headers: Object.fromEntries(answer.headers), body: new Uint8Array(await answer.arrayBuffer()) };
 }
 
-// Ends a node: its process, then its folder.
+// Ends a node: its process, then its folder when it has one to remove (`startNode`'s own; none for another node's).
 async function endNode(node, folder) {
   await stopProcess(node.child);
-  await rm(folder, { recursive: true, force: true });
+  if (folder) await rm(folder, { recursive: true, force: true });
 }
 
 // Ends a process with SIGTERM and waits for its exit. A process that has exited, or never started, is not waited for.
@@ -1383,9 +1673,15 @@ try {
   } else {
     await keptRefused(target.Page);
     await memoryChecks();
+    await spillChecks();
   }
-  if (NODE_BIN) await nodeRun(target);
-  else report.node = 'left out: no --node-bin';
+  if (NODE_BIN) {
+    await nodeRun(target);
+    await joinRun(target);
+  } else {
+    report.node = 'left out: no --node-bin';
+    report.join = 'left out: no --node-bin';
+  }
 } finally {
   await target.close();
 }

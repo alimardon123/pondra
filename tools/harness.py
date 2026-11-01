@@ -10665,6 +10665,16 @@ def guarded():
         isinstance(open_stats, dict) and {"lake", "leader", "nodes", "releases", "role", "version", "term", "format", "keys"} <= set(open_stats)
     # Users: the row doors and the nodes' own routes
     b = Node(lake, P + 1, env=audit).start()  # (a follower)
+    # A follower of an open lake signs nothing, so its own flushes and files reach the leader as an open node's caller's: they
+    # are the nodes' own, never checked as a page's (L1's review of #349): an identity's sequence, DDL's history rows, a bulk
+    # INSERT's files, all from the follower
+    for q in ["CREATE TABLE ids (id BIGINT GENERATED ALWAYS AS IDENTITY, v TEXT)", "INSERT INTO ids (v) VALUES ('a'), ('b')",
+              "CREATE TABLE bulk (n BIGINT)", "INSERT INTO bulk SELECT value FROM range(1000)",
+              "CREATE SEQUENCE tickets", "SELECT nextval('tickets') AS t", "CREATE TABLE made_here AS SELECT value AS x FROM range(10)"]:
+        info.setdefault("open follower", {})[q] = ask(P + 1, q)
+    checks["a follower of an open lake writes as before: an identity insert, DDL, a bulk INSERT, nextval and CREATE TABLE AS, all on the follower"] = \
+        info["open follower"]["SELECT nextval('tickets') AS t"] == [{"t": 1}] \
+        and until(lambda: (ask(P, "SELECT count(*) AS n, max(id) AS top FROM ids"), ask(P, "SELECT count(*) AS n FROM bulk"), ask(P, "SELECT count(*) AS n FROM made_here")) == ([{"n": 2, "top": 2}], [{"n": 1000}], [{"n": 10}]), True, 20)
     basic = lambda u, p: "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
     for q in ["CREATE TABLE orders (id BIGINT, amount DOUBLE)", "CREATE TABLE hr (id BIGINT, salary DOUBLE)", "INSERT INTO hr VALUES (1, 100.0)",
               "CREATE USER boss PASSWORD 'boss-password-1' SUPERUSER"]:
@@ -10697,13 +10707,41 @@ def guarded():
         and ask(P, "SELECT count(*) AS n FROM hr", auth=boss) == [{"n": 1}]
     checks["…and never through the nodes' own routes (/cluster/commit, /cluster/files)"] = \
         "this route is the nodes' own" in said["a user's flush"] and "this route is the nodes' own" in said["a user's files"]
-    # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the commit stream and the replica log
-    # carry the lake's keys (`z/auth`), and a raw flush or heartbeat writes what only the nodes write (L2's review, 10-31)
+    # A superuser's sign-in is Admin, and the nodes' routes once took any Admin: the replica log carries the lake's keys
+    # (`z/auth`), and a heartbeat or an ack writes what only the nodes write (L2's review, 10-31). A superuser's flush and
+    # files are a joined page's writes, which a follower relays to the leader (`server::relay`), checked below
     nodes_own = {p: ask(P, b"" if m == "GET" else "{}", path=p, method=m, auth=boss) for p, m in
-                 (("/cluster/replica", "GET"), ("/cluster/commit", "POST"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
+                 (("/cluster/replica", "GET"), ("/cluster/beat", "POST"), ("/cluster/ack", "POST"))}
     info["nodes_own"] = nodes_own
-    checks["…nor a superuser's sign-in: the replica log (the lake's keys), a raw flush, a heartbeat, an ack: 403"] = \
+    checks["…nor a superuser's sign-in: the replica log (the lake's keys), a heartbeat, an ack: 403"] = \
         all(refused(v) and "this route is the nodes' own" in v for v in nodes_own.values())
+    # A joined page's writes, through its node: a superuser's flush and files on a follower are answered by the leader (not a
+    # 403); a Write role's are refused as before; a new lake file through /store is stored once (the second is 412, the bytes stay)
+    until(lambda: isinstance(ask(P + 1, b"", path="/whoami", method="GET", auth=boss), dict), True, 20)  # (the follower has the new superuser)
+    # (and the nodes' key, which the lake has once it has users: a relay sent before the follower has it is the leader's 401)
+    until(lambda: isinstance(ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss), dict), True, 20)
+    page = {
+        "a superuser's flush, on a follower": ask(P + 1, flush({"path": "", "parts": []}), path="/cluster/commit", auth=boss),
+        "a superuser's files, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g6", "columns": [["id", "BIGINT"], ["amount", "DOUBLE"]], "files": []}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
+        "a Write role's files, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g7", "columns": [], "files": []}), path="/cluster/files", auth=bob, headers={"Content-Type": "application/json"}),
+        # a superuser's page gets a writer's checks, on the follower (before it relays: the leader sees the nodes' key) and on the leader
+        "a file outside the table's folder, on a follower": ask(P + 1, json.dumps({"table": "orders", "job": "g8", "columns": [], "files": [{"path": "data/hr/x.parquet", "rows": 1, "bytes": 1}]}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
+        "a file outside the table's folder, on the leader": ask(P, json.dumps({"table": "orders", "job": "g9", "columns": [], "files": [{"path": "data/hr/x.parquet", "rows": 1, "bytes": 1}]}), path="/cluster/files", auth=boss, headers={"Content-Type": "application/json"}),
+        "rows for the audit log, on a follower": ask(P + 1, flush({"path": "", "parts": [{"table": "pondra$audit", "off": 0, "len": 0, "rows": 0, "src": None}]}), path="/cluster/commit", auth=boss),
+        "a segment outside the log, on a follower": ask(P + 1, flush({"path": "data/t/x.seg", "parts": []}), path="/cluster/commit", auth=boss),
+        "a new file, through /store": ask(P, b"guarded", path="/store/data/guarded/a.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
+        "the same file again": ask(P, b"other", path="/store/data/guarded/a.parquet", method="PUT", auth=boss, headers={"If-None-Match": "*"}),
+        "what the file holds": ask(P, b"", path="/store/data/guarded/a.parquet", method="GET", auth=boss),
+    }
+    info["page writes"] = page
+    checks["a joined page's writes: a superuser's flush and files reach the leader through a follower (answered, not refused); a Write role's files: 403; a new lake file through /store stored once (the second 412, the bytes stay)"] = \
+        isinstance(page["a superuser's flush, on a follower"], dict) and "Acks" in page["a superuser's flush, on a follower"] \
+        and not str(page["a superuser's files, on a follower"]).startswith(("ERROR 401", "ERROR 403")) \
+        and refused(page["a Write role's files, on a follower"]) and "this route is the nodes' own" in str(page["a Write role's files, on a follower"]) \
+        and page["a new file, through /store"] == b"" and str(page["the same file again"]).startswith("ERROR 412") and page["what the file holds"] == b"guarded"
+    checks["a superuser's page gets a writer's checks: a file outside its table's folder (on a follower, and on the leader), the audit log's rows, a segment outside log/: refused by name"] = \
+        all("a table's files are in its folder" in str(page[k]) for k in ("a file outside the table's folder, on a follower", "a file outside the table's folder, on the leader")) \
+        and "written by Pondra alone" in str(page["rows for the audit log, on a follower"]) and "a segment of the log" in str(page["a segment outside the log, on a follower"])
     # What a page that joined the cluster follows, a superuser's sign-in: the catalog and the commit stream, with only
     # the keys a page may hold (`objects::readable`): never the lake's keys, its users or its secrets
     catalog = ask(P, b"", path="/cluster/kv?from=", method="GET", auth=boss)
@@ -10763,7 +10801,7 @@ def guarded():
         got = ask(P, "SELECT statement FROM pondra.audit WHERE outcome = 'refused' AND statement LIKE '% /cluster/%'", auth=boss)
         return {r["statement"] for r in got} if isinstance(got, list) else set()
     checks["a superuser's call that the nodes' own routes refuse is in the audit log, as every refusal at a door is"] = \
-        until(lambda: {"GET /cluster/replica", "POST /cluster/commit"} <= cluster_refused(), True, 15)
+        until(lambda: {"GET /cluster/replica", "POST /cluster/beat"} <= cluster_refused(), True, 15)
     # Flight's DoPut and Kafka's produce ask the same check as /append, at their own doors (the user's grants
     # decide, not the node's); a hidden table's rows stream to a superuser only, through DoGet and /watch alike
     def put(table, auth, cols):

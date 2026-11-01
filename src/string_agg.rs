@@ -38,8 +38,9 @@ fn cap() -> usize {
 /// What a query whose group passed `cap` answers ("out of memory": 53200 at every door, `codes::by_words`).
 fn refused(cap: usize) -> DataFusionError {
     DataFusionError::Execution(format!(
-        "out of memory: one group's string_agg passed {} MB, an eighth of a partition's share of this node's memory for queries: group by more columns, or give the node more memory (--memory-gb)",
-        cap >> 20
+        "out of memory: one group's string_agg passed {} MB, an eighth of a partition's share of this node's memory for queries: group by more columns, or {}",
+        cap >> 20,
+        crate::env::raise_memory()
     ))
 }
 

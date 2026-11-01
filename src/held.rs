@@ -344,7 +344,7 @@ impl ExecutionPlan for HeldInExec {
             let mut h = held.lock().unwrap();
             h.reservation.try_grow(b).map_err(|_| {
                 let figure = limit.map_or(String::new(), |bytes| format!(" ({} MB)", bytes >> 20));
-                let message = format!("out of memory: a window holds more rows than this node's memory for queries{figure}: partition it by more columns, or give the node more memory (--memory-gb)");
+                let message = format!("out of memory: a window holds more rows than this node's memory for queries{figure}: partition it by more columns, or {}", crate::env::raise_memory());
                 // ("Resources exhausted" is what starts the frugal retry (`query::exhausted`): a window over whole partitions is
                 // answered there as a GROUP BY. A streaming window's retry would run out the same way, so its refusal is a plain
                 // error. Both give 53200 on every door, by the message's words.)

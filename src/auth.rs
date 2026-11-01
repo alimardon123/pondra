@@ -226,12 +226,17 @@ const RECORDS: [&str; 3] = ["pondra$audit", "pondra$history", "pondra$runs"];
 /// that are there, and no more. A user writes with SQL, where its grants are checked. A write token
 /// never moves a sequence or a branch's row ids, and never names an object the lake would one day
 /// delete as its own: a segment outside `log/`, a file outside its table's folder; nor adds to the
-/// lake's own records.
-pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
-    if !writer()? {
+/// lake's own records. `forced` (a joined page's, a superuser's: the guard marks it, `Auth::pages_write`) runs the same
+/// checks whatever its role, as `writer` does not let a superuser by them.
+pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
+    if !forced && !writer()? {
         return Ok(());
     }
-    ensure!(f.sequence.is_none() && f.blocks == 0, "moving a sequence or a branch's row ids needs an admin");
+    let moves = match forced {
+        true => "a page's flush moves no sequence and no branch's row ids: its node does (nextval, REFRESH)",
+        false => "moving a sequence or a branch's row ids needs an admin",
+    };
+    ensure!(f.sequence.is_none() && f.blocks == 0, "{moves}");
     if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
         bail!("{} is written by Pondra alone", p.table);
     }
@@ -241,15 +246,36 @@ pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
 }
 
 /// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
-/// `data/`), each in that folder.
-pub fn files_from_writer(folder: Option<&str>, files: &[String]) -> Result<()> {
-    if !writer()? {
+/// `data/`), each in that folder, and never the lake's own records. `forced`: as for `flush_from_writer`; a page's files
+/// are also each one a page may make (`page_creates`): Parquet directly in the folder.
+pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String], forced: bool) -> Result<()> {
+    if !forced && !writer()? {
         return Ok(());
     }
-    let Some(folder) = folder else { bail!("making a table needs an admin") };
+    ensure!(!RECORDS.contains(&table), "{table} is written by Pondra alone"); // (as a flush's rows are)
+    let Some(folder) = folder else {
+        if forced {
+            bail!("{table} isn't there: a page's files go into a table that is");
+        }
+        bail!("making a table needs an admin")
+    };
     let home = format!("data/{folder}/");
     ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
+    ensure!(!forced || files.iter().all(|f| page_creates(f)), "a page's files are Parquet files directly in their table's folder ({home}<name>.parquet)");
     Ok(())
+}
+
+/// An object a joined page may make in the lake (through its node's `/store`, once: `served::lake_files_only`): a segment of
+/// the log (`log/<id>.seg`) or a Parquet file directly in a table's folder (`data/<folder>/<name>.parquet`). Never what
+/// the lake makes beside a table's files (a published Delta or Iceberg view's `_delta_log/` and `metadata/`, its manifests,
+/// its deletion files) nor a base's copy: one such file put first would be taken for the lake's own.
+pub fn page_creates(key: &str) -> bool {
+    let plain = |name: &str| !name.is_empty() && !name.starts_with(['.', '_']) && !name.contains('/');
+    match key.split_once('/') {
+        Some(("log", seg)) => seg.strip_suffix(".seg").is_some_and(plain),
+        Some(("data", rest)) => rest.split_once('/').is_some_and(|(folder, file)| plain(folder.trim_start_matches('_')) && file.strip_suffix(".parquet").is_some_and(plain)),
+        _ => false,
+    }
 }
 
 /// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
@@ -400,6 +426,11 @@ impl Auth {
     /// the keys `objects::readable` allows (`server::feed`, `server::kv`). The others carry the lake's keys or write what
     /// only the nodes write.
     pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka" | "/cluster/log" | "/cluster/kv") }
+
+    /// The nodes' write routes a superuser's sign-in reaches too, for a joined page's writes (a follower relays them to its
+    /// leader: `server::relay_page`). Only a superuser: these two check a write token's rights, never a user's grants, so a
+    /// Write role's sign-in is refused as it is refused now.
+    pub fn pages_write(path: &str, who: &Principal) -> bool { matches!(path, "/cluster/commit" | "/cluster/files") && who.role == Role::Admin && who.access.is_none() }
 
     /// May this role run this write? (And, for a user's request, is it granted: `check`.)
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
@@ -591,6 +622,46 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
+
+    /// A page's flush and files (`forced`) get a writer's checks whatever the role: a segment of the log only, a table's files
+    /// in its folder, the lake's own records never. The nodes' own (not forced) get none, as they had none.
+    #[test]
+    fn a_pages_flush_and_files_are_checked_as_a_writers_are() {
+        use crate::log::{Flush, Part};
+        let flush = |path: &str, table: Option<&str>| Flush {
+            path: path.into(),
+            parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None }).into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(flush_from_writer(&flush("log/a1.seg", None), true).is_ok());
+        assert!(flush_from_writer(&flush("data/t/x.seg", None), true).is_err(), "a segment outside the log");
+        assert!(flush_from_writer(&flush("", Some("pondra$audit")), true).is_err(), "the lake's records");
+        assert!(flush_from_writer(&flush("data/t/x.seg", None), false).is_ok(), "the nodes' own, unchanged");
+        let mine = ["data/orders/a.parquet".to_string()];
+        let other = ["data/hr/a.parquet".to_string()];
+        assert!(files_from_writer("orders", Some("orders"), &mine, true).is_ok());
+        assert!(files_from_writer("orders", Some("orders"), &other, true).is_err(), "a file outside the table's folder");
+        assert!(files_from_writer("orders", None, &mine, true).is_err(), "a table that isn't there");
+        assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()], true).is_err(), "the lake's records");
+        assert!(files_from_writer("orders", Some("orders"), &other, false).is_ok(), "the nodes' own, unchanged");
+        let published = ["data/orders/_delta_log/00000000000000000001.json".to_string()];
+        assert!(files_from_writer("orders", Some("orders"), &published, true).is_err(), "a published view's file");
+        assert!(flush_from_writer(&Flush { blocks: 1, ..Default::default() }, true).is_err_and(|e| e.to_string().contains("a page's flush")));
+    }
+
+    /// What a page may create: a segment of the log, or Parquet directly in a table's folder (an underscore table's too);
+    /// never a published view's file, a manifest, a deletion file, a base's copy, nor anything else.
+    #[test]
+    fn a_page_creates_only_segments_and_a_tables_parquet() {
+        for key in ["log/0a1b-000000000000001.seg", "data/orders/3f2a.parquet", "data/_staging/3f2a.parquet"] {
+            assert!(page_creates(key), "{key}");
+        }
+        for key in ["data/orders/_delta_log/00000000000000000001.json", "data/orders/metadata/v1.metadata.json", "data/orders/_manifests/a.json.zst",
+                    "data/orders/_deletes/a.parquet", "data/_bases/abc/data/t/a.parquet", "data/orders/k=1/a.parquet", "data/orders/a.json",
+                    "data/orders/.a.parquet", "data/a.parquet", "log/a/b.seg", "log/.seg", "catalog/x", "data//a.parquet", "data/../a.parquet"] {
+            assert!(!page_creates(key), "{key}");
+        }
+    }
 
     #[test]
     fn ten_failures_refuse_the_pair_for_a_minute() {

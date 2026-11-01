@@ -36,6 +36,10 @@ impl Options {
     /// address and no doors, and none of the loops a node that lives keeps (`Node::start`). Its tokens are the
     /// environment's, and its own calls are signed with a key it makes, as a library's node's are.
     pub fn guest(dir: &str, attach: Vec<String>, guest: Guest) -> Options {
+        // (a lake in this process's memory is new: nobody wrote it, so a guest that only reads leads it, and reads its empty
+        // catalog, as `pondra sql --dir :memory: "SELECT 1"` asks; a reader would find no lake there. An empty folder is still
+        // refused, which catches a mistyped path)
+        let guest = if crate::memory::in_memory(dir) { Guest::Writes } else { guest };
         let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
                   pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest) }

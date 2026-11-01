@@ -6,6 +6,7 @@
 //! 3. A node opened right after leads: the next term, with its address.
 //! 4. A guest that writes beside a live leader follows it: its write is quick, it reads its own write, it is no member
 //!    of the leader, and the leader has the row afterwards.
+//! Last, a guest that only reads a lake in memory reads a new, empty one.
 #![cfg(feature = "server")]
 #![recursion_limit = "256"] // (as the program's: a node's futures are deep)
 use pondra::node::{Guest, Node, Options};
@@ -38,6 +39,7 @@ fn run() {
         a_node_leads_right_after(&lake_text, &lake).await;
         follows_a_live_leader(&lake_text, &dir).await;
         reads_that_follow_leave_no_task(&lake_text, &dir).await;
+        a_guest_reads_a_new_lake_in_memory().await;
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -121,6 +123,15 @@ async fn leads_writes_and_lets_go(lake_text: &str, lake: &Path) {
     eprintln!("node_guest 1: open {:.2} s, finish {:.2} s", opened.as_secs_f64(), t1.elapsed().as_secs_f64());
     assert_eq!(terms(lake), vec![(1, String::new())], "the guest claimed term 1 with no address, and nothing else");
     assert_eq!(left(lake), vec![1], "the guest's term is given back: cluster/left holds it");
+}
+
+/// A guest that only reads a lake in this process's memory reads a new, empty one (`pondra sql --dir :memory: "SELECT 1"`):
+/// nobody else wrote it, so there is no lake to find, and a folder's "holds no lake yet" would be wrong there.
+async fn a_guest_reads_a_new_lake_in_memory() {
+    let guest = open(Options::guest(&pondra::memory::place(":memory:"), vec![], Guest::Reads)).await;
+    let answer = sql(&guest, "SELECT 1 AS x").await;
+    assert_eq!(answer.0, 200, "a statement on a new lake in memory runs: {}", answer.1);
+    finish(guest).await;
 }
 
 /// 2. A guest that reads claims nothing.
