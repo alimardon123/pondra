@@ -287,11 +287,11 @@ CASES = [
     ("bigquery", "BEGIN TRANSACTION"),
     ("bigquery", "UPDATE orders SET status = 'pending' WHERE id = 5"),
     ("bigquery", "COMMIT TRANSACTION"),
-    ("bigquery", "CREATE TEMP FUNCTION initials(name STRING) AS (SUBSTR(name, 1, 1))", ("0A000", "CREATE TEMP FUNCTION: a routine here is the lake's, not a session's")),
+    ("bigquery", "CREATE TEMP FUNCTION initials(name STRING) AS (SUBSTR(name, 1, 1))"),
     ("bigquery", "CREATE OR REPLACE PROCEDURE sales.mark_paid(IN oid INT64) BEGIN UPDATE orders SET status = 'paid' WHERE id = oid; END", ("42601", "CREATE PROCEDURE: unexpected BEGIN")),
     ("bigquery", "CALL sales.mark_paid(2)", ("42883", "procedure sales.mark_paid does not exist")),
     ("bigquery", "EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM orders'"),
-    ("bigquery", "SELECT COUNT(*) FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"),
+    ("bigquery", "SELECT COUNT(*) FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)", ("0A000", "only append tables are read as they were")),  # (FOR SYSTEM_TIME AS OF is Pondra's own; orders is keyed)
     # sqlserver: queries
     ("sqlserver", "SELECT TOP 3 id, amount FROM orders ORDER BY amount DESC"),
     ("sqlserver", "SELECT id, amount FROM orders ORDER BY id OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY"),

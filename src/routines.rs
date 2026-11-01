@@ -107,7 +107,8 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     }
     let create = p.parse_keyword(Keyword::CREATE);
     let replace = p.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
-    let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|_| create)?;
+    let temporary = p.parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY]).is_some(); // (a function of the session's: `temp.rs`)
+    let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|k| create && (!temporary || *k == Keyword::FUNCTION))?;
     let quiet = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]); // (nothing if one of the name is there)
     if quiet && replace {
         return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
@@ -121,7 +122,10 @@ pub fn statement(sql: &str) -> Option<Stmt> {
                 true => "CREATE PROCEDURE name($p TYPE [= …], …) AS BEGIN … END, or LANGUAGE python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::of_error(&e, format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
+            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::of_error(&e, format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| match temporary {
+                true => Stmt::TempRoutine(name, Box::new(routine), replace, quiet),
+                false => Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]),
+            })
         }
     })
 }
@@ -281,12 +285,7 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::text::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::text::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
     ensure!(r.kind != Kind::Procedure || !crate::git::is_own(crate::text::split(&name).1), "{name}: git_checkout, git_status, git_commit, git_pull and git_pull_request are Pondra's own procedures (CALL git_commit('sales', 'message'))");
-    // (a function by an installed extension's function's name would be replaced by it in every query that names it: `clash`
-    // refuses the other order at INSTALL)
-    let short = crate::text::split(&name).1;
-    if let Some((ext, _)) = crate::extension::listed(lake).await?.into_iter().find(|(_, x)| r.kind != Kind::Procedure && x.functions.iter().any(|f| f.name == short)) {
-        return Err(crate::codes::coded("42723", format!("{name}: the extension {ext} has a function {short}; UNINSTALL it, or name this function otherwise")));
-    }
+    clash(lake, &name, &r).await?;
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -294,6 +293,29 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     check(lake, &name, &r).await?;
     lake.cat.commit(vec![(key(&name), json(&r))], &[]).await?;
     Ok(j!({r.what(): name}))
+}
+
+/// A function by an installed extension's function's name would be replaced by it in every query that names it
+/// (`clash` refuses the other order at INSTALL).
+async fn clash(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
+    let short = crate::text::split(name).1;
+    if let Some((ext, _)) = crate::extension::listed(lake).await?.into_iter().find(|(_, x)| r.kind != Kind::Procedure && x.functions.iter().any(|f| f.name == short)) {
+        return Err(crate::codes::coded("42723", format!("{name}: the extension {ext} has a function {short}; UNINSTALL it, or name this function otherwise")));
+    }
+    Ok(())
+}
+
+/// A session's function (`CREATE TEMP MACRO`, `CREATE TEMP FUNCTION`): checked as the lake's are, for the session to keep
+/// (`temp.rs`). It is SQL: its body is put in its calls' places, so nothing of it is anywhere but in the session. A Python
+/// function runs on the lake's workers, so it is the lake's.
+pub async fn temporary(lake: &Lake, name: &str, r: Routine) -> Result<Routine> {
+    if r.python() {
+        return Err(crate::codes::coded("0A000", format!("{name}: a temporary function is SQL (RETURN …, LANGUAGE sql, or a MACRO); a Python one is the lake's: CREATE FUNCTION {name} … LANGUAGE python")));
+    }
+    let r = spelled(r)?;
+    clash(lake, name, &r).await?;
+    check(lake, name, &r).await?;
+    Ok(r)
 }
 
 /// Its types spelled as a column's are (`friendly::spelled`): each parameter's, and what it returns.

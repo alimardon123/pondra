@@ -635,7 +635,7 @@ fn word_of(stmt: &Stmt) -> &'static str {
     use crate::ddl::Ddl;
     match stmt {
         Stmt::Create(_) | Stmt::Define(..) => "CREATE TABLE",
-        Stmt::TempView(..) | Stmt::TempSecret(..) => "CREATE",
+        Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => "CREATE",
         Stmt::Insert(..) | Stmt::InsertInto(..) => "INSERT",
         Stmt::Update(..) => "UPDATE",
         Stmt::Delete(..) => "DELETE",

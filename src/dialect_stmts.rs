@@ -11,8 +11,7 @@
 //!   `ALTER TABLE t CHANGE / MODIFY …`, `ADD COLUMN … AFTER c / FIRST` (a column is added last here), and `DATABASE()`,
 //!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
 //! - SQL Server's `OUTPUT inserted.…`, which would otherwise run with the clause left out, and `OPTION (…)`;
-//! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`, and a `CREATE TEMP FUNCTION` or `MACRO`
-//!   (DuckDB's, BigQuery's): a routine here is the lake's, never a session's.
+//! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`.
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use regex::Regex;
@@ -41,7 +40,7 @@ fn refusal(sql: &str) -> Option<String> {
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
             r"|\boutput\s+(?:inserted|deleted)\s*\.|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
-            r"|\breplace\s+into\b|\balter\s+table\b[^;]*\b(?:after|first)\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?(?:stream|temp(?:orary)?\s+(?:macro|function))\b"))
+            r"|\breplace\s+into\b|\balter\s+table\b[^;]*\b(?:after|first)\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?stream\b"))
             .expect("a regex")
     });
     if !LOOK.is_match(sql) {
@@ -144,10 +143,6 @@ fn statement(s: &[Token]) -> Option<String> {
                 let (t, _) = name(s, name(s, at + 1).1 + 2);
                 return Some(format!("CREATE STREAM … ON TABLE is Snowflake's: here GET /watch/{t}?changes=true follows a table's changes as they commit (db.watch('{t}', changes=True) in Python)"));
             }
-            if (is(at, "TEMP") || is(at, "TEMPORARY")) && matches!(w(at + 1).as_deref(), Some("FUNCTION" | "MACRO")) {
-                let (kind, (f, _)) = (w(at + 1).unwrap_or_default(), name(s, at + 2));
-                return Some(format!("CREATE TEMP {kind}: a routine here is the lake's, not a session's: write CREATE OR REPLACE {kind} {f}(…) AS …, and DROP {kind} {f} when it's done"));
-            }
             let at = if is(1, "UNIQUE") { 2 } else { 1 };
             let kind = w(at).filter(|k| k == "CLUSTERED" || k == "NONCLUSTERED")?;
             Some(format!("{kind} INDEX is SQL Server's: write CREATE INDEX name ON t (columns); CLUSTER BY orders a table's rows"))
@@ -238,8 +233,6 @@ mod tests {
         assert_eq!(said("SELECT VERSION(), DATABASE(), CURRENT_USER()"), "DATABASE() is MySQL's: write current_database()");
         assert_eq!(said("select user()"), "USER() is MySQL's: write current_user (no parentheses)");
         assert!(said("CREATE OR REPLACE STREAM orders_stream ON TABLE orders").contains("GET /watch/orders?changes=true"));
-        assert_eq!(said("CREATE TEMP FUNCTION initials(name STRING) AS (SUBSTR(name, 1, 1))"), "CREATE TEMP FUNCTION: a routine here is the lake's, not a session's: write CREATE OR REPLACE FUNCTION initials(…) AS …, and DROP FUNCTION initials when it's done");
-        assert!(said("CREATE OR REPLACE TEMPORARY MACRO m(x) AS x + 1").starts_with("CREATE TEMP MACRO: a routine here is the lake's"));
     }
 
     #[test]
@@ -250,7 +243,7 @@ mod tests {
             "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT x DEFAULT FROM t", "DELETE FROM t USING o WHERE t.id = o.id", "UPDATE t SET a = 1 FROM o WHERE t.id = o.id",
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
-            "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "ALTER TABLE t ADD COLUMN after INT",
+            "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP MACRO m(x) AS x + 1", "CREATE OR REPLACE TEMPORARY FUNCTION f(x INT) RETURN x", "ALTER TABLE t ADD COLUMN after INT",
             "ALTER TABLE t ADD COLUMN first INT", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
             "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
         ] {
