@@ -902,7 +902,7 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(opt
         let _guard = app.lock.lock().await;
         crate::ddl::apply(&app.lake, d.clone()).await?
     };
-    crate::ddl::settle(&app.lake, &d).await?; // (once it's filled from the rows already there)
+    app.settle(&d).await?; // (once it's filled from the rows already there)
     Ok(Json(out))
 }
 
@@ -948,7 +948,7 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
             crate::ddl::apply(&app.lake, d.clone()).await?
         }
     };
-    crate::ddl::settle(&app.lake, &d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    app.settle(&d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
     Ok(Json(out))
 }
 

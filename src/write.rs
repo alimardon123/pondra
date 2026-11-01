@@ -1662,7 +1662,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
                     None => post(&app.members.leader().addr, &Request::Ddl(d.clone())).await?,
                 },
             };
-            crate::ddl::settle(lake, &d).await?; // (ATTACH, DETACH: here at once)
+            app.settle(&d).await?; // (ATTACH, DETACH: here at once; a guest leading its lake runs the leader's tasks meanwhile)
             if let Some(n) = out["notice"].as_str() {
                 crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, through this door)
             }
@@ -2042,7 +2042,7 @@ async fn by_inbox(app: &crate::app::App, stmt: Stmt, job: &str, files: bool) -> 
                 } else {
                     through_bucket_one(lake, Stmt::Ddl(vec![d.clone()]), job, files).await?
                 };
-                crate::ddl::settle(lake, &d).await?; // (ATTACH, DETACH: here at once, as `run_listed` settles them)
+                app.settle(&d).await?; // (ATTACH, DETACH: here at once, as `run_listed` settles them)
                 if let Some(n) = out["notice"].as_str() {
                     crate::routines::heard(n); // (carried out on the leader, perhaps over HTTP: told here, as `run_listed` tells it)
                 }
