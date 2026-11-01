@@ -141,6 +141,7 @@ mod rules;
 #[cfg(feature = "lake")] mod kafka_client;
 #[cfg(feature = "lake")] mod kafka_wire;
 #[cfg(feature = "lake")] mod json_rows;
+#[cfg(feature = "lake")] mod keep_parquet;
 #[cfg(feature = "lake")] mod lake_scan;
 #[cfg(feature = "doors")] mod live;
 #[cfg(feature = "lake")] mod locks;
