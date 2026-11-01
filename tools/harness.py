@@ -10266,11 +10266,10 @@ def _lake_keys():
     info["follower"] = {"unsigned": unsigned, "wrote": wrote, "another key said": open(c.log).read()[-400:]}
     checks["a follower that joins once users sign in opens them with the same master key and writes through the leader, answering nothing unsigned meanwhile; a node with another key can't, and says why"] = \
         str(unsigned).startswith("ERROR 401") and wrote == {"rows": 1} and said is True
-    # A follower sends a caller's /cluster/ddl on with the caller's own sign-in (security pass 3, K1): an unchecked branch key
-    # or a reader's sign-in makes no token at the leader. The body is a users DDL (`ddl::Ddl::Users`, tag `op`; its
-    # `users::Change::CreateToken`, tag `do`) that would mint a token for boss, which the answer carries as `pt_…`.
-    as_(A.port, basic, "CREATE USER peek PASSWORD 'peek-password-1'")
-    peek = "Basic " + base64.b64encode(b"peek:peek-password-1").decode()
+    # A follower sends a caller's /cluster/ddl on with the caller's own sign-in (security pass 3, K1): an unchecked branch key,
+    # or a superuser's sign-in (which `/cluster/ddl` takes for a branch's pin alone), makes no token at the leader. The body is
+    # a users DDL (`ddl::Ddl::Users`, tag `op`; `users::Change::CreateToken`, tag `do`) that would mint a token for boss, which
+    # the answer would carry as `pt_…`.
     def follower_ddl(auth, body):  # (to the follower: the leader answers the caller's sign-in, or refuses it)
         try:
             return call(A.port + 1, "POST", "/cluster/ddl", json.dumps(body).encode(), headers={"Authorization": auth, "Content-Type": "application/json"})
@@ -10278,11 +10277,11 @@ def _lake_keys():
             return f"ERROR {e}"
     mint = {"op": "users", "do": "create_token", "name": "takeover", "user": "boss", "expires_secs": None}
     branch_key = follower_ddl("Bearer pb_x", mint)
-    reader = follower_ddl(peek, mint)
+    superuser = follower_ddl(basic, mint)
     succeeded = lambda a: not isinstance(a, str) or bool(re.match(r"ERROR 2\d\d:", a))  # (a 2xx: `call` returns it, or raises with the status)
-    info["follower_door"] = {"branch key pb_x": str(branch_key)[:300], "reader peek": str(reader)[:300]}
-    checks["a follower sends a caller's /cluster/ddl on with the caller's own sign-in: an unchecked branch key or a reader's sign-in makes no token there"] = \
-        "pt_" not in str(branch_key) and "pt_" not in str(reader) and not succeeded(branch_key) and not succeeded(reader)
+    info["follower_door"] = {"branch key pb_x": str(branch_key)[:300], "superuser boss": str(superuser)[:300]}
+    checks["a follower sends a caller's /cluster/ddl on with the caller's own sign-in: an unchecked branch key, or a superuser's sign-in, makes no token there"] = \
+        "pt_" not in str(branch_key) and "pt_" not in str(superuser) and not succeeded(branch_key) and not succeeded(superuser)
     for n in (a, b, c):
         n.kill()
     # A new master key, the previous one set: the leader rewraps them; then the new key alone opens them
