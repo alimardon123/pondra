@@ -85,6 +85,16 @@ pub fn unquoted(error: &str) -> String {
 #[derive(Debug)]
 pub struct Coded(pub &'static str, pub String);
 
+/// An error for DataFusion that keeps its SQLSTATE: a coded one anywhere in its chain goes as `DataFusionError::External`,
+/// where `of` finds it again as the error's source (a function's own error is 38000 at every door, not an internal one);
+/// the rest go in words. A Python function's and an extension's both (`pyfn.rs`, `extension.rs`).
+pub fn for_datafusion(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    match e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
+        Some(c) => datafusion::error::DataFusionError::External(Box::new(Coded(c.0, format!("{e:#}")))),
+        None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
+    }
+}
+
 impl std::fmt::Display for Coded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.1) }
 }

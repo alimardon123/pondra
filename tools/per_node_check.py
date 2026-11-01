@@ -130,6 +130,7 @@ PROCESS = {
     "store.rs:START": "the clock the spill disk's last look is measured from: the disk is the machine's",
     "store.rs:LOOKED": "when the spill disk was last looked at: the disk is the machine's, so one look serves every lake",
     "extension.rs:PARTS": "extensions' parts loaded in this process, by their file's SHA-256: a part holds no lake's state and its file never changes under its hash, so one serves every node",
+    "extension.rs:TURNS": "the extension calls running in this process, against one a core: the cores are the machine's, so every node in a process shares one count (each call gives its turn back as it ends)",
     "wasm.rs:ENGINE": "Wasmtime's engine, the process's compiler: compiled code is shared by every node in a process, and holds no node's state",
     "store.rs:DISK": "the window sorts' spill disk (`window_sorts`, invariant 423), made once from settings read once (PONDRA_SPILL_FAN_IN, --memory-gb, PONDRA_CORES, PONDRA_SPILL_GB): the disk is the machine's, as SPILLERS says",
     "engine.rs:SPARK": "Spark's functions, made against a session with nothing of a lake",

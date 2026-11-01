@@ -139,6 +139,9 @@ doesn't offer …`.
 | `PONDRA_EXTENSION_SECS` | `30` | one batch's time; past it the call fails with `57014` |
 | `PONDRA_EXTENSION_FILE_MB` | `64` | the size of a `.wasm` file at `INSTALL` |
 
+A node runs at most one extension call per core at once. Further calls wait their turn, each on a
+thread of its own, so the node's other queries go on while slow calls run.
+
 <Aside>
 Not in 1.0: aggregates, network and secrets, an index of published extensions with signatures, and
 extensions in the browser page (which refuses `INSTALL` by name). See the
