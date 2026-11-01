@@ -192,7 +192,7 @@ each database's node, on this machine only, doesn't.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-gb GB` | a third of the machine's | memory for queries (also `PONDRA_MEMORY_GB`). A sort, join or aggregation that needs more spills to the temp directory |
-| `--cache-dir DIR` | `<temp dir>/pondra-cache` | for a lake on object storage: where the node keeps its local SSD copy of recent objects |
+| `--cache-dir DIR` | `<temp dir>/pondra-cache-<uid>` (0700) | for a lake on object storage: where the node keeps its local SSD copy of recent objects |
 | `--cache-gb GB` | `20`, or a quarter of the free disk if that is less | the size of that SSD tier. `0` turns it off |
 
 ### Other lakes
