@@ -6062,6 +6062,19 @@ $$""")
 raise ValueError("no such thing")
 $$""")
     checks["a Python error comes back as the error"] = "ValueError: no such thing" in err("CALL py_fail()")
+    def state(s):  # (HTTP status, SQLSTATE) of a statement the node refuses
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", "/sql", s.encode(), {"authorization": "Bearer a-tok"})
+        r = c.getresponse()
+        r.read()
+        return r.status, r.getheader("x-pondra-sqlstate")
+    q("""CREATE FUNCTION py_raise(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$
+return 1 // (x - x)
+$$""")
+    checks["a Python routine's own error is 38000 (400), not an internal one: a procedure's, a function's in a query, a DO's; code that doesn't parse is 42601"] = \
+        state("CALL py_fail()") == (400, "38000") and state("SELECT py_raise(id) AS v FROM orders WHERE id < 3") == (400, "38000") \
+        and "ZeroDivisionError" in err("SELECT py_raise(3) AS v") and state("DO LANGUAGE python $$\n1 / 0\n$$") == (400, "38000") \
+        and state("CREATE FUNCTION py_unparsed(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$\nreturn x +\n$$") == (400, "42601")
     q("""CREATE PROCEDURE py_deep(n BIGINT) LANGUAGE python AS $$
 con.call("py_deep", n + 1)
 $$""")

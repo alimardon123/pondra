@@ -1230,7 +1230,13 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         }
         _ => crate::python::ask(&r.with.packages, kind, head, parts, limit, &mut notice).await,
     };
-    let (answer, parts) = asked.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
+    let (answer, parts) = asked.map_err(|e| {
+        let said = format!("{whose}{}", lease.redact(&format!("{e:#}")));
+        match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+            Some(c) => crate::codes::coded(c.0, said), // (a Python error's SQLSTATE, `python::raised`: 38000, not an internal one)
+            None => anyhow::anyhow!(said),
+        }
+    })?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("images") => Ok(Outcome::Done(j!({"called": name, "images": answer["images"]}))), // (a cell's figures, as PNG: the console shows them)
