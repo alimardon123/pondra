@@ -213,7 +213,10 @@ fn cache() -> Option<PathBuf> {
 /// `bytes` compiled: read back from the cache when this Wasmtime compiled them before, else compiled and kept there. A file
 /// the cache can't read (another build's, cut short) is compiled again and replaced.
 fn compiled(bytes: &[u8], sha256: &str) -> Result<Component> {
-    let file = cache().map(|dir| dir.join(format!("{sha256}.cwasm")));
+    // (a hash names the cache's file, and only a hash: a record's `sha256` is read from a bucket, and a path in it would load
+    // a file elsewhere on this disk as native code. `extension::part` refuses such a record before this; anything else
+    // that isn't a hash is compiled, and not cached)
+    let file = cache().filter(|_| crate::extension::sha_ok(sha256)).map(|dir| dir.join(format!("{sha256}.cwasm")));
     if let Some(file) = file.as_ref().filter(|f| f.exists()) {
         // SAFETY: the file is this process's own compiled output, written whole and renamed into place below; Wasmtime checks
         // that it was compiled by this release with these settings before it runs any of it.

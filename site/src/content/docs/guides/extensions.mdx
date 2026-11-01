@@ -107,8 +107,9 @@ UNINSTALL hello;
 ```
 
 Only an admin installs an extension, and only on a node started with
-`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since 1.0 checks no signatures. The lake keeps the file, so
-a cluster, a branch and a backup all carry it. A function name that another function already has is
+`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since 1.0 checks no signatures; a node runs one only when it
+was started with it too. The lake keeps the file, so a cluster, a branch and a backup all carry it, and
+each node checks the file's hash as it loads it. A function name that another function already has is
 refused (`42723`). The full rules are in the [SQL reference](/pondra/sql/statements/).
 
 ## Logs and the clock

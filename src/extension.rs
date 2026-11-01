@@ -279,10 +279,7 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
     if cfg!(target_arch = "wasm32") {
         return Err(coded("0A000", format!("{name}: extensions in the page come after 1.0 (X3 in the plan)")));
     }
-    // (unsigned is every extension in 1.0: a node loads one only when its admin starts it so)
-    if !crate::env::flag("PONDRA_ALLOW_UNSIGNED_EXTENSIONS") {
-        return Err(coded("0A000", format!("{name} is unsigned: this node loads unsigned extensions only when it runs with PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true (an admin's choice, as DuckDB's allow_unsigned_extensions is)")));
-    }
+    unsigned_allowed(&name)?;
     let max = crate::env::or("PONDRA_EXTENSION_FILE_MB", 64u64) * (1 << 20);
     let bytes = bytes_of(lake, &from, max).await?;
     let record = keep(lake, &name, &from, version, bytes).await?;
@@ -299,6 +296,52 @@ pub async fn fetch(lake: &Lake, lock: Option<&tokio::sync::Mutex<()>>, d: Ddl) -
 /// The file's bytes: a path on this machine (`std::fs`), or a URL read through the store its secret makes, as `read_parquet`
 /// reads one. The check every read makes comes first (`ext::check_url`: a path on the server's disk is the node's owner's, and a
 /// URL needs a secret that covers it). A file over `max` is refused before it is read whole.
+/// Unsigned is every extension in 1.0: a node installs or runs one only when its admin starts it with
+/// `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`. Asked of each node as it loads a part (`part`), not only at INSTALL: a record
+/// another node installed, a backup restored or a branch copied is run only where its admin allowed it (audit 11-01 H1).
+#[cfg(feature = "lake")]
+fn unsigned_allowed(name: &str) -> Result<()> {
+    if !crate::env::flag("PONDRA_ALLOW_UNSIGNED_EXTENSIONS") {
+        return Err(coded("0A000", format!("{name} is unsigned: this node loads unsigned extensions only when it runs with PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true (an admin's choice, as DuckDB's allow_unsigned_extensions is)")));
+    }
+    Ok(())
+}
+
+/// Whether a record's `sha256` may name a file: 64 lower-case hex digits, as `keep` writes it. Checked before it names a key
+/// in the lake or a file in the compiled-code cache (`wasm::compiled`): a record is read from a bucket, and a path there would
+/// name a file elsewhere on the node's disk.
+pub(crate) fn sha_ok(sha256: &str) -> bool {
+    sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The record names the bytes in the lake: its `sha256` is a hash, and the file under it hashes to it. Asked by the leader
+/// as it keeps a record (`install`: a raw `/cluster/ddl` request may carry one its caller built) and by each node as it
+/// loads one (`part`: a bucket writer may have swapped the file). Not so: XX001, INSTALL it again.
+#[cfg(feature = "lake")]
+async fn the_file(lake: &Lake, name: &str, r: &Installed) -> Result<bytes::Bytes> {
+    let again = |why: String| coded("XX001", format!("the extension {name} {why}: INSTALL it again"));
+    if !sha_ok(&r.sha256) {
+        return Err(again(format!("names no file (its record's sha256 {:?} isn't 64 hex digits)", r.sha256)));
+    }
+    let bytes = lake.object(&file_key(name, &r.version, &r.sha256)).await.with_context(|| format!("reading the file of the extension {name}"))?;
+    if crate::text::hex(&crate::crypto::sha256(&bytes)) != r.sha256 {
+        return Err(again("has a file that isn't the one installed (its SHA-256 isn't the record's)".to_string()));
+    }
+    Ok(bytes)
+}
+
+/// An extension's functions as its record keeps them, from its loaded part.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+fn described(part: &crate::wasm::Loaded) -> Vec<Described> {
+    part.functions.iter().map(|f| Described {
+        name: f.name.clone(),
+        arguments: f.arguments.iter().map(ToString::to_string).collect(),
+        returns: f.returns.to_string(),
+        volatile: f.volatile,
+        columns: f.columns.iter().map(|(n, t)| (n.clone(), t.to_string())).collect(),
+    }).collect()
+}
+
 #[cfg(feature = "lake")]
 async fn bytes_of(lake: &Lake, from: &str, max: u64) -> Result<Vec<u8>> {
     use object_store_df::ObjectStoreExt as _;
@@ -337,25 +380,25 @@ pub async fn keep(lake: &Lake, name: &str, from: &str, version: Option<String>, 
         return Err(coded("22023", format!("{file} is {} {}, not {asked}", part.name, part.version)));
     }
     let version = part.version.clone();
-    let functions: Vec<Described> = part.functions.iter().map(|f| Described {
-        name: f.name.clone(),
-        arguments: f.arguments.iter().map(ToString::to_string).collect(),
-        returns: f.returns.to_string(),
-        volatile: f.volatile,
-        columns: f.columns.iter().map(|(n, t)| (n.clone(), t.to_string())).collect(),
-    }).collect();
+    let functions = described(&part);
     clash(lake, name, &functions).await?;
     let size = bytes.len() as u64;
-    match lake.put(&file_key(name, &version, &sha256), bytes).await {
+    let at = file_key(name, &version, &sha256);
+    match lake.put(&at, bytes).await {
         Ok(()) => {}
-        Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::AlreadyExists { .. })) => {} // (these bytes are kept already)
+        // (these bytes are kept already, unless another file was put under their hash: refused, as `part` would refuse it)
+        Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::AlreadyExists { .. })) => {
+            if crate::text::hex(&crate::crypto::sha256(&lake.object(&at).await?)) != sha256 {
+                return Err(coded("XX001", format!("{at} holds another file than its name says: remove it, then INSTALL {name} again")));
+            }
+        }
         Err(e) => return Err(e),
     }
     Ok(Installed {
         version,
         sha256,
         bytes: size,
-        from: from.to_string(),
+        from: kept_from(from),
         by: crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "admin".to_string()),
         at_ms: crate::log::now_ms(),
         functions,
@@ -381,7 +424,7 @@ async fn clash(lake: &Lake, name: &str, functions: &[Described]) -> Result<()> {
         if n.is_empty() || !n.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_') || !n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
             return Err(coded("42602", format!("{name}'s function {n}: a function's name is lower-case letters, digits and _")));
         }
-        if state.scalar_functions().contains_key(n) || state.aggregate_functions().contains_key(n) || state.window_functions().contains_key(n) {
+        if state.scalar_functions().contains_key(n) || state.aggregate_functions().contains_key(n) || state.window_functions().contains_key(n) || state.table_functions().contains_key(n) {
             return Err(coded("42723", format!("{name}'s function {n}: Pondra has a function {n} already")));
         }
         if routines.iter().any(|(r, _)| r == n) {
@@ -418,14 +461,21 @@ async fn part_of(bytes: Vec<u8>, sha256: &str, who: &str) -> Result<Arc<crate::w
     Ok(part)
 }
 
-/// An installed extension's part: from `PARTS`, else its file read from the lake its record is in.
+/// An installed extension's part, on a node its admin allows unsigned extensions on (`unsigned_allowed`): from `PARTS`, else
+/// its file read from the lake its record is in, hashing to the record's `sha256` (`the_file`). Its functions are those its
+/// record names, or it is refused (XX001): a record is what a session registers by, and a node runs only what was installed.
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
 async fn part(lake: &Lake, name: &str, r: &Installed) -> Result<Arc<crate::wasm::Loaded>> {
-    if let Some(p) = PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&r.sha256) {
-        return Ok(p.clone());
+    unsigned_allowed(name)?;
+    let cached = PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&r.sha256).cloned();
+    let part = match cached {
+        Some(p) => p,
+        None => part_of(the_file(lake, name, r).await?.to_vec(), &r.sha256, name).await?,
+    };
+    if described(&part) != r.functions {
+        return Err(coded("XX001", format!("the extension {name}'s file doesn't have the functions its record names: INSTALL it again")));
     }
-    let bytes = lake.object(&file_key(name, &r.version, &r.sha256)).await.with_context(|| format!("reading the file of the extension {name}"))?;
-    part_of(bytes.to_vec(), &r.sha256, name).await
+    Ok(part)
 }
 
 /// The functions of the lake's installed extensions that `text` names (the query and the views it reads), in its session
@@ -438,9 +488,7 @@ pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, t
     if installed.is_empty() {
         return Ok(());
     }
-    let text = text.to_lowercase();
-    let words: std::collections::HashSet<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
-    for (name, r) in installed.iter().filter(|(_, r)| r.functions.iter().any(|f| words.contains(f.name.as_str()))) {
+    for (name, r) in &named(installed, text) {
         let part = part(lake, name, r).await?;
         for f in &part.functions {
             if f.is_table() {
@@ -451,6 +499,16 @@ pub async fn functions(lake: &Lake, ctx: &datafusion::prelude::SessionContext, t
         }
     }
     Ok(())
+}
+
+/// A page has no host for an extension's part (X3 in the plan: after 1.0): a query naming a function of one of the lake's
+/// installed extensions is refused by its name, as INSTALL is, not as an unknown function (audit 11-01 L2).
+#[cfg(all(feature = "lake", target_arch = "wasm32"))]
+pub async fn functions(lake: &Lake, _: &datafusion::prelude::SessionContext, text: &str) -> Result<()> {
+    match named(listed(lake).await?, text).first() {
+        Some((name, _)) => Err(coded("0A000", format!("{name} is an extension, and extensions in the page come after 1.0 (X3 in the plan): run its functions on a node"))),
+        None => Ok(()),
+    }
 }
 
 /// Does `sql`, or a view it reads, call one of the installed extensions' functions that `which` picks? The views are read
@@ -609,8 +667,13 @@ impl datafusion::logical_expr::ScalarUDFImpl for Call {
 
 /// The leader keeps a record (`Ddl::InstallExtension`): the same file already installed is answered "unchanged"; any other
 /// replaces the record there, if any.
+/// A record is checked again here, whoever sent it (`fetch` from any node, or a raw `/cluster/ddl` request): its file is in
+/// the lake under its hash (`the_file`), and its functions' names are free (`clash`).
 #[cfg(feature = "lake")]
 pub async fn install(lake: &Lake, name: &str, record: Installed) -> Result<serde_json::Value> {
+    the_file(lake, name, &record).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    clash(lake, name, &record.functions).await?;
     if let Some(have) = lake.cat.get::<Installed>(&key(name)).await? {
         if have.sha256 == record.sha256 {
             return Ok(serde_json::json!({"extension": name, "unchanged": true, "notice": format!("{name} is unchanged: the same file is installed ({})", have.version)}));
@@ -647,11 +710,37 @@ pub fn files(catalog: &std::collections::BTreeMap<String, bytes::Bytes>) -> Vec<
     records.filter_map(|(k, v)| Some((k.strip_prefix("xt/")?, serde_json::from_slice::<Installed>(v).ok()?))).map(|(name, r)| file_key(name, &r.version, &r.sha256)).collect()
 }
 
-/// The installed extensions with their records, by name.
+/// The installed extensions with their records, by name: read again only after a commit, as `routines::listed` is (every
+/// query asks, some twice).
 #[cfg(feature = "lake")]
 pub async fn listed(lake: &Lake) -> Result<Vec<(String, Installed)>> {
-    Ok(lake.cat.scan::<Installed>("xt/", "xt0").await?.into_iter().map(|(k, v)| (k["xt/".len()..].to_string(), v)).collect())
+    type Seen = std::sync::Mutex<std::collections::HashMap<String, (u64, Arc<Vec<(String, Installed)>>)>>;
+    crate::per_node!(static SEEN: Seen = Default::default());
+    let version = lake.cat.version();
+    if let (Some(v), Some((at, all))) = (version, SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&lake.url)) {
+        if *at == v {
+            return Ok(all.to_vec());
+        }
+    }
+    let all: Arc<Vec<(String, Installed)>> = Arc::new(lake.cat.scan::<Installed>("xt/", "xt0").await?.into_iter().map(|(k, v)| (k["xt/".len()..].to_string(), v)).collect());
+    if let Some(v) = version {
+        SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(lake.url.clone(), (v, all.clone()));
+    }
+    Ok(all.to_vec())
 }
+
+/// The installed extensions with a function `text` names (a query and the views it reads), as words.
+#[cfg(feature = "lake")]
+fn named(installed: Vec<(String, Installed)>, text: &str) -> Vec<(String, Installed)> {
+    let text = text.to_lowercase();
+    let words: std::collections::HashSet<&str> = text.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+    installed.into_iter().filter(|(_, r)| r.functions.iter().any(|f| words.contains(f.name.as_str()))).collect()
+}
+
+/// Where a record says its file came from: the file or URL as INSTALL named it, without a URL's query or fragment (a presigned
+/// URL's signature is a credential, and the record is shown to every reader by `extensions()`).
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+fn kept_from(from: &str) -> String { from.split(['?', '#']).next().unwrap_or(from).to_string() }
 
 /// The file's own name (`words-0.1.wasm`), for what is said of it: the part after its last `/`, before any `?` or `#`.
 fn file_of(from: &str) -> String {
@@ -907,6 +996,8 @@ mod tests {
         use datafusion::arrow::array::{AsArray, Int64Array};
         let dir = std::env::temp_dir().join(format!("pondra-extension-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        // (each node asks the switch as it loads a part, the node this test is included: `unsigned_allowed`)
+        std::env::set_var("PONDRA_ALLOW_UNSIGNED_EXTENSIONS", "true");
         let record = keep(&lake, "words", "/data/words-0.1.wasm", None, WORDS.to_vec()).await?;
         install(&lake, "words", record).await?;
         let run = |sql: &'static str| {

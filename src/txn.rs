@@ -22,7 +22,7 @@ use crate::settings::SERIALIZABLE;
 use crate::write::Stmt;
 pub use crate::rules::txn::Level;
 use crate::rules::txn::{aborted, begin_modes, plan, read_only, savepoint_name, write_word};
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Int64Array, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Int64Type, Schema, UInt64Type};
 use datafusion::sql::sqlparser::ast::{

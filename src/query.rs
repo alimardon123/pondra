@@ -1315,8 +1315,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    #[cfg(not(target_arch = "wasm32"))]
-    crate::extension::functions(lake, &ctx, &text).await?; // the installed extensions' functions it names (`INSTALL … FROM`, ADR-075)
+    crate::extension::functions(lake, &ctx, &text).await?; // the installed extensions' functions it names (`INSTALL … FROM`, ADR-075; a page refuses them)
     if crate::pattern::wanted(&text) || text.contains("pondra_match") || text.contains("pondra_open") {
         crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
     }
