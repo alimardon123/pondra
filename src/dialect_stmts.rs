@@ -10,8 +10,7 @@
 //! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, `REPLACE INTO`,
 //!   `ALTER TABLE t CHANGE / MODIFY …`, `ADD COLUMN … AFTER c / FIRST` (a column is added last here), and `DATABASE()`,
 //!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
-//! - SQL Server's `OUTPUT inserted.…` and `OPTION (…)`, and BigQuery's and SQL Server's `FOR SYSTEM_TIME AS OF`, which
-//!   would otherwise run with the clause left out;
+//! - SQL Server's `OUTPUT inserted.…`, which would otherwise run with the clause left out, and `OPTION (…)`;
 //! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`, and a `CREATE TEMP FUNCTION` or `MACRO`
 //!   (DuckDB's, BigQuery's): a routine here is the lake's, never a session's.
 use datafusion::sql::sqlparser::dialect::GenericDialect;
@@ -41,7 +40,7 @@ fn refusal(sql: &str) -> Option<String> {
             r"|\b(?:non)?clustered\b|\bset\s+(?:@|\w+\s+(?:on|off)\b|identity_insert\b|statistics\b)|\bprepare\s+\w+\s+from\b|\bdeclare\s+@|\bdeclare\b[^;]*\bdefault\b",
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
             r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
-            r"|\boutput\s+(?:inserted|deleted)\s*\.|\bfor\s+system_time\b|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
+            r"|\boutput\s+(?:inserted|deleted)\s*\.|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
             r"|\breplace\s+into\b|\balter\s+table\b[^;]*\b(?:after|first)\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?(?:stream|temp(?:orary)?\s+(?:macro|function))\b"))
             .expect("a regex")
     });
@@ -80,8 +79,8 @@ fn statement(s: &[Token]) -> Option<String> {
     let is = |i: usize, x: &str| w(i).as_deref() == Some(x);
     let first = w(0).unwrap_or_default();
     let mut depth = 0i32; // (how deep in parentheses token `i` is)
-    // (anywhere in it: SQL Server's APPLY, OUTPUT, OPTION and quoting of names; BigQuery's FOR SYSTEM_TIME; Snowflake's
-    // FLATTEN; MySQL's DATABASE() and USER())
+    // (anywhere in it: SQL Server's APPLY, OUTPUT, OPTION and quoting of names; Snowflake's FLATTEN; MySQL's DATABASE()
+    // and USER(). `t FOR SYSTEM_TIME AS OF …` is Pondra's: `past_names.rs`)
     for (i, t) in s.iter().enumerate() {
         match t {
             Token::LParen => depth += 1,
@@ -98,10 +97,6 @@ fn statement(s: &[Token]) -> Option<String> {
             let hint = w(i + 2).unwrap_or_default();
             let more = if hint == "MAXRECURSION" { " (WITH RECURSIVE … stops when a pass adds no rows)" } else { "" };
             return Some(format!("OPTION ({hint} …) is SQL Server's hint to its planner: leave it out{more}"));
-        }
-        if is(i, "FOR") && is(i + 1, "SYSTEM_TIME") {
-            let t = word(s.get(i.wrapping_sub(1))).map_or("t".into(), |_| s[i - 1].to_string());
-            return Some(format!("FOR SYSTEM_TIME AS OF is BigQuery's and SQL Server's: write {t} AT (TIMESTAMP => …), the table as it was then"));
         }
         if is(i, "FLATTEN") && s.get(i + 1) == Some(&Token::LParen) && is(i + 2, "INPUT") && s.get(i + 3) == Some(&Token::RArrow) {
             return Some("FLATTEN(INPUT => …) is Snowflake's: unnest the array in the FROM (… CROSS JOIN unnest(string_to_array(tags, ',')) AS f(tag)), or unnest(json_extract(doc, '$.items')) for a JSON array".into());
@@ -239,7 +234,6 @@ mod tests {
         assert!(said("DELETE FROM t OUTPUT deleted.* WHERE a = 1").starts_with("OUTPUT deleted.…"));
         assert!(said("WITH n AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM n WHERE n < 5) SELECT n FROM n OPTION (MAXRECURSION 10)").ends_with("leave it out (WITH RECURSIVE … stops when a pass adds no rows)"));
         assert_eq!(said("SELECT 1 AS x OPTION (RECOMPILE)"), "OPTION (RECOMPILE …) is SQL Server's hint to its planner: leave it out");
-        assert_eq!(said("SELECT COUNT(*) FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"), "FOR SYSTEM_TIME AS OF is BigQuery's and SQL Server's: write orders AT (TIMESTAMP => …), the table as it was then");
         assert!(said("SELECT o.id, f.value FROM orders o, LATERAL FLATTEN(INPUT => SPLIT(o.tags, ',')) f").starts_with("FLATTEN(INPUT => …) is Snowflake's: unnest the array"));
         assert_eq!(said("SELECT VERSION(), DATABASE(), CURRENT_USER()"), "DATABASE() is MySQL's: write current_database()");
         assert_eq!(said("select user()"), "USER() is MySQL's: write current_user (no parentheses)");
@@ -258,7 +252,7 @@ mod tests {
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
             "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "ALTER TABLE t ADD COLUMN after INT",
             "ALTER TABLE t ADD COLUMN first INT", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
-            "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
+            "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
         ] {
             assert_eq!(refusal(sql), None, "{sql}");
         }

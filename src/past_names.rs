@@ -85,7 +85,7 @@ pub fn syntax(sql: &str) -> Cow<'_, str> {
 
 /// Other engines' words for `AT (…)`: Delta's and Spark's `t VERSION AS OF n` and `t TIMESTAMP AS
 /// OF '…'`, and SQL:2011's and BigQuery's `t FOR SYSTEM_TIME AS OF '…'`, after a table in a FROM or
-/// a JOIN. What follows is a number, a string, `TIMESTAMP '…'`, a `$variable` or `(an expression)`.
+/// a JOIN. What follows is a number, a string, `TIMESTAMP '…'`, a `$variable`, `(an expression)` or a call (`now()`).
 fn as_of(sql: &str) -> Cow<'_, str> {
     static AS_OF: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(VERSION|TIMESTAMP|SYSTEM_TIME)\s+AS\s+OF\b").expect("a regex"));
     if !AS_OF.is_match(sql) {
@@ -122,9 +122,11 @@ fn as_of(sql: &str) -> Cow<'_, str> {
         let end = match solid.get(at).map(|t| &t.token) {
             Some(Token::Number(..) | Token::SingleQuotedString(_) | Token::Placeholder(_)) => at,
             Some(Token::Word(_)) if matches!(solid.get(at + 1).map(|t| &t.token), Some(Token::SingleQuotedString(_))) => at + 1, // (TIMESTAMP '…')
-            Some(Token::LParen) => {
+            // (`(an expression)`, or a call: BigQuery's `FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(…)`, `… AS OF now()`)
+            Some(Token::LParen) | Some(Token::Word(_)) if matches!(solid[at].token, Token::LParen) || matches!(solid.get(at + 1).map(|t| &t.token), Some(Token::LParen)) => {
+                let open = if matches!(solid[at].token, Token::LParen) { at } else { at + 1 };
                 let mut depth = 0;
-                match (at..solid.len()).find(|&k| {
+                match (open..solid.len()).find(|&k| {
                     depth += match solid[k].token {
                         Token::LParen => 1,
                         Token::RParen => -1,
