@@ -33,7 +33,7 @@ fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
     });
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
@@ -1187,8 +1187,9 @@ fn string_of(e: &Expr) -> Option<&str> {
 
 /// A date part as DuckDB, Snowflake and SQL Server spell it (`'day'`, `dd`, `HOURS`): its name in `date_trunc`, or
 /// None for any other expression (a column holding the part is DuckDB's, not taken). A string that isn't a part is
-/// refused by name (`m` is DuckDB's minute and SQL Server's month, so it is neither here).
-fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
+/// refused by name, and so are the letters the databases read apart: `m` (DuckDB's minute, SQL Server's month), `y`
+/// (DuckDB's year, SQL Server's day of the year) and `w` (DuckDB's week, SQL Server's weekday).
+pub(crate) fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
     let (w, word) = match e {
         Expr::Identifier(i) if i.quote_style.is_none() => (i.value.to_lowercase(), true),
         _ => match string_of(e) {
@@ -1196,11 +1197,15 @@ fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
             None => return Ok(None),
         },
     };
+    let apart = |means: &str| crate::codes::coded("22023", format!("{call}: '{w}' is {means} in other databases: write the part's name (year, month, week, day, minute, …)"));
     Ok(Some(match w.as_str() {
-        "year" | "years" | "y" | "yr" | "yrs" | "yy" | "yyyy" => "year",
+        "m" => return Err(apart("DuckDB's minute and SQL Server's month")),
+        "y" => return Err(apart("DuckDB's year and SQL Server's day of the year")),
+        "w" => return Err(apart("DuckDB's week and SQL Server's weekday")),
+        "year" | "years" | "yr" | "yrs" | "yy" | "yyyy" => "year",
         "quarter" | "quarters" | "q" | "qq" | "qtr" => "quarter",
         "month" | "months" | "mon" | "mons" | "mm" => "month",
-        "week" | "weeks" | "w" | "wk" | "wks" | "ww" => "week",
+        "week" | "weeks" | "wk" | "wks" | "ww" => "week",
         "day" | "days" | "d" | "dd" | "dayofmonth" => "day",
         "hour" | "hours" | "h" | "hh" | "hr" | "hrs" => "hour",
         "minute" | "minutes" | "mi" | "min" | "mins" | "n" => "minute",
@@ -1306,6 +1311,12 @@ fn expression(e: &mut Expr) -> Result<()> {
                 }
             }
         }
+        // (SQL Server's `CONVERT(INT, x)` and MySQL's `CONVERT(x, SIGNED)` put the type on either side, so neither is
+        // guessed: CAST names it one way. A `TRY_CONVERT(type, 'literal')` the parser reads as a call is `dialect_fns`')
+        Expr::Convert { is_try, .. } => {
+            let (name, cast) = if *is_try { ("TRY_CONVERT", "TRY_CAST") } else { ("CONVERT", "CAST") };
+            return Err(crate::codes::coded("0A000", format!("{name}(…) puts the type first in SQL Server and last in MySQL, so it isn't guessed: write {cast}(x AS type)")));
+        }
         Expr::Function(f) => {
             within_group(f)?;
             group_concat(f);
@@ -1315,6 +1326,19 @@ fn expression(e: &mut Expr) -> Result<()> {
             }
             let n = function_name(f);
             let a = args(f);
+            // (other databases' names for Pondra's functions, a plain call: unqualified (BigQuery's `SAFE.` and a schema's own
+            // function are left as written), no OVER, FILTER, DISTINCT or named argument)
+            let plain = f.name.0.len() == 1 && f.over.is_none() && f.filter.is_none() && match &f.args {
+                FunctionArguments::List(l) => l.args.len() == a.len() && l.duplicate_treatment.is_none() && l.clauses.is_empty(),
+                FunctionArguments::None => true,
+                FunctionArguments::Subquery(_) => false,
+            };
+            if plain {
+                if let Some(text) = crate::dialect_fns::call(&n, &a)? {
+                    *e = expr(&text)?;
+                    return Ok(());
+                }
+            }
             match (n.as_str(), a.len()) {
                 ("max_by" | "arg_max" | "min_by" | "arg_min", 2) => {
                     ensure!(f.over.is_none(), "{n}(…) OVER (…): first_value(a) OVER (… ORDER BY b DESC) is the window's form");
@@ -1988,7 +2012,9 @@ mod tests {
         assert_eq!(call("datediff(b, a)").unwrap(), "datediff(b, a)");
         assert_eq!(call("date_diff(unit, a, b)").unwrap(), "date_diff(unit, a, b)");
         let m = call("date_diff('m', a, b)").unwrap_err();
-        assert!(crate::codes::of(&m) == "22023" && m.to_string().contains("'m' isn't a date part here"), "{m:#}");
+        assert!(crate::codes::of(&m) == "22023" && m.to_string().contains("'m' is DuckDB's minute and SQL Server's month"), "{m:#}");
+        assert!(call("DATEDIFF(y, a, b)").unwrap_err().to_string().contains("'y' is DuckDB's year and SQL Server's day of the year"));
+        assert!(call("date_diff('fortnight', a, b)").unwrap_err().to_string().contains("'fortnight' isn't a date part here"));
         assert!(wanted("SELECT strftime(ts, '%Y') FROM t") && wanted("SELECT DATEDIFF (day, a, b) FROM t") && !wanted("SELECT epoch FROM t"));
     }
 
