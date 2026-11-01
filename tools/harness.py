@@ -10984,6 +10984,45 @@ def guarded():
     listed = {u: sorted(".".join(t) for t in lister(u).list_tables("default")) for u in ("boss", "bob")}
     info["iceberg listing"] = listed
     checks["the Iceberg REST catalog lists a user only the tables it may read (S27)"] = "default.ice" in listed["boss"] and "default.ice" not in listed["bob"]
+    # H4: an open GET /cluster/log ends when its caller's sign-in stops qualifying (here: no longer a superuser's). The leader's
+    # stream and the follower's relay of it are both read as streams; NOSUPERUSER ends both within 12 s (the check runs every 5 s),
+    # and a new stream is refused, as the guard refuses a sign-in that isn't a superuser's
+    ask(P, "CREATE USER gina PASSWORD 'gina-password-1' SUPERUSER", auth=boss)
+    gina = ask(P, json.dumps({"user": "gina", "password": "gina-password-1"}), path="/login")
+    gina_s = f"Bearer {gina['token']}" if isinstance(gina, dict) else "Bearer none"
+    until(lambda: isinstance(ask(P + 1, b"", path="/whoami", method="GET", auth=gina_s), dict), True, 20)  # (the follower has the session)
+    def open_log(port, auth, out):
+        """`GET /cluster/log` read as a stream: its status, the bytes read, and when its body ended (or failed, but not a timeout)."""
+        import socket
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+        try:
+            c.request("GET", "/cluster/log", headers={"Authorization": auth})
+            r = c.getresponse()
+            out["status"] = r.status
+            while chunk := r.read1(65536):
+                out["bytes"] = out.get("bytes", 0) + len(chunk)
+            out["ended"] = time.monotonic()
+        except Exception as e:
+            if not isinstance(e, socket.timeout):
+                out["ended"] = time.monotonic()
+            out["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            c.close()
+    streams = {"leader": {}, "follower": {}}
+    for name, port in (("leader", P), ("follower", P + 1)):
+        threading.Thread(target=open_log, args=(port, gina_s, streams[name]), daemon=True).start()
+    flowing = until(lambda: all(s.get("status") == 200 and s.get("bytes", 0) > 0 for s in streams.values()), True, 20)
+    t0 = time.monotonic()
+    revoked = ask(P, "ALTER USER gina NOSUPERUSER", auth=boss)
+    until(lambda: all("ended" in s for s in streams.values()), True, 20)
+    ended_after = {k: round(s["ended"] - t0, 1) for k, s in streams.items() if "ended" in s}
+    again = {}
+    open_log(P, gina_s, again)  # (a new stream, after: refused, 401 or 403, and its body ends)
+    info["H4"] = {"streams": {k: {x: str(y)[:200] for x, y in s.items()} for k, s in streams.items()}, "revoked": str(revoked)[:200],
+                  "ended after s": ended_after, "a new stream": {x: str(y)[:200] for x, y in again.items()}}
+    checks["an open GET /cluster/log ends when its sign-in stops being a superuser's: NOSUPERUSER ends the leader's stream and the follower's within 12 s, and a new one is refused (H4)"] = \
+        flowing is True and not str(revoked).startswith("ERROR") and set(ended_after) == {"leader", "follower"} \
+        and all(v <= 12 for v in ended_after.values()) and again.get("status") in (401, 403)
     a.kill(), b.kill()
     # A write token: rows into tables that are there, in the log and their folders; never the lake's records
     lake2 = new_lake()

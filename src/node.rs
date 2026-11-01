@@ -578,8 +578,9 @@ pub fn unclaim_page() {
 /// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
 /// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it. `term` is the
 /// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
-/// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does.
-pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, ended: Arc<AtomicBool>, superuser: bool }
+/// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does. `follow` is the
+/// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: bool }
 
 /// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
 /// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
@@ -629,10 +630,10 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
     match made {
         Ok(app) => {
             keep(&app, &start);
-            Ok(Paged { app, url, term, marks, ended: Default::default(), superuser: false })
+            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: false })
         }
         Err(e) => {
-            end_page(marks, lake, &store, term, &url).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -641,8 +642,11 @@ pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) 
 /// Ends what `open_page` started, as a node's stop does (`node::run::Held::stop` and `Node::stop`): its term's marks, its
 /// loops, its catalog, its term, its lake in memory, and the module's per-node state, so another `open_page` starts
 /// afresh. `Paged::close` and a failed open both end this way.
-async fn end_page(marks: tokio::task::JoinHandle<()>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str) {
+async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str) {
     marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
+    if let Some(follow) = follow {
+        follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
+    }
     crate::panics::abort_all();
     if let Some(lake) = lake {
         let _ = lake.cat.close().await;
@@ -701,7 +705,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 })
             };
-            panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}));
+            let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}));
             panics::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -715,10 +719,10 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                     }
                 }
             });
-            Ok(Paged { app, url, term: 0, marks, ended, superuser })
+            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser })
         }
         Err(e) => {
-            end_page(marks, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
+            end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
             Err(e)
         }
     }
@@ -756,10 +760,10 @@ impl Paged {
 
     /// Ends the page's member (`end_page`), so another `open_page` starts afresh.
     pub async fn close(self) {
-        let Paged { app, url, term, marks, .. } = self;
+        let Paged { app, url, term, marks, follow, .. } = self;
         let lake = app.lake.clone();
         drop(app);
-        end_page(marks, Some(lake.clone()), &lake.store, term, &url).await;
+        end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url).await;
     }
 }
 
