@@ -400,7 +400,7 @@ impl Auth {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
-            "files" if path.to_ascii_lowercase().ends_with(".py") => Role::Admin, // (code a node runs: an admin stores it, invariant 85)
+            "files" if runs_as_code(path) => Role::Admin, // (code a node runs: an admin stores it, invariant 85)
             "files" => Role::Write,
             "" | "console" => Role::None, // (the console's page and files: they hold no data, and ask for a token)
             "stats" | "healthz" | "ready" => Role::None, // (health checks: load balancers and the tests poll them)
@@ -444,6 +444,14 @@ impl Auth {
         privileges.iter().try_for_each(|p| check(p, &t))
     }
 }
+
+/// Does a request's path name code a node runs? Decided on the name the door stores it under, so the path is
+/// percent-decoded as the door decodes it (`/files/a/job.p%79` is `job.py`).
+fn runs_as_code(path: &str) -> bool { py_name(&percent_encoding::percent_decode_str(path).decode_utf8_lossy()) }
+
+/// The `.py` test on a name (`files::put` asks it of the name the store keeps): any case, and no trailing `/`, dot or
+/// space, which the store drops and Windows drops.
+pub(crate) fn py_name(name: &str) -> bool { name.trim_end_matches(['/', '.', ' ']).to_ascii_lowercase().ends_with(".py") }
 
 /// The table a write changes (as the catalog names it) and the privileges it needs on it: none for
 /// anything else.
@@ -714,5 +722,15 @@ mod tests {
         let all = g.failures.lock().unwrap();
         assert_eq!(all.len(), PAIRS);
         assert!(!all.contains_key(&Guesses::key(ip(1), "u0")), "the oldest pair went");
+    }
+
+    /// A `.py` file is code a node runs whatever its case, its percent-encoding, or the trailing `/` the store drops
+    /// (the name it is stored under decides: `runs_as_code`).
+    #[test]
+    fn a_py_file_is_code_by_the_name_it_is_stored_under() {
+        for path in ["/files/a/job.py", "/files/a/job.p%79", "/files/a/job.PY/", "/files/a/job.py%20"] {
+            assert!(runs_as_code(path), "{path}");
+        }
+        assert!(!runs_as_code("/files/a/job.sql"));
     }
 }
