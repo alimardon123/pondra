@@ -572,8 +572,10 @@ impl datafusion::catalog::TableProvider for Called {
     }
 }
 
-/// The call's rows as one stream: opened, read and let go on a thread of its own (a call is the part's to run, as long as
-/// it takes within its limits), two batches ahead of the query at most. A query that stops reading lets the call go.
+/// The call's rows as one stream, a batch each time the query asks for one: opened, and each batch made, on a blocking
+/// thread for as long as that takes within the call's limits (`calling`), and no thread held between them. A query that
+/// stops reading drops the stream, and with it the call. (Made two batches ahead on a thread of its own, a call held that
+/// thread while a slow client wasn't reading: audit 11-01 M1.)
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
 #[derive(Debug)]
 struct Streamed {
@@ -588,30 +590,58 @@ impl datafusion::physical_plan::streaming::PartitionStream for Streamed {
     fn schema(&self) -> &datafusion::arrow::datatypes::SchemaRef { &self.schema }
 
     fn execute(&self, _: Arc<datafusion::execution::TaskContext>) -> datafusion::execution::SendableRecordBatchStream {
-        let mut builder = datafusion::physical_plan::stream::RecordBatchReceiverStream::builder(self.schema.clone(), 2);
-        let tx = builder.tx();
-        let (part, function, values) = (self.part.clone(), self.function.clone(), self.values.clone());
-        builder.spawn_blocking(move || {
-            let mut rows = part.rows(&function, &values, crate::wasm::Limits::now()).map_err(coded_error)?;
-            while let Some(batch) = rows.next().map_err(coded_error)? {
-                if tx.blocking_send(Ok(batch)).is_err() {
-                    break; // (the query stopped reading: the call is let go as `rows` drops)
-                }
-            }
-            Ok(())
+        use datafusion::error::DataFusionError;
+        enum At {
+            Start(Arc<crate::wasm::Loaded>, String, Vec<datafusion::arrow::array::ArrayRef>),
+            Open(Box<crate::wasm::Rows>),
+        }
+        let gone = |e: tokio::task::JoinError| DataFusionError::External(Box::new(e));
+        let start = At::Start(self.part.clone(), self.function.clone(), self.values.clone());
+        let batches = futures::stream::try_unfold(start, move |at| async move {
+            let (rows, batch) = tokio::task::spawn_blocking(move || {
+                let mut rows = match at {
+                    At::Start(part, function, values) => Box::new(calling(|| part.rows(&function, &values, crate::wasm::Limits::now()))?),
+                    At::Open(rows) => rows,
+                };
+                let batch = calling(|| rows.next())?;
+                anyhow::Ok((rows, batch))
+            })
+            .await
+            .map_err(gone)?
+            .map_err(crate::codes::for_datafusion)?;
+            Ok::<_, DataFusionError>(batch.map(|b| (b, At::Open(rows))))
         });
-        builder.build()
+        Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(self.schema.clone(), batches))
     }
 }
 
-/// An error for DataFusion, its code kept (a function's own error is 38000 at every door).
+/// Runs one extension call (a scalar function's batch, a table function's opening or next batch), waiting while
+/// [`CALLS`] others run: each holds a thread for as long as its batch takes, up to `PONDRA_EXTENSION_SECS`, and past
+/// that many the queries that call more wait their turn rather than take every thread of the node (audit 11-01 M1).
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
-fn coded_error(e: anyhow::Error) -> datafusion::error::DataFusionError {
-    match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
-        Some(c) => datafusion::error::DataFusionError::External(Box::new(crate::codes::Coded(c.0, c.1.clone()))),
-        None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
+fn calling<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::{Condvar, LazyLock, Mutex};
+    static TURNS: LazyLock<(Mutex<usize>, Condvar)> = LazyLock::new(|| (Mutex::new(0), Condvar::new()));
+    struct Turn;
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            *TURNS.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            TURNS.1.notify_one();
+        }
     }
+    let mut busy = TURNS.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *busy >= *CALLS {
+        busy = TURNS.1.wait(busy).unwrap_or_else(|e| e.into_inner());
+    }
+    *busy += 1;
+    drop(busy);
+    let _turn = Turn;
+    f()
 }
+
+/// How many extension calls a node runs at once: one a core.
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
+static CALLS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| crate::env::cores().max(1));
 
 /// One of an extension's functions in a session: its batches go to the part, a fresh instance for each (`wasm::Loaded::call`).
 #[cfg(all(feature = "lake", not(target_arch = "wasm32")))]
@@ -658,10 +688,14 @@ impl datafusion::logical_expr::ScalarUDFImpl for Call {
             ColumnarValue::Array(a) => Ok(a.clone()),
             ColumnarValue::Scalar(s) => s.to_array_of_size(rows),
         }).collect::<datafusion::error::Result<Vec<_>>>()?;
-        match self.part.call(&self.function, &columns, rows) {
-            Ok(column) => Ok(ColumnarValue::Array(column)),
-            Err(e) => Err(coded_error(e)),
-        }
+        // (on the node's runtime its worker first hands its other tasks to another, so a call that takes seconds holds no
+        // door or heartbeat behind it: audit 11-01 M1; elsewhere, a test's one-thread runtime or a blocking thread, as it is)
+        let call = || calling(|| self.part.call(&self.function, &columns, rows));
+        let answer = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(call),
+            _ => call(),
+        };
+        answer.map(ColumnarValue::Array).map_err(crate::codes::for_datafusion)
     }
 }
 
@@ -987,9 +1021,28 @@ mod tests {
         Ok(())
     }
 
+    /// No more extension calls run at once than `CALLS`: the rest wait their turn.
+    #[cfg(feature = "lake")]
+    #[test]
+    fn calls_past_one_a_core_wait_their_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        static NOW: AtomicUsize = AtomicUsize::new(0);
+        static MOST: AtomicUsize = AtomicUsize::new(0);
+        let threads: Vec<_> = (0..*CALLS + 3).map(|_| std::thread::spawn(|| calling(|| {
+            MOST.fetch_max(NOW.fetch_add(1, SeqCst) + 1, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            NOW.fetch_sub(1, SeqCst);
+        }))).collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(MOST.load(SeqCst) <= *CALLS, "{} at once, past {}", MOST.load(SeqCst), *CALLS);
+    }
+
     /// In a query: an installed extension's functions answer by their own names, over a column of strings as a table reads
     /// it (a view of strings, cast to the type describe() gave), for each row and its NULLs; its own error is 38000 in its
-    /// words; and once uninstalled, its names are no function.
+    /// words; and once uninstalled, its names are no function. (On a runtime of many threads, as the node's: a scalar call
+    /// hands its worker's other tasks on first, `block_in_place`.)
     #[cfg(feature = "lake")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_installed_extensions_functions_answer_in_a_query() -> Result<()> {

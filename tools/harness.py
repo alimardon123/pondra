@@ -16847,6 +16847,25 @@ def extensions():
         started = time.time()
         e = refused("SELECT spin(id) FROM notes LIMIT 1", 2)
         checks["a runaway call stops at PONDRA_EXTENSION_SECS with 57014, and the node goes on"] = "57014" in e and time.time() - started < 30 and q("SELECT word_count('still here') AS n", 2) == [{"n": 2}]
+        # M1: runaway calls past one a core wait their turn, each on a thread of its own, so the node's other queries go on
+        cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        spun = [None] * (cores + 2)
+
+        def spin_one(k):
+            spun[k] = refused("SELECT spin(id) FROM notes LIMIT 1", 2)
+        spinning = [threading.Thread(target=spin_one, args=(k,)) for k in range(len(spun))]
+        started = time.time()
+        for t in spinning:
+            t.start()
+        time.sleep(0.5)
+        asked = time.time()
+        counted = q("SELECT count(*) AS n FROM notes WHERE id % 3 = 0", 2)
+        took = time.time() - asked
+        for t in spinning:
+            t.join(120)
+        checks[f"{len(spun)} runaway queries at once on {cores} cores: each stops with 57014, and a query beside them answers at once"] = \
+            all(s and "57014" in s for s in spun) and counted == [{"n": 66_667}] and took < 1.5 and time.time() - started < 90
+        print(f"extensions: a query beside {len(spun)} runaway ones answered in {took:.2f} s; they all ended in {time.time() - started:.1f} s", file=sys.stderr)
         # E5: a part may use the node's log and the clock, and nothing else this Pondra doesn't offer
         fixtures = os.path.dirname(fixture)
         e = refused(f"INSTALL later FROM '{fixtures}/needs-http.wasm'")

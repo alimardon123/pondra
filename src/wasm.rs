@@ -301,14 +301,8 @@ impl Loaded {
     /// `call`, within `limits`.
     pub fn call_with(&self, function: &str, columns: &[ArrayRef], rows: usize, limits: Limits) -> Result<ArrayRef> {
         let f = self.functions.iter().find(|f| f.name == function).with_context(|| format!("{} has no function {function}", self.name))?;
-        if columns.len() != f.arguments.len() {
-            bail!("{function} takes {} arguments, not {}", f.arguments.len(), columns.len());
-        }
-        let cast = columns.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
-        let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
-        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(rows)))?;
+        let batch = arguments(f, columns, rows)?;
         let mut store = store(limits, &self.name);
-        let batch = ipc(&batch)?;
         let out = match self.pre.instantiate(&mut store).and_then(|i| i.call_call(&mut store, function, &batch)) {
             Ok(out) => out,
             Err(e) => return Err(stopped(&store, limits, &self.name, function, e)),
@@ -326,16 +320,10 @@ impl Loaded {
     /// Starts a call of the table function `function` with its arguments, one value each, cast to the types `describe()`
     /// gave: its rows, read a batch at a time (`Rows::next`). The call keeps its store until it is dropped, within `limits`:
     /// its memory for the whole call, its time for each batch.
-    pub fn rows(&self, function: &str, arguments: &[ArrayRef], limits: Limits) -> Result<Rows> {
+    pub fn rows(&self, function: &str, values: &[ArrayRef], limits: Limits) -> Result<Rows> {
         let f = self.functions.iter().find(|f| f.name == function && f.is_table()).with_context(|| format!("{} has no table function {function}", self.name))?;
         let pre = self.tables.as_ref().with_context(|| format!("{} has no table function {function}", self.name))?;
-        if arguments.len() != f.arguments.len() {
-            bail!("{function} takes {} arguments, not {}", f.arguments.len(), arguments.len());
-        }
-        let cast = arguments.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
-        let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
-        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(1)))?;
-        let (bytes, mut store) = (ipc(&batch)?, store(limits, &self.name));
+        let (bytes, mut store) = (arguments(f, values, 1)?, store(limits, &self.name));
         let opened = pre.instantiate(&mut store).and_then(|i| Ok((i.call_open(&mut store, function, &bytes)?, i)));
         let (handle, instance) = match opened {
             Ok((handle, instance)) => (handle.map_err(|said| coded("38000", format!("{}'s {function}: {said}", self.name)))?, instance),
@@ -343,6 +331,16 @@ impl Loaded {
         };
         Ok(Rows { store, instance, handle, name: self.name.clone(), function: function.to_string(), schema: f.schema(), limits, open: true })
     }
+}
+
+/// A call's arguments as the part reads them: `rows` rows of one column each, cast to the types `describe()` gave, in Arrow IPC.
+fn arguments(f: &Function, columns: &[ArrayRef], rows: usize) -> Result<Vec<u8>> {
+    if columns.len() != f.arguments.len() {
+        bail!("{} takes {} arguments, not {}", f.name, f.arguments.len(), columns.len());
+    }
+    let cast = columns.iter().zip(&f.arguments).map(|(c, t)| datafusion::arrow::compute::cast(c, t)).collect::<Result<Vec<_>, _>>()?;
+    let fields: Vec<Field> = f.arguments.iter().enumerate().map(|(i, t)| Field::new(format!("a{i}"), t.clone(), true)).collect();
+    ipc(&RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), cast, &RecordBatchOptions::new().with_row_count(Some(rows)))?)
 }
 
 /// A table function's call in progress: its store, held until its rows are read or it is dropped.
