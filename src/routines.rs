@@ -1230,7 +1230,13 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         }
         _ => crate::python::ask(&r.with.packages, kind, head, parts, limit, &mut notice).await,
     };
-    let (answer, parts) = asked.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
+    let (answer, parts) = asked.map_err(|e| {
+        let said = format!("{whose}{}", lease.redact(&format!("{e:#}")));
+        match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+            Some(c) => crate::codes::coded(c.0, said), // (a Python error's SQLSTATE, `python::raised`: 38000, not an internal one)
+            None => anyhow::anyhow!(said),
+        }
+    })?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("images") => Ok(Outcome::Done(j!({"called": name, "images": answer["images"]}))), // (a cell's figures, as PNG: the console shows them)
@@ -1242,6 +1248,10 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
 /// be remembered)? In a view it reads too.
 pub async fn volatile(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| f.volatile).await {
+        return true; // (an extension's function that says it may answer the same arguments differently: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return true };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
 }
@@ -1249,6 +1259,10 @@ pub async fn volatile(lake: &Lake, sql: &str) -> bool {
 /// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
 /// each would call it.
 pub async fn pinned(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| !f.columns.is_empty()).await {
+        return true; // (an extension's table function, as a Python one: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return false };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
 }

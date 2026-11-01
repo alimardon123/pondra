@@ -15,3 +15,21 @@ world extension {
   /// the function's own words: it fails the query that called it.
   export call: func(name: string, batch: list<u8>) -> result<list<u8>, string>;
 }
+
+/// An extension with table functions as well (E3): `describe` names each with `"columns"` in place of `"returns"`,
+/// `[{"name": "word", "type": "Utf8"}, …]`, and these three give its rows. A host calls an extension by this world only when
+/// `describe` names a table function, so an extension of scalars alone exports the two above and nothing more.
+world extension-with-tables {
+  include extension;
+
+  /// Starts one call of the table function `name`: Arrow IPC stream bytes in, one row with a column per argument in the
+  /// types `describe` gave. Its handle names the call to `next` and `close`.
+  export open: func(name: string, arguments: list<u8>) -> result<u32, string>;
+
+  /// The call's next batch of rows, Arrow IPC stream bytes with the columns `describe` gave, or none once it has given
+  /// them all. A host asks for each batch as its query reads it, so a call never has to hold its rows at once.
+  export next: func(handle: u32) -> result<option<list<u8>>, string>;
+
+  /// Lets the call go: asked once its rows are read, or its query stops reading.
+  export close: func(handle: u32);
+}

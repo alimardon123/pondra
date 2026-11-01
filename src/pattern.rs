@@ -87,7 +87,7 @@ pub fn text(sql: &str) -> Cow<'_, str> {
 }
 
 /// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read,
-/// and a materialized view over one of a subquery, which reads a lake table by its name (an EMIT FINAL one is refused by
+/// and a materialized view over one of a subquery or a CTE, which reads a lake table by its name (an EMIT FINAL one is refused by
 /// `write`, in its own words). `front::expand` asks first, at every door.
 pub fn refused(sql: &str) -> Result<()> {
     static SUBSET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bsubset\s+[a-z_][a-z0-9_]*\s*=").expect("a regex"));
@@ -100,10 +100,31 @@ pub fn refused(sql: &str) -> Result<()> {
     if SUBSET.find_iter(sql).any(|m| code[m.start()]) {
         return Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions"));
     }
-    if VIEW.is_match(sql) && crate::once::emit_final(sql).is_none() && !hoists(sql, &code).is_empty() {
-        return Err(coded("0A000", "a materialized view over a MATCH_RECOGNIZE of a subquery isn't supported yet: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…); a query or a plain view takes the subquery"));
+    if VIEW.is_match(sql) && crate::once::emit_final(sql).is_none() {
+        let what = if !hoists(sql, &code).is_empty() {
+            "subquery"
+        } else if reads_cte(sql, &code) {
+            "CTE"
+        } else {
+            return Ok(());
+        };
+        return Err(coded("0A000", format!("a materialized view over a MATCH_RECOGNIZE of a {what} isn't supported yet: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…); a query or a plain view takes the {what}")));
     }
     Ok(())
+}
+
+/// Whether a MATCH_RECOGNIZE in `sql` reads a CTE of it by name (`WITH t AS (…) … FROM t [AS x] MATCH_RECOGNIZE`): a
+/// materialized view follows a lake table, and `views::written_in` leaves a query with MATCH_RECOGNIZE as written.
+fn reads_cte(sql: &str, code: &[bool]) -> bool {
+    static INPUT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:from|join)\s+([a-z_][a-z0-9_]*)\s+(?:as\s+)?(?:[a-z_][a-z0-9_]*\s+)?match_recognize\b").expect("a regex")
+    });
+    static CTE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:\bwith(?:\s+recursive)?|,)\s*([a-z_][a-z0-9_]*)\s*(?:\([^()]*\)\s*)?as\s*(?:(?:not\s+)?materialized\s*)?\(").expect("a regex")
+    });
+    let names = |re: &Regex| re.captures_iter(sql).filter(|c| code[c.get(0).expect("a match").start()]).map(|c| c[1].to_ascii_lowercase()).collect::<Vec<_>>();
+    let ctes = names(&CTE);
+    names(&INPUT).iter().any(|n| ctes.contains(n))
 }
 
 /// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
@@ -2354,6 +2375,27 @@ mod tests {
         assert!(refused(SUBQUERY).is_ok());
         assert!(refused("CREATE MATERIALIZED VIEW v AS SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m").is_ok());
         assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS {SUBQUERY} EMIT FINAL")).is_ok(), "write refuses it, in its own words");
+    }
+
+    #[test]
+    fn a_materialized_view_over_a_cte_is_refused_by_name_and_one_over_a_table_is_not() {
+        let clause = "MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        for sql in [
+            format!("CREATE MATERIALIZED VIEW v AS WITH t AS (SELECT * FROM ticks WHERE venue = 'x') SELECT * FROM t {clause}"),
+            format!("CREATE MATERIALIZED VIEW v AS WITH a AS (SELECT 1), t (s, ts) AS MATERIALIZED (SELECT s, ts FROM ticks) SELECT * FROM t AS x {clause}"),
+        ] {
+            let err = refused(&sql).expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "0A000");
+            assert!(err.to_string().contains("a materialized view over a MATCH_RECOGNIZE of a CTE"), "{err}");
+        }
+        // (a CTE the pattern doesn't read, a query, a plain view and EMIT FINAL are not this refusal's)
+        let other = format!("CREATE MATERIALIZED VIEW v AS WITH k AS (SELECT 1 AS n) SELECT * FROM ticks {clause}");
+        assert!(refused(&other).is_ok());
+        let cte = format!("WITH t AS (SELECT * FROM ticks) SELECT * FROM t {clause}");
+        assert!(refused(&cte).is_ok());
+        assert!(refused(&format!("CREATE VIEW v AS {cte}")).is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS {cte} EMIT FINAL")).is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS SELECT 'WITH t AS (' AS w FROM ticks {clause}")).is_ok());
     }
 
     #[test]

@@ -770,7 +770,9 @@ A parameter is `$name` in a procedure's body, and `name` or `$name` in a functio
 rights: it needs an admin token, and Python needs a node started with `--python`. What the block prints
 comes back as notices, and its last expression, if it is a frame, table, list of dicts or value, comes
 back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
-Python functions and procedures need a node started with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
+Python functions and procedures need a node started with `--python`. An error a Python routine raises comes back with its words and
+the line it was raised at, SQLSTATE `38000` (`42601` for code that doesn't parse, found when the routine is made).
+Functions, procedures and tasks are kept in the lake, so every node and client has
 them. Every call of a procedure, and every file run, is a row of `pondra.runs`
 (see [system columns](/pondra/sql/system-tables/)).
 
@@ -836,7 +838,7 @@ SELECT taxed(100) AS t;
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
-| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly file, kept in the lake by its SHA-256 |
+| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly component, kept in the lake by its SHA-256; `VERSION` must be the one the file says |
 | List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
@@ -849,8 +851,14 @@ their values.
 Only an admin installs an extension, and a node takes one only when it runs with
 `PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
 the node that got the statement (a path on its machine from the program that started it, or a URL a
-secret covers), and every node sees the record; a branch and a backup carry the file with it. This
-release keeps the file and runs none of its functions yet.
+secret covers), and every node sees the record; a branch and a backup carry the file with it. The
+file says its version and its functions, which a query then calls by name in every session, on every
+node; a name another function has already is refused at `INSTALL` (`42723`). A function the file gives
+columns is a table function, read as `SELECT * FROM name(…)` with literal arguments: its rows come a
+batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
+sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
+past it) and `PONDRA_EXTENSION_SECS` for a batch (`57014`); the function's own error is `38000`, and
+the node goes on.
 
 ## Users and grants
 
@@ -1143,7 +1151,7 @@ text is the node's own, it is shown in code:
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
-| Python functions and procedures on a node started without `--python` | refused, with the flag to use |
+| Python functions and procedures on a node started without `--python` | refused (`0A000`), with the flag to use |
 | `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), a `LEFT` over more than one function, or a `LEFT` whose columns include a constant or arithmetic | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
 | `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
 | `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | taken: each row's elements are numbered from 1, as Postgres numbers them |

@@ -2742,9 +2742,71 @@ def kafka():
         p.produce("events", value=b"{}", on_delivery=lambda err, msg: failed.append(err is not None))
         p.flush(6)
     checks["wrong password / read token refused"] = failed == [True, True] and sql_("SELECT count(*) AS n FROM events")[0]["n"] == n + 1000
+    # Told to stop (SIGTERM), the node drains its Kafka door as it does the others (`kafka::conn`): a new connection is
+    # closed at once, and a request on a connection opened before isn't taken (no answer, the connection closed), so a
+    # producer that isn't idempotent sends it to another broker and it is written once, not cut off half done. A long
+    # query keeps the node draining meanwhile; after a restart the table holds the produce sent before the stop alone.
+    def kconn():
+        s = socket.create_connection(("127.0.0.1", kport), timeout=10)
+        def req(key, ver, body):  # the answer's body, or None when the node closed the connection
+            head = struct.pack(">hhih", key, ver, 7, 1) + b"t"
+            try:
+                s.sendall(struct.pack(">i", len(head) + len(body)) + head + body)
+                got = s.recv(4)
+                if len(got) < 4:
+                    return None
+                size, data = struct.unpack(">i", got)[0], b""
+                while len(data) < size:
+                    chunk = s.recv(size - len(data))
+                    if not chunk:
+                        return None
+                    data += chunk
+                return data[4:]
+            except OSError:
+                return None
+        return s, req
+    def plain_batch(rows):  # (not idempotent: no producer id, so a retry would be written again)
+        b = DefaultRecordBatchBuilder(magic=2, compression_type=0, is_transactional=False, producer_id=-1, producer_epoch=-1, base_sequence=-1, batch_size=1 << 20)
+        for k, r in enumerate(rows):
+            b.append(k, timestamp=int(time.time() * 1000), key=None, value=json.dumps(r).encode(), headers=[])
+        return bytes(b.build())
+    def signed_in(req):
+        mech, auth = b"PLAIN", b"\0writer\0w-tok"
+        return req(17, 1, struct.pack(">h", len(mech)) + mech) is not None and (req(36, 0, struct.pack(">i", len(auth)) + auth) or b"\1")[:2] == b"\0\0"
+    produced_error = lambda resp: None if resp is None else struct.unpack(">h", resp[4 + 2 + len("events") + 4 + 4:4 + 2 + len("events") + 4 + 4 + 2])[0]
+    before_drain = sql_("SELECT count(*) AS n FROM events")[0]["n"]
+    kept, kept_req = kconn()
+    kept_in = signed_in(kept_req)
+    sent_before = produced_error(kept_req(*produce("events", plain_batch([{"user": "drain", "amount": 1}]))))
+    holding = {}
+    long_query = threading.Thread(target=lambda: holding.update(answer=_try(lambda: sql_("SELECT sum(value % 7) AS s FROM generate_series(1, 4000000000)"))))
+    long_query.start()
+    time.sleep(1.5)  # (the query is running when the signal comes, so the node drains while it does)
+    node.p.send_signal(signal.SIGTERM)
+    time.sleep(0.5)
+    fresh, fresh_req = None, None
+    try:
+        fresh, fresh_req = kconn()
+        fresh_answer = fresh_req(18, 0, b"")  # ApiVersions v0
+    except OSError:
+        fresh_answer = None
+    sent_during = kept_req(*produce("events", plain_batch([{"user": "drain", "amount": 1}])))
+    still_running = long_query.is_alive()
+    for s_ in (kept, fresh):
+        if s_ is not None:
+            s_.close()
+    long_query.join()
+    exit_code = node.p.wait(120)
+    node = Node(lake, A.port, kafka=f"127.0.0.1:{kport}", changelog_secs=600, **tokens).start()
+    after_drain = sql_("SELECT count(*) AS n, count(*) FILTER (WHERE user = 'drain') AS d FROM events")[0]
+    drained = {"signed_in": kept_in, "produce_before": sent_before, "fresh_connection": fresh_answer is not None, "produce_while_stopping": sent_during is not None,
+               "query_still_running": still_running, "exit": exit_code, "rows": [before_drain, after_drain]}
+    checks["stopping, the Kafka door takes no new connection and no new request (the connection closes unanswered, nothing written); a produce sent before is kept"] = (
+        kept_in and sent_before == 0 and fresh_answer is None and sent_during is None and still_running and exit_code == 0
+        and after_drain == {"n": before_drain + 1, "d": 1})
     node.kill()
     ok = all(checks.values())
-    print(json.dumps({"kafka": checks, "librdkafka_20k_events_s": round(librdkafka_s, 2), "ok": ok}, indent=1))
+    print(json.dumps({"kafka": checks, "librdkafka_20k_events_s": round(librdkafka_s, 2), "drained": drained, "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
     return f"Kafka: librdkafka (5 codecs, idempotent) and kafka-python producers, exactly-once retries, Debezium, tombstones, raw values as JSON, consumers, consumer groups, SASL tokens: all {len(checks)} checks pass"
@@ -4314,6 +4376,34 @@ def scale():
                                    "cheap": [cheap_status, cheap_sqlstate, cheap_body[:120]], "cheap_rows": CHEAP_ROWS}
     checks[f"the memory watch stops the request that grew the node, not an older cheap one beside it (a count(*) over {CHEAP_ROWS} rows started first answers 200 with its count; the array_agg started after it answers 53200)"] = (
         grower[0] == 503 and grower[1] == "53200" and cheap_rows == [{"n": CHEAP_ROWS}])
+    # A median holds its groups' values, and DataFusion's copies of them as it answers aren't in the pool, so a big one
+    # passes the line before the pool refuses it. The watch stops its first try alone (`panics::first_try`), waits for
+    # that memory to go, and the query runs again in a frugal session, from a sort's middle rows (`frugal.rs`, MiddleRows),
+    # under the line. 48 M values in 3 groups (each id 16 times): its first try grows past 1 GB within a second here,
+    # its second stays near 0.6 GB. The node's log says the first try was stopped, and no query is counted as stopped.
+    time.sleep(11)
+    settle()
+    copies = 16
+    median_want16 = {}
+    for g in range(3):
+        ids_g = range(g or 3, 3000001, 3)
+        n = copies * len(ids_g)
+        median_want16[g] = (ids_g[(n // 2 - 1) // copies] + ids_g[(n // 2) // copies]) / 2
+    before_median = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    first_tries = lambda: open(node.log).read().count("stopped a query's first try")  # (the array_agg's first tries above are stopped too)
+    tries_before = first_tries()
+    t0 = time.time()
+    values16 = ", ".join(f"({i})" for i in range(1, copies + 1))
+    medians16 = answer(f"SELECT id % 3 AS g, median(id) AS m FROM big CROSS JOIN (VALUES {values16}) v(n) GROUP BY id % 3 ORDER BY g")
+    median16_seconds = time.time() - t0
+    median16_rows = json.loads(medians16[2]) if medians16[0] == 200 else None
+    first_stopped = first_tries() == tries_before + 1
+    memory_line["median_past_the_line"] = {"answer": [medians16[0], medians16[1], medians16[2][:160]], "seconds": round(median16_seconds, 1),
+                                           "first_try_stopped": first_stopped, "want": median_want16}
+    checks[f"a median of 48M values past the memory line answers: its first try stopped alone, then a frugal second try under the line ({round(median16_seconds, 1)} s)"] = (
+        median16_rows is not None and [r["g"] for r in median16_rows] == [0, 1, 2]
+        and all(abs(r["m"] - median_want16[r["g"]]) <= 1e-6 for r in median16_rows)
+        and first_stopped and metrics_of(port).get("pondra_queries_stopped_for_memory_total") == before_median)
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.
@@ -6000,6 +6090,19 @@ $$""")
 raise ValueError("no such thing")
 $$""")
     checks["a Python error comes back as the error"] = "ValueError: no such thing" in err("CALL py_fail()")
+    def state(s):  # (HTTP status, SQLSTATE) of a statement the node refuses
+        c = http_client.HTTPConnection("127.0.0.1", A.port, timeout=120)
+        c.request("POST", "/sql", s.encode(), {"authorization": "Bearer a-tok"})
+        r = c.getresponse()
+        r.read()
+        return r.status, r.getheader("x-pondra-sqlstate")
+    q("""CREATE FUNCTION py_raise(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$
+return 1 // (x - x)
+$$""")
+    checks["a Python routine's own error is 38000 (400), not an internal one: a procedure's, a function's in a query, a DO's; code that doesn't parse is 42601"] = \
+        state("CALL py_fail()") == (400, "38000") and state("SELECT py_raise(id) AS v FROM orders WHERE id < 3") == (400, "38000") \
+        and "ZeroDivisionError" in err("SELECT py_raise(3) AS v") and state("DO LANGUAGE python $$\n1 / 0\n$$") == (400, "38000") \
+        and state("CREATE FUNCTION py_unparsed(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$\nreturn x +\n$$") == (400, "42601")
     q("""CREATE PROCEDURE py_deep(n BIGINT) LANGUAGE python AS $$
 con.call("py_deep", n + 1)
 $$""")
@@ -6330,7 +6433,7 @@ $$""")
     status, heard, out = told("CALL leak()")
     time.sleep(1)
     logged = json.dumps(q("SELECT * FROM pondra.runs WHERE routine = 'leak'"))
-    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 500 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
+    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 400 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
         and heard == ["using ***"] and "refused: ***" in str(out) and "***" in logged and "only a procedure's code" in err("SELECT 1") + str(_raises_text(lambda: call(A.port, "GET", "/secrets/smtp", headers={"authorization": "Bearer a-tok"})))
     runs = q("SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'send_report' ORDER BY started")
     checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]
@@ -16614,6 +16717,83 @@ def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
           lambda: _outer_refused_port(conn, outer, "t.doc"))
 
 
+def extensions():
+    """Extensions (ADR-075 E1-E2c): an admin installs a WebAssembly file once and every node of a cluster has its functions at
+    once, by their own names; SHOW EXTENSIONS lists it after the built-ins; a query spread over three nodes answers as one node
+    does, and a table function's rows come once; a function's own error is 38000 and a runaway call stops at PONDRA_EXTENSION_SECS with 57014, failing alone while the
+    nodes go on; a branch keeps the extension and its file; UNINSTALL takes the functions away on every node. A non-owner may
+    not install from a path on the node's machine, and a node started without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL
+    by the variable's name."""
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tests/fixtures/extensions/words-0.1.wasm")
+    lake, owner_key = new_lake(), uuid.uuid4().hex
+    cache = tempfile.mkdtemp(prefix="pondra-ext-cache-")
+    env = {"PONDRA_SECRET_KEY": "one key for the cluster", "PONDRA_OWNER_KEY": owner_key, "PONDRA_ALLOW_UNSIGNED_EXTENSIONS": "true",
+           "PONDRA_EXTENSION_SECS": "2", "PONDRA_CACHE_DIR": cache}
+    nodes = [Node(lake, A.port + i, env=env, admin_token="a", **({"read_token": "rtok"} if i == 1 else {})).start() for i in range(3)]
+    signed, admin, reader = {"x-pondra-owner": owner_key}, {"authorization": "Bearer a"}, {"authorization": "Bearer rtok"}
+    checks = {}
+
+    def q(s, i=0, spread=None, headers=None):
+        return call(A.port + i, "POST", "/sql" + (f"?spread={spread}" if spread is not None else ""), s.encode(), headers=headers or signed, timeout=120)
+
+    def refused(s, i=0, headers=None):
+        """'' when `s` answers; else its status, SQLSTATE (`x-pondra-sqlstate`) and words, as one string."""
+        c = http.client.HTTPConnection("127.0.0.1", A.port + i, timeout=120)
+        c.request("POST", "/sql", s.encode(), headers or signed)
+        r = c.getresponse()
+        body = r.read().decode(errors="replace")
+        return "" if r.status == 200 else f"{r.status} {r.getheader('x-pondra-sqlstate')}: {body}"
+    try:
+        q("CREATE TABLE notes (id BIGINT, body TEXT)")
+        for k in range(4):
+            q(f"INSERT INTO notes SELECT k AS id, repeat('word ', (k % 7)::int) || 'end' AS body FROM generate_series({k * 50_000}, {k * 50_000 + 49_999}) AS g(k)")
+            call(A.port, "POST", "/tier", headers=signed, timeout=600)  # (files to slice: a spread query deals them out)
+        checks["a non-owner may not install from a path on the node's machine"] = "42501" in refused(f"INSTALL words FROM '{fixture}'", headers=admin) or "path on the server" in refused(f"INSTALL words FROM '{fixture}'", headers=admin)
+        installed = q(f"INSTALL words FROM '{fixture}'")
+        installed = installed[0] if isinstance(installed, list) and installed else installed
+        checks["INSTALL keeps it, its version the file's own"] = isinstance(installed, dict) and installed.get("version") == "0.1"
+        shown = q("SHOW EXTENSIONS")
+        checks["SHOW EXTENSIONS lists the built-ins, then words with its hash"] = [r["name"] for r in shown][-1] == "words" and shown[-1]["built_in"] is False and len(shown[-1]["sha256"] or "") == 64
+        checks["every node has its functions at once"] = all(until(lambda i=i: q("SELECT word_count('a b c') AS n", i), [{"n": 3}], 15) for i in range(3))
+        agg = "SELECT sum(word_count(body)) AS words, count(*) FILTER (WHERE shout(body) = upper(body)) AS same FROM notes"
+        # (a program's own requests run on their node alone, so the spread is asked with a reader's token, as `outside` asks it)
+        until(lambda: len(call(A.port + 1, "GET", "/stats", headers=admin).get("nodes", ())), 3, 30)
+        before = metrics_of(A.port + 1, signed)["pondra_spread_queries_total"]
+        one, three = q(agg, 1, spread=0, headers=reader), q(agg, 1, spread=1, headers=reader)
+        checks["a query spread over three nodes == one node"] = one == three and one[0]["same"] == 200_000 and metrics_of(A.port + 1, signed)["pondra_spread_queries_total"] > before
+        checks["a table function's rows once, asked of three nodes (it runs on one) or of one"] = q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=1, headers=reader) == q("SELECT count(*) AS n, sum(i) AS s FROM series(10000)", 1, spread=0, headers=reader) == [{"n": 10000, "s": 50005000}]
+        checks["a function's own error is 38000, in its words"] = "38000" in (e := refused("SELECT boom(1)")) and "boom always fails" in e
+        started = time.time()
+        e = refused("SELECT spin(id) FROM notes LIMIT 1", 2)
+        checks["a runaway call stops at PONDRA_EXTENSION_SECS with 57014, and the node goes on"] = "57014" in e and time.time() - started < 30 and q("SELECT word_count('still here') AS n", 2) == [{"n": 2}]
+        here, fork_at = q("SELECT name FROM pondra.databases")[0]["name"], f"{lake}-fork"
+        LAKES.append(fork_at)
+        q(f"CREATE DATABASE fork LOCATION '{fork_at}' CLONE \"{here}\"")
+        fork = Node(fork_at, A.port + 5, env=env, admin_token="a").start()  # (the branch on a node of its own: its file came with it)
+        try:
+            in_fork = lambda s: call(A.port + 5, "POST", "/sql", s.encode(), headers=signed, timeout=120)
+            checks["a branch keeps the extension and its file"] = [r["name"] for r in in_fork("SHOW EXTENSIONS")][-1] == "words" and in_fork("SELECT word_count('a b') AS n") == [{"n": 2}]
+        finally:
+            fork.kill()
+        q("UNINSTALL words")
+        gone = lambda i: "word_count" in refused("SELECT word_count('a b') AS n", i)
+        checks["UNINSTALL takes its functions away on every node"] = all(until(lambda i=i: gone(i), True, 15) for i in range(3))
+        nodes[2].kill()
+        bare = Node(lake, A.port + 2, env={k: v for k, v in env.items() if k != "PONDRA_ALLOW_UNSIGNED_EXTENSIONS"}, admin_token="a").start()
+        nodes[2] = bare
+        checks["a node without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL by the variable's name"] = "PONDRA_ALLOW_UNSIGNED_EXTENSIONS" in refused(f"INSTALL words FROM '{fixture}'", 2)
+    finally:
+        for n in nodes:
+            n.kill()
+        shutil.rmtree(cache, ignore_errors=True)
+    for name_, good in checks.items():
+        print(f"extensions: {name_}: {'OK' if good else 'FAIL'}")
+    print(json.dumps({"extensions": {"passed": all(checks.values()), "checks": checks}}))
+    if not all(checks.values()):
+        sys.exit(1)
+    return checks
+
+
 def jsonfns():
     """Postgres 16's functions that read a JSON document and expand it into rows (ADR-072 phase 2, brief D1). Reading:
     json(b)_typeof, json(b)_array_length, json(b)_extract_path(_text) (`#>` and `#>>` with the keys as the path; NULL where
@@ -19512,7 +19692,7 @@ def bi():
 # section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
 ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
              "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso",
-             "extension": "tests/forms/extensions.slt, extension.rs's tests (an installed one runs from E2b's harness.py extensions)"}
+             "extension": "harness.py extensions"}
 
 
 def registry():
@@ -25159,6 +25339,9 @@ def matches():
     checks["a materialized view (not EMIT FINAL) over a subquery before MATCH_RECOGNIZE is refused 0A000 by name, with what to write"] = \
         refused("a materialized view over a subquery", f"CREATE MATERIALIZED VIEW sub_mv AS SELECT * FROM (SELECT * FROM sub_src WHERE venue = 'x') t {sub_clause} m",
                 ["a materialized view over a MATCH_RECOGNIZE of a subquery", "FROM t MATCH_RECOGNIZE"])
+    checks["a materialized view (not EMIT FINAL) whose MATCH_RECOGNIZE reads a CTE is refused 0A000 by name, with what to write"] = \
+        refused("a materialized view over a CTE", f"CREATE MATERIALIZED VIEW sub_mv AS WITH t AS (SELECT * FROM sub_src WHERE venue = 'x') SELECT * FROM t {sub_clause} m",
+                ["a materialized view over a MATCH_RECOGNIZE of a CTE", "FROM t MATCH_RECOGNIZE"])
     checks["EMIT FINAL over a subquery with an alias is refused 0A000 with the pattern view's words, as without one"] = \
         refused("a subquery with an alias as the input (parser)", f"CREATE MATERIALIZED VIEW r_sq2 AS SELECT * FROM (SELECT * FROM late_src) t "
                 f"MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP PAST LAST ROW "
@@ -26926,7 +27109,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -26958,7 +27141,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -26971,7 +27154,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
