@@ -77,13 +77,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -366,6 +366,48 @@ fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         }
     }
     Ok(edits)
+}
+
+/// DuckDB's and SQLite's `PRAGMA …` where a statement starts: refused by name, with Pondra's statement for it
+/// (`PRAGMA table_info('t')` is `DESCRIBE t`; a setting is SET and SHOW).
+fn pragma_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut start = true;
+    for i in 0..t.toks.len() {
+        match &t.toks[i] {
+            Token::Whitespace(_) => continue,
+            Token::SemiColon => start = true,
+            Token::Word(w) if start && w.quote_style.is_none() && w.keyword == Keyword::PRAGMA => {
+                let at = t.next(i);
+                let name = match t.toks.get(at) {
+                    Some(Token::Word(n)) => n.value.to_lowercase(),
+                    _ => String::new(),
+                };
+                // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
+                let open = t.next(at);
+                let close = (open..t.toks.len()).find(|&j| t.toks[j] == Token::RParen);
+                let table = match (t.toks.get(open), close) {
+                    (Some(Token::LParen), Some(close)) => {
+                        let raw = t.span(open + 1, close).trim();
+                        match raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+                            Some(quoted) => quoted.replace("''", "'"),
+                            None => raw.to_string(),
+                        }
+                    }
+                    _ => "t".to_string(),
+                };
+                let ours = match name.as_str() {
+                    "table_info" | "show" => format!("DESCRIBE {table}"),
+                    "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
+                    "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
+                    "version" => "SELECT version()".to_string(),
+                    _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
+                };
+                return Err(crate::codes::coded("0A000", format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}")));
+            }
+            _ => start = false,
+        }
+    }
+    Ok(Vec::new())
 }
 
 /// DuckDB's `PIVOT t ON g [IN (…)] [USING agg] [GROUP BY …]` and `UNPIVOT t ON a, b [INTO NAME n
@@ -2129,6 +2171,19 @@ mod tests {
         assert_eq!(text("SELECT @@VERSION AS version, @@Version").unwrap(), "SELECT version() AS version, version()");
         assert_eq!(text("SELECT '@@x', 1 -- @@y").unwrap(), "SELECT '@@x', 1 -- @@y");
         assert!(text("SELECT @@spid").unwrap_err().to_string().contains("@@spid is SQL Server's: Pondra's settings are SHOW spid"));
+    }
+
+    #[test]
+    fn pragma_is_refused_with_pondras_statement() {
+        let said = |sql: &str| text(sql).unwrap_err();
+        let e = said("PRAGMA table_info('orders')");
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE orders"), "{e:#}");
+        assert!(said("-- columns\npragma show(sales.orders)").to_string().contains("write DESCRIBE sales.orders"));
+        assert!(said("SELECT 1; PRAGMA show_tables").to_string().contains("write SHOW TABLES"));
+        assert!(said("PRAGMA threads = 4").to_string().contains("write SET threads = … to change a setting, SHOW threads to read it"));
+        // (a column, a string or a comment called pragma is no statement)
+        assert_eq!(text("SELECT pragma FROM t -- pragma").unwrap(), "SELECT pragma FROM t -- pragma");
+        assert_eq!(text("SELECT 'PRAGMA x'").unwrap(), "SELECT 'PRAGMA x'");
     }
 
     #[test]
