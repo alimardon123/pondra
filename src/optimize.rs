@@ -1121,6 +1121,8 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let sides = rules.iter().position(|r| r.name() == "join_selection").unwrap_or(0);
     rules.insert(sides, Arc::new(FilterShares { apart: true })); // (the joins' sides are picked by their inputs' sizes)
     let at = sides + 2;
+    rules.insert(at, Arc::new(crate::frugal::SpillingJoins)); // (a frugal retry's joins of one partition: right after JoinSelection, before the rules that read its hash joins)
+    let at = at + 1;
     rules.insert(at, Arc::new(HavingBuilds));
     rules.insert(at + 1, Arc::new(crate::asof::Rule)); // (before the rules that add exchanges: it asks for its own)
     rules.insert(at + 2, Arc::new(SharedBuilds)); // (after both: a HAVING's few groups and an as-of join are theirs)
