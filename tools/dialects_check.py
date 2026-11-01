@@ -245,7 +245,7 @@ CASES = [
     ("mysql", "UPDATE orders o JOIN customers c ON c.id = o.customer_id SET o.tags = 'uk' WHERE c.country = 'UK' AND o.id = 1", ("0A000", "UPDATE … JOIN … SET is MySQL's")),
     ("mysql", "DELETE t FROM t_case_402 t JOIN customers c ON c.id = t.customer_id WHERE c.country IS NULL", ("0A000", "DELETE t FROM … JOIN is MySQL's and SQL Server's")),
     # mysql: sessions and admin
-    ("mysql", "SET @min_amount := 50", ("0A000", "@min_amount is a user variable of MySQL's and SQL Server's: write DECLARE $min_amount = value")),
+    ("mysql", "SET @min_amount := 50", ("0A000", "SET @min_amount is MySQL's for a variable: here a variable is $min_amount = …")),
     ("mysql", "SHOW CREATE TABLE orders"),
     ("mysql", "DESC events"),
     ("mysql", "EXPLAIN FORMAT=JSON SELECT * FROM orders WHERE customer_id = 1", ("0A000", "EXPLAIN FORMAT=JSON is MySQL's")),

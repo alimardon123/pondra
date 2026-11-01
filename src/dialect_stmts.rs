@@ -17,6 +17,9 @@ use std::sync::LazyLock;
 /// SQL Server's `SET name ON|OFF` options, which nothing here reads.
 const SQL_SERVER_SETS: &[&str] = &["NOCOUNT", "ANSI_NULLS", "QUOTED_IDENTIFIER", "XACT_ABORT", "ANSI_PADDING", "ANSI_WARNINGS", "ARITHABORT", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT", "IDENTITY_INSERT", "STATISTICS", "SHOWPLAN_ALL", "SHOWPLAN_XML", "IMPLICIT_TRANSACTIONS", "FMTONLY"];
 
+/// The words for MySQL's `SET @v = …` (`settings.rs` says them too, for a SET it reads).
+pub(crate) fn user_variable(v: &str) -> String { format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it") }
+
 /// Refused (0A000) with what to write, when a statement of `sql` is one of these.
 pub fn refused(sql: &str) -> anyhow::Result<()> {
     match refusal(sql) {
@@ -104,10 +107,7 @@ fn statement(s: &[Token]) -> Option<String> {
             Some(format!("{kind} INDEX is SQL Server's: write CREATE INDEX name ON t (columns); CLUSTER BY orders a table's rows"))
         }
         "SET" => match s.get(1) {
-            Some(Token::Word(v)) if v.value.starts_with('@') && !v.value.starts_with("@@") => {
-                let x = v.value.trim_start_matches('@');
-                Some(format!("{} is a user variable of MySQL's and SQL Server's: write DECLARE ${x} = value, then ${x}", v.value))
-            }
+            Some(Token::Word(v)) if v.value.starts_with('@') && !v.value.starts_with("@@") => Some(user_variable(v.value.trim_start_matches('@'))),
             _ => {
                 let option = w(1).filter(|o| SQL_SERVER_SETS.contains(&o.as_str()))?;
                 (is(2, "ON") || is(2, "OFF") || option == "IDENTITY_INSERT" || option == "STATISTICS")
@@ -120,7 +120,7 @@ fn statement(s: &[Token]) -> Option<String> {
                 let x = v.value.trim_start_matches('@');
                 Some(format!("DECLARE {} is SQL Server's: write DECLARE ${x} = value, then ${x}", v.value))
             }
-            Some(Token::Word(v)) if v.quote_style.is_none() && !(2..s.len()).any(|i| matches!(w(i).as_deref(), Some("CURSOR" | "BINARY" | "INSENSITIVE" | "ASENSITIVE" | "SCROLL"))) && (2..s.len()).any(|i| is(i, "DEFAULT")) => {
+            Some(Token::Word(v)) if v.quote_style.is_none() && !v.value.eq_ignore_ascii_case("PARAMETER") && !(2..s.len()).any(|i| matches!(w(i).as_deref(), Some("CURSOR" | "BINARY" | "INSENSITIVE" | "ASENSITIVE" | "SCROLL"))) && (2..s.len()).any(|i| is(i, "DEFAULT")) => {
                 let x = v.value.to_lowercase();
                 Some(format!("DECLARE {} … DEFAULT is BigQuery's: write DECLARE ${x} = value, then ${x}", v.value))
             }
@@ -159,7 +159,7 @@ mod tests {
         assert!(said("SHOW TABLES IN default LIKE 'orders*'").starts_with("SHOW TABLES IN …"));
         assert!(said("CREATE NONCLUSTERED INDEX ix ON t (a) INCLUDE (b)").starts_with("NONCLUSTERED INDEX is SQL Server's"));
         assert!(said("SET NOCOUNT ON").starts_with("SET NOCOUNT is SQL Server's"));
-        assert_eq!(said("SET @min_amount := 50"), "@min_amount is a user variable of MySQL's and SQL Server's: write DECLARE $min_amount = value, then $min_amount");
+        assert_eq!(said("SET @min_amount := 50"), "SET @min_amount is MySQL's for a variable: here a variable is $min_amount = …, and $min_amount reads it");
         assert!(said("PREPARE by_status FROM 'SELECT id FROM orders WHERE status = ?'").starts_with("PREPARE … FROM is MySQL's: write PREPARE by_status AS statement"));
         assert!(said("DECLARE @n INT = 5").starts_with("DECLARE @n is SQL Server's: write DECLARE $n = value"));
         assert!(said("DECLARE min_amt NUMERIC DEFAULT 50").starts_with("DECLARE min_amt … DEFAULT is BigQuery's: write DECLARE $min_amt = value"));
@@ -176,7 +176,7 @@ mod tests {
     fn pondras_own_statements_are_left_as_they_are() {
         for sql in [
             "DESCRIBE customers", "DESC customers", "EXPLAIN VERBOSE SELECT 1", "EXPLAIN FORMAT tree SELECT 1", "SHOW TABLES", "CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE OR ALTER TABLE t (a INT)",
-            "CREATE UNIQUE INDEX i ON t (a)", "SET search_path = s", "SET TIME ZONE 'UTC'", "PREPARE p AS SELECT $1", "DECLARE $x = 5", "DECLARE c CURSOR FOR SELECT 1",
+            "CREATE UNIQUE INDEX i ON t (a)", "SET search_path = s", "SET TIME ZONE 'UTC'", "PREPARE p AS SELECT $1", "DECLARE $x = 5", "DECLARE $n BIGINT DEFAULT 3", "DECLARE PARAMETER $top BIGINT DEFAULT 3", "DECLARE c CURSOR FOR SELECT 1",
             "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT x DEFAULT FROM t", "DELETE FROM t USING o WHERE t.id = o.id", "UPDATE t SET a = 1 FROM o WHERE t.id = o.id",
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
