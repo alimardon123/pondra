@@ -1137,14 +1137,27 @@ const READS_PER_ROW: usize = 16;
 /// A partition's two budgets (see `Part`): `KEEP` past n, and `KEEP` past `READS_PER_ROW` × n. With a pattern whose matches
 /// hold at most `longest` rows, each search keeps at most that many and reads at most one more, so the work is linear in n
 /// and the budgets grow with it: n × (longest - 1) more rows kept, n × (longest + 1 - READS_PER_ROW) more read.
-fn budgets(longest: Option<usize>, n: usize) -> (usize, usize) {
+/// The kept rows grow no further than `most` (`kept_most`): a bounded pattern's n × (longest - 1) has no ceiling of its own.
+fn budgets(longest: Option<usize>, n: usize, most: usize) -> (usize, usize) {
     match longest {
         None => (KEEP, KEEP),
         Some(l) => (
-            KEEP.saturating_add(n.saturating_mul(l.saturating_sub(1))),
+            KEEP.saturating_add(n.saturating_mul(l.saturating_sub(1))).min(most.max(KEEP)),
             KEEP.saturating_add(n.saturating_mul((l + 1).saturating_sub(READS_PER_ROW))),
         ),
     }
+}
+
+/// The most rows of matches a partition's search keeps past its n, by their memory: a quarter of the queries' memory
+/// (`PONDRA_MEMORY_GB`), in memberships (`Mem`). A window function has no reservation of its statement's to charge them
+/// to, so this caps them instead: `PATTERN (a b{999}) AFTER MATCH SKIP TO NEXT ROW` over a million rows would keep a
+/// billion (11-01 audit M14). `KEEP` at least.
+fn kept_most() -> usize {
+    #[cfg(feature = "lake")]
+    let memory = crate::store::memory_limit();
+    #[cfg(not(feature = "lake"))]
+    let memory = crate::env::query_memory(|| 1 << 30);
+    (memory / 4 / size_of::<Mem>()).max(KEEP)
 }
 
 /// A row's membership in one match: the match's number, the row's symbol (None for the row of an empty match), its
@@ -1433,7 +1446,7 @@ impl Evaluator {
         let columns = values
             .get(first + plan.rows..first + plan.rows + plan.values)
             .context("MATCH_RECOGNIZE: the glue's value columns are missing")?;
-        let (keep, reads) = budgets(plan.longest, n);
+        let (keep, reads) = budgets(plan.longest, n, kept_most());
         let part = Part {
             cond: &cond,
             within: within.as_ref(),
@@ -2317,9 +2330,13 @@ mod tests {
 
     #[test]
     fn budgets_grow_with_the_longest_match() {
-        assert_eq!(budgets(None, 1_000), (super::KEEP, super::KEEP));
-        assert_eq!(budgets(Some(30), 1_000), (super::KEEP + 29_000, super::KEEP + 15_000));
-        assert_eq!(budgets(Some(5), 1_000), (super::KEEP + 4_000, super::KEEP));
+        assert_eq!(budgets(None, 1_000, usize::MAX), (super::KEEP, super::KEEP));
+        assert_eq!(budgets(Some(30), 1_000, usize::MAX), (super::KEEP + 29_000, super::KEEP + 15_000));
+        assert_eq!(budgets(Some(5), 1_000, usize::MAX), (super::KEEP + 4_000, super::KEEP));
+        // (11-01 audit M14: a b{999} over a million rows would keep a billion rows of matches; its memory caps them, KEEP at least)
+        assert_eq!(budgets(Some(1_000), 1_000_000, 20_000_000).0, 20_000_000);
+        assert_eq!(budgets(Some(1_000), 1_000_000, 1_000).0, super::KEEP);
+        assert!(kept_most() >= super::KEEP);
     }
 
     #[test]
@@ -2329,7 +2346,7 @@ mod tests {
         let plan = compile(&spec("a b{29}", NEXT)).unwrap();
         let n = 300_000;
         let cond = vec![vec![true; n], vec![true; n]];
-        let (keep, reads) = budgets(plan.longest, n);
+        let (keep, reads) = budgets(plan.longest, n, usize::MAX);
         let part = Part { cond: &cond, within: None, n, rows: &[], values: &[], planned: None, cap: STATE_CAP, keep, reads, stop: None };
         let started = Instant::now();
         let rows = partition(&plan, &part).unwrap();
