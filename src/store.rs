@@ -1784,12 +1784,12 @@ impl Lake {
     }
 
     /// Write an object only if it does not exist yet: data is never overwritten.
-    pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
         if self.cat.frozen.load(Relaxed) {
             return Err(crate::backup::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
         }
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
-        let bytes = Bytes::from(bytes);
+        let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
         if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path) || replaceable(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
@@ -1839,7 +1839,7 @@ impl Lake {
     /// Replace a user's file (`files/`) that is still the version `expect` (ADR-034): a newer
     /// one, saved meanwhile, is refused (`Changed`), so two editors never overwrite each other
     /// blind. Where the store can, the check and the write are one request (a conditional put).
-    pub async fn replace(&self, path: &str, bytes: Vec<u8>, expect: &str) -> Result<String> {
+    pub async fn replace(&self, path: &str, bytes: impl Into<Bytes>, expect: &str) -> Result<String> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
         if self.cat.frozen.load(Relaxed) {
             return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
@@ -1855,7 +1855,8 @@ impl Lake {
         if version_of(&m) != expect {
             return Err(Changed.into());
         }
-        let (len, bytes, opts) = (bytes.len() as u64, Bytes::from(bytes), |mode| PutOptions { mode, ..Default::default() });
+        let bytes: Bytes = bytes.into();
+        let (len, opts) = (bytes.len() as u64, |mode| PutOptions { mode, ..Default::default() });
         let update = PutMode::Update(object_store::UpdateVersion { e_tag: m.e_tag.clone(), version: m.version.clone() });
         let put = match self.store.put_opts(&at, bytes.clone().into(), opts(update)).await {
             Ok(r) => r,

@@ -184,8 +184,8 @@ pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::B
     }
     let expect = if_match.map(|v| v.trim_matches('"').to_string());
     let done = match &expect {
-        Some(v) => lake.replace(&path, body.to_vec(), v).await,
-        None => match lake.put(&path, body.to_vec()).await {
+        Some(v) => lake.replace(&path, body.clone(), v).await, // (`Bytes`: the body itself, not a copy of it)
+        None => match lake.put(&path, body.clone()).await {
             Ok(()) => lake.version(&path).await,
             Err(e) => Err(e),
         },
@@ -237,9 +237,9 @@ pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<Stri
     let id = q.get("restore").ok_or_else(|| anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)"))?;
     let bytes = version(lake, &path, id).await?;
     let now = match lake.version(&path).await {
-        Ok(now) => lake.replace(&path, bytes.to_vec(), &now).await?,
+        Ok(now) => lake.replace(&path, bytes.clone(), &now).await?,
         Err(_) => {
-            lake.put(&path, bytes.to_vec()).await?; // (deleted since: back again)
+            lake.put(&path, bytes.clone()).await?; // (deleted since: back again)
             lake.version(&path).await?
         }
     };
@@ -278,7 +278,7 @@ fn saved_before(path: &str) -> Option<String> {
 }
 
 /// Keep this save of `path` as a version, by whoever made it; then let the oldest go.
-pub async fn keep(lake: &Lake, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Result<()> {
     if bytes.len() > KEPT_MB << 20 || path.starts_with(VERSIONS) {
         return Ok(());
     }
@@ -286,7 +286,7 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let who: String = who.chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect();
     let now = crate::log::now_ms();
     for ms in now..now + 8 {
-        match lake.put(&format!("{}{ms:013}.{who}", kept_at(path)), bytes.to_vec()).await {
+        match lake.put(&format!("{}{ms:013}.{who}", kept_at(path)), bytes.clone()).await { // (the saved bytes shared, not copied)
             Err(e) if format!("{e:#}").contains("already exists") => continue, // (two saves in one millisecond: the next)
             done => {
                 done?;
