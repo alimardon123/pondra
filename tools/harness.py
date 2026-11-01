@@ -5955,9 +5955,29 @@ def fills():
     checks["a view whose filling fails: CREATE says so within 10 s, pondra.flows has its error, its source changes once it is dropped"] = (
         "is made, but filling it from" in said and "notes" in said and took < 10 and len(flow) == 1 and bool(flow[0].get("error"))
         and "still being filled" in held and held.startswith("409") and after == [{"s": "7"}, {"s": "8"}])
+    # A view made from a plain view keeps what it was made from (audit 11-01 M5): the plain view's query was written into
+    # its own, so the plain view can't be replaced, renamed or dropped while it is read (2BP01, naming the view), and SHOW
+    # CREATE shows the query as it was written. Once the view is dropped, so can the plain view be.
+    q("CREATE VIEW big_notes AS SELECT s FROM notes WHERE s > '7'")
+    q("CREATE MATERIALIZED VIEW from_plain AS SELECT count(*) AS n FROM big_notes")
+    refused = {}
+    for what, s in [("drop", "DROP VIEW big_notes"), ("replace", "CREATE OR REPLACE VIEW big_notes AS SELECT s FROM notes"), ("rename", "ALTER VIEW big_notes RENAME TO bn")]:
+        try:
+            q(s)
+            refused[what] = "(done)"
+        except RuntimeError as e:
+            refused[what] = str(e)[:240]
+    same = q("CREATE OR REPLACE VIEW big_notes AS SELECT s FROM notes WHERE s > '7'")  # (the same query: nothing changes)
+    shown = q("SHOW CREATE MATERIALIZED VIEW from_plain")[0]["definition"]
+    rows = until(lambda: q("SELECT n FROM from_plain"), [{"n": 1}], secs=20)
+    q("DROP MATERIALIZED VIEW from_plain")
+    q("DROP VIEW big_notes")
+    made_from = {"refused": refused, "same_again": same, "shown": shown, "rows": rows}
+    checks["a view made from a plain view: the plain view can't be replaced, renamed or dropped while it reads it (409, naming the view), SHOW CREATE shows the query as written, and both drop after"] = (
+        all(r.startswith("409") and "materialized view from_plain" in r for r in refused.values()) and "FROM big_notes" in shown and rows == [{"n": 1}])
     a.kill(); b.kill()
     ok = all(checks.values())
-    print(json.dumps({"fills": checks, "rows": count, "bad_fill": bad_fill, "ok": ok}, indent=1))
+    print(json.dumps({"fills": checks, "rows": count, "bad_fill": bad_fill, "made_from": made_from, "ok": ok}, indent=1))
     if not ok:
         sys.exit(1)
     return f"views filled from existing rows while {count:,} rows streamed in, made again, and through a leader restart: all {len(checks)} checks pass"

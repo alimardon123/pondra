@@ -883,7 +883,11 @@ async fn create_view(lake: &Lake, name: &str, sql: String, replace: bool, extern
     unclaimed(lake, &name).await?;
     ensure!(lake.cat.get::<TableMeta>(&table_key(&name)).await?.is_none(), "{name} is a table");
     ensure!(lake.cat.get::<Value>(&crate::views::view_key(&name)).await?.is_none(), "{name} is a materialized view");
-    ensure!(replace || lake.cat.get::<StoredView>(&query_key(&name)).await?.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
+    let before = lake.cat.get::<StoredView>(&query_key(&name)).await?;
+    ensure!(replace || before.is_none(), "view {name} already exists (CREATE OR REPLACE VIEW)");
+    if before.is_some_and(|b| b.sql != sql) {
+        made_from(lake, &name, "replace").await?;
+    }
     crate::facts::measures_checked(lake, &sql).await?; // (a view with measures: its shape, and each join onto a key: ADR-065 §3)
     let expanded = crate::routines::expand(lake, &sql).await?; // (kept as written: macros are read when it is used)
     let planned = crate::sys::planned(&expanded)?;
@@ -1142,6 +1146,7 @@ async fn rename(lake: &Lake, name: &str, to: &str) -> Result<Value> {
     ensure!(!taken, "{to} exists already");
     unclaimed(lake, &to).await?;
     if let Some(v) = lake.cat.get::<StoredView>(&query_key(&name)).await? {
+        made_from(lake, &name, "rename").await?;
         lake.cat.commit(vec![(query_key(&to), json(&v))], &[query_key(&name)]).await?;
         return Ok(j!({"view": name, "renamed": to}));
     }
@@ -1475,6 +1480,15 @@ pub(crate) fn widens(old: &datafusion::arrow::datatypes::DataType, new: &datafus
     }
 }
 
+/// Refused (2BP01) while a materialized view was made from plain view `name`: its query was written into the
+/// materialized view's when it was made (`views::written_in`), so a new query, or none, would leave it working out the old
+/// one (audit 11-01 M5). `what`: replace or drop.
+async fn made_from(lake: &Lake, name: &str, what: &str) -> Result<()> {
+    let made = crate::views::made_from(lake, name).await?;
+    ensure!(made.is_empty(), "{name} is read by {}, made from its query as it was: drop them first, then {what} {name}", made.join(", "));
+    Ok(())
+}
+
 /// `DROP VIEW` or `DROP MATERIALIZED VIEW`: a stored view, or a live one with its tables and state
 /// (and out of the shares that hand them out).
 async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
@@ -1487,6 +1501,7 @@ async fn drop_view(lake: &Lake, name: &str, if_exists: bool) -> Result<Value> {
         return Ok(left_shares(j!({"view": name, "dropped": true}), from));
     }
     if lake.cat.get::<StoredView>(&query_key(name)).await?.is_some() {
+        made_from(lake, name, "drop").await?;
         lake.cat.commit(vec![], &[query_key(name)]).await?;
         return Ok(j!({"view": name, "dropped": true}));
     }
