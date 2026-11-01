@@ -94,6 +94,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
         .route("/cluster/kv", get(kv))
+        .route("/cluster/records", post(records).layer(axum::extract::DefaultBodyLimit::max(1 << 20))) // (a joined page's own statements: 256 lines, a 1 MB body)
         .route("/cluster/stage", post(stage))
         .route("/cluster/copy", post(copy))
         .route("/cluster/insert", post(insert_share))
@@ -629,6 +630,22 @@ async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Respons
         Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
     Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `drain::endless`)
+}
+
+/// `POST /cluster/records`: a joined page's own statements, which this node writes as its own (`page_records::record`), under the
+/// sign-in's name, as the door `page`. Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
+/// user with grants, or a procedure's lent token); a batch past `BATCH_LINES` lines is 413.
+async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(batch): Json<crate::page_records::Batch>) -> Response {
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    let Some(who) = crate::auth::current() else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
+    if let Some(why) = crate::page_records::refusal(&who, token) {
+        return (StatusCode::FORBIDDEN, why).into_response();
+    }
+    if batch.lines.len() > crate::page_records::BATCH_LINES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    crate::page_records::record(&app, &who, batch).await;
+    StatusCode::OK.into_response()
 }
 
 /// Resolves once a caller that isn't one of the nodes no longer qualifies for the commit stream: its sign-in is revoked, is no

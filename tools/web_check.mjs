@@ -1624,7 +1624,7 @@ async function joinRun(target) {
   let b = null;
   try {
     if (!(await joinSetup(a))) return;
-    b = await startNode(target.origin, a.folder);
+    b = await startNode(target.origin, a.folder, { PONDRA_AUDIT: 'read,role,ddl,function' }); // (B's read class is on: the page's own reads are B's audit lines, c6)
     if (!b) {
       report.join = 'left out: the second node did not start';
       return;
@@ -1745,6 +1745,24 @@ async function joinChecks(target, a, b) {
   const updated = await ask('joined: UPDATE w4 FROM the blob is refused by the page', 'POST', '/sql', undefined, updateSql, 'joined');
   if (updated) judge('joined: UPDATE w4 FROM the blob is refused by the page', updated, { error: true, sqlstate: '0A000', says: 'is read by the page alone' });
   await target.revoke('joined', blobUrl);
+
+  // (c4b) M8: the page's read of its own lake (w4 is the page's to read: the page runs it there and keeps no records) is written by
+  // its node B as the sign-in's: boss's name, the door `page`, in B's audit log (its read class is on: `joinRun`) and in
+  // pondra.history, each within 5 s. The page's row is a line the page sent, not one its own lake wrote.
+  const pageRead = 'SELECT count(*) FROM w4';
+  const counted3 = await ask(`joined: ${pageRead}`, 'POST', '/sql?format=csv', undefined, pageRead, 'joined');
+  if (counted3) judge(`joined: ${pageRead}`, counted3, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
+  const pageRow = 'boss,page,SELECT count(*) FROM w4';
+  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.audit WHERE door = 'page'`, pageRow, 5000)) passed++;
+  else {
+    failed.push("B: the page's read is in its audit log as boss, door page, within 5 s");
+    console.error("B: the page's read is in its audit log as boss, door page, within 5 s: no such line");
+  }
+  if (await untilRow(b, `SELECT "user", door, statement FROM pondra.history WHERE door = 'page'`, pageRow, 5000)) passed++;
+  else {
+    failed.push("B: the page's read is in pondra.history as boss, door page, within 5 s");
+    console.error("B: the page's read is in pondra.history as boss, door page, within 5 s: no such row");
+  }
 
   // (c5) The 100 MB check (W4b): the joined page loads a generated 100 MB CSV, and the nodes' CPU is measured around it.
   await w4Checks(target, a, b, session, measured);
@@ -2051,6 +2069,19 @@ async function p50Of(node, basic) {
   return Number(((times[19] + times[20]) / 2).toFixed(2));
 }
 
+// Polls a node's answer to `sql` as boss (CSV) every 50 ms, for up to `within` ms: true once one of its lines is `row`, else false
+// (the answer is not a 200, or the row came in no time).
+async function untilRow(node, sql, row, within) {
+  const from = performance.now();
+  for (;;) {
+    const answer = await ask(`B: ${sql} (poll)`, 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, sql, undefined, node);
+    if (!answer || answer.status !== 200) return false;
+    if (dec.decode(answer.body).split('\n').includes(row)) return true;
+    if (performance.now() - from > within) return false;
+    await pause(50);
+  }
+}
+
 // Polls the page's count of `ev` every 20 ms until it is `want`, for up to `within` ms from `from`: where it was seen (ms from
 // `from`, null when it wasn't in time) and the last count the page answered.
 async function untilCounted(target, on, want, from, within) {
@@ -2068,14 +2099,15 @@ async function untilCounted(target, on, want, from, within) {
 
 // A node of the run's own: `pondra serve` on a folder and a free port. Its origins are those a browser page may call it
 // from (`PONDRA_WEB_ORIGINS`), when there are any. On `folder` when one is given (another node's: this node doesn't remove it),
-// else on a folder of its own. Returns { url, folder, request, stop }, or null after naming the failure: the node exited, or
-// did not answer `/stats` within 60 s. `pid` is the process's, for its CPU (`nodesCpuMs`).
-async function startNode(origins, folder) {
+// else on a folder of its own. `env` adds to the node's environment (`joinRun` starts B with its audit classes). Returns
+// { url, folder, request, stop }, or null after naming the failure: the node exited, or did not answer `/stats` within 60 s.
+// `pid` is the process's, for its CPU (`nodesCpuMs`).
+async function startNode(origins, folder, env) {
   const port = await closedPort();
   const own = folder === undefined;
   const dir = own ? await mkdtemp(join(tmpdir(), 'pondra-web-node-')) : folder;
   const removed = own ? dir : null;
-  const node = spawnNode(origins, dir, port);
+  const node = spawnNode(origins, dir, port, env);
   const why = await untilNodeAnswers(node);
   if (why === null) {
     const { url } = node;
@@ -2087,10 +2119,11 @@ async function startNode(origins, folder) {
   return null;
 }
 
-// `pondra serve` as a child process, with the run's environment and the origins given. Its stderr's last 2 KB are kept, for
-// a failure to name.
-function spawnNode(origins, folder, port) {
-  const env = origins === undefined ? process.env : { ...process.env, PONDRA_WEB_ORIGINS: origins };
+// `pondra serve` as a child process, with the run's environment, `extra` added to it, and the origins given. Its stderr's last
+// 2 KB are kept, for a failure to name.
+function spawnNode(origins, folder, port, extra) {
+  const env = { ...process.env, ...(extra ?? {}) };
+  if (origins !== undefined) env.PONDRA_WEB_ORIGINS = origins;
   const child = spawn(NODE_BIN, ['serve', '--dir', folder, '--addr', `127.0.0.1:${port}`], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   const node = { url: `http://127.0.0.1:${port}`, child, error: null, stderr: '' };
   child.on('error', (e) => {

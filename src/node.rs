@@ -707,6 +707,7 @@ pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, lin
                 })
             };
             let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
+            panics::spawn(crate::page_records::run()); // (the page's own statements go to this node each second: `abort_all` ends it)
             panics::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -773,6 +774,7 @@ impl Paged {
         let Paged { app, url, term, marks, follow, .. } = self;
         let lake = app.lake.clone();
         drop(app);
+        let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush()).await; // (what the page's statements wait to go to its node: once, within 2 s)
         end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url).await;
     }
 }

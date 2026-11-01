@@ -289,19 +289,34 @@ struct Line {
 }
 
 /// A statement a door ran has ended (`audit::statement`): its row, and a line in the node's log
-/// when it was slow.
+/// when it was slow. A joined page keeps no rows: its statement goes to its node (`page_records::add`), which
+/// keeps the row with the sign-in's name (`page_ended`).
 pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
+    if !app.members.keeps_records() {
+        return crate::page_records::add(sql, outcome, error, took);
+    }
+    record(app, class, sql, outcome, error, took, note, false)
+}
+
+/// A joined page's statement, as its node keeps it (`page_records::record`, under the sign-in's name): the row `ended`
+/// keeps, with no line in the node's log for a slow one, and counted against the rate limit whatever its outcome.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
+    record(app, class, sql, outcome, error, took, Note::default(), true)
+}
+
+fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
     if !on() || app.log.is_none() || !app.members.keeps_records() {
-        return; // (a read-only node writes nothing, and a joined page's node keeps the records)
+        return; // (a read-only node writes nothing)
     }
     let slow = took >= slow();
-    if !slow && outcome == "ok" && note.learned.is_empty() && skipped() {
+    if (page || !slow && outcome == "ok" && note.learned.is_empty()) && skipped() {
         return; // (counted: nothing else to do, on the path of every statement)
     }
     let who = crate::auth::current();
     let (user, door, from) = who.map_or((String::new(), "node", None), |p| (p.name, p.door, p.from.map(|a| a.to_string())));
     let statement = crate::audit::redacted(sql, class);
-    if slow {
+    if slow && !page {
         // (a library's host or a `pondra sql` guest doesn't print it: `node::say`. It is in pondra.history)
         crate::node::say(format!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300)));
     }

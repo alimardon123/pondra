@@ -168,6 +168,7 @@ mod rules;
 #[cfg(feature = "doors")] pub mod library;
 #[cfg(feature = "lake")] mod pages;
 #[cfg(feature = "lake")] mod panics;
+#[cfg(feature = "lake")] mod page_records; // (a joined page's own statements, written by its node: audit 11-01 M8)
 #[cfg(feature = "doors")] mod tls;
 #[cfg(feature = "lake")] mod txn;
 #[cfg(feature = "lake")] mod returning;
