@@ -52,9 +52,9 @@ pub fn wanted(sql: &str) -> bool {
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
     // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
     // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`), and a JSONPath
-    // after `->` or `->>` (`payload->>'$.a'`, DuckDB's and MySQL's))
+    // after `->` or `->>` (`payload->>'$.a'`, DuckDB's and MySQL's), and a national string `N'…'`)
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$"#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$|(?:^|[^\w'])[nN]'"#).expect("a regex")
     });
     // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
     static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
@@ -1563,6 +1563,11 @@ fn expression(e: &mut Expr) -> Result<()> {
         return Ok(());
     }
     match e {
+        // (Postgres's `N'…'`, the standard's national character string: a string, as Postgres reads it)
+        Expr::Value(ValueWithSpan { value: v @ Value::NationalStringLiteral(_), .. }) => {
+            let Value::NationalStringLiteral(s) = std::mem::replace(v, Value::Null) else { unreachable!() };
+            *v = Value::SingleQuotedString(s);
+        }
         // (Snowflake's `payload:page::STRING`: DataFusion can't plan it, and Pondra's JSON is text, so it is refused with
         // the forms that read it: `->>` for a key, json_extract_string for a path. The path is written as it was)
         Expr::JsonAccess { value, path } => {
@@ -2470,6 +2475,12 @@ mod tests {
         assert_eq!(backslash_pattern("a\\b", Some('/')).unwrap(), "a\\\\b");
         assert_eq!(backslash_pattern("a\\b", None).unwrap(), "a\\\\b");
         assert!(backslash_pattern("a/", Some('/')).is_err());
+        // (Postgres's N'…' is a string; the gate sees it after a space or a bracket, and not inside a word or a string)
+        let mut n = expr("N'gift'").unwrap();
+        expression(&mut n).unwrap();
+        assert_eq!(n.to_string(), "'gift'");
+        assert!(wanted("INSERT INTO t VALUES (1, N'gift')") && wanted("SELECT n'x'"));
+        assert!(!wanted("SELECT 'ann' AS x") && !wanted("SELECT 'it''s' AS x"));
     }
 
     #[test]

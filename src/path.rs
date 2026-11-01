@@ -239,6 +239,13 @@ impl VisitorMut for Currents<'_> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_select(&mut self, s: &mut ast::Select) -> ControlFlow<()> {
+        if !self.kept {
+            named_currents(s);
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
         if self.kept {
             return ControlFlow::Continue(());
@@ -319,8 +326,12 @@ fn text_of(here: &str, entries: &[(String, String)]) -> String {
 }
 
 fn mentions_current(sql: &str) -> bool {
-    ["current_schema", "current_database", "current_catalog"].iter().any(|w| contains_ci(sql, w))
+    CURRENT.iter().any(|w| contains_ci(sql, w))
 }
+
+/// The words a session answers its own way: its schema, its database, and who it is (Postgres's `current_user`,
+/// `session_user` and `current_role`; a bare `user` stays a column's name, as DuckDB reads it).
+const CURRENT: [&str; 6] = ["current_schema", "current_database", "current_catalog", "current_user", "session_user", "current_role"]; // (the place's, then who's)
 
 /// The database a name is: this lake, or an attached one (or the error that names it).
 async fn db_lake(lake: &Lake, name: &str) -> Result<Arc<Lake>> {
@@ -685,6 +696,13 @@ impl VisitorMut for Walk<'_> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_select(&mut self, s: &mut ast::Select) -> ControlFlow<()> {
+        if self.world.is_some() && !self.view {
+            named_currents(s);
+        }
+        ControlFlow::Continue(())
+    }
+
     /// A table in a FROM (or an UPDATE, DELETE, MERGE's target: the same node).
     fn pre_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<()> {
         if let TableFactor::Table { name, args, .. } = t {
@@ -856,21 +874,40 @@ fn one_part(name: &ObjectName) -> Option<String> {
     }
 }
 
-/// The `current_*` word an expression is: `current_database`, `current_catalog` or `current_schema`,
-/// called with no arguments or written bare (unquoted). None for anything else.
+/// The `current_*` word an expression is (`CURRENT`), called with no arguments or written bare (unquoted). None for
+/// anything else, and for who is asking on the Postgres port, which says its sign-in's name there (`pg_catalog::rewrite`,
+/// as Postgres does, even on a node nobody signs in to).
 fn current_word(e: &Expr) -> Option<String> {
     let word = match e {
         Expr::Function(f) => one_part(&f.name),
         Expr::Identifier(i) if i.quote_style.is_none() => Some(i.value.to_lowercase()),
         _ => None,
     }?;
-    matches!(word.as_str(), "current_database" | "current_catalog" | "current_schema").then_some(word)
+    let port = || crate::auth::current().is_some_and(|p| p.door == "postgres");
+    (CURRENT[..3].contains(&word.as_str()) || CURRENT.contains(&word.as_str()) && !port()).then_some(word)
 }
 
-/// What a `current_*` word is in `path`: the schema for `current_schema`, else the database, as text.
+/// What a `current_*` word is in `path`: the schema for `current_schema`, who is asking for `current_user` and its
+/// kind (`auth::name`), else the database, as text.
 fn current_value(path: &Path, word: &str) -> Expr {
-    let value = if word == "current_schema" { path.schema() } else { path.database() };
-    Expr::Value(Value::SingleQuotedString(value.to_string()).into())
+    let value = match word {
+        "current_schema" => path.schema().to_string(),
+        "current_user" | "session_user" | "current_role" => crate::auth::name(),
+        _ => path.database().to_string(),
+    };
+    Expr::Value(Value::SingleQuotedString(value).into())
+}
+
+/// A select's `current_*` written as a column on its own keeps its word as its name (`SELECT current_user` is a
+/// column `current_user`, as in Postgres), once it is a value.
+fn named_currents(s: &mut ast::Select) {
+    for item in s.projection.iter_mut() {
+        if let ast::SelectItem::UnnamedExpr(e) = item {
+            if let Some(w) = current_word(e) {
+                *item = ast::SelectItem::ExprWithAlias { expr: e.clone(), alias: ast::Ident::new(w) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -993,6 +1030,27 @@ mod tests {
         let s = currents_of(&crm, "SELECT current_schema() AS s, current_database() AS d FROM crm.t");
         assert!(s.contains("'crm'") && s.contains("'lake'") && s.contains("crm.t"), "{s}");
         assert_eq!(currents_of(&crm, "SELECT 1 AS one"), "SELECT 1 AS one");
+    }
+
+    #[test]
+    fn says_who_is_asking_as_postgres_does() {
+        let crm = parse("lake", "crm");
+        let none = world(&[], &[]);
+        // (nobody signed in: `pondra`, as the Postgres port says it; a column on its own is named by its word)
+        assert_eq!(rewrite(&crm, &none, "SELECT current_user, session_user AS s, current_role"), "SELECT 'pondra' AS current_user, 'pondra' AS s, 'pondra' AS current_role");
+        let ann = crate::auth::Principal { name: "ann".into(), ..crate::auth::Principal::of(crate::auth::Role::Read) };
+        let mine = crate::auth::WHO.sync_scope(ann.clone(), || rewrite(&crm, &none, "SELECT a FROM t WHERE owner = current_user"));
+        assert_eq!(mine, "SELECT a FROM crm.t WHERE owner = 'ann'");
+        assert_eq!(rewrite(&crm, &none, "SELECT current_schema(), current_database()"), "SELECT 'crm' AS current_schema, 'lake' AS current_database");
+        // (a view's is its reader's, as its current_schema() is; a bare `user` is a column's name)
+        let v = rewrite(&crm, &none, "CREATE VIEW mine AS SELECT a FROM t WHERE owner = current_user");
+        assert!(v.contains("owner = current_user"), "{v}");
+        let read = crate::auth::WHO.sync_scope(ann, || currents_of(&crm, "SELECT a FROM t WHERE owner = current_user"));
+        assert!(read.contains("owner = 'ann'"), "{read}");
+        assert!(rewrite(&crm, &none, "SELECT user FROM t").contains("SELECT user FROM crm.t"));
+        let port = crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", None);
+        let kept = crate::auth::WHO.sync_scope(port, || rewrite(&crm, &none, "SELECT current_user, current_schema()"));
+        assert_eq!(kept, "SELECT current_user, 'crm' AS current_schema", "the port says its sign-in's name (pg_catalog::rewrite)");
     }
 
     #[test]

@@ -69,6 +69,10 @@ tokio::task_local! {
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
 
+/// Who is asking, as `current_user` says it: the principal's name, or `pondra` where no one signed in (an open node, the
+/// process's own work), as the Postgres port says it.
+pub fn name() -> String { current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "pondra".into()) }
+
 /// Who the request being served is, as one string: an answer kept for it is read back only by the
 /// same (`pages.rs`). No principal is this process's own work, which keeps and reads its own.
 pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| format!("{}|{:?}|{}", p.name, p.role, p.operator)) }

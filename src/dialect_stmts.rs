@@ -7,8 +7,13 @@
 //!   `EXPLAIN FORMAT=JSON`; MySQL's, Snowflake's and Spark's `SHOW TABLES LIKE … / IN … / FROM …`;
 //! - SQL Server's `CREATE [NON]CLUSTERED INDEX`, `SET NOCOUNT ON` and its kind, `DECLARE @x`,
 //!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting;
-//! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, and
-//!   `ALTER TABLE t CHANGE / MODIFY …`; BigQuery's `DECLARE x TYPE DEFAULT v`.
+//! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, `REPLACE INTO`,
+//!   `ALTER TABLE t CHANGE / MODIFY …`, `ADD COLUMN … AFTER c / FIRST` (a column is added last here), and `DATABASE()`,
+//!   `USER()` and their kind; BigQuery's `DECLARE x TYPE DEFAULT v`;
+//! - SQL Server's `OUTPUT inserted.…` and `OPTION (…)`, and BigQuery's and SQL Server's `FOR SYSTEM_TIME AS OF`, which
+//!   would otherwise run with the clause left out;
+//! - Snowflake's `CREATE STREAM … ON TABLE` and `FLATTEN(INPUT => …)`, and a `CREATE TEMP FUNCTION` or `MACRO`
+//!   (DuckDB's, BigQuery's): a routine here is the lake's, never a session's.
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
 use regex::Regex;
@@ -35,7 +40,9 @@ fn refusal(sql: &str) -> Option<String> {
             r"(?is)\b(?:desc|describe)\s+table\b|\bexplain\s+(?:extended|formatted|codegen|cost|using|format\s*=)|\bshow\s+(?:full\s+)?tables\s+(?:like|in|from)\b",
             r"|\b(?:non)?clustered\b|\bset\s+(?:@|\w+\s+(?:on|off)\b|identity_insert\b|statistics\b)|\bprepare\s+\w+\s+from\b|\bdeclare\s+@|\bdeclare\b[^;]*\bdefault\b",
             r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
-            r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\["))
+            r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\[",
+            r"|\boutput\s+(?:inserted|deleted)\s*\.|\bfor\s+system_time\b|\bflatten\s*\(\s*input\b|\b(?:database|schema|user|current_user|session_user|system_user)\s*\(\s*\)",
+            r"|\breplace\s+into\b|\balter\s+table\b[^;]*\b(?:after|first)\b|\boption\s*\(|\bcreate\s+(?:or\s+replace\s+)?(?:stream|temp(?:orary)?\s+(?:macro|function))\b"))
             .expect("a regex")
     });
     if !LOOK.is_match(sql) {
@@ -72,10 +79,45 @@ fn statement(s: &[Token]) -> Option<String> {
     let w = |i: usize| word(s.get(i));
     let is = |i: usize, x: &str| w(i).as_deref() == Some(x);
     let first = w(0).unwrap_or_default();
-    // (anywhere in it: SQL Server's APPLY and its quoting of names)
+    let mut depth = 0i32; // (how deep in parentheses token `i` is)
+    // (anywhere in it: SQL Server's APPLY, OUTPUT, OPTION and quoting of names; BigQuery's FOR SYSTEM_TIME; Snowflake's
+    // FLATTEN; MySQL's DATABASE() and USER())
     for (i, t) in s.iter().enumerate() {
+        match t {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
         if (is(i, "CROSS") || is(i, "OUTER")) && is(i + 1, "APPLY") {
             return Some(format!("{} APPLY is SQL Server's: write CROSS JOIN LATERAL (SELECT …) AS x for CROSS APPLY, and LEFT JOIN LATERAL (SELECT …) AS x ON true for OUTER APPLY", w(i).unwrap_or_default()));
+        }
+        if is(i, "OUTPUT") && matches!(w(i + 1).as_deref(), Some("INSERTED" | "DELETED")) && s.get(i + 2) == Some(&Token::Period) {
+            return Some(format!("OUTPUT {}.… is SQL Server's: end the statement with RETURNING and its columns (RETURNING * for all of them)", w(i + 1).unwrap_or_default().to_lowercase()));
+        }
+        if is(i, "OPTION") && depth == 0 && s.get(i + 1) == Some(&Token::LParen) && ["SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE"].contains(&first.as_str()) {
+            let hint = w(i + 2).unwrap_or_default();
+            let more = if hint == "MAXRECURSION" { " (WITH RECURSIVE … stops when a pass adds no rows)" } else { "" };
+            return Some(format!("OPTION ({hint} …) is SQL Server's hint to its planner: leave it out{more}"));
+        }
+        if is(i, "FOR") && is(i + 1, "SYSTEM_TIME") {
+            let t = word(s.get(i.wrapping_sub(1))).map_or("t".into(), |_| s[i - 1].to_string());
+            return Some(format!("FOR SYSTEM_TIME AS OF is BigQuery's and SQL Server's: write {t} AT (TIMESTAMP => …), the table as it was then"));
+        }
+        if is(i, "FLATTEN") && s.get(i + 1) == Some(&Token::LParen) && is(i + 2, "INPUT") && s.get(i + 3) == Some(&Token::RArrow) {
+            return Some("FLATTEN(INPUT => …) is Snowflake's: unnest the array in the FROM (… CROSS JOIN unnest(string_to_array(tags, ',')) AS f(tag)), or unnest(json_extract(doc, '$.items')) for a JSON array".into());
+        }
+        // (a call, not a name being made: `CREATE FUNCTION user()`, `x.user()`)
+        let called = s.get(i + 1) == Some(&Token::LParen) && s.get(i + 2) == Some(&Token::RParen) && (i == 0 || s[i - 1] != Token::Period && !matches!(word(s.get(i - 1)).as_deref(), Some("FUNCTION" | "MACRO" | "PROCEDURE")));
+        if called {
+            let ours = match w(i).as_deref() {
+                Some("DATABASE") => Some("current_database()"),
+                Some("SCHEMA") => Some("current_schema()"),
+                Some("USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER") => Some("current_user (no parentheses)"),
+                _ => None,
+            };
+            if let Some(ours) = ours {
+                return Some(format!("{}() is MySQL's: write {ours}", w(i).unwrap_or_default()));
+            }
         }
         if let (Token::LBracket, Some(Token::Word(n)), Some(Token::RBracket)) = (t, s.get(i + 1), s.get(i + 2)) {
             let dotted = s.get(i + 3) == Some(&Token::Period) || (i > 0 && s[i - 1] == Token::Period);
@@ -102,9 +144,22 @@ fn statement(s: &[Token]) -> Option<String> {
             Some(format!("SHOW TABLES {by} … is MySQL's, Snowflake's and Spark's: SHOW TABLES lists them all, and SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'ord%' picks"))
         }
         "CREATE" => {
+            let at = if is(1, "OR") && is(2, "REPLACE") { 3 } else { 1 };
+            if is(at, "STREAM") && matches!(w(name(s, at + 1).1).as_deref(), Some("ON")) {
+                let (t, _) = name(s, name(s, at + 1).1 + 2);
+                return Some(format!("CREATE STREAM … ON TABLE is Snowflake's: here GET /watch/{t}?changes=true follows a table's changes as they commit (db.watch('{t}', changes=True) in Python)"));
+            }
+            if (is(at, "TEMP") || is(at, "TEMPORARY")) && matches!(w(at + 1).as_deref(), Some("FUNCTION" | "MACRO")) {
+                let (kind, (f, _)) = (w(at + 1).unwrap_or_default(), name(s, at + 2));
+                return Some(format!("CREATE TEMP {kind}: a routine here is the lake's, not a session's: write CREATE OR REPLACE {kind} {f}(…) AS …, and DROP {kind} {f} when it's done"));
+            }
             let at = if is(1, "UNIQUE") { 2 } else { 1 };
             let kind = w(at).filter(|k| k == "CLUSTERED" || k == "NONCLUSTERED")?;
             Some(format!("{kind} INDEX is SQL Server's: write CREATE INDEX name ON t (columns); CLUSTER BY orders a table's rows"))
+        }
+        "REPLACE" if is(1, "INTO") => {
+            let t = name(s, 2).0;
+            Some(format!("REPLACE INTO is MySQL's: write INSERT OR REPLACE INTO {t} …, or INSERT INTO {t} … ON CONFLICT (key) DO UPDATE SET …"))
         }
         "SET" => match s.get(1) {
             Some(Token::Word(v)) if v.value.starts_with('@') && !v.value.starts_with("@@") => Some(user_variable(v.value.trim_start_matches('@'))),
@@ -137,6 +192,13 @@ fn statement(s: &[Token]) -> Option<String> {
             match w(after).as_deref() {
                 Some("CHANGE") => Some(format!("ALTER TABLE … CHANGE is MySQL's: write ALTER TABLE {t} RENAME COLUMN a TO b, then ALTER TABLE {t} ALTER COLUMN b TYPE type")),
                 Some("MODIFY") => Some(format!("ALTER TABLE … MODIFY is MySQL's: write ALTER TABLE {t} ALTER COLUMN c TYPE type (SET NOT NULL, SET DEFAULT v)")),
+                Some("ADD") => {
+                    // (past the column's name and its type's first word: `ADD COLUMN after INT` names a column `after`)
+                    let mut i = after + 1 + usize::from(is(after + 1, "COLUMN"));
+                    i += if is(i, "IF") && is(i + 1, "NOT") && is(i + 2, "EXISTS") { 3 } else { 0 };
+                    let placed = (i + 2..s.len()).find(|&j| is(j, "AFTER") && matches!(s.get(j + 1), Some(Token::Word(_))) || is(j, "FIRST") && matches!(s.get(j + 1), None | Some(Token::Comma)))?;
+                    Some(format!("ADD COLUMN … {} is MySQL's: a column is added after the others here (a SELECT, or a view, puts columns in any order)", w(placed).unwrap_or_default()))
+                }
                 _ => None,
             }
         }
@@ -170,6 +232,20 @@ mod tests {
         assert!(said("SELECT c.name, x.id FROM customers AS c CROSS APPLY (SELECT TOP 1 o.id FROM orders AS o) AS x").starts_with("CROSS APPLY is SQL Server's: write CROSS JOIN LATERAL"));
         assert!(said("SELECT [o].[id] FROM [dbo].[orders] AS [o]").starts_with("[o] is SQL Server's quoting of a name: write \"o\""));
         assert!(said("SELECT 1; SET NOCOUNT ON").starts_with("SET NOCOUNT"), "any statement of a script");
+        assert_eq!(said("REPLACE INTO t_case_401 (id, note) VALUES (1, 'refund')"), "REPLACE INTO is MySQL's: write INSERT OR REPLACE INTO t_case_401 …, or INSERT INTO t_case_401 … ON CONFLICT (key) DO UPDATE SET …");
+        assert!(said("ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note").starts_with("ADD COLUMN … AFTER is MySQL's: a column is added after the others here"));
+        assert!(said("ALTER TABLE t ADD c INT FIRST").starts_with("ADD COLUMN … FIRST is MySQL's"));
+        assert!(said("INSERT INTO t (a, b) OUTPUT inserted.id, inserted.b VALUES (3, N'x')").starts_with("OUTPUT inserted.… is SQL Server's: end the statement with RETURNING"));
+        assert!(said("DELETE FROM t OUTPUT deleted.* WHERE a = 1").starts_with("OUTPUT deleted.…"));
+        assert!(said("WITH n AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM n WHERE n < 5) SELECT n FROM n OPTION (MAXRECURSION 10)").ends_with("leave it out (WITH RECURSIVE … stops when a pass adds no rows)"));
+        assert_eq!(said("SELECT 1 AS x OPTION (RECOMPILE)"), "OPTION (RECOMPILE …) is SQL Server's hint to its planner: leave it out");
+        assert_eq!(said("SELECT COUNT(*) FROM orders FOR SYSTEM_TIME AS OF TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)"), "FOR SYSTEM_TIME AS OF is BigQuery's and SQL Server's: write orders AT (TIMESTAMP => …), the table as it was then");
+        assert!(said("SELECT o.id, f.value FROM orders o, LATERAL FLATTEN(INPUT => SPLIT(o.tags, ',')) f").starts_with("FLATTEN(INPUT => …) is Snowflake's: unnest the array"));
+        assert_eq!(said("SELECT VERSION(), DATABASE(), CURRENT_USER()"), "DATABASE() is MySQL's: write current_database()");
+        assert_eq!(said("select user()"), "USER() is MySQL's: write current_user (no parentheses)");
+        assert!(said("CREATE OR REPLACE STREAM orders_stream ON TABLE orders").contains("GET /watch/orders?changes=true"));
+        assert_eq!(said("CREATE TEMP FUNCTION initials(name STRING) AS (SUBSTR(name, 1, 1))"), "CREATE TEMP FUNCTION: a routine here is the lake's, not a session's: write CREATE OR REPLACE FUNCTION initials(…) AS …, and DROP FUNCTION initials when it's done");
+        assert!(said("CREATE OR REPLACE TEMPORARY MACRO m(x) AS x + 1").starts_with("CREATE TEMP MACRO: a routine here is the lake's"));
     }
 
     #[test]
@@ -180,6 +256,9 @@ mod tests {
             "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT x DEFAULT FROM t", "DELETE FROM t USING o WHERE t.id = o.id", "UPDATE t SET a = 1 FROM o WHERE t.id = o.id",
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
+            "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "ALTER TABLE t ADD COLUMN after INT",
+            "ALTER TABLE t ADD COLUMN first INT", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
+            "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
         ] {
             assert_eq!(refusal(sql), None, "{sql}");
         }
