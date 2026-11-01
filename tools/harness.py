@@ -19551,7 +19551,7 @@ def bi():
 # section or tool makes the kind and asserts on it). A kind added to KINDS without a check fails there.
 ELSEWHERE = {"external table": "harness.py external", "type": "harness.py enums", "secret": "harness.py secrets", "user": "harness.py users",
              "database": "this section's branches, environments_check.py", "share": "sharing_check.py", "recipient": "sharing_check.py", "identity provider": "harness.py sso",
-             "extension": "tests/forms/extensions.slt, extension.rs's tests (an installed one runs from E2b's harness.py extensions)"}
+             "extension": "harness.py extensions"}
 
 
 def registry():
