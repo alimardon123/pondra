@@ -103,7 +103,7 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `(expr).field` | a field of a struct: `({'a': 1}).a` |
 | `SELECT … FOR UPDATE` | accepted, and no row is locked: a transaction still commits whole ([transactions](#transactions)) |
 | `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
-| `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable or `(an expression)` |
+| `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable, `(an expression)` or a call (`now()`) |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `FROM a ASOF [LEFT] JOIN b ON a.k = b.k AND a.ts >= b.ts` | DuckDB's spelling: only rows with a match, or all of `a`'s with `LEFT` |
 | `PIVOT t ON col [IN (…)] USING agg(x) [GROUP BY …]`, `… FROM t PIVOT (agg(x) FOR col IN (…))` | a column per value of `col`; without `IN`, the values are found when it runs |
@@ -126,8 +126,9 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `CURDATE()`, `UNIX_TIMESTAMP([ts])`, `STR_TO_DATE(s, '%d.%m.%Y %H:%i')` | MySQL's `current_date`, whole seconds since 1970, and a `DATE` (a `TIMESTAMP` when its format reads a time). `FROM_UNIXTIME(n)` is Pondra's own. `TIMESTAMPDIFF` is refused by name (`42883`): MySQL counts whole units and Snowflake part boundaries, so `date_diff` says which |
 | `DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s')`, `date_format(ts, 'yyyy-MM-dd HH:mm')` | MySQL's codes after a `%` (`%i` minutes, `%s` seconds, `%M` a month's name) and, with no `%`, Spark's letters (`mm` minutes, `MM` a month, `SSS` milliseconds): the text `strftime` writes. A code with no equivalent (`%D`, `%V`, `%X`, or a letter such as `G`) is refused (`22023`) |
 | `COUNTIF(c)`, `SAFE_DIVIDE(a, b)`, `DATE(ts)`, `DATE(y, m, d)`, `DATE_TRUNC(d, MONTH)`, `TIMESTAMP_TRUNC(ts, HOUR)`, `TIMESTAMP_DIFF(a, b, HOUR)`, `FORMAT_DATE(f, d)`, `PARSE_DATE(f, s)`, `UNIX_SECONDS(ts)`, `TIMESTAMP_SECONDS(n)` | BigQuery's: the rows where `c` is true, `a / b` (NULL when `b` is 0), a `DATE`, its `DATE_TRUNC` and `TIMESTAMP_TRUNC` (the part a word after the value; `date_trunc('month', d)` is Pondra's own), the whole parts from `b` to `a` (a day or shorter), `to_char`, `to_date`, whole seconds since 1970 and back |
-| `PARSE_JSON(s)`, `TRY_TO_NUMBER(s)`, `TRY_TO_DATE(s)`, `REGEXP_CONTAINS(s, re)`, `PERCENTILE_APPROX(x, p)`, `MONTHS_BETWEEN(a, b)`, `JSON_UNQUOTE(j)` and the other names of their kind, `SAFE.f(…)`, `FORMAT(v, 'yyyy')`, `payload:page::STRING` | refused by name, with what to write instead: `payload->>'a'`, `TRY_CAST(s AS DECIMAL(38, 0))`, `TRY_CAST(s AS DATE)`, `regexp_like(s, re)`, `approx_percentile_cont(x, p)`, `date_diff('month', a, b)` (whole months; Spark's is fractional), `payload->>'$.a'`, `TRY_CAST` and `SAFE_DIVIDE` for `SAFE.`, `strftime(ts, '%Y-%m-%d')` for `FORMAT`. A name is `42883`; `SAFE.`, `FORMAT` and a path are `0A000` |
+| `PARSE_JSON(s)`, `TRY_TO_NUMBER(s)`, `TRY_TO_DATE(s)`, `REGEXP_CONTAINS(s, re)`, `TIMESTAMP_SUB(ts, INTERVAL 1 HOUR)`, `PERCENTILE_APPROX(x, p)`, `MONTHS_BETWEEN(a, b)`, `JSON_UNQUOTE(j)` and the other names of their kind, `SAFE.f(…)`, `FORMAT(v, 'yyyy')`, `payload:page::STRING` | refused by name, with what to write instead: `payload->>'a'`, `TRY_CAST(s AS DECIMAL(38, 0))`, `TRY_CAST(s AS DATE)`, `regexp_like(s, re)`, `approx_percentile_cont(x, p)`, `date_diff('month', a, b)` (whole months; Spark's is fractional), `payload->>'$.a'`, `TRY_CAST` and `SAFE_DIVIDE` for `SAFE.`, `strftime(ts, '%Y-%m-%d')` for `FORMAT`. A name is `42883`; `SAFE.`, `FORMAT` and a path are `0A000` |
 | `SELECT @@VERSION` | SQL Server's `version()`; another `@@name` is refused (`0A000`) with `SHOW name` |
+| `N'gift'` | Postgres's (and the standard's) national character string: the string `'gift'` |
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
@@ -608,7 +609,11 @@ one script's (statements sent together over HTTP).
   name and `public` when there is no session. In a view they are worked out as it is read, as Postgres
   does: a view saying `current_schema()` answers each reader's schema, a macro's or a SQL function's
   each caller's, and a change sent from a follower reads them as its session does. A materialized
-  view's are those of the session that made it, since its rows are made then.
+  view's are those of the session that made it, since its rows are made then. `current_user` (and
+  `session_user`, `current_role`) is who is asking, at every door the same way: the Postgres port's
+  user, a request's user or token, so a view `WHERE owner = current_user` answers each reader their
+  own rows. A bare `user` stays a column's name, as in DuckDB. Each, written as a column on its own,
+  is named as Postgres names it (`SELECT current_user` is a column `current_user`).
 - A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
   console tab, the Python or JavaScript client's connection, or one script's statements.
 
@@ -1181,6 +1186,9 @@ text is the node's own, it is shown in code:
 | `DESCRIBE TABLE t`, `EXPLAIN EXTENDED …`, `EXPLAIN USING TEXT …`, `EXPLAIN FORMAT=JSON …`, `SHOW TABLES LIKE …` | Snowflake's, Spark's and MySQL's, refused (`0A000`) naming Pondra's: `DESCRIBE t`, `EXPLAIN VERBOSE` (or `EXPLAIN ANALYZE`), `EXPLAIN FORMAT pgjson`, and `information_schema.tables` to pick tables by name |
 | `CROSS APPLY (…)`, `OUTER APPLY (…)`, `[dbo].[orders]`, `SET NOCOUNT ON`, `DECLARE @x INT`, `CREATE NONCLUSTERED INDEX` | SQL Server's, refused (`0A000`) naming Pondra's: `CROSS JOIN LATERAL (…) AS x`, `LEFT JOIN LATERAL (…) AS x ON true`, `"dbo"."orders"`, nothing to set, `DECLARE $x = value`, `CREATE INDEX` |
 | `SET @x = 50`, `PREPARE p FROM '…'`, `UPDATE t JOIN u … SET …`, `DELETE t FROM t JOIN u …`, `ALTER TABLE t CHANGE …`, `DECLARE x INT64 DEFAULT 5` | MySQL's and BigQuery's, refused (`0A000`) naming Pondra's: `$x = 50` (a variable), `PREPARE p AS …` with `$1`, `UPDATE t SET … FROM u WHERE …`, `DELETE FROM t USING u WHERE …`, `RENAME COLUMN` then `ALTER COLUMN … TYPE` |
+| `REPLACE INTO t …`, `ALTER TABLE t ADD COLUMN c INT AFTER b` (or `FIRST`), `DATABASE()`, `USER()` | MySQL's, refused (`0A000`) naming Pondra's: `INSERT OR REPLACE INTO t …` (or `ON CONFLICT … DO UPDATE`), a column added after the others (a `SELECT` or a view orders columns), `current_database()`, `current_user` |
+| `INSERT … OUTPUT inserted.id …`, `… OPTION (MAXRECURSION 10)` | SQL Server's, refused (`0A000`) rather than run without the clause: `RETURNING id`, and nothing (`WITH RECURSIVE` stops when a pass adds no rows) |
+| `CREATE STREAM s ON TABLE t`, `LATERAL FLATTEN(INPUT => …)`, `CREATE TEMP FUNCTION f(…)` (or `TEMP MACRO`) | Snowflake's, BigQuery's and DuckDB's, refused (`0A000`) naming Pondra's: `GET /watch/t?changes=true` follows a table's changes, `unnest(…)` in the `FROM`, and a routine of the lake's (`CREATE OR REPLACE FUNCTION`, then `DROP FUNCTION`) |
 | `UPSERT INTO t …` | CockroachDB's, refused (`0A000`) naming Pondra's two upserts: `INSERT OR REPLACE INTO t …`, or `INSERT INTO t … ON CONFLICT (key) DO UPDATE SET …` |
 | `CREATE EXTENSION name` | refused (`0A000`), naming Pondra's way: `CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm` (for `uuid-ossp` and `pgcrypto`, the functions built in) |
 | `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |

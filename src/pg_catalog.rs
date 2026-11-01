@@ -69,7 +69,7 @@ pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatc
 /// `answer` for a request over HTTP that speaks Postgres (`asked`): its SQL rewritten as the port rewrites
 /// it, its principal as `current_user`, the session's schema as `current_schema()`.
 pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
-    let user = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "pondra".into());
+    let user = crate::auth::name();
     let schema = crate::path::current(lake).map_or_else(|| "public".to_string(), |p| p.schema().to_string());
     answer(lake, &rewrite(sql, &user, &schema), &user).await
 }
@@ -77,7 +77,7 @@ pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_role", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
         .iter().any(|w| s.contains(w))
 }
 
@@ -1702,6 +1702,18 @@ impl VisitorMut for Rewriter<'_> {
 
     fn pre_visit_select(&mut self, select: &mut ast::Select) -> ControlFlow<()> {
         for item in select.projection.iter_mut() {
+            // (`SELECT session_user, current_role`: each named by its word, as Postgres names them, once they are the
+            // same literal)
+            if let ast::SelectItem::UnnamedExpr(e) = item {
+                let word = match e {
+                    ast::Expr::Function(f) if matches!(f.args, ast::FunctionArguments::None) => f.name.to_string().to_lowercase(),
+                    ast::Expr::Identifier(i) if i.quote_style.is_none() => i.value.to_lowercase(),
+                    _ => String::new(),
+                };
+                if matches!(word.as_str(), "current_user" | "session_user" | "current_role" | "user") {
+                    *item = ast::SelectItem::ExprWithAlias { expr: e.clone(), alias: ast::Ident::new(word) };
+                }
+            }
             if let ast::SelectItem::ExprWithAlias { expr: ast::Expr::Function(f), alias } = item {
                 if f.name.to_string().to_lowercase().ends_with("_pg_expandarray") {
                     self.expanded.push(alias.value.to_lowercase());
@@ -1882,6 +1894,8 @@ impl VisitorMut for Rewriter<'_> {
                     _ => None,
                 }
             }
+            // (`current_role`, which sqlparser reads as a name, not a call: who signed in, as `current_user` is)
+            ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("current_role") => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.user.to_string()).into())),
             ast::Expr::Function(f) if f.name.to_string().to_lowercase().ends_with("_pg_expandarray") => match &f.args {
                 ast::FunctionArguments::List(l) => l.args.first().and_then(|a| expr(&format!("unnest({a})"))),
                 _ => None,
@@ -1958,7 +1972,8 @@ mod tests {
     #[test]
     fn postgres_from_said_datafusion_way() {
         let r = |s: &str| rewrite(s, "ann", "public");
-        assert_eq!(r("SELECT user, current_user"), "SELECT 'ann', 'ann'");
+        assert_eq!(r("SELECT user, current_user"), "SELECT 'ann' AS user, 'ann' AS current_user");
+        assert_eq!(r("SELECT session_user, current_role AS r"), "SELECT 'ann' AS session_user, 'ann' AS r");
         // a table made or written under a catalog table's name is the current schema's, as in Postgres
         assert_eq!(r("CREATE TABLE pg_stat_user_tables (relid BIGINT)"), "CREATE TABLE pg_stat_user_tables (relid BIGINT)");
         let i = r("INSERT INTO pg_stat_user_tables SELECT oid FROM pg_class");

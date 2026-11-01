@@ -31,6 +31,8 @@ pub(crate) const OURS: &[(&str, &str, &str)] = &[
     ("try_to_date", "Snowflake", "TRY_CAST(s AS DATE)"),
     ("try_to_timestamp", "Snowflake", "TRY_CAST(s AS TIMESTAMP)"),
     ("regexp_contains", "BigQuery", "regexp_like(s, re)"),
+    ("timestamp_sub", "BigQuery", "ts - INTERVAL 1 HOUR"),
+    ("timestamp_add", "BigQuery", "ts + INTERVAL 1 HOUR"),
     ("percentile_approx", "Spark", "approx_percentile_cont(x, p)"),
     ("months_between", "Spark", "date_diff('month', a, b) (whole month boundaries; Spark's is fractional)"),
 ];
