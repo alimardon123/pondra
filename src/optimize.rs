@@ -38,14 +38,19 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
         datafusion.optimizer.hash_join_single_partition_threshold=33554432,\
         datafusion.optimizer.hash_join_single_partition_threshold_rows=1048576,\
         datafusion.execution.perfect_hash_join_small_build_threshold=262144,\
-        datafusion.execution.skip_physical_aggregate_schema_check=true";
+        datafusion.execution.skip_physical_aggregate_schema_check=true,\
+        datafusion.execution.spill_compression=lz4_frame";
     // (the perfect hash join's: a join on one integer key whose build side's keys span under 262,144
     // values looks them up in an array of that span, at most 1 MB, however few they are; DataFusion's
     // 1,024 kept TPC-H q17's 204 parts, spread over 200,000 keys, in a hash table, and its 6 M probes
     // took 2.4 times as long)
-    // (the last: DataFusion 55 works out a CASE's nullability two ways, and the planner's one is
+    // (skip_physical_aggregate_schema_check: DataFusion 55 works out a CASE's nullability two ways, and the planner's one is
     // the more careful, so `SELECT DISTINCT CASE WHEN a < 1 AND b = 5 THEN b ELSE 5 END` failed its
     // check that they agree; the rows are the same either way)
+    // (spill written as LZ4 frames: under a 2 GB cap the twelve B50 queries that spill spilled 1.8 to 6 times less and
+    // none ran slower (join building 60 M rows 15.1 s to 10.9 s, the median 25.8 s to 22.4 s), and the full sort of 60 M
+    // rows by a string reached its merge instead of its 8 GB spill limit; zstd spilled less again but sorted 43% slower.
+    // `datafusion.execution.spill_compression=uncompressed` in PONDRA_SQL_OPTIONS turns it off)
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
