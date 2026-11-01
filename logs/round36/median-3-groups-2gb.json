@@ -44,8 +44,31 @@
   }
  },
  "after": {
-  "build": "main 82bb987 with held::HeldValues (the aggregate runs with no disk to spill to: its memory counts as memory that can't spill) and median::ChunkedMedian (values in chunks of 64 K, the middle picked between sampled bounds)",
-  "hot columns on (default), twice": {
+  "build": "main 8c517d2 (with #396) and this change: held::HeldValues (the aggregate runs with no disk to spill to: its memory counts as memory that can't spill) and median::ChunkedMedian (values in chunks of 64 K, the middle picked between sampled bounds)",
+  "hot columns on (default)": {
+   "seconds": [
+    1.04,
+    0.78,
+    1.04,
+    1.21,
+    1.14,
+    1.2
+   ],
+   "peak_mb": 1779,
+   "first tries stopped by the watch": 0
+  },
+  "hot columns off": {
+   "seconds": [
+    0.86,
+    0.75,
+    0.78,
+    0.77,
+    0.83,
+    0.79
+   ],
+   "peak_mb": 1016
+  },
+  "on main 82bb987 (before #396), hot columns on, twice": {
    "seconds": [
     [
      0.91,
@@ -70,7 +93,7 @@
    ],
    "first tries stopped by the watch": 0
   },
-  "hot columns off": {
+  "on main 82bb987 (before #396), hot columns off": {
    "seconds": [
     1.37,
     0.77,
