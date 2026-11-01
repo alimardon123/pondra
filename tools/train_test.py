@@ -252,6 +252,7 @@ class Scenario:
         log by its name (job ids are the run's id and the job's place). `created` is when it began (by default now)."""
         failed = (("tests",) if conclusion == "failure" else ()) if failed is None else failed
         self.gh.runs.insert(0, {"id": run_id, "event": event, "head_branch": branch, "head_sha": sha,
+                                "head_repository": {"full_name": REPO},
                                 "status": status, "conclusion": conclusion, "run_attempt": attempt,
                                 "html_url": run_url(run_id),
                                 "created_at": created or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})

@@ -15,7 +15,8 @@ artifact() { gh api "repos/$repo/actions/runs/$1/artifacts" --jq ".artifacts[] |
 gone=0
 for _ in $(seq ${WAIT_MINUTES:-75}); do
   # (the newest run that builds: one stopped by a newer push, or skipped for a label, has nothing; and how many were stopped)
-  read -r run status stopped < <(gh run list --repo "$repo" --workflow build.yml --commit "$sha" --limit 10 --json databaseId,status,conclusion --jq '([.[] | select(.conclusion != "cancelled" and .conclusion != "skipped")][0]) as $r | "\($r.databaseId) \($r.status) \([.[] | select(.conclusion == "cancelled")] | length)"' 2>/dev/null || true) || true
+  # (security pass 3: a fork's run never supplies what ships, so only runs whose head repository is this one)
+  read -r run status stopped < <(gh api "repos/$repo/actions/workflows/build.yml/runs?head_sha=$sha&per_page=10" --jq "[.workflow_runs[] | select(.head_repository.full_name == \"$repo\")] | ([.[] | select(.conclusion != \"cancelled\" and .conclusion != \"skipped\")][0]) as \$r | \"\(\$r.id) \(\$r.status) \([.[] | select(.conclusion == \"cancelled\")] | length)\"" 2>/dev/null || true) || true
   [ -n "${run:-}" ] && [ "$run" != null ] || { run=$(bash "$(dirname "$0")/ci_build.sh" "$sha" "pondra-$platform"); status=completed; }
   id=$([ -n "$run" ] && artifact "$run" || true)
   if [ -z "$id" ] && [ "$status" = completed ]; then # (a push to main that built nothing, reusing a pull request's run: that run's)

@@ -231,7 +231,7 @@ jobs:
             # (If the API can't be asked, it runs: a slot is never worth a stuck pull request.)
             # (the train's run takes a slot too: tools/train.py cuts one only with a slot free, and it never waits)
             going=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/runs?per_page=100" \
-              --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\") | select((.event == \"pull_request\" and (.pull_requests[0].number // 0) != $PR) or (.event == \"workflow_dispatch\" and .head_branch == \"train\"))] | length") || going=0
+              --jq "[.workflow_runs[] | select(.id < $GITHUB_RUN_ID and .status != \"completed\") | select(.head_repository.full_name == \"$GITHUB_REPOSITORY\") | select((.event == \"pull_request\" and (.pull_requests[0].number // 0) != $PR) or (.event == \"workflow_dispatch\" and .head_branch == \"train\"))] | length") || going=0
             if [ "$going" -ge "$SLOTS" ]; then
               echo wait=true >> "$GITHUB_OUTPUT"
               echo "Waiting for a CI slot: $going other pull requests' runs are going ($SLOTS at a time). ci-slots.yml starts this run again when one ends." >> "$GITHUB_STEP_SUMMARY"
@@ -379,16 +379,17 @@ jobs:
         run: python tools/startup_order.py check --bin "$BIN" --lib "$(dirname "$BIN")/libpondra_lib.so" --most-mb 31
       # Signed before it is packaged, so every package holds the signed binary: with the certificates' secrets
       # (ADR-041 §8), a step that says so and does nothing until they are set (signed binaries come after 1.0)
+      # (a pull request's run never gets them: its tools/sign.py is the PR's, so signing in a job of its own is after 1.0)
       - name: Signed (macOS, Windows), when the certificates are set
         if: startsWith(matrix.platform, 'macos') || startsWith(matrix.platform, 'windows')
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ github.event_name != 'pull_request' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_KEY_ID: ${{ github.event_name != 'pull_request' && secrets.APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ github.event_name != 'pull_request' && secrets.APPLE_API_ISSUER || '' }}
+          WINDOWS_CERTIFICATE: ${{ github.event_name != 'pull_request' && secrets.WINDOWS_CERTIFICATE || '' }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ github.event_name != 'pull_request' && secrets.WINDOWS_CERTIFICATE_PASSWORD || '' }}
         run: python tools/sign.py "$BIN"
       # The pip and npm packages and the installers' archive, installed and tried as on a user's
       # machine: packaging that breaks on an OS (npm is npm.cmd on Windows) shows on a push.
