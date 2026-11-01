@@ -1104,7 +1104,7 @@ async fn still_deleting(lake: &Lake, c: &Commit, meta: &TableMeta) -> Result<()>
 async fn up_to_date(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64) -> Result<()> {
     let upto = lake.visible();
     for t in [table.to_string(), crate::sys::deleted(table)] {
-        while !crate::tier::tier_table(lake, &t, upto, nodes, me).await?.1 {}
+        crate::tier::all_to_files(lake, &t, upto, nodes, me).await?;
     }
     crate::tier::purge(lake, table, nodes, me, retain_ms, true).await?;
     crate::delta::publish_all(lake).await

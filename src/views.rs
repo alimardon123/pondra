@@ -1596,18 +1596,47 @@ pub async fn filling(lake: &Lake, table: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The earliest commit up to which a view of `table` not filled yet reads its rows (`Fill::upto`),
+/// and that view, if any. `tier::tier_table` folds a keyed table's log no further meanwhile: its
+/// files hold one row per key, as of the last commit folded in, so a key's rows folded from both
+/// sides of that end read as after it, and the filling lacked the ones before (a rollup of a GROUP
+/// BY view, made while rows streamed in, came out short whenever a tiering round ran between the
+/// commit that set its end and its filling). A filling that keeps failing holds nothing back: the
+/// log would grow until backpressure stopped every writer. Its table is tiered on, and once it
+/// works the filling refuses a source folded past its end (`fill_one`).
+pub async fn fill_end(lake: &Lake, table: &str) -> Result<Option<(String, u64)>> {
+    let mut end: Option<(String, u64)> = None;
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        let Some(upto) = v.fill.as_ref().and_then(|f| f.upto) else { continue }; // (one whose end isn't set: it is set past every commit there is)
+        let name = &key[2..];
+        if v.source == table && end.as_ref().is_none_or(|e| upto < e.1) && failing(lake, name, identity(&v)).is_none() && lake.cat.get::<u64>(&producer_key(&format!("fill:{name}"))).await?.is_none() {
+            end = Some((name.to_string(), upto));
+        }
+    }
+    Ok(end)
+}
+
+/// The test hook `PONDRA_TEST_FILL_PAUSE_MS` (read once): the leader waits this long before it fills the views waiting
+/// for it, outside the lake's lock, so tiering rounds run between the commit that set a filling's end and the filling
+/// (`tools/harness.py fill_while_tiering`).
+static FILL_PAUSE: std::sync::LazyLock<Option<std::time::Duration>> = std::sync::LazyLock::new(|| crate::env::parse::<u64>("PONDRA_TEST_FILL_PAUSE_MS").map(std::time::Duration::from_millis));
+
 /// Leader: fill the views made since, from their sources' rows up to where their filling ends,
 /// once each (producer `fill:{view}`, seq 1). One whose end isn't set yet gets a commit to set it.
 /// Under the lake's lock: a view dropped (and made again) meanwhile would get another's rows.
 pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log::Log, lock: &tokio::sync::Mutex<()>) -> Result<()> {
-    let mut waiting = vec![];
+    let (mut waiting, mut ended) = (vec![], false);
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
         if v.fill.is_some() && lake.cat.get::<u64>(&producer_key(&format!("fill:{}", &key[2..]))).await?.is_none() {
+            ended |= v.fill.as_ref().is_some_and(|f| f.upto.is_some());
             waiting.push(key[2..].to_string());
         }
     }
     if waiting.is_empty() {
         return Ok(());
+    }
+    if let (Some(pause), true) = (*FILL_PAUSE, ended) {
+        tokio::time::sleep(pause).await;
     }
     let _guard = lock.lock().await;
     for name in &waiting {
@@ -1633,6 +1662,13 @@ async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto
     // The source as it was at `upto`: its rows (and changes) from then, none from after.
     // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
     // of that row later takes this one back — `{view}$deleted` names the source's version)
+    // (a keyed source's files fold each key's rows into one, and its read combines a key's rows: one in a file past
+    // `upto` (`DataFile::ord`), which only a filling that kept failing lets happen (`fill_end`), reads as after it
+    // with the key's rows from before. Under the lake's lock, as tiering is: none is folded meanwhile)
+    let src: Option<TableMeta> = lake.cat.get(&table_key(&v.source)).await?;
+    if src.is_some_and(|m| !m.key.is_empty() && m.files.iter().any(|f| f.ord > upto)) {
+        bail!("{} was tiered past where {name}'s filling ends while the filling failed: its rows from before that end are folded with later ones now, so DROP {name} and make it again", v.source);
+    }
     let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
     let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
     let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;

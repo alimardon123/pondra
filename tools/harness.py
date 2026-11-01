@@ -13261,6 +13261,45 @@ def stopped():
 
 
 
+def fill_while_tiering():
+    """Rollups of a GROUP BY view made while rows stream in, with tiering rounds between the commit that sets where
+    each one's filling ends and the filling (PONDRA_TEST_FILL_PAUSE_MS holds the leader 1.5 s before it fills; the
+    node tiers every 0.2 s). The GROUP BY view's files fold each key's partial rows into one; folded past a filling's
+    end, a key's rows from before it read as after it, and the rollup lacked them for good (harness flows' gold_again,
+    now and then on a busy runner). Each rollup == its query over the rows, every row once."""
+    lake = new_lake()
+    n = Node(lake, A.port, tier_secs=0.2, env={"PONDRA_TEST_FILL_PAUSE_MS": "1500"}).start()
+    q = lambda s: sql(A.port, s)
+    q("CREATE TABLE orders (id BIGINT, region VARCHAR, buyer VARCHAR, amount BIGINT)")
+    stop, sent = threading.Event(), [0]
+    def produce():
+        seq, rng = 0, random.Random(7)
+        while not stop.is_set():
+            seq += 1
+            body = "".join(json.dumps({"id": seq * 100 + i, "region": f"r{rng.randrange(4)}", "buyer": f"u{rng.randrange(20)}", "amount": rng.randrange(1, 1000)}) + "\n" for i in range(50)).encode()
+            call(A.port, "POST", f"/append/orders?producer=p&seq={seq}", body, timeout=15)
+            sent[0] += 50
+            time.sleep(0.02)
+    t = threading.Thread(target=produce, daemon=True)
+    t.start()
+    time.sleep(1)
+    q("CREATE MATERIALIZED VIEW gold AS SELECT region, buyer, count(*) AS n, sum(amount) AS total FROM orders GROUP BY region, buyer")
+    time.sleep(1)
+    q("CREATE MATERIALIZED VIEW gold_again AS SELECT region, buyer, sum(n) AS n, sum(total) AS total FROM gold GROUP BY region, buyer")
+    q("CREATE MATERIALIZED VIEW by_region AS SELECT region, sum(n) AS n, sum(total) AS total FROM gold GROUP BY region")
+    time.sleep(1)
+    stop.set()
+    t.join()
+    out = {}
+    for view, keys in (("gold_again", "region, buyer"), ("by_region", "region")):
+        want = q(f"SELECT {keys}, count(*) AS n, sum(amount) AS total FROM orders GROUP BY {keys} ORDER BY {keys}")
+        got = until(lambda: q(f"SELECT {keys}, n, total FROM {view} ORDER BY {keys}"), want, secs=30)
+        out[f"a rollup of a GROUP BY view filled while it is tiered past where the filling ends: {view} == its query over orders"] = got == want
+    out["…every row sent there once"] = q("SELECT count(*) AS n FROM orders")[0]["n"] == sent[0]
+    n.kill()
+    return out
+
+
 def flows():
     """Flows of materialized views (ADR-036 §1–2), as Databricks' DLT has them: silver follows
     orders with expectations (one drops rows, one counts them), gold adds silver up, platinum rolls
@@ -13421,6 +13460,7 @@ def flows():
     checks["…nor its time: now() in a view differs from write to write"] = q("SELECT count(DISTINCT seen) AS t FROM stamped")[0]["t"] > 1
     info = {"sent": sent_all, "refused": (refused or "")[:200], "said": {k: (v or "")[:160] for k, v in say.items()}, "made": made, "expectations": ex}
     a.kill(); b.kill()
+    checks.update(fill_while_tiering())
     ok = all(checks.values())
     print(json.dumps({"flows": checks, "ok": ok, "info": info}, indent=1, default=str))
     if not ok:

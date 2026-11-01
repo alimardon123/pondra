@@ -36,10 +36,18 @@ pub async fn backlog(lake: &Lake, after: u64, upto: Option<u64>) -> Result<BTree
 /// Tier one table's log up to segment `hwm`, at most ~4M rows at a time (bounded memory; the
 /// caller repeats). The leader only decides and commits: the data work (reading the log and
 /// files, writing Parquet) is dealt out to the live `nodes` as jobs, SPMD style. Returns the
-/// rows tiered and whether it's done.
+/// rows tiered and whether it's done. A keyed table's log is folded no further than where a
+/// view still to be filled from it reads its rows (`views::fill_end`).
 pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me: &str) -> Result<(u64, bool)> {
     const MAX_ROWS: u64 = 4_000_000;
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok((0, true)) };
+    if hwm <= meta.tiered {
+        return Ok((0, true));
+    }
+    let hwm = match meta.key.is_empty() {
+        true => hwm, // (an append table's rows keep their own versions in its files: a filling reads those up to its end)
+        false => crate::views::fill_end(lake, table).await?.map_or(hwm, |(_, end)| hwm.min(end)),
+    };
     if hwm <= meta.tiered {
         return Ok((0, true));
     }
@@ -81,6 +89,21 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
     lake.backlog.fetch_sub(n.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     Ok((rows, n < MAX_ROWS))
+}
+
+/// Every row of `table`'s log up to `upto` in its files, as a statement that moves its entry or another engine's
+/// commit needs them (`ddl::still`, `iceberg::up_to_date`). Refused (40001: try again) while a view of a keyed
+/// table is filled from its rows short of `upto` (`views::fill_end`): its log isn't folded that far meanwhile, as
+/// changes of its rows wait for the filling too. (A filling whose end is set after this looks is set past `upto`.)
+pub async fn all_to_files(lake: &Lake, table: &str, upto: u64, nodes: &[String], me: &str) -> Result<()> {
+    let keyed = lake.cat.get::<TableMeta>(&table_key(table)).await?.is_some_and(|m| !m.key.is_empty());
+    if let (true, Some((view, end))) = (keyed, crate::views::fill_end(lake, table).await?) {
+        if end < upto {
+            return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {view} is still being filled from {table}'s rows: try again once it is (in a moment)")));
+        }
+    }
+    while !tier_table(lake, table, upto, nodes, me).await?.1 {}
+    Ok(())
 }
 
 /// Keep a table's file count down, once its new rows are committed (so fresh rows never wait

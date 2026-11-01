@@ -160,6 +160,7 @@ pub const NAMES: &[(&str, Who)] = &[
     ("PONDRA_DROP_BEATS", Test),
     ("PONDRA_NO_DIRECT", Test),
     ("PONDRA_TEST_AUTOCOMMIT_PAUSE_MS", Test),
+    ("PONDRA_TEST_FILL_PAUSE_MS", Test),
     ("PONDRA_TEST_FORMAT", Test),
     ("PONDRA_TEST_NO_GATE", Test),
     ("PONDRA_TEST_PANICS", Test),
