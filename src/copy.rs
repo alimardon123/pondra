@@ -74,12 +74,15 @@ pub async fn copy_to(lake: &Lake, query: &str, to: &str, options: &BTreeMap<Stri
         ensure!(!options.contains_key("partition_by"), "COPY … TO as {format}: PARTITION_BY (a partitioned {format} table): not yet");
         let ctx = crate::query::session(lake, &query, "").await?;
         let (append, overwrite) = (on("append"), on("overwrite"));
+        // (one job for both tries: a first try the memory watch stopped while its commit was in flight may have committed, and
+        // its retry then finds that commit by the job and answers it a duplicate, rather than appending the rows again)
+        let job = uuid::Uuid::new_v4().to_string();
         return crate::query::frugally(&ctx, |ctx| {
-            let (query, format) = (&query, &format);
+            let (query, format, job) = (&query, &format, &job);
             async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 // (a new table's first version is put before its rows, so a try that ran out of memory left an empty table: its retry adds to it)
-                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite).await
+                crate::write_outside::copy_table(lake, &ctx, df, to, format, append || crate::query::retrying(&ctx), overwrite, job).await
             }
         }).await; // (a table, not files: ADR-028)
     }

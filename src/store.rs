@@ -729,13 +729,19 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
     }
 }
 
-/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles and the lakes in
-/// memory take their bytes out of it first (without it, the disk's free room already says what they hold).
+/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles, the lakes in
+/// memory and the other spill disks (a window's sorts have their own: `window_sorts`) take their bytes out of it first
+/// (without it, the disk's free room already says what they hold). (Each was given the whole setting, so a window's sorts
+/// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
     let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
     let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
-    for manager in live_spillers() {
-        if let Some(cap) = room_cap(gb, manager.used_disk_space(), shuffled, disk) {
+    let managers = live_spillers();
+    let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
+    for manager in managers {
+        let used = manager.used_disk_space();
+        let others = gb.map_or(0, |_| all.saturating_sub(used));
+        if let Some(cap) = room_cap(gb, used, shuffled + others, disk) {
             let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
         }
     }

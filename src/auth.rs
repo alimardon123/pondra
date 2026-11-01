@@ -233,10 +233,11 @@ pub fn flush_from_writer(f: &crate::log::Flush, forced: bool) -> Result<()> {
         return Ok(());
     }
     let moves = match forced {
-        true => "a page's flush moves no sequence and no branch's row ids: its node does (nextval, REFRESH)",
-        false => "moving a sequence or a branch's row ids needs an admin",
+        true => "a page's flush moves no sequence and no branch's row ids or commit numbers: its node does (nextval, REFRESH)",
+        false => "moving a sequence or a branch's row ids or commit numbers needs an admin",
     };
-    ensure!(f.sequence.is_none() && f.blocks == 0, "{moves}");
+    // (a reserve past one is a branch's REFRESH skipping the numbers its base took: the leader's own, never a writer's)
+    ensure!(f.sequence.is_none() && f.blocks == 0 && f.reserve <= 1, "{moves}");
     if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
         bail!("{} is written by Pondra alone", p.table);
     }

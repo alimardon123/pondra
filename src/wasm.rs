@@ -110,6 +110,8 @@ impl Limits {
 /// and how many it wrote.
 struct Held {
     max_bytes: usize,
+    /// The bytes of every linear memory the call's part has grown, together.
+    memory: usize,
     full: bool,
     who: String,
     lines: u32,
@@ -158,20 +160,27 @@ thread_local! {
     static SAID: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// A call's limits over every memory and instance its part makes: the memories' bytes summed (a component may have several
+/// linear memories, each of which was allowed the whole limit: audit 11-01 M2), and few instances, memories and tables.
 impl wasmtime::ResourceLimiter for Held {
-    fn memory_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
-        if desired > self.max_bytes {
+    fn memory_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        let total = self.memory.saturating_add(desired.saturating_sub(current));
+        if total > self.max_bytes {
             self.full = true; // (said by `stopped`: the call fails, the node goes on)
             wasmtime::bail!("an extension's memory past {} MB", self.max_bytes >> 20);
         }
+        self.memory = total;
         Ok(true)
     }
     fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> { Ok(desired <= 1 << 20) }
+    fn instances(&self) -> usize { 64 }
+    fn memories(&self) -> usize { 16 }
+    fn tables(&self) -> usize { 64 }
 }
 
 /// A store for one call of `who`'s part: nothing kept from another, its limits set.
 fn store(limits: Limits, who: &str) -> Store<Held> {
-    let mut store = Store::new(engine(), Held { max_bytes: limits.mb << 20, full: false, who: who.to_string(), lines: 0 });
+    let mut store = Store::new(engine(), Held { max_bytes: limits.mb << 20, memory: 0, full: false, who: who.to_string(), lines: 0 });
     store.limiter(|held| held);
     store.set_epoch_deadline(limits.secs * 1000 / TICK.as_millis() as u64);
     store
