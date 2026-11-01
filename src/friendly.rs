@@ -8,7 +8,7 @@
 //!   (`[x * 2 FOR x IN l IF x > 0]`) as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as the
 //!   standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
 //! - In the syntax tree (`rewrite`): `FETCH FIRST`, `ORDER BY ALL`, `({…}).a`, `max_by` and
-//!   `arg_max`, `string_split`, `::json`, `json_extract`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
+//!   `arg_max`, `string_split`, `::json`, `json_extract`, `payload->>'$.a'`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
 //!   DataFusion ignored), `COLUMNS(…)`, `* RENAME`, a select's alias in its WHERE.
 //! - Whole statements: `SUMMARIZE` (`summarize`).
 //! - Where a query is planned (`lambdas`): a higher-order function's `x -> …` as a lambda.
@@ -32,22 +32,27 @@ fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
+    // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
+    // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
+    // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
+    static OURS_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("|"))).expect("a regex"));
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
     // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
-    // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`))
+    // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`), and a JSONPath
+    // after `->` or `->>` (`payload->>'$.a'`, DuckDB's and MySQL's))
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$"#).expect("a regex")
     });
     // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
     static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -1360,7 +1365,22 @@ fn expression(e: &mut Expr) -> Result<()> {
         *e = expr(&text)?;
         return Ok(());
     }
+    if let Some(text) = json_arrow(e)? {
+        *e = expr(&text)?;
+        return Ok(());
+    }
     match e {
+        // (Snowflake's `payload:page::STRING`: DataFusion can't plan it, and Pondra's JSON is text, so it is refused with
+        // the forms that read it: `->>` for a key, json_extract_string for a path. The path is written as it was)
+        Expr::JsonAccess { value, path } => {
+            let steps: String = path.path.iter().map(json_step).collect();
+            let first = match path.path.first() {
+                Some(JsonPathElem::Dot { key, .. }) => key.clone(),
+                Some(elem) => format!("${}", json_step(elem)),
+                None => String::new(),
+            };
+            return Err(crate::codes::coded("0A000", format!("{value}{path} is Snowflake's path: Pondra's JSON is text, read with {value}->>'{first}' or json_extract_string({value}, '${steps}')")));
+        }
         // `({'a': 1}).a`, `f(x).a`: a field of a struct that isn't a column, as `…['a']`
         Expr::CompoundFieldAccess { root, access_chain } if !matches!(**root, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
             for a in access_chain.iter_mut() {
@@ -1376,6 +1396,13 @@ fn expression(e: &mut Expr) -> Result<()> {
             return Err(crate::codes::coded("0A000", format!("{name}(…) puts the type first in SQL Server and last in MySQL, so it isn't guessed: write {cast}(x AS type)")));
         }
         Expr::Function(f) => {
+            // (BigQuery's `SAFE.f(…)`, its NULL-on-error prefix, which Pondra doesn't have: a name of two parts, the first `safe`)
+            if let [first, last] = f.name.0.as_slice() {
+                if first.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("safe")) {
+                    let name = last.as_ident().map(|i| i.value.to_uppercase()).unwrap_or_default();
+                    return Err(crate::codes::coded("0A000", format!("SAFE.{name}(…) is BigQuery's NULL-on-error prefix, which Pondra doesn't have: TRY_CAST(x AS type) is NULL where a cast fails, and SAFE_DIVIDE(a, b) where b is 0")));
+                }
+            }
             within_group(f)?;
             group_concat(f);
             if let Some(text) = array_agg_limit(f) {
@@ -1417,7 +1444,9 @@ fn expression(e: &mut Expr) -> Result<()> {
                 ("list", 1) => f.name = ObjectName::from(vec![Ident::new("array_agg")]), // (DuckDB's name for it)
                 ("apply" | "list_apply" | "array_apply", 2) => f.name = ObjectName::from(vec![Ident::new("array_transform")]),
                 ("filter", 2) if matches!(a[1], Expr::BinaryOp { op: BinaryOperator::Arrow, .. }) => f.name = ObjectName::from(vec![Ident::new("array_filter")]),
-                ("json_extract" | "json_extract_string" | "json_extract_path_text" | "json_value", 2) => {
+                ("transform", 2) if matches!(a[1], Expr::BinaryOp { op: BinaryOperator::Arrow, .. }) => f.name = ObjectName::from(vec![Ident::new("array_transform")]), // (Spark's `transform(arr, x -> …)`)
+                // (Spark's get_json_object and BigQuery's json_extract_scalar give a string, as json_as_text does)
+                ("json_extract" | "json_extract_string" | "json_extract_path_text" | "json_value" | "get_json_object" | "json_extract_scalar", 2) => {
                     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = a[1] else { bail!("{n}(json, path): the path is a literal, such as '$.a.b'; json_get(json, key, …) takes expressions") };
                     let keys = json_path(path)?.join(", ");
                     let call = if n == "json_extract" { "json_get_json" } else { "json_as_text" };
@@ -1504,6 +1533,36 @@ fn json_path(path: &str) -> Result<Vec<String>> {
         p = &p[m.get(0).expect("a match").end()..];
     }
     Ok(keys)
+}
+
+/// `payload->>'$.a.b'` (DuckDB's and MySQL's JSONPath after `->>`) as `json_as_text(payload, 'a', 'b')`; after `->` it is
+/// `json_get_json`, which keeps the JSON, and `'$'` alone is the value itself. A key that isn't a path (Postgres's
+/// `->> 'a'`) is None, as it is.
+fn json_arrow(e: &Expr) -> Result<Option<String>> {
+    let Expr::BinaryOp { left, op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow), right } = e else { return Ok(None) };
+    let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = &**right else { return Ok(None) };
+    if !path.starts_with('$') {
+        return Ok(None);
+    }
+    let keys = json_path(path)?.join(", ");
+    let text = match (keys.is_empty(), matches!(op, BinaryOperator::LongArrow)) {
+        (true, false) => left.to_string(),
+        (true, true) => format!("json_as_text({left})"),
+        (false, false) => format!("json_get_json({left}, {keys})"),
+        (false, true) => format!("json_as_text({left}, {keys})"),
+    };
+    Ok(Some(text))
+}
+
+/// One step of a Snowflake path as a JSON path writes it: `.key`, `[n]`, `['key']`.
+fn json_step(elem: &JsonPathElem) -> String {
+    match elem {
+        JsonPathElem::Dot { key, .. } => format!(".{key}"),
+        JsonPathElem::Bracket { key } | JsonPathElem::ColonBracket { key } => match key {
+            Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => format!("[{n}]"),
+            _ => format!("['{}']", key.to_string().trim_matches('\'')),
+        },
+    }
 }
 
 /// A table factor's `TABLESAMPLE` / `SAMPLE`, which DataFusion ignores, as a subquery that samples.
@@ -2201,6 +2260,33 @@ mod tests {
         assert_eq!(json_path("/a/1").unwrap(), ["'a'", "1"]);
         assert_eq!(json_path("$").unwrap(), Vec::<String>::new());
         assert!(json_path("$.a[*]").is_err());
+    }
+
+    #[test]
+    fn json_arrows_read_jsonpaths_and_other_databases_names_are_refused() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        // (DuckDB's and MySQL's JSONPath after the arrows; Postgres's key after `->>` is as it was)
+        assert_eq!(call("j->>'$.a.b'").unwrap(), "json_as_text(j, 'a', 'b')");
+        assert_eq!(call("j->'$[0].x'").unwrap(), "json_get_json(j, 0, 'x')");
+        assert_eq!(call("j->>'$'").unwrap(), "json_as_text(j)");
+        assert_eq!(call("j->'$'").unwrap(), "j");
+        assert_eq!(call("j->>'page'").unwrap(), "j ->> 'page'");
+        // (Spark's get_json_object and Spark's transform; a transform whose second argument isn't a lambda is as it was)
+        assert_eq!(call("get_json_object(j, '$.a')").unwrap(), "json_as_text(j, 'a')");
+        assert_eq!(call("transform(l, x -> x + 1)").unwrap(), "array_transform(l, x -> x + 1)");
+        assert_eq!(call("transform(l, 1)").unwrap(), "transform(l, 1)");
+        // (Snowflake's path, and BigQuery's SAFE. prefix, refused with what to write)
+        let refusal = call("p:a.b").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("p->>'a'") && refusal.to_string().contains("json_extract_string(p, '$.a.b')"), "{refusal:#}");
+        let refusal = call("SAFE.PARSE_DATE('%Y', s)").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("SAFE.PARSE_DATE(…) is BigQuery's"), "{refusal:#}");
+        // (the look: a colon after a word and before a letter is a path, not `x::INT` nor a parameter `:p`)
+        assert!(wanted("SELECT p:a FROM t") && !wanted("SELECT x::INT FROM t") && !wanted("SELECT * FROM t WHERE a = :p"));
+        assert!(wanted("SELECT payload->>'$.a', payload -> '$.a' FROM t") && !wanted("SELECT payload->>'page' FROM t"));
+        assert!(wanted("SELECT SAFE.PARSE_DATE('%Y', s) FROM t") && wanted("SELECT PARSE_JSON(p) FROM t") && wanted("SELECT format(ts, 'yyyy') FROM t"));
     }
 
     #[test]
