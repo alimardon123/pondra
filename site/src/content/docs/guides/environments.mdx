@@ -183,6 +183,8 @@ pondra branch -d orders-by-channel       # its database, and its Git branch once
   makes a clone again from where it came from.
 - **A branch is its maker's.** `GRANT CLONE ON DATABASE prod TO developers` is all a developer needs to
   make one, and only its maker or an admin drops it. Test and the pull requests' databases are CI's.
+  A branch a CLONE grant makes lives beside the database it is made from (no `LOCATION`, which is a
+  superuser's), and its maker renews only the pins it made.
   Each project's CI is in [Continuous integration](/pondra/guides/projects/#continuous-integration).
 - **A branch's tasks wait to be resumed.** A task made in a branch or in test starts suspended, as the
   tasks it was cloned with do, so nothing in a branch reaches the outside on a schedule. `ALTER TASK name

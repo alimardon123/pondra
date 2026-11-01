@@ -221,9 +221,9 @@ pub fn members(lake: Arc<Lake>, members: Arc<dyn Members>) {
     });
 }
 
-/// Where this node keeps its replica files: next to its SSD tier, per lake and per node.
-pub fn dir(lake_url: &str, addr: &str) -> PathBuf {
-    let base = crate::env::get("PONDRA_CACHE_DIR").map(PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+/// Where this node keeps its replica files: next to its SSD tier (`store::cache_base`), per lake and per node.
+pub fn dir(lake_url: &str, addr: &str) -> std::io::Result<PathBuf> {
+    let base = crate::store::cache_base()?;
     let clean = |s: &str| s.trim_start_matches("s3://").replace(['/', ':', '\\'], "_");
-    base.join(format!("{}.replica", clean(lake_url))).join(clean(addr))
+    Ok(base.join(format!("{}.replica", clean(lake_url))).join(clean(addr)))
 }

@@ -89,7 +89,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 Not in the lake, on each node:
 
-- **The SSD tier** (lakes on object storage only): `<temp dir>/pondra-cache/<bucket>_<prefix>/`,
+- **The SSD tier** (lakes on object storage only): `<temp dir>/pondra-cache-<uid>/<bucket>_<prefix>/` (0700),
   or `--cache-dir`. It holds copies of immutable objects under their lake paths, plus the
   catalog's SST cache (`….catalog`). Delete it any time.
 - **Replica files** (`--ack replicated`): `….replica/<node address>/`. They hold the leader's

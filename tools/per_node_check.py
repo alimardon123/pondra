@@ -125,6 +125,7 @@ PROCESS = {
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",
     "store.rs:READER": "a page's reading of its live bytes, the program's (`read_resident_with`): set once a process, as its allocator is (`main.rs:ALLOC`)",
+    "store.rs:SAID": "a warning said once a process: the cache folder under the temp dir is the machine's, so it fails the same for every lake (`cache_base`)",
     "store.rs:SPILLS": "the process's own spill folder, made by the first spill and held until the program ends: `memory::leave` removes it then, or where it can't (Windows, lock open) the next process's sweep does (memory::sweep)",
     "store.rs:SPILLERS": "the spill disk is the machine's: every lake's spills in this process share its room (held weakly, a lake's goes with it)",
     "store.rs:SPILL_FACTORY": "a page's spill factory (`give_spills`, wasm32): plain, not per_node!, since a freed page's member closes in the background, and its reset() would wipe the factory of the page made after it (`take_spills` takes it back when its page ends)",

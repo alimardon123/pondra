@@ -280,7 +280,7 @@ impl Node {
         }
         // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
         tr("lakes attached");
-        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
+        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr)?)?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
         let app = node::start_app(lake.clone(), cluster.clone(), replica.clone(), &start).await?;
         tr("the app");
         // A door whose port is taken stops the start, as HTTP's does: beside a Postgres on 5432, psql would

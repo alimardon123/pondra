@@ -166,6 +166,10 @@ pondra sql --dir till-as-first "SELECT count(*) AS rows FROM t"
 Secrets stay sealed in a backup: restoring them needs the same master key (`PONDRA_SECRET_KEY`), which a
 backup never holds. Keep that key somewhere apart from the bucket.
 
+A restore takes the backup's users, grants and code as it finds them, so whoever can write a backup's place
+can add a user to what is restored from it: keep a backup's bucket or folder as closed as the database's own.
+A backup holds its branches' base files as its own, so one whose catalog names a base elsewhere isn't opened.
+
 <Aside type="caution">
 A backup's files are copied through the node, so a backup in another provider costs that provider's
 egress, and the first run copies the whole database. There is no restore of one table yet: clone the

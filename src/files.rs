@@ -155,12 +155,33 @@ impl AsyncScalarUDFImpl for FileRead {
 
 // ---------------------------------------------------------------- the four `/files` requests (ADR-061's contract)
 
+/// The name the store keeps `path` under (`object_store`'s `Path`: empty segments go, `.` and `..` are escaped). The
+/// checks below decide on it, so `files//.versions/x` is `files/.versions/x`.
+fn stored_name(path: &str) -> String { String::from(object_store::path::Path::from(path)) }
+
+/// Refuses a path a door may not write, restore or remove: a file's versions and each apply's files are kept by
+/// Pondra (`keep`, `apply::keep_files`). Case-blind, as a disk that ignores case keeps `.Versions` as `.versions`.
+fn refuse_kept(path: &str) -> anyhow::Result<()> {
+    let name = stored_name(path).to_ascii_lowercase();
+    match name.starts_with(VERSIONS) || name.starts_with(APPLIES) {
+        true => Err(crate::codes::coded("42501", format!("{path}: a file's versions and each apply's files are kept by Pondra: name the file itself"))),
+        false => Ok(()),
+    }
+}
+
 /// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model, a SQL
 /// file — for `files('…')` to list and `file_read(path)` to read. A path that exists is refused (409),
 /// unless `if_match` names the version `GET` gave: then it is replaced, if nobody replaced it meanwhile
-/// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). Both doors call it.
+/// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). A `.py` is an admin's to save,
+/// and a path Pondra keeps is refused. Both doors call it.
 pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes) -> anyhow::Result<Filed> {
     let (path, bytes) = (under_files(path)?, body.len());
+    refuse_kept(&path)?;
+    // (the HTTP door's gate (`Auth::needed`) asks the same of the raw path; this asks it of the name the store keeps, so the
+    // two can't disagree. No request at all (the node's own work) is let through)
+    if crate::auth::py_name(&stored_name(&path)) && crate::auth::current().is_some_and(|p| p.role < crate::auth::Role::Admin) {
+        return Err(crate::codes::coded("42501", format!("{path}: code a node runs is saved by an admin")));
+    }
     let expect = if_match.map(|v| v.trim_matches('"').to_string());
     let done = match &expect {
         Some(v) => lake.replace(&path, body.to_vec(), v).await,
@@ -212,6 +233,7 @@ pub async fn get(lake: &Lake, path: &str, q: &std::collections::HashMap<String, 
 /// `restore` it is refused by name. Both doors call it.
 pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
     let path = under_files(path)?;
+    refuse_kept(&path)?;
     let id = q.get("restore").ok_or_else(|| anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)"))?;
     let bytes = version(lake, &path, id).await?;
     let now = match lake.version(&path).await {
@@ -229,6 +251,7 @@ pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<Stri
 /// 404. Both doors call it.
 pub async fn remove(lake: &Lake, path: &str) -> anyhow::Result<Filed> {
     let path = under_files(path)?;
+    refuse_kept(&path)?;
     match lake.remove_file(&path).await {
         Ok(()) => Ok(Filed::json(serde_json::json!({"removed": path}))),
         Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
