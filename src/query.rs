@@ -1518,7 +1518,11 @@ pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &Sessi
         Ok(Err(e)) if exhausted(&e) && handed().is_none() => {}
         Ok(r) => return r,
         Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
-        Err(_) => anyhow::bail!(crate::oom::OOM),
+        Err(_) => {
+            // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
+            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
+            anyhow::bail!(crate::oom::OOM)
+        }
     }
     let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
     frugal(&copy);
