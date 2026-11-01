@@ -2207,6 +2207,10 @@ def serverless_guest(port):
     rc_r, _, err_r = run("INSERT INTO t VALUES (15, 'z') RETURNING a", no_direct)
     rc_i, _, err_i = run(f"COPY INTO t FROM '{csv}' (FORMAT csv, HEADER)", no_direct)
     n_refused = node_count(port)
+    rc_v, _, err_v = run("CREATE VIEW tv AS SELECT a FROM t", no_direct)  # (DDL through the inbox: `ddl_listed`, as a node's)
+    rc_vs, out_vs, _ = run("SELECT count(*) AS n FROM tv")
+    checks["e with PONDRA_NO_DIRECT, a CREATE VIEW lands through the inbox, and reads the table's rows"] = \
+        rc_v == 0 and rc_vs == 0 and shown(out_vs, n_refused)
     checks["e with PONDRA_NO_DIRECT, an INSERT and a text of two INSERTs land through the inbox, each of them once"] = \
         rc6 == 0 and n6 == 7 and rc7 == 0 and n7 == 9
     checks["e with PONDRA_NO_DIRECT, a CREATE TABLE and the INSERTs after it in one text land, the table there for them"] = \
