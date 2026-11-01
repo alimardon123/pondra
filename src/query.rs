@@ -1507,20 +1507,26 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 
 /// Run `work` on `ctx`, and once more when it ran out of memory: on a frugal copy of `ctx` (`frugal`), which
 /// shares its catalogs, so the retry reads the tables the first try registered at the same snapshot, and changes
-/// only its own options (`ctx` itself is never changed). An answer half sent is never run again: its client has
-/// the first rows. The paths that run a query for someone go through it: a door's query (`app::App::run_query`),
+/// only its own options (`ctx` itself is never changed). Out of memory is the pool refusing (`exhausted`), or the
+/// node's memory watch stopping the first try (`panics::first_try`: what grows without asking the pool, as a
+/// median's copies of its values do). An answer half sent is never run again: its client has the first rows. The paths that run a query for someone go through it: a door's query (`app::App::run_query`),
 /// `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`) and a node's share of one (`spmd::insert_share`),
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
-    match work(ctx.clone()).await {
-        Err(e) if exhausted(&e) && handed().is_none() => {
-            let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
-            frugal(&copy);
-            work(copy).await
+    match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
+        Ok(Err(e)) if exhausted(&e) && handed().is_none() => {}
+        Ok(r) => return r,
+        Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
+        Err(_) => {
+            // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
+            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
+            anyhow::bail!(crate::oom::OOM)
         }
-        r => r,
     }
+    let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
+    frugal(&copy);
+    work(copy).await
 }
 
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.

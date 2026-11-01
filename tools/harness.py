@@ -4376,6 +4376,34 @@ def scale():
                                    "cheap": [cheap_status, cheap_sqlstate, cheap_body[:120]], "cheap_rows": CHEAP_ROWS}
     checks[f"the memory watch stops the request that grew the node, not an older cheap one beside it (a count(*) over {CHEAP_ROWS} rows started first answers 200 with its count; the array_agg started after it answers 53200)"] = (
         grower[0] == 503 and grower[1] == "53200" and cheap_rows == [{"n": CHEAP_ROWS}])
+    # A median holds its groups' values, and DataFusion's copies of them as it answers aren't in the pool, so a big one
+    # passes the line before the pool refuses it. The watch stops its first try alone (`panics::first_try`), waits for
+    # that memory to go, and the query runs again in a frugal session, from a sort's middle rows (`frugal.rs`, MiddleRows),
+    # under the line. 48 M values in 3 groups (each id 16 times): its first try grows past 1 GB within a second here,
+    # its second stays near 0.6 GB. The node's log says the first try was stopped, and no query is counted as stopped.
+    time.sleep(11)
+    settle()
+    copies = 16
+    median_want16 = {}
+    for g in range(3):
+        ids_g = range(g or 3, 3000001, 3)
+        n = copies * len(ids_g)
+        median_want16[g] = (ids_g[(n // 2 - 1) // copies] + ids_g[(n // 2) // copies]) / 2
+    before_median = metrics_of(port).get("pondra_queries_stopped_for_memory_total")
+    first_tries = lambda: open(node.log).read().count("stopped a query's first try")  # (the array_agg's first tries above are stopped too)
+    tries_before = first_tries()
+    t0 = time.time()
+    values16 = ", ".join(f"({i})" for i in range(1, copies + 1))
+    medians16 = answer(f"SELECT id % 3 AS g, median(id) AS m FROM big CROSS JOIN (VALUES {values16}) v(n) GROUP BY id % 3 ORDER BY g")
+    median16_seconds = time.time() - t0
+    median16_rows = json.loads(medians16[2]) if medians16[0] == 200 else None
+    first_stopped = first_tries() == tries_before + 1
+    memory_line["median_past_the_line"] = {"answer": [medians16[0], medians16[1], medians16[2][:160]], "seconds": round(median16_seconds, 1),
+                                           "first_try_stopped": first_stopped, "want": median_want16}
+    checks[f"a median of 48M values past the memory line answers: its first try stopped alone, then a frugal second try under the line ({round(median16_seconds, 1)} s)"] = (
+        median16_rows is not None and [r["g"] for r in median16_rows] == [0, 1, 2]
+        and all(abs(r["m"] - median_want16[r["g"]]) <= 1e-6 for r in median16_rows)
+        and first_stopped and metrics_of(port).get("pondra_queries_stopped_for_memory_total") == before_median)
     # A sort that needs more than its memory spills to PONDRA_SPILL_DIR, and the spill folder is empty once it answers.
     # Past PONDRA_SPILL_GB the same sort is refused by name (53100), saying to raise that setting and not DataFusion's
     # `datafusion.runtime.*`, and the node answers after. The 10 M strings are made again: the sort check above dropped them.

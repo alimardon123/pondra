@@ -7,7 +7,9 @@
 //! when something asked the pool found 1.8–1.9 GB already resident when it refused, no better than
 //! none. So a watch reads the process's resident memory on a timer, whatever asked for it, and when
 //! it passes the node's line it stops the request that grew it: its future is dropped, so its memory
-//! is let go, and it answers 53200. The node stays up and answers the rest. Which request grew it is
+//! is let go, and it answers 53200. The node stays up and answers the rest. A query in its first try, which a
+//! frugal session can try again (`query::frugally`), has that try stopped alone, and runs again there holding
+//! less (a median from a sort's middle rows, `frugal.rs`); a second stop takes the request. Which request grew it is
 //! read from the allocator (`Meter`): each request is charged what its own polls allocated, less what
 //! they freed, so a long cheap request started early is not stopped for a query that grew the node.
 //! The one watch lets the hot columns (`hot.rs`) go first, past seven tenths of the line, since a column
@@ -99,6 +101,32 @@ pub fn seen() -> usize {
     } else {
         SEEN.load(Relaxed)
     }
+}
+
+/// Waits, at most [`HOLD`], until the watch reads the node back near `noted`, what it held when the request started:
+/// within a tenth of its line (the margin `pick` stops by), and a tenth under the line. After a first try it stopped
+/// (`panics::first_try`), whose partitions' tasks may still be in a poll that holds the try's memory, and whose freed
+/// pages the watch is handing back (`purge`), so the second try doesn't start in that memory and get stopped for it.
+/// (B50's median under 2 GB: started once the node was a tenth under its line, at 1,560 MB, the second try was stopped
+/// at 1,742 MB on a 1,740 MB line, 0.6 s later.) True if it came back.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn come_back(noted: usize) -> bool {
+    let Some(line) = line() else { return true };
+    let near = noted.saturating_add(line / 10).min(line - line / 10);
+    let since = Instant::now();
+    while seen() >= near {
+        if since.elapsed() >= HOLD {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// A page stops no first try (`panics::first_try` runs it as it is there).
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn come_back(_: usize) -> bool {
+    true
 }
 
 /// The resident memory past which the hot columns are given back: seven tenths of the line, so the
@@ -208,9 +236,12 @@ pub fn start() {
                 }
                 if due(last_stop, felt, line, now) {
                     let mb = |bytes: usize| bytes >> 20;
-                    if crate::panics::stop_one(now, line / 10) {
-                        crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
-                        eprintln!("stopped a query: the node held {} MB, its line {} MB (PONDRA_MEMORY_MAX_GB)", mb(felt), mb(line));
+                    if let Some(first) = crate::panics::stop_one(now, line / 10) {
+                        if !first {
+                            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1); // (a query answered 53200: a first try's stop isn't one)
+                        }
+                        let again = if first { "'s first try (it runs again frugally)" } else { "" };
+                        eprintln!("stopped a query{again}: the node held {} MB, its line {} MB (PONDRA_MEMORY_MAX_GB)", mb(felt), mb(line));
                         last_stop = Some(now);
                     } else if !winding && !std::mem::replace(&mut said, true) {
                         // (nothing to stop yet: a request old enough that grew the node is stopped at a later look,
@@ -418,6 +449,9 @@ pub struct Running {
     /// When a stopped request's own future ended while work it spawned was still running: the entry stays,
     /// stopped, until that work has ended too (`panics::stopping`).
     pub left: Option<Instant>,
+    /// How to stop the first try it is in (`panics::first_try`), which a frugal session can try again: the watch
+    /// stops that rather than the request.
+    pub first_try: Option<futures::future::AbortHandle>,
 }
 
 impl Running {
@@ -474,7 +508,7 @@ mod tests {
     }
 
     fn req(since: Instant, noted: usize) -> Running {
-        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None, left: None }
+        Running { since, noted, stop: Some(futures::future::AbortHandle::new_pair().0), stopped: false, used: None, left: None, first_try: None }
     }
 
     // A request that has allocated `used` bytes so far (its meter's counter).
