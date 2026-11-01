@@ -6405,7 +6405,7 @@ $$""")
     status, heard, out = told("CALL leak()")
     time.sleep(1)
     logged = json.dumps(q("SELECT * FROM pondra.runs WHERE routine = 'leak'"))
-    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 500 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
+    checks["a secret read by a procedure never shows: not in its notices, its error or the run log"] = status == 400 and "pw-7f3a9c" not in json.dumps([heard, str(out), logged]) \
         and heard == ["using ***"] and "refused: ***" in str(out) and "***" in logged and "only a procedure's code" in err("SELECT 1") + str(_raises_text(lambda: call(A.port, "GET", "/secrets/smtp", headers={"authorization": "Bearer a-tok"})))
     runs = q("SELECT routine, caller, status, args FROM pondra.runs WHERE routine = 'send_report' ORDER BY started")
     checks["pondra.runs: every call, its caller, arguments and outcome"] = len(runs) == 4 and all(r["status"] == "ok" and r["caller"] == "read" for r in runs) and '"recipients":["pg@example.com"]' in runs[1]["args"]
