@@ -2301,6 +2301,40 @@ def serverless_guest(port):
     checks["i on a lake nobody leads, CREATE MATERIALIZED VIEW answers within 30 s, its view filled with the rows already there"] = \
         rc11 == 0 and times["mv_create_s"] < 30 and rc12 == 0 and shown(out12, 10)
 
+    # j. On a lake nobody leads, CHECKPOINT leads it for the moment and tiers its log (it said only "no node runs this lake")
+    rc13, out13, err13 = run("CHECKPOINT")
+    tiered = re.search(r'"rows_tiered":(\d+)', out13)
+    checks["j on a lake nobody leads, CHECKPOINT leads for the moment, tiers the log, and the rows read the same"] = \
+        rc13 == 0 and '"checkpoint":true' in out13 and tiered is not None and int(tiered.group(1)) > 0 and count() == 12
+
+    # k. 100 one-off writes to a keyed table on a lake no node ever serves: none waits out the catalog's flush (each one-off
+    # writer leaves a level-0 file, and none ran the compactor: from about the 64th, every write took 10 s), and the log past
+    # what is tiered stays within 64 segments (a writer tiers it on the way out once it holds that many)
+    solo = new_lake()
+
+    def solo_run(q):
+        p = subprocess.run([BIN, "sql", "--dir", solo, q], capture_output=True, text=True, timeout=300)
+        return p.returncode, p.stdout
+
+    def catalog(prefix):
+        p = subprocess.run([BIN, "catalog", "--dir", solo, prefix], capture_output=True, text=True, timeout=120)
+        return [line.split(" ", 1) for line in p.stdout.splitlines() if " " in line]
+
+    solo_run("CREATE TABLE k (id BIGINT PRIMARY KEY, v VARCHAR)")
+    slowest, failed = 0.0, 0
+    for i in range(100):
+        t0 = time.time()
+        rc, _ = solo_run(f"INSERT INTO k VALUES ({i % 40}, 'v{i}') ON CONFLICT (id) DO UPDATE SET v = excluded.v")
+        slowest, failed = max(slowest, time.time() - t0), failed + (rc != 0)
+    times["one_off_write_slowest_s"] = round(slowest, 2)
+    meta = dict(catalog("t/k")).get("t/k")
+    last = max((int(k[2:]) for k, _ in catalog("s/")), default=0)
+    behind = last - json.loads(meta)["tiered"] if meta else None
+    times["one_off_log_segments_untiered"] = behind
+    rc14, out14 = solo_run("SELECT count(*) AS n FROM k")
+    checks["k 100 one-off writes on a lake no node serves: none waits on the catalog (each under 5 s), the log stays within 64 segments, the rows all there"] = \
+        failed == 0 and slowest < 5 and behind is not None and behind <= 66 and shown(out14, 40)
+
     # h. `--dir :memory:`: a lake held in the process's memory for its statements, as DuckDB's `:memory:` is: they answer,
     # and nothing is written where it ran
     there = tempfile.mkdtemp(prefix="pondra-memory-")
@@ -27744,7 +27778,7 @@ def memorylake():
 # first, 40 in the second and since). `--shard K/N` deals the sections out by it, so CI runs the suite in parts side
 # by side that end together. A section not listed counts as 5 s. (Dealt by the first run's table, the second's five
 # parts took 271 to 469 s, the last of them the run's last job; by this one, 402 to 421 s.)
-SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 143, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
+SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scale": 120, "waits": 95, "sso": 90, "hot": 88,
         "stopped": 82, "guesses": 45, "doors": 40, "crash": 38, "functions": 37, "backpressure": 35, "served": 33,
         "server": 30, "kafkas": 29, "finals": 28, "kafka": 28, "pace": 25, "found": 24, "tails": 20, "load": 20,
         "objects": 18, "live": 17, "refreshed": 15, "clouds": 15, "answers_big": 14, "users": 14, "workspace": 14,

@@ -384,6 +384,10 @@ impl Node {
             if let Some(seq) = &app.seq {
                 inbox::drain(&app.lake, seq, &app.lock, false).await?;
                 app.lake.cat.wait_durable(app.lake.cat.committed()).await; // (no cap: the answer is printed after this, and a leader's acks are durable already)
+                // (what it wrote is durable: a full catalog level 0 or a long log is tidied on the way out; one that fails is left to the next)
+                if let Err(e) = app.tidy_one_off().await {
+                    eprintln!("the log stays untiered for now: {e:#}");
+                }
             }
             anyhow::Ok(())
         }

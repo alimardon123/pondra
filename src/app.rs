@@ -385,6 +385,12 @@ impl App {
             anyhow::ensure!(r.ok(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
+        // (a one-off writer that leads for this, `pondra sql --dir … CHECKPOINT` on a lake no node serves, compacts the
+        // catalog's level 0 first, so the round's flushes don't wait on it: nobody else runs its compactor)
+        let one_off = crate::node::is_guest();
+        if one_off {
+            self.lake.cat.tidy(8, Duration::from_secs(60), false).await?;
+        }
         let rows = self.tier_all(0).await?;
         let (mut purged, nodes) = (vec![], if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() });
         {
@@ -403,8 +409,33 @@ impl App {
                 crate::delta::publish_all(&self.lake).await?; // (publishing happens under the lock: `iceberg::record`)
             }
         }
-        self.lake.cat.checkpoint().await?;
+        match one_off {
+            true => self.lake.cat.tidy(8, Duration::from_secs(60), true).await?, // (and its old WAL and manifests cleared)
+            false => self.lake.cat.checkpoint().await?,
+        }
         Ok(j!({"checkpoint": true, "rows_tiered": rows, "rewritten": purged}))
+    }
+
+    /// A one-off writer's last steps (`Node::finish`: a guest that led the lake for its statement), what a node's loops
+    /// would do, done here once each is due, since no node may ever run this lake. Under both bounds a write costs what
+    /// it did. The catalog's level 0: each one-off writer's stop leaves a file there, and once `CATALOG_FILES` wait, this
+    /// one compacts them before it lets go (the stop's flush waits on a full level 0, 10 s a write). The log: past what
+    /// is tiered it grows a segment a write, and every later reader replays it; once it holds `LONG_SEGMENTS` segments
+    /// or `LONG_ROWS` rows, this one tiers it, as a node's round does (no Parquet file a write under that).
+    pub async fn tidy_one_off(&self) -> anyhow::Result<u64> {
+        const CATALOG_FILES: usize = 32; // (of the 64 a flush waits at: `kv::slate`)
+        const LONG_SEGMENTS: u64 = 64;
+        const LONG_ROWS: u64 = 100_000;
+        if self.lake.cat.waiting() >= CATALOG_FILES {
+            // (and the write-ahead-log objects the writers before it left, once a minute old, are cleared with it)
+            self.lake.cat.tidy(8, Duration::from_secs(60), true).await?;
+        }
+        let hwm = *self.lake.hwm.borrow();
+        let from = self.lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm);
+        if hwm.saturating_sub(from) < LONG_SEGMENTS && crate::tier::backlog(&self.lake, from, None).await?.values().sum::<u64>() < LONG_ROWS {
+            return Ok(0);
+        }
+        self.tier_all(0).await
     }
 
     /// One table's log up to `hwm`, a chunk at a time.
