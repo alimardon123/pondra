@@ -363,7 +363,7 @@ fn values(rows: &[[String; 4]]) -> String {
 // ---------------------------------------------------------------- writing the folder
 
 /// Keep a save as a version (`files::keep`): one that can't be kept is said, not failed.
-async fn kept(lake: &Lake, path: &str, bytes: &[u8]) {
+async fn kept(lake: &Lake, path: &str, bytes: &bytes::Bytes) {
     if let Err(e) = crate::files::keep(lake, path, bytes).await {
         eprintln!("{path}: saved, but not kept as a version: {e:#}");
     }
@@ -371,6 +371,7 @@ async fn kept(lake: &Lake, path: &str, bytes: &[u8]) {
 
 /// Save a workspace file as `PUT /files` does: over its version when it exists, kept as a version.
 async fn save(lake: &Lake, path: &str, bytes: Vec<u8>) -> Result<()> {
+    let bytes = bytes::Bytes::from(bytes); // (shared by the save and its version, not copied for each)
     match lake.version(path).await {
         Ok(v) => lake.replace(path, bytes.clone(), &v).await.map(drop)?,
         Err(e) if missing(&e) => lake.put(path, bytes.clone()).await?,
@@ -384,7 +385,7 @@ async fn save(lake: &Lake, path: &str, bytes: Vec<u8>) -> Result<()> {
 /// once can't both record. The first record of a folder is made new (`None`).
 async fn save_record(lake: &Lake, folder: &str, record: &Record, read_at: Option<&str>) -> Result<()> {
     let path = format!("{folder}/{RECORD}");
-    let bytes = serde_json::to_vec_pretty(record)?;
+    let bytes = bytes::Bytes::from(serde_json::to_vec_pretty(record)?);
     let written = match read_at {
         Some(v) => lake.replace(&path, bytes.clone(), v).await.map(drop),
         None => lake.put(&path, bytes.clone()).await,

@@ -122,7 +122,11 @@ impl Page {
         let body: Vec<u8> = match body.as_string() {
             Some(text) => text.into_bytes(),
             None if body.is_undefined() || body.is_null() => Vec::new(),
-            None => js_sys::Uint8Array::new(&body).to_vec(),
+            // (a Uint8Array, a Node Buffer too, is copied once, into the module: `new Uint8Array(it)` copied it first)
+            None => match body.dyn_ref::<js_sys::Uint8Array>() {
+                Some(bytes) => bytes.to_vec(),
+                None => js_sys::Uint8Array::new(&body).to_vec(),
+            },
         };
         self.settle().await;
         let answer = self.0.request(&method, &path, &headers, body.into()).await;
