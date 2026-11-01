@@ -54,6 +54,10 @@ pub fn config(mut config: SessionConfig) -> SessionConfig {
     for (k, v) in defaults.split(',').chain(user.split(',')).filter_map(|kv| kv.trim().split_once('=')) {
         config = config.set_str(k, v);
     }
+    // (a page's spill is written uncompressed: arrow-ipc 59 writes a compressed buffer's length as a `usize`, 4 bytes on
+    // wasm32, and reads it back as 8, so a page couldn't read an LZ4 spill it wrote ("Invalid uncompressed length"); 60 fixes it)
+    #[cfg(target_arch = "wasm32")]
+    let config = config.set_str("datafusion.execution.spill_compression", "uncompressed");
     config
 }
 
