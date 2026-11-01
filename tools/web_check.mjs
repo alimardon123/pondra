@@ -556,6 +556,26 @@ async function memoryChecks() {
   if (failed.length === before) report.memory = 'a query past its 0.1 GB line stopped with 53200, and the next one answered';
 }
 
+// A page's query past its query pool (`memory_gb`) with no folder to spill to is refused, not a trap of the module: a full sort of
+// 20 M rows past a 0.1 GB pool (under a 1 GB line, so the pool runs out first) answers 53200 naming the page's setting, and the
+// page answers its next query. In a child process of its own, as `memoryChecks`: `inChild` runs Node in either form, so this runs in
+// Node only (the Chromium run has no check of its own for it).
+async function spillChecks() {
+  const answers = await inChild('spill', '{ memory_max_gb: 1, memory_gb: 0.1 }', `
+    const past = await answer('SELECT value FROM range(20000000) ORDER BY random() OFFSET 19999999'); // (no LIMIT: with one it is a top-k, which holds its rows)
+    const after = await answer('SELECT 1 AS n');
+    return { past, after };
+  `);
+  if (!answers) return;
+  const before = failed.length;
+  judge('spill: a sort past its pool', asJudged(answers.past), { status: 503, sqlstate: '53200', says: 'memory_gb' });
+  if (answers.after.status !== 200 || answers.after.text !== 'n\n1\n') {
+    failed.push('spill: the next query');
+    console.error(`spill: the next query answered ${answers.after.status} ${JSON.stringify(answers.after.text)}`);
+  }
+  if (failed.length === before) report.spill = 'a sort past its 0.1 GB pool with no folder to spill to stopped with 53200 naming memory_gb, and the next query answered';
+}
+
 // A node's answer past the room a page has for it is not read (the node's `big` is a view of 20 M rows, 160 MB as Arrow and
 // more as CSV, past a 0.1 GB line): a query's answer and a copy's rows are each 53200, naming the room, and the next small
 // answer is read. In a child process of its own, as `memoryChecks`.
@@ -1653,6 +1673,7 @@ try {
   } else {
     await keptRefused(target.Page);
     await memoryChecks();
+    await spillChecks();
   }
   if (NODE_BIN) {
     await nodeRun(target);

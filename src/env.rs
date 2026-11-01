@@ -264,6 +264,11 @@ pub fn query_memory(own: impl FnOnce() -> usize) -> usize {
     gib("PONDRA_MEMORY_GB").unwrap_or_else(own)
 }
 
+/// What a refusal tells a user to raise for a query's memory: a page's query pool (`memory_gb`), else a node's (`--memory-gb`).
+pub fn raise_memory() -> &'static str {
+    if cfg!(target_arch = "wasm32") { "raise memory_gb" } else { "give the node more memory (--memory-gb)" }
+}
+
 /// A page's memory line when `PONDRA_MEMORY_MAX_GB` isn't set and its device doesn't say: 3 GiB, a quarter below the 4 GiB a
 /// wasm32 memory ends at. The live bytes are what the program asked for, so that quarter is the room for the allocator's own
 /// footprint and for a last step that grows within one poll.

@@ -619,7 +619,9 @@ fn spill_disk() -> DiskManagerBuilder { spill_disk_merging(spill_fan_in().unwrap
 
 /// `spill_disk`, its merges reading at most `fan_in` spilled runs at once.
 fn spill_disk_merging(fan_in: usize) -> DiskManagerBuilder {
-    if spill_gb() == Some(0.0) {
+    // (a page has no folder to spill to: its OPFS spill comes with a factory the page gives the core (designs/l2-page-spill.md,
+    // S1), and until then a query past its pool is refused (53200) rather than trapping the module in `spill_folder`)
+    if spill_gb() == Some(0.0) || cfg!(target_arch = "wasm32") {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
     // (the lake's own manager holds no file: `Spills` makes the one that does, with this fan-in too, since sorts read it here)

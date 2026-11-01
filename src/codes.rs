@@ -56,12 +56,18 @@ pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
-/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. Spilling is off on a page too (it has no
-/// disk), so the words for it are true of both.
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. A page has no disk to spill to, so its
+/// words name its query pool (`memory_gb`) instead.
 const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
-    ("(DiskManager is disabled)", "(nothing spills to disk: PONDRA_SPILL_GB is 0, or this is a page)"),
+    ("(DiskManager is disabled)", DISABLED),
 ];
+
+/// What a spill that is off says, in the setting a user can change: a page's query pool, `memory_gb`, or a node's `PONDRA_SPILL_GB`.
+#[cfg(target_arch = "wasm32")]
+const DISABLED: &str = "(nothing spills to disk on a page: raise memory_gb, up to memory_max_gb, to hold more in memory)";
+#[cfg(not(target_arch = "wasm32"))]
+const DISABLED: &str = "(nothing spills to disk: PONDRA_SPILL_GB is 0)";
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
 /// with `  line 3: <the line>` for each place in the body, which become `  line 3`. Here for a procedure (and its
