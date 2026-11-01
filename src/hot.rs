@@ -2,8 +2,9 @@
 //! from here when all it needs are here, and skips reading and decoding the Parquet file (TPC-H
 //! runs about 1.5x faster hot). Files never change, so nothing here goes stale.
 //!
-//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: a quarter of the
-//! query memory, an eighth of RAM; 0 turns it off), and only for a file a second scan came back to:
+//! Filled in the background, one file at a time, within `PONDRA_HOT_GB` (default: half of RAM, beside the
+//! query memory's third, as an in-memory engine holds its tables; 0 turns it off). The node's memory watch gives
+//! the columns back past its trim line, before it stops any query (`oom.rs`). Only for a file a second scan came back to:
 //! data read once — a backfill, a consumer reading the log through, a one-off report — passes through
 //! without costing the CPU that decoding it would. A table whose columns are held keeps each file it
 //! writes as written (`put`), so its new files and a merge's are read from memory at once. When full,
@@ -13,8 +14,7 @@
 //! when the last copy of those files goes, with the query's plan, so no query pays for the loads it
 //! starts, and a concurrent scan of the same file starts no second load (`busy`).
 //!
-//! A lake held in memory (`memory://`) is different: its files are in memory already, so its cache
-//! may take the query memory's room, within the memory line (`room_for`), and it loads a file on its
+//! A lake held in memory (`memory://`) is different: its files are in memory already, so it loads a file on its
 //! first read, not its second. Once the first query's loads have started and run, every file it holds
 //! is hot; the first query itself reads Parquet, as before. A quarter of the query memory held the first
 //! files a scan loaded and left the rest in Parquet for good (a 10M-row table of nine files kept five of
@@ -113,13 +113,15 @@ impl Held {
 }
 
 impl Hot {
-    /// The cache of a lake: `memory` for a lake held in memory. Its budget is the query memory (`room_for` takes what
-    /// queries don't reserve, within the memory line), not a quarter of it: see the module's doc.
+    /// The cache of a lake: `memory` for a lake held in memory. Its budget is half of the machine's memory, beside the
+    /// query memory rather than out of it, as an in-memory engine holds its tables (`room_for`); see the module's doc.
+    /// (A page, whose machine's memory isn't read, keeps its query memory's: all of it for a lake held in memory.)
     pub fn new(memory: bool) -> Hot {
         let gb = crate::env::parse::<f64>("PONDRA_HOT_GB");
-        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match memory {
-            true => crate::store::memory_limit(),
-            false => crate::store::memory_limit() / 4, // (a quarter of the query memory: an eighth of RAM)
+        let max = gb.map(|g| (g * (1u64 << 30) as f64) as usize).unwrap_or_else(|| match (crate::store::ram(), memory) {
+            (Some(ram), _) => ram / 2,
+            (None, true) => crate::store::memory_limit(),
+            (None, false) => crate::store::memory_limit() / 4,
         });
         Hot { max, memory, state: Default::default(), slot: tokio::sync::Semaphore::new(1) }
     }
@@ -259,13 +261,20 @@ impl Hot {
         true
     }
 
-    /// The most the cache may hold now: its budget, less what queries hold; and past the node's trim line
-    /// (`oom::trim_line`), no more than the room the node has under it. So the cache loads only while the
-    /// node is under the line, rather than loading what the watch would trim and decoding it again.
+    /// The most the cache may hold now: its budget; and past the node's trim line (`oom::trim_line`), no more
+    /// than the room the node has under it. So the cache loads only while the node is under the line, rather
+    /// than loading what the watch would trim and decoding it again. Its budget is beside the query memory where
+    /// the watch runs, which gives the columns back before it stops a query; where none runs (`pondra sql`, a
+    /// page), nothing would give them back, so they take only what queries don't reserve, as they did everywhere.
     /// Called outside the state's lock (it takes the lock itself).
     pub fn room_for(&self, lake: &Lake) -> usize {
-        let (reserved, limit) = lake.memory();
-        let room = self.max.min(limit.saturating_sub(reserved));
+        let room = match crate::oom::watching() {
+            true => self.max,
+            false => {
+                let (reserved, limit) = lake.memory();
+                self.max.min(limit.saturating_sub(reserved))
+            }
+        };
         match crate::oom::trim_line() {
             Some(trim) => room.min(self.usage().0 + trim.saturating_sub(crate::store::resident().unwrap_or(0))),
             None => room,

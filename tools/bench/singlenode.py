@@ -24,9 +24,9 @@ DECIMAL alike) and 122,880-row row groups. Two ways to run, compared like with l
 - from memory: `duckdb-native` loads the tables into DuckDB first, `clickhouse-native` into
   MergeTree tables (merged; `hits` sorted by ClickBench's own key for ClickHouse, TPC-H's tables
   by their first key column); `pondra` runs every query twice
-  first, so the columns they read are in memory (hot.rs takes a file on its second read; they get
-  `--hot-gb` GB: 3 by default, room for TPC-H SF1's; 6 for ClickBench, whose 10 million rows'
-  columns take 5.4 GB decoded). Neither load is in the times.
+  first, so the columns they read are in memory (hot.rs takes a file on its second read, within the
+  node's own budget, half of RAM: ClickBench's 10 million rows take 7.3 GB decoded, which a third of RAM,
+  the budget before 11-01, didn't hold on a 15 GB machine; `--hot-gb` sets another). Neither load is in the times.
 
 Each query runs `--runs` times: the best time is "hot", the first "first". Answers are checked
 against DuckDB's (row count, and every value; numbers to a relative 1e-6).
@@ -314,8 +314,7 @@ def pondra_up(lake, hot, qs):
     read to be in memory; returns how long that took."""
     import harness, re
     harness.A = argparse.Namespace(s3=False, keep=False)
-    gb = A.hot_gb if A.hot_gb is not None else 6 if A.suite == "clickbench" else 3
-    env = {"PONDRA_HOT_GB": str(gb) if hot else "0"}
+    env = {} if hot and A.hot_gb is None else {"PONDRA_HOT_GB": str(A.hot_gb) if hot else "0"}  # (none: the node's own, half of RAM)
     node = harness.Node(lake, A.port, env=env, **dict(f.split("=", 1) for f in A.flag)).start()
     harness.call(A.port, "POST", "/tier", timeout=3600)  # (merges and sealing done before timing)
     t0 = time.time()
@@ -406,7 +405,7 @@ if __name__ == "__main__":
     ap.add_argument("--clickhouse", default=shutil.which("clickhouse") or os.path.expanduser("~/engines/clickhouse"), help="the clickhouse binary (clickhouse.com/docs/install)")
     ap.add_argument("--port", type=int, default=8150)
     ap.add_argument("--flag", action="append", default=[], help="a pondra serve flag for the node, e.g. memory-gb=4")
-    ap.add_argument("--hot-gb", type=float, help="memory for Pondra's hot columns (PONDRA_HOT_GB; 3, 6 for ClickBench)")
+    ap.add_argument("--hot-gb", type=float, help="memory for Pondra's hot columns (PONDRA_HOT_GB; the node's own by default, half of RAM)")
     ap.add_argument("--out", default="singlenode.json")
     A = ap.parse_args()
     (prepare_hits if A.suite == "clickbench" else prepare)(A.data) if A.what == "prepare" else run()
