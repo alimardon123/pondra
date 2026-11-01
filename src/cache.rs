@@ -157,12 +157,13 @@ pub struct CachedStore {
     disk: Option<(Arc<Disk>, String)>, // the SSD tier, and the lake's prefix in the bucket
     lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
     id: String, // (this store, in the keys of `OUTSIDE`)
-    blocks: Arc<tokio::sync::Semaphore>, // the blocks of files outside the lakes in flight from it at once (`in_blocks`)
+    blocks: Arc<tokio::sync::Semaphore>, // the blocks (and pieces) in flight from it at once (`side_by_side`)
 }
 
-/// A file outside the lakes is read in blocks of this size (`in_blocks`): one connection to a bucket carries some tens
-/// of MB a second, so a few MB of column chunks fetched as one range waited on one connection. (TPC-H's first runs over
-/// Parquet files on R2 took 1.65x DuckDB's, which fetches 2 MB pieces, up to 16 at once.)
+/// A file outside the lakes is read in blocks of this size (`in_blocks`), and a longer range of a lake's file not on this
+/// node's disk yet in pieces of it (`in_pieces`): one connection to a bucket carries some tens of MB a second, so a few MB
+/// of column chunks fetched as one range waited on one connection. (TPC-H's first runs over Parquet files on R2 took 1.65x
+/// DuckDB's, which fetches 2 MB pieces, up to 16 at once.)
 const BLOCK: u64 = 2 << 20;
 /// A range's blocks in flight at once, and a store's.
 const BLOCKS_A_RANGE: usize = 16;
@@ -242,20 +243,7 @@ impl CachedStore {
         if !missing.is_empty() && r.end - r.start < BLOCK / 4 {
             return Ok(None);
         }
-        let fetched: Vec<Entry> = stream::iter(missing.iter().copied())
-            .map(|i| {
-                let mut o = options.clone();
-                o.range = Some(GetRange::Bounded(i * BLOCK..((i + 1) * BLOCK).min(size)));
-                async move {
-                    let _turn = self.blocks.acquire().await.map_err(|e| Error::Generic { store: "files", source: Box::new(e) })?;
-                    let got = bridge.get_opts(location, o).await?;
-                    let (meta, range) = (got.meta.clone(), got.range.clone());
-                    Ok::<_, Error>((got.bytes().await?, meta, range))
-                }
-            })
-            .buffered(BLOCKS_A_RANGE)
-            .try_collect()
-            .await?;
+        let fetched = self.side_by_side(bridge, location, options, missing.iter().copied().map(|i| i * BLOCK..((i + 1) * BLOCK).min(size))).await?;
         for (i, e) in missing.iter().zip(&fetched) {
             if version(&e.1) == listed {
                 keep_outside(key(*i), e.clone());
@@ -282,6 +270,35 @@ impl CachedStore {
             }
         };
         Ok(Some((bytes, meta, r)))
+    }
+
+    /// Range `whole` of a lake's file, fetched as pieces of a `BLOCK` side by side (`side_by_side`) and put together.
+    async fn in_pieces(&self, location: &Path, whole: Range<u64>) -> Result<Entry> {
+        let bridge = crate::bridge::Bridge(self.inner.clone());
+        let pieces = (whole.start..whole.end).step_by(BLOCK as usize).map(|at| at..(at + BLOCK).min(whole.end));
+        let got = self.side_by_side(&bridge, location, &GetOptions::default(), pieces).await?; // (a lake's file never changes)
+        let mut all = bytes::BytesMut::with_capacity((whole.end - whole.start) as usize);
+        got.iter().for_each(|(b, ..)| all.extend_from_slice(b));
+        Ok((all.freeze(), got[0].1.clone(), whole))
+    }
+
+    /// `ranges` of a file, each with `options` (a version to match, if any), fetched side by side: `BLOCKS_A_RANGE` at
+    /// once, and `BLOCKS_A_STORE` from this store; in `ranges`' order.
+    async fn side_by_side(&self, bridge: &crate::bridge::Bridge, location: &Path, options: &GetOptions, ranges: impl Iterator<Item = Range<u64>>) -> Result<Vec<Entry>> {
+        stream::iter(ranges)
+            .map(|r| {
+                let mut o = options.clone();
+                o.range = Some(GetRange::Bounded(r));
+                async move {
+                    let _turn = self.blocks.acquire().await.map_err(|e| Error::Generic { store: "bucket", source: Box::new(e) })?;
+                    let got = bridge.get_opts(location, o).await?;
+                    let (meta, range) = (got.meta.clone(), got.range.clone());
+                    Ok::<_, Error>((got.bytes().await?, meta, range))
+                }
+            })
+            .buffered(BLOCKS_A_RANGE)
+            .try_collect()
+            .await
     }
 
     /// Another lake in this bucket (attached): its files are cached too.
@@ -336,6 +353,11 @@ impl CachedStore {
     }
 
     async fn fetch(&self, location: &Path, range: Option<GetRange>, head: bool) -> Result<Entry> {
+        if let (Some(GetRange::Bounded(r)), false) = (&range, head) {
+            if r.end - r.start > BLOCK {
+                return self.in_pieces(location, r.clone()).await;
+            }
+        }
         let range = range.map(|r| match r {
             GetRange::Bounded(r) => object_store::GetRange::Bounded(r),
             GetRange::Offset(o) => object_store::GetRange::Offset(o),
@@ -440,6 +462,24 @@ impl ObjectStore for CachedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A range of a lake's file longer than a block, not on disk, is fetched in pieces and put together in order; one
+    /// shorter as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_file_s_long_range_is_fetched_in_pieces() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use object_store_df::ObjectStoreExt as _;
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let size = 3 * BLOCK + 777;
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 % 253) as u8).collect();
+        inner.put(&object_store::path::Path::from("lk/data/t/a.parquet"), data.clone().into()).await.unwrap();
+        let store = CachedStore::new(inner, 64 << 20, None, "lk");
+        let path = Path::from("lk/data/t/a.parquet");
+        for r in [5..size - 3, BLOCK - 1..2 * BLOCK + 2, 0..BLOCK + 1, 0..size, 10..20] {
+            assert_eq!(store.get_range(&path, r.clone()).await?, Bytes::copy_from_slice(&data[r.start as usize..r.end as usize]), "{r:?}");
+        }
+        Ok(())
+    }
 
     /// A file outside the lakes is read in blocks: ranges across blocks, within one, at the file's end, and one too small
     /// for a block, each its bytes; and once the file is gone from the bucket, ranges its blocks hold are still read, from
