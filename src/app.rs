@@ -231,7 +231,7 @@ impl App {
             let here = datafusion::common::instant::Instant::now();
             let ctx = session(&self.lake, query, "").await?;
             crate::query::mark("session with its tables");
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
             let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
             let out = crate::query::frugally(&ctx, |ctx| async move {

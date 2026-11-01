@@ -530,7 +530,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    by ours: our catalog never lists another lake's files.
 21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
    or MCP runs with `engine::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
-   DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
+   DDL); writes go through `write.rs`. Local files (`engine::with_files`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
    sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`, or

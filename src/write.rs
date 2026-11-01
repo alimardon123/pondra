@@ -905,7 +905,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         (None, Some(q)) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             let df = crate::engine::sql(&ctx, &sql).await?;
             // (the types the query gives: the analyzer's rules make 1e15 a whole decimal and a float meeting a decimal a float, and the table must hold what the query gives)
             let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
@@ -1143,7 +1143,7 @@ pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, nam
         return shaped(home, t, name, Some(all), how).await;
     }
     let ctx = crate::query::session_at(lake, sql, "", upto).await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await
 }
 
@@ -1655,7 +1655,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if let Stmt::CopyInto(table, from, options) = &stmt {
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
-    let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let open = |ctx: SessionContext| if files { crate::engine::with_files(ctx) } else { ctx };
     // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, on this node.
     if let Stmt::Create(c) = &stmt {
         if let Some(out) = Box::pin(existing(app, c)).await? {
@@ -1817,7 +1817,7 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let slug = crate::dial::page_slug().context("a joined page stages its rows under its user's folder, and its node gave it none")?;
     let stage = stage_job(job);
     let ctx = session(lake, query, "").await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     in_order(&ctx);
     let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
     let width = df.schema().fields().len();
@@ -2291,7 +2291,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     if crate::backup::frozen(target) && !crate::backup::reads_only(stmt) {
         return Err(crate::backup::refused(Some(&target.url))); // (before a file is written into it: ADR-070)
     }
-    let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let open = |ctx: SessionContext| if files { crate::engine::with_files(ctx) } else { ctx };
     match stmt {
         Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), made_by_job(create_spec(c, query, files).await?, job)?))),
         Stmt::Define(_, spec) => return Ok(Some(Request::Table(table.into(), spec.clone()))),
