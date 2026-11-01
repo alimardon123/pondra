@@ -24245,7 +24245,10 @@ def friendly():
     # (11-01 audit L1, M6, M7: each refusal with its SQLSTATE, never XX000)
     coded = {"SELECT TOP 10 PERCENT id FROM t": "0A000", "SELECT id FROM t FETCH FIRST 10 PERCENT ROWS ONLY": "0A000", "SELECT TOP 2 id FROM t LIMIT 3": "42601",
              "SELECT string_agg(g, ',' ORDER BY id) WITHIN GROUP (ORDER BY id) AS s FROM t": "42601", "SELECT DATEDIFF(week, ts, ts) AS w FROM t": "22023",
-             "SELECT strftime(ts, '%F') AS f FROM t": "22023", "UPSERT INTO t VALUES (1)": "0A000"}
+             "SELECT strftime(ts, '%F') AS f FROM t": "22023", "UPSERT INTO t VALUES (1)": "0A000",
+             # (other databases' statements for what Pondra writes otherwise: `dialect_stmts.rs`)
+             "SET NOCOUNT ON": "0A000", "SELECT [o].[id] FROM [dbo].[t] AS [o]": "0A000", "UPDATE t JOIN q ON t.k = q.k SET x = 1": "0A000",
+             "DECLARE @n INT = 5": "0A000", "SELECT t.id FROM t CROSS APPLY (SELECT p FROM q WHERE q.k = t.k) AS x": "0A000", "EXPLAIN EXTENDED SELECT 1": "0A000"}
     got_codes = {}
     for q_, want_ in coded.items():
         c.request("POST", "/sql", q_.encode())
@@ -24256,6 +24259,16 @@ def friendly():
         all(st_ != 200 and hd_ == coded[q_] for q_, (st_, hd_) in got_codes.items())
     if not checks[list(checks)[-1]]:
         failed["coded refusals"] = got_codes
+    # (the Postgres port refuses them in the same words)
+    try:
+        with psycopg.connect(f"host=127.0.0.1 port={A.port + 10} user=u dbname=lake", autocommit=True) as pc:
+            pc.execute("SET NOCOUNT ON")
+        port_refusal = None
+    except psycopg.Error as e:
+        port_refusal = (e.sqlstate, str(e).splitlines()[0][:200])
+    checks["the Postgres port refuses SQL Server's SET NOCOUNT ON by name too, 0A000"] = port_refusal is not None and port_refusal[0] == "0A000" and "SET NOCOUNT is SQL Server's" in port_refusal[1]
+    if not checks[list(checks)[-1]]:
+        failed["port refusal"] = port_refusal
     # SUMMARIZE: the exact columns (approximate ones and the mean's and spread's text aside)
     cn, got = ours("SUMMARIZE t")
     dn, want = theirs("SUMMARIZE t")

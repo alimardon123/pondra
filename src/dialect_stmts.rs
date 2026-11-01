@@ -1,0 +1,187 @@
+//! Other databases' statements for what Pondra writes another way, refused by name (0A000) with what to write, at
+//! every door in the same words (`statement::run`, and the Postgres port's `pg.rs`), before anything else reads them.
+//! Each would otherwise fail with the parser's words, or, for MySQL's `UPDATE … JOIN … SET`, with a column it can't see.
+//!
+//! A statement is matched by its words as tokens, so a string or a comment holding them is not:
+//! - Snowflake's and Spark's `DESCRIBE TABLE t`; Spark's `EXPLAIN EXTENDED`, Snowflake's `EXPLAIN USING TEXT`, MySQL's
+//!   `EXPLAIN FORMAT=JSON`; MySQL's, Snowflake's and Spark's `SHOW TABLES LIKE … / IN … / FROM …`;
+//! - SQL Server's `CREATE [NON]CLUSTERED INDEX`, `SET NOCOUNT ON` and its kind, `DECLARE @x`,
+//!   `CROSS APPLY` and `OUTER APPLY`, and `[name]` quoting;
+//! - MySQL's `SET @x = …`, `PREPARE p FROM '…'`, `DELETE t FROM t JOIN …`, `UPDATE t JOIN … SET …`, and
+//!   `ALTER TABLE t CHANGE / MODIFY …`; BigQuery's `DECLARE x TYPE DEFAULT v`.
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// SQL Server's `SET name ON|OFF` options, which nothing here reads.
+const SQL_SERVER_SETS: &[&str] = &["NOCOUNT", "ANSI_NULLS", "QUOTED_IDENTIFIER", "XACT_ABORT", "ANSI_PADDING", "ANSI_WARNINGS", "ARITHABORT", "CONCAT_NULL_YIELDS_NULL", "NUMERIC_ROUNDABORT", "IDENTITY_INSERT", "STATISTICS", "SHOWPLAN_ALL", "SHOWPLAN_XML", "IMPLICIT_TRANSACTIONS", "FMTONLY"];
+
+/// The words for MySQL's `SET @v = …` (`settings.rs` says them too, for a SET it reads).
+pub(crate) fn user_variable(v: &str) -> String { format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it") }
+
+/// Refused (0A000) with what to write, when a statement of `sql` is one of these.
+pub fn refused(sql: &str) -> anyhow::Result<()> {
+    match refusal(sql) {
+        Some(why) => Err(crate::codes::coded("0A000", why)),
+        None => Ok(()),
+    }
+}
+
+/// The words of the refusal, or None. A text with none of these words is not tokenized.
+fn refusal(sql: &str) -> Option<String> {
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?is)\b(?:desc|describe)\s+table\b|\bexplain\s+(?:extended|formatted|codegen|cost|using|format\s*=)|\bshow\s+(?:full\s+)?tables\s+(?:like|in|from)\b",
+            r"|\b(?:non)?clustered\b|\bset\s+(?:@|\w+\s+(?:on|off)\b|identity_insert\b|statistics\b)|\bprepare\s+\w+\s+from\b|\bdeclare\s+@|\bdeclare\b[^;]*\bdefault\b",
+            r"|\bdelete\s+\w+\s+from\b|\bupdate\b[^;]*\bjoin\b[^;]*\bset\b|\balter\s+table\b[^;]*\b(?:change|modify)\b|\b(?:cross|outer)\s+apply\b",
+            r"|\]\s*\.|\.\s*\[|\[dbo\]|\b(?:from|join|into|update|table)\s+\["))
+            .expect("a regex")
+    });
+    if !LOOK.is_match(sql) {
+        return None;
+    }
+    let tokens = Tokenizer::new(&GenericDialect {}, sql).tokenize().ok()?;
+    let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    tokens.split(|t| *t == Token::SemiColon).find_map(statement)
+}
+
+/// The word `t` is, upper-cased, when it is one and not quoted.
+fn word(t: Option<&Token>) -> Option<String> {
+    match t {
+        Some(Token::Word(w)) if w.quote_style.is_none() => Some(w.value.to_uppercase()),
+        _ => None,
+    }
+}
+
+/// A name as written from `i` (`a.b`), and the place after it.
+fn name(s: &[Token], mut i: usize) -> (String, usize) {
+    let mut parts = Vec::new();
+    while let Some(Token::Word(w)) = s.get(i) {
+        parts.push(w.to_string());
+        i += 1;
+        if s.get(i) != Some(&Token::Period) {
+            break;
+        }
+        i += 1;
+    }
+    (if parts.is_empty() { "t".into() } else { parts.join(".") }, i)
+}
+
+fn statement(s: &[Token]) -> Option<String> {
+    let w = |i: usize| word(s.get(i));
+    let is = |i: usize, x: &str| w(i).as_deref() == Some(x);
+    let first = w(0).unwrap_or_default();
+    // (anywhere in it: SQL Server's APPLY and its quoting of names)
+    for (i, t) in s.iter().enumerate() {
+        if (is(i, "CROSS") || is(i, "OUTER")) && is(i + 1, "APPLY") {
+            return Some(format!("{} APPLY is SQL Server's: write CROSS JOIN LATERAL (SELECT …) AS x for CROSS APPLY, and LEFT JOIN LATERAL (SELECT …) AS x ON true for OUTER APPLY", w(i).unwrap_or_default()));
+        }
+        if let (Token::LBracket, Some(Token::Word(n)), Some(Token::RBracket)) = (t, s.get(i + 1), s.get(i + 2)) {
+            let dotted = s.get(i + 3) == Some(&Token::Period) || (i > 0 && s[i - 1] == Token::Period);
+            let named = i > 0 && matches!(word(s.get(i - 1)).as_deref(), Some("FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE"));
+            if n.quote_style.is_none() && (dotted || named || n.value.eq_ignore_ascii_case("dbo")) {
+                return Some(format!("[{}] is SQL Server's quoting of a name: write \"{}\" (or the name alone)", n.value, n.value));
+            }
+        }
+    }
+    match first.as_str() {
+        "DESC" | "DESCRIBE" if is(1, "TABLE") => Some(format!("DESCRIBE TABLE is Snowflake's and Spark's: write DESCRIBE {}", name(s, 2).0)),
+        "EXPLAIN" => {
+            let how = w(1)?;
+            match how.as_str() {
+                "EXTENDED" | "FORMATTED" | "CODEGEN" | "COST" => Some(format!("EXPLAIN {how} is Spark's: write EXPLAIN VERBOSE query, or EXPLAIN ANALYZE query to run it and see its numbers")),
+                "USING" => Some(format!("EXPLAIN USING {} is Snowflake's: write EXPLAIN query, or EXPLAIN FORMAT pgjson query for JSON", w(2).unwrap_or_default())),
+                "FORMAT" if s.get(2) == Some(&Token::Eq) => Some(format!("EXPLAIN FORMAT={} is MySQL's: write EXPLAIN FORMAT pgjson query for JSON, or EXPLAIN FORMAT tree query", w(3).unwrap_or_default())),
+                _ => None,
+            }
+        }
+        "SHOW" => {
+            let at = if is(1, "FULL") { 2 } else { 1 };
+            let by = w(at + 1).filter(|_| is(at, "TABLES")).filter(|b| ["LIKE", "IN", "FROM"].contains(&b.as_str()))?;
+            Some(format!("SHOW TABLES {by} … is MySQL's, Snowflake's and Spark's: SHOW TABLES lists them all, and SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'ord%' picks"))
+        }
+        "CREATE" => {
+            let at = if is(1, "UNIQUE") { 2 } else { 1 };
+            let kind = w(at).filter(|k| k == "CLUSTERED" || k == "NONCLUSTERED")?;
+            Some(format!("{kind} INDEX is SQL Server's: write CREATE INDEX name ON t (columns); CLUSTER BY orders a table's rows"))
+        }
+        "SET" => match s.get(1) {
+            Some(Token::Word(v)) if v.value.starts_with('@') && !v.value.starts_with("@@") => Some(user_variable(v.value.trim_start_matches('@'))),
+            _ => {
+                let option = w(1).filter(|o| SQL_SERVER_SETS.contains(&o.as_str()))?;
+                (is(2, "ON") || is(2, "OFF") || option == "IDENTITY_INSERT" || option == "STATISTICS")
+                    .then(|| format!("SET {option} is SQL Server's, and nothing here reads it: a setting is SET name = value, and SHOW ALL lists them"))
+            }
+        },
+        "PREPARE" if is(2, "FROM") => Some(format!("PREPARE … FROM is MySQL's: write PREPARE {} AS statement, with $1, $2 … for its ? marks", w(1).map_or("name".into(), |n| n.to_lowercase()))),
+        "DECLARE" => match s.get(1) {
+            Some(Token::Word(v)) if v.value.starts_with('@') => {
+                let x = v.value.trim_start_matches('@');
+                Some(format!("DECLARE {} is SQL Server's: write DECLARE ${x} = value, then ${x}", v.value))
+            }
+            Some(Token::Word(v)) if v.quote_style.is_none() && !v.value.eq_ignore_ascii_case("PARAMETER") && !(2..s.len()).any(|i| matches!(w(i).as_deref(), Some("CURSOR" | "BINARY" | "INSENSITIVE" | "ASENSITIVE" | "SCROLL"))) && (2..s.len()).any(|i| is(i, "DEFAULT")) => {
+                let x = v.value.to_lowercase();
+                Some(format!("DECLARE {} … DEFAULT is BigQuery's: write DECLARE ${x} = value, then ${x}", v.value))
+            }
+            _ => None,
+        },
+        "DELETE" if !is(1, "FROM") && is(2, "FROM") => Some(format!("DELETE {} FROM … JOIN is MySQL's and SQL Server's: write DELETE FROM t USING other WHERE … (the join's condition in the WHERE)", name(s, 1).0)),
+        "UPDATE" => {
+            let set = (1..s.len()).find(|&i| is(i, "SET"))?;
+            (1..set).any(|i| is(i, "JOIN")).then(|| format!("UPDATE … JOIN … SET is MySQL's: write UPDATE {} SET … FROM other WHERE … (the join's condition in the WHERE)", name(s, 1).0))
+        }
+        "ALTER" if is(1, "TABLE") => {
+            let at = if is(2, "IF") && is(3, "EXISTS") { 4 } else { 2 };
+            let (t, after) = name(s, at);
+            match w(after).as_deref() {
+                Some("CHANGE") => Some(format!("ALTER TABLE … CHANGE is MySQL's: write ALTER TABLE {t} RENAME COLUMN a TO b, then ALTER TABLE {t} ALTER COLUMN b TYPE type")),
+                Some("MODIFY") => Some(format!("ALTER TABLE … MODIFY is MySQL's: write ALTER TABLE {t} ALTER COLUMN c TYPE type (SET NOT NULL, SET DEFAULT v)")),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn other_databases_statements_are_refused_with_what_to_write() {
+        let said = |sql: &str| refusal(sql).unwrap_or_else(|| panic!("{sql}: not refused"));
+        assert_eq!(said("DESC TABLE customers"), "DESCRIBE TABLE is Snowflake's and Spark's: write DESCRIBE customers");
+        assert!(said("EXPLAIN EXTENDED SELECT 1").starts_with("EXPLAIN EXTENDED is Spark's: write EXPLAIN VERBOSE query"));
+        assert!(said("EXPLAIN USING TEXT SELECT 1").starts_with("EXPLAIN USING TEXT is Snowflake's"));
+        assert!(said("explain format=json select 1").starts_with("EXPLAIN FORMAT=JSON is MySQL's: write EXPLAIN FORMAT pgjson query"));
+        assert!(said("SHOW TABLES LIKE 'ORD%' IN SCHEMA PUBLIC").contains("information_schema.tables"));
+        assert!(said("SHOW TABLES IN default LIKE 'orders*'").starts_with("SHOW TABLES IN …"));
+        assert!(said("CREATE NONCLUSTERED INDEX ix ON t (a) INCLUDE (b)").starts_with("NONCLUSTERED INDEX is SQL Server's"));
+        assert!(said("SET NOCOUNT ON").starts_with("SET NOCOUNT is SQL Server's"));
+        assert_eq!(said("SET @min_amount := 50"), "SET @min_amount is MySQL's for a variable: here a variable is $min_amount = …, and $min_amount reads it");
+        assert!(said("PREPARE by_status FROM 'SELECT id FROM orders WHERE status = ?'").starts_with("PREPARE … FROM is MySQL's: write PREPARE by_status AS statement"));
+        assert!(said("DECLARE @n INT = 5").starts_with("DECLARE @n is SQL Server's: write DECLARE $n = value"));
+        assert!(said("DECLARE min_amt NUMERIC DEFAULT 50").starts_with("DECLARE min_amt … DEFAULT is BigQuery's: write DECLARE $min_amt = value"));
+        assert!(said("DELETE t FROM t_case_402 t JOIN customers c ON c.id = t.customer_id WHERE c.country IS NULL").starts_with("DELETE t FROM … JOIN is MySQL's"));
+        assert!(said("UPDATE orders o JOIN customers c ON c.id = o.customer_id SET o.tags = 'uk'").starts_with("UPDATE … JOIN … SET is MySQL's: write UPDATE orders SET … FROM other"));
+        assert!(said("ALTER TABLE t_case_401 CHANGE COLUMN flag is_flagged TINYINT(1)").contains("RENAME COLUMN a TO b, then ALTER TABLE t_case_401 ALTER COLUMN b TYPE type"));
+        assert!(said("ALTER TABLE s.t MODIFY note TEXT").contains("ALTER TABLE s.t ALTER COLUMN c TYPE type"));
+        assert!(said("SELECT c.name, x.id FROM customers AS c CROSS APPLY (SELECT TOP 1 o.id FROM orders AS o) AS x").starts_with("CROSS APPLY is SQL Server's: write CROSS JOIN LATERAL"));
+        assert!(said("SELECT [o].[id] FROM [dbo].[orders] AS [o]").starts_with("[o] is SQL Server's quoting of a name: write \"o\""));
+        assert!(said("SELECT 1; SET NOCOUNT ON").starts_with("SET NOCOUNT"), "any statement of a script");
+    }
+
+    #[test]
+    fn pondras_own_statements_are_left_as_they_are() {
+        for sql in [
+            "DESCRIBE customers", "DESC customers", "EXPLAIN VERBOSE SELECT 1", "EXPLAIN FORMAT tree SELECT 1", "SHOW TABLES", "CREATE OR REPLACE VIEW v AS SELECT 1", "CREATE OR ALTER TABLE t (a INT)",
+            "CREATE UNIQUE INDEX i ON t (a)", "SET search_path = s", "SET TIME ZONE 'UTC'", "PREPARE p AS SELECT $1", "DECLARE $x = 5", "DECLARE $n BIGINT DEFAULT 3", "DECLARE PARAMETER $top BIGINT DEFAULT 3", "DECLARE c CURSOR FOR SELECT 1",
+            "DECLARE c NO SCROLL CURSOR WITH HOLD FOR SELECT x DEFAULT FROM t", "DELETE FROM t USING o WHERE t.id = o.id", "UPDATE t SET a = 1 FROM o WHERE t.id = o.id",
+            "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
+            "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
+        ] {
+            assert_eq!(refusal(sql), None, "{sql}");
+        }
+    }
+}

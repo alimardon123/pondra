@@ -55,6 +55,7 @@ pub enum Answer<O> {
 
 /// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
 pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    crate::dialect_stmts::refused(&req.sql)?; // (another database's statement for what Pondra writes otherwise: refused by name, `dialect_stmts.rs`)
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;

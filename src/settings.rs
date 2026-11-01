@@ -246,7 +246,7 @@ fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
     let n = name(variable);
     if let Some(v) = n.strip_prefix('@') {
-        return Err(crate::codes::coded("0A000", format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it")));
+        return Err(crate::codes::coded("0A000", crate::dialect_stmts::user_variable(v)));
     }
     if let Some((code, why)) = one_way(&n, &value) {
         return Err(crate::codes::coded(code, why));
