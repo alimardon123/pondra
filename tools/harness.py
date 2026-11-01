@@ -23986,6 +23986,9 @@ def friendly():
         "MySQL's DATE_FORMAT (%i minutes, %s seconds, %M a month's name) and Spark's date_format (Java's letters: mm minutes, MMM a month)": (
             "SELECT id, DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s %M %W %e') AS m, date_format(ts, 'yyyy-MM-dd HH:mm:ss EEE MMM d h a') AS s FROM t WHERE id < 50 OR id % 97 = 0",
             "SELECT id, strftime(ts, '%Y-%m-%d %H:%M:%S %B %A %-d') AS m, strftime(ts, '%Y-%m-%d %H:%M:%S %a %b %-d %-I %p') AS s FROM t WHERE id < 50 OR id % 97 = 0"),
+        "DuckDB's JSONPath after ->> and -> (j->>'$.a.b', j->'$.s'): a path, not a key named $.a.b": (
+            "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, j->'$.s' AS a, get_json_object(j, '$.a.b') AS g FROM t WHERE id < 50",
+            "SELECT id, j->>'$.a.b' AS b, j->>'$.s' AS s, CAST(j->'$.s' AS VARCHAR) AS a, json_extract_string(j, '$.a.b') AS g FROM t WHERE id < 50"),
         "BigQuery's COUNTIF and SAFE_DIVIDE (NULL by zero)": (
             "SELECT k, COUNTIF(x > 100) AS c, SAFE_DIVIDE(sum(x), sum(k)) AS r FROM t GROUP BY k",
             "SELECT k, count(*) FILTER (WHERE x > 100) AS c, CASE WHEN sum(k) = 0 THEN NULL ELSE sum(x) / sum(k) END AS r FROM t GROUP BY k"),
