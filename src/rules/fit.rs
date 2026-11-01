@@ -26,8 +26,21 @@ pub fn conform(b: &RecordBatch, s: &SchemaRef) -> Result<RecordBatch> {
 pub fn strict(c: &ArrayRef, t: &DataType) -> Result<ArrayRef> {
     Ok(match (c.data_type(), t) {
         (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Timestamp(..)) => crate::casts::into(&with_seconds(c)?, t)?, // ('… 10:00')
+        (DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8, DataType::Binary | DataType::LargeBinary | DataType::BinaryView) => crate::casts::into(&bytea(c)?, t)?,
         _ => crate::casts::into(c, t)?,
     })
+}
+
+/// Text meant as a bytea's, read as Postgres reads it (`pg_bytea::parse`: the hex form `\x00ff` is the two bytes 00 ff, as
+/// `'\x00ff'::bytea` is, and the escape form's `\\` and `\ooo` one byte each), refused as Postgres refuses it (22P02, an odd
+/// hex digit 22023).
+/// Arrow's cast took the text's own bytes: the six of `\x00ff`.
+fn bytea(c: &ArrayRef) -> Result<ArrayRef> {
+    use datafusion::arrow::array::BinaryArray;
+    let text = datafusion::arrow::compute::cast(c, &DataType::Utf8)?;
+    let bytes = text.as_string::<i32>().iter().map(|s| s.map(crate::pg_bytea::parse).transpose()).collect::<Result<Vec<_>, _>>();
+    let bytes = bytes.map_err(|e| crate::codes::coded(e.code, e.message))?;
+    Ok(Arc::new(BinaryArray::from_iter(bytes)) as ArrayRef)
 }
 
 /// Text meant as timestamps, the ones without seconds given them (`seconds`).
@@ -203,6 +216,18 @@ mod tests {
         let (out, padded) = fit_with(&target(), &row(&["a", "_deleted"])).expect("fits");
         assert_eq!(padded, ["b", "c"]);
         assert_eq!((out.column(1).null_count(), out.column(2).null_count(), out.column(3).null_count()), (1, 1, 0));
+    }
+
+    #[test]
+    fn text_into_a_bytea_column_is_read_as_postgres_reads_a_bytea() {
+        use datafusion::arrow::array::StringArray;
+        let text: ArrayRef = Arc::new(StringArray::from(vec![Some("\\x00ff"), Some("a\\\\b"), Some("plain"), None]));
+        let bytes = strict(&text, &DataType::Binary).unwrap();
+        let bytes = bytes.as_binary::<i32>();
+        assert_eq!((bytes.value(0), bytes.value(1), bytes.value(2), bytes.is_null(3)), (&[0x00, 0xff][..], &b"a\\b"[..], &b"plain"[..], true));
+        // (refused as byteain refuses it: an odd hex digit 22023, a backslash before anything else 22P02)
+        let said = |s: &str| crate::codes::of(&strict(&(Arc::new(StringArray::from(vec![s])) as ArrayRef), &DataType::Binary).unwrap_err()).to_string();
+        assert_eq!((said("\\xf"), said("a\\qb")), ("22023".to_string(), "22P02".to_string()));
     }
 
     #[test]
