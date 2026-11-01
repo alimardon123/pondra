@@ -362,6 +362,7 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 /// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
 /// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
 pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
+    urls.iter().try_for_each(|u| off_page(u))?; // (as `check` does: before anything is listed, for the owner too)
     if reads_any_url() {
         return Ok(());
     }
@@ -1847,7 +1848,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pondra-blob-{}", uuid::Uuid::new_v4()));
         let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
         for owner in [true, false] {
-            for sql in ["SELECT * FROM read_csv('blob:https://o/6f1c')", "SELECT * FROM read_csv('blob:nodedata:6f1c')"] {
+            for sql in ["SELECT * FROM read_csv('blob:https://o/6f1c')", "SELECT * FROM read_csv('blob:nodedata:6f1c')", "SELECT * FROM read_csv('BLOB:https://o/6f1c')"] {
                 let err = run(&lake, owner, sql).await.unwrap_err();
                 assert_eq!(crate::codes::of(&err), "0A000", "{sql} as owner {owner}");
                 assert!(crate::codes::words(&err).contains("a blob: URL is a browser tab's own file: only that tab's page reads it"), "{}", crate::codes::words(&err));
@@ -1855,6 +1856,10 @@ mod tests {
         }
         assert!(scope(true, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as the owner");
         assert!(scope(false, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as a client");
+        for owner in [true, false] {
+            let listed = scope(owner, check_urls(&lake, &["blob:https://o/6f1c"])).await.unwrap_err();
+            assert_eq!(crate::codes::of(&listed), "0A000", "check_urls as owner {owner}: {listed}");
+        }
         let scoped = BTreeMap::from([("type".to_string(), "s3".to_string()), ("scope".to_string(), "blob:https://o/".to_string())]);
         assert!(made("s", scoped).is_err(), "a secret's SCOPE is no blob");
         lake.cat.close().await?;

@@ -51,9 +51,14 @@ const FILE_BESIDE_NODE: &str = "a query a page sends its node names the page's t
 const BLOB_ON_PAGE: &str = "a tab's file (a blob: URL) is read by the page alone, so no statement its node runs may name one: load it with INSERT INTO t SELECT … FROM read_csv('blob:…') (with no RETURNING), then read t";
 
 /// Whether a file name (`ext:…`, as `routines::expand` names it) reads only blob URLs: every URL of its spec is one, so the file is a
-/// tab's own (`own_insert`, `part_of`).
+/// tab's own, which the page may stage (`own_insert`).
 fn blob_file(name: &str) -> bool {
     crate::ext_names::spec(name).is_some_and(|s| !s.urls.is_empty() && s.urls.iter().all(|u| crate::ext_names::is_blob(u)))
+}
+
+/// Whether a file name reads any blob URL, beside other URLs or alone: the node may never be sent one (`part_of`, `joined_part`).
+fn names_blob(name: &str) -> bool {
+    crate::ext_names::spec(name).is_some_and(|s| s.urls.iter().any(|u| crate::ext_names::is_blob(u)))
 }
 
 /// The refusal of a statement that names a blob URL where it may not run (`BLOB_ON_PAGE`).
@@ -1015,7 +1020,7 @@ async fn part_of(lake: &crate::store::Lake, sql: &str, format_query: String) -> 
     // (a tab's file is read by the page alone: a statement that names one beside a node's table is refused by name, before the node
     // is asked; with none of the node's, it is the lake's own, the page's tables and views included. A joined page's writes, whose
     // lake is the node's, are refused in `joined_part`)
-    if tables.iter().any(|(h, _)| *h == Home::Node) && tables.iter().any(|(h, n)| *h == Home::File && blob_file(n)) {
+    if tables.iter().any(|(h, _)| *h == Home::Node) && tables.iter().any(|(h, n)| *h == Home::File && names_blob(n)) {
         return Err(blob_refused());
     }
     match fill_of(&state, &statement)?.filter(|(target, _, insert)| !insert || home(&state, target, &held) == Home::Page) {
@@ -1089,7 +1094,7 @@ async fn joined_part(lake: &crate::store::Lake, sql: &str, format_query: String,
         return Ok(Routed::Own);
     }
     if crate::statement::is_write(&expanded) || crate::seq::calls(&expanded) {
-        if crate::ext_names::names(&expanded).iter().any(|n| blob_file(n)) {
+        if crate::ext_names::names(&expanded).iter().any(|n| names_blob(n)) {
             return Err(blob_refused()); // (a write the node runs, or a call of nextval, may not name a tab's file: `BLOB_ON_PAGE`)
         }
         return Ok(Routed::Node(Part::Query { sent: bound, names: BTreeSet::new(), format: format_query }));

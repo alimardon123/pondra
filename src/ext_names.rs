@@ -252,7 +252,7 @@ pub(crate) fn scheme(url: &str) -> Option<&str> {
 
 /// A `blob:` URL: a browser tab's own file (`blob:https://o/uuid` in Chromium, `blob:nodedata:uuid` in Node). Only the
 /// tab that made it reads it: it is never a path, a lake's file, or a secret's (`ext.rs`, `off_page`).
-pub fn is_blob(url: &str) -> bool { url.starts_with("blob:") }
+pub fn is_blob(url: &str) -> bool { url.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("blob:")) } // (a scheme in any case, as URLs read it)
 
 /// The one name DataFusion reads a blob URL by: `blob:///` and the URL in base64url (no padding), which has no `/`, `*`
 /// or `[` for a path or a glob to read. `blob_of` gives the URL back, and `ext::register` reads it through the page's

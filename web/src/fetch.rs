@@ -177,27 +177,36 @@ impl ObjectStore for Blob {
             Some(GetRange::Bounded(r)) => Some(r),
             Some(other) => return Err(generic(format!("{url}: a blob is read in a bounded range, not {other:?}: an offset or a suffix isn't read"))),
         };
-        let opened = sent(open(url.clone(), read.body, wanted.clone())).await.map_err(|_| blob_dropped(&url))??;
-        let (range, size, expected) = match wanted {
-            None => {
+        // (a range from the blob's start is its whole body, cut at the range's end: it asks no `Range`. Only a range past the start
+        // asks for one. Node 22's fetch answers a blob's range a byte short, its last byte never, and its whole body right, so a
+        // row file's read, which starts at 0, reads there too)
+        let asked = wanted.clone().filter(|r| r.start > 0);
+        let opened = sent(open(url.clone(), read.body, asked.clone())).await.map_err(|_| blob_dropped(&url))??;
+        let whole_size = || opened.content_length.as_deref().and_then(|v| v.trim().parse::<u64>().ok()).ok_or_else(|| generic(format!("{url} sent no content-length")));
+        let (range, size, expected) = match (wanted, &asked) {
+            (wanted, None) => {
                 if opened.status != 200 {
                     return Err(generic(format!("{url} answered {} to a read of the whole blob", opened.status)));
                 }
-                let size = opened.content_length.as_deref().and_then(|v| v.trim().parse::<u64>().ok()).ok_or_else(|| generic(format!("{url} sent no content-length")))?;
-                (0..size, size, size)
+                let size = whole_size()?;
+                let end = wanted.map_or(size, |r| r.end);
+                if end > size {
+                    return Err(generic(format!("{url} holds {size} bytes, and bytes up to {end} were asked")));
+                }
+                (0..end, size, end)
             }
-            Some(r) => {
+            (_, Some(r)) => {
                 if opened.status != 206 {
                     return Err(generic(format!("{url} answered {} to a range, not 206", opened.status)));
                 }
                 let size = opened.content_range.as_deref().and_then(parse_content_range).map_or(r.end, |(_, size)| size);
-                let expected = r.end.saturating_sub(r.start);
-                (r, size, expected)
+                (r.clone(), size, r.end.saturating_sub(r.start))
             }
         };
         let range = read.empty_at.map_or(range, |start| start..start);
+        let cut = asked.is_none(); // (a whole body read for a range from the start ends at the range's end)
         let payload = match opened.body {
-            Some(rx) => body_of(url, rx, expected),
+            Some(rx) => body_of(url, rx, expected, cut),
             None => stream::empty().boxed(),
         };
         let meta = ObjectMeta { location: location.clone(), last_modified: DateTime::<Utc>::UNIX_EPOCH, size, e_tag: None, version: None };
@@ -261,19 +270,28 @@ async fn open(url: String, want_body: bool, range: Option<Range<u64>>) -> StoreR
 }
 
 /// A blob's body as the store yields it: each chunk as `pump` reads it, and the body's end checked against `expected` (the length
-/// asked, or the whole's content-length). A body shorter or longer than that, or a read that fails, is the stream's last item.
-fn body_of(url: String, rx: mpsc::Receiver<Result<Vec<u8>, String>>, expected: u64) -> BoxStream<'static, StoreResult<Bytes>> {
+/// asked, or the whole's content-length). With `cut`, the body is the blob's whole and the read ends at `expected`: the chunk that
+/// passes it is cut there, and dropping the receiver cancels the rest. Otherwise a body longer than that, or any body shorter, or a
+/// read that fails, is the stream's last item.
+fn body_of(url: String, rx: mpsc::Receiver<Result<Vec<u8>, String>>, expected: u64, cut: bool) -> BoxStream<'static, StoreResult<Bytes>> {
     stream::unfold(Some((rx, 0u64)), move |state| {
         let url = url.clone();
         async move {
             let (mut rx, got) = state?; // (after the last item, the stream is done)
+            if cut && got == expected {
+                return None; // (the range is read: the receiver drops here, and the pump cancels the rest)
+            }
             match rx.next().await {
-                Some(Ok(chunk)) => {
-                    let got = got + chunk.len() as u64;
-                    if got > expected {
-                        return Some((Err(short(&url, got, expected)), None));
+                Some(Ok(mut chunk)) => {
+                    let total = got + chunk.len() as u64;
+                    if total > expected {
+                        if !cut {
+                            return Some((Err(short(&url, total, expected)), None));
+                        }
+                        chunk.truncate((expected - got) as usize);
+                        return Some((Ok(Bytes::from(chunk)), Some((rx, expected))));
                     }
-                    Some((Ok(Bytes::from(chunk)), Some((rx, got))))
+                    Some((Ok(Bytes::from(chunk)), Some((rx, total))))
                 }
                 Some(Err(text)) => Some((Err(generic(text)), None)),
                 None if got == expected => None,
