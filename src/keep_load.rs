@@ -7,10 +7,12 @@ use crate::adopt::fits_as_written;
 use crate::answer;
 use crate::expander;
 use crate::ext;
-use crate::keep_parquet::{self, Cut, Kept, Limits};
+use crate::keep_parquet::{self, Cut, Kept, Limits, Sys};
+use crate::log::Reserved;
 use crate::manifest::Seen;
 use crate::sketch::Sketches;
 use crate::store::{DataFile, Lake, TableMeta};
+use crate::text::{NAMES, ROW_ID};
 use crate::tier;
 use crate::write::{recorded, Files};
 use anyhow::{ensure, Context, Result};
@@ -28,9 +30,10 @@ use std::sync::Arc;
 
 /// The files of a `CREATE TABLE … AS FROM 'f.parquet'`'s INSERT into `table` (`job` made the table, `stored` is it):
 /// Some when every check holds (`attempt`), else None and the INSERT is written as today. An error before the
-/// commit is None too, and says why.
-pub async fn kept(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>) -> Option<Files> {
-    match attempt(query, target, table, sql, job, stored).await {
+/// commit is None too, and says why. `stamp` is the INSERT's (`write::stamp`): the kept files carry their rows'
+/// system columns, as a written file does, so they are plain files of the table.
+pub async fn kept(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Option<Files> {
+    match attempt(query, target, table, sql, job, stored, stamp).await {
         Ok(Ok(files)) => Some(files),
         Ok(Err(_reason)) => None,
         Err(e) => {
@@ -42,10 +45,11 @@ pub async fn kept(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str
 
 /// Keeps the files, or says why not (`Err`, in words). Each check comes before anything is copied, except the
 /// file's own: every file is planned from its footer first, so a reason in the last one copies nothing.
-async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>) -> Result<Result<Files, String>> {
+async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str, stored: Option<&Arc<TableMeta>>, stamp: Option<Reserved>) -> Result<Result<Files, String>> {
     if crate::env::get("PONDRA_KEEP_PARQUET").as_deref() == Some("0") {
         return Ok(Err("PONDRA_KEEP_PARQUET=0".into()));
     }
+    let Some(stamp) = stamp else { return Ok(Err("no commit number reserved: the rows take a lineage".into())) };
     // The table: this statement's own, with nothing in it, and nothing a file as it is can't keep.
     let Some(meta) = stored else { return Ok(Err("no table".into())) };
     let plain = meta.made_by.as_deref() == Some(job) && meta.files.is_empty() && meta.sealed.is_none() && fits_as_written(meta) && meta.partition.is_none() && meta.cluster.is_empty() && meta.constraints.is_empty() && meta.identity.is_empty();
@@ -82,9 +86,20 @@ async fn attempt(query: &Lake, target: &Lake, table: &str, sql: &str, job: &str,
         };
         jobs.extend(cuts.into_iter().map(|cut| Job { store: store.clone(), location: location.clone(), md: md.clone(), cut }));
     }
+    // Each cut's rows take ids from the INSERT's block on, in order, as `sys::stamp_stream` gives them.
+    let rows: u64 = jobs.iter().map(|j| j.cut.groups.clone().map(|g| j.md.row_group(g).num_rows() as u64).sum::<u64>()).sum();
+    if rows > 1 << 32 {
+        return Ok(Err("more than 4,294,967,296 rows".into()));
+    }
+    let mut next = stamp.block << 32;
+    let sys: Vec<Sys> = jobs.iter().map(|j| {
+        let first = next as i64;
+        next += j.cut.groups.clone().map(|g| j.md.row_group(g).num_rows() as u64).sum::<u64>();
+        Sys { first, version: stamp.version as i64, at_us: (stamp.ms * 1000) as i64 }
+    }).collect();
     // Then each cut is copied, at most two at a time, in order.
     let folder = meta.folder(table).to_string();
-    let files = futures::stream::iter(jobs).map(|cut| copy_one(target, &folder, schema.clone(), cut)).buffered(2).try_collect::<Vec<DataFile>>().await?;
+    let files = futures::stream::iter(jobs.into_iter().zip(sys)).map(|(cut, sys)| copy_one(target, &folder, schema.clone(), cut, sys)).buffered(2).try_collect::<Vec<DataFile>>().await?;
     let columns = meta.live().map(|(s, _, t)| Ok((s.to_string(), answer::dtype(t)?.to_string()))).collect::<Result<Vec<_>>>()?;
     Ok(Ok(Files::new(table, job, columns, files)))
 }
@@ -105,11 +120,11 @@ struct Job {
 }
 
 /// One cut read by range (never the whole file), copied, read back, and put as one of the table's files in `folder`.
-async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job) -> Result<DataFile> {
+async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job, sys: Sys) -> Result<DataFile> {
     let Job { store, location, md, cut } = job;
     let piece = store.get_range(&location, cut.bytes.clone()).await?;
     let (bytes, file) = tier::blocking(move || {
-        let kept = keep_parquet::copy(&md, &schema, &cut, piece)?;
+        let kept = keep_parquet::copy(&md, &schema, &cut, piece, Some(sys))?;
         entry(kept)
     })
     .await?;
@@ -119,12 +134,14 @@ async fn copy_one(target: &Lake, folder: &str, schema: Arc<Schema>, job: Job) ->
 }
 
 /// A kept file's bytes and its entry but for where it goes: its rows, and the ranges, NULLs and sketches a written file
-/// of them would have (`tier::Encoding`'s, which see every row as it is written). Read back from its first 32 columns,
-/// decoded but not encoded, with no schema hint, so strings are Utf8 as a written file's are.
+/// of them would have (`tier::Encoding`'s, which see every row as it is written). Read back from its first 32 columns
+/// and its system columns (`manifest::Seen` ranges both), decoded but not encoded, with no schema hint, so strings are
+/// Utf8 as a written file's are.
 fn entry(kept: Kept) -> Result<(Bytes, DataFile)> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(kept.bytes.clone())?;
-    let n = builder.schema().fields().len().min(32);
-    let mask = ProjectionMask::roots(builder.parquet_schema(), 0..n);
+    let fields = builder.schema().fields().clone();
+    let read = fields.iter().enumerate().filter(|(i, f)| *i < 32 || NAMES.contains(&f.name().as_str())).map(|(i, _)| i);
+    let mask = ProjectionMask::roots(builder.parquet_schema(), read);
     let reader = builder.with_projection(mask).with_batch_size(8192).build()?;
     let schema = reader.schema();
     let (mut seen, mut sketches, mut rows) = (Seen::new(schema.clone()), Sketches::new(&schema), 0u64);
@@ -141,7 +158,7 @@ fn entry(kept: Kept) -> Result<(Bytes, DataFile)> {
         stats: seen.stats(&kept.footer),
         nulls: Some(seen.nulls()),
         sketch: sketches.done(),
-        sys: false,
+        sys: schema.index_of(ROW_ID).is_ok(),
         ..Default::default()
     };
     Ok((kept.bytes, file))
@@ -199,7 +216,7 @@ mod tests {
         let (_, got) = entry(Kept { bytes: bytes.clone(), footer, rows: 3000 }).unwrap();
         assert_eq!(got.rows, 3000);
         assert_eq!(got.bytes, bytes.len() as u64);
-        assert!(!got.sys, "a kept file has no system columns of its own");
+        assert!(!got.sys, "a file of no system columns");
         assert_eq!(got.stats, want.0, "ranges");
         assert_eq!(got.nulls, Some(want.1), "NULLs");
         assert_eq!(got.sketch, want.2, "sketches");

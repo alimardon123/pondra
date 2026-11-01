@@ -1758,11 +1758,11 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
         }
         (_, Stmt::Insert(_, query)) => {
             // A CREATE TABLE … AS FROM a Parquet file keeps its row groups, or the rows are written as always (`keep_load`).
-            let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref()).await {
+            let to = app.to();
+            let stamped = stamp(lake, &table, Some(&to)).await?;
+            let f = match crate::keep_load::kept(lake, lake, &table, query, &job, stored.as_ref(), stamped).await {
                 Some(f) => Some(f),
                 None => {
-                    let to = app.to();
-                    let stamped = stamp(lake, &table, Some(&to)).await?;
                     match everywhere(app, &table, query, &job, stamped, &to, files || meta.is_none()).await? {
                         Some(f) => f,
                         None => write_files(lake, &open(session(lake, query, "").await?), &table, query, &job, stamped).await?,
@@ -2340,11 +2340,12 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
             Ok(Some(Request::Flush(encode_flush(&pack(target, &[append]).await?)?.into())))
         }
         (_, Stmt::Insert(_, sql)) => {
-            if let Some(f) = crate::keep_load::kept(query, target, table, sql, job, stored.as_ref()).await {
+            let stamped = stamp(target, table, None).await?;
+            if let Some(f) = crate::keep_load::kept(query, target, table, sql, job, stored.as_ref(), stamped).await {
                 return Ok(Some(Request::Files(f))); // (a Parquet file's row groups kept: `keep_load`)
             }
             let ctx = open(session(query, sql, "").await?);
-            Ok(write_files(target, &ctx, table, sql, job, stamp(target, table, None).await?).await?.map(Request::Files))
+            Ok(write_files(target, &ctx, table, sql, job, stamped).await?.map(Request::Files))
         }
         (None, _) => bail!("no table {table}"),
         _ => bail!("UPDATE and DELETE need a keyed table (append tables only take INSERTs)"),

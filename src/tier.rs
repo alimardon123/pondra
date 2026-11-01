@@ -983,7 +983,7 @@ pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_write
 /// The codec data files are written with (`PONDRA_CODEC`). LZ4 by default: it decodes fastest,
 /// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
 /// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
-fn codec() -> Compression {
+pub(crate) fn codec() -> Compression {
     match crate::env::get("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
         "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
         "snappy" => Compression::SNAPPY,

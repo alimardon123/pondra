@@ -4,18 +4,21 @@
 //! writes one cut as one file. `keep` does both for a whole file in memory, for the tests.
 
 use crate::adopt::same;
-use anyhow::{ensure, Result};
+use crate::text::{CREATED, NAMES, ROW_ID, UPDATED};
+use anyhow::{ensure, Context, Result};
 use bytes::{Buf, Bytes};
 use datafusion::arrow::datatypes::Schema;
 use datafusion::parquet::arrow::parquet_to_arrow_schema;
-use datafusion::parquet::basic::{ColumnOrder, Compression, SortOrder, Type as Physical};
+use datafusion::parquet::basic::{ColumnOrder, Compression, Encoding, LogicalType, Repetition, SortOrder, TimeUnit, Type as Physical};
+use datafusion::parquet::data_type::Int64Type;
+use datafusion::parquet::schema::types::ColumnPath;
 use datafusion::parquet::column::page::PageReader;
 use datafusion::parquet::column::writer::ColumnCloseResult;
 use datafusion::parquet::errors::ParquetError;
 use datafusion::parquet::file::metadata::{ColumnChunkMetaData, ParquetMetaData};
 #[cfg(test)]
 use datafusion::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
-use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use datafusion::parquet::file::reader::{ChunkReader, Length};
 use datafusion::parquet::file::serialized_reader::SerializedPageReader;
 use datafusion::parquet::file::statistics::Statistics;
@@ -135,10 +138,21 @@ fn chunk_bytes(c: &ColumnChunkMetaData) -> std::result::Result<(u64, u64), Strin
     Ok((start as u64, start as u64 + c.compressed_size() as u64))
 }
 
+/// The system columns a written file of a bulk INSERT carries (`sys::stamp_new`), for one cut's rows: ids from `first`
+/// on, and the commit number and time (µs) the writer reserved. With them a kept file is a plain file, read as a written
+/// one is (no lineage: `hot::plain_file`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sys {
+    pub first: i64,
+    pub version: i64,
+    pub at_us: i64,
+}
+
 /// Writes one cut as one file of ours: its row groups' chunks copied as they are, under our schema (the table's names,
-/// types as the source's, field ids 1..n). `piece` is the source's bytes of `cut.bytes`. Err if a chunk doesn't start
-/// with a page (encrypted, or a bad cut), or if the file comes out over what `plan` leaves room for.
-pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes) -> Result<Kept> {
+/// types as the source's, field ids 1..n), then, with `sys`, the four system columns encoded as `tier::writer` encodes
+/// them. `piece` is the source's bytes of `cut.bytes`. Err if a chunk doesn't start with a page (encrypted, or a bad
+/// cut), or if the file comes out over what `plan` leaves room for.
+pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes, sys: Option<Sys>) -> Result<Kept> {
     let descr = md.file_metadata().schema_descr();
     let fields = descr.root_schema().get_fields();
     ensure!(table.fields().len() == fields.len(), "the table has {} columns, the file {}", table.fields().len(), fields.len());
@@ -158,25 +172,54 @@ pub(crate) fn copy(md: &ParquetMetaData, table: &Schema, cut: &Cut, piece: Bytes
             .build()?;
         ours.push(Arc::new(field));
     }
+    let mut props = WriterProperties::builder().set_compression(crate::tier::codec());
+    if md.offset_index().is_none() {
+        // (a file's chunks all have an offset index or none do: a source with none, the system columns with none, and
+        // ranges per chunk, not per page, which would ask for one)
+        props = props.set_offset_index_disabled(true).set_statistics_enabled(EnabledStatistics::Chunk);
+    }
+    if sys.is_some() {
+        // (as `tier::writer` writes them, with the ids `tier::field_ids` gives them)
+        for (k, name) in NAMES.iter().enumerate() {
+            let mut b = Node::primitive_type_builder(name, Physical::INT64).with_repetition(Repetition::OPTIONAL).with_id(Some(1_000_001 + k as i32));
+            if *name == CREATED || *name == UPDATED {
+                b = b.with_logical_type(Some(LogicalType::timestamp(true, TimeUnit::MICROS)));
+            }
+            ours.push(Arc::new(b.build()?));
+            let path: ColumnPath = (*name).into();
+            let encoding = if *name == ROW_ID { Encoding::DELTA_BINARY_PACKED } else { Encoding::PLAIN };
+            props = props.set_column_dictionary_enabled(path.clone(), false).set_column_encoding(path, encoding);
+        }
+    }
     let root: TypePtr = Arc::new(Node::group_type_builder("schema").with_fields(ours).build()?);
     let our_descr = SchemaDescriptor::new(root.clone());
     let reader = Arc::new(Piece { from: cut.bytes.start, bytes: piece });
-    let props = Arc::new(WriterProperties::builder().build());
-    let mut w = SerializedFileWriter::new(Vec::with_capacity(len + (1 << 20)), root, props)?;
+    let mut w = SerializedFileWriter::new(Vec::with_capacity(len + (1 << 20)), root, Arc::new(props.build()))?;
     let mut rows = 0u64;
     for g in cut.groups.clone() {
         let rg = md.row_group(g);
-        rows += rg.num_rows() as u64;
         let mut out = w.next_row_group()?;
         for (i, chunk) in rg.columns().iter().enumerate() {
             SerializedPageReader::new(reader.clone(), chunk, rg.num_rows() as usize, None)?.peek_next_page()?;
             out.append_column(reader.as_ref(), column_close(md, g, i, chunk, our_descr.column(i))?)?;
         }
+        if let Some(s) = sys {
+            let n = rg.num_rows() as usize;
+            let (defs, from) = (vec![1i16; n], s.first + rows as i64);
+            let columns: [Vec<i64>; 4] = [(from..from + n as i64).collect(), vec![s.version; n], vec![s.at_us; n], vec![s.at_us; n]];
+            for values in columns {
+                let mut c = out.next_column()?.context("a system column")?;
+                c.typed::<Int64Type>().write_batch(&values, Some(&defs), None)?;
+                c.close()?;
+            }
+        }
+        rows += rg.num_rows() as u64;
         out.close()?;
     }
     let footer = w.finish()?;
     let bytes = std::mem::take(w.inner_mut());
-    let cap = len + room(len);
+    // (the system columns: ids of a few bits each, versions and times one value a column, squeezed by the codec)
+    let cap = len + room(len) + if sys.is_some() { rows as usize / 4 + (64 << 10) } else { 0 };
     ensure!(bytes.len() <= cap, "the kept file is {} bytes, over the {cap} its {len} bytes leave room for", bytes.len());
     Ok(Kept { bytes: Bytes::from(bytes), footer, rows })
 }
@@ -196,7 +239,7 @@ pub(crate) fn keep(file: Bytes, table: &Schema, limits: &Limits) -> Result<Resul
     };
     let mut kept = Vec::with_capacity(cuts.len());
     for cut in &cuts {
-        let k = copy(&md, table, cut, file.slice(cut.bytes.start as usize..cut.bytes.end as usize))?;
+        let k = copy(&md, table, cut, file.slice(cut.bytes.start as usize..cut.bytes.end as usize), None)?;
         if k.bytes.len() > limits.file {
             return Ok(Err(format!("a kept file came out at {} bytes, over the {}", k.bytes.len(), limits.file)));
         }
@@ -401,6 +444,82 @@ mod tests {
                 assert_eq!((a.min_bytes_opt(), a.max_bytes_opt(), a.null_count_opt()), (b.min_bytes_opt(), b.max_bytes_opt(), b.null_count_opt()), "row group {g} column {c}");
             }
         }
+    }
+
+    /// With `sys`, a kept file carries its rows' system columns as a written file of a bulk INSERT does
+    /// (`sys::stamp_new`, `tier::writer`): ids counting up from `first` across its row groups, the commit number and time,
+    /// the same types, field ids and encodings. The table's own columns are copied as they are.
+    #[test]
+    fn a_kept_file_carries_its_rows_system_columns() {
+        use crate::text::VERSION;
+        use datafusion::arrow::array::AsArray;
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true), Field::new("s", DataType::Utf8, true)]));
+        let batch = |from: i64| RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(Int64Array::from_iter_values(from..from + 1000)) as ArrayRef,
+            Arc::new(StringArray::from_iter((from..from + 1000).map(|v| Some(format!("s{}", v % 13))))),
+        ]).unwrap();
+        let mut w = tier::writer(schema.clone(), &[]).unwrap();
+        for from in [0, 1000, 2000] {
+            w.write(&batch(from)).unwrap();
+            w.flush().unwrap();
+        }
+        let file = Bytes::from(w.into_inner().unwrap());
+        let md = footer_of(&file);
+        let cuts = plan(&md, &schema, &limits()).unwrap();
+        assert_eq!(cuts.len(), 1);
+        let reserved = crate::log::Reserved { version: 41, ms: 1_700_000_000_123, block: 5 };
+        let sys = Sys { first: (5 << 32) + 7, version: 41, at_us: 1_700_000_000_123_000 };
+        let k = copy(&md, &schema, &cuts[0], file.slice(cuts[0].bytes.start as usize..cuts[0].bytes.end as usize), Some(sys)).unwrap();
+        assert_eq!(k.rows, 3000);
+        let ids: Vec<i32> = k.footer.file_metadata().schema_descr().root_schema().get_fields().iter().map(|f| f.get_basic_info().id()).collect();
+        assert_eq!(ids, vec![1, 2, 1_000_001, 1_000_002, 1_000_003, 1_000_004]);
+
+        // What a written file of the same rows, stamped, reads as.
+        let stamped: Vec<RecordBatch> = [0i64, 1000, 2000].iter().map(|&from| crate::sys::stamp_new(&batch(from), sys.first + from, reserved).unwrap()).collect();
+        let mut w = tier::writer(stamped[0].schema(), &[]).unwrap();
+        for b in &stamped {
+            w.write(b).unwrap();
+        }
+        let written = Bytes::from(w.into_inner().unwrap());
+        assert_same_rows(&k.bytes, &written);
+        let got = rows(&k.bytes);
+        let ids = got.column_by_name(ROW_ID).unwrap().as_primitive::<Int64Type>();
+        assert_eq!((ids.value(0), ids.value(2999)), (sys.first, sys.first + 2999));
+        assert_eq!(got.column_by_name(VERSION).unwrap().as_primitive::<Int64Type>().value(1500), 41);
+        // The system columns' chunks encoded as the writer's: no dictionary, row ids as deltas.
+        for rg in k.footer.row_groups() {
+            let encodings = |c: usize| rg.column(c).encodings().collect::<Vec<_>>();
+            assert!(encodings(2).contains(&Encoding::DELTA_BINARY_PACKED), "{:?}", encodings(2));
+            for c in 2..6 {
+                assert!(!encodings(c).contains(&Encoding::RLE_DICTIONARY), "column {c}: {:?}", encodings(c));
+                assert!(rg.column(c).statistics().is_some_and(|s| s.min_bytes_opt().is_some()), "column {c}'s range");
+            }
+        }
+    }
+
+    /// A source with no offset index (pyarrow's default): its kept file has none either, the system columns' included
+    /// (a file's chunks all have one or none do), and reads with them.
+    #[test]
+    fn a_file_with_no_offset_index_takes_system_columns_with_none() {
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int64, true)]));
+        let props = WriterProperties::builder().set_offset_index_disabled(true).set_statistics_enabled(EnabledStatistics::Chunk).build();
+        let mut w = ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).unwrap();
+        for from in [0i64, 500] {
+            w.write(&RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from_iter_values(from..from + 500))]).unwrap()).unwrap();
+            w.flush().unwrap();
+        }
+        let file = Bytes::from(w.into_inner().unwrap());
+        let md = footer_of(&file);
+        assert!(md.offset_index().is_none(), "the source has no offset index");
+        let cuts = plan(&md, &schema, &limits()).unwrap();
+        let sys = Sys { first: 1 << 32, version: 3, at_us: 9 };
+        let k = copy(&md, &schema, &cuts[0], file.slice(cuts[0].bytes.start as usize..cuts[0].bytes.end as usize), Some(sys)).unwrap();
+        assert_eq!((k.rows, k.footer.num_row_groups()), (1000, 2));
+        assert!(footer_of(&k.bytes).offset_index().is_none());
+        let got = rows(&k.bytes);
+        assert_eq!(got.num_columns(), 5);
+        assert_eq!(got.column(0).to_data(), rows(&file).column(0).to_data());
+        assert!(k.footer.row_groups().iter().all(|rg| (1..5).all(|c| rg.column(c).statistics().is_some_and(|s| s.min_bytes_opt().is_some()))), "the system columns' ranges");
     }
 
     /// Another writer's file: parquet-rs's ArrowWriter with SNAPPY, dictionary pages, data page v2, page indexes, an

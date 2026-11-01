@@ -27894,11 +27894,15 @@ def kept():
     summary = "SELECT count(*) AS n, count(DISTINCT _row_id) AS ids, count(DISTINCT _version) AS versions, sum(amount) AS total FROM {}"
     data = lambda root, t: sorted(glob_.glob(os.path.join(root, "data", t, "*.parquet")))
     OURS = {"LZ4", "LZ4_RAW"}  # (our writer's LZ4_RAW, which pyarrow names LZ4)
+    SYS = {"_row_id", "_version", "_created_at", "_updated_at"}
+    WITH_SYS = [1, 2, 3, 1_000_001, 1_000_002, 1_000_003, 1_000_004]  # (a written file's ids: `tier::field_ids`)
     def props(p):
         md = pq.ParquetFile(p).metadata
-        codecs = {md.row_group(g).column(c).compression for g in range(md.num_row_groups) for c in range(md.num_columns)}
+        chunks = [md.row_group(g).column(c) for g in range(md.num_row_groups) for c in range(md.num_columns)]
+        codecs = {c.compression for c in chunks if c.path_in_schema not in SYS}  # (the table's own columns)
+        sys_codecs = {c.compression for c in chunks if c.path_in_schema in SYS}
         ids = [int(f.metadata[b"PARQUET:field_id"]) for f in pq.ParquetFile(p).schema_arrow if f.metadata and b"PARQUET:field_id" in f.metadata]
-        return {"codecs": codecs, "arrow": b"ARROW:schema" in (md.metadata or {}), "ids": ids, "groups": md.num_row_groups, "rows": md.num_rows}
+        return {"codecs": codecs, "sys_codecs": sys_codecs, "arrow": b"ARROW:schema" in (md.metadata or {}), "ids": ids, "groups": md.num_row_groups, "rows": md.num_rows}
     def write(name, t, **kw):
         p = os.path.join(d, name)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -27913,8 +27917,9 @@ def kept():
     q(f"CREATE TABLE k AS FROM '{f}'", B)  # (through the follower)
     q(f"CREATE TABLE w AS SELECT * FROM '{f}' WHERE true", B)  # (a WHERE: written as today)
     kept_files = data(lake, "k")
-    checks["k's files are the file's own column chunks: Snappy, no Arrow schema, field ids 1..3, the source's three row groups"] = bool(kept_files) \
-        and all(props(p)["codecs"] == {"SNAPPY"} and not props(p)["arrow"] and props(p)["ids"] == [1, 2, 3] for p in kept_files) \
+    checks["k's files are the file's own column chunks (Snappy) and the system columns as ours, no Arrow schema, a written file's field ids, the source's three row groups"] = bool(kept_files) \
+        and all(props(p)["codecs"] == {"SNAPPY"} and props(p)["sys_codecs"] <= OURS and not props(p)["arrow"] and props(p)["ids"] == WITH_SYS for p in kept_files) \
+        and all(props(p)["ids"] == WITH_SYS for p in data(lake, "w")) \
         and sum(props(p)["groups"] for p in kept_files) == 3 and sum(props(p)["rows"] for p in kept_files) == 3000
     checks["w's files are written as always (LZ4_RAW)"] = bool(data(lake, "w")) and all(props(p)["codecs"] <= OURS for p in data(lake, "w"))
     checks["the answers: every row, from either node, as w's"] = len(rows("k")) == 3000 and rows("k") == rows("w") and rows("k", B) == rows("w")
