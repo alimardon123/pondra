@@ -280,8 +280,6 @@ pub struct Rows {
 }
 
 impl Rows {
-    pub fn schema(&self) -> Arc<Schema> { self.schema.clone() }
-
     /// The next batch, in the columns `describe()` gave, or None once the call has given them all. A batch of other columns
     /// fails the call, as a trap or the function's own error does.
     pub fn next(&mut self) -> Result<Option<RecordBatch>> {
