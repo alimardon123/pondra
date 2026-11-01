@@ -8,10 +8,11 @@
 //! whose content-range the page can't see is read from the range asked (`unranged`). An `ETag` the server hides is
 //! only left out of the object's meta.
 
-use crate::js::{body, get, header, js_words, read_of, send, sent, status};
+use crate::js::{body, cancel, get, header, js_words, named_error, pump, read_of, send, sent, status};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::channel::mpsc;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -135,6 +136,173 @@ impl ObjectStore for Fetch {
     async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> StoreResult<()> {
         Err(writes())
     }
+}
+
+// ---------------------------------------------------------------- a blob: URL
+
+/// A browser tab's own file (`blob:https://o/uuid` in Chromium, `blob:nodedata:uuid` in Node), read with `fetch` at the URL its
+/// stand-in names (`ext_names::blob_of`: a path of `blob:///`). One store serves every blob, since a stand-in names its URL.
+/// It never fetches the `https://` inside a blob URL (`Url::origin` of a blob URL is that inner origin), never goes through the
+/// http store (whose bearer token could ride along), and sends no header but `Range`. A body streams as it is read (`pump`), a
+/// few chunks ahead of its consumer, and a read dropped part way cancels the rest. Only the tab that made a blob reads it, until
+/// it is revoked: another tab's, or a revoked one, rejects its fetch with a TypeError.
+#[derive(Debug)]
+pub struct Blob;
+
+impl fmt::Display for Blob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Blob")
+    }
+}
+
+/// How many chunks of a body are read ahead of the consumer.
+const CHUNKS: usize = 2;
+
+#[async_trait]
+impl ObjectStore for Blob {
+    async fn put_opts(&self, _location: &Path, _payload: PutPayload, _opts: PutOptions) -> StoreResult<PutResult> {
+        Err(writes())
+    }
+
+    async fn put_multipart_opts(&self, _location: &Path, _opts: PutMultipartOptions) -> StoreResult<Box<dyn MultipartUpload>> {
+        Err(writes())
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> StoreResult<GetResult> {
+        let url = blob_url(location)?;
+        // (what is read, and whether a body is wanted, is `js::read_of`'s: a HEAD and an empty range want the meta only)
+        let read = read_of(options);
+        let wanted = match read.range {
+            None => None,
+            Some(GetRange::Bounded(r)) => Some(r),
+            Some(other) => return Err(generic(format!("{url}: a blob is read in a bounded range, not {other:?}: an offset or a suffix isn't read"))),
+        };
+        let opened = sent(open(url.clone(), read.body, wanted.clone())).await.map_err(|_| blob_dropped(&url))??;
+        let (range, size, expected) = match wanted {
+            None => {
+                if opened.status != 200 {
+                    return Err(generic(format!("{url} answered {} to a read of the whole blob", opened.status)));
+                }
+                let size = opened.content_length.as_deref().and_then(|v| v.trim().parse::<u64>().ok()).ok_or_else(|| generic(format!("{url} sent no content-length")))?;
+                (0..size, size, size)
+            }
+            Some(r) => {
+                if opened.status != 206 {
+                    return Err(generic(format!("{url} answered {} to a range, not 206", opened.status)));
+                }
+                let size = opened.content_range.as_deref().and_then(parse_content_range).map_or(r.end, |(_, size)| size);
+                let expected = r.end.saturating_sub(r.start);
+                (r, size, expected)
+            }
+        };
+        let range = read.empty_at.map_or(range, |start| start..start);
+        let payload = match opened.body {
+            Some(rx) => body_of(url, rx, expected),
+            None => stream::empty().boxed(),
+        };
+        let meta = ObjectMeta { location: location.clone(), last_modified: DateTime::<Utc>::UNIX_EPOCH, size, e_tag: None, version: None };
+        Ok(GetResult { payload: GetResultPayload::Stream(payload), meta, range, attributes: Attributes::default(), extensions: Default::default() })
+    }
+
+    fn delete_stream(&self, locations: BoxStream<'static, StoreResult<Path>>) -> BoxStream<'static, StoreResult<Path>> {
+        locations.map(|_| Err(writes())).boxed()
+    }
+
+    fn list(&self, _prefix: Option<&Path>) -> BoxStream<'static, StoreResult<ObjectMeta>> {
+        stream::once(async { Err(lists_nothing()) }).boxed()
+    }
+
+    async fn list_with_delimiter(&self, _prefix: Option<&Path>) -> StoreResult<ListResult> {
+        Err(lists_nothing())
+    }
+
+    async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> StoreResult<()> {
+        Err(writes())
+    }
+}
+
+/// The blob URL an object's stand-in names.
+fn blob_url(location: &Path) -> StoreResult<String> {
+    let stand_in = format!("blob:///{}", location.as_ref());
+    pondra::ext_names::blob_of(&stand_in).ok_or_else(|| generic(format!("{stand_in} names no blob: URL")))
+}
+
+/// What one fetch of a blob answered, read on the page's thread (`sent`): the status and the headers the store reads, and, when
+/// a body is wanted, the receiver its chunks come through (`pump`).
+struct Opened {
+    status: u16,
+    content_length: Option<String>,
+    content_range: Option<String>,
+    body: Option<mpsc::Receiver<Result<Vec<u8>, String>>>,
+}
+
+/// One `GET` of a blob's URL, with a `Range` when a range is asked. A body is pumped when one is wanted, and cancelled unread
+/// when not (a HEAD's size comes from the content-length alone).
+async fn open(url: String, want_body: bool, range: Option<Range<u64>>) -> StoreResult<Opened> {
+    let asked: Vec<(&str, String)> = range.map(|r| ("Range", range_header(&GetRange::Bounded(r)))).into_iter().collect();
+    let response = JsFuture::from(send(&url, "GET", &asked, None).map_err(|e| fetched_failed(&url, e))?)
+        .await
+        .map_err(|e| if named_error(&e, "TypeError") { revoked(&url) } else { fetched_failed(&url, js_words(e)) })?;
+    let headers = get(&response, "headers").map_err(generic)?;
+    let mut opened = Opened {
+        status: status(&response).map_err(generic)?,
+        content_length: header(&headers, "content-length").map_err(generic)?,
+        content_range: header(&headers, "content-range").map_err(generic)?,
+        body: None,
+    };
+    if !want_body {
+        cancel(&response).await;
+        return Ok(opened);
+    }
+    let (tx, rx) = mpsc::channel(CHUNKS);
+    pump(&response, tx).map_err(generic)?;
+    opened.body = Some(rx);
+    Ok(opened)
+}
+
+/// A blob's body as the store yields it: each chunk as `pump` reads it, and the body's end checked against `expected` (the length
+/// asked, or the whole's content-length). A body shorter or longer than that, or a read that fails, is the stream's last item.
+fn body_of(url: String, rx: mpsc::Receiver<Result<Vec<u8>, String>>, expected: u64) -> BoxStream<'static, StoreResult<Bytes>> {
+    stream::unfold(Some((rx, 0u64)), move |state| {
+        let url = url.clone();
+        async move {
+            let (mut rx, got) = state?; // (after the last item, the stream is done)
+            match rx.next().await {
+                Some(Ok(chunk)) => {
+                    let got = got + chunk.len() as u64;
+                    if got > expected {
+                        return Some((Err(short(&url, got, expected)), None));
+                    }
+                    Some((Ok(Bytes::from(chunk)), Some((rx, got))))
+                }
+                Some(Err(text)) => Some((Err(generic(text)), None)),
+                None if got == expected => None,
+                None => Some((Err(short(&url, got, expected)), None)),
+            }
+        }
+    })
+    .boxed()
+}
+
+fn short(url: &str, got: u64, expected: u64) -> Error {
+    generic(format!("{url} sent {got} bytes where {expected} were due"))
+}
+
+/// A blob the tab can't read: revoked, or made by another tab (its fetch rejects with a TypeError, not a 404).
+fn revoked(url: &str) -> Error {
+    generic(format!("the tab's file at {url} can't be read: a blob: URL is read only by the tab that made it, until it is revoked"))
+}
+
+fn fetched_failed(url: &str, text: String) -> Error {
+    generic(format!("error sending request for url ({url}): {text}"))
+}
+
+fn blob_dropped(url: &str) -> Error {
+    generic(format!("error sending request for url ({url}): the fetch was dropped"))
+}
+
+fn lists_nothing() -> Error {
+    Error::NotSupported { source: "a blob: URL is one file: it lists nothing".into() }
 }
 
 fn writes() -> Error {

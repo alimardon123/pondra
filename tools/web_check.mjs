@@ -169,6 +169,9 @@ async function openInNode() {
         globalThis.fetch = sent;
       }
     },
+    // A blob URL of `text`, made in this process (a `blob:nodedata:` URL): a tab's own file, which the module's pages read.
+    blob: async (on, text) => URL.createObjectURL(new Blob([text], { type: 'text/csv' })),
+    revoke: async (on, url) => URL.revokeObjectURL(url),
     // Closes and frees the joined page `name`: its member ends, and the module has no page of that name after.
     closeAs: async (name) => {
       const page = pages.get(name);
@@ -269,6 +272,9 @@ async function openInBrowser() {
           }
         }, { name, url, session });
       },
+      // A blob URL of `text`, made in the tab `on` (its own origin's: only that tab's page reads it), and its revocation.
+      blob: (on, text) => tabs.get(on).evaluate((text) => URL.createObjectURL(new Blob([text], { type: 'text/csv' })), text),
+      revoke: (on, url) => tabs.get(on).evaluate((url) => URL.revokeObjectURL(url), url),
       closeAs: (name) => tabs.get(name).evaluate(async (name) => {
         await window[name].close();
         window[name].free();
@@ -567,6 +573,28 @@ async function onePageCheck(target) {
     failed.push('one page to a module');
     console.error(`one page to a module: refused ${refused ?? 'not refused'}, reopened ${reopened}`);
   }
+}
+
+// A tab's own file, a blob made in the page's own context (`URL.createObjectURL`), read by a page with no node: its rows are
+// counted by the page, a bare name is refused with the readers' words, and a revoked blob is refused with its own words (the
+// page's fetch of a blob is the tab's, and a blob is read only by the tab that made it, until it is revoked: `blob_with`).
+const BLOB_CSV = 'id,name,amount\n1,ann,2.5\n2,bo,4\n3,cy,0.5\n';
+async function blobChecks(target) {
+  let url;
+  try {
+    url = await target.blob('pondra', BLOB_CSV);
+  } catch (e) {
+    failed.push('a blob made in the page');
+    console.error(`a blob made in the page: threw ${e}`);
+    return;
+  }
+  const counted = await ask('blob: count and sum of read_csv(blob)', 'POST', '/sql?format=csv', undefined, `SELECT count(*) AS n, CAST(sum(amount) AS BIGINT) AS total FROM read_csv('${url}')`, 'pondra');
+  if (counted) judge('blob: count and sum of read_csv(blob)', counted, { status: 200, sqlstate: null, out: 'n,total\n3,7\n' });
+  const bare = await ask('blob: a bare name is refused', 'POST', '/sql', undefined, `SELECT count(*) FROM '${url}'`, 'pondra');
+  if (bare) judge('blob: a bare name is refused', bare, { error: true, sqlstate: '22023', says: "read the tab's file with read_csv" });
+  await target.revoke('pondra', url);
+  const revoked = await ask('blob: a revoked blob is refused', 'POST', '/sql', undefined, `SELECT count(*) FROM read_csv('${url}')`, 'pondra');
+  if (revoked) judge('blob: a revoked blob is refused', revoked, { error: true, says: 'until it is revoked' });
 }
 
 // In Node there is no origin's private file system, so `Page.kept` is refused by name: the kept checks are left out.
@@ -1562,6 +1590,7 @@ const JOIN_SETUP = [
 const JOIN_AS_BOSS = [
   "CREATE USER rd PASSWORD 'rd-password-1'",
   'GRANT SELECT ON ev TO rd',
+  'CREATE TABLE w4 (id BIGINT, name TEXT, amount DOUBLE, at TIMESTAMP)', // (the blob check's table: a tab's file loaded into it)
 ];
 const BOSS_BASIC = `Basic ${Buffer.from('boss:boss-password-1').toString('base64')}`;
 // What the page's objects and a node's catalog never name: the secret, its value, and the superuser.
@@ -1686,6 +1715,20 @@ async function joinChecks(target, a, b) {
   if (keyIns) judge(`joined: ${keySql}`, keyIns, { sqlstate: '23505', error: true });
   const keyCount = await ask('joined: SELECT count(*) FROM keyed after the refused key', 'POST', '/sql?format=csv', undefined, 'SELECT count(*) FROM keyed', 'joined');
   if (keyCount) judge('joined: SELECT count(*) FROM keyed after the refused key', keyCount, { status: 200, sqlstate: null, out: 'count(*)\n1\n' });
+
+  // (c4) A tab's own file (a blob made in the joined page's tab) loaded into a lake table: the page stages its rows and its node
+  // writes them, so A's count is right at once; an UPDATE from the same file is refused by the page's words (`BLOB_ON_PAGE`).
+  const blobRows = 'id,name,amount,at\n1,ann,2.5,2026-01-01 00:00:00\n2,bo,4,2026-01-02 00:00:00\n3,cy,0.5,2026-01-03 00:00:00\n';
+  const blobUrl = await target.blob('joined', blobRows);
+  const loadSql = `INSERT INTO w4 SELECT * FROM read_csv('${blobUrl}')`;
+  const loadedBlob = await ask(`joined: ${loadSql}`, 'POST', '/sql', undefined, loadSql, 'joined');
+  if (loadedBlob) judge(`joined: ${loadSql}`, loadedBlob, { status: 200, sqlstate: null });
+  const aBlob = await ask('A: SELECT count(*) FROM w4 right after the blob INSERT', 'POST', '/sql?format=csv', { Authorization: BOSS_BASIC }, 'SELECT count(*) FROM w4', undefined, a);
+  if (aBlob) judge('A: SELECT count(*) FROM w4 right after the blob INSERT', aBlob, { status: 200, sqlstate: null, out: 'count(*)\n3\n' });
+  const updateSql = `UPDATE w4 SET name = 'x' FROM read_csv('${blobUrl}') AS f WHERE w4.id = f.id`;
+  const updated = await ask('joined: UPDATE w4 FROM the blob is refused by the page', 'POST', '/sql', undefined, updateSql, 'joined');
+  if (updated) judge('joined: UPDATE w4 FROM the blob is refused by the page', updated, { error: true, sqlstate: '0A000', says: 'is read by the page alone' });
+  await target.revoke('joined', blobUrl);
 
   // (d) A transaction is refused by name: each statement is the node's own, run on its own.
   const begun = await ask('joined: BEGIN', 'POST', '/sql', undefined, 'BEGIN', 'joined');
@@ -1878,6 +1921,7 @@ async function stopProcess(child) {
 try {
   await lakeChecks(lake);
   await onePageCheck(target);
+  await blobChecks(target);
   if (IN_BROWSER) {
     await keptChecks(await target.tab('kept'), lake);
     await demoChecks(target.page);

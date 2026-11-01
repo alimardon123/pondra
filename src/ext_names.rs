@@ -183,6 +183,9 @@ pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)>
     if url.starts_with("kafka://") {
         return Ok(("kafka".into(), BTreeMap::new())); // (a topic)
     }
+    if is_blob(url) {
+        return Err(given(format!("{url}: a bare blob: name has no extension, so it says no format: read the tab's file with read_csv('…'), read_json('…') or read_parquet('…')")));
+    }
     let path = path_of(url);
     let stem = unwrapped(&path).0;
     let (format, mut options) = match stem.rsplit('.').next().unwrap_or_default() {
@@ -240,18 +243,43 @@ fn decoded_here(variant: CompressionTypeVariant, decoders: bool, urls: &[String]
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the node's readers call it; a page's build doesn't yet)
 pub(crate) fn scheme(url: &str) -> Option<&str> {
+    if is_blob(url) {
+        return Some("blob");
+    }
     let s = url.split_once("://")?.0;
     ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
 }
 
-/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query).
+/// A `blob:` URL: a browser tab's own file (`blob:https://o/uuid` in Chromium, `blob:nodedata:uuid` in Node). Only the
+/// tab that made it reads it: it is never a path, a lake's file, or a secret's (`ext.rs`, `off_page`).
+pub fn is_blob(url: &str) -> bool { url.starts_with("blob:") }
+
+/// The one name DataFusion reads a blob URL by: `blob:///` and the URL in base64url (no padding), which has no `/`, `*`
+/// or `[` for a path or a glob to read. `blob_of` gives the URL back, and `ext::register` reads it through the page's
+/// blob store (`blob_with`).
+pub fn stand_in(blob: &str) -> String { format!("blob:///{}", B64.encode(blob)) }
+
+/// The blob URL a stand-in names (`stand_in`'s inverse): None for any other name.
+pub fn blob_of(stand_in: &str) -> Option<String> {
+    let url = String::from_utf8(B64.decode(stand_in.strip_prefix("blob:///")?).ok()?).ok()?;
+    is_blob(&url).then_some(url)
+}
+
+/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query). A blob URL has none: its `[` (an IPv6
+/// origin's) is its address's.
 pub(crate) fn glob_at(u: &str) -> Option<usize> {
+    if is_blob(u) {
+        return None;
+    }
     let web = u.starts_with("http");
     u.char_indices().find(|(_, c)| *c == '*' || *c == '[' || (*c == '?' && !web)).map(|(i, _)| i)
 }
 
-/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs).
+/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs). A blob URL is listed by its stand-in.
 pub(crate) fn listing_url(u: &str) -> Result<ListingTableUrl> {
+    if is_blob(u) {
+        return Ok(ListingTableUrl::parse(stand_in(u))?);
+    }
     let Some(at) = glob_at(u).filter(|_| u.split_once("://").is_some_and(|(s, _)| s != "file")) else { return Ok(ListingTableUrl::parse(u)?) };
     let cut = u[..at].rfind('/').map_or(0, |j| j + 1);
     let (prefix, glob) = u.split_at(cut);
@@ -975,6 +1003,46 @@ mod tests {
         assert_eq!(schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(), ["id", "name"]);
         let batches = read_files(&ctx, &[("mem:///g/a.csv.gz", "")], &schema, &spec).await.unwrap().collect().await.unwrap();
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A blob URL's stand-in round-trips through DataFusion and back: `stand_in` → `ListingTableUrl::parse` → the store's path →
+    /// `Found::full` → parse again, unchanged, and `blob_of` gives the URL back. Chromium's opaque form, Node's, and an IPv6
+    /// origin (whose `[` no glob may read) all pass; a stand-in names no glob.
+    #[test]
+    fn a_blob_url_round_trips_through_its_stand_in() {
+        for blob in ["blob:https://o/6f1c0e2a-uuid", "blob:nodedata:6f1c0e2a-uuid", "blob:https://[::1]:8080/u"] {
+            let name = stand_in(blob);
+            assert!(glob_at(&name).is_none() && glob_at(blob).is_none(), "{blob}");
+            assert_eq!(scheme(blob), Some("blob"));
+            assert_eq!(blob_of(&name).as_deref(), Some(blob));
+            let url = listing_url(blob).unwrap();
+            assert_eq!(url.object_store().as_str(), "blob:///", "the store URL; the registry key it is read through is blob://");
+            let object = ObjectMeta { location: Path::from(url.prefix().as_ref()), last_modified: chrono::DateTime::UNIX_EPOCH, size: 4, e_tag: None, version: None };
+            let found = Found { store: Arc::new(InMemory::new()), url, object };
+            let full = found.full();
+            assert_eq!(full, name, "{blob}");
+            assert_eq!(blob_of(&full).as_deref(), Some(blob));
+            let again = ListingTableUrl::parse(&full).unwrap();
+            assert_eq!(again.as_str(), ListingTableUrl::parse(&name).unwrap().as_str());
+            assert_eq!(again.prefix().as_ref(), found.object.location.as_ref(), "the file is its stand-in's path");
+        }
+        assert_eq!(blob_of("blob:///not-base64!"), None);
+        assert_eq!(blob_of("https://o/u"), None);
+    }
+
+    /// A blob URL is one file, never a path or a lake's name: `lake_files::relative` leaves it be, and a bare `'blob:…'` (no
+    /// reader) is refused by name, with the readers' names. Read by a reader, it is the file's spec, its URL as written.
+    #[test]
+    fn a_blob_url_is_read_by_a_reader_and_never_as_a_path() {
+        let blob = "blob:https://o/6f1c0e2a-uuid";
+        assert!(crate::lake_files::relative("mem:///", blob).is_none(), "not the lake's file");
+        let bare = format_of(blob).unwrap_err();
+        assert!(bare.to_string().contains("read_csv"), "{bare}");
+        assert_eq!(crate::codes::of(&bare), "22023");
+        let name = table(&table_of(&format!("read_csv('{blob}')"))).unwrap().unwrap();
+        let spec = spec(&name).unwrap();
+        assert_eq!((spec.urls.as_slice(), spec.format.as_str()), ([blob.to_string()].as_slice(), "csv"));
+        assert!(table(&table_of(&format!("'{blob}'"))).is_err());
     }
 
     #[test]
