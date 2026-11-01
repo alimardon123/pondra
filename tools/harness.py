@@ -7809,6 +7809,7 @@ def temps():
         shown[0][0]["definition"].startswith("CREATE TEMPORARY VIEW mine AS SELECT") and "picked" in shown[0][0]["definition"] and \
         shown[1][0]["definition"].startswith("CREATE TEMPORARY TABLE picked (\n  id BIGINT,\n  note ") and "no view mine" in shown[2] and \
         shown_pg[0][0] == "CREATE TEMPORARY VIEW tv1 AS SELECT a FROM t1;"
+    fns = _temps_functions(checks, A.port, db, other)  # (CREATE TEMP FUNCTION / TEMP MACRO: the session's own)
     session = db.session
     db.close()
     closed = _raises_text(lambda: call(A.port, "POST", "/sql", b"SELECT * FROM picked", headers={"x-pondra-session": session}))
@@ -7822,9 +7823,59 @@ def temps():
     ok = all(checks.values())
     print(json.dumps({"temps": checks, "ok": ok}, indent=1))
     if not ok:
-        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled)
+        print(got, before, joined, spread, cached, shadow, unseen, no_session, lake_view, mine, gone, shown, shown_pg, closed, idled, fns)
         sys.exit(1)
     return f"temps: a session's own tables and views, every statement, on its node: all {len(checks)} checks pass"
+
+
+def _temps_functions(checks, port, db, other):
+    """A temporary function (Alimardon 11-01: "it should be temporary"): `CREATE TEMP MACRO` and `CREATE TEMP FUNCTION` are the
+    session's own (`temp.rs`), as in DuckDB. Another session doesn't have it, and the same query text there isn't answered from
+    what this session's was; it is used before the lake's of its name, and DROP takes the session's; a query calling it spreads
+    over the nodes with the same answer (its body is put in its place); a lake's view or function can't call one, a TEMP VIEW
+    can; a Python one is the lake's; a Postgres connection's ends with it; without a session it is refused by name."""
+    import psycopg
+    rows = lambda s, c=db: c.sql(s).rows()
+    got = {}
+    db.sql("CREATE TEMP MACRO cents(x) AS round(x * 100)::BIGINT")
+    db.sql("CREATE TEMP FUNCTION twice(x BIGINT) RETURNS BIGINT RETURN cents(x) * 2")  # (one of the session's may call another)
+    got["mine"] = rows("SELECT cents(1.234) AS c, twice(3) AS t")
+    got["other"] = _raises_text(lambda: rows("SELECT cents(1.234) AS c", other))
+    got["again"] = _raises_text(lambda: db.sql("CREATE TEMP MACRO cents(x) AS 0"))
+    db.sql("CREATE TEMP MACRO IF NOT EXISTS cents(x) AS 0")
+    got["kept"] = rows("SELECT cents(2) AS c")
+    db.sql("CREATE OR REPLACE TEMP MACRO cents(x) AS round(x * 100)::BIGINT + 0")
+    checks["CREATE TEMP MACRO and TEMP FUNCTION: the session's own; another session hasn't it; IF NOT EXISTS keeps it, OR REPLACE replaces it"] = \
+        got["mine"] == [{"c": 123, "t": 600}] and "cents" in got["other"] and "exists" in got["again"] and got["kept"] == [{"c": 200}]
+    db.sql("CREATE MACRO tag(x) AS 'lake'")
+    got["lake first"] = rows("SELECT tag(1) AS t", other)  # (the same text, asked by another session first: never this session's answer)
+    db.sql("CREATE TEMP FUNCTION tag(x) RETURN 'mine'")
+    got["shadow"] = [rows("SELECT tag(1) AS t"), rows("SELECT tag(1) AS t", other)]
+    db.sql("DROP FUNCTION tag")
+    got["dropped"] = [rows("SELECT tag(1) AS t"), rows("SELECT tag(1) AS t", other)]
+    checks["a temporary function is used before the lake's of its name, for its session only (the result cache keeps them apart); DROP takes the session's"] = \
+        got["lake first"] == [{"t": "lake"}] and got["shadow"] == [[{"t": "mine"}], [{"t": "lake"}]] and got["dropped"] == [[{"t": "lake"}], [{"t": "lake"}]]
+    q = b"SELECT count(*) AS n, sum(cents(amount)) AS s FROM orders"
+    got["spread"] = [call(port, "POST", f"/sql?spread={s}", q, headers={"x-pondra-session": db.session}) for s in (0, 1)]
+    checks["a query calling one spreads over three nodes with the same answer (its body is in its place)"] = \
+        got["spread"][0] == got["spread"][1] and got["spread"][0][0]["n"] == 30000 and got["spread"][0][0]["s"] == 100 * 30000 * 30001 // 2
+    got["view"] = _raises_text(lambda: db.sql("CREATE VIEW in_cents AS SELECT cents(amount) AS c FROM orders"))
+    got["macro"] = _raises_text(lambda: db.sql("CREATE MACRO lake_cents(x) AS cents(x)"))
+    db.sql("CREATE TEMP VIEW my_cents AS SELECT cents(amount) AS c FROM orders WHERE id = 3")
+    got["temp view"] = rows("SELECT c FROM my_cents")
+    got["python"] = _raises_text(lambda: db.sql("CREATE TEMP FUNCTION py(x BIGINT) RETURNS BIGINT LANGUAGE python AS $$ return x $$"))
+    got["no session"] = _raises_text(lambda: call(port, "POST", "/sql", b"CREATE TEMP MACRO m(x) AS x"))
+    checks["a lake's view or function calling one is refused (a TEMP VIEW may); a Python one is the lake's; without a session, refused by name"] = \
+        "temporary function" in got["view"] and "temporary function" in got["macro"] and got["temp view"] == [{"c": 300}] \
+        and "a Python one is the lake's" in got["python"] and "x-pondra-session" in got["no session"]
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as pg:
+        pg.execute("CREATE TEMP MACRO pg_twice(x) AS x * 2")
+        got["pg"] = pg.execute("SELECT pg_twice(%s::BIGINT) AS t", (21,)).fetchall()
+    time.sleep(0.5)
+    with psycopg.connect(f"host=127.0.0.1 port={port + 10} user=u dbname=lake", autocommit=True) as pg:
+        got["pg gone"] = _raises_text(lambda: pg.execute("SELECT pg_twice(1)").fetchall())
+    checks["Postgres: a connection's temporary macro, gone when it ends"] = got["pg"] == [(42,)] and "pg_twice" in got["pg gone"]
+    return got
 
 
 def _temps_typed(checks, port):
@@ -24288,7 +24339,7 @@ def friendly():
              # (other databases' statements for what Pondra writes otherwise: `dialect_stmts.rs`)
              "SET NOCOUNT ON": "0A000", "SELECT [o].[id] FROM [dbo].[t] AS [o]": "0A000", "UPDATE t JOIN q ON t.k = q.k SET x = 1": "0A000",
              "DECLARE @n INT = 5": "0A000", "SELECT t.id FROM t CROSS APPLY (SELECT p FROM q WHERE q.k = t.k) AS x": "0A000", "EXPLAIN EXTENDED SELECT 1": "0A000",
-             "REPLACE INTO t VALUES (1)": "0A000", "SELECT 1 AS n OPTION (RECOMPILE)": "0A000", "SELECT DATABASE()": "0A000", "CREATE TEMP MACRO tm(x) AS x": "0A000",
+             "REPLACE INTO t VALUES (1)": "0A000", "SELECT 1 AS n OPTION (RECOMPILE)": "0A000", "SELECT DATABASE()": "0A000",
              "INSERT INTO t (id) OUTPUT inserted.id VALUES (99)": "0A000"}
     got_codes = {}
     for q_, want_ in coded.items():

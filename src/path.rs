@@ -567,6 +567,7 @@ struct Walk<'a> {
     world: Option<&'a World>, // (None: collecting)
     ctes: Vec<Vec<String>>,   // the CTE names of the queries around: `WITH t AS …` makes no table `t`
     temp: Vec<String>,        // the session's temporary tables and views, and the tables sent with the request
+    temp_routines: Vec<String>, // the session's temporary functions
     wanted: Vec<(Fam, String)>,
     changed: bool,
     view: bool,               // inside a stored view's query: its current_* stay, worked out as each reader reads it (`currents`)
@@ -577,15 +578,16 @@ impl<'a> Walk<'a> {
         let (tables, views) = crate::temp::listed();
         let sent = crate::query::SENT.try_with(|t| t.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()).unwrap_or_default();
         let temp = tables.into_iter().map(|(n, _)| n).chain(views.into_iter().map(|(n, _)| n)).chain(sent).collect();
-        Walk { path, skip, world, ctes: vec![], temp, wanted: vec![], changed: false, view: false }
+        Walk { path, skip, world, ctes: vec![], temp, temp_routines: crate::temp::routine_names(), wanted: vec![], changed: false, view: false }
     }
 
     /// Names a name the path never changes: a CTE, a temporary table, a table sent with the request
-    /// or one a view names (for a relation), Postgres's catalog, and a file or a table as it was
-    /// (`ext:`, `at:`).
+    /// or one a view names (for a relation), a temporary function, Postgres's catalog, and a file or
+    /// a table as it was (`ext:`, `at:`).
     fn free(&self, parts: &[String], fam: Fam) -> bool {
         let [n] = parts else { return false };
-        let shadowed = fam == Fam::Relation && (self.skip.contains(n) || self.temp.contains(n) || self.ctes.iter().any(|c| c.contains(n)));
+        let shadowed = fam == Fam::Relation && (self.skip.contains(n) || self.temp.contains(n) || self.ctes.iter().any(|c| c.contains(n)))
+            || fam == Fam::Routine && self.temp_routines.contains(n);
         shadowed || n.starts_with("pg_") || n.contains(['.', '/', ':']) // (a file's or a past's name: `"ext:…"`, `"at:…"`, `"x.parquet"`)
     }
 

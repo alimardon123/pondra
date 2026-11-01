@@ -56,6 +56,22 @@ SELECT * FROM on_day(DATE '2026-09-29');
 A stored view reads a function as it is now; a materialized view keeps the function as it was when
 the view was made.
 
+### Temporary functions
+
+`CREATE TEMP FUNCTION` (or DuckDB's `CREATE TEMP MACRO`) makes a SQL function that is the session's
+own: a Postgres connection's, or a Python or JavaScript client's until `close()`. Nobody else sees
+it, it is used before the lake's function of the same name, and it ends with the session, as a
+[temporary table](/pondra/sql/statements/#views) does. `DROP FUNCTION` drops it.
+
+```sql
+CREATE TEMP FUNCTION cents(x DOUBLE) RETURNS BIGINT RETURN round(x * 100)::BIGINT;
+SELECT item, cents(price) AS cents FROM sales ORDER BY id;
+```
+
+It is put in its calls' places like any SQL function, so a query that calls it still spreads over the
+nodes. A stored view or a lake function can't call one, since its other readers don't have it
+(a `CREATE TEMP VIEW` can). A Python function is the lake's: `TEMP … LANGUAGE python` is refused.
+
 ## Python functions
 
 `LANGUAGE python` takes the body of a function whose parameters are the names you declared.

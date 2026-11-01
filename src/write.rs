@@ -283,6 +283,7 @@ pub enum Stmt {
     CopyInto(String, crate::copy::Source, std::collections::BTreeMap<String, String>), // COPY INTO t FROM 'path' (options): each file loaded once a version (`copy.rs`)
     TempView(String, String, bool, bool),                  // CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] name AS query: the session's (`temp.rs`)
     TempSecret(String, std::collections::BTreeMap<String, String>, bool, bool), // CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…): the session's, in memory (`temp.rs`)
+    TempRoutine(String, Box<crate::expander::Routine>, bool, bool), // CREATE [OR REPLACE] TEMP MACRO | FUNCTION [IF NOT EXISTS] name …: the session's (`temp.rs`)
 }
 
 impl Stmt {
@@ -300,7 +301,7 @@ impl Stmt {
             Stmt::Create(c) => object(&c.name),
             Stmt::Define(t, _) | Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) | Stmt::AddColumn(t, ..) | Stmt::SetOptions(t, _) | Stmt::CopyInto(t, ..) => t.clone(),
             Stmt::Ddl(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) => String::new(),
-            Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) => v.clone(),
+            Stmt::TempView(v, ..) | Stmt::TempSecret(v, ..) | Stmt::TempRoutine(v, ..) => v.clone(),
             Stmt::Merge(m) => m.target.clone(),
         }
     }
@@ -640,6 +641,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
                 }
                 _ => d,
             }).collect()),
+            Some(Stmt::TempRoutine(name, r, replace, _)) => Stmt::TempRoutine(name, r, replace, true),
             other => other?,
         });
     }
@@ -822,6 +824,7 @@ pub fn parse(sql: &str) -> Option<Stmt> {
             let into = s.into.take()?;
             return parse(&format!("CREATE {}TABLE {} AS {q}", if into.temporary { "TEMP " } else { "" }, into.name));
         }
+        Statement::CreateMacro { or_replace, temporary: true, name, args, definition } => Stmt::TempRoutine(object(&name), Box::new(crate::routines::of_macro(&args, &definition)), or_replace, false), // (the session's: `temp.rs`)
         Statement::CreateMacro { or_replace, name, args, definition, .. } => Stmt::Ddl(vec![Ddl::CreateRoutine { name: object(&name), routine: crate::routines::of_macro(&args, &definition), replace: or_replace }]),
         Statement::DropFunction(ast::DropFunction { if_exists, func_desc: names, .. }) | Statement::DropProcedure { if_exists, proc_desc: names, .. } => {
             Stmt::Ddl(names.iter().map(|f| Ddl::DropRoutine { name: object(&f.name), if_exists }).collect())
@@ -1029,7 +1032,7 @@ pub(crate) fn rows_sql(meta: &TableMeta, stmt: &Stmt) -> Result<String> {
             ensure!(deletes, "DELETE needs an upsert table with a Boolean _deleted column");
             Ok(select(&|c: &str| if c == "_deleted" { "true".into() } else { q(c) }, t, cond))
         }
-        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) => unreachable!("not a row write here"),
+        Stmt::Create(_) | Stmt::Define(..) | Stmt::AddColumn(..) | Stmt::SetOptions(..) | Stmt::Ddl(_) | Stmt::Merge(_) | Stmt::Invalid(_) | Stmt::Refused(..) | Stmt::CopyTo(..) | Stmt::CopyInto(..) | Stmt::InsertInto(..) | Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => unreachable!("not a row write here"),
     }
 }
 

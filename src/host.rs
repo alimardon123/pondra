@@ -20,7 +20,7 @@ impl Host for Lake {
     // which the compiler reports as a cycle (E0391). `own` below is the same pass.)
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send { own(self, sql) }
 
-    async fn routines(&self) -> Result<Arc<HashMap<String, Routine>>> { crate::routines::listed(self).await }
+    async fn routines(&self) -> Result<Arc<HashMap<String, Routine>>> { Ok(crate::temp::routines(crate::routines::listed(self).await?)) } // (the session's temporary ones over the lake's)
 
     async fn attached(&self) -> Result<Vec<(String, Attached)>> { crate::ext::attached(self).await }
 
