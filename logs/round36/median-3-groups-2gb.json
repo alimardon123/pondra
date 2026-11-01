@@ -1,0 +1,140 @@
+{
+ "what": "The median over 3 groups of 60 M DECIMAL(15,2) values under a hard 2 GB cgroup cap (B50's median_3_groups: SELECT l_returnflag, median(l_extendedprice) FROM lineitem GROUP BY 1 ORDER BY 1). The rows are made like SF10's lineitem's flag and price (a quarter A, a quarter R, half N; prices 900.00 to 104,899.99), by CREATE TABLE AS over generate_series, not tpchgen's. One node, defaults (query memory a third of the cap, 683 MB; line 85% of it), 4 cores, 15 GB sandbox; each run a new text. Peak MB is the cgroup's, page cache included.",
+ "query": "SELECT l_returnflag, median(l_extendedprice) AS m FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag",
+ "answer": [
+  [
+   "A",
+   "52900.00"
+  ],
+  [
+   "N",
+   "52899.98"
+  ],
+  [
+   "R",
+   "52900.01"
+  ]
+ ],
+ "before": {
+  "build": "main 82bb987 with #396 (the median's path is the same as main's: refused, then the frugal retry's sort)",
+  "hot columns on (default)": {
+   "seconds": [
+    24.11,
+    30.23,
+    18.89
+   ],
+   "note": "the third run's first try was stopped by the memory watch (the node held 1756 MB, its line 1740 MB), the others refused by the pool"
+  },
+  "hot columns off": {
+   "seconds": [
+    23.93,
+    22.67
+   ]
+  },
+  "query memory needed for a first try (no cap, PONDRA_MEMORY_GB)": {
+   "0.67 to 1.3 GB": "refused (17-20 s on the retry)",
+   "1.8 GB": 2.64,
+   "2.5 GB": 2.35,
+   "3.5 GB": 0.91
+  },
+  "one partition (target_partitions = 1)": {
+   "0.67 GB": 40.26,
+   "0.9 GB": 42.02,
+   "1.2 GB": 2.04
+  }
+ },
+ "after": {
+  "build": "main 8c517d2 (with #396) and this change: held::HeldValues (the aggregate runs with no disk to spill to: its memory counts as memory that can't spill) and median::ChunkedMedian (values in chunks of 64 K, the middle picked between sampled bounds)",
+  "hot columns on (default)": {
+   "seconds": [
+    1.04,
+    0.78,
+    1.04,
+    1.21,
+    1.14,
+    1.2
+   ],
+   "peak_mb": 1779,
+   "first tries stopped by the watch": 0
+  },
+  "hot columns off": {
+   "seconds": [
+    0.86,
+    0.75,
+    0.78,
+    0.77,
+    0.83,
+    0.79
+   ],
+   "peak_mb": 1016
+  },
+  "on main 82bb987 (before #396), hot columns on, twice": {
+   "seconds": [
+    [
+     0.91,
+     0.8,
+     0.96,
+     1.04,
+     1.0,
+     0.84
+    ],
+    [
+     0.87,
+     0.79,
+     1.03,
+     1.19,
+     1.19,
+     1.04
+    ]
+   ],
+   "peak_mb": [
+    928,
+    1456
+   ],
+   "first tries stopped by the watch": 0
+  },
+  "on main 82bb987 (before #396), hot columns off": {
+   "seconds": [
+    1.37,
+    0.77,
+    0.77,
+    0.77
+   ],
+   "peak_mb": 1163
+  },
+  "held::HeldValues alone (DataFusion's arrays that double)": {
+   "hot columns on": [
+    1.59,
+    1.29,
+    0.8,
+    1.31,
+    1.66,
+    1.34
+   ],
+   "peak_mb": 1952
+  },
+  "chunks with the group copied into one array at its answer": {
+   "hot columns on": [
+    1.03,
+    0.85,
+    17.06,
+    1.33,
+    1.33,
+    1.21
+   ],
+   "peak_mb": 1987,
+   "note": "the third run's first try stopped by the watch (the node held 1748 MB, its line 1740 MB): the copy of the N group, 240 MB the pool doesn't count"
+  }
+ },
+ "duckdb 2.0.0": {
+  "setting": "memory_limit 1.5 GiB, in the same 2 GB cgroup, its own table loaded from the same Parquet files (2.1 s)",
+  "seconds": [
+   3.27,
+   3.08,
+   2.75,
+   2.76
+  ],
+  "answer": "the same"
+ },
+ "why": "DataFusion's FairSpillPool gives each consumer that may spill an even share of the pool, idle ones counted: on four partitions the median's aggregate had an eighth of 683 MB beside the exchanges and sorts, for 480 MB of values (Vec capacity 536 MB). With no disk to spill to, DataFusion counts it as memory that can't spill, which takes what the pool has free. DataFusion's arrays double as they fill: each doubling copies, and the freed array stays resident a while, so the node held up to twice what the pool counted. In chunks it holds what the pool counts, and the middle is picked from the values between two of 16 K sampled values (about a thirty-second of them), not from a copy of the group."
+}

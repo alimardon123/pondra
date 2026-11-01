@@ -4443,12 +4443,14 @@ def scale():
         grower[0] == 503 and grower[1] == "53200" and cheap_rows == [{"n": CHEAP_ROWS}])
     # A median holds its groups' values once, in one step (`held::HeldOnce`), and the pool counts them: a big one is refused
     # by the pool before the node reaches its memory line, and runs again in a frugal session, from a sort's middle rows
-    # (`frugal.rs`, MiddleRows). 48 M values in 3 groups (each id 16 times, 384 MB) on a 0.5 GB pool: no try of it is
-    # stopped by the watch, and no query is counted as stopped. (Until 11-01 DataFusion's two steps copied the values
-    # outside the pool: its first try passed the 1 GB line within a second, and the watch stopped it.)
+    # (`frugal.rs`, MiddleRows). 72 M values in 3 groups (each id 24 times, 576 MB) on a 0.5 GB pool: no try of it is
+    # stopped by the watch, and no query is counted as stopped. (DataFusion's two steps copied the values outside the
+    # pool: its first try passed the 1 GB line within a second, and the watch stopped it. Its values now take what the
+    # pool has free, `held::HeldValues`, in chunks the pool counts as they are, `median::ChunkedMedian`: held
+    # in arrays that doubled, 60 M values passed the line before the pool refused them.)
     time.sleep(11)
     settle()
-    copies = 16
+    copies = 24
     median_want16 = {}
     for g in range(3):
         ids_g = range(g or 3, 3000001, 3)
@@ -4465,7 +4467,7 @@ def scale():
     watch_stopped = first_tries() - tries_before
     memory_line["median_past_the_pool"] = {"answer": [medians16[0], medians16[1], medians16[2][:160]], "seconds": round(median16_seconds, 1),
                                            "tries_the_watch_stopped": watch_stopped, "want": median_want16}
-    checks[f"a median of 48M values past the pool answers on its frugal retry: its values are counted, so the pool refuses its first try before the node's memory line, and the watch stops no try ({round(median16_seconds, 1)} s)"] = (
+    checks[f"a median of 72M values past the pool answers on its frugal retry: its values are counted, so the pool refuses its first try before the node's memory line, and the watch stops no try ({round(median16_seconds, 1)} s)"] = (
         median16_rows is not None and [r["g"] for r in median16_rows] == [0, 1, 2]
         and all(abs(r["m"] - median_want16[r["g"]]) <= 1e-6 for r in median16_rows)
         and watch_stopped == 0 and metrics_of(port).get("pondra_queries_stopped_for_memory_total") == before_median)
