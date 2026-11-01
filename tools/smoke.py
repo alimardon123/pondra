@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A first run of a freshly built binary, on each OS it is built for (CI's build job): the shell
 takes statements on its input, a node serves SQL, schemas and views work, and the node knows the
-machine's memory and its own (on Windows and macOS there is no /proc to read them from); the
-shell attaches the lakes beside its own, for that session, and `FROM t` reads every column.
+machine's memory and its own (on Windows and macOS there is no /proc to read them from); an
+extension's .wasm built once on Linux runs here; the shell attaches the lakes beside its own, for that session, and `FROM t` reads every column.
 
   python3 tools/smoke.py path/to/pondra[.exe]
 
@@ -28,6 +28,13 @@ def main():
                            capture_output=True, text=True, timeout=180)
     checks["the shell runs statements from its input"] = "| 3 " in shell.stdout
     checks["the shell reads a file on this machine; CREATE DATABASE makes another lake"] = "| 4 " in shell.stdout and shell.stdout.count("| 4 ") == 2
+    # An extension built once, on Linux (extensions/hello, written with the kit in extensions/kit), runs on this OS too (ADR-075 E4)
+    hello = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures", "extensions", "hello-0.1.wasm")).replace("\\", "/")
+    ext = subprocess.run([BIN, os.path.join(work, "ext")], input=f"INSTALL hello FROM '{hello}';\nSELECT greet('Ada') AS g, add(2, 3) AS s, checked_div(7, 2) AS d;\n"
+                         "SELECT sum(square) AS sq FROM count_to(3);\n", capture_output=True, text=True, timeout=300,
+                         env={**os.environ, "PONDRA_ALLOW_UNSIGNED_EXTENSIONS": "true", "PONDRA_CACHE_DIR": os.path.join(work, "cache")})
+    checks["an extension's .wasm built on Linux installs and answers here: its functions and a table function"] = \
+        "hello, Ada" in ext.stdout and "| 5 " in ext.stdout and "| 3 " in ext.stdout and "| 14 " in ext.stdout
     port = 8099
     log = open(os.path.join(work, "node.log"), "w")
     node = subprocess.Popen([BIN, "serve", "--dir", os.path.join(work, "lake"), "--addr", f"127.0.0.1:{port}"], stdout=subprocess.DEVNULL, stderr=log)
@@ -92,7 +99,7 @@ def main():
     ok = all(checks.values())
     print(json.dumps({"smoke": checks, "platform": sys.platform, "ok": ok}, indent=1))
     if not ok:
-        print(shell.stdout, shell.stderr, beside.stdout, beside.stderr, elsewhere.stdout, typo.stderr, full.stderr, open(log.name).read()[-2000:], file=sys.stderr)
+        print(shell.stdout, shell.stderr, ext.stdout, ext.stderr, beside.stdout, beside.stderr, elsewhere.stdout, typo.stderr, full.stderr, open(log.name).read()[-2000:], file=sys.stderr)
         sys.exit(1)
 
 

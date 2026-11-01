@@ -239,6 +239,19 @@
   "register.setting",
   "register.view"
  ],
+ "extension_world": [
+  "pondra:clock/clock@1.0.0: now: func() -> s64",
+  "pondra:log/log@1.0.0: enum level { debug, info, warn, error }",
+  "pondra:log/log@1.0.0: write: func(level: level, message: string)",
+  "world extension-with-tables: export close: func(handle: u32)",
+  "world extension-with-tables: export next: func(handle: u32) -> result<option<list<u8>>, string>",
+  "world extension-with-tables: export open: func(name: string, arguments: list<u8>) -> result<u32, string>",
+  "world extension-with-tables: include extension",
+  "world extension: export call: func(name: string, batch: list<u8>) -> result<list<u8>, string>",
+  "world extension: export describe: func() -> string",
+  "world extension: import pondra:clock/clock@1.0.0",
+  "world extension: import pondra:log/log@1.0.0"
+ ],
  "http": [
   "ANY /db/{name}",
   "ANY /db/{name}/{*rest}",

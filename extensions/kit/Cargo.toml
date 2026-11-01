@@ -1,0 +1,18 @@
+# Write a Pondra extension in Rust (ADR-075, E4 in designs/extensions-before-1-0.md): functions over plain Rust values, made
+# into a WebAssembly component Pondra 1.x loads. A crate of its own, outside the node's workspace, built for
+# wasm32-unknown-unknown by its users (see README.md).
+[package]
+name = "pondra-extension"
+version = "0.1.0"
+edition = "2021"
+description = "Write a Pondra extension in Rust: scalar and table functions over plain Rust values"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc"] }
+arrow-array = { version = "59", default-features = false }
+arrow-ipc = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
+
+[workspace]

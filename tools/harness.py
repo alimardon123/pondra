@@ -16680,10 +16680,12 @@ def _jsonfns_bare_names(check, http_answer, http_error, port_answer, conn, info)
 
 
 def extensions():
-    """Extensions (ADR-075 E1-E2c): an admin installs a WebAssembly file once and every node of a cluster has its functions at
+    """Extensions (ADR-075 E1-E5): an admin installs a WebAssembly file once and every node of a cluster has its functions at
     once, by their own names; SHOW EXTENSIONS lists it after the built-ins; a query spread over three nodes answers as one node
     does, and a table function's rows come once; a function's own error is 38000 and a runaway call stops at PONDRA_EXTENSION_SECS with 57014, failing alone while the
-    nodes go on; a branch keeps the extension and its file; UNINSTALL takes the functions away on every node. A non-owner may
+    nodes go on; a file needing a capability this Pondra doesn't offer is refused naming it, and one using the clock and the
+    log works, its functions volatile and its lines in the node's log; a branch keeps the extension and its file; UNINSTALL
+    takes the functions away on every node. A non-owner may
     not install from a path on the node's machine, and a node started without PONDRA_ALLOW_UNSIGNED_EXTENSIONS refuses INSTALL
     by the variable's name."""
     fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../tests/fixtures/extensions/words-0.1.wasm")
@@ -16728,6 +16730,20 @@ def extensions():
         started = time.time()
         e = refused("SELECT spin(id) FROM notes LIMIT 1", 2)
         checks["a runaway call stops at PONDRA_EXTENSION_SECS with 57014, and the node goes on"] = "57014" in e and time.time() - started < 30 and q("SELECT word_count('still here') AS n", 2) == [{"n": 2}]
+        # E5: a part may use the node's log and the clock, and nothing else this Pondra doesn't offer
+        fixtures = os.path.dirname(fixture)
+        e = refused(f"INSTALL later FROM '{fixtures}/needs-http.wasm'")
+        checks["a file that needs a capability this Pondra doesn't offer is refused at INSTALL, naming it and the import (0A000)"] = \
+            "0A000" in e and "later (needs-http.wasm) needs pondra:http/http@1.0.0, which this Pondra doesn't offer" in e
+        q(f"INSTALL clocked FROM '{fixtures}/clocked-0.1.wasm'")
+        until(lambda: refused("SELECT now_us(1) AS t", 1), "", 15)  # (node 1 has it once the record reaches it)
+        stamped = q("SELECT now_us(1) AS t", 1)[0].get("t")
+        # (now_us(1) has a literal argument: a deterministic function's would be worked out once, a volatile one's per batch)
+        checks["a part's clock gives the time, on another node too, and makes its functions volatile (one call per batch)"] = \
+            isinstance(stamped, int) and abs(stamped / 1e6 - time.time()) < 60 and q("SELECT count(DISTINCT now_us(1)) AS n FROM notes")[0]["n"] > 1
+        q("SELECT say('hello from a harness') AS s")
+        checks["a part's log line is in the node's log with its name"] = "extension clocked: info: hello from a harness" in open(nodes[0].log).read()
+        q("UNINSTALL clocked")
         here, fork_at = q("SELECT name FROM pondra.databases")[0]["name"], f"{lake}-fork"
         LAKES.append(fork_at)
         q(f"CREATE DATABASE fork LOCATION '{fork_at}' CLONE \"{here}\"")
