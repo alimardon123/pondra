@@ -1001,6 +1001,12 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
         }
     };
     app.settle(&d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    let mut out = out;
+    if key.is_some() {
+        // (a renewal by a branch's key gets no key back: one given before the lake's keys were sealed would get the
+        // new one, which lets the pin go (11-01 audit L12), and the branch keeps the key it has: `branch::renew`)
+        out.as_object_mut().map(|o| o.remove("key"));
+    }
     Ok(Json(out))
 }
 

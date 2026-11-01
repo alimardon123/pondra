@@ -351,8 +351,8 @@ pub async fn unpin(lake: &Lake, branch: &str) -> Result<Value> {
 }
 
 /// A branch's key in this lake: its pin renewed and let go with it, nothing else (`keyed`).
-/// Derived from the lake's own key, so asked again (a retried CLONE) it is the same.
-/// (`sign_for` signs the same bytes as before, so keys already given stay good.)
+/// Derived from the lake's own key, so asked again (a retried CLONE) it is the same, until the
+/// lake's keys are made new as they are sealed (`users::seal_keys`).
 pub async fn key_for(lake: &Lake, branch: &str) -> Result<String> {
     Ok(format!("pb_{}", crate::users::sign_for(lake, "branch-key", branch.as_bytes()).await?))
 }
@@ -365,7 +365,19 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
         _ => bail!("permission denied: a branch's key renews or lets go of its own pin, and does nothing else"),
     };
     let want = key_for(lake, branch).await?;
-    ensure!(crate::crypto::same(want.as_bytes(), key.as_bytes()), "permission denied: not {branch}'s key");
+    if !crate::crypto::same(want.as_bytes(), key.as_bytes()) {
+        // (a key given before the lake's keys were sealed, signed with the sessions' key that was kept in the clear:
+        // whoever copied that from the bucket can make any branch's. It renews its pin, so a branch made then keeps
+        // reading its base; it never lets one go, which would have the base's retention delete what a branch reads
+        // (11-01 audit L12). Such a branch's pin, its lease no longer renewed once the branch is dropped, lapses.)
+        let old = crate::users::signed_before_sealing(lake, "branch-key", branch.as_bytes()).await?.map(|s| format!("pb_{s}"));
+        ensure!(old.is_some_and(|o| crate::crypto::same(o.as_bytes(), key.as_bytes())), "permission denied: not {branch}'s key");
+        ensure!(
+            !matches!(d, Ddl::Unpin { .. }),
+            "permission denied: {branch}'s key was given before {}'s keys were sealed, so it renews its pin and doesn't let it go: the pin lapses once it isn't renewed (PONDRA_PIN_LEASE_SECS)",
+            lake.url
+        );
+    }
     ensure!(matches!(d, Ddl::Unpin { .. }) || lake.cat.get::<Pin>(&pin_key(branch)).await?.is_some(), "permission denied: {branch} has no pin in {}: a branch's key renews its pin, it never makes one", lake.url);
     Ok(())
 }

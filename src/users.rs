@@ -794,8 +794,8 @@ impl Scram {
 struct Keys {
     session: String,
     node: String,
-    /// What branches' keys are signed with when it isn't the sessions' key (`sign_for`): the sessions' key from before
-    /// `seal_keys` made a new one, so the keys branches were given go on renewing their pins.
+    /// The sessions' key from before `seal_keys` made a new one: a branch's key given then still renews its pin with
+    /// it, and does nothing else (`signed_before_sealing`, `branch::keyed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branches: Option<String>,
 }
@@ -910,8 +910,8 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
             crate::format::require(lake, SEALED, "the lake's own keys, sealed").await?;
             // (keys in the clear could be read from the bucket, and copied: sealed, they'd go on signing in whoever
             // copied them, the nodes' key now from anywhere (`nodes_key`), so new ones are sealed (audit 10-31 M7).
-            // Everyone signs in again; a share's links and a sign-in's flow last minutes. Branches' keys, which last,
-            // are still signed with the old sessions' key: who copied it can renew or let go a branch's pin, no more)
+            // Everyone signs in again; a share's links and a sign-in's flow last minutes. Branches' keys given before,
+            // which last, still renew their pins with the old sessions' key, and let none go: `branch::keyed`)
             let k = Keys { session: new_session_key()?, node: new_node_key()?, branches: k.branches.or(Some(k.session)) };
             lake.cat.commit(vec![(KEYS.to_string(), json(&sealed(&k)?))], &[]).await?;
             KEYS_HERE.lock().unwrap().insert(lake.url.clone(), k.clone());
@@ -1009,13 +1009,13 @@ async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac2
 /// (`vend.rs`), a branch's key (`branch.rs`). The purpose is signed with it, so a value made for one is never
 /// taken for another, nor for a session, which alone is signed bare (`ps_`). Signed alike, a flow's cookie, a
 /// command line's code and a session each passed for the others (H1 of the 10-17 audit).
-pub async fn sign_for(lake: &Lake, purpose: &str, data: &[u8]) -> Result<String> {
-    let k = keys(lake).await?;
-    let key = match purpose {
-        "branch-key" => k.branches.unwrap_or(k.session),
-        _ => k.session,
-    };
-    Ok(B64U.encode(hmac256(&B64.decode(key)?, &labelled(purpose, data))))
+pub async fn sign_for(lake: &Lake, purpose: &str, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, &labelled(purpose, data)))) }
+
+/// `data` signed for `purpose` as `sign_for` signed it before `seal_keys` made the lake's keys new, if it did: with
+/// the sessions' key that was kept in the clear, which whoever copied it from the bucket can sign with too.
+pub async fn signed_before_sealing(lake: &Lake, purpose: &str, data: &[u8]) -> Result<Option<String>> {
+    let Some(old) = keys(lake).await?.branches else { return Ok(None) };
+    Ok(Some(B64U.encode(hmac256(&B64.decode(old)?, &labelled(purpose, data)))))
 }
 
 /// `payload` (base64url JSON) if `sig` is the lake's key's signature of it for `purpose` (`sign_for`).

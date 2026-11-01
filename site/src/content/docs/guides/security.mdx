@@ -368,7 +368,10 @@ write. One made without has them sealed when its leader next starts with one, on
 release that reads them sealed (the lake's format moves to 3). They are made new as they are sealed,
 since the ones kept in the clear could be read from the bucket: everyone signs in again, and the other
 nodes take the new ones from the bucket within seconds. So a key that only reads the bucket, such
-as a backup's or another environment's, can't sign anyone in. `GET /stats` says which in its `keys`
+as a backup's or another environment's, can't sign anyone in. A branch on another server keeps the
+key its pin was given before then. Since anyone who copied the old keys could make that key too, it
+only renews the pin, so the branch keeps reading; it never lets the pin go. Once that branch is
+dropped, its pin lapses after `PONDRA_PIN_LEASE_SECS`. `GET /stats` says which in its `keys`
 field: `"sealed"`, `"clear"` (kept in the clear), or `"none"` until the lake makes them. The key made
 for one machine never seals them, since a node on another machine couldn't open them.
 
