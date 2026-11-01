@@ -23685,6 +23685,10 @@ def friendly():
                                                                  "date_diff('month', DATE '2025-11-30', ts) AS m, date_diff('week', DATE '2025-12-20', ts) AS w, date_diff('quarter', DATE '2025-09-30', ts) AS q, "
                                                                  "datediff('year', DATE '2024-12-31', ts) AS y, date_diff('millisecond', TIMESTAMP '2026-01-01 00:00:00.0005', ts) AS ms FROM t", True, False),
         "date_add with an INTERVAL": ("SELECT id, date_add(ts, INTERVAL 7 DAY) AS a FROM t", True, False),
+        # (a DATE plus hours: a TIMESTAMP, as DuckDB answers; DataFusion kept the DATE and dropped them, `intervals::on_a_date`)
+        "a DATE plus or minus hours, minutes, a scaled interval, the interval first": (
+            "SELECT id, CAST(ts AS DATE) + INTERVAL '1 hour' AS a, CAST(ts AS DATE) - INTERVAL '90 minutes' AS b, INTERVAL '25 hours' + CAST(ts AS DATE) AS c, "
+            "CAST(ts AS DATE) + 3 * INTERVAL '30 minutes' AS e, CAST(ts AS DATE) + INTERVAL '1 day 2 hours' AS f FROM t", True, False),
         "json_extract, json_extract_string": ("SELECT id, json_extract(j, '$.a.b') AS b, json_extract_string(j, '$.s') AS s FROM t", True, False),
         "DuckDB's ASOF JOIN … ON": ("SELECT t.id, q.p FROM t ASOF JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
         "ASOF LEFT JOIN … ON": ("SELECT t.id, q.p FROM t ASOF LEFT JOIN q ON t.k = q.k AND t.ts >= q.ts", True, False),
@@ -23739,6 +23743,9 @@ def friendly():
         "DATEADD(day, 7, ts), dateadd('week', 2, ts), timestampadd(hour, -3, ts): as ts + INTERVAL …": (
             "SELECT id, DATEADD(day, 7, ts) AS a, dateadd('week', 2, ts) AS b, timestampadd(hour, -3, ts) AS c, DATEADD(quarter, 1, ts) AS q FROM t",
             "SELECT id, ts + INTERVAL 7 DAY AS a, ts + INTERVAL 14 DAY AS b, ts - INTERVAL 3 HOUR AS c, ts + INTERVAL 3 MONTH AS q FROM t"),
+        "DATEADD(hour, 2, a DATE): a TIMESTAMP, as a DATE plus hours is": ("SELECT id, DATEADD(hour, 2, CAST(ts AS DATE)) AS a FROM t", "SELECT id, CAST(ts AS DATE) + INTERVAL 2 HOUR AS a FROM t"),
+        "a DATE plus days or months stays a DATE": ("SELECT id, CAST(ts AS DATE) + INTERVAL '1 day' AS a, CAST(ts AS DATE) - INTERVAL '1 month' AS b FROM t",
+                                                     "SELECT id, CAST(CAST(ts AS DATE) + INTERVAL '1 day' AS DATE) AS a, CAST(CAST(ts AS DATE) - INTERVAL '1 month' AS DATE) AS b FROM t"),
         "MySQL's date_sub(ts, INTERVAL …): as ts - INTERVAL …": ("SELECT id, date_sub(ts, INTERVAL '1 month') AS b FROM t", "SELECT id, ts - INTERVAL '1 month' AS b FROM t"),
         "date_diff('week', …) either way: whole weeks of the days between": (
             "SELECT id, date_diff('week', DATE '2025-12-28', ts) AS a, date_diff('week', ts, TIMESTAMP '2025-12-20 12:00:00') AS b FROM t",
