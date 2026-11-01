@@ -78,15 +78,16 @@ fn key_url(node: &str, key: &str) -> String {
 /// `{node}/cluster/kv?from=F[&to=T]&limit=N[&since=C]`: the bounds' raw bytes, base64url without padding, a page's key count,
 /// and the commit the range's first page read as of (a later page's). `to` is left out when the range ends at `[0xff]` or
 /// beyond: the node then reads to the end of its keys, as the range does.
-fn scan_url(node: &str, from: &[u8], end: &[u8], limit: usize, since: Option<u64>) -> String {
+fn scan_url(node: &str, from: &[u8], end: &[u8], limit: usize, since: Option<(u64, &[u8])>) -> String {
     let mut q = url::form_urlencoded::Serializer::new(String::new());
     q.append_pair("from", &B64U.encode(from));
     if end < [0xff].as_slice() {
         q.append_pair("to", &B64U.encode(end));
     }
     q.append_pair("limit", &limit.to_string());
-    if let Some(since) = since {
-        q.append_pair("since", &since.to_string());
+    if let Some((since, start)) = since {
+        q.append_pair("since", &since.to_string()); // (and where the range starts: a key its first pages held may have moved)
+        q.append_pair("start", &B64U.encode(start));
     }
     format!("{node}/cluster/kv?{}", q.finish())
 }
@@ -158,7 +159,8 @@ impl Kv for Remote {
     /// The range, page after page of `PAGE` keys (`read_pages`).
     async fn scan(&self, range: Range<Vec<u8>>, _remote: bool) -> Result<BTreeMap<String, Bytes>, Error> {
         let end = &range.end;
-        read_pages(&range, |from, since| async move { self.ask(scan_url(&self.node, &from, end, PAGE, since)).await }).await
+        let start = &range.start;
+        read_pages(&range, |from, since| async move { self.ask(scan_url(&self.node, &from, end, PAGE, since.map(|s| (s, start.as_slice())))).await }).await
     }
 
     fn is_writer(&self) -> bool {
@@ -203,7 +205,7 @@ mod tests {
     fn remote_the_next_page_starts_past_its_last_key_and_asks_since_the_first_pages_commit() {
         let next = next_from("a");
         assert_eq!(next, [b'a', 0], "the first key past `a`: `a` and a NUL");
-        assert_eq!(scan_url("https://n", &next, &[0x62], PAGE, Some(7)), "https://n/cluster/kv?from=YQA&to=Yg&limit=5000&since=7");
+        assert_eq!(scan_url("https://n", &next, &[0x62], PAGE, Some((7, b"a"))), "https://n/cluster/kv?from=YQA&to=Yg&limit=5000&since=7&start=YQ");
     }
 
     #[test]

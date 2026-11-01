@@ -657,6 +657,7 @@ struct KvParams {
     to: Option<String>,
     limit: Option<usize>,
     since: Option<u64>,
+    start: Option<String>,
 }
 
 /// A page of a range on `GET /cluster/kv`: at most this many keys, and past about this many bytes of values it ends (after
@@ -668,8 +669,8 @@ const KV_BYTES: usize = 8 << 20;
 /// `{"value": …}` (null when there is none), `?from=F[&to=T][&limit=N]` answers `{"entries": [[key, value], …], "more": …,
 /// "at": …}` for the range [F, T): no `to` is to the end. `limit` (1 to 5,000) is the page's keys at most; `more` says keys
 /// follow it, which the next request asks for (from the last key + `"\0"`, the same `to`), and `at` is the commit the
-/// page was read as of. A range's later pages ask `since=` the first page's `at`, and `moved` says a key the caller may
-/// see in the range changed after that commit (then the range starts over). A caller that isn't one of the nodes
+/// page was read as of. A range's later pages ask `since=` the first page's `at` and `start=` the range's own start, and
+/// `moved` says a key the caller may see from that start to `to` changed after that commit (then the range starts over). A caller that isn't one of the nodes
 /// (`nodes_own`) is answered only for the keys `objects::readable` allows.
 async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Value>, Response> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
@@ -715,7 +716,11 @@ async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Va
         }
     };
     // (`since`: a page after the first of a range asks whether the keys it may see moved since that first page's `at`)
-    let moved = p.since.is_some_and(|since| cat.moved_since(&from, &to, since, at, &may));
+    let start = match p.start {
+        Some(start) => text(&start)?, // (the range's own start: its earlier pages' keys count too)
+        None => from.clone(),
+    };
+    let moved = p.since.is_some_and(|since| cat.moved_since(&start, &to, since, at, &may));
     let entries: Vec<(String, String)> = kept.into_iter().map(|(k, v)| (k, B64.encode(v))).collect();
     Ok(Json(j!({"entries": entries, "more": more, "at": at, "moved": moved})))
 }
