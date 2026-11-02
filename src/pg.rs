@@ -505,7 +505,10 @@ impl Backend {
         Ok(Response::Query(rows(&schema, batches, format)?))
     }
 
-    /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE.
+    /// `run`, the notices its procedures send (what they print) sent first: psql shows NOTICE. They wait in the client's
+    /// buffer (`feed`) and leave with the answer, in its one write (pgwire feeds an answer and writes it at ReadyForQuery):
+    /// a write each, a DO that printed 8 lines took 9 writes, and a connection idle a while sends its first ones slowly
+    /// (TCP's slow start after idle).
     async fn told<C: Sink<PgWireBackendMessage> + Unpin + Send>(&self, client: &mut C, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
         let t0 = std::time::Instant::now();
         let me = self.me.upgrade().expect("its connection holds it");
@@ -516,7 +519,7 @@ impl Backend {
         };
         let (out, heard) = crate::panics::work(true, Box::pin(run)).await.unwrap_or_else(|m| (Err(user_error(anyhow::anyhow!(m))), vec![])); // (stoppable for memory: `oom.rs`)
         for n in heard {
-            let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
+            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), n).into())).await; // (a client gone: the answer fails too)
         }
         if trace() {
             eprintln!("pg told: {} µs: {}", t0.elapsed().as_micros(), sql.chars().take(60).collect::<String>());
@@ -610,7 +613,7 @@ impl Backend {
         crate::txn::gate(&self.app.lake, &format!("COPY {} FROM STDIN", c.table)).map_err(user_error)?;
         if crate::txn::open() {
             let note = "COPY ran at once: it isn't part of a transaction here, and ROLLBACK won't undo it";
-            let _ = client.send(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), note.into()).into())).await;
+            let _ = client.feed(PgWireBackendMessage::NoticeResponse(ErrorInfo::new("NOTICE".into(), "00000".into(), note.into()).into())).await; // (written with CopyInResponse: `told`)
         }
         let (other, table) = crate::ddl::resolve(&self.app.lake, &c.table).await.map_err(user_error)?;
         if other.is_some() {
@@ -1253,7 +1256,8 @@ impl CopyHandler for Backend {
     {
         let Some(mut p) = COPIES.lock().unwrap().remove(&client.socket_addr()) else { return Err(user_error(anyhow::anyhow!("COPY done without a COPY"))) };
         self.load(&mut p, true).await?;
-        client.send(PgWireBackendMessage::CommandComplete(Tag::new("COPY").with_rows(p.rows as usize).into())).await?;
+        // (written with the ReadyForQuery that follows: pgwire's, or the Sync's in the extended protocol)
+        client.feed(PgWireBackendMessage::CommandComplete(Tag::new("COPY").with_rows(p.rows as usize).into())).await?;
         Ok(())
     }
 }
