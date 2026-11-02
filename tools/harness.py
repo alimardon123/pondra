@@ -8170,10 +8170,14 @@ def hot_under_line():
             return True
         except OSError:  # not allowed here: the peak then counts from the node's start, the warm-up included
             return False
-    def warm(table):  # the table's columns held and resident memory settled: the state each check starts from
-        for run in range(2):  # (a file's columns load on its second read)
+    def warm(table, want=1):  # the table's columns held (`want` bytes at least) and resident memory settled: the state each check starts from
+        # (a file's columns load on its second read, so a file a merge made after the first read is held only after a
+        # third: on a CI run hw's merges left 96 MB held after two reads, where 192 MB is usual. It is read again until the
+        # cache holds `want`, six times at most)
+        for run in range(6):
             q(f"SELECT sum(a) AS a, sum(b) AS b, sum(c) AS c, sum(d) AS d FROM {table} -- warm {run}")
-        hot_settled(A.port)
+            if run >= 1 and hot_settled(A.port) >= want:
+                break
         resident_settled(node.p.pid)  # (the decoding's memory goes back first: the cache is read in steady state)
         return hot_bytes(), resident_of(node.p.pid)
     checks, seen = {}, {}
@@ -8210,7 +8214,7 @@ def hot_under_line():
         node.kill()
         node = Node(lake, A.port, env=env).start()
         seen["files of hw once the leader's first tiering rounds are done"] = files_settled(lake, "data/hw/")
-        held_before2, rss_before2 = warm("hw")
+        held_before2, rss_before2 = warm("hw", HOT_HELD_BYTES)
         peak_reset = reset_peak()  # the peak from here is the query's own (VmHWM); where clear_refs isn't allowed it counts from the node's start
         stopped_before2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
         big = 8 * HOT_LINE_ROWS
