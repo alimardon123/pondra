@@ -106,6 +106,14 @@ contract is versioned, not the build.
     fields it doesn't know.
   - `call(name, batch) → batch` for scalars; `open`, `next`, `close` for tables; `init`, `update`,
     `merge`, `finish` for aggregates. A batch is Arrow IPC bytes.
+  - **Async, with no new 1.0 world** (11-02, so a model's answer can be awaited inside a live view): a
+    function whose answer waits on the network says `"async": true` in `describe()`. It still answers
+    through `call`, one batch at a time, so every 1.x host serves it. A later host that awaits calls
+    (the component model's async, WASI 0.3) calls it through a `call-async` export beside `call`, with
+    many batches in flight and no thread held; the kit writes both exports from the one async function.
+    A 1.0 host passes over the field, as over any it doesn't know, and holds a thread for each call
+    (one a core, `PONDRA_EXTENSION_SECS` each). How a host runs a call is its own business, never the
+    contract, so any 1.x may move from threads to awaiting.
 - **Capabilities are separate imports, each versioned on its own:** `request@1`, `log@1`, `clock@1`,
   `http@1` (fetch, to granted hosts only), `secret@1`, `files@1` (byte ranges of granted files). New
   powers come as new imports. An import's `@2`, if ever needed, comes beside its `@1`, which stays.
