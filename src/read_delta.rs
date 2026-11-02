@@ -28,15 +28,15 @@ pub struct Log {
     pub protocol: Value,
     pub metadata: Value,
     files: HashMap<String, Value>, // add actions, by logical file (its path and deletion vector)
-    pub txns: std::collections::HashSet<String>, // the writers' transactions applied (their app ids)
+    pub txns: HashMap<String, u64>, // the writers' transactions applied (their app ids), by the version that holds each
 }
 
 impl Log {
     /// The table's files, as their add actions.
     pub fn live(&self) -> impl Iterator<Item = &Value> { self.files.values() }
 
-    /// One action. A checkpoint's removes are tombstones for cleanup: its adds are the table.
-    fn apply(&mut self, a: &Value, checkpoint: bool) {
+    /// One action, of the commit (or checkpoint) at version `at`. A checkpoint's removes are tombstones for cleanup: its adds are the table.
+    fn apply(&mut self, a: &Value, at: u64, checkpoint: bool) {
         if let Some(p) = a.get("protocol") {
             self.protocol = p.clone();
         }
@@ -50,7 +50,7 @@ impl Log {
             self.files.remove(&logical(r));
         }
         if let Some(id) = a["txn"]["appId"].as_str() {
-            self.txns.insert(id.to_string());
+            self.txns.insert(id.to_string(), at);
         }
     }
 }
@@ -151,7 +151,7 @@ pub async fn replay(reach: &impl Reach, root: &str, version: Option<i64>) -> Res
     for v in log.version + 1..=upto {
         let name = commits.get(&v).with_context(|| format!("{root}: the log has no commit {v} (its retention removed it?)"))?;
         for a in lines(&crate::reach::get(reach, &format!("{root}/_delta_log/{name}")).await?)? {
-            log.apply(&a, false);
+            log.apply(&a, v as u64, false);
         }
         log.version = v;
     }
@@ -173,7 +173,7 @@ async fn replay_from_start(reach: &impl Reach, root: &str, version: Option<i64>)
 async fn from_checkpoint(reach: &impl Reach, root: &str, version: i64, files: &[String]) -> Result<Log> {
     let mut log = Log { version, ..Default::default() };
     for a in checkpoint(reach, root, files).await? {
-        log.apply(&a, true);
+        log.apply(&a, version as u64, true);
     }
     Ok(log)
 }
@@ -268,7 +268,7 @@ async fn apply_commits(reach: &impl Reach, root: &str, log: &mut Log, version: O
             };
         };
         for a in lines(&body)? {
-            log.apply(&a, false);
+            log.apply(&a, k as u64, false);
         }
         log.version = k;
         k += 1;
@@ -306,6 +306,12 @@ async fn parquet_actions(reach: &impl Reach, urls: Vec<String>) -> Result<Vec<Va
 
 fn lines(body: &[u8]) -> Result<Vec<Value>> {
     body.split(|b| *b == b'\n').filter(|l| !l.iter().all(u8::is_ascii_whitespace)).map(|l| Ok(serde_json::from_slice(l)?)).collect()
+}
+
+/// One commit's actions, as the log holds them at `version`; None if there is no such commit (the log's retention removed it).
+pub async fn commit_at(reach: &impl Reach, root: &str, version: u64) -> Result<Option<Vec<Value>>> {
+    let Some(body) = crate::reach::found(reach, &format!("{root}/_delta_log/{version:020}.json")).await? else { return Ok(None) };
+    Ok(Some(lines(&body)?))
 }
 
 /// Refuse a table whose reading needs what isn't done here.
@@ -612,6 +618,21 @@ mod tests {
         put(&web, &format!("{root}/_delta_log/_last_checkpoint"), br#"{"version":1,"v2Checkpoint":{"path":"../../secret.json"}}"#.to_vec()).await;
         let err = replay(&web, &root, None).await.err().expect("refused");
         assert!(err.to_string().contains("outside its log"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_txn_is_kept_at_the_version_whose_commit_holds_it() {
+        let web = web();
+        let root = format!("{ROOT}/txn");
+        let mut all = commits();
+        all[1].push(r#"{"txn":{"appId":"pondra:job-1","version":0,"lastUpdated":0}}"#.to_string());
+        for (v, actions) in all.iter().enumerate() {
+            put(&web, &format!("{root}/_delta_log/{v:020}.json"), commit(actions)).await;
+        }
+        assert_eq!(replay(&web, &root, None).await.unwrap().txns.get("pondra:job-1"), Some(&1));
+        let actions = commit_at(&web, &root, 1).await.unwrap().expect("commit 1");
+        assert!(actions.iter().any(|a| a["txn"]["appId"].as_str() == Some("pondra:job-1")));
+        assert!(commit_at(&web, &root, 7).await.unwrap().is_none(), "a commit the log doesn't hold");
     }
 
     #[tokio::test]

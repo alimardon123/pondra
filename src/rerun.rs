@@ -602,7 +602,7 @@ pub(crate) async fn table_columns(lake: &Lake, sql: &str, ctx: &datafusion::prel
 /// Make view `name` run again by key or whole (leader only): its table gets the query's columns,
 /// and its first run works every group out (`ddl::settle` waits for it). `why`: None when asked.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &TableMeta, upstream: Option<&View>, plan: &LogicalPlan, how: How, why: Option<String>, lag_secs: Option<u64>) -> Result<()> {
+pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &TableMeta, upstream: Option<&View>, plan: &LogicalPlan, how: How, why: Option<String>, lag_secs: Option<u64>, from: Vec<String>, written: Option<String>) -> Result<()> {
     let asked = why.is_none();
     let (keys, joins, full, reason) = match how {
         How::ByKey => {
@@ -631,7 +631,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, source: &str, src: &Tabl
     let (columns, sql_types) = table_columns(lake, sql, &ctx, plan).await?;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
     let r = Rerun { id: uuid::Uuid::new_v4().to_string(), keys, full, reason, asked, lag_secs, joins };
-    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: Some(r), matches: None, from: vec![] };
+    let view = View { source: source.into(), sql: sql.into(), emit: None, sessions: None, ids: false, join: None, fill: None, expect: vec![], once: None, written, rerun: Some(r), matches: None, from };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (crate::views::view_key(name), json(&view))], &[]).await
 }
 

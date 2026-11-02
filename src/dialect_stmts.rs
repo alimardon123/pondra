@@ -323,7 +323,7 @@ mod tests {
             "UPDATE t SET a = (SELECT b FROM o JOIN p ON o.k = p.k LIMIT 1)", "ALTER TABLE t ALTER COLUMN change TYPE INT", "ALTER TABLE t RENAME COLUMN modify TO m",
             "SELECT l[1] FROM t", "SELECT [1, 2] AS a, x.apply FROM t x", "SELECT 'CROSS APPLY' AS s", "SELECT 1 -- SET NOCOUNT ON", "SELECT a FROM t JOIN u ON t.k = u.k",
             "INSERT OR REPLACE INTO t VALUES (1)", "CREATE OR REPLACE MACRO m(x) AS x + 1", "CREATE TEMP TABLE t (a INT)", "CREATE TEMP VIEW v AS SELECT 1", "CREATE TEMP MACRO m(x) AS x + 1", "CREATE OR REPLACE TEMPORARY FUNCTION f(x INT) RETURN x", "ALTER TABLE t ADD COLUMN after INT",
-            "ALTER TABLE t ADD COLUMN first INT", "ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note", "ALTER TABLE t ADD c INT FIRST", "ALTER TABLE t ALTER COLUMN c AFTER b",
+            "ALTER TABLE t ADD COLUMN first INT", "ALTER TABLE t ADD COLUMN channel VARCHAR(20) AFTER note", "ALTER TABLE t ADD c INT FIRST", "ALTER TABLE t ALTER COLUMN c AFTER b", "ALTER VIEW v ALTER COLUMN c FIRST", "ALTER MATERIALIZED VIEW m ALTER c AFTER b",
             "ALTER TABLE t ALTER c FIRST", "SELECT current_user, current_database(), current_schema()", "CREATE FUNCTION user() AS 1", "SELECT flatten([[1], [2]])",
             "SELECT items[i].sku FROM t", "SELECT (l)[k].x, m[j].y FROM t", "ALTER TABLE t ADD a INT, ADD COLUMN after TEXT",
             "SELECT * FROM orders AT (TIMESTAMP => now())", "SELECT count(*) FROM past FOR SYSTEM_TIME AS OF (now())", "SELECT * FROM t FOR UPDATE", "CREATE TABLE t (a INT) WITH (option = 'x')", "INSERT INTO t (output) VALUES (1) RETURNING output",
