@@ -1,4 +1,6 @@
-## What's new in 0.34.0 (since 0.33.0)
+## What's new in 0.80.0 (since 0.33.0)
+
+0.34.0 was never published (PyPI and npm are at 0.33.0, and there is no `v0.34.0` tag), so what it changed comes with 0.80.0.
 
 - **Secure by default.** A node that listens beyond its own machine is never open now. With no token, its leader makes the lake's first user, `pondra`, and prints its token once, and `pondra token --dir LAKE` makes another one with the node up or down. A node started by the shell, `local()` or a project command answers only that program, and a lake once served with tokens never opens up again when a node is started on it without them. From another machine a password crosses only TLS, and ten wrong passwords in a minute lock out that address for that user, not everyone. An open node refuses web pages from other sites, so a page you visit can't send it SQL. With an admin token and no `PONDRA_SECRET_KEY`, the token seals the lake's own keys and secrets. The row doors check the INSERT grant (Flight's DoPut and Kafka's produce too, where a user granted one table could write another through Flight), the audit log, the statement history and the run log take no statement's rows and stream to superusers only, a change forwarded to the leader runs as its user, and a user is shown only the tables it may read and routines without their code, in Postgres's catalog too. Wrong passwords are counted on the Postgres port and Flight as on HTTP, and Flight signs a call in before it reads the call's body. A temporary secret made by anyone but an admin reads with its own keys on the public internet only, never the node's credentials, its machine or its network. A secret's `SCOPE` covers a URL only whole or followed by `/`, `?` or `#`, so `s3://data` no longer covers `s3://data-other/`. Loading a table with a primary key through `/append`, Flight, Kafka or `COPY` asks UPDATE as well as INSERT, and rows marked deleted ask DELETE. The installers check the release's SHA-256.
 - **Pondra in your process.** `pondra.connect()` is the one way in, in Python and JavaScript. With no argument, or `":memory:"` as DuckDB spells it, it opens a lake held in memory with nothing on disk. A folder or a bucket URL opens that lake with its node in this process, and an `http(s)://` URL reaches a node somewhere. `pondra :memory:` and `pondra serve :memory:` do the same from the command line. A lake in this process answers live queries, watches and big answers through the library, Ctrl-C stops a long query, and closing it takes 0.02 s instead of 0.9 s. The packages carry one library, on jemalloc on Linux as the program is, so `pip install pondra` gives memory back and runs TPC-H as fast as the release archive. Ten million rows reach pandas in 0.92 s, against 1.25 s for DuckDB 1.5.5.
@@ -15,23 +17,60 @@
 
 ### Upgrading from 0.33.0
 
-- **A node on the network asks everyone to sign in.** Use the token it prints once, make one with `pondra token --dir LAKE`, or give every node `--admin-token`. A cluster with an admin token and no `PONDRA_SECRET_KEY` needs the same admin token on every node, since that token seals the lake's keys.
-- **The lake's format moves** once every node runs 0.34.0, and only when a write needs it: to 3 when the lake's own keys are sealed (by `PONDRA_SECRET_KEY` or a shared admin token, which happens at the leader's first start with one), to 4 with a grant on another database. 0.33.0 then refuses the lake by name: take a backup before upgrading if you may need to go back.
-- **Transactions are READ COMMITTED by default,** with writers that wait. `SERIALIZABLE` is refused by name, and `FOR UPDATE` really locks.
-- **Errors carry their HTTP status by SQLSTATE:** a bad statement, a table definition refused or a body that can't be read is 400, a missing name 404, a conflict 409, a feature not taken yet 501, a busy or catching-up node 503. Before, almost every error was 500.
-- **Refused now, where they were taken quietly:** `--pg`, `--kafka` or `--flight` on a port another program holds (the node no longer starts without that door), an `INSERT INTO` a name no table has (42P01; `CREATE TABLE … AS SELECT` makes one), rows for a table dropped or renamed away (42P01), a `read_*` option given twice, a positional argument after a named one, a value longer than its `VARCHAR(n)` (22001, as Postgres refuses it) and a table with two primary keys (42P16).
-- **`connect()` replaces `local()` and `open()`,** which still work, with a warning, until 1.0.
-- **Answers over the Postgres port carry Postgres's column names:** `count(*)` is `count`, `1` is `?column?`, a cast takes its type's name. HTTP, Flight and MCP keep the names they had. `avg` over a DECIMAL may differ from 0.33.0 in its last place, now rounded rather than cut off.
-- **Secrets:** a temporary secret made by a user who isn't an admin reaches only the public internet. An admin's `CREATE SECRET … SCOPE '…'` with `GRANT USAGE` is the way to private buckets and services. Loads into a table with a primary key need UPDATE as well as INSERT, and deletes through a load need DELETE.
-- **Metrics:** `pondra_object_requests_total{op="write"}` now counts each part of a multipart upload, and a scan's reads are counted too (`op="read"`).
-- **Renamed:** `deploy` is `apply` (`pondra apply`, `GRANT APPLY`, `pondra.applies`). `pondra dev`, `pondra branch --hook` and `--if-missing` are gone.
-- **The planner's learned facts are off by default** (`PONDRA_LEARN=on` turns them on). Runs still learn them, and `pondra.learned` lists them.
-- **Clients:** `from pondra import *` no longer replaces Python's `sum`, `len`, `max`, `min` and `all`. JavaScript's `local()` takes `timeout` in seconds. ADBC's Flight SQL connections open a transaction unless `autocommit=True`. A string column is `text` in the Postgres catalog.
-- **New settings:** `PONDRA_QUERIES`, `PONDRA_QUEUE_SECS`, `PONDRA_STREAM_MB`, `PONDRA_STATEMENT_TIMEOUT`, `PONDRA_TRUSTED_PROXIES` (set it when your own load balancer fronts the nodes), `PONDRA_TXN_IDLE_SECS`, `PONDRA_BLOCKING_THREADS`.
+The full guide, with each step: [Upgrading to 0.80](https://alimardon123.github.io/pondra/guides/upgrades/#upgrading-to-080).
 
-### Known in 0.34.0
+**Sign-in**
 
-- A `MERGE` whose `ON` doesn't name the table's primary key, run outside a transaction, can replace a row whose key its `WHEN NOT MATCHED THEN INSERT` inserts, where Postgres refuses it with 23505. It has been so since `MERGE` came, and the next release refuses it. Until then, put the key in the `ON`.
+- **A node on the network with no token now asks everyone to sign in.** Its leader makes the lake's first user, `pondra`, before it serves, and prints its token once on its standard error; `pondra token --dir LAKE` makes another, with the node up or down. Before you upgrade such a cluster, give every node `--admin-token` (the same one), or read the token from the new leader's log.
+- **With an admin token and no `PONDRA_SECRET_KEY`, the admin token is the master key:** it seals the lake's own keys and its secrets, so every node needs the same one. To change it, start the leader with the new one and the old one in `PONDRA_ADMIN_TOKEN_PREVIOUS`.
+- **A node the shell or a `connect()` starts answers only that program**, a token or a signed-in user.
+- **A lake whose nodes share a master key moves to format 3** as soon as every node runs 0.80.0 (an admin token, `PONDRA_SECRET_KEY`, `PONDRA_KMS_COMMAND`, or `PONDRA_SHARED_KEY_FILE`, which the Compose file sets). Its leader seals the lake's own keys and makes them new, so everyone signed in to the console signs in again; tokens keep working. A grant on another database moves it to format 4, an identity provider to format 5. 0.33.0 refuses the lake from then on: keep a copy of it from before the upgrade if you may need to go back.
+
+**Writes refused as Postgres refuses them** (0.33.0 took them, some by changing a row you didn't mean to change)
+
+- A plain `INSERT` of a primary key the table already holds (23505), which 0.33.0 took as a replace. To replace a row, write `INSERT … ON CONFLICT (id) DO UPDATE`, `MERGE` or `INSERT OR REPLACE`.
+- A `MERGE` whose `ON` doesn't name the key, when its `WHEN NOT MATCHED THEN INSERT` inserts a key the table holds (23505).
+- An `INSERT … ON CONFLICT DO UPDATE` that gives one key twice (21000). `DO NOTHING` keeps the first.
+- A row with more values than the table has columns (42601). A keyed table's delete marker, `_deleted`, is given only by name.
+- A value for a `GENERATED ALWAYS` identity column (428C9), and a value longer than its `VARCHAR(n)` (22001).
+- An `INSERT INTO` a name no table has (42P01; `CREATE TABLE … AS SELECT` makes one), rows for a table dropped or renamed away (42P01), and a table with two primary keys (42P16).
+- A database, an attached lake or a catalog named `pondra` (42939).
+- `--pg`, `--kafka` or `--flight` on a port another program holds: the node doesn't start, where 0.33.0 started without that door.
+
+**Answers that change**
+
+- A decimal or a float cast to an integer rounds, as Postgres and DuckDB round it, where 0.33.0 cut toward zero: `CAST(2.5 AS INT)` is 3, `CAST(-2.5 AS INT)` is -3, `2.5::DOUBLE::INT` is 2 (half to even). A value written into an integer column rounds the same way.
+- A `DATE` plus hours, minutes or seconds is a `TIMESTAMP` (`DATE '2026-01-01' + INTERVAL '25 hours'` is `2026-01-02 01:00:00`); a date plus days or months is still a `DATE`.
+- Text written into a `BYTEA` column is read as Postgres reads it: `'\x00ff'` is two bytes.
+- A string compared with a `jsonb` column is compared as JSON.
+- A `DOUBLE` that meets a `DECIMAL` is a `DOUBLE`, and `avg` over a `DECIMAL` rounds its last place where 0.33.0 cut it off.
+- Over the Postgres port, columns have Postgres's names (`count(*)` is `count`, `1` is `?column?`, a cast takes its type's name), and a string column is `text` in the Postgres catalog. HTTP, Flight and MCP keep the names they had.
+- `date_format(ts, '%d/%m/%Y')` and a JSON path after `->>` (`payload->>'$.a.b'`) read as MySQL reads them; 0.33.0 answered both wrongly.
+
+**Transactions, errors and grants**
+
+- READ COMMITTED is the default: a write locks its rows until its transaction ends, and a second writer waits its turn instead of failing at `COMMIT` with 40001. `SELECT … FOR UPDATE` locks, and `SERIALIZABLE` is refused by name (0A000). ADBC's Flight SQL connections open a transaction unless `autocommit=True`.
+- An error's HTTP status follows its SQLSTATE (400 a bad statement or value, 401 sign in, 403 not granted, 404 a missing name, 409 a conflict such as a duplicate key, 429 too many queries at once, 501 a feature not taken yet, 503 a busy or catching-up node), where 0.33.0 answered almost every error with 500.
+- Loading a table with a primary key through `/append`, Flight, Kafka or `COPY` asks the UPDATE grant as well as INSERT, and rows marked deleted ask DELETE.
+- A temporary secret made by a user who isn't an admin reaches only the public internet, with its own keys; an admin's `CREATE SECRET … SCOPE '…'` with `GRANT USAGE` is the way to private buckets and services. A `SCOPE` covers a URL only whole or followed by `/`, `?` or `#`.
+- The nodes' own routes, `/cluster/…`, answer only the nodes: a user's sign-in, a superuser's too, gets 403 there.
+- Behind a load balancer of your own, set `PONDRA_TRUSTED_PROXIES` to its addresses, so one client's wrong passwords lock out only that client.
+
+**Commands and clients**
+
+- `deploy` is `apply`: `pondra apply`, `GRANT APPLY` and `pondra.applies`. `pondra dev`, `pondra branch --hook` and `--if-missing` are gone.
+- `connect()` replaces Python's `pondra.local()` and `pondra.open()` and JavaScript's `local()`, which still work, with a warning, until 1.0.
+- `from pondra import *` no longer replaces Python's `sum`, `len`, `max`, `min` and `all`. JavaScript's `local()` takes `timeout` in seconds.
+- `EXECUTE TASK` runs the task's whole graph, suspended tasks too; a scheduled run still skips a suspended task and what follows it.
+
+**Memory, disks and metrics**
+
+- A lake on a local folder flushes each write to the disk before it acknowledges it, so small writes there cost a disk flush each. A lake in a bucket writes as it did.
+- A node keeps the columns queries read lately decoded in memory, up to half of the machine's memory (`PONDRA_HOT_GB`), and gives it back as queries need it. Where the node shares its machine, set `PONDRA_HOT_GB` lower.
+- A node's local copy of the lake and its spills are in `<temp dir>/pondra-cache-<uid>` unless `--cache-dir` says otherwise; the old `<temp dir>/pondra-cache` can be deleted.
+- The planner's learned facts are off by default (`PONDRA_LEARN=on` uses them); runs still learn them, and `pondra.learned` lists them.
+- `pondra_object_requests_total{op="write"}` counts each part of a multipart upload, and a scan's reads are counted too (`op="read"`).
+- New settings: `PONDRA_QUERIES`, `PONDRA_QUEUE_SECS`, `PONDRA_STREAM_MB`, `PONDRA_STATEMENT_TIMEOUT`, `PONDRA_TRUSTED_PROXIES`, `PONDRA_TXN_IDLE_SECS`, `PONDRA_BLOCKING_THREADS`.
 
 The details are in each pull request, and the measures in [`logs/gates/`](https://github.com/alimardon123/pondra/tree/main/logs/gates).
 
