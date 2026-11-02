@@ -75,22 +75,26 @@ enum TableSpec {
 }
 
 /// Leader: `TableMeta::shown` for SQL's order `sql` (SQL's names, every live column but `_deleted`): empty when that is
-/// the stored order. Refused while something reads the table by position (`ddl::by_position`): its columns would move.
-async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String]) -> Result<Vec<String>> {
+/// the stored order. What reads the table by position keeps reading it as it did, without `added` (the columns this ALTER
+/// adds, wherever they go: a task's `*` would give one more column than its target has) (`ddl::keep_readers`): the
+/// catalog's writes for that, for the same commit, and what each reader does now.
+async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String], added: &[String]) -> Result<(Vec<String>, Vec<(String, Vec<u8>)>, Vec<String>)> {
     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
     let stored = sql.iter().map(|c| m.stored(c).map(str::to_string).ok_or_else(|| anyhow::anyhow!(crate::rules::alter::no_column(name, c)))).collect::<Result<Vec<_>>>()?;
     let mut sorted = (stored.clone(), as_stored.clone());
     (sorted.0.sort(), sorted.1.sort());
     ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
-    if stored == as_stored {
-        return Ok(vec![]);
+    let shown = if stored == as_stored { vec![] } else { stored };
+    let star = |m: &TableMeta| -> Vec<(String, String)> { m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() }; // (what `SELECT *` lists)
+    let was: Vec<(String, String)> = star(m).into_iter().filter(|(c, _)| !added.contains(c)).collect();
+    let then = TableMeta { shown: shown.clone(), ..m.clone() };
+    let now = star(&then);
+    if now == was {
+        return Ok((shown, vec![], vec![])); // (nothing moved, nothing added)
     }
-    if stored != m.in_order().into_iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>() {
-        let readers = crate::ddl::by_position(lake, name).await?;
-        let moved = sql.iter().zip(&m.sql_order()).find(|(a, b)| a != b).map_or("a column", |(a, _)| a.as_str());
-        ensure!(readers.is_empty(), crate::rules::alter::read_by_position(name, moved, &readers));
-    }
-    Ok(stored)
+    let moved = sql.iter().zip(&m.sql_order()).find(|(a, b)| a != b).map(|(a, _)| a.as_str()).or(added.first().map(String::as_str)).unwrap_or("a column");
+    let (puts, readers) = crate::ddl::keep_readers(lake, name, moved, was, now).await?;
+    Ok((shown, puts, readers))
 }
 
 /// A CREATE TABLE of a table that's there, refused as Postgres refuses it (42P07).
@@ -112,6 +116,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     let name = &new_table(lake, name).await?; // (its schema exists; `public.t` is `t`; a staged name is checked by its table)
     let owner = crate::sys::staged_for(name.as_str()).unwrap_or(name.as_str()); // (a staged table takes its folder and sequences' names from the table it replaces)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
+    let mut kept: (Vec<(String, Vec<u8>)>, Vec<String>) = Default::default(); // (what reads it by position, kept reading it as it did: `shown_as_stored`)
     let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown) = match serde_json::from_str(spec)? {
         TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None, None),
         TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown),
@@ -246,8 +251,12 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                     }
                 }
             }
-            if let Some(sql) = &shown {
-                m.shown = shown_as_stored(lake, name, &m, sql).await?; // (ADD COLUMN … AFTER b | FIRST: in the same commit)
+            let added: Vec<String> = columns[old.min(new)..].iter().map(|(c, _)| c.clone()).collect();
+            if shown.is_some() || !added.is_empty() {
+                // (ADD COLUMN, at the end or `… AFTER b | FIRST`: what reads it by position keeps reading it as it did, in the same commit)
+                let sql = shown.clone().unwrap_or_else(|| m.sql_order().into_iter().filter(|c| c != "_deleted").collect());
+                let (shown, puts, readers) = shown_as_stored(lake, name, &m, &sql, &added).await?;
+                (m.shown, kept) = (shown, (puts, readers));
             }
             let stored = |c: &String| m.stored(c).unwrap_or(c).to_string();
             let cluster = cluster.map(|c| c.iter().map(stored).collect());
@@ -275,13 +284,18 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
         ensure!(defaulted, "{name} can't be published as {f}: {why}");
     }
     meta.publish = meta.publish.iter().filter(|f| crate::delta::refused(&meta, f).is_none()).cloned().collect();
-    lake.cat.commit(vec![(table_key(name), json(&meta))], &[]).await?;
-    if !meta.publish.is_empty() {
+    let (mut puts, readers) = kept;
+    puts.push((table_key(name), json(&meta)));
+    lake.cat.commit(puts, &[]).await?;
+    if !meta.publish.is_empty() || !readers.is_empty() {
         crate::delta::publish_all(lake).await?; // (an empty table is there for other engines at once: they may append to it, ADR-028)
     }
     let mut out = j!({"table": name, "publish": meta.publish});
     if let Some(n) = notice {
         out["notice"] = n.into();
+    }
+    if !readers.is_empty() {
+        out["readers"] = j!(readers);
     }
     Ok(out)
 }

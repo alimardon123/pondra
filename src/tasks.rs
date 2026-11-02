@@ -33,6 +33,10 @@ pub struct Task {
     pub shards: u32,
     #[serde(default)]
     pub shard_by: Option<String>, // required when shards > 1
+    /// The target's columns its rows fill, first to last, once the target's columns moved (`ddl::keep_readers`): the
+    /// ones they filled before, by name from then on. None: SQL's first ones, in SQL's order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<String>>,
 }
 
 fn one() -> u32 { 1 }
@@ -90,6 +94,13 @@ async fn run(lake: &Lake, task: &Task, shard: u32, mut rows: Vec<RecordBatch>) -
 /// columns are stored, which the log keeps.
 async fn target_rows(lake: &Lake, task: &Task, rows: &RecordBatch) -> Result<RecordBatch> {
     let meta = lake.cat.get::<TableMeta>(&table_key(&task.target)).await?.context("no target table")?;
+    if let Some(names) = &task.columns {
+        // (the columns it filled before the target's moved, written out: by name, the rest NULL)
+        let types: std::collections::HashMap<String, String> = meta.sql_columns().into_iter().collect();
+        let filled = names.iter().map(|c| Ok((c.clone(), types.get(c).with_context(|| format!("{} has no column {c}", task.target))?.clone()))).collect::<Result<Vec<_>>>()?;
+        let batch = crate::query::cast_as(rows, &schema(&filled)?)?;
+        return crate::rules::fit::conform(&batch, &schema(&meta.logical_columns())?);
+    }
     let batch = crate::query::cast_as(rows, &schema(&meta.sql_columns())?)?;
     match meta.shown.is_empty() {
         true => Ok(batch),

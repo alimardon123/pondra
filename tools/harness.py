@@ -14,6 +14,7 @@
   harness.py columns             RENAME/DROP COLUMN, a name added again, widened types, under streaming, vs a model
   harness.py colorder            ALTER COLUMN c AFTER b | FIRST, ADD COLUMN … AFTER | FIRST: every positional write, read and door
   harness.py vieworder           ALTER [MATERIALIZED] VIEW … ALTER COLUMN c AFTER b | FIRST: the query moved, rows kept
+  harness.py movereaders         a column move never refused for what reads by position: `*` views and tasks follow, rows kept
   harness.py fills               materialized views filled from the rows already there, every row once
   harness.py dedup               a keyed table deduplicated by event time (order_by) vs a model
   harness.py procedures          macros, procedures (SQL, Python), scripts, parameters: rights, depth, three nodes
@@ -9684,8 +9685,8 @@ def colorder():
     second node. Reads list the new order: SELECT *, DESCRIBE, information_schema, pg_attribute, a Postgres row's
     description, a point lookup, a past read, /watch, SHOW CREATE (which makes the same table again, and CREATE OR ALTER
     leaves as it is), Delta and Iceberg readers; all as it was after a restart. A view with a `*` lists the new order. Refused
-    by name: a materialized view that reads the table with a `*` (through a view too), a column after itself or after one
-    the table lacks, a system column."""
+    by name: a column after itself or after one the table lacks, a system column. A materialized view that reads the table
+    with a `*` (through a view too) moves the column with it, its rows kept (`movereaders` has the rest)."""
     import psycopg
     lake = new_lake()
     pgp = A.port + 10
@@ -9782,18 +9783,18 @@ def colorder():
         status, head, text = reply(A.port, "POST", "/sql", stmt.encode())
         return status, head.get("x-pondra-sqlstate"), text if isinstance(text, str) else text.decode()
     q("CREATE MATERIALIZED VIEW per_c AS SELECT * FROM t")
-    star_mv = refusal("ALTER TABLE t ALTER COLUMN a FIRST")
-    q("DROP MATERIALIZED VIEW per_c")
     q("CREATE VIEW star_v AS SELECT t.* FROM t")
     q("CREATE VIEW named_v AS SELECT a, b FROM t")
     over_v = _raises_text(lambda: q("CREATE MATERIALIZED VIEW over_v AS SELECT * FROM star_v"))  # (a materialized view of a view, if one can be made)
-    through_v = refusal("ALTER TABLE t ALTER COLUMN a FIRST") if not over_v else None
+    moved_ok = q("ALTER TABLE t ALTER COLUMN a FIRST")
+    rows = lambda t: sorted(json.dumps(r, sort_keys=True) for r in q(f"SELECT * FROM {t}"))
+    now = ["a", "e", "c", "d", "b", "f"]
+    checks["a materialized view reading t with a `*` moves the column too, its rows kept, through a view too; a view with `*` follows, one naming its columns stays"] = \
+        isinstance(moved_ok, dict) and any("per_c" in r for r in moved_ok.get("readers", [])) and names("t") == now and names("per_c") == now and rows("per_c") == rows("t") \
+        and (bool(over_v) or (names("over_v") == now and rows("over_v") == rows("t"))) and names("star_v") == now and names("named_v") == ["a", "b"]
+    q("DROP MATERIALIZED VIEW per_c")
     if not over_v:
         q("DROP MATERIALIZED VIEW over_v")
-    moved_ok = q("ALTER TABLE t ALTER COLUMN a FIRST")
-    checks["refused while a materialized view reads t with a `*` (0A000, named), through a view too; a view with `*` follows, one naming its columns stays"] = \
-        star_mv[1] == "0A000" and "per_c" in star_mv[2] and (through_v is None or (through_v[1] == "0A000" and "over_v" in through_v[2])) \
-        and isinstance(moved_ok, dict) and names("t") == ["a", "e", "c", "d", "b", "f"] and names("star_v") == ["a", "e", "c", "d", "b", "f"] and names("named_v") == ["a", "b"]
     refused = {
         "after itself": refusal("ALTER TABLE t ALTER COLUMN a AFTER a"),
         "after a column it lacks": refusal("ALTER TABLE t ALTER COLUMN a AFTER zz"),
@@ -9839,8 +9840,9 @@ def vieworder():
     keeps its rows and the query it runs: reads list the new order (a plain one's table, a GROUP BY one's, one whose avg
     and HAVING are finished as it is read, one kept by key), new rows land in the right columns, SHOW CREATE gives the
     query moved and makes the same view again; a second node and a restart see the same. A view with `*` over a moved
-    view follows; a materialized view made from a view naming its columns stays. Refused by name: a view whose `*` lists
-    a table's columns, a materialized view reading the moved one with `*`, ALTER TABLE on a view, a column it lacks."""
+    view follows; a materialized view made from a view naming its columns stays, one made with `*` (from a view or from a
+    materialized view) moves the column too, its rows kept. Refused by name: a view whose `*` lists a table's columns,
+    ALTER TABLE on a view, a column it lacks."""
     lake = new_lake()
     nodes = [Node(lake, A.port, tier_secs=0.3).start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
     q = lambda s, port=A.port: sql(port, s)
@@ -9923,19 +9925,26 @@ def vieworder():
     q("CREATE VIEW star AS SELECT * FROM s")
     q("CREATE VIEW pv AS SELECT g, x FROM s")
     star_mv = _raises_text(lambda: q("CREATE MATERIALIZED VIEW pm AS SELECT * FROM pv"))  # (one made from a view, if it can be)
-    by_star = refusal("ALTER VIEW pv ALTER COLUMN x FIRST") if not star_mv else None
     if not star_mv:
+        pm_rows = until(lambda: rows("pm", ["g", "x"]), rows("pv", ["g", "x"]), 20)
+        by_star = q("ALTER VIEW pv ALTER COLUMN x FIRST")
+        checks["a materialized view reading a view with `*` moves the column too, its rows kept"] = isinstance(by_star, dict) and "pm" in str(by_star.get("readers")) \
+            and names("pv") == ["x", "g"] and names("pm") == ["x", "g"] and rows("pm", ["g", "x"]) == pm_rows and bool(pm_rows)
         q("DROP MATERIALIZED VIEW pm")
     q("CREATE VIEW pv2 AS SELECT g, x FROM s")
     named_mv = _raises_text(lambda: q("CREATE MATERIALIZED VIEW pm2 AS SELECT g, x FROM pv2"))
     pv2 = q("ALTER VIEW pv2 ALTER COLUMN x FIRST")
     checks["a materialized view made from a view naming its columns stays as it is"] = isinstance(pv2, dict) and names("pv2") == ["x", "g"] and (bool(named_mv) or names("pm2") == ["g", "x"])
     q("CREATE MATERIALIZED VIEW m5 AS SELECT * FROM m1")
-    over_mv = refusal("ALTER MATERIALIZED VIEW m1 ALTER COLUMN g FIRST")
+    m5_rows = until(lambda: rows("m5", ["y", "g", "x"]), want["m1"], 20)
+    over_mv = q("ALTER MATERIALIZED VIEW m1 ALTER COLUMN g FIRST")
+    followed = names("m1") == ["g", "x", "y"] and names("m5") == ["g", "x", "y"] and rows("m5", ["y", "g", "x"]) == want["m1"]
+    back = q("ALTER MATERIALIZED VIEW m1 ALTER COLUMN g AFTER y")
+    checks["a materialized view reading one with `*` moves the column too, its rows kept, and back"] = m5_rows == want["m1"] and isinstance(over_mv, dict) \
+        and "m5" in str(over_mv.get("readers")) and followed and isinstance(back, dict) and names("m1") == ["x", "y", "g"] and names("m5") == ["x", "y", "g"] \
+        and rows("m5", ["y", "g", "x"]) == want["m1"]
     refused = {
         "a view whose `*` lists a table's columns": refusal("ALTER VIEW star ALTER COLUMN y FIRST"),
-        "a materialized view reading a view with `*`": by_star,
-        "a materialized view reading it with `*`": over_mv,
         "ALTER TABLE of a view": refusal("ALTER TABLE gv ALTER COLUMN g FIRST"),
         "ALTER TABLE of a materialized view": refusal("ALTER TABLE m2 ALTER COLUMN g FIRST"),
         "ALTER VIEW of a table": refusal("ALTER VIEW s ALTER COLUMN g FIRST"),
@@ -9943,9 +9952,8 @@ def vieworder():
         "a column it lacks": refusal("ALTER VIEW gv ALTER COLUMN zz FIRST"),
         "after itself": refusal("ALTER MATERIALIZED VIEW m2 ALTER COLUMN g AFTER g"),
     }
-    checks["refused by name: a `*` of a table's, a materialized view reading by position, the wrong ALTER, a missing column, after itself"] = \
+    checks["refused by name: a `*` of a table's, the wrong ALTER, a missing column, after itself"] = \
         refused["a view whose `*` lists a table's columns"][1] == "0A000" and "*" in refused["a view whose `*` lists a table's columns"][2] \
-        and (by_star is None or (by_star[1] == "0A000" and "pm" in by_star[2])) and over_mv[1] == "0A000" and "m5" in over_mv[2] \
         and all(refused[k][1] == "42809" for k in ["ALTER TABLE of a view", "ALTER TABLE of a materialized view", "ALTER VIEW of a table", "ALTER VIEW of a materialized view"]) \
         and "ALTER VIEW gv" in refused["ALTER TABLE of a view"][2] and "ALTER MATERIALIZED VIEW m2" in refused["ALTER TABLE of a materialized view"][2] \
         and refused["a column it lacks"][1] == "42703" and refused["after itself"][1] == "42P10" and names("m1") == want_names["m1"]
@@ -9964,6 +9972,154 @@ def vieworder():
         node.kill()
     ok = all(checks.values())
     print(json.dumps({"vieworder": checks, "refused": refused, "ok": ok}, indent=1, default=str))
+
+
+def movereaders():
+    """A table's column move is never refused for what reads it (L6, 11-02): materialized views with a `*` (direct, with
+    an expression after it, with EXCLUDE, through a `*` view, and one reading another so) move the same column in the same
+    step, their rows kept, and SHOW CREATE still gives their query as written; a task reading the table with a `*` reads it
+    as it did and one writing into it by position fills the columns it filled. New rows land in the right columns after
+    the move, after a second one, after an ADD COLUMN … AFTER, and after a restart; a second node sees the same. A
+    materialized view's own move and a plain view's move take their `*` readers along too."""
+    lake = new_lake()
+    nodes = [Node(lake, A.port, tier_secs=0.3).start(), Node(lake, A.port + 1, tier_secs=0.3).start()]
+    q = lambda s, port=A.port: sql(port, s)
+    names = lambda t, port=A.port: [r["column_name"] for r in q(f"DESCRIBE {t}", port)]
+    rows = lambda t, cols, port=A.port: sorted(tuple(r.get(c) for c in cols) for r in q(f"SELECT * FROM {t}", port))
+    checks, info = {}, {}
+    gxy = ["g", "x", "y"]
+    q("CREATE TABLE t (g BIGINT, x BIGINT, y BIGINT)")
+    q("CREATE TABLE t_copy (g BIGINT, x BIGINT, y BIGINT)")
+    q("CREATE TABLE src (a BIGINT, b BIGINT)")
+    call(A.port, "POST", "/tasks/k_read", json.dumps({"source": "t", "target": "t_copy", "sql": "SELECT * FROM t"}).encode())
+    call(A.port, "POST", "/tasks/k_write", json.dumps({"source": "src", "target": "t", "sql": "SELECT a, b, a * 100 AS c FROM src"}).encode())
+    made = {
+        "m_star": "SELECT * FROM t WHERE g > 0",
+        "m_expr": "SELECT *, x + y AS s FROM t",
+        "m_excl": "SELECT * EXCLUDE (y) FROM t",
+        "m_named": "SELECT g, x FROM t",
+    }
+    for m, s in made.items():
+        q(f"CREATE MATERIALIZED VIEW {m} AS {s}")
+    q("CREATE VIEW pv AS SELECT * FROM t")
+    q("CREATE MATERIALIZED VIEW m_pv AS SELECT * FROM pv")
+    q("CREATE MATERIALIZED VIEW m2 AS SELECT * FROM m_star")
+    model = [(1, 10, 100), (2, 20, 200), (-3, 30, 300)]
+    q("INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (-3, 30, 300)")
+    q("INSERT INTO src VALUES (4, 40)")
+    model.append((4, 40, 400))
+    def want():
+        pos = sorted(r for r in model if r[0] > 0)
+        return {"t": sorted(model), "t_copy": sorted(model), "m_star": pos, "m2": pos, "m_pv": sorted(model),
+                "m_expr": sorted(r + (r[1] + r[2],) for r in model), "m_excl": sorted(r[:2] for r in model), "m_named": sorted(r[:2] for r in model)}
+    cols = {"t": gxy, "t_copy": gxy, "m_star": gxy, "m2": gxy, "m_pv": gxy, "m_expr": gxy + ["s"], "m_excl": ["g", "x"], "m_named": ["g", "x"]}
+    def landed(port=A.port, secs=30):
+        w = want()
+        got = {m: until(lambda: rows(m, c, port), w[m], secs) for m, c in cols.items()}
+        return {m: got[m] for m in got if got[m] != w[m]}  # (empty: every reader has every row, by name)
+    info["before"] = landed()
+    checks["before the move: every reader has every row"] = info["before"] == {}
+    # The move: never refused, in one step, rows kept
+    moved = q("ALTER TABLE t ALTER COLUMN y FIRST")
+    info["moved"] = moved
+    said = " | ".join(moved.get("readers", [])) if isinstance(moved, dict) else ""
+    ygx = ["y", "g", "x"]
+    order = {m: names(m) for m in cols}
+    info["order"] = order
+    checks["ALTER TABLE t ALTER COLUMN y FIRST with materialized views and tasks reading it by position: done, each reader said"] = isinstance(moved, dict) \
+        and all(r in said for r in ["m_star", "m_expr", "m_excl", "m_pv", "m2", "k_read", "k_write"]) and "m_named" not in said
+    checks["the `*` readers list the new order (through a `*` view, and one reading another so); EXCLUDE (y) and a column list stay"] = \
+        order == {"t": ygx, "t_copy": gxy, "m_star": ygx, "m2": ygx, "m_pv": ygx, "m_expr": ygx + ["s"], "m_excl": ["g", "x"], "m_named": ["g", "x"]} and names("pv") == ygx
+    checks["their rows kept, by name"] = landed(secs=1) == {}
+    shown = {m: q(f"SHOW CREATE MATERIALIZED VIEW {m}")[0]["definition"] for m in made}
+    info["shown"] = shown
+    checks["SHOW CREATE gives each query as written"] = all(s in shown[m] for m, s in made.items())
+    # New rows: a plain INSERT, a task's, by name
+    q("INSERT INTO t (g, x, y) VALUES (5, 50, 500)")
+    q("INSERT INTO t VALUES (900, 9, 90)")  # (SQL's order now: y, g, x)
+    q("INSERT INTO src VALUES (-6, 60)")
+    model += [(5, 50, 500), (9, 90, 900), (-6, 60, -600)]
+    info["after"] = landed()
+    checks["new rows land in the right columns: a plain INSERT, one naming its columns, a task writing into t, a task copying t"] = info["after"] == {}
+    checks["a second node sees the same"] = until(lambda: {m: names(m, A.port + 1) for m in cols}, order, 10) == order and landed(A.port + 1, 10) == {}
+    # A second move, then ADD COLUMN … AFTER
+    again = q("ALTER TABLE t ALTER COLUMN x AFTER y")
+    q("INSERT INTO t (g, x, y) VALUES (7, 70, 700)")
+    model.append((7, 70, 700))
+    yxg = ["y", "x", "g"]
+    checks["a second move: the readers follow again, rows land"] = isinstance(again, dict) and names("t") == yxg and names("m_star") == yxg and names("m2") == yxg \
+        and names("m_pv") == yxg and names("m_expr") == yxg + ["s"] and landed() == {}
+    added = q("ALTER TABLE t ADD COLUMN z BIGINT AFTER y")
+    q("INSERT INTO t (g, x, y, z) VALUES (8, 80, 800, 8000)")
+    q("INSERT INTO src VALUES (10, 100)")
+    model += [(8, 80, 800), (10, 100, 1000)]
+    info["added"] = added
+    info["added_then"] = {"t": names("t"), "m_star": names("m_star"), "m_expr": names("m_expr"), "landed": landed(), "z": [(r["g"], r.get("z")) for r in q("SELECT g, z FROM t WHERE g IN (8, 10) ORDER BY g")]}
+    checks["ADD COLUMN z AFTER y: done, the readers keep their columns, rows land"] = isinstance(added, dict) and info["added_then"] == \
+        {"t": ["y", "z", "x", "g"], "m_star": yxg, "m_expr": yxg + ["s"], "landed": {}, "z": [(8, 8000), (10, None)]}
+    shown = {m: q(f"SHOW CREATE MATERIALIZED VIEW {m}")[0]["definition"] for m in ["m_star", "m_expr", "m_excl", "m_pv"]}
+    info["shown_after_add"] = shown
+    q(shown["m_star"].replace("CREATE MATERIALIZED VIEW m_star", "CREATE MATERIALIZED VIEW m_star_again", 1))
+    checks["…and SHOW CREATE leaves the new column out of each `*` by name, so it makes the same view"] = "SELECT * EXCLUDE (z) FROM t WHERE g > 0" in shown["m_star"] \
+        and "SELECT * EXCLUDE (z), x + y AS s FROM t" in shown["m_expr"] and "SELECT * EXCLUDE (y, z) FROM t" in shown["m_excl"] and "SELECT * EXCLUDE (z) FROM pv" in shown["m_pv"] \
+        and names("m_star_again") == names("m_star")
+    q("DROP MATERIALIZED VIEW m_star_again")
+    # ADD COLUMN at the end: a task reading a table with a `*` and one writing into it go on (before, the first had one
+    # column too many for its target, and the second one too few for the table)
+    q("CREATE TABLE u (a BIGINT, b BIGINT)")
+    q("CREATE TABLE u_copy (a BIGINT, b BIGINT)")
+    q("CREATE TABLE u_src (a BIGINT)")
+    call(A.port, "POST", "/tasks/ku_read", json.dumps({"source": "u", "target": "u_copy", "sql": "SELECT * FROM u"}).encode())
+    call(A.port, "POST", "/tasks/ku_write", json.dumps({"source": "u_src", "target": "u", "sql": "SELECT a, a * 10 AS b FROM u_src"}).encode())
+    q("CREATE MATERIALIZED VIEW mu AS SELECT * FROM u")
+    q("INSERT INTO u VALUES (1, 10)")
+    q("INSERT INTO u_src VALUES (2)")
+    u_rows = lambda t: sorted(tuple(r.get(c) for c in ["a", "b"]) for r in q(f"SELECT * FROM {t}"))
+    first = [until(lambda: u_rows(t), [(1, 10), (2, 20)], 20) for t in ["u", "u_copy", "mu"]]
+    at_end = q("ALTER TABLE u ADD COLUMN c BIGINT")
+    q("INSERT INTO u VALUES (3, 30, 300)")
+    q("INSERT INTO u_src VALUES (4)")
+    want_u = [(1, 10), (2, 20), (3, 30), (4, 40)]
+    info["at_end"] = {"answer": at_end, "first": first, "then": {t: until(lambda: u_rows(t), want_u, 20) for t in ["u", "u_copy", "mu"]}, "c": [(r["a"], r.get("c")) for r in q("SELECT a, c FROM u ORDER BY a")],
+                      "shown": q("SHOW CREATE MATERIALIZED VIEW mu")[0]["definition"], "mu": names("mu")}
+    checks["ADD COLUMN c at the end: a task copying u with a `*` and one writing into it go on, mu keeps its columns and says so"] = isinstance(at_end, dict) \
+        and first == [[(1, 10), (2, 20)]] * 3 and info["at_end"]["then"] == {t: want_u for t in ["u", "u_copy", "mu"]} and info["at_end"]["mu"] == ["a", "b"] \
+        and info["at_end"]["c"] == [(1, None), (2, None), (3, 300), (4, None)] and "SELECT * EXCLUDE (c) FROM u" in info["at_end"]["shown"]
+    # A materialized view's own move takes its `*` reader along; a plain view's too
+    q("CREATE MATERIALIZED VIEW m3 AS SELECT * FROM m_named")
+    cols["m3"] = ["g", "x"]
+    _want0 = want
+    want = lambda: {**_want0(), "m3": sorted(r[:2] for r in model)}
+    info["m3"] = landed()
+    own = q("ALTER MATERIALIZED VIEW m_named ALTER COLUMN x FIRST")
+    checks["ALTER MATERIALIZED VIEW m_named ALTER COLUMN x FIRST: m3 reading it with `*` follows, rows kept"] = info["m3"] == {} and isinstance(own, dict) \
+        and "m3" in str(own.get("readers")) and names("m_named") == ["x", "g"] and names("m3") == ["x", "g"] and landed(secs=1) == {}
+    q("CREATE VIEW nv AS SELECT g, x FROM t")
+    q("CREATE MATERIALIZED VIEW m_nv AS SELECT * FROM nv")
+    cols["m_nv"] = ["g", "x"]
+    _want = want
+    want = lambda: {**_want(), "m_nv": sorted(r[:2] for r in model)}
+    info["m_nv"] = landed()
+    nv = q("ALTER VIEW nv ALTER COLUMN x FIRST")
+    q("INSERT INTO t (g, x, y) VALUES (11, 110, 1100)")
+    model.append((11, 110, 1100))
+    checks["ALTER VIEW nv ALTER COLUMN x FIRST: m_nv reading it with `*` follows, rows kept and landing"] = isinstance(nv, dict) and "m_nv" in str(nv.get("readers")) \
+        and names("nv") == ["x", "g"] and names("m_nv") == ["x", "g"] and info["m_nv"] == {} and landed() == {}
+    # After a restart, as it was
+    order = {m: names(m) for m in cols}
+    for node in nodes:
+        node.kill()
+    nodes = [Node(lake, A.port, tier_secs=0.3).start()]
+    checks["after a restart: the order and the rows as they were"] = all(names(m) == order[m] for m in cols) and landed(secs=5) == {}
+    q("INSERT INTO t (g, x, y) VALUES (12, 120, 1200)")
+    q("INSERT INTO src VALUES (13, 130)")
+    model += [(12, 120, 1200), (13, 130, 1300)]
+    info["restarted"] = landed()
+    checks["and rows after it land in the right columns"] = info["restarted"] == {}
+    for node in nodes:
+        node.kill()
+    ok = all(checks.values())
+    print(json.dumps({"movereaders": checks, "info": info, "ok": ok}, indent=1, default=str))
 
 
 def viewtext():
@@ -28692,7 +28848,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "movereaders", "viewtext", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -28705,7 +28861,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "movereaders": movereaders, "viewtext": viewtext, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)
