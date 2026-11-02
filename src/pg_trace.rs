@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
-use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, Visit, WildcardAdditionalOptions};
+use datafusion::sql::sqlparser::ast::{self, Expr, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value, WildcardAdditionalOptions};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 
 use crate::codes::coded;
@@ -117,7 +117,7 @@ pub async fn rewrite<H: Host>(host: &H, stmt: &mut Statement) -> anyhow::Result<
     // (a `||` is read as jsonb's when JSON is in its text, or when a relation it names has a json or jsonb column: plain
     // text concatenation over other columns reads nothing more than the names it has)
     let (mut trigger, mut concatenates, mut json) = (false, false, false);
-    let _ = ast::visit_expressions(stmt, |e| {
+    let _ = crate::walk::visit_expressions(stmt, |e| {
         trigger |= asks(e) || spelled(e) || compares_string(e) || maker(e);
         concatenates |= is_concat(e);
         json |= visibly_json(e);
@@ -153,7 +153,7 @@ fn rewritten(known: &Known, stmt: &mut Statement) -> anyhow::Result<bool> {
     // (`pg_typeof(id)` becomes 'uuid', whose own name would be `Utf8("uuid")`: `names_kept` names it as written)
     Ok(names_kept(stmt, |stmt| {
         let mut changed = false;
-        let _ = ast::visit_expressions_mut(stmt, |e| {
+        let _ = crate::walk::visit_expressions_mut(stmt, |e| {
             let place = at(e);
             let to = match asked.iter().find(|(p, _)| *p == place) {
                 Some((_, ty)) => Some(ty.name().to_string()),
@@ -178,7 +178,7 @@ fn jsonb_texts(stmt: &Statement, places: &[usize]) -> anyhow::Result<Vec<(usize,
         return Ok(vec![]);
     }
     let mut texts = vec![];
-    let _ = ast::visit_expressions(stmt, |e| {
+    let _ = crate::walk::visit_expressions(stmt, |e| {
         if let Some(s) = string(e).filter(|_| places.contains(&at(e))) {
             texts.push((at(e), crate::pg_json_make::jsonb_text(s).map_err(anyhow::Error::from)));
         }
@@ -321,7 +321,7 @@ pub(crate) async fn known<H: Host>(host: &H, stmt: &Statement) -> Known {
 fn look_up<'a, H: Host>(host: &'a H, stmt: &'a Statement, known: &'a mut Known, depth: usize) -> futures::future::BoxFuture<'a, ()> {
     Box::pin(async move {
         let mut names = vec![];
-        let _ = ast::visit_relations(stmt, |n| {
+        let _ = crate::walk::visit_relations(stmt, |n| {
             names.push(object(n));
             ControlFlow::<()>::Continue(())
         });
@@ -405,7 +405,7 @@ fn names_its_columns(stmt: &Statement) -> bool {
             }
         }
     }
-    Visit::visit(stmt, &mut Named).is_continue()
+    crate::walk::visit(stmt, &mut Named).is_continue()
 }
 
 /// One relation of a FROM: the names its columns may be qualified by, its columns, and whether an outer join pads it
@@ -815,7 +815,7 @@ impl<'a> Trace<'a> {
     /// (`concat`) and the comparisons (`comparison`). A query nested in `e` is traced with its own relations, which note their
     /// own: this walk leaves its expressions alone (`Walk`).
     fn walk(&self, e: &Expr, rels: &[Rel]) {
-        let _ = e.visit(&mut Walk { trace: self, rels, depth: 0 });
+        let _ = crate::walk::visit(e, &mut Walk { trace: self, rels, depth: 0 });
     }
 
     /// Notes what a JSON maker's arguments need, when `e` is a call of one: an aggregate (`aggregate`), or each argument of a

@@ -15,6 +15,7 @@ use crate::app::App;
 use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use futures::{Stream, StreamExt};
 use std::future::Future;
 use crate::reset::Once;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,8 +92,10 @@ pub fn class(sql: &str) -> &'static str {
         "CREATE" | "ALTER" | "DROP" if about(&["USER", "ROLE", "TOKEN", "SECRET", "SHARE", "RECIPIENT", "PROVIDER"]) => "role",
         "ATTACH" if sql.to_uppercase().contains("TOKEN") => "role", // (a share's profile: its token is a secret)
         "ALTER" if about(&["DATABASE"]) && sql.to_lowercase().contains("protected") => "role", // (who may change a protected database's projects: ADR-058)
-        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" => "ddl",
+        "CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "ATTACH" | "DETACH" | "COMMENT" | "UNDROP" | "OPTIMIZE" | "VACUUM" | "CHECKPOINT" | "INSTALL" | "UNINSTALL" => "ddl",
+        "FORCE" if about(&["INSTALL"]) => "ddl", // (FORCE INSTALL: an extension, as INSTALL is)
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "COPY" | "UPSERT" => "write",
+        "WITH" if crate::with_writes::of(sql).is_some() => "write", // (`WITH d AS (DELETE …) INSERT …`: its writes, by their CTEs)
         "CALL" | "DO" => "function",
         _ if sql.to_lowercase().contains("pondra.start(") => "function",
         "SET" | "RESET" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "END" | "DISCARD" | "DEALLOCATE" | "USE" => "misc",
@@ -172,10 +175,17 @@ tokio::task_local! {
 /// the statement's planning, bound to it). None outside a statement.
 pub fn stop() -> Option<Arc<AtomicBool>> { STOP.try_with(|s| s.clone()).ok() }
 
-/// Sets its flag when dropped before `done` is set: the statement's future was dropped (a timeout, a Stop, a closed tab).
+/// Sets its flag when dropped before it is marked done: the statement's future was dropped (a timeout, a Stop, a closed tab).
 struct SetOnDrop {
     flag: Arc<AtomicBool>,
     done: bool,
+}
+
+impl SetOnDrop {
+    fn new(flag: Arc<AtomicBool>) -> Self { SetOnDrop { flag, done: false } }
+
+    /// The work ended: the drop that follows leaves the flag unset.
+    fn mark_done(&mut self) { self.done = true; }
 }
 
 impl Drop for SetOnDrop {
@@ -189,10 +199,25 @@ impl Drop for SetOnDrop {
 /// `f`, with `flag` as its statement's stop flag (`stop`). The flag is set if `f` is dropped before it finishes. A `f` that
 /// finishes leaves it unset, because a door may stream the rows the statement made after `statement` returns.
 pub(crate) async fn stoppable<T>(flag: Arc<AtomicBool>, f: impl Future<Output = T>) -> T {
-    let mut guard = SetOnDrop { flag: flag.clone(), done: false };
+    let mut guard = SetOnDrop::new(flag.clone());
     let out = STOP.scope(flag, f).await;
-    guard.done = true;
+    guard.mark_done();
     out
+}
+
+/// `s`, which sets `flag` when it is dropped before it ends. A door whose rows stream after `statement` returns (a
+/// plan's pieces, read by the client as they come) is guarded so: a client that goes mid-stream stops the search still
+/// running on those rows, as a statement dropped unfinished does (`stoppable`).
+pub(crate) fn guarded<S: Stream>(flag: Arc<AtomicBool>, s: S) -> impl Stream<Item = S::Item> {
+    futures::stream::unfold((Box::pin(s), SetOnDrop::new(flag)), |(mut s, mut guard)| async move {
+        match s.next().await {
+            Some(item) => Some((item, (s, guard))),
+            None => {
+                guard.mark_done(); // (read to its end: the drop that follows leaves the flag unset)
+                None
+            }
+        }
+    })
 }
 
 /// An error a door says: an error of its own kind (`code`: Postgres's SQLSTATE).
@@ -231,7 +256,9 @@ impl Drop for Stopped<'_> {
 fn refusal(m: &str) -> bool { ["permission denied", "needs a", "needs more rights", "sign in", "quota:"].iter().any(|r| m.contains(r)) }
 
 /// Run one statement a door was sent, within its user's quota (`users::Quota`), writing what
-/// came of it when its class is written (and a refusal always).
+/// came of it when its class is written (and a refusal always). The lake it was sent to is in
+/// scope while it runs (`ext::rooted`): every door's statement passes here, so each stores a
+/// client's relative LOCATION as the same file of the lake's.
 pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, f: impl Future<Output = std::result::Result<T, E>>) -> std::result::Result<T, E> {
     if INSIDE.try_with(|_| ()).is_ok() {
         return f.await;
@@ -241,7 +268,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
     }
     let (class, start, quota) = (class(sql), Instant::now(), crate::users::quota());
     let mut stopped = Stopped(Some((app, class, sql, start)));
-    let (out, note) = crate::history::noted(INSIDE.scope((), async {
+    let (out, note) = crate::history::noted(crate::ext::rooted(&app.lake.url, INSIDE.scope((), async {
         let _turn = quota.turn().await.map_err(|m| E::refusal("53000", m))?; // (insufficient_resources)
         let flag = Arc::new(AtomicBool::new(false)); // (set if the work is dropped first: a timeout drops it, inside the timeout)
         match quota.timeout {
@@ -251,7 +278,7 @@ pub async fn statement<T, E: std::fmt::Display + Refusal>(app: &App, sql: &str, 
             }))),
             None => stoppable(flag, f).await,
         }
-    }))
+    })))
     .await;
     stopped.0 = None;
     let took = start.elapsed();
@@ -284,45 +311,113 @@ pub fn rows(app: &App, door: &str, table: &str, error: Option<String>, took: std
     }
 }
 
-/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement). Anyone may
-/// knock, so an address's refusals past `KNOCKS` a minute aren't written: the last one written says so.
-pub fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
+/// A sign-in that failed, or a request its rights didn't cover (at a door, before any statement), from `from`. Its
+/// client is the connection's: `refused_by` names another (behind a proxy, `Peer::client`).
+pub async fn refused(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, what: &str, message: &str) {
+    refused_by(app, user, door, from, from.map(|a| a.ip()), what, message).await
+}
+
+/// `refused`, counted by `client`. One that names a user of the lake is always written. Anyone may knock with no
+/// user, or with a name that is none of its users, so past `KNOCKS` a minute from one client (an IPv6 one's /64)
+/// those aren't written one by one: a row says how many weren't, once their minute has ended (at the next refusal).
+pub async fn refused_by(app: &App, user: &str, door: &'static str, from: Option<std::net::SocketAddr>, client: Option<std::net::IpAddr>, what: &str, message: &str) {
     if !on() {
         return;
     }
-    let message = match knocked(from.map(|a| a.ip()), crate::log::now_ms()) {
+    let known = !user.is_empty() && app.lake.cat.get::<crate::users::User>(&crate::users::user_key(user)).await.ok().flatten().is_some();
+    let now = crate::log::now_ms();
+    let (written, uncounted) = knocked((!known).then_some(client), now);
+    for (range, since, n) in uncounted {
+        let since = chrono::DateTime::from_timestamp_millis(since as i64).map(|t| t.to_rfc3339()).unwrap_or_default();
+        let message = format!("{n} more refusals naming no user of the lake from {range} in the minute from {since} weren't written one by one");
+        write(app, Line { at: now, user: String::new(), door: "node", from: Some(range), class: "access", statement: "refusals".into(), outcome: "refused", message: Some(message), ms: None });
+    }
+    let message = match written {
         Some(false) => message.to_string(),
-        Some(true) => format!("{message} (this address's refusals past {KNOCKS} a minute aren't written until its minute ends)"),
+        Some(true) => format!("{message} (this client's refusals naming no user of the lake past {KNOCKS} a minute are counted, not written one by one, until its minute ends)"),
         None => return,
     };
-    write(app, Line { at: crate::log::now_ms(), user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
+    write(app, Line { at: now, user: user.to_string(), door, from: from.map(|a| a.to_string()), class: "access", statement: redacted(what, "role"), outcome: "refused", message: Some(message), ms: None });
 }
 
-/// Refusals written a minute from one address (security pass 2: 400 anonymous `/sso/…` calls wrote 400 rows).
+/// Refusals naming no user of the lake written a minute from one client (security pass 2: 400 anonymous `/sso/…` calls
+/// wrote 400 rows; audit 10-31 M6: as many with made-up user names did too).
 const KNOCKS: u32 = 60;
-const ADDRESSES: usize = 10_000; // (the addresses held at once: when full, those whose minute ended go, or all)
+const CLIENTS: usize = 10_000; // (the clients counted at once: when full, newcomers count together, and no count starts over)
 
-crate::per_node!(static KNOCKED: std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u64, u32)>> = std::sync::Mutex::new(std::collections::HashMap::new()));
+#[derive(Default)]
+struct Knocks {
+    by: std::collections::HashMap<std::net::IpAddr, (u64, u32)>, // client's range -> its minute's start, refusals in it
+    swept: u64,                                                  // (when the minutes that ended were last counted out)
+}
 
-/// Is a refusal from `ip` at `now_ms` written: Some(false) yes, Some(true) yes and it is the last this minute,
-/// None no. (No address: a door that can't tell, counted under 0.0.0.0.)
-fn knocked(ip: Option<std::net::IpAddr>, now_ms: u64) -> Option<bool> {
-    let mut all = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if all.len() >= ADDRESSES {
-        all.retain(|_, (since, _)| now_ms.saturating_sub(*since) < 60_000);
-        if all.len() >= ADDRESSES {
-            all.clear();
-        }
+crate::per_node!(static KNOCKED: std::sync::Mutex<Knocks> = std::sync::Mutex::new(Knocks::default()));
+
+/// The range a client's refusals are counted under: its address, an IPv6 one's /64 (what a network hands one machine).
+fn range(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(a) => std::net::IpAddr::V6((u128::from(a) & !(u64::MAX as u128)).into()),
+        v4 => v4,
     }
-    let (since, n) = all.entry(ip.unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))).or_insert((now_ms, 0));
+}
+
+/// Is a refusal at `now_ms` written: Some(false) yes, Some(true) yes and the last one written this minute, None no. Only
+/// those naming no user of the lake are counted (`client` Some: its address, None when the door can't tell, counted under 0.0.0.0).
+/// With it, the minutes that ended with refusals not written: (range, its minute's start, how many).
+fn knocked(client: Option<Option<std::net::IpAddr>>, now_ms: u64) -> (Option<bool>, Vec<(String, u64, u32)>) {
+    let Some(client) = client else { return (Some(false), vec![]) };
+    let mut k = KNOCKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut ended = vec![];
+    let shown = |ip: &std::net::IpAddr| if ip.is_ipv6() { format!("{ip}/64") } else { ip.to_string() };
+    if now_ms.saturating_sub(k.swept) >= 60_000 || k.by.len() >= CLIENTS {
+        k.swept = now_ms;
+        k.by.retain(|ip, (since, n)| {
+            let over = now_ms.saturating_sub(*since) >= 60_000;
+            if over && *n > KNOCKS {
+                ended.push((shown(ip), *since, *n - KNOCKS));
+            }
+            !over
+        });
+    }
+    let unspecified = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    let key = client.map_or(unspecified, range);
+    let key = if k.by.len() >= CLIENTS && !k.by.contains_key(&key) { unspecified } else { key };
+    let (since, n) = k.by.entry(key).or_insert((now_ms, 0));
     if now_ms.saturating_sub(*since) >= 60_000 {
+        if *n > KNOCKS {
+            ended.push((shown(&key), *since, *n - KNOCKS));
+        }
         (*since, *n) = (now_ms, 0);
     }
     *n += 1;
-    match *n {
+    let written = match *n {
         n if n < KNOCKS => Some(false),
         n if n == KNOCKS => Some(true),
         _ => None,
+    };
+    (written, ended)
+}
+
+/// A statement a joined page ran, as its node writes it (`page_records::record`, under the sign-in's name, as the door
+/// `page`): its line when its class is written, and always when refused.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_statement(app: &App, class: &'static str, sql: &str, outcome: &'static str, message: Option<String>, ms: i64) {
+    if kept(classes(), class, outcome) {
+        log(app, class, redacted(sql, class), outcome, message, Some(ms));
+    }
+}
+
+/// Whether a line of `class` and `outcome` is written, given the classes a node writes (`written`, and a refusal always).
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `page_statement`)
+fn kept(list: &[String], class: &str, outcome: &str) -> bool {
+    !list.iter().any(|c| c == "off") && (outcome == "refused" || list.iter().any(|c| c == class || c == "all"))
+}
+
+/// A line the node writes as itself about a joined page's statements it did not record (`page_records::record`).
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_note(app: &App, message: String) {
+    if on() {
+        write(app, Line { at: crate::log::now_ms(), user: String::new(), door: "node", from: None, class: "access", statement: "page statements".into(), outcome: "refused", message: Some(message), ms: None });
     }
 }
 
@@ -343,8 +438,8 @@ fn log(app: &App, class: &'static str, statement: String, outcome: &'static str,
 crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
 fn write(app: &App, line: Line) {
-    if app.log.is_none() {
-        return; // (a read-only node writes nothing: its own log says it)
+    if app.log.is_none() || !app.members.keeps_records() {
+        return; // (a read-only node writes nothing: its own log says it; a joined page's node keeps the records)
     }
     let tx = WRITER.get_or(|| crate::history::writer(app, TABLE, crate::ddl::Ddl::AuditLog, Duration::from_millis(50), batch));
     let _ = tx.send(line);
@@ -390,11 +485,15 @@ mod tests {
     #[test]
     fn classes_and_redaction() {
         assert_eq!(class("CREATE USER ana PASSWORD 'x'"), "role");
+        assert_eq!(class("WITH d AS (DELETE FROM t WHERE id = 1 RETURNING *) INSERT INTO gone SELECT * FROM d"), "write"); // (11-01 audit M4)
+        assert_eq!(class("WITH d AS (SELECT 1) SELECT * FROM d"), "read");
         assert_eq!(class("create or replace secret s (type s3, secret 'y')"), "role");
         assert_eq!(class("GRANT SELECT ON t TO ana"), "role");
         assert_eq!(class("ALTER DATABASE prod SET (protected = false)"), "role");
         assert_eq!(class("ALTER DATABASE dev REFRESH t"), "ddl");
         assert_eq!(class("CREATE TABLE t (a INT)"), "ddl");
+        assert_eq!((class("INSTALL words FROM 'https://x.org/words.wasm'"), class("force install words"), class("UNINSTALL words")), ("ddl", "ddl", "ddl"));
+        assert_eq!(class("LOAD words"), "read");
         assert_eq!(class("insert into t values (1)"), "write");
         assert_eq!(class("CALL p(1)"), "function");
         assert_eq!(class("SELECT 1"), "read");
@@ -405,6 +504,19 @@ mod tests {
         assert_eq!(class("-- note\nCREATE USER ana PASSWORD 'x'"), "role");
         assert_eq!(redacted("CREATE SECRET s (TYPE s3, KEY_ID \"k\", SECRET xyz)", "role"), "CREATE SECRET s (TYPE s3, KEY_ID '***', SECRET '***')");
         assert_eq!(redacted("/* a */ create temporary secret t (type http, bearer_token 'a,b''c')", "role"), "/* a */ create temporary secret t (type http, bearer_token '***')");
+    }
+
+    /// A joined page's line is written by its node by the node's own classes (`page_statement`): with the read class off, an ok
+    /// SELECT is no audit line (its history row is kept all the same), a DDL is one, and a refusal always is.
+    #[test]
+    fn a_pages_line_is_written_by_the_nodes_classes_and_a_refusal_always() {
+        let list = |s: &str| s.split(',').map(str::to_string).collect::<Vec<_>>();
+        let node = list("role,ddl,function,write");
+        assert!(!kept(&node, "read", "ok"), "the read class off: an ok SELECT is no line");
+        assert!(kept(&node, "ddl", "ok"), "a DDL the node's class writes");
+        assert!(kept(&node, "read", "refused"), "a refusal is written whatever its class");
+        assert!(!kept(&list("off"), "ddl", "ok"), "off writes nothing at all");
+        assert!(kept(&list("all"), "read", "ok"), "all writes every class");
     }
 
     #[tokio::test]
@@ -421,13 +533,46 @@ mod tests {
     }
 
     #[test]
-    fn an_address_has_its_refusals_written_up_to_sixty_a_minute() {
+    fn a_client_has_its_refusals_naming_no_user_written_up_to_sixty_a_minute_and_the_rest_counted() {
         let (ip, other) = (Some("203.0.113.7".parse().unwrap()), Some("203.0.113.8".parse().unwrap()));
-        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(ip, 1_000)).collect();
+        let said: Vec<_> = (0..KNOCKS + 5).map(|_| knocked(Some(ip), 1_000).0).collect();
         assert!(said[..KNOCKS as usize - 1].iter().all(|s| *s == Some(false)), "the first 59 written");
-        assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest aren't");
+        assert_eq!(said[KNOCKS as usize - 1], Some(true), "the 60th written, saying the rest are counted");
         assert!(said[KNOCKS as usize..].iter().all(Option::is_none), "the rest of the minute not written");
-        assert_eq!(knocked(other, 1_000), Some(false), "another address counts apart");
-        assert_eq!(knocked(ip, 61_000), Some(false), "a new minute, written again");
+        assert_eq!(knocked(Some(other), 1_000).0, Some(false), "another client counts apart");
+        assert_eq!(knocked(None, 1_000).0, Some(false), "one that names a user is always written");
+        let (written, counted) = knocked(Some(ip), 61_000);
+        assert_eq!(written, Some(false), "a new minute, written again");
+        assert_eq!(counted, vec![("203.0.113.7".to_string(), 1_000, 5)], "the minute that ended: a count of the 5 not written");
+        let v6 = |s: &str| Some(s.parse().unwrap());
+        for _ in 0..KNOCKS {
+            knocked(Some(v6("2001:db8:0:1::1")), 1_000);
+        }
+        assert_eq!(knocked(Some(v6("2001:db8:0:1:ffff::2")), 1_000).0, None, "an IPv6 client's /64 counts as one");
+        assert_eq!(knocked(Some(v6("2001:db8:0:2::1")), 1_000).0, Some(false), "the next /64 apart");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_dropped_after_one_item_sets_its_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut rows = Box::pin(guarded(flag.clone(), futures::stream::iter([1, 2, 3])));
+        assert_eq!(rows.next().await, Some(1));
+        drop(rows);
+        assert!(flag.load(Ordering::Relaxed), "a stream its client drops after one of its three items sets its flag");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_read_to_its_end_leaves_its_flag_unset() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let rows: Vec<i32> = guarded(flag.clone(), futures::stream::iter([1, 2, 3])).collect().await;
+        assert_eq!(rows, vec![1, 2, 3]);
+        assert!(!flag.load(Ordering::Relaxed), "a stream read to its end leaves its flag unset");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_stream_never_polled_and_dropped_sets_its_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        drop(guarded(flag.clone(), futures::stream::iter([1, 2, 3])));
+        assert!(flag.load(Ordering::Relaxed), "a stream dropped unpolled sets its flag: its statement was dropped unfinished");
     }
 }

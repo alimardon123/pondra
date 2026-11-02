@@ -8,7 +8,7 @@
   records the migration instead of running it, and loads the seed;
 - a materialized view changed is made again with what follows it;
 - a failed test fails the apply; a plan shown before someone else applied is refused;
-- another project can't change this one's objects;
+- another project can't change this one's objects; a pipeline in YAML or Python under objects/ is refused by name (1.1);
 - `pondra export` of prod, applied into an empty database, exports the same;
 - `pondra login` with no URL: the project's server;
 - `pondra apply test`: a clone made once and kept; `--fresh` makes it again; a name nobody declared is a branch of prod;
@@ -290,6 +290,14 @@ def project_check(bin, work, port, checks):
     other = {"pondra.toml": '[project]\nname = "crm"\n', "objects/o.sql": "CREATE VIEW sales.big AS SELECT 1 AS x;\n"}
     p = call("POST", "/db/prod/plan", {"files": other})
     checks["another project declaring this one's view: refused, naming its owner"] = any("project sales's" in r for r in p["plan"]["refused"])
+
+    # A pipeline or a dashboard in YAML, and a pipeline in Python, come in 1.1: a plan of the folder refuses each by its
+    # name, rather than skipping it and then reading it differently in 1.1.
+    for rel, words in [("objects/load.py", "pipelines in Python come in 1.1"), ("objects/overview.dashboard.yaml", "pipelines and dashboards in YAML come in 1.1")]:
+        write(rel, "")
+        said = pondra("plan", "prod", ok=False)
+        os.remove(os.path.join(proj, rel))
+        checks[f"{rel} in the project: refused by name"] = f"{rel}: {words}" in said
 
     # Shares and recipients are each database's own: a plan never drops prod's, and a project can't
     # declare them (a branch would carry a partner's grant into dev).

@@ -2,9 +2,10 @@
 // A page (web/, the module in Node) behind an HTTP port, so a check written for a node runs on a page unchanged
 // (reviews/form-parity.md §1: one forms check over every form). Each request goes to `Page.request` as it came, and its
 // answer (status, headers, body) goes back as the page gave it: the page's contract is the node's (ADR-061).
-// `node tools/page_serve.mjs [--pkg web/pkg] [--port 0]`: one page in memory, made afresh by `POST /reset`. Once it
-// listens it prints one JSON line, `{"url": "http://127.0.0.1:<port>"}` (port 0 takes a free one); it ends on SIGTERM or
-// SIGINT, and its tables end with it.
+// `node tools/page_serve.mjs [--pkg web/pkg] [--port 0]`: one page in memory, made afresh by `POST /reset`. The page is a
+// member on the core's lake, as every page is (`new Page()`: one page a module, so a reset closes and frees the last first).
+// Once it listens it prints one JSON line, `{"url": "http://127.0.0.1:<port>"}` (port 0 takes a free one); it ends on
+// SIGTERM or SIGINT, and its tables end with it.
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { dirname, join, resolve } from 'node:path';
@@ -26,8 +27,15 @@ async function answer(req, res) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   if (req.method === 'POST' && req.url === '/reset') {
-    page.free();
-    page = new Page();
+    try {
+      await page.close(); // (close before free: the member ends now, not in the background, and the next page opens on a clean lake)
+      page.free();
+      page = new Page();
+    } catch (e) {
+      res.writeHead(500, { 'content-type': 'text/plain' });
+      res.end(`the page didn't reset: ${e?.message ?? e}`);
+      return;
+    }
     res.writeHead(204);
     res.end();
     return;

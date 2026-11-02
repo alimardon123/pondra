@@ -26,7 +26,7 @@ use crate::write::Stmt;
 use crate::text::{ident, object};
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::RecordBatch;
-use datafusion::sql::sqlparser::ast::{self, visit_expressions_mut, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Statement, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
 use serde::Deserialize;
 use serde_json::{json as j, Value};
@@ -107,21 +107,25 @@ pub fn statement(sql: &str) -> Option<Stmt> {
     }
     let create = p.parse_keyword(Keyword::CREATE);
     let replace = p.parse_keywords(&[Keyword::OR, Keyword::REPLACE]);
-    let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|_| create)?;
+    let temporary = p.parse_one_of_keywords(&[Keyword::TEMP, Keyword::TEMPORARY]).is_some(); // (a function of the session's: `temp.rs`)
+    let what = p.parse_one_of_keywords(&[Keyword::FUNCTION, Keyword::PROCEDURE, Keyword::TASK]).filter(|k| create && (!temporary || *k == Keyword::FUNCTION))?;
     let quiet = p.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]); // (nothing if one of the name is there)
     if quiet && replace {
         return Some(Stmt::Invalid("CREATE OR REPLACE … IF NOT EXISTS: one or the other".into()));
     }
     Some(match what {
         // (a refusal is said as it is, the pipeline's words; any other mistake gets the usage too)
-        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| Stmt::Invalid(if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }), |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
+        Keyword::TASK => crate::runs::task(&mut p, sql).map_or_else(|e| { let said = if e.is::<crate::codes::Coded>() { format!("{e:#}") } else { format!("CREATE TASK: {e:#} ({})", crate::runs::USAGE) }; Stmt::of_error(&e, said) }, |(name, task)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "task", Ddl::CreateTask { name: name.clone(), task, replace })])),
         k => {
             let procedure = k == Keyword::PROCEDURE;
             let usage = match procedure {
                 true => "CREATE PROCEDURE name($p TYPE [= …], …) AS BEGIN … END, or LANGUAGE python AS $$ … $$",
                 false => "CREATE FUNCTION name(p TYPE, …) RETURNS TYPE RETURN expression, or … RETURNS TYPE|TABLE (c TYPE, …) LANGUAGE sql|python AS $$ … $$",
             };
-            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::Invalid(format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]))
+            routine(&mut p, sql, procedure).map_or_else(|e| Stmt::of_error(&e, format!("CREATE {}: {e:#} ({usage})", if procedure { "PROCEDURE" } else { "FUNCTION" })), |(name, routine)| match temporary {
+                true => Stmt::TempRoutine(name, Box::new(routine), replace, quiet),
+                false => Stmt::Ddl(vec![crate::write::unless(quiet, &name, "routine", Ddl::CreateRoutine { name: name.clone(), routine, replace })]),
+            })
         }
     })
 }
@@ -215,12 +219,14 @@ fn routine(p: &mut Parser, sql: &str, procedure: bool) -> Result<(String, Routin
         }
     }
     let t = if rest { Token::EOF } else { p.next_token().token };
-    ensure!(matches!(t, Token::EOF | Token::SemiColon), "unexpected {t}");
+    if !matches!(t, Token::EOF | Token::SemiColon) {
+        return Err(crate::codes::coded("42601", format!("unexpected {t}")));
+    }
     r.body = body.context("no body: AS $$ … $$, or RETURN expression")?;
     r.language = match r.language.as_str() {
         "" | "sql" => "sql".into(),
         "python" | "python3" | "plpython3u" | "plpythonu" | "plpython" => "python".into(),
-        l => bail!("LANGUAGE sql or python, not {l}"),
+        l => return Err(crate::codes::coded("0A000", format!("LANGUAGE sql or python, not {l}"))),
     };
     ensure!(!expression || r.language == "sql", "an expression's language is SQL: LANGUAGE python AS $$ … $$ for Python");
     ensure!(!rest || r.language == "sql", "a Python procedure's body is a string: LANGUAGE python AS $$ … $$");
@@ -274,10 +280,12 @@ fn options(p: &mut Parser, o: &mut Options) -> Result<()> {
 
 /// Leader: keep a function or procedure (`ddl::apply`).
 pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Result<Value> {
+    let r = spelled(r)?;
     let name = crate::ddl::new_name(lake, name).await?;
     ensure!(r.kind != Kind::Procedure || !crate::workspace::is_run(crate::text::split(&name).1), "{name}: run is Pondra's own procedure (CALL run('etl/orders.sql') runs a file of the lake's)");
     ensure!(r.kind != Kind::Procedure || !crate::apply::is_own(crate::text::split(&name).1), "{name}: plan, apply, status and capture are Pondra's own procedures (CALL apply('files/sales', env => 'prod'))");
     ensure!(r.kind != Kind::Procedure || !crate::git::is_own(crate::text::split(&name).1), "{name}: git_checkout, git_status, git_commit, git_pull and git_pull_request are Pondra's own procedures (CALL git_commit('sales', 'message'))");
+    clash(lake, &name, &r).await?;
     if let Some(old) = lake.cat.get::<Routine>(&key(&name)).await? {
         ensure!(replace, "{} {name} already exists (CREATE OR REPLACE {})", old.what(), r.what().to_uppercase());
         ensure!((old.kind == Kind::Procedure) == (r.kind == Kind::Procedure), "{name} is a {}", old.what());
@@ -285,6 +293,44 @@ pub async fn create(lake: &Lake, name: &str, r: Routine, replace: bool) -> Resul
     check(lake, &name, &r).await?;
     lake.cat.commit(vec![(key(&name), json(&r))], &[]).await?;
     Ok(j!({r.what(): name}))
+}
+
+/// A function by an installed extension's function's name would be replaced by it in every query that names it
+/// (`clash` refuses the other order at INSTALL).
+async fn clash(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
+    let short = crate::text::split(name).1;
+    if let Some((ext, _)) = crate::extension::listed(lake).await?.into_iter().find(|(_, x)| r.kind != Kind::Procedure && x.functions.iter().any(|f| f.name == short)) {
+        return Err(crate::codes::coded("42723", format!("{name}: the extension {ext} has a function {short}; UNINSTALL it, or name this function otherwise")));
+    }
+    Ok(())
+}
+
+/// A session's function (`CREATE TEMP MACRO`, `CREATE TEMP FUNCTION`): checked as the lake's are, for the session to keep
+/// (`temp.rs`). It is SQL: its body is put in its calls' places, so nothing of it is anywhere but in the session. A Python
+/// function runs on the lake's workers, so it is the lake's.
+pub async fn temporary(lake: &Lake, name: &str, r: Routine) -> Result<Routine> {
+    if r.python() {
+        return Err(crate::codes::coded("0A000", format!("{name}: a temporary function is SQL (RETURN …, LANGUAGE sql, or a MACRO); a Python one is the lake's: CREATE FUNCTION {name} … LANGUAGE python")));
+    }
+    let r = spelled(r)?;
+    clash(lake, name, &r).await?;
+    check(lake, name, &r).await?;
+    Ok(r)
+}
+
+/// Its types spelled as a column's are (`friendly::spelled`): each parameter's, and what it returns.
+fn spelled(mut r: Routine) -> Result<Routine> {
+    for p in &mut r.params {
+        p.ty = p.ty.as_deref().map(crate::friendly::spelled).transpose()?;
+    }
+    r.returns = match r.returns.as_deref() {
+        Some(t) if t.starts_with("TABLE") => {
+            let cols = columns_of(t)?.into_iter().map(|(c, t)| Ok(format!("{} {}", ast::Ident::with_quote('"', c), crate::friendly::spelled(&t)?))).collect::<Result<Vec<_>>>()?;
+            Some(format!("TABLE ({})", cols.join(", ")))
+        }
+        t => t.map(crate::friendly::spelled).transpose()?,
+    };
+    Ok(r)
 }
 
 /// A body that reads, parameters named once, and a function that hides none of SQL's own.
@@ -353,9 +399,9 @@ async fn check(lake: &Lake, name: &str, r: &Routine) -> Result<()> {
 
 /// Every `$n` and `$name` in a SQL function's body is one of its parameters (Postgres: "there is no
 /// parameter $2"): a function's answer depends on its arguments alone, never a session's variable.
-fn places<T: VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
+fn places<T: ast::VisitMut>(r: &Routine, body: &mut T) -> Result<()> {
     let mut wrong = None;
-    let _ = visit_expressions_mut(body, |e| {
+    let _ = crate::walk::visit_expressions_mut(body, |e| {
         if let Expr::Value(v) = e {
             if let ast::Value::Placeholder(p) = &v.value {
                 let n = p.trim_start_matches('$');
@@ -418,7 +464,8 @@ pub async fn prepare(lake: &Lake, sql: &str, params: &HashMap<String, Value>, vi
         },
     };
     let sql = crate::path::door(lake, &sql, &views.keys().cloned().collect()).await?; // (the session's search path: `path.rs`; a client's frames are views, not tables)
-    crate::front::expand(lake, &sql, views).await
+    // (a macro's body brings its `current_*` in as its caller's session has them: `door` kept them in its body)
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, views).await?))
 }
 
 /// Is `sql` a `CREATE` of a task, procedure, function or macro? Its `$name`s are its own
@@ -453,7 +500,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
     let bound = |p: &str| numbered || p.trim_start_matches('$').starts_with(|c: char| c.is_alphabetic() || c == '_');
     named_as_written(&mut stmts, |e| {
         let mut uses = false;
-        let _ = ast::visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             uses |= match x {
                 Expr::Value(v) => matches!(&v.value, ast::Value::Placeholder(p) if bound(p)),
                 Expr::Function(f) => getvariable && object(&f.name) == "getvariable",
@@ -464,7 +511,7 @@ fn bind_as(sql: &str, params: &HashMap<String, Value>, numbered: bool) -> Result
         uses
     });
     let mut missing: Vec<String> = vec![];
-    let _ = visit_expressions_mut(&mut stmts, |e| {
+    let _ = crate::walk::visit_expressions_mut(&mut stmts, |e| {
         match e {
             Expr::Value(v) => {
                 if let ast::Value::Placeholder(p) = &v.value {
@@ -525,7 +572,7 @@ fn named_as_written(stmts: &mut [Statement], uses: impl Fn(&Expr) -> bool) {
     }
     let mut namer = Namer(uses);
     for s in stmts {
-        let _ = s.visit(&mut namer);
+        let _ = crate::walk::visit_mut(s, &mut namer);
     }
 }
 
@@ -563,17 +610,25 @@ fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 /// and a spread query see full names. Stored SQL is read with `expand_stored` instead.
 pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
     let sql = crate::path::door(lake, sql, &std::collections::HashSet::new()).await?;
-    crate::front::expand(lake, &sql, &HashMap::new()).await
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &sql, &HashMap::new()).await?)) // (a macro's `current_*`: its caller's, as `prepare`)
 }
 
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
 /// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
 /// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
-/// (`path::currents`), as Postgres reads a view's.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await }
+/// (`path::currents`), as Postgres reads a view's. Its functions are the lake's: a session's temporary one of the same
+/// name never changes it (`temp::stored`), so it reads the same for every reader and may be kept for them.
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::temp::stored(read_stored(lake, sql)).await }
+
+/// `expand_stored` for a temporary view: the session's own, so it calls the session's temporary functions too.
+pub async fn expand_temp_view(lake: &Lake, sql: &str) -> Result<String> { read_stored(lake, sql).await }
+
+async fn read_stored(lake: &Lake, sql: &str) -> Result<String> {
+    Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
+}
 
 /// `SHOW USER FUNCTIONS`, `SHOW PROCEDURES`, `SHOW TASKS`, `SHOW VIEWS`, `SHOW MATERIALIZED VIEWS`,
-/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
+/// `SHOW SCHEMAS`, `SHOW DATABASES`, `SHOW SECRETS`, `SHOW EXTENSIONS`, `SHOW USERS`, `SHOW ROLES`, `SHOW GRANTS`
 /// (`[LIKE 'pattern']`; shares and recipients: `show_shares`): this lake's own, from `pondra.routines`, `pondra.tasks`, `pondra.tables`,
 /// `information_schema.schemata`, `secrets()`, `pondra.users` and `pondra.grants`, as Snowflake has them. (`SHOW FUNCTIONS` is every function a query may call,
 /// as DataFusion lists them: its own, and the Python ones; `SHOW TABLES` is DataFusion's.)
@@ -585,7 +640,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
     if let Some(q) = crate::settings::show(sql) {
         return Some(q); // (`SHOW search_path`, `SHOW application_name`: the session's)
     }
-    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
+    static SHOW: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)^\s*show\s+(user\s+functions|procedures|tasks|materialized\s+views|views|schemas|databases|secrets|extensions|users|roles|grants)(?:\s+like\s+('(?:[^']|'')*'))?\s*;?\s*$").expect("a regex"));
     if let Some(q) = show_shares(sql) {
         return Some(q);
     }
@@ -597,6 +652,7 @@ pub(crate) fn show(sql: &str) -> Option<String> {
         "schemas" => format!("SELECT catalog_name AS lake, schema_name AS name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', 'pg_catalog') AND schema_name NOT LIKE 'pg_temp%'{like} ORDER BY 1, 2"),
         "databases" => format!("SELECT DISTINCT catalog_name AS name FROM information_schema.schemata WHERE true{like} ORDER BY 1"),
         "secrets" => format!("SELECT * FROM secrets() WHERE true{like} ORDER BY name"),
+        "extensions" => format!("SELECT * FROM extensions() WHERE true{like} ORDER BY name"),
         "users" => format!("SELECT * FROM pondra.users WHERE kind <> 'role'{like} ORDER BY name"),
         "roles" => format!("SELECT * FROM pondra.users WHERE kind = 'role'{like} ORDER BY name"),
         "grants" => format!("SELECT * FROM pondra.grants WHERE true{like} ORDER BY 1, 2"),
@@ -788,7 +844,7 @@ async fn one_or_locked(app: &App, sql: &str, who: Who, job: Option<String>) -> R
     }
 }
 
-async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
+pub(crate) async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<Outcome> {
     if let Some(cmd) = crate::cursors::of(sql) {
         // DECLARE, FETCH, MOVE, CLOSE: the session's cursors (cursors.rs). Before the script's check: DECLARE reads as one.
         return Ok(match crate::cursors::run(app, cmd?, who.role).await? {
@@ -846,6 +902,9 @@ async fn one_of(app: &App, sql: &str, who: Who, job: Option<String>) -> Result<O
     if let Some(steps) = Box::pin(steps(app, sql, who)).await? {
         return Box::pin(run_steps(app, steps, who, job)).await; // (several statements: an ALTER's actions, a DROP's views)
     }
+    if let Some(w) = crate::with_writes::of(sql) {
+        return Box::pin(crate::with_writes::run(app, &w?, who, job)).await; // (a WITH that writes: its writes in one transaction, then its answer)
+    }
     if let Some(r) = crate::returning::of(sql) {
         return Ok(Outcome::Rows(vec![Box::pin(crate::returning::run(app, &r, who.role, who.files, job)).await?])); // (INSERT … RETURNING: the rows it wrote)
     }
@@ -876,6 +935,7 @@ async fn steps(app: &App, sql: &str, who: Who) -> Result<Option<Vec<(String, Opt
     for (part, _) in &parts {
         match crate::write::parse(part) {
             Some(Stmt::Invalid(why)) => bail!("{why}"),
+            Some(Stmt::Refused(code, why)) => return Err(crate::codes::coded(code, why)),
             Some(stmt) => {
                 app.auth.allows(who.role, &stmt)?;
                 if let Stmt::Ddl(ds) = &stmt {
@@ -1062,8 +1122,9 @@ pub fn do_of(sql: &str) -> Option<(String, String)> {
 /// every statement), cast to their parameters' types.
 async fn prepared(app: &App, name: &str, args: &[FunctionArg], who: Who) -> Result<(String, Routine, RecordBatch)> {
     ensure!(who.depth < 16, "{name}: procedures calling procedures 16 deep (a loop?)");
-    let local = crate::ddl::local(&app.lake, name).with_context(|| format!("no procedure {name}"))?;
-    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().with_context(|| format!("no procedure {name}"))?;
+    let missing = || crate::codes::coded("42883", format!("procedure {name} does not exist"));
+    let local = crate::ddl::local(&app.lake, name).ok_or_else(missing)?;
+    let r = listed(&app.lake).await?.get(&local).filter(|r| r.kind == Kind::Procedure).cloned().ok_or_else(missing)?;
     let values = arguments(name, &r, args)?;
     let select = r.params.iter().map(|p| match &p.ty {
         Some(t) if !crate::text::loose(Some(t)) => format!("CAST(({}) AS {t}) AS \"{}\"", values[&p.name], p.name),
@@ -1222,7 +1283,13 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
         }
         _ => crate::python::ask(&r.with.packages, kind, head, parts, limit, &mut notice).await,
     };
-    let (answer, parts) = asked.map_err(|e| anyhow::anyhow!("{whose}{}", lease.redact(&format!("{e:#}"))))?;
+    let (answer, parts) = asked.map_err(|e| {
+        let said = format!("{whose}{}", lease.redact(&format!("{e:#}")));
+        match e.chain().find_map(|c| c.downcast_ref::<crate::codes::Coded>()) {
+            Some(c) => crate::codes::coded(c.0, said), // (a Python error's SQLSTATE, `python::raised`: 38000, not an internal one)
+            None => anyhow::anyhow!(said),
+        }
+    })?;
     match answer["kind"].as_str() {
         Some("rows") => Ok(Outcome::Rows(crate::query::read_ipc(parts.first().context("no rows")?)?)),
         Some("images") => Ok(Outcome::Done(j!({"called": name, "images": answer["images"]}))), // (a cell's figures, as PNG: the console shows them)
@@ -1234,6 +1301,10 @@ async fn python(app: &App, name: &str, r: &Routine, args: RecordBatch, who: Who,
 /// Does `sql` call a Python function that may answer differently each time (so its result mustn't
 /// be remembered)? In a view it reads too.
 pub async fn volatile(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| f.volatile).await {
+        return true; // (an extension's function that says it may answer the same arguments differently: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return true };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind != Kind::Procedure && !r.cacheable())).await
 }
@@ -1241,6 +1312,10 @@ pub async fn volatile(lake: &Lake, sql: &str) -> bool {
 /// Does `sql` read a Python table function, itself or through a view? Then it runs on one node:
 /// each would call it.
 pub async fn pinned(lake: &Lake, sql: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::extension::calls(lake, sql, |f| !f.columns.is_empty()).await {
+        return true; // (an extension's table function, as a Python one: `extension.rs`)
+    }
     let Ok(all) = listed(lake).await else { return false };
     reads_any(lake, sql, all.iter().filter(|(_, r)| r.kind == Kind::Table && r.python())).await
 }
@@ -1288,6 +1363,19 @@ mod tests {
         assert_eq!(body("d ? 'a'"), "jsonb_exists(d, 'a')", "an expression stays one, unnamed");
         assert_eq!(body("SELECT d ? 'a'"), r#"SELECT jsonb_exists(d, 'a') AS "?column?""#);
         assert_eq!(body("x + 1"), "x + 1", "nothing of JSON's: as written");
+    }
+
+    #[test]
+    fn a_routines_types_are_spelled_as_a_columns_are() {
+        let param = |ty: &str| Param { name: "x".into(), ty: Some(ty.into()), default: None };
+        let r = |params: Vec<Param>, returns: &str| Routine { kind: Kind::Macro, params, language: "sql".into(), body: "x".into(), returns: Some(returns.into()), with: Options::default() };
+        let s = spelled(r(vec![param("DATETIME"), param("DECIMAL(10,2)")], "UBIGINT")).unwrap();
+        assert_eq!(s.params.iter().map(|p| p.ty.clone().unwrap()).collect::<Vec<_>>(), ["TIMESTAMP", "DECIMAL(10,2)"], "a type spell leaves stays as written");
+        assert_eq!(s.returns.as_deref(), Some("BIGINT UNSIGNED"));
+        let s = spelled(r(vec![], r#"TABLE ("a" BLOB, "b" INT)"#)).unwrap();
+        assert_eq!(s.returns.as_deref(), Some(r#"TABLE ("a" BYTEA, "b" INT)"#));
+        let e = spelled(r(vec![param("HUGEINT")], "INT")).unwrap_err();
+        assert_eq!(e.to_string(), "HUGEINT is DuckDB's 128-bit integer: write DECIMAL(38, 0)");
     }
 
     #[test]

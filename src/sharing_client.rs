@@ -31,7 +31,8 @@ pub async fn accept(lake: &crate::store::Lake, name: &str, url: &str, mut option
         crate::ext::create(lake, &format!("share_{name}"), params, true, false).await?;
     }
     let token = crate::ext::share_token(lake, endpoint).await?.with_context(|| format!("no token for {endpoint}: ATTACH '<the share's profile>' AS {name} (TYPE share), or add TOKEN '…'"))?;
-    let r = crate::fetch::send(crate::fetch::timeout(crate::ext::web().get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
+    let r = crate::fetch::send(crate::fetch::timeout(own_web().get(format!("{endpoint}/shares")).bearer_auth(&token), std::time::Duration::from_secs(15))).await.with_context(|| format!("reaching {endpoint}"))?;
+    ensure!(!r.status().is_redirection(), "{endpoint} sent its shares' list off its own address: a provider's own calls stay on it");
     let (status, body) = (r.status(), r.json::<Value>().await.unwrap_or_default());
     ensure!(status.is_success(), "{endpoint} says {status}: {}", body["message"].as_str().unwrap_or_default());
     let shares: Vec<String> = body["items"].as_array().into_iter().flatten().filter_map(|s| s["name"].as_str().map(str::to_string)).collect();
@@ -58,20 +59,25 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
         ask["version"] = j!(v.parse::<i64>().with_context(|| format!("version is a number, not {v}"))?);
     }
     let at = format!("{endpoint}/shares/{}/schemas/{}/tables/{}/query", o("share"), o("schema"), o("table"));
-    let r = crate::fetch::send(crate::ext::web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask)).await.with_context(|| format!("reaching {endpoint}"))?;
+    let r = crate::fetch::send(own_web().post(&at).bearer_auth(&token).header("delta-sharing-capabilities", "responseformat=delta,parquet;readerfeatures=deletionvectors,columnmapping,timestampntz").json(&ask)).await.with_context(|| format!("reaching {endpoint}"))?;
     let status = r.status();
+    ensure!(!status.is_redirection(), "{at}: sent off the provider's own address: a provider's own calls stay on it");
     let delta = r.headers().get("delta-sharing-capabilities").and_then(|v| v.to_str().ok()).is_some_and(|c| c.contains("responseformat=delta"));
     // (an answer lists a table's files, a line each: one past ANSWER_MOST is refused, not read whole into memory)
     let text = r.body_within(ANSWER_MOST).await?.map(String::from_utf8).transpose()?.with_context(|| format!("{}.{}.{} at {endpoint}: an answer over {} MB", o("share"), o("schema"), o("table"), ANSWER_MOST >> 20))?;
     ensure!(status.is_success(), "{}.{}.{} at {endpoint}: {status} {}", o("share"), o("schema"), o("table"), serde_json::from_str::<Value>(&text).ok().and_then(|e| e["message"].as_str().map(str::to_string)).unwrap_or(text));
     let lines: Vec<Value> = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<_, _>>()?;
     ensure!(lines.len() >= 2, "{at}: an answer without its protocol and metadata");
-    // (a link on the provider's own host is reached as the provider is, its admin having named it; any other only on the
-    // public internet, every address and redirect checked as it is reached: `public::web`)
-    let host = url::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(str::to_string));
+    // (a link on the provider's own origin, its scheme, host and port, is reached as the provider is, its admin having
+    // named it, and so is one that a secret an admin made covers by its SCOPE (a provider's files in a bucket of a
+    // network both reach); any other only on the public internet, every address and redirect checked as it is reached:
+    // `public::web`)
+    let origin = url::Url::parse(endpoint).ok().map(|u| u.origin());
+    let secrets = crate::ext::list(lake).await?;
+    let named = |u: &str| crate::ext::covering(&secrets, u).is_some_and(|(_, s)| s.scope.is_some() && (!s.temporary || s.trusted));
     let link = |u: &str| -> anyhow::Result<String> {
         let at = url::Url::parse(u).with_context(|| format!("{endpoint}: a link that isn't a URL"))?;
-        let own = at.host_str().is_some_and(|h| Some(h) == host.as_deref());
+        let own = origin.as_ref().is_some_and(|o| o.is_tuple() && *o == at.origin()) || named(u);
         if !own {
             crate::public::check(&at).with_context(|| format!("{endpoint} links to {}", at.host_str().unwrap_or_default()))?;
         }
@@ -96,6 +102,27 @@ pub async fn read(lake: &crate::store::Lake, spec: &crate::ext_names::Spec) -> a
     lake.rt.register_object_store(&url::Url::parse("share://files")?, Arc::new(Links { public: false }));
     lake.rt.register_object_store(&url::Url::parse("share://public")?, Arc::new(Links { public: true }));
     crate::read_delta::table(endpoint, &protocol, &metadata, adds.iter()).map(crate::ext::table_meta)
+}
+
+/// The client for a provider's own calls (its `/shares`, its tables' `/query` and links on its own origin): a redirect
+/// is followed on that origin (scheme, host and port) alone, and one elsewhere is handed back unfollowed, refused or
+/// reached as the public internet is (`public::web`): a provider can't send this node to an address of its network
+/// (audit 10-30 M8). On a page it is the web client, as `public::web` is.
+fn own_web() -> &'static reqwest::Client {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| {
+            let same = reqwest::redirect::Policy::custom(|to| match to.previous().len() >= 10 {
+                true => to.error("more than 10 redirects"),
+                false if to.previous().first().is_some_and(|first| first.origin() == to.url().origin()) => to.follow(),
+                false => to.stop(),
+            });
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(60)).redirect(same).build().expect("an HTTP client")
+        })
+    }
+    #[cfg(target_arch = "wasm32")]
+    crate::ext::web()
 }
 
 /// The files a provider links to (`share://files/<link, base64url>`, or `share://public/…` for a link off its own host):
@@ -143,8 +170,16 @@ impl object_store_df::ObjectStore for Links {
             (Some(r), _) => ours(r),
             (None, _) => object_store::GetRange::Offset(0),
         };
-        let web = if self.public { crate::public::web() } else { crate::ext::web() };
-        let r = crate::fetch::send(web.get(&url).header("range", byte_range::header(&want))).await.map_err(links_error)?;
+        let range = byte_range::header(&want);
+        let web = if self.public { crate::public::web() } else { own_web() };
+        let mut r = crate::fetch::send(web.get(&url).header("range", &range)).await.map_err(links_error)?;
+        if !self.public && r.status().is_redirection() {
+            // (a link on the provider's own origin sent elsewhere, to a bucket's signed link say: reached as the public
+            // internet is, its address and every redirect checked)
+            let to = r.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|l| url::Url::parse(&url).ok()?.join(l).ok()).ok_or_else(|| links_error("the provider's link redirected without a Location"))?;
+            crate::public::check(&to).map_err(|e| links_error(format!("the provider's link redirected to {}: {e}", to.host_str().unwrap_or_default())))?;
+            r = crate::fetch::send(crate::public::web().get(to.as_str()).header("range", &range)).await.map_err(links_error)?;
+        }
         match r.status().as_u16() {
             200 | 206 => {}
             404 => return Err(object_store_df::Error::NotFound { path: location.to_string(), source: "the provider has no such file now".into() }),

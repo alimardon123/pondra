@@ -158,6 +158,22 @@ impl Peer {
     /// node runs)? Behind `pondra serve --lakes` the connection is always this machine's, so the client's
     /// own address decides.
     pub fn from_here(&self, headers: &axum::http::HeaderMap) -> bool { self.client(headers).is_loopback() }
+
+    /// Is the request this machine's own, with no proxy between (the nodes' key while the lake's keys are in
+    /// the clear: `users::nodes_key`)? From this machine, from no proxy of `PONDRA_TRUSTED_PROXIES`, for no
+    /// client `pondra serve --lakes` names elsewhere, and with no header a proxy adds: nginx, Caddy, a mesh's
+    /// sidecar or a tunnel on this host make every connection local.
+    pub fn own(&self, headers: &axum::http::HeaderMap) -> bool {
+        self.local && !proxies().iter().any(|p| within(self.addr.ip(), *p)) && self.client(headers) == self.addr.ip() && !proxied(headers)
+    }
+}
+
+/// Does a request carry a header a proxy adds (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, Envoy's,
+/// Cloudflare's)? No node's own call sends one.
+fn proxied(headers: &axum::http::HeaderMap) -> bool {
+    headers.keys().map(|k| k.as_str()).any(|k| {
+        matches!(k, "forwarded" | "via" | "x-real-ip" | "true-client-ip" | "cf-connecting-ip") || k.starts_with("x-forwarded-") || k.starts_with("x-envoy-")
+    })
 }
 
 /// Your own load balancers and ingresses, as addresses and ranges (`PONDRA_TRUSTED_PROXIES`:
@@ -272,6 +288,19 @@ mod tests {
         for bad in ["10.0.0.0/33", "lb.internal", "10.0.0.0/x"] {
             assert!(ranges(bad).is_err(), "{bad} refused at start");
         }
+    }
+
+    #[test]
+    fn a_request_is_this_machines_own_only_with_no_proxy_between() {
+        let at = |ip: [u8; 4], local| Peer { addr: SocketAddr::from((ip, 9)), tls: false, signed: false, local };
+        let with = |k: &'static str| { let mut h = axum::http::HeaderMap::new(); h.insert(k, "203.0.113.9".parse().unwrap()); h };
+        let none = axum::http::HeaderMap::new();
+        assert!(at([127, 0, 0, 1], true).own(&none), "a node or a shell on this machine");
+        assert!(!at([10, 0, 0, 2], false).own(&none), "another machine");
+        for k in ["x-forwarded-for", "x-forwarded-proto", "forwarded", "via", "x-real-ip", "x-envoy-external-address", "cf-connecting-ip"] {
+            assert!(!at([127, 0, 0, 6], true).own(&with(k)), "a proxy on this host (nginx, Caddy, Istio's sidecar, cloudflared) adds {k}");
+        }
+        assert!(at([127, 0, 0, 1], true).own(&with("x-request-id")), "a header anyone sends");
     }
 
     #[test]

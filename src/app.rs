@@ -105,7 +105,9 @@ impl App {
         if self.auth.on() || self.auth.network() || self.auth.owned() {
             return false;
         }
-        let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
+        if self.lake.caught_up().await.is_err() {
+            return false; // (still catching up after 10 s: its catalog may lack its leader's users, so it is never open on its word)
+        }
         if crate::users::signed(&self.lake).await {
             return false; // (served with tokens once: a node started without them answers no one, `users::signed`)
         }
@@ -129,7 +131,7 @@ struct Turns {
 }
 
 static TURNS: std::sync::LazyLock<Turns> = std::sync::LazyLock::new(|| {
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let cores = crate::env::cores();
     let most = crate::env::or::<usize>("PONDRA_QUERIES", (4 * cores).max(16)).max(1);
     let wait = crate::env::or::<f64>("PONDRA_QUEUE_SECS", 60.0);
     Turns { turns: tokio::sync::Semaphore::new(most), most, wait: Duration::from_secs_f64(wait.max(0.0)) }
@@ -188,7 +190,7 @@ impl App {
     /// the session's own: the other nodes read it with no session, as its reader's path says. And
     /// so do a session's queries while it holds temporary secrets, which only this node has.
     pub async fn here_only(&self, query: &str) -> bool {
-        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
+        crate::query::sent() || crate::temp::mentioned(query) || crate::temp::called(query).is_some() || crate::temp::holds_secrets() || crate::past_names::mentioned(query) || crate::txn::open() || crate::settings::any() || crate::vars::mentioned(query) || crate::routines::pinned(&self.lake, query).await || crate::auth::limited().is_some()
             || (crate::path::current(&self.lake).is_some() && crate::path::reads_current(&self.lake, query).await)
     }
 
@@ -231,20 +233,21 @@ impl App {
             let here = datafusion::common::instant::Instant::now();
             let ctx = session(&self.lake, query, "").await?;
             crate::query::mark("session with its tables");
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
+            let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
             let out = crate::query::frugally(&ctx, |ctx| async move {
                 let df = crate::engine::sql(&ctx, query).await?;
                 crate::query::mark("parsed to logical plan");
-                let task = Arc::new(df.task_ctx());
                 let (state, logical) = df.into_parts();
+                let task = crate::query::task_with_peak(&state, peak)?;
                 let logical = state.optimize(&logical)?; // (as `create_physical_plan`, the plan it optimized kept: what its filters were about, `learned.rs`)
                 crate::query::mark("optimized plan");
                 let plan = state.query_planner().create_physical_plan(&logical, &state).await?;
                 crate::query::mark("physical plan");
                 let out = if top { crate::query::collect_or_send(plan.clone(), task).await? } else { crate::query::collect(plan.clone(), task).await? };
                 crate::query::mark("run to the end");
-                crate::history::planned(&logical, &plan); // (its shape; a slow statement's plan, with what each operator did; what it learned)
+                crate::history::planned(&logical, &plan, peak.peak_reserved()); // (its shape; a slow statement's plan, with what each operator did; what it learned; its cost)
                 // (no rows: still its columns, with the types its batches have, which the physical plan gives: not the planner's)
                 anyhow::Ok(crate::engine::kept(out, &plan))
             }).await?;
@@ -384,6 +387,12 @@ impl App {
             anyhow::ensure!(r.ok(), "the leader: {}", r.text().await?);
             return Ok(r.json().await?);
         }
+        // (a one-off writer that leads for this, `pondra sql --dir … CHECKPOINT` on a lake no node serves, compacts the
+        // catalog's level 0 first, so the round's flushes don't wait on it: nobody else runs its compactor)
+        let one_off = crate::node::is_guest();
+        if one_off {
+            self.lake.cat.tidy(8, Duration::from_secs(60), false).await?;
+        }
         let rows = self.tier_all(0).await?;
         let (mut purged, nodes) = (vec![], if self.members.nodes().is_empty() { vec![self.members.me().to_string()] } else { self.members.nodes() });
         {
@@ -402,8 +411,33 @@ impl App {
                 crate::delta::publish_all(&self.lake).await?; // (publishing happens under the lock: `iceberg::record`)
             }
         }
-        self.lake.cat.checkpoint().await?;
+        match one_off {
+            true => self.lake.cat.tidy(8, Duration::from_secs(60), true).await?, // (and its old WAL and manifests cleared)
+            false => self.lake.cat.checkpoint().await?,
+        }
         Ok(j!({"checkpoint": true, "rows_tiered": rows, "rewritten": purged}))
+    }
+
+    /// A one-off writer's last steps (`Node::finish`: a guest that led the lake for its statement), what a node's loops
+    /// would do, done here once each is due, since no node may ever run this lake. Under both bounds a write costs what
+    /// it did. The catalog's level 0: each one-off writer's stop leaves a file there, and once `CATALOG_FILES` wait, this
+    /// one compacts them before it lets go (the stop's flush waits on a full level 0, 10 s a write). The log: past what
+    /// is tiered it grows a segment a write, and every later reader replays it; once it holds `LONG_SEGMENTS` segments
+    /// or `LONG_ROWS` rows, this one tiers it, as a node's round does (no Parquet file a write under that).
+    pub async fn tidy_one_off(&self) -> anyhow::Result<u64> {
+        const CATALOG_FILES: usize = 32; // (of the 64 a flush waits at: `kv::slate`)
+        const LONG_SEGMENTS: u64 = 64;
+        const LONG_ROWS: u64 = 100_000;
+        if self.lake.cat.waiting() >= CATALOG_FILES {
+            // (and the write-ahead-log objects the writers before it left, once a minute old, are cleared with it)
+            self.lake.cat.tidy(8, Duration::from_secs(60), true).await?;
+        }
+        let hwm = *self.lake.hwm.borrow();
+        let from = self.lake.cat.scan::<TableMeta>("t/", "t0").await?.iter().map(|(_, m)| m.tiered).min().unwrap_or(hwm);
+        if hwm.saturating_sub(from) < LONG_SEGMENTS && crate::tier::backlog(&self.lake, from, None).await?.values().sum::<u64>() < LONG_ROWS {
+            return Ok(0);
+        }
+        self.tier_all(0).await
     }
 
     /// One table's log up to `hwm`, a chunk at a time.
@@ -423,13 +457,41 @@ impl App {
             return Ok(()); // (a backup's views and tasks follow nothing: ADR-070)
         }
         crate::tasks::run_all(&self.lake, &*self.members, self.log()?).await?;
+        self.keep_views().await
+    }
+
+    /// The leader's turn at its views: each filled from the rows already there, stream joins, views kept by key.
+    async fn keep_views(&self) -> anyhow::Result<()> {
         match &self.seq {
             Some(seq) => {
                 crate::views::fill_all(&self.lake, seq, self.log()?, &self.lock).await?; // (the leader: views filled from the rows already there)
-                crate::views::join_all(&self.lake, self.log()?).await?; // (and stream joins)
+                crate::views::join_all(&self.lake, self.log.as_ref().ok_or_else(|| anyhow::anyhow!("read-only node"))?).await?; // (and stream joins)
                 crate::rerun::run_all(&self.lake, seq, &self.lock).await // (and views kept by key: each in a task of its own)
             }
             None => Ok(()),
+        }
+    }
+
+    /// `ddl::settle`: waits for what `d` made to be ready. A guest that leads its lake (`pondra sql`, or a program's node,
+    /// on a lake nobody else leads) has no loop running the leader's tasks (`node.rs`: only a node that lives runs it), so
+    /// it takes the views' turns while it waits (not the scheduled tasks': it leads for a moment). A materialized view is
+    /// filled from the rows already there, and a view kept by key works its groups out, before its CREATE answers. (Its
+    /// CREATE waited ten minutes, and the view lacked those rows until a node led the lake.)
+    pub(crate) async fn settle(&self, d: &crate::ddl::Ddl) -> anyhow::Result<()> {
+        if !(crate::node::is_guest() && self.seq.is_some()) {
+            return crate::ddl::settle(&self.lake, d).await;
+        }
+        let tasks = async {
+            loop {
+                if let Err(e) = self.keep_views().await {
+                    eprintln!("keeping views failed: {e:#}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            done = crate::ddl::settle(&self.lake, d) => done,
+            _ = tasks => Ok(()), // (never: the loop runs until the wait ends)
         }
     }
 }
@@ -453,10 +515,10 @@ impl App {
             static OFFSET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bAT\s*\(\s*OFFSET\s*=>").expect("a regex"));
             let text = &format!("{text} {}", crate::past_names::spelled(text));
             let q = text.to_lowercase();
-            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since)
+            (q.contains("offset") && OFFSET.is_match(text)) || !crate::ext_names::names(text).is_empty() || ["now()", "today(", "random(", "current_", "session_user", "uuid(", "explain", "pondra.runs", "pondra.tasks", "pondra.audit", "pondra$audit", "pondra.history", "pondra$history", "pondra.loads", "pondra.learned", "pondra.flows", "pondra.variables", "pondra.find", "pondra.parts", "files(", "nextval(", "currval(", "setval("].iter().any(|f| q.contains(f)) // (files outside the lake change on their own; `files()` lists objects put since; a view's failing runs, `pondra.flows`' `error`, commit nothing)
         };
         let volatile = crate::auth::limited().is_some() || asks(query) || crate::pg_catalog::asked(query) // (Postgres's catalog: another answer to the same text)
-            || crate::temp::mentioned(query) // (the session's temporary tables change without a commit)
+            || crate::temp::mentioned(query) || crate::temp::called(query).is_some() // (the session's temporary tables change without a commit, and its functions are its own)
             || crate::settings::any() // (and its settings may change the answer)
             || crate::routines::with_views(&self.lake, query).await.map_or(true, |t| t.len() > query.len() && asks(&t)) // (and so may a view it reads: `now()`, files)
             || crate::routines::volatile(&self.lake, query).await // (a Python function may answer differently each time)

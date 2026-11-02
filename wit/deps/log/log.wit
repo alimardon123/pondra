@@ -1,0 +1,10 @@
+package pondra:log@1.0.0;
+
+/// Lines an extension writes to the node's log (ADR-075 §2, E5), each with the extension's name. A call writes at most 100;
+/// the rest are counted in one line.
+interface log {
+  enum level { debug, info, warn, error }
+
+  /// Writes `message` at `level`: one line, cut at 1,000 characters.
+  write: func(level: level, message: string);
+}

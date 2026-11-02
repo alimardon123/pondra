@@ -12,8 +12,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::prelude::*;
 use datafusion::common::utils::memory::RecordBatchMemoryCounter;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
-use datafusion::execution::TaskContext;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation, PeakRecordingPool};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::{SessionState, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::{StreamExt, TryStreamExt};
 use std::sync::Arc;
@@ -444,12 +445,14 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
-    if (!meta.mapped() && !hide) || meta.finish.is_some() {
+    if (!meta.mapped() && !hide && meta.shown.is_empty()) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &str| !meta.dropped.iter().any(|d| d == c) && !(hide && c == "_deleted");
-    Ok(Arc::new(Table(crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?.into_view())))
+    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
+    let df = if meta.shown.is_empty() { df } else { crate::answer::reordered(df, &meta.sql_order())? }; // (a column moved: SQL's order)
+    Ok(Arc::new(Table(df.into_view())))
 }
 
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
@@ -541,6 +544,18 @@ impl TableProvider for Table {
     async fn scan(&self, state: &dyn datafusion::catalog::Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         self.0.scan(state, projection, filters, limit).await
     }
+}
+
+/// Is a table one of the lake's own append tables as a query reads it (`Pruned`), under the wrappers a session puts
+/// around it (`Guarded`, `Table`)?
+pub(crate) fn lakes_own(p: &dyn TableProvider) -> bool {
+    if let Some(g) = p.downcast_ref::<Guarded>() {
+        return lakes_own(g.inner.as_ref());
+    }
+    if let Some(t) = p.downcast_ref::<Table>() {
+        return lakes_own(t.0.as_ref());
+    }
+    p.is::<Pruned>()
 }
 
 /// Does a query (with the stored views it reads) name a keyed table's `_deleted` (`named`)? As a
@@ -937,11 +952,13 @@ impl Pieces {
 
 /// An answer handed to its door: its first piece's bytes, the rest as they are written, and whether its last
 /// was written (a channel that closes before it is an answer cut short: the body must fail then, never end as
-/// if whole).
+/// if whole). `stop`: the statement's stop flag, for a plan's pieces (`send_rest`), which the body sets when the
+/// client goes before the end (`audit::guarded`); None when the rows were already collected.
 pub struct Handed {
     pub first: Vec<u8>,
     pub rest: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
     pub ended: Arc<std::sync::atomic::AtomicBool>,
+    pub stop: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Lets the query a request runs send its answer in pieces, until it is dropped (`arm`).
@@ -1017,8 +1034,17 @@ async fn gather(plan: Arc<dyn ExecutionPlan>, task: Arc<TaskContext>, send: Opti
     Ok(out)
 }
 
+/// The memory an answer kept for a ticket to read back holds in `pool` (Flight's `kept`): its batches counted as `gather`
+/// counts them, each buffer once. None when it doesn't fit: the caller refuses it with `too_big`, and keeps nothing.
+pub fn kept_memory(pool: &Arc<dyn MemoryPool>, batches: &[RecordBatch]) -> Option<MemoryReservation> {
+    let held = MemoryConsumer::new("a Flight answer kept for its ticket").register(pool);
+    let mut counted = RecordBatchMemoryCounter::new();
+    batches.iter().try_for_each(|b| held.try_grow(counted.count_batch(b))).ok()?;
+    Some(held)
+}
+
 /// The refusal of an answer bigger than the query memory (53200), with the way out.
-fn too_big() -> anyhow::Error {
+pub(crate) fn too_big() -> anyhow::Error {
     crate::codes::coded("53200", format!("the answer is bigger than this node's memory for queries ({} MB): ask for fewer rows (a LIMIT or a filter), or write them out with COPY (…) TO a file or folder", memory_limit() >> 20))
 }
 
@@ -1051,7 +1077,8 @@ async fn send_rest(out: Vec<RecordBatch>, mut stream: datafusion::physical_plan:
     let Some(hand) = take_hand() else { bail!("an answer in pieces has no door") };
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    if hand.send(Handed { first, rest: rx, ended: ended.clone() }).is_err() {
+    let stop = crate::audit::stop(); // (this runs inside the statement: its flag is here, and the door's body outlives this)
+    if hand.send(Handed { first, rest: rx, ended: ended.clone(), stop }).is_err() {
         return Err(gone());
     }
     set_sent(Some(0));
@@ -1081,7 +1108,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
         // (no rows: the answer is its end, and nothing is left to write)
         let first = enc.step(None)?;
         ended.store(true, std::sync::atomic::Ordering::Release);
-        return Ok(Handed { first, rest: rx, ended });
+        return Ok(Handed { first, rest: rx, ended, stop: None });
     };
     let first = enc.step(Some(&piece))?;
     let done = ended.clone();
@@ -1098,7 +1125,7 @@ pub fn hand_out(batches: Vec<RecordBatch>, format: Option<&str>, held: Option<Me
             }
         }
     });
-    Ok(Handed { first, rest: rx, ended })
+    Ok(Handed { first, rest: rx, ended, stop: None }) // (the rows are collected: no search runs after this)
 }
 
 /// Writes each piece to the body (`step_to`), and returns the rows written.
@@ -1282,7 +1309,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
-        let expanded = crate::routines::expand_stored(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
+        let expanded = crate::routines::expand_temp_view(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
         *v = expanded;
     }
     let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
@@ -1290,7 +1317,8 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     views.retain(|(n, _)| !temps.iter().any(|(m, _)| m == n));
     views.extend(temps);
     let text = views.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));
-    if crate::pattern::wanted(&text) || text.contains("pondra_match") {
+    crate::extension::functions(lake, &ctx, &text).await?; // the installed extensions' functions it names (`INSTALL … FROM`, ADR-075; a page refuses them)
+    if crate::pattern::wanted(&text) || text.contains("pondra_match") || text.contains("pondra_open") {
         crate::matcher::register(&ctx); // (again, last: a DEFINE's glue sees the session's every function, the lake's own and Python ones too)
     }
     let named_sys = crate::sys::mentioned(&text); // (named: the tables get their system columns)
@@ -1301,6 +1329,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let entries = lake.cat.scan_raw("t/", "t0").await?;
     lake.cat.settle().await?; // (the log read as far as these entries: `Catalog::settle`)
     let upto = upto.or_else(|| Some(lake.visible())); // (one end for every table it reads, fixed once their entries are read: a table read twice, or two a transaction wrote, read one commit)
+    let mut unlisted = vec![]; // (tables a listing leaves out, which the views over them still plan against: below)
     for (key, raw) in entries {
         let name = &key[2..];
         // (a staged table is read only where the SQL names it quoted: its constraint checks, `constraints::held` and `kept`)
@@ -1316,8 +1345,11 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
             if let Some(h) = &meta.history {
                 t = crate::views::history_view(&ctx, t, h, crate::sys::mentioned(&text)).await?; // (each version's __start_at and __end_at, as it is read)
             }
-            if let Some(t) = guarded(name, t, listing) {
-                ctx.register_table(table_ref(name), t)?;
+            match guarded(name, t.clone(), listing) {
+                Some(t) => {
+                    ctx.register_table(table_ref(name), t)?;
+                }
+                None => unlisted.push((name.to_string(), Arc::new(Guarded { inner: t, name: name.to_string(), columns: None, why: None }) as Arc<dyn TableProvider>)),
             }
         }
     }
@@ -1426,7 +1458,22 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
         }
     }
     crate::temp::register(&ctx, &text)?; // (the session's temporary tables, over the lake's)
-    register_views(&ctx, views, !listing, listing).await?; // (a listing shows what it can)
+    // A listing leaves out a table its user may not read, but a view over it is planned against it: the table is there
+    // for the views' planning and taken out again after, unless the session has a table of that name already.
+    let mut planned_only = vec![];
+    for (name, t) in unlisted {
+        if !ctx.table_exist(table_ref(&name))? {
+            ctx.register_table(table_ref(&name), t)?;
+            planned_only.push(table_ref(&name));
+        }
+    }
+    // (a listing shows what it can; and so does a session without `except`, whose caller registers that table after, as a
+    // view's new rows: a view over it, only named in the query (a subquery's alias, `views::written_in`), can't be planned
+    // yet, and the query fails by itself if it reads one)
+    register_views(&ctx, views, !listing && except.is_empty(), listing).await?;
+    for name in planned_only {
+        ctx.deregister_table(name)?;
+    }
     if listing {
         let direct = crate::ext_names::names(sql);
         for n in crate::ext_names::names(&text).into_iter().filter(|n| !direct.contains(n)) {
@@ -1436,12 +1483,27 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     Ok(ctx)
 }
 
+/// A memory pool for one statement, over the lake's (which every statement shares): what its operators reserve goes
+/// through it (`task_with_peak`), so `PeakRecordingPool`'s peak is the most that statement held at once.
+pub fn peak_pool(ctx: &SessionContext) -> Arc<PeakRecordingPool> {
+    Arc::new(PeakRecordingPool::new(ctx.runtime_env().memory_pool.clone()))
+}
+
+/// The task a statement's plan runs on: `state`'s own (`SessionState::task_ctx`), but with `peak` for its memory pool.
+/// Only the runtime differs: the caches, the object stores and the spill disk are the lake's, and the session isn't
+/// made again.
+pub fn task_with_peak(state: &SessionState, peak: &Arc<PeakRecordingPool>) -> Result<Arc<TaskContext>> {
+    let rt = RuntimeEnvBuilder::from_runtime_env(state.runtime_env()).with_memory_pool(peak.clone()).build_arc()?;
+    Ok(Arc::new(TaskContext::from(state).with_runtime(rt)))
+}
+
 /// Whether a query ran out of memory, so a frugal run may help (DataFusion's "Resources exhausted", 53200).
 /// A spill past its cap carries the same words (53100), and a frugal run would spill to the cap again.
 pub fn exhausted(e: &anyhow::Error) -> bool { format!("{e:#}").contains("Resources exhausted") && crate::codes::of(e) != "53100" }
 
 /// A session made to run frugally: hash joins as sort-merge joins (hash joins can't spill), sorts
 /// keeping 1 MB aside to merge, and the rewrites in `frugal.rs` (a window over whole partitions as a GROUP BY).
+/// Over one partition, where DataFusion plans every join as a hash join, `frugal::SpillingJoins` makes them sort-merge joins.
 pub fn frugal(ctx: &SessionContext) {
     let state = ctx.state_ref();
     let mut state = state.write();
@@ -1459,20 +1521,40 @@ pub fn retrying(ctx: &SessionContext) -> bool {
 
 /// Run `work` on `ctx`, and once more when it ran out of memory: on a frugal copy of `ctx` (`frugal`), which
 /// shares its catalogs, so the retry reads the tables the first try registered at the same snapshot, and changes
-/// only its own options (`ctx` itself is never changed). An answer half sent is never run again: its client has
-/// the first rows. The paths that run a query for someone go through it: a door's query (`app::App::run_query`),
+/// only its own options (`ctx` itself is never changed). Out of memory is the pool refusing (`exhausted`), or the
+/// node's memory watch stopping the first try (`panics::first_try`: what grows without asking the pool, as a
+/// median's copies of its values do). An answer half sent is never run again: its client has the first rows. The paths that run a query for someone go through it: a door's query (`app::App::run_query`),
 /// `CREATE TABLE … AS` and `INSERT … SELECT` (`write::write_files`) and a node's share of one (`spmd::insert_share`),
 /// and `COPY … TO` a file or a Delta or Iceberg table (`copy::copy_to`). Not a Kafka topic (records sent are sent),
 /// and not the shares of a spread query or COPY: when one fails, the coordinator runs it again from its own node.
 pub async fn frugally<T, F: std::future::Future<Output = Result<T>>>(ctx: &SessionContext, work: impl Fn(SessionContext) -> F) -> Result<T> {
-    match work(ctx.clone()).await {
-        Err(e) if exhausted(&e) && handed().is_none() => {
-            let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
-            frugal(&copy);
-            work(copy).await
+    let mut one_part = false;
+    match crate::panics::first_try(work(ctx.clone()), |r| matches!(r, Err(e) if exhausted(e) && handed().is_none())).await {
+        Ok(Err(e)) if exhausted(&e) && handed().is_none() => one_part = merging_a_sort(&e),
+        Ok(r) => return r,
+        Err(crate::panics::Stopped::Again) if handed().is_none() => {} // (the watch stopped the first try, and its memory has gone)
+        Err(_) => {
+            // (stopped on its first try and not run again: its memory stayed over the line, or half its answer was sent)
+            crate::metrics::add(&crate::metrics::STOPPED_FOR_MEMORY, 1);
+            anyhow::bail!(crate::oom::OOM)
         }
-        r => r,
     }
+    let copy = SessionContext::new_with_state(ctx.state()); // (`state` copies the options: `frugal` changes only the copy's)
+    frugal(&copy);
+    if one_part {
+        copy.state_ref().write().config_mut().options_mut().execution.target_partitions = 1;
+    }
+    work(copy).await
+}
+
+/// Whether the pool refused a sort's merge: a partition's merge of its spilled runs, or the merge of the partitions'
+/// sorted streams into one. A sort spills, but those merges hold a batch of every stream they read, and with four
+/// partitions each holding its share the last one was refused: under a 2 GB cap a sort of 60 M rows by a string to a
+/// file failed so with or without compressed spill, and on one partition it answered (100.6 s, 3.6 GB spilled; DuckDB
+/// 78 s, 10.9 GB). So such a query runs again on one partition: it has the pool to itself, and no merge across.
+fn merging_a_sort(e: &anyhow::Error) -> bool {
+    let words = format!("{e:#}");
+    words.contains("SortPreservingMergeExec") || words.contains("ExternalSorterMerge")
 }
 
 /// The stored views (`CREATE VIEW`) `sql` names, and the ones they name; every one for a listing.
@@ -1565,9 +1647,10 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, keep, Facts, FactsMemo, Tail};
+    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
+    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
 
     /// A version's facts, told apart by their row count.
@@ -1672,6 +1755,26 @@ mod tests {
         assert!(!exhausted(&anyhow::Error::new(cap)));
         // The memory watch's stop (`oom::OOM`) says "out of memory", not "Resources exhausted": not retried either.
         assert!(!exhausted(&anyhow::anyhow!("{}", crate::oom::OOM)));
+    }
+
+    /// A query whose sort's merge the pool refused runs again frugally on one partition; one refused elsewhere, frugally on
+    /// as many as it had. The words are DataFusion's as B50's sorts were refused.
+    #[tokio::test]
+    async fn a_sort_whose_merge_was_refused_runs_again_on_one_partition() {
+        let refused = |what: &str| anyhow::Error::new(DataFusionError::ResourcesExhausted(format!("Failed to allocate additional 43.0 MB for {what} with 125.1 MB already allocated for this reservation - 15.6 MB remain available for the total memory pool: fair(pool_size: 682.7 MB)")));
+        for (what, parts) in [("SortPreservingMergeExec[0]", 1), ("ExternalSorterMerge[1]", 1), ("HashJoinInput[2]", 4)] {
+            let ctx = SessionContext::new_with_config(datafusion::prelude::SessionConfig::new().with_target_partitions(4));
+            let tries = std::sync::Mutex::new(vec![]);
+            let out = frugally(&ctx, |c| {
+                let mut tries = tries.lock().expect("the tries");
+                tries.push((c.state().config().target_partitions(), retrying(&c)));
+                let first = tries.len() == 1;
+                async move { if first { Err(refused(what)) } else { Ok(()) } }
+            }).await;
+            assert!(out.is_ok(), "{what}: the retry answers");
+            assert_eq!(*tries.lock().expect("the tries"), vec![(4, false), (parts, true)], "{what}");
+            assert_eq!(ctx.state().config().target_partitions(), 4, "{what}: the first session is as it was");
+        }
     }
 
     /// A tail of `form` at mark `of` through segment `through`, `bytes` long (the cache keeps only sizes here).

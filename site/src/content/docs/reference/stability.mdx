@@ -26,6 +26,8 @@ working through every 1.x release, and goes only in 2.0.
 ## What may change in any release
 
 - How fast a query runs, how much memory it takes, and the plan `EXPLAIN` shows.
+- Whether an index is built. `CREATE INDEX` keeps the index as an object and builds nothing yet; a
+  later release may build it and read it, with no change to the statement or to any answer.
 - The wording of messages, warnings and log lines. Match an error by its SQLSTATE or its HTTP
   status, not by its text.
 - Defaults that tune speed or memory, such as cache sizes and how queries spread across nodes.

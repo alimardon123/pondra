@@ -20,19 +20,26 @@ Columns take these types. A list is written `type[]`, such as `FLOAT[]` for an e
 
 | Type | Also written | Holds |
 |---|---|---|
-| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | | 8, 16, 32 and 64-bit integers |
+| `TINYINT`, `SMALLINT`, `INT`, `BIGINT` | `INT1`, `SHORT`, `LONG` | 8, 16, 32 and 64-bit integers |
+| `TINYINT UNSIGNED`, …, `BIGINT UNSIGNED` | `UTINYINT`, `USMALLINT`, `UINTEGER`, `UBIGINT` | integers of no sign |
 | `REAL`, `DOUBLE` | | 32 and 64-bit floating point |
 | `DECIMAL(p, s)` | | exact numbers; `0.07` in SQL is a decimal |
-| `VARCHAR` | `TEXT`, `STRING` | text |
+| `VARCHAR` | `TEXT`, `STRING`, `BPCHAR` | text |
 | `VARCHAR(n)` | `CHARACTER VARYING(n)`, `NVARCHAR(n)` | text of at most `n` characters |
 | `UUID` | | a uuid, kept as text written one way: lower case with hyphens |
-| `BOOLEAN` | | true or false |
-| `DATE`, `TIME`, `TIMESTAMP` | | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
+| `BOOLEAN` | `LOGICAL` | true or false |
+| `DATE`, `TIME`, `TIMESTAMP` | `DATETIME`, `TIMESTAMP_NTZ`; `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP_NS` for `TIMESTAMP(0)`, `(3)`, `(9)` | `TIMESTAMP` is a wall-clock time with no zone, kept in microseconds |
 | `TIMESTAMPTZ` | `TIMESTAMP WITH TIME ZONE` | an instant, kept and shown in UTC with its zone: `2026-09-29T05:00:00Z` |
 | `BYTEA` | `BINARY`, `VARBINARY`, `BLOB` | bytes |
 | `JSON` | `VARIANT` | JSON text, read with `json_get` and `->` (see [functions](/pondra/sql/functions/)) |
 | `type[]` | | a list of one type |
 | an enum type, or `ENUM('a', 'b')` | | text, one of its labels ([enum types](#enum-types)) |
+
+A type Pondra doesn't have is refused by name (`0A000`), with what to write instead: DuckDB's `HUGEINT` and
+`VARINT` (`DECIMAL(38, 0)`), `BIT` and `VARBIT` (`BOOLEAN`, or `BYTEA` for bits), `TIMETZ` (`TIME`, or
+`TIMESTAMPTZ` for an instant), `MONEY` (`DECIMAL(19, 4)`), SQL Server's `DATETIME2`, `DATETIMEOFFSET` and
+`UNIQUEIDENTIFIER`, and MySQL's `TINYTEXT`, `LONGBLOB` and `YEAR` and their kind. A function's parameters and what it
+returns are spelled the same way.
 
 A `DOUBLE` or `REAL` that meets a decimal, a column or a number such as `0.5`, makes it a `DOUBLE`, as
 Postgres and DuckDB do: `x > 0.5` and `x * 1.5` on a `DOUBLE` column are worked out in doubles. An
@@ -96,7 +103,7 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `(expr).field` | a field of a struct: `({'a': 1}).a` |
 | `SELECT … FOR UPDATE` | accepted, and no row is locked: a transaction still commits whole ([transactions](#transactions)) |
 | `FROM t AT (VERSION => n)`, `AT (TIMESTAMP => '…')`, `AT (OFFSET => -3600)` | the table as it was after commit `n`, at that time, or that many seconds ago ([below](#a-tables-past)) |
-| `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable or `(an expression)` |
+| `FROM t VERSION AS OF n`, `FROM t TIMESTAMP AS OF '…'`, `FROM t FOR SYSTEM_TIME AS OF '…'` | the same, in Delta's, Spark's and SQL:2011's words: what follows is a number, a string, `TIMESTAMP '…'`, a variable, `(an expression)` or a call (`now()`) |
 | `FROM a ASOF JOIN b MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k` | each row gets the other table's row as it was at that moment (`>=`, `>`, `<=`, `<`) |
 | `FROM a ASOF [LEFT] JOIN b ON a.k = b.k AND a.ts >= b.ts` | DuckDB's spelling: only rows with a match, or all of `a`'s with `LEFT` |
 | `PIVOT t ON col [IN (…)] USING agg(x) [GROUP BY …]`, `… FROM t PIVOT (agg(x) FOR col IN (…))` | a column per value of `col`; without `IN`, the values are found when it runs |
@@ -106,8 +113,22 @@ SELECT who, feeling, array_position(enum_range(NULL::mood), feeling) AS place FR
 | `ORDER BY ALL [DESC]`, `GROUP BY ALL` | by every column of the answer, left to right; by every column not aggregated |
 | `FETCH FIRST n ROWS ONLY`, `OFFSET n ROWS FETCH NEXT m ROWS ONLY` | the standard's `LIMIT` |
 | `[x * 2 FOR x IN l IF x > 0]`, `list_transform(l, x -> x + 1)`, `LAMBDA x: x + 1` | list comprehensions and lambdas (`list_filter`, `array_any_match` and the others take them too) |
-| `max_by(x, y)`, `arg_max`, `min_by`, `arg_min`, `list(x)`, `string_split(s, ',')` | DuckDB's names (`max_by` leaves out rows whose `y` is NULL) |
+| `max_by(x, y)`, `arg_max`, `min_by`, `arg_min`, `list(x)`, `string_split(s, ',')`, `split(s, ',')` | DuckDB's names (`max_by` leaves out rows whose `y` is NULL) |
+| `strftime(ts, '%Y-%m')`, `strptime(s, '%d/%m/%Y')`, `epoch(ts)`, `regexp_extract(s, '@(.+)$', 1)` | DuckDB's dates and patterns: `regexp_extract` gives the group's text (the whole match without a group number), and `''` when nothing matches. A format takes DuckDB's codes (`%f` microseconds, `%g` milliseconds, `%n` nanoseconds; SQLite's `strftime('%f', ts)` is seconds with milliseconds), and a code DuckDB hasn't, such as `%F`, is refused (`22023`) |
+| `date_diff('day', a, b)`, `DATEDIFF(day, a, b)`, `DATEADD(day, 7, ts)`, `date_add(ts, INTERVAL 7 DAY)` | the part boundaries from `a` to `b`, as DuckDB counts them (a week is 7 of the days between, whole ones), and a date moved by `n` parts. A part is `year`, `quarter`, `month`, `week`, `day`, `hour`, `minute`, `second`, `millisecond` or `microsecond`, or a short name (`dd`, `hh`, `mi`); `m`, `y` and `w` alone are refused (`22023`), since DuckDB and SQL Server read them apart (`m` is DuckDB's minute and SQL Server's month). So is `DATEDIFF(week, a, b)`, the part a bare word: SQL Server counts Sundays crossed and Snowflake Mondays. `date_diff('week', a, b)` counts whole weeks |
+| `d + INTERVAL '1 hour'`, `d - n * INTERVAL '30 minutes'` | a `DATE` plus hours, minutes or seconds is a `TIMESTAMP` (the date's midnight plus them), as Postgres and DuckDB answer it; a `DATE` plus days or months is still a `DATE`. An interval times or over a number is scaled as Postgres scales one |
 | `json_extract(j, '$.a.b[0]')`, `json_extract_string(…)`, `x::JSON` | JSON as text: a path written as a literal |
+| `string_agg(x, ', ') WITHIN GROUP (ORDER BY y)`, `listagg(x, ', ') WITHIN GROUP (ORDER BY y)` | SQL Server's and Snowflake's spelling of `string_agg(x, ', ' ORDER BY y)` |
+| `SELECT TOP 3 …`, `GROUP_CONCAT(x ORDER BY y SEPARATOR ', ')`, `ARRAY_AGG(x ORDER BY y LIMIT 2)` | SQL Server's `LIMIT 3`, MySQL's `string_agg` (its separator `,` when none is given), BigQuery's first 2 of `array_agg` |
+| `INT64`, `FLOAT64`, `NUMBER(10, 2)`, `NUMBER`, `BYTEINT` | BigQuery's and Snowflake's names for `BIGINT`, `DOUBLE`, `DECIMAL(10, 2)`, `DECIMAL(38, 0)` and `TINYINT`, in a cast or a column |
+| `IFF(c, a, b)`, `ZEROIFNULL(x)`, `DECODE(x, 'a', 1, 'b', 2, 0)`, `ARRAY_CONSTRUCT(…)`, `ARRAY_SIZE(a)`, `OBJECT_CONSTRUCT('k', v, …)` | Snowflake's `CASE`, `coalesce(x, 0)`, a `CASE` in which NULL matches NULL, `make_array`, `cardinality` and a JSON object without its NULL values. Pondra's own `decode(bytes, 'hex')` keeps its meaning |
+| `IIF(c, a, b)`, `ISNULL(a, b)`, `CHARINDEX(sub, s)`, `TRY_CONVERT(INT, '12')`, `GETDATE()`, `EOMONTH(d)`, `DATEPART(weekday, d)` | SQL Server's `CASE`, `coalesce`, `strpos(s, sub)`, `TRY_CAST('12' AS INT)` (a text literal's; `CONVERT` and `TRY_CONVERT` of a column are refused by name, `0A000`, since MySQL puts the type last: write `CAST`), `now()`, the month's last day and a part as an `INT` (`weekday` 1 for Sunday, `dayofyear`, `week` SQL Server's from Sunday with 1 January in week 1, `isowk` ISO's, `ms` and `mcs` within the second, or any part above). `datepart('month', d)` is Pondra's own |
+| `CURDATE()`, `UNIX_TIMESTAMP([ts])`, `STR_TO_DATE(s, '%d.%m.%Y %H:%i')` | MySQL's `current_date`, whole seconds since 1970, and a `DATE` (a `TIMESTAMP` when its format reads a time). `FROM_UNIXTIME(n)` is Pondra's own. `TIMESTAMPDIFF` is refused by name (`42883`): MySQL counts whole units and Snowflake part boundaries, so `date_diff` says which |
+| `DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s')`, `date_format(ts, 'yyyy-MM-dd HH:mm')` | MySQL's codes when the format holds MySQL's `%i` (minutes; then `%s` is seconds and `%M` a month's name) and, with no `%`, Spark's letters (`mm` minutes, `MM` a month, `SSS` milliseconds): the text `strftime` writes. Without `%i`, a code MySQL and DataFusion's own `date_format` read apart (`%M`, `%s`, `%W`, `%e`, …) is refused (`22023`) naming `strftime`, and codes they share (`%Y-%m-%d %H:%S`) read as written. A code with no equivalent (`%D`, `%V`, `%X`, `%u`, or a letter such as `G`) is refused (`22023`); `%v` is ISO's week |
+| `COUNTIF(c)`, `SAFE_DIVIDE(a, b)`, `DATE(ts)`, `DATE(y, m, d)`, `DATE_TRUNC(d, MONTH)`, `TIMESTAMP_TRUNC(ts, HOUR)`, `TIMESTAMP_DIFF(a, b, HOUR)`, `FORMAT_DATE(f, d)`, `PARSE_DATE(f, s)`, `UNIX_SECONDS(ts)`, `TIMESTAMP_SECONDS(n)` | BigQuery's: the rows where `c` is true, `a / b` as a `DOUBLE` (NULL when `b` is 0), a `DATE`, its `DATE_TRUNC` and `TIMESTAMP_TRUNC` (the part a word after the value, `WEEK` from Sunday and `ISOWEEK` from Monday; `date_trunc('month', d)` is Pondra's own), the whole parts from `b` to `a` (a day or shorter, in whole microseconds; `DATETIME_DIFF` the part's boundaries crossed), `to_char`, `to_date`, whole seconds since 1970 and back |
+| `PARSE_JSON(s)`, `TRY_TO_NUMBER(s)`, `TRY_TO_DATE(s)`, `REGEXP_CONTAINS(s, re)`, `TIMESTAMP_SUB(ts, INTERVAL 1 HOUR)`, `PERCENTILE_APPROX(x, p)`, `MONTHS_BETWEEN(a, b)`, `JSON_UNQUOTE(j)` and the other names of their kind, `SAFE.f(…)`, `FORMAT(v, 'yyyy')`, `payload:page::STRING` | refused by name, with what to write instead: `payload->>'a'`, `TRY_CAST(s AS DECIMAL(38, 0))`, `TRY_CAST(s AS DATE)`, `regexp_like(s, re)`, `approx_percentile_cont(x, p)`, `date_diff('month', a, b)` (whole months; Spark's is fractional), `payload->>'$.a'`, `TRY_CAST` and `SAFE_DIVIDE` for `SAFE.`, `strftime(ts, '%Y-%m-%d')` for `FORMAT`. A name is `42883`; `SAFE.`, `FORMAT` and a path are `0A000` |
+| `SELECT @@VERSION` | SQL Server's `version()`; another `@@name` is refused (`0A000`) with `SHOW name` |
+| `N'gift'` | Postgres's (and the standard's) national character string: the string `'gift'` |
 | `SELECT x * 2 AS y FROM t WHERE y > 1` | a select's alias in its `WHERE` (a column of that name wins) |
 | `SUMMARIZE t`, `SUMMARIZE SELECT …` | a row per column: its type, min and max, distinct values about, mean, spread, quartiles, count and NULLs |
 | `FROM t USING SAMPLE 10%` (or `n ROWS`), `FROM t TABLESAMPLE (10)` (or `(n ROWS)`) | a sample: each row kept on its own, or `n` of them |
@@ -257,7 +278,8 @@ RESTORE TABLE prices TO TIMESTAMP AS OF $before;
 | Create like another | `CREATE TABLE t LIKE s`: an empty table with `s`'s columns and their types, as Postgres's does |
 | Create a transient table | `CREATE TRANSIENT TABLE t (…)`: the same as `CREATE TABLE`, for SQL written for Snowflake |
 | Create from a query | `CREATE TABLE t AS SELECT …`, `CREATE TABLE t (a INT, b VARCHAR) AS VALUES …`, or `SELECT … INTO t FROM …` |
-| Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type`. The rows there read NULL, so the column takes its type alone: add a constraint after (`ADD CONSTRAINT`), and fill it with `UPDATE` before `SET NOT NULL` |
+| Add a column | `ALTER TABLE t ADD COLUMN [IF NOT EXISTS] c type [FIRST \| AFTER b]`. It comes last unless `FIRST` or `AFTER` says where. The rows there read NULL, so the column takes its type alone: add a constraint after (`ADD CONSTRAINT`), and fill it with `UPDATE` before `SET NOT NULL` |
+| Move a column | `ALTER TABLE t ALTER COLUMN c FIRST` or `ALTER COLUMN c AFTER b`. Only the order SQL lists the columns in changes: `SELECT *`, `DESCRIBE`, `SHOW CREATE`, an `INSERT` with no column list, `COPY` and Delta and Iceberg readers all follow it, and no file is rewritten. A view that reads the table with a `*` lists the new order too. Refused while a materialized view reads it with a `*`, since its rows keep the order they were made in |
 | Rename a column | `ALTER TABLE t RENAME COLUMN a TO b`. Its key, `UNIQUE` and `CHECK`s follow it; a dropped column takes its `UNIQUE` and `CHECK`s along |
 | Rename a table | `ALTER TABLE t RENAME TO u` |
 | Drop a column | `ALTER TABLE t DROP COLUMN [IF EXISTS] c` |
@@ -476,14 +498,49 @@ SELECT * FROM users ORDER BY id;
 SELECT * FROM visits ORDER BY id;
 ```
 
+### RETURNING
+
+`INSERT`, `UPDATE` and `DELETE` take `RETURNING`, which answers with the rows the statement wrote: an
+`INSERT`'s and an `UPDATE`'s new rows, a `DELETE`'s old ones. The items are columns, expressions or `*`, as in a
+`SELECT`. It needs `SELECT` on the table, as Postgres asks (`42501` without it). An `ON CONFLICT … DO NOTHING`
+answers no row for a row it skips.
+
+```sql
+INSERT INTO users VALUES (5, 'ed', 'free') RETURNING id, name;
+UPDATE users SET plan = 'pro' WHERE name = 'ed' RETURNING *;
+DELETE FROM users WHERE name = 'ed' RETURNING id, plan;
+```
+
+### Writes in a WITH
+
+A `WITH` can hold a write, and a `WITH` can come before one. Each write runs once, in the order the `WITH`
+lists them, even when nothing names it. The parts after a write read its `RETURNING` rows by its name, and a
+column list renames them. A plain query in the `WITH` runs first when a write comes after it, and that write
+reads its rows by name. A write with no `RETURNING` runs too, but nothing can name its rows. The statement is
+one commit: in the open transaction if there is one, or in one of its own. Every part sees the data as it was
+before the statement, so no other part may name a table that a write changes. That is refused, and so are a few
+other shapes (see [Refused by name](#refused-by-name)).
+
+```sql
+CREATE TABLE orders_done (id BIGINT, item VARCHAR, qty INT, amount DOUBLE);
+WITH moved AS (DELETE FROM orders WHERE qty = 0 RETURNING *)
+INSERT INTO orders_done SELECT * FROM moved;
+
+CREATE TABLE parent (id BIGINT, name VARCHAR);
+CREATE TABLE child (parent_id BIGINT, note VARCHAR);
+WITH ins AS (INSERT INTO parent VALUES (1, 'a') RETURNING id),
+     kid AS (INSERT INTO child SELECT id, 'x' FROM ins RETURNING *)
+SELECT count(*) AS n FROM kid;
+```
+
 ### Transactions
 
 | Statement | Syntax |
 |---|---|
-| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …] [READ ONLY \| READ WRITE]`, `START TRANSACTION` |
+| Begin | `BEGIN [TRANSACTION \| WORK] [ISOLATION LEVEL …] [READ ONLY \| READ WRITE]`, `START TRANSACTION`, SQL Server's `BEGIN TRAN [name]` (the name labels nothing) |
 | Set the level | `SET TRANSACTION ISOLATION LEVEL READ COMMITTED \| REPEATABLE READ`, before the first statement; `SET SESSION CHARACTERISTICS AS TRANSACTION …` for the session |
-| Commit | `COMMIT`, `END` |
-| Roll back | `ROLLBACK`, `ABORT` |
+| Commit | `COMMIT`, `END`, `COMMIT TRAN [name]` |
+| Roll back | `ROLLBACK`, `ABORT`, `ROLLBACK TRAN` |
 | Savepoint | `SAVEPOINT name`, `RELEASE [SAVEPOINT] name`, `ROLLBACK [WORK \| TRANSACTION] TO [SAVEPOINT] name` |
 
 The statements between `BEGIN` and `COMMIT` are one commit, and they read their own writes. A transaction
@@ -529,7 +586,10 @@ one script's (statements sent together over HTTP).
   `--memory-gb` ([`PONDRA_MEMORY_GB`](/pondra/reference/environment/) and the other settings there),
   and refused here.
 - `COPY … FROM STDIN`, `COPY … TO STDOUT`, `DISCARD` and `CLOSE` are the Postgres port's: see
-  [Postgres](/pondra/reference/postgres/).
+  [Postgres](/pondra/reference/postgres/). Over HTTP, the console and `pondra sql`, the two `COPY`s are refused
+  (`0A000`) naming what to write there: the query as CSV (`POST /sql?format=csv`) or `COPY … TO 's3://…'`, and
+  `COPY INTO t FROM 'path or URL'` or `POST /append/t`. So is Postgres's `COPY t FROM 'file'`, a file of its own
+  server's: `COPY INTO t FROM 'path or URL'` loads one.
 - `SET datafusion.sql_parser.dialect = 'spark'` (or `'databricks'`) gives the session Spark's
   functions where Spark and DataFusion share a name ([Spark's functions](/pondra/sql/functions/#sparks-functions)),
   and `'duckdb'` takes DuckDB's `STRUCT(a INT)` in `CREATE TABLE`.
@@ -548,8 +608,13 @@ one script's (statements sent together over HTTP).
   `crm` when read from elsewhere, and one made in `public` still reads `public` under `USE crm`.
 - `current_database()` and `current_schema()` answer the session's values at every door: this lake's
   name and `public` when there is no session. In a view they are worked out as it is read, as Postgres
-  does: a view saying `current_schema()` answers each reader's schema. A materialized view's are those
-  of the session that made it, since its rows are made then.
+  does: a view saying `current_schema()` answers each reader's schema, a macro's or a SQL function's
+  each caller's, and a change sent from a follower reads them as its session does. A materialized
+  view's are those of the session that made it, since its rows are made then. `current_user` (and
+  `session_user`, `current_role`) is who is asking, at every door the same way: the Postgres port's
+  user, a request's user or token, so a view `WHERE owner = current_user` answers each reader their
+  own rows. A bare `user` stays a column's name, as in DuckDB. Each, written as a column on its own,
+  is named as Postgres names it (`SELECT current_user` is a column `current_user`).
 - A session lasts as long as its connection: a Postgres connection, an HTTP `x-pondra-session`, a
   console tab, the Python or JavaScript client's connection, or one script's statements.
 
@@ -641,7 +706,7 @@ A script's blocks, branches, loops, handlers and parallel statements are explain
 | Keep a lake held in memory | `ALTER DATABASE name SET LOCATION 'folder' \| 's3://…'`: the lake moves there and goes on there, the same node and port, its tables, views, tasks and files as they were; statements sent meanwhile wait. Only a lake in memory moves this way (0A000 otherwise); a lake on disk or in a bucket moves with BACKUP and RESTORE. If the move fails, the lake stays in memory and `pondra.databases.move_failed` says why |
 | Drop a branch | `DROP DATABASE name`: what it wrote goes; refused while it has branches of its own |
 | Compare two tables | `SELECT * FROM pondra.diff('a', 'b')`: the rows of `b` that differ from `a`, with `_change_type` |
-| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines |
+| Attach a lake | `ATTACH 'dir' AS name`; `ATTACH 'url' AS name (READ_ONLY [, ENDPOINT 'https://…'])` for a lake on another server, read with the secret whose `SCOPE` covers it and written there only ([production apart](/pondra/guides/environments/#production-on-a-server-of-its-own)); `ATTACH 'url' AS name (TYPE delta \| iceberg \| kafka, …)` for other engines. A database in a bucket attaches lakes in buckets only: every node opens what its catalog names, and whoever may write the bucket could name a folder or a node's lake there, so those go with `--attach` |
 | Detach | `DETACH [IF EXISTS] name` |
 | Back up a database | `BACKUP DATABASE [name] TO 'place' [WITH (retention_days = n)]`: this database (or one attached here) copied to a lake at `place`, as of one moment; run again, only what changed. A backup is read-only (25006) but to its next run ([backups](/pondra/guides/backups/)) |
 | Restore a backup | `RESTORE DATABASE name FROM 'place' [LOCATION 'dir'] [AT (TIMESTAMP => '…')]`: the backup's newest run (at or before that time, in UTC) copied into a new database, attached as `name`, its tasks suspended |
@@ -671,8 +736,8 @@ DROP SCHEMA sales CASCADE;
 |---|---|
 | Stored view | `CREATE [OR REPLACE] VIEW [IF NOT EXISTS] v [(c1, c2, … \| PRIMARY KEY (…) NOT ENFORCED, UNIQUE (…) NOT ENFORCED, FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED)] AS SELECT …`: a query run over the tables as they are when read. A select list may name a measure with `expr AS MEASURE name` ([measures and key facts](/pondra/guides/measures/)). `OR REPLACE` is how a stored view's query changes; `ALTER VIEW … AS SELECT` is refused |
 | Key facts | `ALTER VIEW v ADD [CONSTRAINT [IF NOT EXISTS] name] PRIMARY KEY (…) \| UNIQUE (…) \| FOREIGN KEY (…) REFERENCES t (…) NOT ENFORCED` and `ALTER VIEW v DROP CONSTRAINT [IF EXISTS] name`: facts about the view's rows, never checked. A materialized view takes the same with `ALTER MATERIALIZED VIEW` ([measures and key facts](/pondra/guides/measures/#key-facts-on-views)) |
-| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/windows/#windows-each-group-once-its-over)) |
-| Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`: a session's own |
+| Materialized view | `CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] v [(CONSTRAINT c CHECK \| EXPECT (condition) [ON VIOLATION DROP ROW \| FAIL], …)] [WITH (option = value, …)] AS SELECT … FROM t … [EMIT FINAL]`: kept up to date as rows arrive; it may follow another materialized view ([Flows](/pondra/guides/flows/)). Its query may read a CTE (`WITH t AS (…)`) or a plain view: each is written in where it is read, as a subquery, and a plain view as it is when the materialized view is made. While the materialized view reads a plain view, that view can't be replaced, renamed or dropped (`2BP01`, naming the materialized view), and `SHOW CREATE` shows the query as written. A write in its `WITH` is refused (`0A000`). `EMIT FINAL` keeps each group of a time bucket (or `SESSION(ts, INTERVAL …)`) once it is over ([windows](/pondra/guides/windows/#windows-each-group-once-its-over)) |
+| Temporary | `CREATE [OR REPLACE] TEMP TABLE [IF NOT EXISTS] t AS SELECT …`, `CREATE [OR REPLACE] TEMP VIEW [IF NOT EXISTS] v AS SELECT …`, and `CREATE [OR REPLACE] TEMP FUNCTION` or `TEMP MACRO` ([temporary functions](/pondra/guides/functions-and-procedures/#temporary-functions)): a session's own |
 | Rename | `ALTER VIEW v RENAME TO w`: a stored view, not a materialized one |
 | Refresh | `REFRESH MATERIALIZED VIEW [CONCURRENTLY] v`: taken, and nothing to do, since the view is current as rows arrive (dbt sends it) |
 | Detach | `ALTER MATERIALIZED VIEW v DETACH`: its rows stop following and stay, as a table of that name (a `GROUP BY` view's a merge table, its rows combining as they are read). What follows it keeps following its table. A view that keeps windows is refused |
@@ -711,6 +776,7 @@ DROP MATERIALIZED VIEW spend_by_item;
 |---|---|
 | SQL function | `CREATE [OR REPLACE] FUNCTION [IF NOT EXISTS] f(x [type] [= v], …) [RETURNS type] AS expression`, or `RETURNS type RETURN expression` |
 | Table function | `CREATE FUNCTION f(…) RETURNS TABLE (c type, …) AS $$ SELECT … $$` |
+| Temporary function | `CREATE [OR REPLACE] TEMP FUNCTION f(…) …` or `CREATE TEMP MACRO m(…) AS …`: SQL, the session's own, used before the lake's of the name, gone when the session ends ([temporary functions](/pondra/guides/functions-and-procedures/#temporary-functions)) |
 | Python function | `CREATE FUNCTION f(x type) RETURNS type LANGUAGE python [WITH (…)] AS $$ … $$` |
 | Procedure | `CREATE [OR REPLACE] PROCEDURE [IF NOT EXISTS] p($x type [= v], …) AS BEGIN … END` (or any one statement after `AS`) |
 | Python procedure | `CREATE PROCEDURE p($x type, …) LANGUAGE python AS $$ … $$` |
@@ -733,7 +799,9 @@ A parameter is `$name` in a procedure's body, and `name` or `$name` in a functio
 rights: it needs an admin token, and Python needs a node started with `--python`. What the block prints
 comes back as notices, and its last expression, if it is a frame, table, list of dicts or value, comes
 back as rows (see [Functions and procedures](/pondra/guides/functions-and-procedures/#run-code-once-do)).
-Python functions and procedures need a node started with `--python`. Functions, procedures and tasks are kept in the lake, so every node and client has
+Python functions and procedures need a node started with `--python`. An error a Python routine raises comes back with its words and
+the line it was raised at, SQLSTATE `38000` (`42601` for code that doesn't parse, found when the routine is made).
+Functions, procedures and tasks are kept in the lake, so every node and client has
 them. Every call of a procedure, and every file run, is a row of `pondra.runs`
 (see [system columns](/pondra/sql/system-tables/)).
 
@@ -799,6 +867,8 @@ SELECT taxed(100) AS t;
 | Make a secret | `CREATE [OR REPLACE] SECRET [IF NOT EXISTS] name (TYPE s3 \| r2 \| gcs \| azure \| http \| iceberg \| kafka \| pondra \| git \| generic, KEY value, …, SCOPE 'url')`; `TYPE pondra, TOKEN '…', SCOPE 'https://…'` is how a lake attached `READ_ONLY` asks its own server's leader to pin a branch; `TYPE git, TOKEN '…', SCOPE 'https://github.com/acme'` is a person's token for [Git folders](/pondra/guides/git/), sent only to the repositories its `SCOPE` covers and never used to read files |
 | A session's own | `CREATE [OR REPLACE] TEMPORARY SECRET [IF NOT EXISTS] name (…)`: in the node's memory for this session only, used before the lake's |
 | Drop a secret | `DROP [TEMPORARY] SECRET [IF EXISTS] name` |
+| Install an extension | `[FORCE] INSTALL name FROM 'path or URL' [VERSION 'v']`: a WebAssembly component, kept in the lake by its SHA-256; `VERSION` must be the one the file says |
+| List and drop extensions | `SHOW EXTENSIONS [LIKE 'pattern']` (or `SELECT * FROM extensions()`), `UNINSTALL [IF EXISTS] name` |
 
 `COPY table TO …` is short for `COPY (SELECT * FROM table) TO …`. A URL needs a secret whose `SCOPE`
 covers it (a user's query, one it has `USAGE` on), and only an admin may write files. A path on a
@@ -807,6 +877,26 @@ Each secret is sealed with a key of its own, which the master key (`PONDRA_SECRE
 service: `PONDRA_KMS_COMMAND`) wraps; `SELECT * FROM secrets()` lists their names and scopes, never
 their values.
 
+Only an admin installs an extension, and a node takes one only when it runs with
+`PONDRA_ALLOW_UNSIGNED_EXTENSIONS=true`, since Pondra checks no signatures in 1.0. The file is read by
+the node that got the statement (a path on its machine from the program that started it, or a URL a
+secret covers), and every node sees the record; a branch and a backup carry the file with it. Each node
+checks the file against the record's SHA-256 as it loads it, and runs it only when it was started with
+the variable too: a file that isn't the one installed is refused (`XX001`), and so is a call on a node
+without the variable (`0A000`). The file says its version and its functions, which a query then calls by
+name in every session, on every node; a name another function has already, a table function's too, is
+refused at `INSTALL` (`42723`), and so is a `CREATE FUNCTION` by the name of an extension's function. A function the file gives
+columns is a table function, read as `SELECT * FROM name(…)` with literal arguments: its rows come a
+batch at a time as the query reads them, and a query that reads one runs on one node. Each call runs in a
+sandbox of its own that reaches nothing outside it, within `PONDRA_EXTENSION_MB` of memory (`53200`
+past it) and `PONDRA_EXTENSION_SECS` for a batch (`57014`); the function's own error is `38000`, and
+the node goes on. Beyond its arguments, a part may use only what Pondra offers it, each capability
+versioned on its own: the node's log (`pondra:log/log@1.0.0`, its lines carrying the extension's name,
+at most 100 a call) and the time (`pondra:clock/clock@1.0.0`, which makes every one of its functions
+volatile). A file that needs any other, as one built for a later Pondra may, is refused at `INSTALL`
+naming it (`0A000`: `words (words-0.2.wasm) needs pondra:http/http@1.0.0, which this Pondra doesn't
+offer …`); a later 1.x keeps offering these, so a file built for this one keeps loading.
+
 ## Users and grants
 
 | Statement | Syntax |
@@ -814,7 +904,7 @@ their values.
 | Make a user or a role | `CREATE USER [IF NOT EXISTS] name [WITH] [PASSWORD 'at least 8'] [SUPERUSER] [MAX_QUERIES n] [STATEMENT_TIMEOUT '5 minutes']`, `CREATE ROLE name` |
 | Change one | `ALTER USER name [WITH] PASSWORD '…' \| SUPERUSER \| NOSUPERUSER \| MAX_QUERIES n \| STATEMENT_TIMEOUT '…'` (`0`: no limit); `ALTER ROLE` takes the same words |
 | Drop one | `DROP USER [IF EXISTS] name`, `DROP ROLE [IF EXISTS] name` |
-| Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` |
+| Grant | `GRANT SELECT [(col, …)] \| INSERT \| UPDATE \| DELETE \| ALL [PRIVILEGES] ON [TABLE] t \| SCHEMA s \| ALL TABLES [IN SCHEMA s] TO name, …` (Snowflake's `TO ROLE name` is the same) |
 | Grant a secret | `GRANT USAGE ON SECRET s TO name, …` |
 | Let someone branch a database | `GRANT CLONE ON DATABASE d \| SCHEMA s TO name, …`: a user makes branches of it, and owns each (it or an admin drops it); another server's token pins a branch of those schemas and does nothing else |
 | Let a user apply a project | `GRANT APPLY ON DATABASE d TO name, …`: applies to the database (`pondra apply`, `CALL apply`) without being an admin; on a protected database, only a holder or the node's operator may apply ([protected production](/pondra/guides/projects/#protected-production)) |
@@ -823,7 +913,7 @@ their values.
 | A token | `CREATE TOKEN name FOR [USER] u [EXPIRES IN '90 days']` (answers it, once), `DROP TOKEN name FOR [USER] u` |
 | List | `SELECT * FROM pondra.users`, `SELECT * FROM pondra.grants` |
 | What was done, and refused | `SELECT * FROM pondra.audit` (a superuser's): `at`, `user`, `door`, `from`, `class`, `statement`, `outcome`, `message`, `ms`, `node` |
-| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`; `fingerprint` (the statement with its literals left out: one query's runs share it), `plan_id` (the shape of the plan it ran), `version` (the commit it read at: `t AT (VERSION => n)` reads what it read), `reads` and `writes` (the tables and views it read, the tables it changed), `misestimate` (for a query of `PONDRA_LEARN_MS` or more, a factor: how many times more or fewer rows its worst join gave than expected, so `40` is forty times off); `learned` (as JSON, each filter on a table that kept 2× or more of its rows more or fewer than expected: its table, conditions, and the shares expected and kept); and for a statement slower than `PONDRA_SLOW_MS`, or ten times off, its `plan` (each step's rows beside its expected rows, and its time) and `trace` (each node's share, as JSON) |
+| Every statement | `SELECT * FROM pondra.history` (a superuser sees every row, anyone else their own): `at`, `id`, `user`, `door`, `from`, `node`, `session`, `class`, `statement`, `outcome`, `error`, `ms`, `rows`, `nodes`; `fingerprint` (the statement with its literals left out: one query's runs share it), `plan_id` (the shape of the plan it ran), `version` (the commit it read at: `t AT (VERSION => n)` reads what it read), `reads` and `writes` (the tables and views it read, the tables it changed), `misestimate` (for a query of `PONDRA_LEARN_MS` or more, a factor: how many times more or fewer rows its worst join gave than expected, so `40` is forty times off); `learned` (as JSON, each filter on a table that kept 2× or more of its rows more or fewer than expected: its table, conditions, and the shares expected and kept); `cpu_ms`, `bytes_read` and `peak_memory` for a read that ran on this node (its operators' compute time, the bytes its Parquet scans read from files, and the most its statement's memory held at once, in bytes; NULL for writes, DDL, `CALL`, `DO` and reads spread over several nodes); and for a statement slower than `PONDRA_SLOW_MS`, or ten times off, its `plan` (each step's rows beside its expected rows, and its time) and `trace` (each node's share, as JSON) |
 | What the lake learned | `SELECT * FROM pondra.learned` (from the history you may read): `object`, `kind` (`filter`), `about` (its conditions), `expected` and `actual` (the shares of its table's rows it was expected to keep and kept: the planner counts the filter as `actual` from then on), `runs`, `updated_at`; each fact as last seen |
 
 ```sql
@@ -1044,7 +1134,15 @@ text is the node's own, it is shown in code:
 | a value that doesn't cast to its column's type (`'abc'` into a `BIGINT`) | refused, naming the value; never stored as `NULL` |
 | `INSERT … ON DUPLICATE KEY UPDATE` | refused: it is MySQL's; write `ON CONFLICT (…) DO UPDATE SET …` or `MERGE` |
 | `INSERT OVERWRITE` | refused: `write BEGIN; DELETE FROM t; INSERT INTO t …; COMMIT (one commit), or CREATE OR REPLACE TABLE t AS …` |
-| `INSERT`, `UPDATE` or `DELETE` with `RETURNING` | refused, not taken yet; read the rows with a `SELECT` after it |
+| a table that a write in a `WITH` changes, named by another part of that statement (another CTE, or the main statement, its target included), directly or through a view | refused (`0A000`) before anything runs: each part sees the data as it was before the statement. Change or read the table in a statement after this one |
+| two write CTEs in one `WITH` that change the same table | refused (`0A000`), before anything runs |
+| `MERGE` as a CTE, as in `WITH m AS (MERGE …)` | refused (`0A000`), saying so |
+| a write CTE in `WITH RECURSIVE`, or one in a subquery or in a CTE's own `WITH` | refused (`0A000`): a write goes in the top `WITH` |
+| a write CTE with no `RETURNING` that a part names | refused (`0A000`), in Postgres's words: `WITH query "m" does not have a RETURNING clause`. A write that nothing names runs |
+| a write into a temporary table, in a `WITH` that writes | refused (`0A000`): it would land at once, outside the transaction |
+| a CTE named as a temporary table or a view, stored or temporary, in a `WITH` that writes | refused (`0A000`): the name would be read instead of the CTE |
+| a CTE with a quoted name that has a capital letter, in a `WITH` that writes | refused (`0A000`): the session keeps names in lowercase, so the name would not match |
+| `FOR UPDATE` or `FOR SHARE` in a `WITH` that writes | refused (`0A000`) |
 | `CREATE TABLE … ENGINE = …`, `… TBLPROPERTIES (…)` | refused: `a table's options go in WITH (name = value, …)` |
 | `CREATE TABLE … WITH (…)` with an option name Pondra doesn't know | refused, with the name; see [table options](/pondra/sql/table-options/) |
 | `CREATE TEMPORARY EXTERNAL TABLE` | refused; use `CREATE TEMP VIEW v AS SELECT * FROM read_parquet('…')` |
@@ -1086,11 +1184,20 @@ text is the node's own, it is shown in code:
 | `ALTER TABLE t ALTER COLUMN c SET NOT NULL` while a row has NULL in `c` | refused, naming the rows: `column "c" of relation "t" contains null values (1 rows): UPDATE t SET c = … WHERE c IS NULL first` |
 | `SET name = value` sent alone over HTTP | refused (`55000`): a setting is a session's. Send `x-pondra-session: <id>` with the statements that use it, or use a client's session |
 | `ALTER VIEW v AS SELECT …` | not implemented, the same message; use `CREATE OR REPLACE VIEW v AS SELECT …` |
-| `PRAGMA`, `INSTALL`, `LOAD`, `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `CREATE EXTENSION`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
+| `PRAGMA table_info('t')`, and DuckDB's and SQLite's other `PRAGMA`s | refused (`0A000`), naming Pondra's statement: `PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE t` (`SHOW TABLES`, `SHOW DATABASES`, `SET` and `SHOW` for a setting) |
+| `DESCRIBE TABLE t`, `EXPLAIN EXTENDED …`, `EXPLAIN USING TEXT …`, `EXPLAIN FORMAT=JSON …`, `SHOW TABLES LIKE …` | Snowflake's, Spark's and MySQL's, refused (`0A000`) naming Pondra's: `DESCRIBE t`, `EXPLAIN VERBOSE` (or `EXPLAIN ANALYZE`), `EXPLAIN FORMAT pgjson`, and `information_schema.tables` to pick tables by name |
+| `CROSS APPLY (…)`, `OUTER APPLY (…)`, `[dbo].[orders]`, `SET NOCOUNT ON`, `DECLARE @x INT`, `CREATE NONCLUSTERED INDEX` | SQL Server's, refused (`0A000`) naming Pondra's: `CROSS JOIN LATERAL (…) AS x`, `LEFT JOIN LATERAL (…) AS x ON true`, `"dbo"."orders"`, nothing to set, `DECLARE $x = value`, `CREATE INDEX` |
+| `SET @x = 50`, `PREPARE p FROM '…'`, `UPDATE t JOIN u … SET …`, `DELETE t FROM t JOIN u …`, `ALTER TABLE t CHANGE …`, `DECLARE x INT64 DEFAULT 5` | MySQL's and BigQuery's, refused (`0A000`) naming Pondra's: `$x = 50` (a variable), `PREPARE p AS …` with `$1`, `UPDATE t SET … FROM u WHERE …`, `DELETE FROM t USING u WHERE …`, `RENAME COLUMN` then `ALTER COLUMN … TYPE` |
+| `REPLACE INTO t …`, `DATABASE()`, `USER()` | MySQL's, refused (`0A000`) naming Pondra's: `INSERT OR REPLACE INTO t …` (or `ON CONFLICT … DO UPDATE`), `current_database()`, `current_user` |
+| `INSERT … OUTPUT inserted.id …`, `… OPTION (MAXRECURSION 10)` | SQL Server's, refused (`0A000`) rather than run without the clause: `RETURNING id`, and nothing (`WITH RECURSIVE` stops when a pass adds no rows) |
+| `CREATE STREAM s ON TABLE t`, `LATERAL FLATTEN(INPUT => …)` | Snowflake's, refused (`0A000`) naming Pondra's: `GET /watch/t?changes=true` follows a table's changes, and `unnest(…)` in the `FROM` |
+| `UPSERT INTO t …` | CockroachDB's, refused (`0A000`) naming Pondra's two upserts: `INSERT OR REPLACE INTO t …`, or `INSERT INTO t … ON CONFLICT (key) DO UPDATE SET …` |
+| `CREATE EXTENSION name` | refused (`0A000`), naming Pondra's way: `CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm` (for `uuid-ossp` and `pgcrypto`, the functions built in) |
+| `CREATE TRIGGER`, `LOCK TABLE`, `VACUUM`, `DISCARD ALL`, `CLOSE ALL` | not implemented over HTTP, the same message. The [Postgres port](/pondra/reference/postgres/) takes `DISCARD` and `CLOSE` and ignores them |
 | `ALTER TABLE t SET TBLPROPERTIES (k = v)` with a name not listed | refused, naming it: `k: ALTER TABLE … SET takes publish, cluster_by, ttl, order_by and retention, and other engines' properties (write.delete.mode = 'merge-on-read')` |
 | `COPY … TO` a path on the node's machine | refused unless the program that started the node sends it |
 | `COPY … TO` a folder inside a lake | refused; a lake's files are its own |
-| Python functions and procedures on a node started without `--python` | refused, with the flag to use |
+| Python functions and procedures on a node started without `--python` | refused (`0A000`), with the flag to use |
 | `LEFT JOIN LATERAL … ON <condition>` (only `ON true` is taken), a `LEFT` over more than one function, or a `LEFT` whose columns include a constant or arithmetic | refused, SQLSTATE `0A000`: `LEFT JOIN LATERAL over u is not supported yet` |
 | `RIGHT JOIN LATERAL` or `FULL JOIN LATERAL` | refused, SQLSTATE `0A000`: `LATERAL syntax is not supported for FULL OUTER and RIGHT … joins` |
 | `generate_series(1, t.n) WITH ORDINALITY` over a column of the same `FROM` | taken: each row's elements are numbered from 1, as Postgres numbers them |

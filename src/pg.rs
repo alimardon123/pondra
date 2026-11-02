@@ -17,6 +17,7 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Date32Type, Field, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType, IntervalUnit, Schema, Time64MicrosecondType, TimeUnit, TimestampMicrosecondType};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::sql::sqlparser::ast::{self, BinaryOperator, CastKind, ExactNumberInfo, Expr, UnaryOperator, Value};
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::portal::{Format, Portal};
@@ -25,14 +26,15 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::results::{CopyCsvOptions, CopyEncoder, CopyResponse, CopyTextOptions, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::store::PortalStore;
+use pgwire::api::store::{Entry, PortalStore};
 use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionManager, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone};
-use pgwire::messages::extendedquery::{Describe, Execute, TARGET_TYPE_BYTE_PORTAL};
+use pgwire::messages::extendedquery::{Bind, BindComplete, Describe, Execute, Parse, ParseComplete, TARGET_TYPE_BYTE_PORTAL};
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::fmt::Debug;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// Accept Postgres clients on `addr`.
@@ -114,7 +116,7 @@ fn fatal(why: String) -> PgWireError { PgWireError::UserError(Box::new(ErrorInfo
 /// audited as HTTP's is, and waits 400 ms first, as a wrong guess does.
 async fn guessing_refused(app: &App, user: &str, from: Option<std::net::SocketAddr>, wait: u64) -> PgWireError {
     let why = crate::auth::guessing_says(user, wait);
-    crate::audit::refused(app, user, "postgres", from, "sign in", &why);
+    crate::audit::refused(app, user, "postgres", from, "sign in", &why).await;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     fatal(why)
 }
@@ -157,7 +159,7 @@ impl Startup {
         let first = m.into_sasl_initial_response()?;
         if first.auth_method != "OAUTHBEARER" {
             let why = format!("user \"{user}\" signs in through an identity provider (OAuth), which this client doesn't speak: use psql 18 or another libpq 18 client, with oauth_issuer={} and oauth_client_id, or ask for the provider's POSTGRES 'password' to send a token as the password", bearer.issuer);
-            crate::audit::refused(app, &user, "postgres", from, "sign in", "the client doesn't speak OAuth");
+            crate::audit::refused(app, &user, "postgres", from, "sign in", "the client doesn't speak OAuth").await;
             return Err(fatal(why));
         }
         let discovery = format!("{}/.well-known/openid-configuration", bearer.issuer);
@@ -170,7 +172,7 @@ impl Startup {
                 }
                 None => {
                     let why = crate::sso::why(&app.lake, &token).await.unwrap_or_else(|| format!("the token doesn't sign in {user}"));
-                    crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                    crate::audit::refused(app, &user, "postgres", from, "sign in", &why).await;
                     // (the cost of a wrong guess, but not counted by `auth::Guesses`: a provider's token isn't
                     // guessed, and counting it would lock the user out of the right one, invariant 381)
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -197,8 +199,8 @@ impl StartupHandler for Startup {
         let app = &self.backend.app;
         let from = Some(client.socket_addr());
         let ip = from.map(|a| a.ip()); // (failed sign-ins are counted per address and user name: `auth::guessing`)
-        let wrong = |user: &str| {
-            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password");
+        let wrong = async |user: &str| {
+            crate::audit::refused(app, user, "postgres", from, "sign in", "wrong user name or password").await;
             PgWireError::InvalidPassword(user.to_string())
         };
         match message {
@@ -249,10 +251,10 @@ impl StartupHandler for Startup {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
                     if let Some(why) = crate::sso::why(&app.lake, &password).await {
                         // (an identity provider's token says why it was refused, as HTTP's 401 does)
-                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why);
+                        crate::audit::refused(app, &user, "postgres", from, "sign in", &why).await;
                         return Err(PgWireError::UserError(Box::new(ErrorInfo::new("FATAL".into(), "28P01".into(), format!("password authentication failed for user \"{user}\": {why}")))));
                     }
-                    return Err(wrong(&user));
+                    return Err(wrong(&user).await);
                 };
                 *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                 return finish(client, &self.cancels).await;
@@ -273,7 +275,9 @@ impl StartupHandler for Startup {
                             true => app.auth.token_for(&user).filter(|t| !t.is_empty()).map(|t| crate::users::Verifier::of(&t)),
                             false => crate::users::verifier(&app.lake, &user).await,
                         };
-                        let (exchange, reply) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text).map_err(|_| wrong(&user))?;
+                        let Ok((exchange, reply)) = crate::users::Scram::first(verifier.unwrap_or_else(|| crate::users::Verifier::of(&uuid::Uuid::new_v4().to_string())), &text) else {
+                            return Err(wrong(&user).await);
+                        };
                         *scram = Some((exchange, user));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLContinue(reply.into_bytes().into()))).await?;
                     }
@@ -286,13 +290,13 @@ impl StartupHandler for Startup {
                                 crate::auth::guessed(ip, &user);
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(400)).await; // (a guess costs time)
-                            return Err(wrong(&user));
+                            return Err(wrong(&user).await);
                         };
                         let who = match crate::users::BUILT_IN.contains(&user.as_str()) {
                             true => Some(crate::auth::Principal::token(app.auth.role_of_user(&user))),
                             false => crate::users::principal(&app.lake, &user).await.ok(),
                         };
-                        let Some(who) = who else { return Err(wrong(&user)) };
+                        let Some(who) = who else { return Err(wrong(&user).await) };
                         *self.backend.who.lock().unwrap() = Some(who.at("postgres", Some(client.socket_addr())));
                         client.send(PgWireBackendMessage::Authentication(Authentication::SASLFinal(reply.into_bytes().into()))).await?;
                         return finish(client, &self.cancels).await;
@@ -347,6 +351,7 @@ fn user_error(e: anyhow::Error) -> PgWireError {
 impl Backend {
     /// Run one statement the way `POST /sql` does, for a client whose role comes from its user name.
     async fn run(&self, user: &str, sql: &str, format: &Format) -> PgWireResult<Response> {
+        crate::dialect_stmts::refused(sql).map_err(user_error)?; // (as `statement::run` refuses them: `dialect_stmts.rs`)
         if let Some(c) = crate::vars::change(sql) {
             // DECLARE $day …, $day = …: this connection's variable (`vars.rs`)
             let tag = c.tag();
@@ -445,6 +450,27 @@ impl Backend {
                 }
                 crate::routines::Outcome::Done(_) => Ok(Response::Execution(Tag::new(if crate::routines::do_of(&sql).is_some() { "DO" } else { "CALL" }))),
             };
+        }
+        if let Some(w) = crate::with_writes::of(&sql) {
+            // a WITH that writes (`WITH m AS (DELETE … RETURNING *) INSERT …`): its steps, then its answer, under its command's tag
+            let w = w.map_err(user_error)?;
+            let who = crate::routines::Who { role, files: false, depth: 0 };
+            return Ok(match Box::pin(crate::with_writes::run(&self.app, &w, who, None)).await.map_err(user_error)? {
+                crate::routines::Outcome::Rows(batches) => {
+                    let schema = batches.first().map(|b| b.schema()).unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
+                    let schema = crate::pg_types::typed(&schema, &crate::pg_types::columns(&self.app.lake, &bound).await);
+                    let mut answer = rows(&schema, batches, format)?;
+                    answer.command_tag = w.tag().into();
+                    Response::Query(answer)
+                }
+                crate::routines::Outcome::Done(v) => {
+                    let tag = Tag::new(w.tag().split(' ').next().unwrap_or_default()).with_rows(v["rows"].as_u64().unwrap_or(0) as usize);
+                    Response::Execution(match w.tag().starts_with("INSERT") {
+                        true => tag.with_oid(0),
+                        false => tag,
+                    })
+                }
+            });
         }
         if let Some(r) = crate::returning::of(&sql) {
             // INSERT, UPDATE or DELETE … RETURNING: the rows it wrote, under its command's tag (`INSERT 0 3`)
@@ -623,7 +649,7 @@ impl Backend {
         let meta = self.app.lake.cat.meta(&crate::store::table_key(&p.copy.table)).await.map_err(err)?.ok_or_else(|| err(anyhow::anyhow!("no table {}", p.copy.table)))?;
         let rules = meta.rules().map_err(err)?;
         let table = rules.schema.clone(); // (SQL's names: ADR-022)
-        let given: Vec<String> = if p.copy.columns.is_empty() { table.fields().iter().map(|f| f.name().clone()).filter(|c| c != "_deleted").collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
+        let given: Vec<String> = if p.copy.columns.is_empty() { rules.order.iter().filter(|c| *c != "_deleted").cloned().collect() } else { p.copy.columns.clone() }; // (as `SELECT *` shows it)
         let schema = Arc::new(Schema::new(given.iter().map(|c| table.field_with_name(c).cloned()).collect::<Result<Vec<_>, _>>().map_err(|e| err(e.into()))?));
         let null = p.copy.null.clone().unwrap_or(if csv { String::new() } else { "\\N".into() });
         let delimiter = p.copy.delimiter.unwrap_or(if csv { ',' } else { '\t' }) as u8;
@@ -848,7 +874,8 @@ pub(crate) fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
         DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2, DataType::Int16),
         DataType::Int32 | DataType::UInt16 => (Type::INT4, DataType::Int32),
         DataType::UInt32 => (Type::OID, DataType::UInt32), // (the catalog's oids: `pg_catalog.rs`)
-        DataType::Int64 | DataType::UInt64 => (Type::INT8, DataType::Int64),
+        DataType::Int64 => (Type::INT8, DataType::Int64),
+        DataType::UInt64 => (Type::NUMERIC, DataType::Decimal128(20, 0)), // (UBIGINT: every value, 2^63 and above too; INT8 sent those as NULL)
         DataType::Float32 => (Type::FLOAT4, DataType::Float32),
         DataType::Float64 => (Type::FLOAT8, DataType::Float64),
         DataType::Decimal128(..) => (Type::NUMERIC, t.clone()), // (`Numeric`: text or binary)
@@ -869,7 +896,7 @@ pub(crate) fn pg_type(t: &DataType, format: FieldFormat) -> (Type, DataType) {
                 DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => (Type::TEXT_ARRAY, of(DataType::Utf8)),
                 DataType::Int8 | DataType::Int16 | DataType::UInt8 => (Type::INT2_ARRAY, of(DataType::Int16)),
                 DataType::Int32 | DataType::UInt16 => (Type::INT4_ARRAY, of(DataType::Int32)),
-                DataType::Int64 | DataType::UInt64 => (Type::INT8_ARRAY, of(DataType::Int64)),
+                DataType::Int64 => (Type::INT8_ARRAY, of(DataType::Int64)), // (a UBIGINT[] as text, below: INT8 can't hold its values)
                 DataType::UInt32 => (Type::OID_ARRAY, of(DataType::UInt32)),
                 DataType::Float16 | DataType::Float32 => (Type::FLOAT4_ARRAY, of(DataType::Float32)),
                 DataType::Float64 => (Type::FLOAT8_ARRAY, of(DataType::Float64)),
@@ -1231,6 +1258,66 @@ impl CopyHandler for Backend {
     }
 }
 
+/// The client as Parse, Bind, Describe and Execute write to it: their messages wait in its buffer, and the socket is written
+/// at Sync (`on_sync`) or Flush, as Postgres writes it, not after each message. pgwire sends each of ParseComplete,
+/// BindComplete, a portal's RowDescription and CommandComplete on its own: a prepared key lookup took four writes to the
+/// socket where a simple query takes one, and the client as many wake-ups (2,000 lookups: 8,004 `sendto` to 2,002). A
+/// COPY's start is written at once, since the client answers it before it sends a Sync; a full buffer is written anyway
+/// (the codec's own limit), so a long answer still streams.
+struct Corked<'a, C> {
+    c: &'a mut C,
+    now: bool, // (a COPY began: write as asked from here)
+}
+
+impl<'a, C> Corked<'a, C> {
+    fn new(c: &'a mut C) -> Self { Corked { c, now: false } }
+}
+
+impl<C: Sink<PgWireBackendMessage> + Unpin> Sink<PgWireBackendMessage> for Corked<'_, C> {
+    type Error = C::Error;
+    fn poll_ready(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut *self.c).poll_ready(cx)
+    }
+    fn start_send(mut self: std::pin::Pin<&mut Self>, item: PgWireBackendMessage) -> Result<(), Self::Error> {
+        if matches!(item, PgWireBackendMessage::CopyInResponse(_) | PgWireBackendMessage::CopyOutResponse(_) | PgWireBackendMessage::CopyBothResponse(_)) {
+            self.now = true;
+        }
+        std::pin::Pin::new(&mut *self.c).start_send(item)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        match self.now {
+            true => std::pin::Pin::new(&mut *self.c).poll_flush(cx),
+            false => std::task::Poll::Ready(Ok(())),
+        }
+    }
+    fn poll_close(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::pin::Pin::new(&mut *self.c).poll_close(cx)
+    }
+}
+
+impl<C: ClientPortalStore> ClientPortalStore for Corked<'_, C> {
+    type PortalStore = C::PortalStore;
+    fn portal_store(&self) -> &Self::PortalStore { self.c.portal_store() }
+}
+
+impl<C: ClientInfo> ClientInfo for Corked<'_, C> {
+    fn socket_addr(&self) -> std::net::SocketAddr { self.c.socket_addr() }
+    fn is_secure(&self) -> bool { self.c.is_secure() }
+    fn protocol_version(&self) -> pgwire::messages::ProtocolVersion { self.c.protocol_version() }
+    fn set_protocol_version(&mut self, v: pgwire::messages::ProtocolVersion) { self.c.set_protocol_version(v) }
+    fn pid_and_secret_key(&self) -> (i32, pgwire::messages::startup::SecretKey) { self.c.pid_and_secret_key() }
+    fn set_pid_and_secret_key(&mut self, pid: i32, key: pgwire::messages::startup::SecretKey) { self.c.set_pid_and_secret_key(pid, key) }
+    fn state(&self) -> pgwire::api::PgWireConnectionState { self.c.state() }
+    fn set_state(&mut self, s: pgwire::api::PgWireConnectionState) { self.c.set_state(s) }
+    fn transaction_status(&self) -> pgwire::messages::response::TransactionStatus { self.c.transaction_status() }
+    fn set_transaction_status(&mut self, s: pgwire::messages::response::TransactionStatus) { self.c.set_transaction_status(s) }
+    fn metadata(&self) -> &std::collections::HashMap<String, String> { self.c.metadata() }
+    fn metadata_mut(&mut self) -> &mut std::collections::HashMap<String, String> { self.c.metadata_mut() }
+    fn session_extensions(&self) -> &pgwire::api::SessionExtensions { self.c.session_extensions() }
+    fn sni_server_name(&self) -> Option<&str> { self.c.sni_server_name() }
+    fn client_certificates<'b>(&self) -> Option<&[tokio_rustls::rustls::pki_types::CertificateDer<'b>]> { self.c.client_certificates() }
+}
+
 /// A statement as Parse gave it, and what was found of it once. Postgres settles a prepared statement's
 /// parameter types, and its columns, when it is prepared. Finding them here plans the query, and libpq's
 /// drivers (psycopg) bind, describe and execute a prepared statement every time it runs: each run
@@ -1363,6 +1450,8 @@ impl SimpleQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // (pgwire writes the answer's rows inside this call, so the drain counts the call until they are written)
+        let _busy = crate::drain::Busy::new();
         let out = self._on_query(client, query).await;
         self.cancelled(&out);
         out
@@ -1399,7 +1488,12 @@ impl ExtendedQueryHandler for Backend {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let out = self._on_execute(client, message).await;
+        // (pgwire writes the rows this Execute sends inside this call, so the drain counts the call until they are written)
+        let _busy = crate::drain::Busy::new();
+        let out = self._on_execute(&mut Corked::new(client), message).await;
+        if crate::drain::draining() {
+            client.flush().await?; // (a node stopping writes the rows now, while the drain still counts this call)
+        }
         self.cancelled(&out);
         out
     }
@@ -1419,7 +1513,46 @@ impl ExtendedQueryHandler for Backend {
                 crate::temp::SESSION.sync_scope(Some(self.session.clone()), || cursor_portal(&*client, name));
             }
         }
-        self._on_describe(client, message).await
+        self._on_describe(&mut Corked::new(client), message).await
+    }
+
+    // (pgwire's own Parse and Bind, their answers written at the Sync with the rest: `Corked`)
+    async fn on_parse<C>(&self, client: &mut C, message: Parse) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.clone().unwrap_or_else(|| pgwire::api::DEFAULT_NAME.to_owned());
+        match StoredStatement::parse(client, &message, self.query_parser()).await? {
+            Some(stmt) => client.portal_store().put_statement(Arc::new(stmt)),
+            None => client.portal_store().put_empty_statement(&name),
+        }
+        client.feed(PgWireBackendMessage::ParseComplete(ParseComplete::new())).await?;
+        Ok(())
+    }
+
+    async fn on_bind<C>(&self, client: &mut C, message: Bind) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let statement_name = message.statement_name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        let portal_name = message.portal_name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match client.portal_store().get_statement(statement_name) {
+            Some(Entry::Value(statement)) => client.portal_store().put_portal(Arc::new(Portal::try_new(&message, statement)?)),
+            Some(Entry::Empty) if !message.parameters.is_empty() => {
+                let why = format!("bind message supplies {} parameters, but prepared statement {statement_name:?} requires 0", message.parameters.len());
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_owned(), "08P01".to_owned(), why))));
+            }
+            Some(Entry::Empty) => client.portal_store().put_empty_portal(portal_name),
+            None => return Err(PgWireError::StatementNotFound(statement_name.to_owned())),
+        }
+        client.feed(PgWireBackendMessage::BindComplete(BindComplete::new())).await?;
+        Ok(())
     }
 
     async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, _max_rows: usize) -> PgWireResult<Response>
@@ -1506,6 +1639,9 @@ impl Backend {
         }
         let n = (1..).take_while(|i| sql.contains(&format!("${i}"))).count();
         let mut types = vec![Type::TEXT; n]; // (text when the query doesn't say, as the doc above has it)
+        if n > 0 {
+            arithmetic_types(sql, &mut types); // (an operand of + - * / %: the other operand's type, as Postgres gives it; the plan below still wins)
+        }
         if n > 0 && session_command(sql).is_none() && !crate::settings::is(sql) && crate::write::parse(sql).is_none() && Copy::of(sql).is_none() && !crate::script::is(sql) {
             let plan = async {
                 let sql = crate::routines::expand(&self.app.lake, sql).await.ok()?;
@@ -1560,6 +1696,23 @@ impl Backend {
                 return Ok((described(&schema, format), Columns::Kept { schema, given: false }));
             }
         }
+        if crate::with_writes::of(sql).is_some() {
+            // (a WITH that writes: its columns as `run` answers them, with each `$i` read as NULL, as a plain statement's are planned)
+            let marks = crate::pg_types::columns(&self.app.lake, &written).await; // (its uuids, from the statement as written)
+            let sql = crate::vars::bound(sql).map_err(user_error)?;
+            let sql = crate::routines::expand(&self.app.lake, &sql).await.map_err(user_error)?;
+            let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
+            if let Some(w) = crate::with_writes::of(&pg_dialect(&self.app.lake, &probe, "")) {
+                let w = w.map_err(user_error)?;
+                return Ok(match crate::with_writes::columns(&self.app, &w).await.map_err(user_error)? {
+                    Some(schema) => {
+                        let schema = crate::pg_types::typed(&schema, &marks);
+                        (described(&schema, format), Columns::Kept { schema, given: false })
+                    }
+                    None => (vec![], Columns::None), // (a write without RETURNING answers no columns)
+                });
+            }
+        }
         let point = match crate::auth::limited() {
             None => crate::serve::point(&self.app.lake, sql).await.ok().flatten().and_then(|p| Some(crate::pg_types::typed(&p.schema().ok()?, &p.types().into()))), // (a key lookup's columns, unplanned, first)
             Some(_) => None,
@@ -1577,12 +1730,137 @@ impl Backend {
         let schema = match point {
             Some(s) => s,
             None => {
-                let probe = (1..).take_while(|i| sql.contains(&format!("${i}"))).fold(sql.to_string(), |q, i| q.replace(&format!("${i}"), "NULL"));
+                let probe = crate::pg_values::substitute(&sql, &vec!["NULL".to_string(); (1..).take_while(|i| sql.contains(&format!("${i}"))).count()]); // (each `$i` once: `$1` is not the start of `$10`)
                 crate::pg_types::typed(&self.schema(&probe, "").await?, &marks)
             }
         };
         Ok((described(&schema, format), Columns::Kept { schema, given: false }))
     }
+}
+
+/// Where an unknown parameter is an operand of `+ - * / %` (`$1 * 1000000000000000 + $2`), its type as Postgres gives it: the
+/// other operand's. A client that sends text (pgbench, node-postgres, psycopg's str) then lands as that number, not as text.
+/// Written into `types`, which holds TEXT where nothing says. A parameter whose other operand is a column or a function is
+/// UNKNOWN, which `pg_values::literal` writes as a number when it reads as one. A parse and a walk, with no plan, so a write
+/// takes it too (`INSERT … VALUES ($1 * …)`).
+fn arithmetic_types(sql: &str, types: &mut [Type]) {
+    let Some(statement) = crate::pg_types::one(sql) else { return };
+    let mut typed: Vec<Option<Type>> = vec![None; types.len()];
+    // (a parameter can wait on another's type: the walk runs again until nothing changes, four passes at most)
+    for _ in 0..4 {
+        let mut changed = false;
+        arithmetic_params(&statement, |i, other| {
+            if i < typed.len() && typed[i].is_none() {
+                if let Some(t) = numeric_type(other, &typed) {
+                    typed[i] = Some(t);
+                    changed = true;
+                }
+            }
+        });
+        if !changed {
+            break;
+        }
+    }
+    // (what is left has an other operand that is a column, a function or another unknown parameter)
+    let mut unknown = Vec::new();
+    arithmetic_params(&statement, |i, other| {
+        if i < typed.len() && typed[i].is_none() && numeric_type(other, &typed).is_none() {
+            unknown.push(i);
+        }
+    });
+    for i in unknown {
+        typed[i] = Some(Type::UNKNOWN);
+    }
+    for (t, found) in types.iter_mut().zip(typed) {
+        if let Some(found) = found {
+            *t = found;
+        }
+    }
+}
+
+/// Each parameter that is an operand of `+ - * / %` in `statement`, with the other operand (`$1 + col` gives `$1` and
+/// `col`). `f` sees them in the statement's order, through `walk`, the one walk of the tree.
+fn arithmetic_params(statement: &ast::Statement, mut f: impl FnMut(usize, &Expr)) {
+    let _ = crate::walk::visit_expressions(statement, |e| {
+        if let Expr::BinaryOp { left, op, right } = e {
+            if is_arithmetic(op) {
+                for (operand, other) in [(left, right), (right, left)] {
+                    if let Some(i) = crate::pg_trace::param(operand) {
+                        f(i, other);
+                    }
+                }
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+}
+
+/// Is `op` one of the operators whose operands Postgres types alike: `+ - * / %`.
+fn is_arithmetic(op: &BinaryOperator) -> bool {
+    matches!(op, BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo)
+}
+
+/// The numeric type of `e` where it reads without its column: a number literal, a parameter `typed` has a numeric type for,
+/// a CAST, a sign on one of those, or an arithmetic operator on two of them. None for a column, a function, a string, or a
+/// parameter not typed yet.
+fn numeric_type(e: &Expr, typed: &[Option<Type>]) -> Option<Type> {
+    if let Some(i) = crate::pg_trace::param(e) {
+        return typed.get(i).cloned().flatten();
+    }
+    match e {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => Some(number_type(n)),
+            _ => None,
+        },
+        Expr::Nested(inner) | Expr::UnaryOp { op: UnaryOperator::Plus | UnaryOperator::Minus, expr: inner } => numeric_type(inner, typed),
+        Expr::Cast { kind: CastKind::Cast | CastKind::DoubleColon, data_type, .. } => cast_type(data_type),
+        Expr::BinaryOp { left, op, right } if is_arithmetic(op) => Some(wider(numeric_type(left, typed)?, numeric_type(right, typed)?)),
+        _ => None,
+    }
+}
+
+/// The type of a number literal as Postgres reads it: int4 if it fits, int8 if it fits a bigint, else numeric; a point or
+/// an exponent makes it numeric.
+fn number_type(n: &str) -> Type {
+    if n.contains(['.', 'e', 'E']) {
+        Type::NUMERIC
+    } else if n.parse::<i32>().is_ok() {
+        Type::INT4
+    } else if n.parse::<i64>().is_ok() {
+        Type::INT8
+    } else {
+        Type::NUMERIC
+    }
+}
+
+/// The numeric type a CAST names, as Postgres's casts give it: BIGINT is int8, DOUBLE PRECISION float8, and FLOAT(p) is
+/// real up to 24 digits of precision. None for any other type.
+fn cast_type(t: &ast::DataType) -> Option<Type> {
+    Some(match t {
+        ast::DataType::SmallInt(_) | ast::DataType::Int2(_) => Type::INT2,
+        ast::DataType::Int(_) | ast::DataType::Integer(_) | ast::DataType::Int4(_) => Type::INT4,
+        ast::DataType::BigInt(_) | ast::DataType::Int8(_) => Type::INT8,
+        ast::DataType::Numeric(_) | ast::DataType::Decimal(_) => Type::NUMERIC,
+        ast::DataType::Real | ast::DataType::Float4 => Type::FLOAT4,
+        ast::DataType::Float(ExactNumberInfo::Precision(p)) if *p <= 24 => Type::FLOAT4,
+        ast::DataType::Float(_) | ast::DataType::Double(_) | ast::DataType::DoublePrecision | ast::DataType::Float8 => Type::FLOAT8,
+        _ => return None,
+    })
+}
+
+/// The wider of two numeric types, in the order arithmetic widens them: int2, int4, int8, numeric, float4, float8.
+fn wider(a: Type, b: Type) -> Type {
+    fn rank(t: &Type) -> u8 {
+        match *t {
+            Type::INT2 => 0,
+            Type::INT4 => 1,
+            Type::INT8 => 2,
+            Type::NUMERIC => 3,
+            Type::FLOAT4 => 4,
+            _ => 5,
+        }
+    }
+    if rank(&b) > rank(&a) { b } else { a }
 }
 
 /// A DECLARE that ran makes a portal of the cursor's name, as Postgres does: psycopg describes it right
@@ -1611,4 +1889,42 @@ fn described(schema: &Schema, format: &Format) -> Vec<FieldInfo> {
 fn trace() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| crate::env::is_set("PONDRA_TRACE_PG"));
     *ON
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The types of `n` parameters of `sql`, as `arithmetic_types` leaves them (TEXT where nothing says).
+    fn typed(sql: &str, n: usize) -> Vec<Type> {
+        let mut types = vec![Type::TEXT; n];
+        arithmetic_types(sql, &mut types);
+        types
+    }
+
+    /// An unknown parameter that is an operand of arithmetic takes the other operand's type, as Postgres gives it; beside a
+    /// column it is unknown; and anywhere else it stays text, as it was.
+    #[test]
+    fn arithmetic_gives_the_other_operands_type() {
+        assert_eq!(typed("SELECT $1 * 1000000000000000 + $2", 2), [Type::INT8, Type::INT8]);
+        assert_eq!(typed("INSERT INTO kv (id, v) VALUES ($1 * 1000000000000000 + $2, 'x')", 2), [Type::INT8, Type::INT8]);
+        assert_eq!(typed("SELECT $1 + 1", 1), [Type::INT4]);
+        assert_eq!(typed("SELECT $1 * 2.5", 1), [Type::NUMERIC]);
+        assert_eq!(typed("SELECT $1 * -3", 1), [Type::INT4]);
+        assert_eq!(typed("SELECT $1 + 4000000000", 1), [Type::INT8]);
+        assert_eq!(typed("UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2", 2), [Type::UNKNOWN, Type::TEXT]);
+        assert_eq!(typed("SELECT $1 || 'x'", 1), [Type::TEXT]);
+        assert_eq!(typed("SELECT id FROM t WHERE a = $1", 1), [Type::TEXT]);
+        assert_eq!(typed("SELECT CAST($2 AS BIGINT) + $1", 2), [Type::INT8, Type::TEXT]);
+        assert_eq!(typed("SELECT $2::BIGINT + $1", 2), [Type::INT8, Type::TEXT]);
+        assert_eq!(typed("SELECT $1 + $2", 2), [Type::UNKNOWN, Type::UNKNOWN]);
+        assert_eq!(typed("SELECT $1 + 1 + abalance * $2", 2), [Type::INT4, Type::UNKNOWN]);
+    }
+
+    /// A statement that doesn't parse as one, or has no arithmetic on a parameter, leaves every type as it was.
+    #[test]
+    fn arithmetic_leaves_what_it_cannot_read() {
+        assert_eq!(typed("SELECT $1 + 1; SELECT 2", 1), [Type::TEXT]);
+        assert_eq!(typed("NOT SQL $1 +", 1), [Type::TEXT]);
+    }
 }

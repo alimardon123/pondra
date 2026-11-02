@@ -35,6 +35,10 @@ pub type Store = Arc<dyn ObjectStore>;
 /// replaced or removed, so no cache keeps it (ADR-034). Everything else is written once.
 pub fn replaceable(path: &str) -> bool { path.starts_with("files/") }
 
+/// A lake's files and its log: the objects that may go to disk, and that a page may read through its node. The
+/// catalog's objects are not among them, since they hold what a page must not.
+pub(crate) fn lake_file(key: &str) -> bool { key.starts_with("data/") || key.starts_with("log/") }
+
 fn version_of(m: &object_store::ObjectMeta) -> String {
     match &m.e_tag {
         Some(e) => format!("{}:{}", e.trim_matches('"'), m.size),
@@ -108,6 +112,12 @@ pub struct TableMeta {
     /// Columns dropped (their stored names): older files still hold them; nothing reads them again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<String>,
+    /// The order SQL lists the columns in, by stored name (`ALTER COLUMN c AFTER b`, `ADD COLUMN … FIRST`); the columns
+    /// it leaves out follow in their stored order, so a column added later comes last. Empty: as stored. Storage keeps
+    /// `columns`' order (a file's field ids are places in it), and so does everything under SQL: this is SQL's order only,
+    /// for `SELECT *`, an INSERT without a column list, `SHOW CREATE` and the catalogs (`in_order`, `sql_order`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown: Vec<String>,
     /// Where its files, manifests and Delta and Iceberg copies are: `data/{folder}/`. None: its
     /// name, as for every table before round 26; a renamed table keeps the folder it had
     /// (`ALTER TABLE … RENAME TO`, ADR-030).
@@ -208,6 +218,21 @@ impl TableMeta {
     /// Has any column been renamed or dropped (ADR-022)? If not, SQL sees `columns` as stored.
     pub fn mapped(&self) -> bool { !self.names.is_empty() || !self.dropped.is_empty() }
 
+    /// This entry's live columns (under the names it keeps them by: stored, or SQL's in `logical()`'s) in SQL's order
+    /// (`shown`, then the others as stored). Without `shown`, `columns` as they are, dropped ones out.
+    pub fn in_order(&self) -> Vec<&(String, String)> {
+        let first = self.shown.iter().filter_map(|s| self.columns.iter().find(|(c, _)| c == s));
+        let rest = self.columns.iter().filter(|(c, _)| !self.shown.contains(c));
+        first.chain(rest).filter(|(c, _)| !self.dropped.contains(c)).collect()
+    }
+
+    /// The live columns' SQL names in SQL's order (`_deleted` among them, if the table has it): what `SELECT *` lists, and
+    /// what an INSERT without a column list fills, first to last (`write::implicit`).
+    pub fn sql_order(&self) -> Vec<String> { self.in_order().into_iter().map(|(c, _)| self.name_of(c).to_string()).collect() }
+
+    /// SQL's columns (`logical_columns`) in SQL's order (`in_order`): what `SELECT *` and RETURNING * answer.
+    pub fn sql_columns(&self) -> Vec<(String, String)> { self.in_order().into_iter().map(|(c, t)| (self.name_of(c).to_string(), t.clone())).collect() }
+
     /// A stored column's name in SQL.
     pub fn name_of<'a>(&'a self, stored: &'a str) -> &'a str { self.names.get(stored).map_or(stored, String::as_str) }
 
@@ -250,6 +275,7 @@ impl TableMeta {
             sql_types: self.in_sql(&self.sql_types),
             names: BTreeMap::new(),
             dropped: vec![],
+            shown: self.in_sql_list(&self.shown),
             ..self.clone()
         }
     }
@@ -302,6 +328,7 @@ impl TableMeta {
                 .collect(),
             checks: self.checks.clone(),
             mapped: self.mapped(),
+            order: self.sql_order(),
         })
     }
 
@@ -315,12 +342,14 @@ impl TableMeta {
         Ok(self.rules.0.get_or_init(|| t).clone())
     }
 
-    /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, but
-    /// a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
+    /// The table as its readers see it, to describe it (listings, `pg_catalog`, MCP): `logical`, its columns in SQL's order
+    /// (`sql_columns`), but a view that finishes its answers (`finish.rs`) shows the columns it answers, not its partial ones.
+    /// Only to describe: its `columns` aren't the stored order once a column moved.
     pub fn described(&self) -> TableMeta {
         match &self.finish {
             Some(f) => TableMeta { columns: f.columns.clone(), merge: BTreeMap::new(), ..self.logical() },
-            None => self.logical(),
+            None if self.shown.is_empty() => self.logical(),
+            None => TableMeta { columns: self.sql_columns(), shown: vec![], ..self.logical() },
         }
     }
 
@@ -530,11 +559,28 @@ const RECENT_BYTES: usize = 64 << 20; // …within this much memory (past it, a 
 /// Query read cache in memory, MB (env PONDRA_CACHE_MB, default 1024).
 fn cache_mb() -> usize { crate::env::or("PONDRA_CACHE_MB", 1024) }
 
+/// The folder the node's SSD tiers and replica logs go under: `PONDRA_CACHE_DIR` when set (the operator's own
+/// choice), else `pondra-cache-{uid}` in the temp dir, made 0700 and used only while it is this user's alone
+/// (`memory::own_dir`: the temp dir is shared, so a folder with a predictable name may be another user's).
+pub(crate) fn cache_base() -> std::io::Result<std::path::PathBuf> {
+    match crate::env::get("PONDRA_CACHE_DIR") {
+        Some(dir) => Ok(std::path::PathBuf::from(dir)),
+        None => crate::memory::own_dir(&std::env::temp_dir(), "pondra-cache"),
+    }
+}
+
 /// The local SSD tier for a lake on object storage (`serve --cache-dir/--cache-gb`, or env
-/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under the temp dir, 20 GB, or a quarter of the free disk
+/// PONDRA_CACHE_DIR / PONDRA_CACHE_GB): under `cache_base`, 20 GB, or a quarter of the free disk
 /// if that is less (a notebook's sandbox may have a few GB). 0 GB turns it off.
 fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
-    let dir = crate::env::get("PONDRA_CACHE_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("pondra-cache"));
+    let dir = match cache_base() {
+        Ok(dir) => dir,
+        Err(e) => {
+            static SAID: std::sync::Once = std::sync::Once::new(); // (the same for every lake, so said once)
+            SAID.call_once(|| eprintln!("no SSD tier ({e}): lakes on object storage read the bucket without one"));
+            return None;
+        }
+    };
     let bytes = match crate::env::parse::<u64>("PONDRA_CACHE_GB") {
         Some(gb) => gb << 30,
         None => space(&dir).map_or(20 << 30, |(free, _)| (free / 4).min(20 << 30)),
@@ -545,7 +591,7 @@ fn disk_tier(url: &str, store: &Store) -> Option<Arc<crate::cache::Disk>> {
 
 /// Free and total bytes of the disk that holds `dir` (or its nearest existing parent), where the
 /// platform says.
-fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
+pub(crate) fn space(dir: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         let at = std::ffi::CString::new(dir.ancestors().find(|a| a.exists())?.as_os_str().as_encoded_bytes()).ok()?;
@@ -592,9 +638,10 @@ pub(crate) fn spill_folder() -> std::io::Result<&'static std::path::Path> {
 }
 
 /// `PONDRA_SPILL_GB`: how many GB of spills the node may keep on disk. None when unset (a negative setting is none).
-fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
+pub(crate) fn spill_gb() -> Option<f64> { crate::env::parse::<f64>("PONDRA_SPILL_GB").filter(|gb| *gb >= 0.0) }
 
 /// The bytes that may spill under `dir`: `PONDRA_SPILL_GB` when set, else `dir`'s disk's free space less `lake_keeps`; None with no `dir`.
+/// The lakes in memory spill under the same setting and room, counted with these (`memory::spilled`, `others_held`).
 pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
     match spill_gb() {
         Some(gb) => Some(gb_bytes(gb)),
@@ -610,16 +657,87 @@ pub(crate) fn spill_cap(dir: Option<&std::path::Path>) -> Option<u64> {
 /// The cap is the free space when the first spill makes the disk, less the room a lake keeps, or the
 /// setting in GB; it is looked at again as queries start (`spill_room`). `0` turns spilling off: a
 /// query that needs it is refused (53200). A negative setting is no setting.
-fn spill_disk() -> DiskManagerBuilder {
+fn spill_disk() -> DiskManagerBuilder { spill_disk_merging(spill_fan_in().unwrap_or_else(|| merge_files(partitions()))) }
+
+/// The spill factory a page in a Worker gives the core (`give_spills`, wasm32): the lakes that open while it is set spill through
+/// it (`spill_disk_merging`). Not `per_node!`: a freed page's member closes in the background, and its `reset()` would wipe the
+/// factory of the page made after it (node.rs's CLAIMED says the same of the claim).
+static SPILL_FACTORY: Mutex<Option<Arc<dyn TempFileFactory>>> = Mutex::new(None);
+
+/// Gives the core the factory a page's spill file comes from (wasm32: `web/`'s `spill.rs`), for the lakes that open while it is
+/// set. True when it is given; false when one is set already, which a page never leaves behind (it takes its own back, `take_spills`).
+#[cfg(target_arch = "wasm32")]
+pub fn give_spills(factory: Arc<dyn TempFileFactory>) -> bool {
+    let mut given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if given.is_some() {
+        return false;
+    }
+    *given = Some(factory);
+    true
+}
+
+/// Takes back the factory `give_spills` gave, when it is this one (`Arc::ptr_eq`): a page ends with its own and leaves another's be.
+#[cfg(target_arch = "wasm32")]
+pub fn take_spills(factory: &Arc<dyn TempFileFactory>) {
+    let mut given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if given.as_ref().is_some_and(|g| Arc::ptr_eq(g, factory)) {
+        *given = None;
+    }
+}
+
+/// `spill_disk`, its merges reading at most `fan_in` spilled runs at once.
+fn spill_disk_merging(fan_in: usize) -> DiskManagerBuilder {
     if spill_gb() == Some(0.0) {
         return DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled);
     }
-    // (a merge of spilled runs takes at most an eighth of its partition's share, about 4 MB a run read at once: unlimited,
-    // as DataFusion has it, each partition's merge took the whole pool and a window over its rows was refused)
-    // (`PONDRA_SPILL_FAN_IN` replaces the formula; 0 is DataFusion's own, no limit.)
-    let fan_in = crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN").unwrap_or_else(|| (memory_limit() / partitions() / (32 << 20)).clamp(4, 64));
+    // (a page on wasm has no folder to spill to: it spills through the factory it gave the core before this lake opened
+    // (`give_spills`), and with none it has no disk, so a query past its pool is refused (53200) rather than trapping the module
+    // in `spill_folder`. Only a lake that opens while the factory is set spills through it: `Custom` reserves the sorts' spill
+    // memory, so a page with none keeps its pool as it was (designs/l2-page-spill.md, S1).)
+    if cfg!(target_arch = "wasm32") {
+        let given = SPILL_FACTORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        return match given {
+            Some(factory) => DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(factory)).with_max_spill_merge_fan_in(fan_in),
+            None => DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+        };
+    }
     // (the lake's own manager holds no file: `Spills` makes the one that does, with this fan-in too, since sorts read it here)
     DiskManagerBuilder::default().with_mode(DiskManagerMode::Custom(Arc::new(Spills { fan_in, made: std::sync::OnceLock::new() }))).with_max_spill_merge_fan_in(fan_in)
+}
+
+/// `PONDRA_SPILL_FAN_IN`: how many spilled runs any merge reads at once, in place of `merge_files` and `merge_fan_in`
+/// (0 is DataFusion's own, no limit).
+fn spill_fan_in() -> Option<usize> { crate::env::parse::<usize>("PONDRA_SPILL_FAN_IN") }
+
+/// How many spilled runs a merge reads at once, one pass whenever its memory holds them all (Alimardon, 10-31: stream, and
+/// spill as little as can be): 512 open files over `partitions`, 4 to 64. Memory bounds it before that: a GROUP BY's
+/// merge reserves from the aggregate's own fair share of the pool, and a sort's takes runs only while the pool has room.
+/// Under a 2 GB cap a GROUP BY of 34 M strings and a three-way join made 25 to 64 runs a partition: merged 5 at a time
+/// (#150) they ran 40-90% slower, writing their rows again each pass (B50, 10-31). The sorts feeding a window take fewer
+/// (`merge_fan_in`).
+fn merge_files(partitions: usize) -> usize { (512 / partitions.max(1)).clamp(4, 64) }
+
+/// How many spilled runs the merge of a sort that feeds a window reads at once (`window_sorts`), with `memory` for queries
+/// over `partitions`: as many as half a partition's share holds at about 4 MB a run (the merge reserves a run's largest
+/// batch twice, two batches deep), 4 to 64. That reservation is a sort's merge, which no one may take back, so with as
+/// many runs as the pool held the window over its rows was refused (invariant 423). Under 2 GB this is 21; at the
+/// window check's 256 MB, 8 (it passes at 16 and is refused at 32).
+fn merge_fan_in(memory: usize, partitions: usize) -> usize { (memory / partitions.max(1) / (8 << 20)).clamp(4, 64) }
+
+/// `ctx` with the spill disk of the sorts that feed a window (their merges read `merge_fan_in` runs at once) in place of
+/// the lake's; the pool, the caches and the stores as they are. `held::HeldInExec` runs its input on it. The disk is made
+/// once for the process, as its spill folder is; spills off, or a disk that can't be made, leave `ctx` as it is.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn window_sorts(ctx: Arc<datafusion::execution::TaskContext>) -> Arc<datafusion::execution::TaskContext> {
+    static DISK: std::sync::OnceLock<Option<Arc<DiskManager>>> = std::sync::OnceLock::new();
+    let disk = DISK.get_or_init(|| {
+        let fan_in = spill_fan_in().unwrap_or_else(|| merge_fan_in(memory_limit(), partitions()));
+        (spill_gb() != Some(0.0)).then(|| spill_disk_merging(fan_in).build().ok().map(Arc::new)).flatten()
+    });
+    let Some(disk) = disk else { return ctx };
+    let built = RuntimeEnvBuilder { disk_manager: Some(disk.clone()), ..RuntimeEnvBuilder::from_runtime_env(&ctx.runtime_env()) }.build_arc();
+    let Ok(rt) = built else { return ctx };
+    Arc::new(datafusion::execution::TaskContext::new(ctx.task_id(), ctx.session_id(), ctx.session_config().clone(), ctx.scalar_functions().clone(), ctx.higher_order_functions().clone(), ctx.aggregate_functions().clone(), ctx.window_functions().clone(), rt))
 }
 
 /// DataFusion's spill disk for one lake, made by its first spill (`TempFileFactory`): the same manager `spill_disk`
@@ -688,12 +806,19 @@ fn room_cap(gb: Option<f64>, used: u64, shuffled: u64, disk: Option<(u64, u64)>)
     }
 }
 
-/// Sets every live lake's cap from the disk as it is now (`room_cap`).
+/// Sets every live lake's cap from the disk as it is now (`room_cap`). Under the setting, the shuffles, the lakes in
+/// memory and the other spill disks (a window's sorts have their own: `window_sorts`) take their bytes out of it first
+/// (without it, the disk's free room already says what they hold). (Each was given the whole setting, so a window's sorts
+/// and a GROUP BY spilling beside them could take twice it: audit 11-01 M13.)
 fn set_room(gb: Option<f64>) {
-    let shuffled = gb.map_or(0, |_| crate::spill::held()); // (shuffles count only under the setting: without it the disk's free room says it all)
+    let shuffled = gb.map_or(0, |_| crate::spill::held() + crate::memory::spilled());
     let disk = space(&crate::memory::spill_base()); // (the disk the folder is, or would be on: not made here, the first spill makes it)
-    for manager in live_spillers() {
-        if let Some(cap) = room_cap(gb, manager.used_disk_space(), shuffled, disk) {
+    let managers = live_spillers();
+    let all: u64 = managers.iter().map(|m| m.used_disk_space()).sum();
+    for manager in managers {
+        let used = manager.used_disk_space();
+        let others = gb.map_or(0, |_| all.saturating_sub(used));
+        if let Some(cap) = room_cap(gb, used, shuffled + others, disk) {
             let _ = manager.set_max_temp_directory_size(cap); // (a disabled manager refuses: none is registered)
         }
     }
@@ -712,25 +837,32 @@ pub(crate) fn spill_room() {
         return;
     }
     LOOKED.store(now, Relaxed);
+    if live_spillers().is_empty() {
+        return; // (no spill disk made yet, so nothing to size and no disk to look at: a page never makes one)
+    }
     set_room(spill_gb());
 }
 
 /// Whether `bytes` more fit on the spill disk: within the setting, with `held` already on it (shuffles' pieces
 /// and spills), or in its free room beyond what a lake keeps. Where the platform can't say how much room there
 /// is, it fits.
-fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u64, u64)>) -> bool {
+pub(crate) fn piece_fits(gb: Option<f64>, held: u64, bytes: u64, disk: Option<(u64, u64)>) -> bool {
     match gb {
         Some(gb) => held.saturating_add(bytes) <= gb_bytes(gb),
         None => disk.map_or(true, |(free, total)| bytes <= free.saturating_sub(lake_keeps(total))),
     }
 }
 
+/// What this process spills, other than its lakes in memory: the shuffles' pieces (`spill::held`) and the queries' spill
+/// disks (`live_spillers`). The lakes' bytes come with `memory::spilled`, so one check sees all of it.
+pub(crate) fn others_held() -> u64 { crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>() }
+
 /// Whether a shuffle's piece of `bytes` fits on the spill disk now: `Spill::write` asks before it writes one.
 /// No spill folder: it fits, and the write fails with its own error.
 pub(crate) fn spill_fits(bytes: u64) -> Result<()> {
     let Ok(folder) = spill_folder() else { return Ok(()) };
     let gb = spill_gb();
-    let held = gb.map_or(0, |_| crate::spill::held() + live_spillers().iter().map(|m| m.used_disk_space()).sum::<u64>());
+    let held = gb.map_or(0, |_| others_held() + crate::memory::spilled());
     match piece_fits(gb, held, bytes, space(folder)) {
         true => Ok(()),
         false => Err(no_room(bytes, gb)),
@@ -766,6 +898,7 @@ pub struct Lake {
     pub ids: crate::sys::Ids, // the row ids this process stamps rows with (a block reserved from the leader)
     pub caught: watch::Sender<bool>, // false while a node that just started catches up with its leader (`caught_up`)
     pub to: std::sync::OnceLock<crate::log::To>, // where this process's flushes and sequences' values go: its sequencer, or the leader's
+    pub owner_key: std::sync::OnceLock<String>, // the key of the program that started this process's node on the lake (`Auth::owner_key`): what its owner's tasks are signed with (`runs::signed`)
     pub sequences: tokio::sync::Mutex<HashMap<String, crate::seq::Block>>, // the sequences' values this node hands out (`seq::next`)
     bases: std::sync::RwLock<BTreeMap<String, (String, Option<Store>)>>, // a branch's bases (ADR-047): id -> place, and its store once read
     sessions: Mutex<std::collections::HashMap<usize, datafusion::execution::SessionState>>, // (`session_with`'s, made once a partition count)
@@ -781,9 +914,15 @@ impl std::fmt::Debug for Lake {
 /// a query never takes the node down. (A third, not half: what DataFusion counts here is the big
 /// hash tables and sort buffers, not the Parquet decoding and the batches in flight around them,
 /// so the node's own memory runs ahead of this number. The hot columns come out of it too.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn memory_limit() -> usize {
     crate::env::query_memory(|| ram().map_or(4 << 30, |r| r / 3))
 }
+
+/// A page's lake holds what the page's own pool does (`env::page_query_memory`, of its device's line): its memory is its
+/// line, not a machine's (`ram` is None there, and 4 GiB is past a 32-bit `usize`).
+#[cfg(target_arch = "wasm32")]
+pub fn memory_limit() -> usize { crate::env::page_query_memory(crate::env::device_line()) }
 
 /// The machine's memory, if it says: `/proc` on Linux, the OS's own call elsewhere. Less when a
 /// cgroup limits this process (a container, a service with `MemoryMax`): `/proc/meminfo` is the
@@ -838,10 +977,23 @@ pub fn resident() -> Option<usize> {
     })
 }
 
-/// A page's resident memory is not asked of an OS: it has none, and its memory is its line (`page.rs`).
+/// The page's live heap bytes, as the program that runs the page reads them (`page::Options::memory`, which re-exports this).
+pub type Memory = Arc<dyn Fn() -> usize + Send + Sync>;
+
+// A page's live bytes, as the program that runs the page reads them (`page::Options::memory`): process-wide, as the page's allocator is.
+#[cfg(target_arch = "wasm32")]
+static READER: std::sync::OnceLock<Memory> = std::sync::OnceLock::new();
+
+/// Gives the page's live bytes to the core's watch (`oom`): set once, and a second call keeps the first.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn read_resident_with(reading: Memory) {
+    let _ = READER.set(reading);
+}
+
+/// A page's resident memory is the bytes its program reads (`read_resident_with`), and none until one is given.
 #[cfg(target_arch = "wasm32")]
 pub fn resident() -> Option<usize> {
-    None
+    READER.get().map(|reading| reading())
 }
 
 /// The size of a page in bytes, which `/proc/self/statm` counts in: 4 KB, or 64 KB on some arm64 builds
@@ -969,9 +1121,10 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
     if served(url) {
         anyhow::bail!("{url}: this form reads no lake through a node's door (pondra://): open its bucket or folder instead");
     }
-    let Some((scheme, rest)) = url.split_once("://").filter(|(s, _)| ["s3", "gs", "az", "abfs", "abfss"].contains(s)) else {
+    if place(url)? == Place::Folder {
         return folder(url);
-    };
+    }
+    let (scheme, rest) = url.split_once("://").filter(|(s, _)| BUCKETS.contains(s)).expect("(a bucket: `place` refused any other URL)");
     let (bucket, prefix) = rest.trim_end_matches('/').split_once('/').unwrap_or((rest, ""));
     let root = format!("{scheme}://{bucket}");
     let reach = reach_of(url);
@@ -999,6 +1152,13 @@ pub fn open_store(url: &str) -> Result<(String, Store, Option<(String, Store)>)>
 /// A folder's store, made if it isn't there.
 #[cfg(not(target_arch = "wasm32"))]
 fn folder(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
+    // (a folder made here is its user's alone: other users would read its catalog and keys; one already there keeps its permissions)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(url)?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(url)?;
     let dir = std::fs::canonicalize(url)?.to_string_lossy().trim_start_matches(r"\\?\").to_string(); // (Windows verbatim prefix)
     // (`Local`: SlateDB's collector advances its manifest and compactions boundary files with conditional
@@ -1007,7 +1167,11 @@ fn folder(url: &str) -> Result<(String, Store, Option<(String, Store)>)> {
     // boundary stays on (`boundary_files_enabled`): it is what lets a reader whose manifest's successor was
     // deleted list again. The lock in `Local` orders one process's updates only: a folder has one writer,
     // and a writer fenced by a newer one restarts (`fatal`).)
-    Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?)))), None))
+    // (each write is flushed to the disk, the file and then its folder, before it returns: a commit acknowledged on a
+    // folder survives a power loss as one in a bucket does, and a catalog file renamed into place is never found
+    // empty after one. It cost a one-client commit 1.0 ms at the median, 8 clients 10% of their commits a second and a
+    // 1M-row INSERT 3%, on a sandbox's ext4: 10-31)
+    Ok((dir.clone(), Arc::new(Counted(Arc::new(Local(LocalFileSystem::new_with_prefix(&dir)?.with_fsync(true))))), None))
 }
 
 /// A page has no folders: its lake is in memory or in a bucket.
@@ -1022,6 +1186,29 @@ use crate::memory::in_memory;
 
 /// Is `url` a lake served by the node that holds it (`pondra://host:port`, ADR-072 §8)?
 pub fn served(url: &str) -> bool { url.starts_with("pondra://") }
+
+/// The schemes of a bucket's lake (`s3://bucket/prefix`): `open_store` and `place` both take only these.
+const BUCKETS: [&str; 5] = ["s3", "gs", "az", "abfs", "abfss"];
+
+/// The kinds of place a lake can be (`place`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Place { Memory, Served, Bucket, Folder }
+
+/// What kind of place `url` is: memory, a node's lake, a bucket, or a folder on this machine (no scheme). Any other
+/// scheme is refused here, before anything is opened: a URL no door knows was once made as a folder at a relative path.
+pub(crate) fn place(url: &str) -> Result<Place> {
+    if in_memory(url) {
+        return Ok(Place::Memory);
+    }
+    if served(url) {
+        return Ok(Place::Served);
+    }
+    match url.split_once("://") {
+        None => Ok(Place::Folder),
+        Some((scheme, _)) if BUCKETS.contains(&scheme) => Ok(Place::Bucket),
+        Some(_) => Err(crate::codes::coded("22023", format!("{url} is not a place a lake can be: a folder, a bucket (s3://, gs://, az://, abfs://, abfss://), memory, or a node's lake (pondra://host:port)"))),
+    }
+}
 
 /// A lake's bucket, as DataFusion names its store (`s3://bucket`), or None for a folder.
 pub fn bucket_url(url: &str) -> Option<String> {
@@ -1192,6 +1379,12 @@ pub(crate) fn functions(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionCo
 /// How often a reader polls the bucket for newer manifests and WAL: a node's, and the CLI's.
 pub const READER_POLL: Duration = Duration::from_millis(250);
 
+/// How often a node that follows the leader's commit stream polls the bucket for newer manifests. Once seeded it answers
+/// every read from the stream (`Catalog::seed`): its own view only lets it drop the inline data it holds, and catches it up
+/// after a gap in the stream. Each poll is two GETs (the next manifest, and SlateDB's GC boundary), so every 250 ms was
+/// 480 GETs a minute a follower, idle or not (reviews/storage-requests-2026-11-01.md); every second is 120.
+pub const FOLLOWER_POLL: Duration = Duration::from_secs(1);
+
 /// A guest that reads reads one snapshot, for one statement, and never polls: its life is far shorter than this.
 pub const READER_ONE_SNAPSHOT: Duration = Duration::from_secs(3600);
 
@@ -1207,6 +1400,18 @@ impl Lake {
 
     /// `open`, a reader polling the bucket every `poll` (`READER_POLL`, or `READER_ONE_SNAPSHOT` for a guest's one statement).
     pub async fn open_polled(url: &str, writer: bool, streamed: bool, poll: Duration) -> Result<Arc<Lake>> {
+        Self::open_with(url, writer, streamed, poll, None).await
+    }
+
+    /// A reader of the lake at `url` (a memory URL whose store is given: `memory::give`) whose catalog is `kv`, a node's
+    /// over `kv::remote` for a joined page (designs/l2-page-joins-cluster.md, J5). Nothing polls `kv`, and the lake's torn
+    /// move is not checked here: the node that serves the catalog checks it.
+    pub(crate) async fn open_on(url: &str, streamed: bool, kv: Arc<dyn Kv>) -> Result<Arc<Lake>> {
+        Self::open_with(url, false, streamed, READER_POLL, Some(kv)).await
+    }
+
+    /// `open_polled` and `open_on`: a reader's catalog is `given` when one is, else `kv::reader` on the lake's store.
+    async fn open_with(url: &str, writer: bool, streamed: bool, poll: Duration, given: Option<Arc<dyn Kv>>) -> Result<Arc<Lake>> {
         let (url, store, bucket) = open_store(url)?;
         let memory = in_memory(&url); // (no bucket to bill or cache: its catalog's garbage goes as a local disk's)
         let local = bucket.is_none() || memory;
@@ -1232,6 +1437,7 @@ impl Lake {
         // The catalog's own files go on the SSD tier too (next to the lake's objects), so catalog
         // reads — the leader's, a new node's, a reader's without a live leader — are local.
         let cache_dir = disk.as_ref().map(|d| d.dir.with_extension("catalog"));
+        let check_torn = given.is_none();
         let opening = async {
             Ok::<_, anyhow::Error>(match writer {
                 true => {
@@ -1240,25 +1446,30 @@ impl Lake {
                     trace_since("the catalog's writer open", t0);
                     Catalog::writer(kv, t0).await?
                 }
-                false => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
-                    Ok(cat) => cat,
-                    // (no catalog at all: say so, rather than the database's own words for it)
-                    Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
-                        None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
-                        Some(_) => return Err(e),
+                // (a given catalog is a node's: no bucket to wait for, and the store a page holds lists nothing under `catalog/`,
+                // so `opened`'s listing after 3 s would fail a slow open)
+                false => match given {
+                    Some(kv) => Catalog::reader(kv, streamed).await?,
+                    None => match Catalog::opened(store.clone(), streamed, kv::reader(store.clone(), streamed, cache_dir, poll)).await {
+                        Ok(cat) => cat,
+                        // (no catalog at all: say so, rather than the database's own words for it)
+                        Err(e) => match futures::StreamExt::next(&mut store.list(Some(&object_store::path::Path::from("catalog/manifest")))).await {
+                            None => anyhow::bail!("{url} {}: start one there (`pondra {url}`, or `pondra serve --dir {url}`), or make a table in it", Lake::NO_LAKE),
+                            Some(_) => return Err(e),
+                        },
                     },
                 },
             })
         };
         // (the place's torn check runs beside the catalog's opening, so a bucket pays no extra round trip; `join`
         // and not `try_join`: a failure of one must not drop the other half way, with SlateDB's tasks still running)
-        let (torn, cat) = tokio::join!(crate::memory::refuse_torn(&store, &url), opening);
+        let (torn, cat) = tokio::join!(async { if check_torn { crate::memory::refuse_torn(&store, &url).await } else { Ok(()) } }, opening);
         torn?;
         let cat = cat?;
         crate::format::check(&cat, &url, writer).await?; // (a lake a newer Pondra wrote: refused before its tables are read, ADR-039)
         let hwm = watch::Sender::new(cat.get::<u64>("n").await?.unwrap_or(1) - 1);
         cat.frozen.store(cat.get::<serde_json::Value>(crate::backup::KEY).await?.is_some(), Relaxed); // (a backup: ADR-070)
-        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
+        let lake = Arc::new_cyclic(|me| Lake { url, store, cat, hwm, backlog: Default::default(), rt, tail: Default::default(), tails: Mutex::new((lru::LruCache::unbounded(), 0)), kept, disk, groups: crate::serve::Groups::new(cache_mb() << 19), hot: Arc::new(crate::hot::Hot::new(memory)), attached: Default::default(), ids: Default::default(), cached: cached_store, caught: watch::channel(true).0, to: Default::default(), owner_key: Default::default(), sequences: Default::default(), bases: Default::default(), sessions: Default::default(), me: me.clone() });
         crate::oom::gives_back(&lake.hot); // (the decoded columns give memory back when the node needs it: the one watch takes them, `oom.rs`)
         crate::branch::load(&lake).await?; // (a branch's files listed in its bases: ADR-047)
         if let Some(writes) = lake.cat.unstarted.lock().unwrap().take() {
@@ -1332,6 +1543,12 @@ impl Lake {
     pub fn hold(&self, d: Arc<Delta>) {
         self.arrived(&d);
         self.cat.pending.lock().unwrap().insert(d.id, d);
+    }
+
+    /// Follower: a new leader's term began (`members::follow`): the changes the old one streamed and never committed are
+    /// not the new one's, so they go.
+    pub fn drop_pending(&self) {
+        self.cat.pending.lock().unwrap().clear();
     }
 
     /// Follower: lay the committed changes (up to `upto`) over our view of the catalog.
@@ -1506,14 +1723,20 @@ impl Lake {
         crate::files::register(&ctx, self.arc()); // files('…'), file_read(path) (here, not in what is kept: the lake would keep itself)
         crate::seq::register(&ctx, self.arc()); // nextval, currval, setval
         crate::ext::register_secrets(&ctx, self.arc()); // secrets()
+        crate::extension::register(&ctx, self.arc()); // extensions() (SHOW EXTENSIONS)
         ctx
     }
 
     /// A session made from nothing, with everything every query's session has: the engine's (`engine::session`) and
-    /// the node's own functions.
+    /// the node's own functions. On a page every plan it makes runs its partitions in the page's task, as the page's own
+    /// session's do (`in_task::planned`): a page has no runtime to start a partition's task on, and a plan of one
+    /// partition still merges more than one below it. Plans made by hand from it (`fresh.rs`) are planned by it too.
     fn made(&self, partitions: usize) -> SessionContext {
         let config = SessionConfig::new().with_target_partitions(partitions).with_default_catalog_and_schema(crate::ddl::lake_name(self), crate::text::PUBLIC);
-        functions(config, self.rt.clone())
+        let ctx = functions(config, self.rt.clone());
+        #[cfg(target_arch = "wasm32")]
+        let ctx = crate::in_task::planned(ctx);
+        ctx
     }
 
     /// Query memory in use, and the limit.
@@ -1592,12 +1815,12 @@ impl Lake {
     }
 
     /// Write an object only if it does not exist yet: data is never overwritten.
-    pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, path: &str, bytes: impl Into<Bytes>) -> Result<()> {
         if self.cat.frozen.load(Relaxed) {
             return Err(crate::backup::refused(Some(&self.url))); // (a backup's objects are its runs': ADR-070)
         }
         let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
-        let bytes = Bytes::from(bytes);
+        let bytes: Bytes = bytes.into(); // (a `Vec` or `Bytes` as it is: a page's 232 MB file was held twice while it was put)
         self.store.put_opts(&Path::from(path), bytes.clone().into(), opts).await?;
         if let (Some(disk), false) = (&self.disk, crate::delta::open_format(path) || replaceable(path)) {
             disk.put(path, &bytes); // what a node writes, it keeps
@@ -1647,7 +1870,7 @@ impl Lake {
     /// Replace a user's file (`files/`) that is still the version `expect` (ADR-034): a newer
     /// one, saved meanwhile, is refused (`Changed`), so two editors never overwrite each other
     /// blind. Where the store can, the check and the write are one request (a conditional put).
-    pub async fn replace(&self, path: &str, bytes: Vec<u8>, expect: &str) -> Result<String> {
+    pub async fn replace(&self, path: &str, bytes: impl Into<Bytes>, expect: &str) -> Result<String> {
         anyhow::ensure!(replaceable(path), "only the lake's files (files/…) are replaced");
         if self.cat.frozen.load(Relaxed) {
             return Err(crate::backup::refused(Some(&self.url))); // (ADR-070)
@@ -1655,11 +1878,16 @@ impl Lake {
         static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()); // (a store with no conditional put: this node's saves one at a time)
         let _one = ONE.lock().await;
         let at = Path::from(path);
-        let m = self.store.head(&at).await?;
+        let m = match self.store.head(&at).await {
+            Ok(m) => m,
+            Err(object_store::Error::NotFound { .. }) => return Err(Changed.into()), // (no file is not the version the caller read: 412)
+            Err(e) => return Err(e.into()),
+        };
         if version_of(&m) != expect {
             return Err(Changed.into());
         }
-        let (len, bytes, opts) = (bytes.len() as u64, Bytes::from(bytes), |mode| PutOptions { mode, ..Default::default() });
+        let bytes: Bytes = bytes.into();
+        let (len, opts) = (bytes.len() as u64, |mode| PutOptions { mode, ..Default::default() });
         let update = PutMode::Update(object_store::UpdateVersion { e_tag: m.e_tag.clone(), version: m.version.clone() });
         let put = match self.store.put_opts(&at, bytes.clone().into(), opts(update)).await {
             Ok(r) => r,
@@ -1737,9 +1965,7 @@ impl Lake {
         };
         let mut rows = vec![];
         for &(off, len, _) in parts {
-            for b in crate::log::decode(&bytes[off as usize..(off + len) as usize])? {
-                rows.push(crate::sys::expand(b)?); // (fresh row ids: one number in the log)
-            }
+            rows.extend(crate::log::decode_part(&bytes[off as usize..(off + len) as usize])?); // (fresh row ids: one number in the log)
         }
         let rows: Rows = Arc::new(rows);
         let tiered = self.cat.meta(&table_key(table)).await?.map_or(0, |t| t.tiered);
@@ -1989,6 +2215,12 @@ pub struct Delta {
 
 impl Delta {
     fn bytes(&self) -> usize { self.puts.iter().map(|(k, v)| k.len() + v.len()).sum() }
+
+    /// The same change with only the puts and deletes `keep` names. The id stays, so a stream that filters
+    /// its changes shows no gap (`server::feed`, `objects::readable`).
+    pub fn only(&self, keep: impl Fn(&str) -> bool) -> Delta {
+        Delta { id: self.id, puts: self.puts.iter().filter(|(k, _)| keep(k)).cloned().collect(), deletes: self.deletes.iter().filter(|k| keep(k)).cloned().collect() }
+    }
 }
 
 /// A commit's key that says nothing a read sees changed (retention's marks: `tier::expire`).
@@ -2222,10 +2454,21 @@ impl Catalog {
     /// What the catalog's block caches hold, in bytes.
     pub fn cached(&self) -> usize { self.kv.cached() }
 
-    /// Leader: the recent frames plus a receiver for every frame from now on.
+    /// The recent frames plus a receiver for every frame from now on: the leader's own stream, or a follower's, which
+    /// holds the leader's frames as it relayed them (`relay`). Either serves `GET /cluster/log` the same way.
     pub fn subscribe(&self) -> (Vec<Frame>, broadcast::Receiver<Frame>) {
         let rx = self.feed.subscribe();
         (self.recent.lock().unwrap().0.iter().map(|(_, f)| f.clone()).collect(), rx)
+    }
+
+    /// Follower: relay a frame of the leader's stream as it came (`members::follow`, with `resend`), so the pages that
+    /// follow this node get it from `subscribe`, as the leader's followers get its own. A new term's `Start` says whether
+    /// this node's own commits are replicated, as its feed's first `Start` does, never the leader's.
+    pub(crate) fn relay(&self, f: Frame) {
+        self.send(match f {
+            Frame::Start { term, .. } => Frame::Start { term, replicated: self.replicas > 1 },
+            f => f,
+        });
     }
 
     /// Inline data (`d/`) that one of the last 64 commits wrote: it never changes, so the frame's copy is always good.
@@ -2275,6 +2518,21 @@ impl Catalog {
 
     /// Leader: the last committed write.
     pub fn committed(&self) -> u64 { self.committed.load(Relaxed) }
+
+    /// Do this node's reads include commit `c` (its leader's `committed`)? The leader's, once it committed it; a follower's
+    /// whole catalog in memory, once the stream brought it; between seeds, once our view has it, or the stream laid over the
+    /// view does (`overlay_ok`). A view's mark moves at `settle`. (Commits, not log segments: a CREATE TABLE adds none.)
+    pub fn holds(&self, c: u64) -> bool {
+        if self.kv.is_writer() {
+            return self.committed() >= c;
+        }
+        let _o = self.overlay.lock().unwrap(); // (under the lock: see `apply`)
+        let (view, streamed) = (self.view.0.load(Relaxed), self.streamed.load(Relaxed));
+        match self.mirror.load(Relaxed) {
+            true => streamed >= c,
+            false => view >= c || (self.overlay_ok(view) && streamed >= c),
+        }
+    }
 
     fn apply(&self, d: &Delta) {
         let mut o = self.overlay.lock().unwrap();
@@ -2482,8 +2740,8 @@ impl Catalog {
     }
 
     /// `key` from this node's own view of the bucket, past the mirror: for what a follower needs
-    /// before its commit stream opens, which never changes once written (the lake's own keys, which
-    /// signing in to that stream takes: `users::keys`).
+    /// before its commit stream opens (the lake's own keys, which signing in to that stream takes:
+    /// `users::keys`), or when the key it signed in with is refused (`users::sealed_node_key`).
     pub async fn from_view(&self, key: &str) -> Result<Option<Bytes>> {
         match self.kv.is_writer() {
             true => self.get_raw(key).await,
@@ -2553,20 +2811,28 @@ impl Catalog {
 
     /// `scan`, the values as they are kept (JSON), for a caller that decodes only what it hasn't.
     pub async fn scan_raw(&self, from: &str, to: &str) -> Result<BTreeMap<String, Bytes>> {
+        Ok(self.scan_raw_at(from, to).await?.0)
+    }
+
+    /// `scan_raw`, and the commit the entries are read as of (`at`): the lake as of commit `at`, which a page of a range
+    /// is checked against (`kv`, `Remote::scan`). A mirror answers as of its last streamed commit; a view alone as of its own.
+    pub async fn scan_raw_at(&self, from: &str, to: &str) -> Result<(BTreeMap<String, Bytes>, u64)> {
         if from >= to {
-            return Ok(BTreeMap::new());
+            return Ok((BTreeMap::new(), self.at_now().await?));
         }
         let range = from.as_bytes().to_vec()..to.as_bytes().to_vec();
-        let decode = |all: BTreeMap<String, Bytes>| -> Result<BTreeMap<String, Bytes>> { Ok(all) };
         if self.kv.is_writer() && !self.mirror.load(Relaxed) {
-            return decode(self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?);
+            // (`at` first: a commit after it that the scan sees is one a later page's `moved_since` counts)
+            let at = self.committed.load(Relaxed);
+            let all = self.kv.scan(range, true).await.map_err(|e| self.fenced(e))?;
+            return Ok((all, at));
         }
         {
             let o = self.overlay.lock().unwrap();
             if self.mirror.load(Relaxed) {
                 // The in-memory catalog (scans never cover inline segment data).
                 let hits = o.range(from.to_string()..to.to_string()).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?)));
-                return decode(hits.collect());
+                return Ok((hits.collect(), self.streamed.load(Relaxed)));
             }
         }
         let _pin = self.pin();
@@ -2586,26 +2852,73 @@ impl Catalog {
                             None => all.remove(k),
                         };
                     }
-                    return decode(all); // = the lake as of commit `streamed`
+                    return Ok((all, streamed)); // = the lake as of commit `streamed`
                 }
                 streamed
             };
-            if before >= streamed || before < self.hold.load(Relaxed) {
-                return decode(all); // our view alone: newer than the stream (or the stream has a gap)
+            // Our view alone, when the stream is newer than it or has a gap, and the view stood still while we read it (as
+            // the loop below requires: a view that moved mid-read is read again).
+            if (before >= streamed || before < self.hold.load(Relaxed)) && before == after {
+                return Ok((all, before)); // our view alone: newer than the stream (or the stream has a gap)
             }
             tokio::time::sleep(Duration::from_millis(1)).await; // our view passed the stream mid-read: again
         }
+    }
+
+    /// The commit a read takes right now, when it lays nothing over our view: the mirror's last streamed commit, else the view's.
+    async fn at_now(&self) -> Result<u64> {
+        if self.mirror.load(Relaxed) {
+            return Ok(self.streamed.load(Relaxed));
+        }
+        self.view_now().await
+    }
+
+    /// The first `n` entries with keys in [from, to) that `keep` allows, in key order, and the commit they are read as of
+    /// (`scan_raw_at`'s `at`): one page of a range (`kv`). In memory it takes only those `n` (the overlay's range, filtered
+    /// and `take`n), so keys `keep` refuses don't cost a page; without the whole catalog here, it reads all of the range.
+    pub async fn scan_page(&self, from: &str, to: &str, n: usize, keep: impl Fn(&str) -> bool) -> Result<(Vec<(String, Bytes)>, u64)> {
+        if from >= to {
+            return Ok((Vec::new(), self.at_now().await?));
+        }
+        if self.mirror.load(Relaxed) {
+            let o = self.overlay.lock().unwrap();
+            let page = o.range(from.to_string()..to.to_string()).filter(|(k, _)| keep(k.as_str())).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).take(n).collect();
+            return Ok((page, self.streamed.load(Relaxed)));
+        }
+        let (all, at) = self.scan_raw_at(from, to).await?;
+        Ok((all.into_iter().filter(|(k, _)| keep(k.as_str())).take(n).collect(), at))
+    }
+
+    /// Whether a commit between `since` and `at` put or deleted a key in [from, to) that `keep` allows, as far as the changes
+    /// `recent` holds say (the leader's own, or a follower's relayed ones): a range read partly as of `since` and partly as of
+    /// `at` is then torn (`kv`'s `since`). Only the commits after the older of the two and up to the newer count: later ones
+    /// are in neither read. One change per commit, so a commit missing from `recent` (aged out, or a follower's reconnect
+    /// that left a hole) counts as moved: it can't tell.
+    pub fn moved_since(&self, from: &str, to: &str, since: u64, at: u64, keep: impl Fn(&str) -> bool) -> bool {
+        let (after, upto) = (since.min(at), since.max(at));
+        if after == upto {
+            return false;
+        }
+        let within = |k: &str| k >= from && k < to && keep(k);
+        let r = self.recent.lock().unwrap();
+        let mut ids = std::collections::BTreeSet::new();
+        let mut touched = false;
+        for (_, f) in r.0.iter() {
+            if let Frame::Change(d) = f {
+                if d.id > after && d.id <= upto {
+                    ids.insert(d.id);
+                    touched = touched || d.puts.iter().any(|(k, _)| within(k)) || d.deletes.iter().any(|k| within(k));
+                }
+            }
+        }
+        touched || (ids.len() as u64) < upto - after
     }
 
     /// The first `n` entries with keys in [from, to), in key order: a commit's bounded look at a range
     /// (producers' expiries, the old marks' pass). In memory it takes only those `n` (the overlay's range,
     /// `take`), never a copy of the whole range; without the whole catalog here, it reads all of it.
     pub async fn scan_first(&self, from: &str, to: &str, n: usize) -> Result<Vec<(String, Bytes)>> {
-        if self.mirror.load(Relaxed) {
-            let o = self.overlay.lock().unwrap();
-            return Ok(o.range(from.to_string()..to.to_string()).filter_map(|(k, (_, v))| Some((k.clone(), v.clone()?))).take(n).collect());
-        }
-        Ok(self.scan_raw(from, to).await?.into_iter().take(n).collect())
+        Ok(self.scan_page(from, to, n, |_| true).await?.0)
     }
 
     /// The producers' marks (`p/` keys) and the expiries (`g/` keys) the catalog holds, when it holds the whole catalog in
@@ -2639,6 +2952,23 @@ impl Catalog {
         }
         // (a catalog with nothing unflushed counts from here, so a commit after a quiet spell isn't seen as one that waited all of it)
         *self.flushed_at.lock().unwrap() = Instant::now();
+        Ok(())
+    }
+
+    /// Leader: the catalog's level-0 files waiting for compaction.
+    pub fn waiting(&self) -> usize { self.kv.waiting() }
+
+    /// A leader that lives for one statement (`pondra sql`): runs the compactor until fewer than `below` level-0 files
+    /// wait (`cap` at most), so a flush doesn't wait on it. Each one-off writer's stop leaves one level-0 file, and none
+    /// runs the compactor alone (it starts 10 s on): left so, the catalog's level 0 filled, and every write after it
+    /// waited out its flush (10 s a write). `collect`: then the memtable written out, and the garbage collector run once
+    /// (old WAL and manifests: a lake no node serves had nobody else to clear them).
+    pub async fn tidy(&self, below: usize, cap: Duration, collect: bool) -> Result<()> {
+        self.kv.compact(below, cap).await?;
+        if collect {
+            self.checkpoint().await?;
+            self.kv.collect().await;
+        }
         Ok(())
     }
 
@@ -2794,14 +3124,47 @@ pub fn crash_rolled(point: &str) -> bool {
 pub fn partitions() -> usize {
     static PARTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); // (every session asks: the cores are read from the cgroup's files)
     *PARTS.get_or_init(|| {
-        let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get()));
-        cores.min(memory_limit() / (24 << 20)).max(2)
+        #[cfg(target_arch = "wasm32")]
+        return 1; // (a page has one thread and no runtime to start a partition's task on: `in_task.rs`)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cores = crate::env::parse("PONDRA_CORES").unwrap_or_else(crate::env::cores);
+            cores.min(memory_limit() / (24 << 20)).max(2)
+        }
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_place_is_a_folder_a_bucket_memory_or_a_node_and_no_other_scheme() {
+        assert_eq!(place("/a").unwrap(), Place::Folder);
+        assert_eq!(place("a/b").unwrap(), Place::Folder);
+        assert_eq!(place("s3://b/x").unwrap(), Place::Bucket);
+        assert_eq!(place("memory://x").unwrap(), Place::Memory);
+        #[cfg(feature = "doors")]
+        assert_eq!(place("pondra://h:1").unwrap(), Place::Served);
+        for url in ["https://../../x", "file:///a", "r2://b"] {
+            assert_eq!(crate::codes::of(&place(url).unwrap_err()), "22023", "{url} is no place a lake can be");
+            assert!(open_store(url).is_err(), "{url} is refused before a folder is made of it");
+        }
+    }
+
+    #[test]
+    fn merges_read_as_many_runs_as_their_memory_and_files_allow() {
+        // (B50, 10-31: under a 2 GB cap a GROUP BY's merge took 5 runs at once and made several passes; its runs number
+        // up to 64 a partition there. A window's sorts take half a share's worth: at the window check's 256 MB it passes
+        // at 16 and is refused at 32)
+        assert_eq!(merge_files(4), 64);
+        assert_eq!(merge_files(16), 32, "512 files over the partitions");
+        assert_eq!(merge_files(256), 4, "4 at least");
+        assert_eq!(merge_fan_in(683 << 20, 4), 21);
+        assert_eq!(merge_fan_in(256 << 20, 4), 8);
+        assert_eq!(merge_fan_in(64 << 20, 4), 4, "4 at least");
+        assert_eq!(merge_fan_in(5 << 30, 4), 64, "64 at most");
+    }
 
     /// `resident` counts bytes: `/proc/self/statm` counts pages, and the page size is the OS's (64 KB on
     /// some arm64 builds), so it agrees with `VmRSS` in kilobytes. (On 4 KB pages the old constant passed
@@ -2856,6 +3219,19 @@ mod tests {
         assert!(!quiet_with(&[(&expiring, "1"), (&marker, "\"Done\""), ("n", "4"), ("c", "9")], &[]), "expiries alone are as loud as nothing: unmarked numbers are loud");
     }
 
+    /// A change a page's caller sees keeps its id and only the keys it may hold: a change with nothing kept is still
+    /// a change, so the ids the page sees run on without a gap.
+    #[test]
+    fn only_keeps_the_keys_asked_and_the_id() {
+        let d = Delta { id: 7, puts: vec![("t/a".into(), Bytes::from("1")), ("z/auth".into(), Bytes::from("2"))], deletes: vec!["z/old".into(), "t/b".into()] };
+        let kept = d.only(|k| !k.starts_with("z/"));
+        assert_eq!(kept.id, 7);
+        assert_eq!(kept.puts.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), ["t/a"]);
+        assert_eq!(kept.deletes, ["t/b"]);
+        assert_eq!(d.only(|_| false).id, 7, "an empty change keeps its id");
+        assert!(d.only(|_| false).puts.is_empty() && d.only(|_| false).deletes.is_empty());
+    }
+
     /// `scan_first` is the first keys of a range, in key order, and `count` counts the range as the catalog holds it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn scan_first_takes_the_first_keys_of_a_range() -> Result<()> {
@@ -2870,6 +3246,50 @@ mod tests {
         assert_eq!(lake.cat.tallies().map(|t| t.1), Some(5), "five expiries; `h/x` is neither");
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    /// `scan_page` pages a range by the keys `keep` allows: nothing lost or doubled, the keys it refuses between the pages
+    /// don't stop it, and every page reads the one commit (on a memory lake, which the overlay answers).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_page_pages_a_range_past_the_keys_it_refuses() -> Result<()> {
+        let url = format!("memory://scan-page-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false).await?;
+        lake.cat.commit((0..12u8).map(|i| (format!("g/{i:02}"), vec![i])).collect(), &[]).await?;
+        let may = |k: &str| !matches!(k, "g/03" | "g/04" | "g/05" | "g/10");
+        let (mut got, mut from, mut ats) = (Vec::new(), "g/".to_string(), Vec::new());
+        loop {
+            let (page, at) = lake.cat.scan_page(&from, "g0", 3, may).await?;
+            ats.push(at);
+            let Some(last) = page.last().map(|(k, _)| k.clone()) else { break };
+            from = format!("{last}\0"); // (the next key past this page's last)
+            got.extend(page.into_iter().map(|(k, _)| k));
+        }
+        assert_eq!(got, ["g/00", "g/01", "g/02", "g/06", "g/07", "g/08", "g/09", "g/11"], "the kept keys, once each, in order");
+        assert!(ats.iter().all(|&a| a == lake.cat.committed()) && ats.len() == 4, "three pages and the empty one, all as of the one commit");
+        crate::memory::forget_memory(&url);
+        Ok(())
+    }
+
+    /// `moved_since`: a commit outside the range doesn't move a read of it since an earlier commit, and one inside does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn moved_since_sees_a_commit_in_the_range_and_not_one_outside() -> Result<()> {
+        let url = format!("memory://moved-since-{}", uuid::Uuid::new_v4().simple());
+        let lake = Lake::open(&url, true, false).await?;
+        lake.cat.commit(vec![("g/1".to_string(), vec![1])], &[]).await?;
+        let since = lake.cat.committed();
+        lake.cat.commit(vec![("h/x".to_string(), vec![2])], &[]).await?;
+        let all = |_: &str| true;
+        let mid = lake.cat.committed();
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "a commit outside the range doesn't move it");
+        lake.cat.commit(vec![("g/2".to_string(), vec![3])], &[]).await?;
+        let now = lake.cat.committed();
+        assert!(lake.cat.moved_since("g/", "g0", since, now, all), "a commit inside it does");
+        assert!(lake.cat.moved_since("g/", "g0", now, since, all), "read the other way round too");
+        assert!(!lake.cat.moved_since("g/", "g0", since, mid, all), "one past both reads is in neither");
+        assert!(!lake.cat.moved_since("g/", "g0", since, now, |k: &str| k != "g/2"), "one the reader may not see doesn't");
+        assert!(lake.cat.moved_since("x/", "x0", now, now + 2, all), "commits `recent` doesn't hold can't be told apart");
+        crate::memory::forget_memory(&url);
         Ok(())
     }
 
@@ -3016,6 +3436,54 @@ mod tests {
         }
         assert!(gone.upgrade().is_none(), "the lake is still held");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A joined page's reader (`open_on`): its catalog is the kv it is given (a node's, over `kv::remote`), and its tables
+    /// are listed from that. Here the kv holds a folder lake's catalog as the writer sees it, and the folder is the files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_on_lists_the_tables_of_the_catalog_it_is_given() -> Result<()> {
+        /// A catalog that holds what it was given and takes no writes, as a node's catalog reads to a joined page.
+        struct Given(BTreeMap<String, Bytes>);
+        #[async_trait::async_trait]
+        impl Kv for Given {
+            async fn get(&self, key: &str, _: bool) -> Result<Option<Bytes>, kv::Error> {
+                Ok(self.0.get(key).cloned())
+            }
+            async fn scan(&self, range: std::ops::Range<Vec<u8>>, _: bool) -> Result<BTreeMap<String, Bytes>, kv::Error> {
+                Ok(self.0.iter().filter(|(k, _)| range.contains(&k.as_bytes().to_vec())).map(|(k, v)| (k.clone(), v.clone())).collect())
+            }
+            fn is_writer(&self) -> bool {
+                false
+            }
+            async fn write(&self, _: &[(String, Bytes)], _: &[String]) -> Result<Arc<dyn Written>, kv::Error> {
+                Err(kv::Error::new(false, "a joined page's catalog takes no writes"))
+            }
+            async fn checkpoint(&self) -> Result<(), kv::Error> {
+                Ok(())
+            }
+            async fn close(&self) -> Result<(), kv::Error> {
+                Ok(())
+            }
+            fn cached(&self) -> usize {
+                0
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("pondra-joined-{}", uuid::Uuid::new_v4()));
+        let folder = dir.to_str().unwrap().to_string();
+        let writer = Lake::open(&folder, true, false).await?;
+        crate::write::create_table(&writer, "t", r#"{"columns": [["a", "Int64"]]}"#).await?;
+        let copied = writer.cat.kv.scan(b"".to_vec()..vec![0xff], false).await?;
+        assert!(copied.contains_key(&table_key("t")), "the writer's catalog holds its table");
+
+        let reader = Lake::open_on(&folder, false, Arc::new(Given(copied))).await?;
+        let tables = reader.cat.scan::<TableMeta>("t/", "t0").await?;
+        assert_eq!(tables.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), vec![table_key("t").as_str()]);
+
+        reader.cat.close().await?;
+        writer.cat.close().await?;
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

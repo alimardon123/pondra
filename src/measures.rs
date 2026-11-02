@@ -9,8 +9,8 @@
 
 use anyhow::{anyhow, bail, ensure, Result};
 use datafusion::sql::sqlparser::{
-    ast::{self, visit_expressions, visit_expressions_mut, Expr, ObjectName, OrderBy, OrderByKind, SelectItem},
-    ast::{SetExpr, Statement, TableFactor, VisitMut, VisitorMut},
+    ast::{self, Expr, ObjectName, OrderBy, OrderByKind, SelectItem},
+    ast::{SetExpr, Statement, TableFactor, VisitorMut},
     dialect::GenericDialect,
     keywords::RESERVED_FOR_COLUMN_ALIAS,
     parser::Parser,
@@ -244,7 +244,7 @@ fn is_subquery_or_window(e: &Expr) -> bool {
 
 /// Whether any node of `e`, itself included, passes `pred` (subqueries too).
 fn any_expr(e: &Expr, pred: fn(&Expr) -> bool) -> bool {
-    matches!(visit_expressions(e, |x| if pred(x) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }), ControlFlow::Break(_))
+    matches!(crate::walk::visit_expressions(e, |x| if pred(x) { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }), ControlFlow::Break(_))
 }
 
 // Inlining: a measure's expression with the measures it names written in.
@@ -263,7 +263,7 @@ fn expanded(d: &Definition, name: &str, path: &mut Vec<String>) -> Result<Expr> 
     let Some((_, expr)) = d.measures.iter().find(|(n, _)| n == name) else { bail!("no measure named {name}") };
     path.push(name.to_string());
     let mut e = expr.clone();
-    let worked = visit_expressions_mut(&mut e, |x: &mut Expr| {
+    let worked = crate::walk::visit_expressions_mut(&mut e, |x: &mut Expr| {
         let Expr::Identifier(id) = x else { return ControlFlow::Continue(()) };
         let inner = text::ident(id);
         if !d.measures.iter().any(|(n, _)| *n == inner) {
@@ -330,7 +330,7 @@ fn base(d: &Definition, used_dims: &HashSet<String>, used: &[String], alias: &st
     let mut refs: Vec<Expr> = Vec::new();
     for m in used {
         let body = inlined.get(m).ok_or_else(|| anyhow!("no measure {m}"))?;
-        let _ = visit_expressions(body, |x| {
+        let _ = crate::walk::visit_expressions(body, |x| {
             if matches!(x, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) && !refs.iter().any(|r| r.to_string() == x.to_string()) {
                 refs.push(x.clone());
             }
@@ -341,7 +341,7 @@ fn base(d: &Definition, used_dims: &HashSet<String>, used: &[String], alias: &st
     let mut over = HashMap::new();
     for m in used {
         let mut e = inlined[m].clone();
-        let _ = visit_expressions_mut(&mut e, |x: &mut Expr| {
+        let _ = crate::walk::visit_expressions_mut(&mut e, |x: &mut Expr| {
             if let Some((_, h)) = hidden_refs.iter().find(|(k, _)| *k == x.to_string()) {
                 *x = h.clone();
             }
@@ -399,7 +399,7 @@ fn unread(s: &ast::Select, i: usize, others: &[Expr]) -> bool {
 
 /// The qualifier of each column an expression reads (None for a bare name).
 fn qualifiers(e: &Expr, out: &mut Vec<Option<String>>) {
-    let _ = visit_expressions(e, |x| {
+    let _ = crate::walk::visit_expressions(e, |x| {
         match x {
             Expr::Identifier(_) => out.push(None),
             Expr::CompoundIdentifier(p) if p.len() >= 2 => out.push(Some(text::ident(&p[p.len() - 2]))),
@@ -465,7 +465,7 @@ impl<'a> Uses<'a> {
     /// The first measure named anywhere inside `e`.
     fn measure_inside(&self, e: &Expr) -> Option<String> {
         let mut found = None;
-        let _ = visit_expressions(e, |x| match self.measure_ref(x) {
+        let _ = crate::walk::visit_expressions(e, |x| match self.measure_ref(x) {
             Some(m) => {
                 found = Some(m);
                 ControlFlow::Break(())
@@ -571,8 +571,8 @@ fn single_arg(f: &ast::Function) -> Option<&Expr> {
 }
 
 /// Runs the walk over one part of a select, stopping at the first refusal.
-fn walk(part: &mut impl VisitMut, uses: &mut Uses<'_>) -> Result<()> {
-    match part.visit(uses) {
+fn walk(part: &mut impl ast::VisitMut, uses: &mut Uses<'_>) -> Result<()> {
+    match crate::walk::visit_mut(part, uses) {
         ControlFlow::Break(err) => Err(err),
         ControlFlow::Continue(()) => Ok(()),
     }
@@ -601,7 +601,7 @@ fn names_used(s: &ast::Select, order: Option<&OrderBy>) -> HashSet<String> {
     }
     let mut names = HashSet::new();
     for e in exprs {
-        let _ = visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             match x {
                 Expr::Identifier(i) => {
                     names.insert(text::ident(i));
@@ -757,7 +757,7 @@ fn flattened(s: &ast::Select, order: Option<&OrderBy>, alias: &str) -> Option<(a
 /// Writes each of the base's columns that `e` names (`region`, `sales.region`, `sales.__pondra_m0`) as its expression. None
 /// when `e` names anything else (in an ORDER BY, the query's own columns, `ours`, may be named) or holds a subquery or a window.
 fn written_in(e: &mut Expr, columns: &HashMap<String, Expr>, alias: &str, ours: Option<&HashSet<String>>) -> Option<()> {
-    let done = visit_expressions_mut(e, |x: &mut Expr| {
+    let done = crate::walk::visit_expressions_mut(e, |x: &mut Expr| {
         let name = match &*x {
             Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } | Expr::Lambda(_) => return ControlFlow::Break(()),
             Expr::Function(f) if f.over.is_some() => return ControlFlow::Break(()),
@@ -926,10 +926,10 @@ pub fn rewrite_with(stmts: &mut [Statement], view: &dyn Fn(&ObjectName) -> Optio
         if stored {
             continue;
         }
-        if let ControlFlow::Break(err) = stmt.visit(&mut rewrite) {
+        if let ControlFlow::Break(err) = crate::walk::visit_mut(stmt, &mut rewrite) {
             return Err(err);
         }
-        if let ControlFlow::Break(err) = stmt.visit(&mut Leftover { routine }) {
+        if let ControlFlow::Break(err) = crate::walk::visit_mut(stmt, &mut Leftover { routine }) {
             return Err(err);
         }
     }

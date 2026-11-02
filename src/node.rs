@@ -12,10 +12,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, atomic::{AtomicBool, Ordering::SeqCst}};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use crate::members::Members;
 
 #[cfg(feature = "doors")] mod run;
-#[cfg(feature = "doors")] pub use run::{Node, Options, Unreached};
-#[cfg(feature = "doors")] pub(crate) use run::{attach, request, Held};
+#[cfg(feature = "doors")] pub use run::{Node, Options};
+#[cfg(feature = "doors")] pub(crate) use run::{request, Held};
 
 /// What a guest is for. A guest that reads claims nothing; one that writes may record, so it leads a lake nobody leads.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -253,6 +254,9 @@ pub async fn lead_once(_dir: &str) -> anyhow::Result<()> {
 /// followers' changes a leader inherits recovered, its sequencer and log started, its first user made. `replica` is
 /// what this follower holds for its leader (a node's folder; None elsewhere).
 pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::members::Members>, replica: Option<Arc<crate::replica::ReplicaLog>>, s: &Start) -> anyhow::Result<crate::app::App> {
+    if let Some(key) = s.auth.owner_key() {
+        let _ = lake.owner_key.set(key.to_string()); // (whose tasks this process runs with its owner's files: `runs::signed`)
+    }
     let lives = !is_guest();
     let leader = members.is_leader();
     let term = members.leader().n;
@@ -269,18 +273,33 @@ pub async fn start_app(lake: Arc<crate::store::Lake>, members: Arc<dyn crate::me
     // Followers keep the leader's changes that aren't in the bucket yet (replicated acks);
     // a new leader first commits what they hold from the previous one.
     crate::store::trace("warming");
-    if let (true, Some(own)) = (leader, &replica) {
-        // (the members are asked with the nodes' key: one that just restarted holds an
-        // unsigned call until it has caught up, and it catches up from this leader)
-        if crate::dial::node_key().is_none() {
-            if let Some(k) = users::node_key_made(&lake).await {
-                crate::dial::set_node_key(k);
+    let recovered = match (leader, &replica) {
+        (true, Some(own)) => {
+            // (the members are asked with the nodes' key: one that just restarted holds an
+            // unsigned call until it has caught up, and it catches up from this leader)
+            if crate::dial::node_key().is_none() {
+                if let Some(k) = users::node_key_made(&lake).await {
+                    crate::dial::set_node_key(k);
+                }
             }
+            Some(replica::recover(&lake, &addr, term, Some(own)).await)
         }
-        replica::recover(&lake, &addr, term, Some(own)).await?;
-    } else if leader && !lives {
         // (a guest that leads recovers as `write::lead` does: no followers' changes to hold, and no key to ask for)
-        replica::recover(&lake, "", term, None).await?;
+        (true, None) if !lives => Some(replica::recover(&lake, "", term, None).await),
+        _ => None,
+    };
+    match recovered {
+        // (a node outside the members that can't reach them: it let its term go, and they lead; it follows them, and a
+        // guest starts over through them, as `write::deliver` does: audit 10-31 L11)
+        Some(Err(e)) if e.downcast_ref::<replica::Unreached>().is_some() => {
+            eprintln!("{e:#}");
+            crate::terms::newer_claimed(&lake.store, term).await;
+            restart("not leading past members this node can't reach")
+        }
+        Some(r) => {
+            r?;
+        }
+        None => {}
     }
     crate::store::trace("followers' changes recovered");
     let lock: Arc<tokio::sync::Mutex<()>> = Default::default(); // (the lake's: everything that rewrites table metadata)
@@ -374,6 +393,7 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
     if lives {
         let l = app.lake.clone();
+        let closing = crate::drain::closing();
         panics::spawn(async move {
             // (a follower's catalog shows the leader's keys once the leader has flushed them)
             let mut said = false;
@@ -381,7 +401,18 @@ pub fn keep(app: &crate::app::App, s: &Start) {
                 match users::node_key(&l).await {
                     Ok(k) => {
                         crate::dial::set_node_key(k); // (nodes call each other with it when no admin token is set: cluster::http)
-                        return;
+                        // (and a new one when a leader seals keys that were in the clear: `users::seal_keys`)
+                        tokio::pin!(closing);
+                        loop {
+                            tokio::select! {
+                                () = &mut closing => return,
+                                () = tokio::time::sleep(users::NODE_KEY_LOOK) => {}
+                            }
+                            if let Some(k) = users::sealed_node_key(&l).await.filter(|k| crate::dial::node_key().as_deref() != Some(k)) {
+                                crate::dial::set_node_key(k);
+                                eprintln!("this node took the lake's new keys from the bucket");
+                            }
+                        }
                     }
                     Err(e) if !said && format!("{e:#}").contains("master key") => {
                         said = true; // (sealed by a master key this node doesn't have: said at once, since waiting won't help)
@@ -415,12 +446,12 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     if lives && app.log.is_some() {
         feeds::start(app.clone()); // (other clusters' topics feeding views: none, no work)
     }
-    if let (true, Some(_), Some(log)) = (lives, &app.seq, &app.log) {
-        let (lake, log) = (lake.clone(), log.clone()); // windows and sessions past the watermark, emitted once
+    if let (true, Some(seq), Some(log)) = (lives, &app.seq, &app.log) {
+        let (lake, log, seq, lock) = (lake.clone(), log.clone(), seq.clone(), app.lock.clone()); // windows, sessions and matches past the watermark, emitted once
         panics::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                if let Err(e) = views::emit_all(&lake, &log).await {
+                if let Err(e) = views::emit_all(&lake, &log, &seq, &lock).await {
                     eprintln!("emission: {e:#}");
                 }
             }
@@ -521,6 +552,233 @@ pub fn keep(app: &crate::app::App, s: &Start) {
     }
 }
 
+/// Is a page's member open in this process (`open_page`)? Set when one opens, and set back by `end_page` as its last step,
+/// after `reset()`: a waiting `open_page` takes it only once every other static is set back. Not `per_node!`, since `reset()`
+/// would set it back before the rest are, and a page opened in that gap would have them cleared under it.
+static PAGED: AtomicBool = AtomicBool::new(false);
+
+/// Is a live `page::Page` holding this module's page (`claim_page`)? Set by the claim, set back by `unclaim_page`. Not
+/// `per_node!`: a freed page's member closes in the background, and its `reset()` would set back the claim of the page made
+/// after it.
+static CLAIMED: AtomicBool = AtomicBool::new(false);
+
+/// Claims this module's page for a `page::Page` (`Page::claim`), refused 55006 while a live page holds it.
+pub fn claim_page() -> anyhow::Result<()> {
+    if CLAIMED.swap(true, SeqCst) {
+        return Err(crate::codes::coded("55006", "a page is open in this module already: close it (close() or free()) first, or open the other in a Worker"));
+    }
+    Ok(())
+}
+
+/// Gives the module's page back (`claim_page`): its page is closed, or dropped.
+pub fn unclaim_page() {
+    CLAIMED.store(false, SeqCst);
+}
+
+/// A page's member (designs/page-lake-p2.md): a lake in the page's memory, led by the page alone (`members::Alone`),
+/// started as every member is (`start_app`, `keep`). One at a time in a process, as a node is: `close` ends it. `term` is the
+/// term it leads, 0 for a joined page, which claims none (`open_joined`); `marks` keeps that term alive (a finished task for one).
+/// `ended` is the sign-in a joined page follows its node with has ended (`ended`); an own page's never does. `follow` is the
+/// task that follows a joined page's node's stream (`open_joined`), aborted at the page's end (`end_page`).
+pub struct Paged { pub app: crate::app::App, url: String, term: u64, marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, ended: Arc<AtomicBool>, superuser: AtomicBool }
+
+/// Takes the module's page (`PAGED`) for a page's member, and sets the device line its queries hold (`env::device_line`). A
+/// freed page's member may still be closing in the background, which sets PAGED back when it has ended: then this waits for
+/// it, 10 ms at a time, for 30 s at most, and is refused 55006 after that.
+async fn claim_paged(line: Option<usize>) -> anyhow::Result<()> {
+    // (`swap` checks and sets at once, so two opens can't both take it)
+    let mut sleeps = 0;
+    while PAGED.swap(true, SeqCst) {
+        if sleeps == 3_000 {
+            return Err(crate::codes::coded("55006", "the page freed before this one is still closing: reload, or open this one in a Worker"));
+        }
+        sleeps += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    crate::env::set_device_line(line); // (its lake's queries hold the page's share of it: `store::memory_limit`)
+    Ok(())
+}
+
+/// Opens a page's member (`Paged`), its lake on `store` when one is given (a kept page's folder), else in memory, and its
+/// queries holding the page's share of its device's `line` (`claim_paged`). Set back if the open fails.
+pub async fn open_page(store: Option<crate::store::Store>, line: Option<usize>) -> anyhow::Result<Paged> {
+    claim_paged(line).await?;
+    let url = crate::memory::place(":memory:");
+    let owned = store.is_some(); // (a given store is a kept page's folder, under its Web Lock: no other writer, so its term is taken at once)
+    if let Some(given) = store {
+        crate::memory::give(&url, given); // (a kept page's objects stay in its folder when the page closes: `end_page` forgets the URL only)
+    }
+    let store = crate::memory::store(&url);
+    let lead = if owned { crate::members::Alone::lead_owned(&store).await } else { crate::members::Alone::lead(&store).await };
+    let (alone, marks) = match lead {
+        Ok(led) => led,
+        Err(e) => {
+            crate::memory::forget_memory(&url);
+            PAGED.store(false, SeqCst);
+            return Err(e);
+        }
+    };
+    let term = alone.leader().n;
+    let start = Start::default();
+    let mut lake = None;
+    let made = async {
+        let l = crate::store::Lake::open(&url, true, false).await?;
+        lake = Some(l.clone());
+        start_app(l, alone.clone(), None, &start).await
+    }
+    .await;
+    match made {
+        Ok(app) => {
+            keep(&app, &start);
+            Ok(Paged { app, url, term, marks, follow: None, ended: Default::default(), superuser: AtomicBool::new(false) })
+        }
+        Err(e) => {
+            end_page(marks, None, lake, &store, term, &url).await; // (a failed open leaves nothing running)
+            Err(e)
+        }
+    }
+}
+
+/// Ends what `open_page` started, as a node's stop does (`node::run::Held::stop` and `Node::stop`): its term's marks, its
+/// loops, its catalog, its term, its lake in memory, and the module's per-node state, so another `open_page` starts
+/// afresh. `Paged::close` and a failed open both end this way.
+async fn end_page(marks: tokio::task::JoinHandle<()>, follow: Option<tokio::task::JoinHandle<()>>, lake: Option<Arc<crate::store::Lake>>, store: &crate::store::Store, term: u64, url: &str) {
+    marks.abort(); // (a dropped handle aborts nothing: its mark would land again after the release)
+    if let Some(follow) = follow {
+        follow.abort(); // (the node's stream ends as the page closes, not at the node's next commit)
+    }
+    crate::panics::abort_all();
+    if let Some(lake) = lake {
+        let _ = lake.cat.close().await;
+    }
+    if term > 0 {
+        crate::terms::release(store, term).await; // (a joined page claimed no term: `open_joined`'s is 0, and its store takes no write)
+    }
+    crate::memory::forget_memory(url);
+    crate::reset::reset();
+    PAGED.store(false, SeqCst); // (last: the next `open_page` starts once the statics are set back)
+}
+
+/// Opens a joined page's member (`Paged`): a read-only follower of the lake the cluster at `node` leads (designs/
+/// l2-page-joins-cluster.md, J5). Its catalog is the node's (`kv::remote`, under the sign-in `auth`), its files are read from
+/// `store` (the node's lake files through its door), and its commit stream is followed (`members::follow`), with a refresh every
+/// 3 s (a node's is 250 ms, but each of a page's is a request). It claims no term and writes nothing to the cluster, so closing
+/// it changes nothing there. The sign-in's end stops both loops and sets `ended` (a 401 or 403 from the node, or the refresh's
+/// closed error).
+pub async fn open_joined(node: &str, auth: &str, store: crate::store::Store, line: Option<usize>) -> anyhow::Result<Paged> {
+    claim_paged(line).await?;
+    let url = crate::memory::place(":memory:");
+    crate::memory::give(&url, store);
+    let store = crate::memory::store(&url);
+    let node = node.trim_end_matches('/').to_string();
+    crate::dial::set_page(node.clone(), auth.to_string()); // (the page's calls go to this node, with this sign-in: `dial::Paged`)
+    let members: Arc<dyn Members> = Arc::new(crate::members::Joined::new(&node));
+    let kv: Arc<dyn crate::kv::Kv> = Arc::new(crate::kv::remote::Remote::new(&node, auth));
+    let marks = crate::panics::task(async {}); // (a joined page claims no term, so it runs no mark: this task is finished)
+    let start = Start::default();
+    let mut lake = None;
+    let made = async {
+        let l = crate::store::Lake::open_on(&url, true, kv).await?;
+        lake = Some(l.clone());
+        start_app(l, members, None, &start).await
+    }
+    .await;
+    match made {
+        Ok(app) => {
+            let (superuser, slug) = whoami(&node, auth).await; // (the sign-in's: a superuser's joins stage their rows, `page::joined_part`)
+            crate::dial::set_page_slug(slug);
+            let (following, refreshing) = (Arc::downgrade(&app.lake), Arc::downgrade(&app.lake));
+            let (http, auth) = (reqwest::Client::new(), auth.to_string());
+            let ended = Arc::new(AtomicBool::new(false)); // (the sign-in ended: neither loop asks again)
+            let (said, refreshed) = (ended.clone(), ended.clone());
+            let open = move || -> futures::future::BoxFuture<'static, Result<crate::fetch::Response, crate::members::Open>> {
+                let (http, url, auth, said) = (http.clone(), format!("{node}/cluster/log"), auth.clone(), said.clone());
+                Box::pin(async move {
+                    match crate::fetch::send(http.get(url).header(reqwest::header::AUTHORIZATION, auth)).await {
+                        Ok(r) if r.status().is_success() => Ok(r),
+                        // (the sign-in ended: the stream is not followed again)
+                        Ok(r) if matches!(r.status(), reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+                            eprintln!("this page's sign-in at its node ended ({}): it no longer follows the lake", r.status());
+                            said.store(true, SeqCst);
+                            Err(crate::members::Open::Stop)
+                        }
+                        _ => Err(crate::members::Open::Retry),
+                    }
+                })
+            };
+            let follow = panics::spawn(crate::members::follow(following, open, |_, _| {}, || {}, false)); // (a page relays nothing: its node's feed is its stream)
+            panics::spawn(crate::page_records::run()); // (the page's own statements go to this node each second: `abort_all` ends it)
+            panics::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    let Some(live) = refreshing.upgrade().filter(|_| !refreshed.load(SeqCst)) else { return };
+                    if let Err(e) = live.refresh().await {
+                        // (the Remote's closed error: the node refused the sign-in, so the catalog is no longer followed)
+                        if e.downcast_ref::<crate::kv::Error>().is_some_and(|k| k.closed()) {
+                            refreshed.store(true, SeqCst);
+                        }
+                        eprintln!("refreshing the joined lake's catalog: {e:#}");
+                    }
+                }
+            });
+            Ok(Paged { app, url, term: 0, marks, follow: Some(follow), ended, superuser: AtomicBool::new(superuser) })
+        }
+        Err(e) => {
+            end_page(marks, None, lake, &store, 0, &url).await; // (a failed open leaves nothing running)
+            Err(e)
+        }
+    }
+}
+
+/// What the sign-in a joined page follows its node with is, as the node's `GET /whoami` says it (asked once as `open_joined` opens
+/// the member, and again after a refusal of a staged write: `Paged::ask_superuser_again`): whether it is a superuser's, which
+/// decides whether the page's INSERTs are its own to stage (`page::joined_part`), and its slug, the folder it stages them in
+/// (`auth::slug`). Not known (no answer in 10 s, or a sign-in refused): neither.
+async fn whoami(node: &str, auth: &str) -> (bool, Option<String>) {
+    let asked = crate::fetch::send(crate::ext::bare().get(format!("{node}/whoami")).header(reqwest::header::AUTHORIZATION, auth));
+    let answer = async {
+        let r = asked.await.ok().filter(|r| r.status().is_success())?;
+        let who: serde_json::Value = r.json().await.ok()?;
+        Some((who["superuser"].as_bool()?, who["slug"].as_str().map(str::to_string)))
+    };
+    tokio::time::timeout(Duration::from_secs(10), answer).await.ok().flatten().unwrap_or((false, None))
+}
+
+impl Paged {
+    /// Whether the sign-in a joined page follows its node with is a superuser's (`whoami`). Always false for a page of its own,
+    /// which has no node to write through.
+    pub fn superuser(&self) -> bool {
+        self.superuser.load(SeqCst)
+    }
+
+    /// Asks the node again whether the sign-in is a superuser's, after it refused a staged write with a 403 (`page::own_answer`):
+    /// a user demoted since the join takes the page's own INSERTs no more, and they go whole to the node.
+    pub async fn ask_superuser_again(&self) {
+        if let Some((node, auth)) = crate::dial::page_node() {
+            self.superuser.store(whoami(&node, &auth).await.0, SeqCst);
+        }
+    }
+
+    /// Whether the sign-in a joined page follows its node with has ended (`open_joined`): its requests are then refused.
+    pub fn ended(&self) -> bool {
+        self.ended.load(SeqCst)
+    }
+
+    /// Says the sign-in has ended, as a node refusing it does (`page::Page::ask`): the page answers 28000 from then on.
+    pub fn set_ended(&self) {
+        self.ended.store(true, SeqCst)
+    }
+
+    /// Ends the page's member (`end_page`), so another `open_page` starts afresh.
+    pub async fn close(self) {
+        let Paged { app, url, term, marks, follow, .. } = self;
+        let lake = app.lake.clone();
+        drop(app);
+        let _ = tokio::time::timeout(Duration::from_secs(2), crate::page_records::flush()).await; // (what the page's statements wait to go to its node: once, within 2 s)
+        end_page(marks, follow, Some(lake.clone()), &lake.store, term, &url).await;
+    }
+}
+
 /// Run `job` forever, starting every `period` (right away if a run took longer; a zero period
 /// disables it).
 fn every<F, Fut>(period: Duration, job: F)
@@ -541,4 +799,17 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_claimed_page_refuses_a_second_claim_by_55006() {
+        super::claim_page().expect("the first claim is taken");
+        let refused = super::claim_page().expect_err("a second claim is refused while the first holds the page");
+        assert_eq!(crate::codes::of(&refused), "55006");
+        super::unclaim_page();
+        super::claim_page().expect("the page is claimable again once it is given back");
+        super::unclaim_page();
+    }
 }

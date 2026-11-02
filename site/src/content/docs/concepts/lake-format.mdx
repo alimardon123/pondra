@@ -83,7 +83,7 @@ lake/data/orders/metadata
 A node also keeps two things outside the lake. Delete either whenever you like.
 
 - **The SSD tier**, for lakes on object storage only: copies of the objects that never change (all
-  but `files/`, whose files are replaced in place), in a `pondra-cache` folder in the temp directory
+  but `files/`, whose files are replaced in place), in a `pondra-cache-<uid>` folder in the temp directory, the node's user's alone
   (or `--cache-dir`).
 - **Replica files**, with `--ack replicated`: the changes the bucket doesn't have yet. They are
   deleted as soon as it has them.

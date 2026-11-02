@@ -1,6 +1,6 @@
-# 1.1's statements, refused by name at every form, in the same words (src/kept.rs): pipelines, dashboards, the grants on
-# them, GRANT EXECUTE, and a pipeline's STEP, PARALLEL and WAIT FOR. The words that are also names still work: a table
-# called pipeline or dashboard, and a prepared statement called pipeline.
+# 1.1's statements, refused by name at every form, in the same words (src/kept.rs): pipelines, dashboards, connections
+# the grants on them, GRANT EXECUTE, and a pipeline's STEP, PARALLEL and WAIT FOR. The words that are also names still
+# work: a table called pipeline, dashboard or connection, and a prepared statement called pipeline.
 statement error 0A000 1\.1
 CREATE PIPELINE p AS BEGIN STEP a AS SELECT 1; END
 
@@ -50,6 +50,21 @@ statement error 0A000 1\.1
 COMMENT ON DASHBOARD d IS 'x'
 
 statement error 0A000 1\.1
+CREATE CONNECTION shop TYPE postgres WITH (host = 'db', secret = shop_login)
+
+statement error 0A000 1\.1
+DROP CONNECTION shop
+
+statement error 0A000 SHOW DATABASES
+SHOW CONNECTIONS
+
+statement error 0A000 1\.1
+ATTACH 'postgres://db/shop' AS shop (TYPE postgres)
+
+statement error 0A000 1\.1
+GRANT USAGE ON CONNECTION shop TO r
+
+statement error 0A000 1\.1
 GRANT SELECT ON PIPELINE p TO r
 
 statement error 0A000 1\.1
@@ -73,11 +88,27 @@ WAIT FOR p
 statement error 0A000 1\.1
 CREATE PIPELINE p (day DATE) SCHEDULE '1 hour' AS BEGIN STEP a AS SELECT $day; END
 
+# The AI types kept free for after 1.0 (designs/ai-data-plan.md): a vector is FLOAT[] until then.
+statement error 0A000 after 1\.0
+CREATE TABLE v (e VECTOR(3))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (e HALFVEC(768))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (e SPARSEVEC(30000))
+
+statement error 0A000 after 1\.0
+CREATE TABLE v (x TENSOR(FLOAT, 3, 224, 224))
+
 statement ok
 CREATE TABLE pipeline (a INT)
 
 statement ok
 CREATE TABLE dashboard (a INT)
+
+statement ok
+CREATE TABLE connection (a INT)
 
 statement ok
 SELECT * FROM pipeline

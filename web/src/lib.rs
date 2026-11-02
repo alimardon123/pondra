@@ -1,6 +1,8 @@
-//! The page form (designs/l2-b4-web.md): the core's lake-less engine (`pondra::page::Page`) for a browser or Node,
-//! through wasm-bindgen. Its requests and answers are a node's (ADR-061's contract), so a client speaks to a page as
-//! it speaks to a node.
+//! The page form (designs/l2-b4-web.md, designs/page-p3.md): a page is a member on the core's lake, through wasm-bindgen.
+//! Its requests and answers are a node's (ADR-061's contract), so a client speaks to a page as it speaks to a node. A
+//! module holds one page at a time: a second is refused by name until the first is closed or freed, or it runs in a
+//! Worker of its own (a Worker is a module of its own).
+#![recursion_limit = "256"] // (`kept` awaits the core's lake open, whose future is many awaits deep: as the core's own `lib.rs` says)
 
 use pondra::page::Node;
 use std::sync::Arc;
@@ -11,6 +13,7 @@ mod heap;
 mod js;
 mod node;
 mod opfs;
+mod spill;
 
 #[wasm_bindgen]
 extern "C" {
@@ -18,36 +21,43 @@ extern "C" {
     fn error(text: &str);
 }
 
-/// A page: tables given to it, SQL read as a node reads it, answers in a node's bytes. A kept page holds its folder's
-/// Web Lock (`kept`) until it is freed, so no other page writes the folder meanwhile.
+/// A page: tables given to it, SQL read as a node reads it, answers in a node's bytes. It is the module's one page
+/// (`new` and `kept` refuse a second until this one is closed or freed). A kept page holds its folder's Web Lock
+/// (`kept`) until it is freed, so no other page writes the folder meanwhile. In a Worker it holds its spill file too
+/// (`spill.rs`), which the core spills through once it is open.
 #[wasm_bindgen]
 // (the lock is never read: it is held for its `Drop`, which lets the folder go when the page is freed)
-pub struct Page(pondra::page::Page, #[allow(dead_code)] Option<js::Held>);
+pub struct Page(pondra::page::Page, #[allow(dead_code)] Option<js::Held>, Option<spill::Spills>);
 
 #[wasm_bindgen]
 impl Page {
-    /// A page with no tables, on one partition (a page runs on one thread). It reads the web through `fetch` (`fetch.rs`):
-    /// a web server must allow the page's origin (CORS), and expose `Content-Range` only if a read from the end of an
-    /// object needs it (an `ETag` it hides is only left out of the object's meta).
+    /// A page with no tables, kept in the page's memory. Its member is on the core's lake, which opens on the page's first
+    /// request. A web address a statement names is read through the browser's `fetch`, so its server must allow the
+    /// page's origin (CORS).
     ///
     /// `opts` is a plain object, or nothing: `node` (the node's address) and `token` (its token), both text, make the
     /// page's node (`node.rs`), which answers the tables the page doesn't have. Every other key is a setting the node
     /// reads (`spill_gb` or `PONDRA_SPILL_GB`), given as text, a number or a boolean. The settings are the module's, not
     /// one page's: the first page given any fixes them, and a later page given others is refused by name.
+    ///
+    /// A module has one page: while another lives here (`new` or `kept`, until it is `close()`d or `free()`d), this is
+    /// refused by name.
     #[wasm_bindgen(constructor)]
     pub fn new(opts: JsValue) -> Result<Page, JsValue> {
         set_panic_hook();
         let given = Given::read(&opts)?;
         give(given.settings)?;
-        Ok(Page(pondra::page::Page::open(&options(None, given.node)), None))
+        let page = pondra::page::Page::claim(&options(None, given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        Ok(Page(page, None, spill::start()))
     }
 
     /// A page kept in the origin's private file system (OPFS): its files and its tables are kept in the folder `folder`
     /// (`"pondra"` when none is given), so what it had is there again after a reload. A folder is one page's at a time:
     /// while a kept page has it, another page given the same folder (in another tab, or this one) is refused, and the
-    /// folder is let go by `free()` on that page, or by closing or reloading its tab. `new Page()` keeps nothing. Without
-    /// OPFS (Node, or a browser without it) this rejects, before anything is read. `opts` is as `new`'s, and its settings
-    /// are fixed only once the folder is this page's, so a refused call fixes nothing.
+    /// folder is let go by `free()` on that page (once the page's member has closed), or by closing or reloading its tab.
+    /// `new Page()` keeps nothing. Without OPFS (Node, or a browser without it) this rejects, before anything is read.
+    /// `opts` is as `new`'s, and its settings are fixed only once the folder is this page's, so a refused call fixes
+    /// nothing.
     #[wasm_bindgen(js_name = kept)]
     pub async fn kept(folder: Option<String>, opts: JsValue) -> Result<Page, JsValue> {
         set_panic_hook();
@@ -66,9 +76,33 @@ impl Page {
         };
         give(given.settings)?;
         let store: Arc<dyn object_store::ObjectStore> = Arc::new(opfs::Opfs::new(folder));
-        // (if the page can't be kept, `held` drops with this return, and the folder is let go)
-        let page = pondra::page::Page::kept(&options(Some(store), given.node)).await;
-        Ok(Page(page.map_err(|e| JsValue::from_str(&format!("{e:#}")))?, Some(held)))
+        // (claimed first, so a page refused its claim opens no spill file; if the page can't be kept, it and `held` drop with
+        // this return, and the folder is let go)
+        let claimed = pondra::page::Page::claim(&options(Some(store), given.node)).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let mut page = Page(claimed, Some(held), spill::start());
+        page.open_now().await?;
+        Ok(page)
+    }
+
+    /// A page that follows the lake of the node at `url`, under an admin's `ps_` session `session` (from the node's `/login`):
+    /// its reads run on the page, over its own copy of the lake, and its writes go to the node, each as the node's own statement.
+    /// A transaction is refused by name (the page holds none of the node's). The node's `web_origins` must allow the page's origin.
+    /// `opts` is as `new`'s, but `node` and `token` are refused by name (the node is `url`, the sign-in `session`). A join that
+    /// fails (an address or session it refuses, a node that doesn't open the lake) is this call's error.
+    #[wasm_bindgen(js_name = join)]
+    pub async fn join(url: String, session: String, opts: JsValue) -> Result<Page, JsValue> {
+        set_panic_hook();
+        let join = pondra::page::Join::new(&url, &session).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        joined_keys_refused(&opts)?;
+        let given = Given::read(&opts)?;
+        give(given.settings)?;
+        let node = node::node(join.node().to_string(), Some(session));
+        let options = pondra::page::Options { joined: Some(join), ..options(None, Some(node)) };
+        // (claimed first, as `kept` is: see there)
+        let claimed = pondra::page::Page::claim(&options).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+        let mut page = Page(claimed, None, spill::start());
+        page.open_now().await?;
+        Ok(page)
     }
 
     /// The kept files this page couldn't read, each as `{file, why}`: the file's path and the words of why. Empty when
@@ -88,8 +122,13 @@ impl Page {
         let body: Vec<u8> = match body.as_string() {
             Some(text) => text.into_bytes(),
             None if body.is_undefined() || body.is_null() => Vec::new(),
-            None => js_sys::Uint8Array::new(&body).to_vec(),
+            // (a Uint8Array, a Node Buffer too, is copied once, into the module: `new Uint8Array(it)` copied it first)
+            None => match body.dyn_ref::<js_sys::Uint8Array>() {
+                Some(bytes) => bytes.to_vec(),
+                None => js_sys::Uint8Array::new(&body).to_vec(),
+            },
         };
+        self.settle().await;
         let answer = self.0.request(&method, &path, &headers, body.into()).await;
         let out = js_sys::Object::new();
         js_sys::Reflect::set(&out, &"status".into(), &answer.status.into())?;
@@ -100,6 +139,58 @@ impl Page {
         js_sys::Reflect::set(&out, &"headers".into(), &answered)?;
         js_sys::Reflect::set(&out, &"body".into(), &js_sys::Uint8Array::from(&answer.body[..]).into())?;
         Ok(out.into())
+    }
+
+    /// Ends the page's member on the core's lake: its loops, its catalog, its term and its lake in memory, so another page
+    /// can open in this module. A page that is already closed has nothing to end. wasm-bindgen holds this page mutably
+    /// while `close` runs, so a `request` that is still running panics: await the requests first.
+    pub async fn close(&mut self) {
+        let spilled = self.2.take().and_then(spill::Spills::detach); // (the core's factory taken back first)
+        self.0.close().await;
+        if let Some(file) = spilled {
+            file.close().await; // (the file is closed and removed once its member has ended)
+        }
+    }
+}
+
+impl Page {
+    /// Gives the core the page's spill file, once it is open, and waits for it: a lake that opens after this spills through it
+    /// (`store::spill_disk_merging`). A page with no spill file has nothing to wait for.
+    async fn settle(&self) {
+        if let Some(spills) = &self.2 {
+            spills.settle().await;
+        }
+    }
+
+    /// Opens the page's member on the core's lake (`open_now`) after the spill file is given: a kept or joined page opens its
+    /// lake at once, as `kept` and `join` promise. A page that fails to open is dropped by its caller, which frees its claim.
+    async fn open_now(&mut self) -> Result<(), JsValue> {
+        self.settle().await;
+        self.0.open_now().await.map_err(|e| JsValue::from_str(&format!("{e:#}")))
+    }
+}
+
+impl Drop for Page {
+    /// Ends the page's member in the background, and lets the folder's Web Lock go only once that has ended: another tab
+    /// can't take the folder while the catalog still flushes. A page with no member to end (never requested, or closed)
+    /// lets its lock go at once. The spill file is taken back from the core at once, and closed once the member has ended,
+    /// or at once when no member opened (`spill::Spills::detach`).
+    fn drop(&mut self) {
+        let spilled = self.2.take().and_then(spill::Spills::detach);
+        let ending = self.0.ending();
+        if ending.is_none() && spilled.is_none() {
+            return;
+        }
+        let held = self.1.take();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(ending) = ending {
+                ending.await;
+            }
+            if let Some(file) = spilled {
+                file.close().await;
+            }
+            drop(held);
+        });
     }
 }
 
@@ -128,13 +219,6 @@ fn header_pairs(headers: &JsValue) -> Result<Vec<(String, String)>, JsValue> {
         pairs.push((name, value));
     }
     Ok(pairs)
-}
-
-impl Default for Page {
-    fn default() -> Self {
-        set_panic_hook();
-        Page(pondra::page::Page::open(&options(None, None)), None)
-    }
 }
 
 /// A page's options as JavaScript gives them (`new Page({node, token, …})`): its node, if it has one, and the settings
@@ -197,18 +281,24 @@ fn give(settings: Vec<(String, String)>) -> Result<(), JsValue> {
     pondra::env::give(settings).map_err(|e| JsValue::from_str(&format!("{e:#}")))
 }
 
-/// A page's options: it reads the web through `fetch` (`fetch.rs`), asks `node` (`node.rs`) for the tables it doesn't
-/// have, keeps its files and tables in `store` (none is memory, as `new` has it; OPFS is `kept`'s), and watches the bytes
-/// its allocator holds (`heap::live`) against the line its device has (`device_line`).
+/// A page's options: its member's lake is kept in `store` (a kept page's folder; None is memory, as `new` has it),
+/// `node` (`node.rs`) answers the tables the page doesn't have, and the bytes its allocator holds (`heap::live`) are
+/// watched against the line its device has (`device_line`).
 fn options(store: Option<Arc<dyn object_store::ObjectStore>>, node: Option<Node>) -> pondra::page::Options {
-    pondra::page::Options {
-        web: Some(Arc::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>)),
-        store,
-        node,
-        memory: Some(Arc::new(heap::live)),
-        line: device_line(),
-        ..Default::default()
+    pondra::page::Options { store, node, memory: Some(Arc::new(heap::live)), line: device_line(), ..Default::default() }
+}
+
+/// Refuses `node` and `token` in a join's options by name: a join's node is its `url`, and its sign-in its `session`.
+fn joined_keys_refused(opts: &JsValue) -> Result<(), JsValue> {
+    if !opts.is_object() {
+        return Ok(());
     }
+    for key in ["node", "token"] {
+        if js_sys::Reflect::has(opts, &key.into())? {
+            return Err(JsValue::from_str(&format!("a join takes no {key}: its node is the url, and its sign-in the session")));
+        }
+    }
+    Ok(())
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -245,19 +335,26 @@ fn mobile_agent(global: &JsValue) -> bool {
     ["Mobi", "Android", "iPhone", "iPad"].iter().any(|m| agent.contains(m))
 }
 
-/// Sets the panic hook once: a panic says why, not just "unreachable".
+/// Sets the panic hook once: a panic says why, not just "unreachable". It gives the core the page's store of a web origin
+/// too (`fetch.rs`): a statement that names a web address reads it through the browser's `fetch`, in every page, and the
+/// core keeps the first store given. And the page's store of its blob URLs, the tab's own files (`fetch::Blob`).
 fn set_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
-    HOOK.call_once(|| std::panic::set_hook(Box::new(|p| error(&p.to_string()))));
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|p| error(&p.to_string())));
+        pondra::page::web_with(Box::new(|origin: &str| Arc::new(fetch::Fetch::new(origin)) as Arc<dyn object_store::ObjectStore>));
+        pondra::page::blob_with(Arc::new(fetch::Blob));
+    });
 }
 
-/// A page's folder is one name in the origin's private file system: not empty, not `.` or `..`, and with no `/` or `\`
-/// (a path would reach past the page's folder). Refused by name.
+/// A page's folder is one name in the origin's private file system: not empty, not `.` or `..`, not the folder of the page's
+/// spill files (`spill::FOLDER`), and with no `/` or `\` (a path would reach past the page's folder). Refused by name.
 fn check_folder(folder: &str) -> Result<(), JsValue> {
-    let bad = folder.is_empty() || folder == "." || folder == ".." || folder.contains(['/', '\\']);
+    let bad = folder.is_empty() || folder == "." || folder == ".." || folder == spill::FOLDER || folder.contains(['/', '\\']);
     if bad {
         return Err(JsValue::from_str(&format!(
-            "{folder:?} is no folder name: a page's folder is one name, not empty, '.' or '..', and with no '/' or '\\'"
+            "{folder:?} is no folder name: a page's folder is one name, not empty, '.', '..' or '{}' (the spill files' folder), and with no '/' or '\\'",
+            spill::FOLDER
         )));
     }
     Ok(())

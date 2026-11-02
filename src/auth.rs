@@ -69,6 +69,10 @@ tokio::task_local! {
 /// The principal of the request being served (None: no door set one: this process's own work).
 pub fn current() -> Option<Principal> { WHO.try_with(|p| p.clone()).ok() }
 
+/// Who is asking, as `current_user` says it: the principal's name, or `pondra` where no one signed in (an open node, the
+/// process's own work), as the Postgres port says it.
+pub fn name() -> String { current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "pondra".into()) }
+
 /// Who the request being served is, as one string: an answer kept for it is read back only by the
 /// same (`pages.rs`). No principal is this process's own work, which keeps and reads its own.
 pub fn holder() -> String { current().map_or_else(|| "node".to_string(), |p| format!("{}|{:?}|{}", p.name, p.role, p.operator)) }
@@ -99,9 +103,9 @@ pub fn check_all(table: &str) -> Result<()> {
 /// A user's grants, if the request being served is a user's who isn't a superuser.
 pub fn limited() -> Option<Arc<crate::users::Access>> { current().and_then(|p| p.access) }
 
-/// Whether the request being served is shown routines' code and tasks' statements (S27): a token, a superuser,
-/// an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them into
-/// a branch it owns). A user granted some tables is shown their names and parameters only.
+/// Whether the request being served is shown routines' code, tasks' statements and views' queries (S27): a token, a
+/// superuser, an open node, and a user who could hold them anyway (APPLY deploys them, CLONE ON DATABASE copies them
+/// into a branch it owns). A user granted some tables is shown their names and parameters only.
 pub fn shows_code() -> bool { limited().is_none_or(|a| a.applies() || a.clones().is_some_and(|s| s.is_empty())) }
 
 /// Is the request being served from whoever runs the nodes (`Principal::token`)? (None: work no
@@ -115,7 +119,7 @@ crate::per_node!(static TOKENS: std::sync::atomic::AtomicBool = std::sync::atomi
 
 /// The header that carries, with a change a node sends its leader, the user it is for: the leader
 /// runs it as that user, so its subqueries read with the user's grants, as where it came in. Only the
-/// cluster's own calls may say it (`Principal::operator`), and it only narrows what they may do.
+/// cluster's own calls may say it (the nodes' key or the admin token, to `/cluster/*`), and it only narrows what they may do.
 pub const AS_USER: &str = "x-pondra-as";
 
 /// The user the request being served is for, when its work goes on elsewhere (None: not a user's).
@@ -231,7 +235,8 @@ pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
     if !writer()? {
         return Ok(());
     }
-    ensure!(f.sequence.is_none() && f.blocks == 0, "moving a sequence or a branch's row ids needs an admin");
+    // (a reserve past one is a branch's REFRESH skipping the numbers its base took: the leader's own, never a writer's)
+    ensure!(f.sequence.is_none() && f.blocks == 0 && f.reserve <= 1, "moving a sequence or a branch's row ids or commit numbers needs an admin");
     if let Some(p) = f.parts.iter().find(|p| RECORDS.contains(&p.table.as_str())) {
         bail!("{} is written by Pondra alone", p.table);
     }
@@ -240,17 +245,37 @@ pub fn flush_from_writer(f: &crate::log::Flush) -> Result<()> {
     Ok(())
 }
 
-/// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under
-/// `data/`), each in that folder.
-pub fn files_from_writer(folder: Option<&str>, files: &[String]) -> Result<()> {
+/// The same for a bulk INSERT's files: into a table that is there (`folder`: its folder under `data/`), each in that folder,
+/// and never the lake's own records.
+pub fn files_from_writer(table: &str, folder: Option<&str>, files: &[String]) -> Result<()> {
     if !writer()? {
         return Ok(());
     }
+    ensure!(!RECORDS.contains(&table), "{table} is written by Pondra alone"); // (as a flush's rows are)
     let Some(folder) = folder else { bail!("making a table needs an admin") };
     let home = format!("data/{folder}/");
     ensure!(files.iter().all(|f| f.starts_with(&home) && !f.split('/').any(|part| part == ".." || part == ".")), "a table's files are in its folder ({home})");
     Ok(())
 }
+
+/// A caller's slug: the one folder of its own a joined page stages its rows in, `stage/<slug>/` (`page_creates`). The user
+/// name in hex, one-to-one and safe in any key. None for a principal with no name of its own (a token, an open node).
+pub fn slug(p: &Principal) -> Option<String> { (!p.operator && !p.name.is_empty()).then(|| crate::text::hex(p.name.as_bytes())) }
+
+/// An object a joined page may make in the lake (through its node's `/store`, once: `served::lake_files_only`): a file of its
+/// own staged rows, `stage/<slug>/<job>/<n>.parquet`, where `<slug>` is the caller's own (`slug`: another's is refused, and a
+/// caller with none stages nothing), `<job>` is `[A-Za-z0-9-]{1,64}` and `<n>` is at most six digits. The node's INSERT reads
+/// those files and then deletes them (`server::insert`).
+pub fn page_creates(key: &str) -> bool {
+    let Some(me) = current().and_then(|p| slug(&p)) else { return false };
+    let mut parts = key.split('/');
+    let (Some("stage"), Some(who), Some(job), Some(file), None) = (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) else { return false };
+    let n = file.strip_suffix(".parquet").unwrap_or_default();
+    who == me && staged_job(job) && (1..=6).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A job name a staged INSERT takes: letters, digits and hyphens, 64 at most (it is a folder's name in `stage/`).
+pub fn staged_job(job: &str) -> bool { !job.is_empty() && job.len() <= 64 && job.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') }
 
 /// Is the request being served a writer's that isn't an admin (refused if it is a user's)?
 fn writer() -> Result<bool> {
@@ -379,7 +404,7 @@ impl Auth {
         let first = path.trim_start_matches('/').split('/').next().unwrap_or_default();
         match first {
             "files" if method == "GET" => Role::Read, // (objects next to the tables: files.rs)
-            "files" if path.to_ascii_lowercase().ends_with(".py") => Role::Admin, // (code a node runs: an admin stores it, invariant 85)
+            "files" if runs_as_code(path) => Role::Admin, // (code a node runs: an admin stores it, invariant 85)
             "files" => Role::Write,
             "" | "console" => Role::None, // (the console's page and files: they hold no data, and ask for a token)
             "stats" | "healthz" | "ready" => Role::None, // (health checks: load balancers and the tests poll them)
@@ -393,6 +418,13 @@ impl Auth {
             _ => Role::Admin,
         }
     }
+
+    /// The nodes' own routes (`/cluster/*`) a user's sign-in may reach, a superuser's too (`server::guard`): a branch's pin
+    /// (`ddl` lets nothing else of a user's through), the leader's probe, where the node's Kafka door is (the console
+    /// asks), and what a page that joined the cluster follows: the commit stream and the catalog, which answer a user only
+    /// the keys `objects::readable` allows (`server::feed`, `server::kv`), and where a superuser's joined page sends its own
+    /// statements' lines (`server::records`, `page_records`). The others carry the lake's keys or write what only the nodes write.
+    pub fn users_reach(path: &str) -> bool { matches!(path, "/cluster/ddl" | "/cluster/leader" | "/cluster/kafka" | "/cluster/log" | "/cluster/kv" | "/cluster/records") }
 
     /// May this role run this write? (And, for a user's request, is it granted: `check`.)
     pub fn allows(&self, role: Role, stmt: &Stmt) -> Result<()> {
@@ -416,6 +448,14 @@ impl Auth {
         privileges.iter().try_for_each(|p| check(p, &t))
     }
 }
+
+/// Does a request's path name code a node runs? Decided on the name the door stores it under, so the path is
+/// percent-decoded as the door decodes it (`/files/a/job.p%79` is `job.py`).
+fn runs_as_code(path: &str) -> bool { py_name(&percent_encoding::percent_decode_str(path).decode_utf8_lossy()) }
+
+/// The `.py` test on a name (`files::put` asks it of the name the store keeps): any case, and no trailing `/`, dot or
+/// space, which the store drops and Windows drops.
+pub(crate) fn py_name(name: &str) -> bool { name.trim_end_matches(['/', '.', ' ']).to_ascii_lowercase().ends_with(".py") }
 
 /// The table a write changes (as the catalog names it) and the privileges it needs on it: none for
 /// anything else.
@@ -585,6 +625,56 @@ mod tests {
 
     fn ip(last: u8) -> Option<IpAddr> { Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))) }
 
+    /// A write token's flush and files are checked (`writer`): a segment of the log only, a table's files in its folder, the
+    /// lake's own records never. With no sign-in (the nodes' own), neither is checked, as before.
+    #[test]
+    fn a_writers_flush_and_files_are_checked_and_the_nodes_own_are_not() {
+        use crate::log::{Flush, Part};
+        let flush = |path: &str, table: Option<&str>| Flush {
+            path: path.into(),
+            parts: table.map(|t| Part { table: t.into(), off: 0, len: 0, rows: 0, src: None }).into_iter().collect(),
+            ..Default::default()
+        };
+        let mine = ["data/orders/a.parquet".to_string()];
+        let other = ["data/hr/a.parquet".to_string()];
+        futures::executor::block_on(WHO.scope(Principal::of(Role::Write), async {
+            assert!(flush_from_writer(&flush("log/a1.seg", None)).is_ok());
+            assert!(flush_from_writer(&flush("data/t/x.seg", None)).is_err(), "a segment outside the log");
+            assert!(flush_from_writer(&flush("", Some("pondra$audit"))).is_err(), "the lake's records");
+            assert!(flush_from_writer(&Flush { reserve: 1, ..Default::default() }).is_ok(), "a bulk INSERT's stamp takes one number");
+            assert!(flush_from_writer(&Flush { reserve: 2, ..Default::default() }).is_err(), "more than one is the leader's own");
+            assert!(files_from_writer("orders", Some("orders"), &mine).is_ok());
+            assert!(files_from_writer("orders", Some("orders"), &other).is_err(), "a file outside the table's folder");
+            assert!(files_from_writer("orders", None, &mine).is_err(), "a table that isn't there");
+            assert!(files_from_writer("pondra$audit", Some("pondra$audit"), &["data/pondra$audit/a.parquet".to_string()]).is_err(), "the lake's records");
+        }));
+        assert!(flush_from_writer(&flush("data/t/x.seg", None)).is_ok(), "the nodes' own, with no sign-in: unchanged");
+        assert!(files_from_writer("orders", Some("orders"), &other).is_ok(), "the nodes' own, unchanged");
+    }
+
+    /// What a joined page stages (`page_creates`): Parquet in its own slug's folder, `stage/<slug>/<job>/<n>.parquet`, for the
+    /// user the request is for. Another's slug, a job name outside `[A-Za-z0-9-]{1,64}`, a file number past six digits, any
+    /// other key, a token's and a caller with no name are all refused.
+    #[test]
+    fn a_page_stages_only_its_own_files() {
+        let user = |name: &str| Principal { name: name.into(), role: Role::Admin, access: None, door: "http", from: None, operator: false };
+        assert_eq!(slug(&user("ali")).as_deref(), Some("616c69"), "a user's slug is its name in hex");
+        assert!(slug(&Principal::token(Role::Admin)).is_none(), "a token has no slug");
+        let long = format!("stage/616c69/{}/0.parquet", "j".repeat(65));
+        futures::executor::block_on(WHO.scope(user("ali"), async {
+            for key in ["stage/616c69/j1/0.parquet", "stage/616c69/auto-3f2a/123456.parquet", "stage/616c69/a-b-C9/7.parquet"] {
+                assert!(page_creates(key), "{key}");
+            }
+            for key in ["stage/626f62/j1/0.parquet", "stage/616c69/j_1/0.parquet", "stage/616c69/j.1/0.parquet", "stage/616c69//0.parquet",
+                        "stage/616c69/j1/1234567.parquet", "stage/616c69/j1/.parquet", "stage/616c69/j1/a.csv", "stage/616c69/j1/0.parquet/x",
+                        "stage/616c69/j1", "stage/616c69/j1/0.parquet/", "data/orders/3f2a.parquet", "log/0a1b.seg", "stage/616c69/j1/../0.parquet", long.as_str()] {
+                assert!(!page_creates(key), "{key}");
+            }
+        }));
+        assert!(!futures::executor::block_on(WHO.scope(user(""), async { page_creates("stage/616c69/j1/0.parquet") })), "a caller with no name stages nothing");
+        assert!(!page_creates("stage/616c69/j1/0.parquet"), "no sign-in: nothing is staged");
+    }
+
     #[test]
     fn ten_failures_refuse_the_pair_for_a_minute() {
         let (g, t) = (Guesses::default(), Instant::now());
@@ -636,5 +726,15 @@ mod tests {
         let all = g.failures.lock().unwrap();
         assert_eq!(all.len(), PAIRS);
         assert!(!all.contains_key(&Guesses::key(ip(1), "u0")), "the oldest pair went");
+    }
+
+    /// A `.py` file is code a node runs whatever its case, its percent-encoding, or the trailing `/` the store drops
+    /// (the name it is stored under decides: `runs_as_code`).
+    #[test]
+    fn a_py_file_is_code_by_the_name_it_is_stored_under() {
+        for path in ["/files/a/job.py", "/files/a/job.p%79", "/files/a/job.PY/", "/files/a/job.py%20"] {
+            assert!(runs_as_code(path), "{path}");
+        }
+        assert!(!runs_as_code("/files/a/job.sql"));
     }
 }

@@ -1,8 +1,9 @@
 # ADR-075: Extensions: one line to install, one build for every version and every form
 
 **Date:** 2026-10-24 · **Status:** accepted (the owner's "Ok", 2026-10-24 02:39, to all eight
-decisions in `reviews/extensions-design.md` as recommended); built from 1.1, its first row before
-1.0 · **Merges and replaces:** ADR-031 (extensions as WebAssembly
+decisions in `reviews/extensions-design.md` as recommended); its 1.1 row pulled before 1.0 (the owner, 2026-10-31;
+`designs/extensions-before-1-0.md`): `INSTALL … FROM`, scalar and table functions in Rust from a kit
+(`extensions/kit`), the `log@1` and `clock@1` capabilities, every node form; the rest from 1.1 · **Merges and replaces:** ADR-031 (extensions as WebAssembly
 components) and ADR-035 §6 (plugins) · **Builds on:** ADR-013 (functions over Flight), ADR-027
 (Python on the node's workers), ADR-049 and `designs/rules-for-new-kinds.md` (one registry), ADR-060
 §9 (every tool takes part in branch and apply), ADR-068 (what 1.0 keeps), ADR-072 (one core, one

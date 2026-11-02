@@ -53,13 +53,9 @@ pub enum Answer<O> {
     Sent,
 }
 
-/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it. The lake it was
-/// sent to is in scope while it runs (`ext::rooted`), so every door stores a client's relative LOCATION as the same file.
+/// Runs one statement a door was sent, for `who`, as `how` asks, and gives its answer as `wire` encodes it.
 pub async fn run<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
-    crate::ext::rooted(&app.lake.url, one_statement(app, req, how, who, wire)).await
-}
-
-async fn one_statement<W: Wire>(app: &App, req: Request, how: How<'_>, who: Who, wire: &W) -> Result<Answer<W::Own>> {
+    crate::dialect_stmts::refused(&req.sql)?; // (another database's statement for what Pondra writes otherwise: refused by name, `dialect_stmts.rs`)
     if let Some(seg) = how.after {
         let mut hwm = app.lake.hwm.subscribe();
         let _ = tokio::time::timeout(Duration::from_secs(30), async { while app.lake.visible() < seg { hwm.changed().await.ok()?; } Some(()) }).await;
@@ -99,7 +95,7 @@ pub(crate) fn single_statement(sql: &str) -> Option<String> {
 /// CALL, a write, transaction control, a setting or several statements. Such a statement is answered from a read, and a
 /// `pondra sql` process leaves it to a guest that reads (`node::Guest::Reads`).
 pub(crate) fn plain_statement(one: &str) -> bool {
-    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one)
+    !crate::write::checkpoint(one) && !routines::runs_procedure(one) && crate::write::parse(one).is_none() && !routines::several(one) && crate::text::control(one).is_none() && !crate::settings::is(one) && crate::with_writes::of(one).is_none()
 }
 
 /// A plain query's text as sent, and the statement it runs as (its `$name`s and macros expanded, `vars::bound` and
@@ -188,6 +184,39 @@ pub(crate) fn owner(auth: &crate::auth::Auth, headers: &http::HeaderMap) -> bool
         || headers.get("x-pondra-owner").and_then(|h| h.to_str().ok()).is_some_and(|h| auth.is_owner(h))
 }
 
+/// The header a `/sql` answer carries while its session holds temporary tables (`temp::holds`): the client keeps to this
+/// node meanwhile. Each door adds it (HTTP's `held_session`, a page's `lake_sql`).
+pub const HELD_SESSION: (&str, &str) = ("x-pondra-session", "held");
+
+/// A statement the node stopped for memory fails its session's transaction, as an error does (`txn::failed`): the session is
+/// found as `sql` finds it, for the caller that asked. Each door that stops one calls it (HTTP's `guard`, a page's `lake_sql`).
+pub fn failed_for_memory(who: crate::auth::Principal, headers: &http::HeaderMap) {
+    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
+    if let Some(s) = session {
+        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
+    }
+}
+
+/// What the statement's procedures printed, for the caller: a JSON list of lines (all of it in ASCII, the first 32 KB of
+/// it; the run log has the rest), as the text of the `x-pondra-notices` header. None when nothing was said.
+pub fn notices(heard: &[String]) -> Option<String> {
+    if heard.is_empty() {
+        return None;
+    }
+    let (mut kept, mut size) = (vec![], 0);
+    for n in heard {
+        size += n.len() + 4;
+        if size > 32 << 10 {
+            kept.push("…".to_string());
+            break;
+        }
+        kept.push(n.clone());
+    }
+    let text = serde_json::to_string(&kept).ok()?;
+    let ascii: String = text.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect();
+    Some(ascii)
+}
+
 /// What one `/sql` request answers, by any door that reads one (the HTTP door, a page): its reply, the notices its
 /// statements said, and its session, which the door says it holds while it has temporary tables (`temp::holds`).
 pub struct Said {
@@ -216,6 +245,12 @@ pub enum Rendered {
     Sent,
 }
 
+/// `f` in the scope a `/sql` request's statement runs in: its session's temporary tables, views and variables (`session`), and
+/// the variables of the code a lent token runs for (`vars`). A page's fallback (`page::node_part`) reads a statement's names in it too.
+pub(crate) async fn scoped<F: std::future::Future>(session: Option<String>, vars: Option<crate::vars::Lent>, f: F) -> F::Output {
+    crate::vars::within(vars, temp::SESSION.scope(session, f)).await
+}
+
 /// One `/sql` request (its query, its headers, its body), for `role`, with every step a `/sql` takes around
 /// `statement::run` (the session, the owner's files, …): server.rs's `sql`, moved.
 pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http::HeaderMap, body: Bytes) -> Said {
@@ -234,7 +269,7 @@ pub async fn sql(app: App, p: SqlParams, role: crate::auth::Role, headers: http:
     let (hand, mut handed) = tokio::sync::oneshot::channel(); // (the door's end of an answer in pieces: `query::Pieces`)
     let statement = crate::query::PIECES.scope(crate::query::Pieces::new(hand), sql_as(app, p, role, headers, body));
     // (the answer's memory is counted here until its body is sent: `query::collect`, `answer`)
-    let go = crate::query::HELD.scope(Default::default(), crate::vars::within(vars.clone(), crate::temp::SESSION.scope(session.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement))))));
+    let go = crate::query::HELD.scope(Default::default(), scoped(session.clone(), vars.clone(), crate::ext::scope(files, crate::pg_catalog::speaking(postgres, Box::pin(statement)))));
     // (`guard` gave this request its principal and its apply flag, outside this handler: a request whose answer is
     // handed over runs on after it, and its history and audit still need who asked, so `auth::carried` takes WHO here)
     let applying = crate::protect::APPLYING.try_with(|_| ()).is_ok();

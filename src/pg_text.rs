@@ -4,7 +4,7 @@
 //! so the same text comes out for the same input. tests/text_cases.json holds
 //! 612 cases written by gen.py from Postgres 16.15, and every one matches (see NOTES.md).
 
-use datafusion::sql::sqlparser::ast::{self, VisitMut};
+use datafusion::sql::sqlparser::ast;
 use std::ops::ControlFlow;
 
 /// Every keyword that quote_ident must quote: the words pg_get_keywords() gives a category
@@ -453,7 +453,7 @@ fn unescaped(s: &str) -> String {
 /// `doc ?| '{a,b}'::text[]` asked for the key `{a,b}`. Returns whether one was found; a malformed one is 22P02.
 pub(crate) fn array_literals(stmt: &mut ast::Statement) -> anyhow::Result<bool> {
     let mut found = ArrayLiterals { found: false };
-    match stmt.visit(&mut found) {
+    match crate::walk::visit_mut(stmt, &mut found) {
         ControlFlow::Break(e) => Err(e),
         ControlFlow::Continue(()) => Ok(found.found),
     }

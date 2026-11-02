@@ -9,7 +9,7 @@ use anyhow::Result;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::DataFrame;
 use datafusion::sql::sqlparser::ast::Statement;
-use datafusion::sql::sqlparser::{ast::{self, VisitMut}, dialect::GenericDialect, parser::Parser};
+use datafusion::sql::sqlparser::{ast, dialect::GenericDialect, parser::Parser};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -26,8 +26,8 @@ pub trait Host: Send + Sync {
     /// The host's own statements, asked before anything else (a node's `SHOW CREATE`, `pondra.find`, `RESTORE`, …):
     /// `Own::Go` with the text when it has none.
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send;
-    /// The lake's macros, functions and procedures, by name (`routines::listed`).
-    fn routines(&self) -> impl Future<Output = Result<Arc<HashMap<String, Routine>>>> + Send;
+    /// The macros, functions and procedures a statement may call, by name (`routines::listed`, and a node's session's own).
+    fn routines(&self) -> impl Future<Output = Result<Routines>> + Send;
     /// Other engines' catalogs attached (`ext::attached`).
     fn attached(&self) -> impl Future<Output = Result<Vec<(String, Attached)>>> + Send;
     /// The columns of these tables of the lake (names inside it, as `text::local_in` gives them), system columns last;
@@ -66,10 +66,20 @@ pub enum Relation<H: ?Sized> {
     View { sql: String, lake: Option<Arc<H>> },
 }
 
+/// What a statement may call: `own` in its own text (a node's session's temporary functions over the lake's, `temp.rs`),
+/// and `lake` in the body of one of the lake's: a session's function never changes what the lake's own functions mean,
+/// so a lake function, or a stored view, reads the same for every reader (Postgres never looks in `pg_temp` for a
+/// function either). With no temporary functions the two are one map.
+pub struct Routines {
+    pub own: Arc<HashMap<String, Routine>>,
+    pub lake: Arc<HashMap<String, Routine>>,
+}
+
 /// The front:
 pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String>) -> Result<String> {
     crate::kept::refused(sql)?; // (1.1's statements, refused by name at every door in the same words: `kept.rs`)
-    crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, refused by name with what to write: `pattern.rs`)
+    crate::dialect_stmts::refused(sql)?; // (another database's statement for what Pondra writes otherwise, in every form: `dialect_stmts.rs`)
+    crate::pattern::refused(sql)?; // (MATCH_RECOGNIZE's SUBSET, and a materialized view over one of a subquery: refused by name with what to write, `pattern.rs`)
     let sql = &match host.own(sql).await? {
         Own::Answer(q) => return Ok(q),
         Own::Go(sql) => sql,
@@ -82,10 +92,10 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     let sql = &crate::diff::diffs(sql)?; // (`pondra.diff('prod.t', 'dev.t')`: rows apart, ADR-047)
     let sql = &crate::past_names::syntax(sql).into_owned(); // (`t AT (VERSION => n)`: a table as it was, ADR-043)
     let sql = &crate::friendly::text(sql)?.into_owned(); // (`PIVOT t ON g`, `[x FOR x IN l]`, DuckDB's ASOF … ON: as SQL that parses)
-    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse)
+    let sql = &crate::pattern::text(sql).into_owned(); // (FINAL and RUNNING before a measure: as calls that parse; a subquery before MATCH_RECOGNIZE: as a CTE)
     let marked = crate::measures::text(sql); // (`sum(x) AS MEASURE revenue`: an alias that parses, ADR-065 §3)
     let sql: &str = &marked;
-    let all = host.routines().await?;
+    let Routines { own: all, lake } = host.routines().await?;
     let outside = host.attached().await?;
     let named = |n: &String| crate::text::mentions(sql, n);
     let expands = all.iter().any(|(n, r)| r.kind != Kind::Procedure && named(n)) || views.keys().any(named) || crate::expander::FROM_FIRST.is_match(sql) || crate::ext_names::mentions(sql)
@@ -114,7 +124,7 @@ pub async fn expand<H: Host>(host: &H, sql: &str, views: &HashMap<String, String
     };
     for s in stmts.iter_mut().filter(|_| expands) {
         if !matches!(s, Statement::CreateMacro { .. } | Statement::CreateFunction(_) | Statement::CreateView(ast::CreateView { materialized: false, .. })) {
-            if let ControlFlow::Break(e) = s.visit(&mut Expander { name: &name, all: &all, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
+            if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut Expander { name: &name, all: &all, lake: &lake, views, outside: &outside, depth: 0, own: 0, columns: &columns, scopes: vec![] }) {
                 return Err(e);
             }
         }

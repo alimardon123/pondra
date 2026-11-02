@@ -16,8 +16,8 @@
 //!
 //! Bytes are `BINARY` columns: `byte_length`, `sha256`, `md5`, `encode(…, 'base64')`, `decode`
 //! and `substr` (`engine.rs`: DataFusion's own takes only text) work on them.
-use crate::lake_files::under_files;
-use crate::store::Lake;
+use crate::lake_files::{self, under_files, Filed};
+use crate::store::{Changed, Lake};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::catalog::{MemTable, Session, TableFunctionImpl, TableProvider};
@@ -153,6 +153,114 @@ impl AsyncScalarUDFImpl for FileRead {
     }
 }
 
+// ---------------------------------------------------------------- the four `/files` requests (ADR-061's contract)
+
+/// The name the store keeps `path` under (`object_store`'s `Path`: empty segments go, `.` and `..` are escaped). The
+/// checks below decide on it, so `files//.versions/x` is `files/.versions/x`.
+fn stored_name(path: &str) -> String { String::from(object_store::path::Path::from(path)) }
+
+/// Refuses a path a door may not write, restore or remove: a file's versions and each apply's files are kept by
+/// Pondra (`keep`, `apply::keep_files`). Case-blind, as a disk that ignores case keeps `.Versions` as `.versions`.
+fn refuse_kept(path: &str) -> anyhow::Result<()> {
+    let name = stored_name(path).to_ascii_lowercase();
+    match name.starts_with(VERSIONS) || name.starts_with(APPLIES) {
+        true => Err(crate::codes::coded("42501", format!("{path}: a file's versions and each apply's files are kept by Pondra: name the file itself"))),
+        false => Ok(()),
+    }
+}
+
+/// `PUT /files/<path>`: an object in the lake next to the tables — an image, a PDF, a model, a SQL
+/// file — for `files('…')` to list and `file_read(path)` to read. A path that exists is refused (409),
+/// unless `if_match` names the version `GET` gave: then it is replaced, if nobody replaced it meanwhile
+/// (412 if so; ADR-034). Each save is kept as a version too (`keep`, ADR-035 §8). A `.py` is an admin's to save,
+/// and a path Pondra keeps is refused. Both doors call it.
+pub async fn put(lake: &Lake, path: &str, if_match: Option<&str>, body: bytes::Bytes) -> anyhow::Result<Filed> {
+    let (path, bytes) = (under_files(path)?, body.len());
+    refuse_kept(&path)?;
+    // (the HTTP door's gate (`Auth::needed`) asks the same of the raw path; this asks it of the name the store keeps, so the
+    // two can't disagree. No request at all (the node's own work) is let through)
+    if crate::auth::py_name(&stored_name(&path)) && crate::auth::current().is_some_and(|p| p.role < crate::auth::Role::Admin) {
+        return Err(crate::codes::coded("42501", format!("{path}: code a node runs is saved by an admin")));
+    }
+    let expect = if_match.map(|v| v.trim_matches('"').to_string());
+    let done = match &expect {
+        Some(v) => lake.replace(&path, body.clone(), v).await, // (`Bytes`: the body itself, not a copy of it)
+        None => match lake.put(&path, body.clone()).await {
+            Ok(()) => lake.version(&path).await,
+            Err(e) => Err(e),
+        },
+    };
+    match done {
+        Ok(version) => {
+            if let Err(e) = keep(lake, &path, &body).await {
+                eprintln!("{path}: saved, but not kept as a version: {e:#}");
+            }
+            let etag = Some(version.clone()); // (the version written, as GET's `etag`: the next save's `If-Match`)
+            Ok(Filed { etag, ..Filed::json(serde_json::json!({"path": path, "bytes": bytes, "version": version})) })
+        }
+        Err(e) if e.is::<Changed>() => Ok(Filed::text(412, lake_files::changed(&path))),
+        Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") => Ok(Filed::text(409, lake_files::there_already(&path))),
+        Err(e) => Err(e),
+    }
+}
+
+/// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content type by its
+/// name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes. Both doors call it.
+pub async fn get(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    if q.contains_key("versions") {
+        let all = versions(lake, &path).await?;
+        return Ok(Filed::json(serde_json::Value::Array(all.iter().map(|v| serde_json::json!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect())));
+    }
+    let found = match q.get("version") {
+        Some(id) => match version(lake, &path, id).await {
+            Ok(b) => Ok((b, id.clone())),
+            Err(e) => return Ok(Filed::text(404, crate::ext::said(&e))), // (not one of its versions, or gone)
+        },
+        None => lake.file(&path).await,
+    };
+    let (body, tag) = match found {
+        Ok(found) => found,
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            return Ok(Filed::text(404, lake_files::not_found(&path)));
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(Filed { status: 200, content_type: lake_files::content_type(&path), etag: Some(tag), body })
+}
+
+/// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest). Without
+/// `restore` it is refused by name. Both doors call it.
+pub async fn restore(lake: &Lake, path: &str, q: &std::collections::HashMap<String, String>) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    refuse_kept(&path)?;
+    let id = q.get("restore").ok_or_else(|| anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)"))?;
+    let bytes = version(lake, &path, id).await?;
+    let now = match lake.version(&path).await {
+        Ok(now) => lake.replace(&path, bytes.clone(), &now).await?,
+        Err(_) => {
+            lake.put(&path, bytes.clone()).await?; // (deleted since: back again)
+            lake.version(&path).await?
+        }
+    };
+    keep(lake, &path, &bytes).await?;
+    Ok(Filed::json(serde_json::json!({"path": path, "version": now, "restored": id})))
+}
+
+/// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at:
+/// 404. Both doors call it.
+pub async fn remove(lake: &Lake, path: &str) -> anyhow::Result<Filed> {
+    let path = under_files(path)?;
+    refuse_kept(&path)?;
+    match lake.remove_file(&path).await {
+        Ok(()) => Ok(Filed::json(serde_json::json!({"removed": path}))),
+        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
+            Ok(Filed::text(404, lake_files::not_found(&path)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------- versions (ADR-035 §8)
 
 pub const VERSIONS: &str = "files/.versions/";
@@ -170,7 +278,7 @@ fn saved_before(path: &str) -> Option<String> {
 }
 
 /// Keep this save of `path` as a version, by whoever made it; then let the oldest go.
-pub async fn keep(lake: &Lake, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+pub async fn keep(lake: &Lake, path: &str, bytes: &bytes::Bytes) -> anyhow::Result<()> {
     if bytes.len() > KEPT_MB << 20 || path.starts_with(VERSIONS) {
         return Ok(());
     }
@@ -178,7 +286,7 @@ pub async fn keep(lake: &Lake, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
     let who: String = who.chars().map(|c| if c.is_ascii_alphanumeric() || "_.-".contains(c) { c } else { '_' }).collect();
     let now = crate::log::now_ms();
     for ms in now..now + 8 {
-        match lake.put(&format!("{}{ms:013}.{who}", kept_at(path)), bytes.to_vec()).await {
+        match lake.put(&format!("{}{ms:013}.{who}", kept_at(path)), bytes.clone()).await { // (the saved bytes shared, not copied)
             Err(e) if format!("{e:#}").contains("already exists") => continue, // (two saves in one millisecond: the next)
             done => {
                 done?;

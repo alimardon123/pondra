@@ -17,7 +17,7 @@ use datafusion::catalog::{MemTable, MemorySchemaProvider, SchemaProvider};
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::{ScalarUDF, Signature, TypeSignature, Volatility};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, VisitorMut};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -36,9 +36,29 @@ pub async fn speaking<F: std::future::Future>(yes: bool, f: F) -> F::Output {
     }
 }
 
-/// Does this request speak Postgres, and this query read its catalog? (Any other query, and every query of
-/// a request that doesn't, reads as before: DataFusion's own `information_schema` over HTTP.)
-pub fn asked(sql: &str) -> bool { POSTGRES.try_with(|_| ()).is_ok() && wanted(sql) }
+/// Does this request speak Postgres, and this query read its catalog? Or does the query name the catalog itself
+/// (`pg_catalog.pg_tables`, or `FROM pg_tables`: a name that means only Postgres's catalog), whoever sends it? (Any
+/// other query, and every other query of a request that doesn't, reads as before: DataFusion's own
+/// `information_schema` over HTTP.)
+pub fn asked(sql: &str) -> bool { (POSTGRES.try_with(|_| ()).is_ok() && wanted(sql)) || names_catalog(sql) }
+
+/// `pg_catalog.` before a name, or one of `CATALOG`'s tables right after FROM or JOIN.
+fn names_catalog(sql: &str) -> bool {
+    static NAMES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        let names = CATALOG.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("|");
+        regex::Regex::new(&format!(r"(?i)\bpg_catalog\s*\.\s*\w|\b(?:from|join)\s+(?:{names})\b")).expect("a regex")
+    });
+    if !NAMES.is_match(sql) {
+        return false; // (most queries: no tokens made)
+    }
+    // (the words themselves, not inside a string or a comment)
+    use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).tokenize() else { return true };
+    let t: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    t.windows(3).any(|w| word(w[0], "pg_catalog") && *w[1] == Token::Period && matches!(w[2], Token::Word(_)))
+        || t.windows(2).any(|w| (word(w[0], "from") || word(w[0], "join")) && CATALOG.iter().any(|(n, _)| word(w[1], n)))
+}
 
 /// A query over Postgres's catalog, as the Postgres port answers it: the catalog's tables and functions in
 /// its session, `user` as `current_user`, and over tables that are always empty, no rows with the columns
@@ -58,7 +78,7 @@ pub async fn answer(lake: &Lake, sql: &str, user: &str) -> Result<Vec<RecordBatc
 /// `answer` for a request over HTTP that speaks Postgres (`asked`): its SQL rewritten as the port rewrites
 /// it, its principal as `current_user`, the session's schema as `current_schema()`.
 pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
-    let user = crate::auth::current().map(|p| p.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "pondra".into());
+    let user = crate::auth::name();
     let schema = crate::path::current(lake).map_or_else(|| "public".to_string(), |p| p.schema().to_string());
     answer(lake, &rewrite(sql, &user, &schema), &user).await
 }
@@ -66,7 +86,7 @@ pub async fn over_http(lake: &Lake, sql: &str) -> Result<Vec<RecordBatch>> {
 /// Does this query read Postgres's catalog, or say something only Postgres says?
 pub fn wanted(sql: &str) -> bool {
     let s = sql.to_lowercase();
-    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
+    ["pg_", "information_schema", "::reg", "operator(", "format_type(", "current_user", "session_user", "current_role", "current_schemas", "to_regtype", "to_regclass", "collate", "obj_description", "col_description", "current_setting", "has_table_privilege", "has_schema_privilege"]
         .iter().any(|w| s.contains(w))
 }
 
@@ -353,7 +373,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         let typed = enums.chain(held_types(&l)).collect();
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = l.columns.iter().filter_map(|(c, _)| Some((c.clone(), notes.get(&format!("column/{name}/{}", m.stored(c)?))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: mvs.get(name).cloned(), identity: l.identity.clone(), constraints: l.constraints.clone(), checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: table.into(), kind, columns: cols, key: l.key.clone(), sql: crate::views::code_for_caller(|| mvs.get(name).cloned()).flatten(), identity: l.identity.clone(), constraints: if kind == 'm' { crate::views::code_for_caller(|| l.constraints.clone()).unwrap_or_default() } else { l.constraints.clone() }, checks: l.checks.clone(), typed, comment, comments, rows: rows + sealed.rows + logged.get(name).copied().unwrap_or(0), bytes: bytes + sealed.bytes });
     }
     let views = lake.cat.scan::<crate::ddl::StoredView>("q/", "q0").await?;
     // (a view's columns are its query's: planned only when a client asks for columns, in a
@@ -377,7 +397,7 @@ async fn lakes(lake: &Lake, user: &str, columns: bool, counts: bool) -> Result<L
         };
         let comment = notes.get(&format!("relation/{name}")).cloned();
         let comments = cols.iter().filter_map(|(c, ..)| Some((c.clone(), notes.get(&format!("column/{name}/{c}"))?.clone()))).collect();
-        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: Some(crate::views::shown(&v.sql)), identity: Default::default(), constraints: v.facts.clone(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
+        rels.push(Rel { oid: oid("r", name), schema: schema.into(), name: view.into(), kind: 'v', columns: cols, key: vec![], sql: crate::views::code_for_caller(|| crate::views::shown(&v.sql)), identity: Default::default(), constraints: crate::views::code_for_caller(|| v.facts.clone()).unwrap_or_default(), checks: vec![], typed: BTreeMap::new(), comment, comments, rows: 0, bytes: 0 });
     }
     // A user granted some tables sees those, and of one granted by columns those columns, as at every other
     // listing (`ddl::listed`, invariant 382). Postgres's pg_class names every table; Pondra names none its
@@ -723,10 +743,11 @@ fn tables(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'static str, A
     }).collect();
     listed.extend(l.indexes.iter().map(|i| vec![s(i.schema.clone()), s(i.table_name.clone()), s(i.name.clone()), n(), s(i.def.clone())]));
     add!("pg_indexes", &[("schemaname", TEXT), ("tablename", TEXT), ("indexname", TEXT), ("tablespace", TEXT), ("indexdef", TEXT)], listed);
+    // (a view's or materialized view's definition is NULL where a caller may not see its code, as `pg_get_viewdef` is)
     add!("pg_views", &[("schemaname", TEXT), ("viewname", TEXT), ("viewowner", TEXT), ("definition", TEXT)],
-        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), s(r.sql.clone().unwrap_or_default())]).collect());
+        rel_rows('v').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), r.sql.clone().map(s).unwrap_or_else(n)]).collect());
     add!("pg_matviews", &[("schemaname", TEXT), ("matviewname", TEXT), ("matviewowner", TEXT), ("tablespace", TEXT), ("hasindexes", BOOL), ("ispopulated", BOOL), ("definition", TEXT)],
-        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(true), s(r.sql.clone().unwrap_or_default())]).collect());
+        rel_rows('m').map(|r| vec![s(r.schema.clone()), s(r.name.clone()), s(l.user.clone()), n(), b(!r.key.is_empty() || l.indexes.iter().any(|i| i.table == r.oid)), b(true), r.sql.clone().map(s).unwrap_or_else(n)]).collect());
     add!("pg_proc", &[("oid", OID), ("proname", TEXT), ("pronamespace", OID), ("proowner", OID), ("prolang", OID), ("procost", DataType::Float32), ("prorows", DataType::Float32),
         ("provariadic", OID), ("prosupport", TEXT), ("prokind", TEXT), ("prosecdef", BOOL), ("proleakproof", BOOL), ("proisstrict", BOOL), ("proretset", BOOL), ("provolatile", TEXT),
         ("proparallel", TEXT), ("pronargs", INT2), ("pronargdefaults", INT2), ("prorettype", OID), ("proargtypes", list(OID)), ("proallargtypes", list(OID)), ("proargmodes", list(TEXT)),
@@ -886,7 +907,7 @@ fn information_schema(l: &Lakes, want: &dyn Fn(&str) -> bool) -> Result<Vec<(&'s
         ("identity_maximum", TEXT), ("identity_minimum", TEXT), ("identity_cycle", TEXT), ("is_generated", TEXT), ("generation_expression", TEXT), ("is_updatable", TEXT)], cols);
     add!("views", &[("table_catalog", TEXT), ("table_schema", TEXT), ("table_name", TEXT), ("view_definition", TEXT), ("check_option", TEXT), ("is_updatable", TEXT),
         ("is_insertable_into", TEXT), ("is_trigger_updatable", TEXT), ("is_trigger_deletable", TEXT), ("is_trigger_insertable_into", TEXT)],
-        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), s(r.sql.clone().unwrap_or_default()), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect());
+        l.rels.iter().filter(|r| r.kind == 'v').map(|r| vec![db(), s(r.schema.clone()), s(r.name.clone()), r.sql.clone().map(s).unwrap_or_else(n), s("NONE"), s("NO"), s("NO"), s("NO"), s("NO"), s("NO")]).collect());
     // Each table's key, then its declared constraints, as the standard lists them.
     let yes = |b: bool| s(if b { "YES" } else { "NO" });
     let keyed: Vec<&Rel> = l.rels.iter().filter(|r| !r.key.is_empty()).collect();
@@ -1354,7 +1375,7 @@ pub fn rewrite(sql: &str, user: &str, schema: &str) -> String {
         // (a table a statement makes or writes keeps its name: Postgres makes `CREATE TABLE
         // pg_stat_user_tables (…)` in the current schema; only reads look in pg_catalog first)
         let written = target(s).cloned();
-        let _ = s.visit(&mut r);
+        let _ = crate::walk::visit_mut(s, &mut r);
         if let (Some(name), Some(t)) = (written, target(s)) {
             *t = name;
         }
@@ -1481,7 +1502,7 @@ fn settle(q: &mut ast::Query) -> Option<ast::Expr> {
     split_and(selection, &mut conds);
     let outer_only = |c: &ast::Expr| {
         let mut qualifiers = vec![];
-        let _ = ast::visit_expressions(c, |x| {
+        let _ = crate::walk::visit_expressions(c, |x| {
             if let ast::Expr::CompoundIdentifier(parts) = x {
                 qualifiers.push(parts[parts.len().saturating_sub(2)].value.to_lowercase()); // (its table: `a.x`, `pg_catalog.pg_attrdef.x`)
             }
@@ -1517,7 +1538,7 @@ fn identity_of(q: &ast::Query) -> Option<ast::Expr> {
     }
     let mut serial = false;
     let mut outer = None; // the table the column is read from: `pg_catalog.pg_attribute` for `…pg_attribute.attidentity`
-    let _ = ast::visit_expressions(sel.selection.as_ref()?, |x| {
+    let _ = crate::walk::visit_expressions(sel.selection.as_ref()?, |x| {
         match x {
             ast::Expr::Function(f) if f.name.to_string().eq_ignore_ascii_case("pg_get_serial_sequence") => serial = true,
             ast::Expr::CompoundIdentifier(p) if p.len() > 1 && p.last().is_some_and(|i| i.value.eq_ignore_ascii_case("attidentity")) => {
@@ -1576,7 +1597,7 @@ pub fn empty_answer(sql: &str) -> Option<Vec<String>> {
 fn aggregated(e: &ast::Expr) -> bool {
     const AGGREGATES: &[&str] = &["count", "max", "min", "sum", "avg", "array_agg", "string_agg", "bool_or", "bool_and", "every", "first_value", "last_value"];
     let mut found = false;
-    let _ = ast::visit_expressions(e, |x| {
+    let _ = crate::walk::visit_expressions(e, |x| {
         if let ast::Expr::Function(f) = x {
             found |= AGGREGATES.contains(&f.name.to_string().to_lowercase().trim_start_matches("pg_catalog.")) && f.over.is_none();
         }
@@ -1690,6 +1711,18 @@ impl VisitorMut for Rewriter<'_> {
 
     fn pre_visit_select(&mut self, select: &mut ast::Select) -> ControlFlow<()> {
         for item in select.projection.iter_mut() {
+            // (`SELECT session_user, current_role`: each named by its word, as Postgres names them, once they are the
+            // same literal)
+            if let ast::SelectItem::UnnamedExpr(e) = item {
+                let word = match e {
+                    ast::Expr::Function(f) if matches!(f.args, ast::FunctionArguments::None) => f.name.to_string().to_lowercase(),
+                    ast::Expr::Identifier(i) if i.quote_style.is_none() => i.value.to_lowercase(),
+                    _ => String::new(),
+                };
+                if matches!(word.as_str(), "current_user" | "session_user" | "current_role" | "user") {
+                    *item = ast::SelectItem::ExprWithAlias { expr: e.clone(), alias: ast::Ident::new(word) };
+                }
+            }
             if let ast::SelectItem::ExprWithAlias { expr: ast::Expr::Function(f), alias } = item {
                 if f.name.to_string().to_lowercase().ends_with("_pg_expandarray") {
                     self.expanded.push(alias.value.to_lowercase());
@@ -1805,7 +1838,7 @@ impl VisitorMut for Rewriter<'_> {
                     ast::Value::SingleQuotedString(c) if c.chars().count() == 1 && c != "\\" => c.chars().next(),
                     _ => None,
                 }) {
-                    let _ = ast::visit_expressions_mut(pattern.as_mut(), |x| {
+                    let _ = crate::walk::visit_expressions_mut(pattern.as_mut(), |x| {
                         if let ast::Expr::Value(v) = x {
                             if let ast::Value::SingleQuotedString(t) = &mut v.value {
                                 let mut out = String::new();
@@ -1870,6 +1903,8 @@ impl VisitorMut for Rewriter<'_> {
                     _ => None,
                 }
             }
+            // (`current_role`, which sqlparser reads as a name, not a call: who signed in, as `current_user` is)
+            ast::Expr::Identifier(i) if i.quote_style.is_none() && i.value.eq_ignore_ascii_case("current_role") => Some(ast::Expr::Value(ast::Value::SingleQuotedString(self.user.to_string()).into())),
             ast::Expr::Function(f) if f.name.to_string().to_lowercase().ends_with("_pg_expandarray") => match &f.args {
                 ast::FunctionArguments::List(l) => l.args.first().and_then(|a| expr(&format!("unnest({a})"))),
                 _ => None,
@@ -1934,9 +1969,20 @@ mod tests {
     use datafusion::arrow::util::display::array_value_to_string;
 
     #[test]
+    fn a_query_naming_the_catalog_reads_it_over_any_request() {
+        for sql in ["SELECT tablename FROM pg_catalog.pg_tables", "select relname from PG_CLASS c join pg_namespace n on n.oid = c.relnamespace", "SELECT * FROM pg_catalog . pg_type"] {
+            assert!(names_catalog(sql), "{sql}");
+        }
+        for sql in ["SELECT * FROM orders", "SELECT * FROM pg_tables_backup", "SELECT pg_class FROM t", "SELECT 'pg_catalog'"] {
+            assert!(!names_catalog(sql), "{sql}");
+        }
+    }
+
+    #[test]
     fn postgres_from_said_datafusion_way() {
         let r = |s: &str| rewrite(s, "ann", "public");
-        assert_eq!(r("SELECT user, current_user"), "SELECT 'ann', 'ann'");
+        assert_eq!(r("SELECT user, current_user"), "SELECT 'ann' AS user, 'ann' AS current_user");
+        assert_eq!(r("SELECT session_user, current_role AS r"), "SELECT 'ann' AS session_user, 'ann' AS r");
         // a table made or written under a catalog table's name is the current schema's, as in Postgres
         assert_eq!(r("CREATE TABLE pg_stat_user_tables (relid BIGINT)"), "CREATE TABLE pg_stat_user_tables (relid BIGINT)");
         let i = r("INSERT INTO pg_stat_user_tables SELECT oid FROM pg_class");

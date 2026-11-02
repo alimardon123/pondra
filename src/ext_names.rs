@@ -3,6 +3,8 @@
 use crate::data_file::DataFile;
 use anyhow::{bail, ensure, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+use datafusion::common::{parsers::CompressionTypeVariant, GetExt};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 use datafusion::datasource::file_format::{csv::CsvFormat, json::JsonFormat, parquet::ParquetFormat, FileFormat};
 use datafusion::arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::listing::ListingTableUrl;
@@ -98,62 +100,186 @@ pub fn table(t: &TableFactor) -> Result<Option<String>> {
     for (name, e) in a.named {
         let value = match (name.to_lowercase().as_str(), e) {
             ("columns" | "hive_types" | "types", Expr::Dictionary(d)) => d.iter().map(|c| Ok(format!("{} {}", quoted(&c.key.value), literal(&c.value)?))).collect::<Result<Vec<_>>>().map(|c| c.join(", ")),
-            ("types", _) => bail!("{f}: types names each column's type in a struct, types => {{'zip': 'VARCHAR'}} (DuckDB's list form isn't read)"),
+            ("types", _) => return Err(given(format!("{f}: types names each column's type in a struct, types => {{'zip': 'VARCHAR'}} (DuckDB's list form isn't read)"))),
             _ => literal(e),
         };
         options.insert(name.to_lowercase(), value.with_context(|| format!("{f}: {name} is a value"))?);
     }
-    ensure!(!urls.is_empty(), "{f}: which files? {f}('s3://bucket/path/*.{format}')");
+    if urls.is_empty() {
+        return Err(given(format!("{f}: which files? {f}('s3://bucket/path/*.{format}')")));
+    }
+    // (a name's compression, when the call doesn't give one: `read_csv('x.csv.gz')`; the files of a list must agree on it)
+    if !options.contains_key("compression") {
+        let named = urls.iter().map(|u| name_options(format, u)).collect::<Result<Vec<_>>>()?;
+        if !named.windows(2).all(|w| w[0] == w[1]) {
+            return Err(given(format!("{f}: the files are compressed differently ({}): read each with its own {f}, or give compression => … for all of them", urls.join(", "))));
+        }
+        options.extend(named.into_iter().next().unwrap_or_default());
+    }
     let known: Vec<&str> = match format {
-        "csv" => [CSV_OPTIONS, LISTING_OPTIONS, &["types"][..]].concat(),
+        "csv" => [CSV_OPTIONS, LISTING_OPTIONS, &["types", "compression"][..]].concat(),
+        "json" => [LISTING_OPTIONS, &["compression"][..]].concat(),
         "delta" => vec!["version"],
         "iceberg" => vec!["version", "snapshot_from_id", "snapshot_from_timestamp", "allow_moved_paths"],
         _ => LISTING_OPTIONS.to_vec(),
     };
-    ensure!(!["delta", "iceberg"].contains(&format) || urls.len() == 1, "{f}: one table at a time");
+    if ["delta", "iceberg"].contains(&format) && urls.len() != 1 {
+        return Err(crate::codes::coded("0A000", format!("{f}: one table at a time")));
+    }
     if let Some(k) = options.keys().find(|k| !known.contains(&k.as_str())) {
-        bail!("{f} has no option {k}: {}", known.join(", "));
+        return Err(given(format!("{f} has no option {k}: {}", known.join(", "))));
     }
     if options.contains_key("types") {
-        ensure!(!options.contains_key("columns"), "{f}: types and columns: columns names every column's type, so types would do nothing");
-        ensure!(!options.get("all_varchar").is_some_and(|v| v != "false"), "{f}: types and all_varchar => true: one is enough (all_varchar reads every column as text)");
+        if options.contains_key("columns") {
+            return Err(given(format!("{f}: types and columns: columns names every column's type, so types would do nothing")));
+        }
+        if options.get("all_varchar").is_some_and(|v| v != "false") {
+            return Err(given(format!("{f}: types and all_varchar => true: one is enough (all_varchar reads every column as text)")));
+        }
     }
     Ok(Some(name(&Spec { urls, format: format.into(), options })))
 }
 
-/// A file's format by its extension (a glob's too: `*.parquet`).
+/// A name's lower-case path: no query or fragment, so a web address's ending is its file's.
+fn path_of(url: &str) -> String { url.split(['?', '#']).next().unwrap_or(url).to_lowercase() }
+
+/// Compressed text's name endings and the compression each means (`x.csv.gz` is gzip-ed CSV): DataFusion's names.
+const ENDINGS: [(&str, &str); 4] = [("gz", "gzip"), ("zst", "zstd"), ("bz2", "bzip2"), ("xz", "xz")];
+
+/// A lower-case path without its compression ending, and the compression the ending names (`x.csv.gz` is (`x.csv`,
+/// gzip)). A name ending in anything else is all its own format.
+fn unwrapped(path: &str) -> (&str, Option<&'static str>) {
+    match path.rsplit_once('.') {
+        Some((stem, end)) => match ENDINGS.iter().find(|(e, _)| *e == end) {
+            Some((_, compression)) => (stem, Some(*compression)),
+            None => (path, None),
+        },
+        None => (path, None),
+    }
+}
+
+/// The compression a file's name says (`.gz`, `.zst`, `.bz2`, `.xz`), as DataFusion names it: every name that is read
+/// or written goes through here, through `format_of`, `name_options` or `table`.
+pub(crate) fn compression_of(url: &str) -> Option<&'static str> { unwrapped(&path_of(url)).1 }
+
+/// The reader options a file's name gives its format: `compression` for a CSV or JSON file whose name ends in one
+/// (`x.csv.gz`). Parquet and Arrow are compressed inside the file, not by its name, so a name that says otherwise is
+/// refused with that said; any other format's name gives none.
+pub(crate) fn name_options(format: &str, url: &str) -> Result<BTreeMap<String, String>> {
+    let Some(compression) = compression_of(url) else { return Ok(BTreeMap::new()) };
+    match format {
+        "csv" | "json" => Ok(BTreeMap::from([("compression".to_string(), compression.to_string())])),
+        "parquet" | "arrow" => {
+            let end = path_of(url).rsplit('.').next().unwrap_or_default().to_string();
+            Err(given(format!("{url}: {format} files are compressed inside the file, so a name ending in .{end} isn't read as one: name the file without it")))
+        }
+        _ => Ok(BTreeMap::new()),
+    }
+}
+
+/// A file's format by its extension (a glob's too: `*.parquet`), before any compression's ending (`x.csv.gz` is CSV, gzip-ed),
+/// with the options its name gives (`name_options`).
 pub(crate) fn format_of(url: &str) -> Result<(String, BTreeMap<String, String>)> {
     if url.starts_with("kafka://") {
         return Ok(("kafka".into(), BTreeMap::new())); // (a topic)
     }
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
-    let tsv = BTreeMap::from([("delim".to_string(), "\t".to_string())]);
-    Ok(match path.rsplit('.').next().unwrap_or_default() {
-        "parquet" | "pq" => ("parquet".into(), BTreeMap::new()),
-        "csv" => ("csv".into(), BTreeMap::new()),
-        "tsv" => ("csv".into(), tsv),
-        "json" | "ndjson" | "jsonl" => ("json".into(), BTreeMap::new()),
-        "arrow" | "feather" | "ipc" => ("arrow".into(), BTreeMap::new()), // (Arrow's file format: IPC with a footer)
-        "gz" | "zst" | "bz2" | "xz" => bail!("{url}: compressed files aren't read yet: Parquet, CSV, JSON and Arrow as they are"),
-        _ => bail!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"),
+    if is_blob(url) {
+        return Err(given(format!("{url}: a bare blob: name has no extension, so it says no format: read the tab's file with read_csv('…'), read_json('…') or read_parquet('…')")));
+    }
+    let path = path_of(url);
+    let stem = unwrapped(&path).0;
+    let (format, mut options) = match stem.rsplit('.').next().unwrap_or_default() {
+        "parquet" | "pq" => ("parquet", BTreeMap::new()),
+        "csv" => ("csv", BTreeMap::new()),
+        "tsv" => ("csv", BTreeMap::from([("delim".to_string(), "\t".to_string())])),
+        "json" | "ndjson" | "jsonl" => ("json", BTreeMap::new()),
+        "arrow" | "feather" | "ipc" => ("arrow", BTreeMap::new()), // (Arrow's file format: IPC with a footer)
+        _ => return Err(given(format!("{url}: which format? name files by their extension (.parquet, .csv, .json, .arrow; compressed: .csv.gz, .json.zst), or read them with read_parquet(…), read_csv(…), read_json(…) or read_arrow(…)"))),
+    };
+    options.extend(name_options(format, url)?);
+    Ok((format.into(), options))
+}
+
+/// A compression as a `compression` option or a name says it (`gzip` or `gz`, `zst`, `GZIP`, …): DataFusion's variant, and
+/// UNCOMPRESSED for none (`""`, `uncompressed`). Anything else is refused by its name.
+pub(crate) fn compression_named(c: &str) -> Result<CompressionTypeVariant> {
+    Ok(match c.to_ascii_lowercase().as_str() {
+        "" | "uncompressed" => CompressionTypeVariant::UNCOMPRESSED,
+        "gzip" | "gz" => CompressionTypeVariant::GZIP,
+        "zstd" | "zst" => CompressionTypeVariant::ZSTD,
+        "bzip2" | "bz2" => CompressionTypeVariant::BZIP2,
+        "xz" => CompressionTypeVariant::XZ,
+        other => return Err(given(format!("compression {other}: gzip, zstd, bzip2 or xz (or uncompressed)"))),
     })
+}
+
+/// The compression a reader's or a writer's `compression` option names; UNCOMPRESSED when it has none.
+pub(crate) fn compression_in(options: &BTreeMap<String, String>) -> Result<CompressionTypeVariant> {
+    compression_named(options.get("compression").map_or("", String::as_str))
+}
+
+/// The compression a CSV or JSON file is read through: the spec's `compression`, which is its name's ending or the option the
+/// call gave. DataFusion decodes it where the server is built (`datafusion/compression`, the `server` feature); a page has no
+/// decoder, so a compressed file is refused by name there, as the page can't read it.
+pub(crate) fn compression(spec: &Spec) -> Result<FileCompressionType> {
+    let variant = compression_in(&spec.options)?;
+    decoded_here(variant, cfg!(feature = "server"), &spec.urls)?;
+    Ok(variant.into())
+}
+
+/// A read call refused for what it was given (its files, options or their values): 22023, as Postgres refuses a bad
+/// argument, not XX000 (audit 10-31 L12's siblings).
+fn given(message: String) -> anyhow::Error { crate::codes::coded("22023", message) }
+
+/// Whether a file compressed with `variant` can be read where `decoders` says DataFusion's are built: refused 0A000 (a feature
+/// this form lacks) when not, naming the files and the forms that read them.
+fn decoded_here(variant: CompressionTypeVariant, decoders: bool, urls: &[String]) -> Result<()> {
+    match variant == CompressionTypeVariant::UNCOMPRESSED || decoders {
+        true => Ok(()),
+        false => Err(crate::codes::coded("0A000", format!("{}: compressed CSV and JSON are read by the server, the shell and `pondra sql`; in the page, uncompressed", urls.join(", ")))),
+    }
 }
 
 /// A URL's scheme, if it names one Pondra reads (not a path on this machine).
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the node's readers call it; a page's build doesn't yet)
 pub(crate) fn scheme(url: &str) -> Option<&str> {
+    if is_blob(url) {
+        return Some("blob");
+    }
     let s = url.split_once("://")?.0;
     ["s3", "r2", "gs", "gcs", "az", "azure", "abfs", "abfss", "http", "https", "kafka", "file"].contains(&s).then_some(s)
 }
 
-/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query).
+/// A `blob:` URL: a browser tab's own file (`blob:https://o/uuid` in Chromium, `blob:nodedata:uuid` in Node). Only the
+/// tab that made it reads it: it is never a path, a lake's file, or a secret's (`ext.rs`, `off_page`).
+pub fn is_blob(url: &str) -> bool { url.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("blob:")) } // (a scheme in any case, as URLs read it)
+
+/// The one name DataFusion reads a blob URL by: `blob:///` and the URL in base64url (no padding), which has no `/`, `*`
+/// or `[` for a path or a glob to read. `blob_of` gives the URL back, and `ext::register` reads it through the page's
+/// blob store (`blob_with`).
+pub fn stand_in(blob: &str) -> String { format!("blob:///{}", B64.encode(blob)) }
+
+/// The blob URL a stand-in names (`stand_in`'s inverse): None for any other name.
+pub fn blob_of(stand_in: &str) -> Option<String> {
+    let url = String::from_utf8(B64.decode(stand_in.strip_prefix("blob:///")?).ok()?).ok()?;
+    is_blob(&url).then_some(url)
+}
+
+/// Where a URL's glob starts (`*`, `[`; `?` too, but not in a web address: its query). A blob URL has none: its `[` (an IPv6
+/// origin's) is its address's.
 pub(crate) fn glob_at(u: &str) -> Option<usize> {
+    if is_blob(u) {
+        return None;
+    }
     let web = u.starts_with("http");
     u.char_indices().find(|(_, c)| *c == '*' || *c == '[' || (*c == '?' && !web)).map(|(i, _)| i)
 }
 
-/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs).
+/// A URL as DataFusion lists it, its glob split off (DataFusion splits only paths' globs). A blob URL is listed by its stand-in.
 pub(crate) fn listing_url(u: &str) -> Result<ListingTableUrl> {
+    if is_blob(u) {
+        return Ok(ListingTableUrl::parse(stand_in(u))?);
+    }
     let Some(at) = glob_at(u).filter(|_| u.split_once("://").is_some_and(|(s, _)| s != "file")) else { return Ok(ListingTableUrl::parse(u)?) };
     let cut = u[..at].rfind('/').map_or(0, |j| j + 1);
     let (prefix, glob) = u.split_at(cut);
@@ -254,10 +380,10 @@ pub(crate) fn file_format(spec: &Spec, state: &dyn datafusion::catalog::Session)
     let byte = |k: &str, v: &str| -> Result<u8> { v.bytes().next().filter(|_| v.len() == 1).with_context(|| format!("{k} is one character, not {v:?}")) };
     Ok(match spec.format.as_str() {
         "parquet" => Arc::new(ParquetFormat::default().with_options(state.default_table_options().parquet)),
-        "json" => Arc::new(JsonFormat::default()),
+        "json" => Arc::new(JsonFormat::default().with_file_compression_type(compression(spec)?)),
         "arrow" => Arc::new(datafusion::datasource::file_format::arrow::ArrowFormat),
         "csv" => {
-            let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false"));
+            let mut f = CsvFormat::default().with_has_header(o("header").is_none_or(|h| h != "false")).with_file_compression_type(compression(spec)?);
             if o("all_varchar").is_some_and(|v| v != "false") {
                 f = f.with_schema_infer_max_rec(0); // (no inference: every column is text, as DuckDB's all_varchar reads it)
             }
@@ -276,11 +402,11 @@ pub(crate) fn file_format(spec: &Spec, state: &dyn datafusion::catalog::Session)
             match o("new_line") {
                 None | Some("\n" | "\r\n" | "\\n" | "\\r\\n") => {} // (either, as read)
                 Some("\r" | "\\r") => f = f.with_terminator(Some(b'\r')),
-                Some(t) => bail!("new_line is \\n, \\r\\n or \\r, not {t:?}"),
+                Some(t) => return Err(given(format!("new_line is \\n, \\r\\n or \\r, not {t:?}"))),
             }
             Arc::new(f)
         }
-        f => bail!("files as {f}: parquet, csv, json or arrow"),
+        f => return Err(given(format!("files as {f}: parquet, csv, json or arrow"))),
     })
 }
 
@@ -320,7 +446,7 @@ pub async fn listed(state: &SessionState, spec: &Spec, none: impl Fn(&str) -> Op
     for u in &spec.urls {
         let url = listing_url(u)?;
         let store = state.runtime_env().object_store(&url)?;
-        let wanted = if u.ends_with('/') { format!(".{}", spec.format) } else { String::new() }; // (a folder: its files of that format)
+        let wanted = if u.ends_with('/') { format!(".{}{}", spec.format, compression(spec)?.get_ext()) } else { String::new() }; // (a folder: its files of that format, compressed as it is)
         let objects: Vec<ObjectMeta> = url.list_all_files(&state, store.as_ref(), &wanted).await?.try_collect().await?;
         if objects.is_empty() {
             if let Some(e) = none(u) {
@@ -382,7 +508,7 @@ pub fn retyped(schema: &SchemaRef, types: &[(String, DataType)]) -> Result<Schem
     for (name, t) in types {
         let Some(field) = fields.iter_mut().find(|f| f.name() == name) else {
             let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-            bail!("types names {name}, which the files don't have: their columns are {}", columns.join(", "))
+            return Err(crate::codes::coded("42703", format!("types names {name}, which the files don't have: their columns are {}", columns.join(", "))));
         };
         *field = Arc::new(field.as_ref().clone().with_data_type(t.clone()));
     }
@@ -461,11 +587,15 @@ pub fn keys(found: &[Found], spec: &Spec, hive_types: &[FieldRef], columns: &[(S
     let asked = spec.options.get("hive_partitioning").map(|v| v != "false" && v != "0").or((!hive_types.is_empty()).then_some(true));
     let names: Vec<Vec<String>> = if asked == Some(false) { vec![] } else { found.iter().map(|f| folders(&f.url, &f.object).into_iter().map(|(k, _)| k).collect()).collect() };
     let same = names.windows(2).all(|w| w[0] == w[1]);
-    ensure!(same || asked != Some(true), "{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), names[0].join("/"));
+    if !same && asked == Some(true) {
+        return Err(given(format!("{}: files in other folders than {} (hive_partitioning)", spec.urls.join(", "), names[0].join("/"))));
+    }
     let folder_keys = if same { names.first().cloned().unwrap_or_default() } else { vec![] };
     let mut out: Vec<(String, String)> = vec![];
     for (i, k) in folder_keys.iter().enumerate() {
-        ensure!(!columns.iter().chain(&out).any(|(c, _)| c == k), "{k} is a folder's key and a column in the files");
+        if columns.iter().chain(&out).any(|(c, _)| c == k) {
+            return Err(crate::codes::coded("42701", format!("{k} is a folder's key and a column in the files")));
+        }
         let values: Vec<String> = found.iter().filter_map(|f| hive_value(folders(&f.url, &f.object).get(i)?.1.as_str())).collect();
         let typed = hive_types.iter().find(|f| f.name() == k).map(|f| crate::answer::type_name(f.data_type()));
         out.push((k.clone(), typed.unwrap_or_else(|| hive_type(&values).into())));
@@ -798,5 +928,134 @@ mod tests {
         let err = read_files(&ctx, &[("mem:///c/b.csv", "")], &schema, &spec).await.unwrap().collect().await.unwrap_err();
         let refusal = crate::casts::parse_refusal(&err.to_string()).expect("the reader's refusal, in its words");
         assert_eq!(crate::codes::words(&anyhow::Error::from(refusal)), r#"invalid input syntax for type integer: "2.5""#);
+    }
+
+    /// A name's compression ending is read as the format before it, with the compression as an option: `x.csv.gz` is gzip-ed
+    /// CSV, and `.tsv` keeps its tab. Parquet and Arrow with an ending are refused, and a name with no format says so.
+    #[test]
+    fn compressed_names_are_their_format_compressed() {
+        let with = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
+        assert_eq!(format_of("s3://b/x.csv.gz").unwrap(), ("csv".to_string(), with(&[("compression", "gzip")])));
+        assert_eq!(format_of("x.CSV.ZST?v=1").unwrap(), ("csv".to_string(), with(&[("compression", "zstd")])));
+        assert_eq!(format_of("x.csv.bz2").unwrap().1["compression"], "bzip2");
+        assert_eq!(format_of("x.csv.xz").unwrap().1["compression"], "xz");
+        assert_eq!(format_of("dir/x.tsv.gz").unwrap(), ("csv".to_string(), with(&[("compression", "gzip"), ("delim", "\t")])));
+        assert_eq!(format_of("x.jsonl.zst").unwrap(), ("json".to_string(), with(&[("compression", "zstd")])));
+        assert_eq!(format_of("x.ndjson.bz2").unwrap(), ("json".to_string(), with(&[("compression", "bzip2")])));
+        assert_eq!(format_of("x.csv").unwrap(), ("csv".to_string(), BTreeMap::new()));
+        assert_eq!(compression_of("x.parquet"), None);
+        for name in ["x.parquet.gz", "x.arrow.zst"] {
+            assert!(format_of(name).unwrap_err().to_string().contains("compressed inside the file"), "{name}");
+        }
+        assert!(format_of("x.gz").unwrap_err().to_string().contains("which format?"));
+        assert_eq!(name_options("json", "x.txt").unwrap(), BTreeMap::new());
+        assert_eq!(name_options("delta", "x.gz").unwrap(), BTreeMap::new(), "a table's folder isn't a file");
+    }
+
+    /// A compression as an option says it, in any of DataFusion's spellings; anything else is refused by its name.
+    #[test]
+    fn compression_options_take_their_names() {
+        assert_eq!(compression_named("gz").unwrap(), CompressionTypeVariant::GZIP);
+        assert_eq!(compression_named("ZSTD").unwrap(), CompressionTypeVariant::ZSTD);
+        assert_eq!(compression_named("bz2").unwrap(), CompressionTypeVariant::BZIP2);
+        assert_eq!(compression_named("xz").unwrap(), CompressionTypeVariant::XZ);
+        assert_eq!(compression_named("uncompressed").unwrap(), CompressionTypeVariant::UNCOMPRESSED);
+        assert!(compression_named("lz4").unwrap_err().to_string().starts_with("compression lz4: gzip, zstd, bzip2 or xz"));
+    }
+
+    /// The reading functions take a name's compression, or the call's own, and refuse a list whose names disagree and a
+    /// compressed Parquet or Arrow name.
+    #[test]
+    fn read_calls_take_the_names_compression() {
+        let read = |sql: &str| spec(&table(&table_of(sql)).unwrap().unwrap()).unwrap();
+        assert_eq!(read("read_csv('a.csv.gz')").options["compression"], "gzip");
+        assert_eq!(read("read_csv('a.csv.gz', compression => 'zstd')").options["compression"], "zstd");
+        assert_eq!(read("read_json('a.jsonl.zst')").options["compression"], "zstd");
+        assert_eq!(read("read_json('a.jsonl', compression => 'xz')").options["compression"], "xz");
+        assert_eq!(read("read_csv(['a.csv.gz', 'b.csv.gz'])").options["compression"], "gzip");
+        assert!(read("read_csv('a.csv')").options.get("compression").is_none());
+        let mixed = table(&table_of("read_csv(['a.csv', 'b.csv.gz'])")).unwrap_err();
+        assert!(mixed.to_string().contains("compressed differently"), "{mixed}");
+        let parquet = table(&table_of("read_parquet('a.parquet.gz')")).unwrap_err();
+        assert!(parquet.to_string().contains("compressed inside the file"), "{parquet}");
+        let option = table(&table_of("read_parquet('a.parquet', compression => 'gzip')")).unwrap_err();
+        assert!(option.to_string().contains("no option compression"), "{option}");
+    }
+
+    /// A folder of gzip-ed CSV files is listed by its `.csv.gz` files (not its plain `.csv` ones) and read as a table of CSV.
+    #[tokio::test]
+    async fn a_folder_of_gzip_csv_reads_as_csv() {
+        use std::io::Write;
+        let ctx = SessionContext::new();
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+        gz.write_all(b"id,name\n1,ann\n2,bo\n").unwrap();
+        let body = gz.finish().unwrap();
+        for key in ["g/a.csv.gz", "g/plain.csv"] {
+            store.put(&Path::from(key), PutPayload::from(bytes::Bytes::from(body.clone()))).await.unwrap();
+        }
+        ctx.register_object_store(&url::Url::parse("mem://").unwrap(), store);
+        let spec = Spec { urls: vec!["mem:///g/".to_string()], format: "csv".to_string(), options: BTreeMap::from([("compression".to_string(), "gzip".to_string())]) };
+        let state = ctx.state();
+        let found = listed(&state, &spec, |_| None).await.unwrap();
+        assert_eq!(found.iter().map(|f| f.full()).collect::<Vec<_>>(), ["mem:///g/a.csv.gz"]);
+        let schema = schema_of(&state, &spec, &found).await.unwrap();
+        assert_eq!(schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(), ["id", "name"]);
+        let batches = read_files(&ctx, &[("mem:///g/a.csv.gz", "")], &schema, &spec).await.unwrap().collect().await.unwrap();
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A blob URL's stand-in round-trips through DataFusion and back: `stand_in` → `ListingTableUrl::parse` → the store's path →
+    /// `Found::full` → parse again, unchanged, and `blob_of` gives the URL back. Chromium's opaque form, Node's, and an IPv6
+    /// origin (whose `[` no glob may read) all pass; a stand-in names no glob.
+    #[test]
+    fn a_blob_url_round_trips_through_its_stand_in() {
+        for blob in ["blob:https://o/6f1c0e2a-uuid", "blob:nodedata:6f1c0e2a-uuid", "blob:https://[::1]:8080/u"] {
+            let name = stand_in(blob);
+            assert!(glob_at(&name).is_none() && glob_at(blob).is_none(), "{blob}");
+            assert_eq!(scheme(blob), Some("blob"));
+            assert_eq!(blob_of(&name).as_deref(), Some(blob));
+            let url = listing_url(blob).unwrap();
+            assert_eq!(url.object_store().as_str(), "blob:///", "the store URL; the registry key it is read through is blob://");
+            let object = ObjectMeta { location: Path::from(url.prefix().as_ref()), last_modified: chrono::DateTime::UNIX_EPOCH, size: 4, e_tag: None, version: None };
+            let found = Found { store: Arc::new(InMemory::new()), url, object };
+            let full = found.full();
+            assert_eq!(full, name, "{blob}");
+            assert_eq!(blob_of(&full).as_deref(), Some(blob));
+            let again = ListingTableUrl::parse(&full).unwrap();
+            assert_eq!(again.as_str(), ListingTableUrl::parse(&name).unwrap().as_str());
+            assert_eq!(again.prefix().as_ref(), found.object.location.as_ref(), "the file is its stand-in's path");
+        }
+        assert_eq!(blob_of("blob:///not-base64!"), None);
+        assert_eq!(blob_of("https://o/u"), None);
+    }
+
+    /// A blob URL is one file, never a path or a lake's name: `lake_files::relative` leaves it be, and a bare `'blob:…'` (no
+    /// reader) is refused by name, with the readers' names. Read by a reader, it is the file's spec, its URL as written.
+    #[test]
+    fn a_blob_url_is_read_by_a_reader_and_never_as_a_path() {
+        let blob = "blob:https://o/6f1c0e2a-uuid";
+        assert!(crate::lake_files::relative("mem:///", blob).is_none(), "not the lake's file");
+        let bare = format_of(blob).unwrap_err();
+        assert!(bare.to_string().contains("read_csv"), "{bare}");
+        assert_eq!(crate::codes::of(&bare), "22023");
+        let name = table(&table_of(&format!("read_csv('{blob}')"))).unwrap().unwrap();
+        let spec = spec(&name).unwrap();
+        assert_eq!((spec.urls.as_slice(), spec.format.as_str()), ([blob.to_string()].as_slice(), "csv"));
+        assert!(table(&table_of(&format!("'{blob}'"))).is_err());
+    }
+
+    #[test]
+    fn a_read_calls_refusals_carry_their_codes() {
+        // (audit 10-31 L12: a page has no decoder, so a compressed file is a feature it lacks, 0A000, not XX000)
+        let urls = ["x.csv.gz".to_string()];
+        assert_eq!(crate::codes::of(&decoded_here(CompressionTypeVariant::GZIP, false, &urls).unwrap_err()), "0A000");
+        assert!(decoded_here(CompressionTypeVariant::GZIP, true, &urls).is_ok() && decoded_here(CompressionTypeVariant::UNCOMPRESSED, false, &urls).is_ok());
+        // (its siblings: what a call is given, refused 22023, as Postgres refuses a bad argument)
+        assert_eq!(crate::codes::of(&compression_named("lzma").unwrap_err()), "22023");
+        assert_eq!(crate::codes::of(&format_of("x.txt").unwrap_err()), "22023");
+        assert_eq!(crate::codes::of(&name_options("parquet", "x.parquet.gz").unwrap_err()), "22023");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        assert_eq!(crate::codes::of(&retyped(&schema, &[("zip".into(), DataType::Utf8)]).unwrap_err()), "42703");
     }
 }

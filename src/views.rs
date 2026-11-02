@@ -19,13 +19,16 @@
 //! * A session view (`sessions`) holds each key's sessions, a session being its rows with no gap
 //!   of `gap_secs` between them, each emitted once, when the watermark passes its last row plus
 //!   the gap. A row that falls inside a session already emitted is late, and left out.
+use crate::codes::coded;
 use crate::query::{first_table, over, session, session_at};
+use crate::reset::Once as _;
 use crate::store::*;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::{Expr, LogicalPlan};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct View {
@@ -57,6 +60,13 @@ pub struct View {
     /// Kept current by key (ADR-056): the groups new and changed rows touch, worked out again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rerun: Option<crate::rerun::Rerun>,
+    /// A MATCH_RECOGNIZE with EMIT FINAL (`matches.rs`): each match written once, when it is decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matches: Option<crate::matches::Matches>,
+    /// The plain views (`CREATE VIEW`) written into its query when it was made (`written_in`): while it reads them, they
+    /// can't be replaced or dropped (`made_from`), or it would go on with their old query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub from: Vec<String>,
 }
 
 /// A view that keeps each group once, when it's over (`EMIT FINAL`). Its GROUP BY has one
@@ -202,17 +212,23 @@ impl View {
     }
     /// Are its rows derived as flushes are packed (`derive`)? Sessions are cut as they close,
     /// stream joins and views kept by key run once rows commit.
-    pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() }
+    pub fn inline(&self) -> bool { self.sessions.is_none() && self.join.is_none() && self.rerun.is_none() && self.matches.is_none() }
 }
 
 /// A view's stored text as it was written, with the measures' and MATCH_RECOGNIZE's rewrites taken back
 /// (`measures::written`, `pattern::shown`): what every door that shows a definition shows.
 pub fn shown(sql: &str) -> String { crate::pattern::shown(&crate::measures::written(sql)).into_owned() }
 
+/// What a caller may see of a view's query, or of a name or expression taken from it: `text`, for a caller who may see
+/// code (`auth::shows_code`), and nothing for any other user. A view's query names the tables under it and the filters
+/// that keep rows out, so a user granted only the view is not shown them, as a routine's code is not (S27).
+pub fn code_for_caller<T>(text: impl FnOnce() -> T) -> Option<T> { crate::auth::shows_code().then(text) }
+
 /// The producers a view's rows are written under (what goes when it is dropped or detached).
 pub fn producers(name: &str) -> Vec<String> {
     let mut p: Vec<String> = ["emit", "join", "fill"].iter().map(|p| format!("{p}:{name}")).collect();
     p.extend([crate::rerun::producer(name), format!("{}:deleted", crate::rerun::producer(name))]);
+    p.extend(crate::matches::producers(name));
     p
 }
 
@@ -270,7 +286,9 @@ pub fn options(kv: &std::collections::BTreeMap<String, String>) -> Result<Option
         Some(e) => bail!("emit = '{e}': a view's query ends EMIT FINAL to keep each group once, when it's over"),
         None => false,
     };
-    ensure!(!once || !kv.contains_key("window"), "EMIT FINAL finds its window in the GROUP BY: leave out window = '…' and size_secs");
+    if once && kv.contains_key("window") {
+        return Err(coded("0A000", "EMIT FINAL finds its window in the GROUP BY: leave out window = '…' and size_secs"));
+    }
     ensure!(idle_secs.is_none() || once || kv.contains_key("session"), "idle moves time on for a view that keeps what is over: its query ends EMIT FINAL");
     let slide_secs = kv.get("slide_secs").map(|_| num("slide_secs", 0)).transpose()?;
     let emit = kv.get("window").map(|w| Ok::<_, anyhow::Error>(Emit { window: w.clone(), size_secs: num("size_secs", 60)?, lateness_secs, time: None, slide_secs })).transpose()?;
@@ -409,9 +427,192 @@ pub fn constraints(sql: &str) -> Result<Option<(String, Vec<Expect>)>> {
 /// A session view's bound: no session still open starts before this (µs).
 fn open_key(name: &str) -> String { format!("w/{name}") }
 
+/// The refusal of a view that takes each row once (`what`: sessions, stream joins, pattern views with EMIT FINAL)
+/// over `source`, whose rows are replaced: `kept`, a view kept by key, or a view that follows one row by row
+/// (`replaced`). Its rows are replaced as their groups are worked out again (0A000).
+pub(crate) fn kept_by_key(source: &str, kept: &str, name: &str, what: &str) -> anyhow::Error {
+    coded("0A000", format!("{}: its rows are replaced as their groups are worked out again, and {what} take each row once. Make {name} from {kept}'s own source", replaced_said(source, kept)))
+}
+
+/// `source`, whose rows `kept`'s replace, in words: "a is kept by key", or "b follows a, which is kept by key".
+pub(crate) fn replaced_said(source: &str, kept: &str) -> String {
+    match source == kept {
+        true => format!("{source} is kept by key"),
+        false => format!("{source} follows {kept}, which is kept by key"),
+    }
+}
+
+/// The view kept by key whose replaced rows reach `table`'s: itself, or one it follows through views that derive their
+/// rows from it as they come (`View::inline`: row by row, or adding up). Their rows are replaced, or taken back, as its
+/// groups are worked out again, so what takes each row once (sessions, stream joins, pattern views, windows) can't
+/// follow any of them. None for a table, or for a view whose rows are its own (sessions, a stream join, matches: none
+/// of which follows such a view).
+pub(crate) async fn replaced(lake: &Lake, table: &str) -> Result<Option<String>> {
+    let mut t = table.to_string();
+    for _ in 0..64 {
+        // (64: views follow views in a chain that ends; a loop can't be made, as a view follows a table that exists)
+        let Some(v) = lake.cat.get::<View>(&view_key(&t)).await? else { return Ok(None) };
+        if v.rerun.is_some() {
+            return Ok(Some(t));
+        }
+        if !v.inline() {
+            return Ok(None);
+        }
+        t = v.source;
+    }
+    Ok(None)
+}
+
+/// A view's query with its CTEs (`WITH t AS (…) … FROM t`) and the plain views it reads (`CREATE VIEW`) written in where
+/// they are read, as subqueries `(…) AS t`: the form a view follows its table through (`first_table`), and that its
+/// rows are kept by, as Postgres, Databricks and Snowflake take both. A plain view is read as it is now: the view keeps
+/// that text. A recursive CTE stays as written (a view can't follow one), and so does a query that isn't one SELECT; a
+/// write in a WITH (`WITH m AS (DELETE … RETURNING *)`), which runs once, is refused (0A000). A query with a
+/// MATCH_RECOGNIZE stays as written too: `pattern.rs` reads its input as written (a CTE, or a subquery it refuses by name).
+pub(crate) async fn written_in(lake: &Lake, sql: &str) -> Result<String> { Ok(writing_in(lake, sql).await?.0) }
+
+/// `written_in`, with the plain views written in, by their names in the catalog (each once, in order).
+async fn writing_in(lake: &Lake, sql: &str) -> Result<(String, Vec<String>)> {
+    use datafusion::sql::sqlparser::ast::{Query, Statement, TableAlias, TableFactor, VisitorMut};
+    use std::collections::HashMap;
+    use std::ops::ControlFlow;
+    if crate::text::contains_ci(sql, "match_recognize") {
+        return Ok((sql.to_string(), vec![])); // (written in, its CTE would be a subquery before the pattern: `pattern::refused`'s case)
+    }
+    let Ok(mut parsed) = datafusion::sql::sqlparser::parser::Parser::parse_sql(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql) else { return Ok((sql.to_string(), vec![])) };
+    let [Statement::Query(q)] = &mut parsed[..] else { return Ok((sql.to_string(), vec![])) };
+    let views: HashMap<String, String> = crate::query::stored_views(lake, sql, false).await?.into_iter().collect();
+    if q.with.is_none() && views.is_empty() {
+        return Ok((sql.to_string(), vec![])); // (nothing to write in: the text as written)
+    }
+    /// The CTEs in scope (innermost last), each its query (written in already) and its columns' names; the plain views by
+    /// name; and, for each query entered, whether it opened a scope.
+    struct In<'a> {
+        scopes: Vec<HashMap<String, (Query, Vec<datafusion::sql::sqlparser::ast::TableAliasColumnDef>)>>,
+        opened: Vec<bool>,
+        views: &'a HashMap<String, String>,
+        depth: usize,
+        read: &'a std::cell::RefCell<Vec<String>>,
+    }
+    impl VisitorMut for In<'_> {
+        type Break = anyhow::Error;
+        fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<anyhow::Error> {
+            // (a write in a WITH runs once, as a statement: a view that reruns its query can't hold one)
+            if let Some((cte, write)) = q.with.as_ref().and_then(|w| w.cte_tables.iter().find_map(|c| crate::text::write_of(&c.query).map(|w| (c, w)))) {
+                let name = crate::text::ident(&cte.alias.name);
+                return ControlFlow::Break(coded("0A000", format!("WITH {name} AS ({write} …): a view can't hold a write, which runs once: run it in a statement of its own, and make the view over the table it writes")));
+            }
+            let open = q.with.as_ref().is_some_and(|w| !w.recursive);
+            if let Some(with) = q.with.take_if(|w| !w.recursive) {
+                let mut scope = HashMap::new();
+                for cte in with.cte_tables {
+                    let mut body = *cte.query;
+                    self.scopes.push(scope.clone()); // (a CTE reads those before it)
+                    let walked = crate::walk::visit_mut(&mut body, self);
+                    self.scopes.pop();
+                    walked?;
+                    scope.insert(crate::text::ident(&cte.alias.name), (body, cte.alias.columns));
+                }
+                self.scopes.push(scope);
+            }
+            self.opened.push(open);
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<anyhow::Error> {
+            if self.opened.pop() == Some(true) {
+                self.scopes.pop();
+            }
+            ControlFlow::Continue(())
+        }
+        // (after its children: what it is replaced by is walked already, so a table inside a CTE that has the CTE's name is the table)
+        fn post_visit_table_factor(&mut self, t: &mut TableFactor) -> ControlFlow<anyhow::Error> {
+            let TableFactor::Table { name, alias, args: None, .. } = t else { return ControlFlow::Continue(()) };
+            let n = crate::text::object(name);
+            let shown = || name.0.last().and_then(|p| p.as_ident()).map_or_else(|| n.clone(), crate::text::ident);
+            let cte = (name.0.len() == 1).then(|| self.scopes.iter().rev().find_map(|s| s.get(&n))).flatten();
+            let (q, columns) = match cte {
+                Some((q, columns)) => (q.clone(), columns.clone()),
+                None => {
+                    let Some((stored, text)) = self.views.get_key_value(&n).or_else(|| self.views.get_key_value(n.strip_prefix("public.").unwrap_or(&n))) else { return ControlFlow::Continue(()) };
+                    if !self.read.borrow().contains(stored) {
+                        self.read.borrow_mut().push(stored.clone());
+                    }
+                    if self.depth > 16 {
+                        return ControlFlow::Break(anyhow::anyhow!("{n}: views read each other more than 16 deep"));
+                    }
+                    let mut q = match crate::expander::parse_query(text) {
+                        Ok(q) => q,
+                        Err(e) => return ControlFlow::Break(e.context(format!("the view {n}"))),
+                    };
+                    // (a plain view sees no CTE of the query that reads it)
+                    let mut inner = In { scopes: vec![], opened: vec![], views: self.views, depth: self.depth + 1, read: self.read };
+                    crate::walk::visit_mut(&mut q, &mut inner)?;
+                    (q, vec![])
+                }
+            };
+            // (a CTE's own column names, `WITH t(a, b) AS …`, go with it under whatever name it is read by)
+            let alias = match alias.clone() {
+                Some(a) if a.columns.is_empty() => Some(TableAlias { columns, ..a }),
+                Some(a) => Some(a),
+                None => Some(TableAlias { explicit: true, name: datafusion::sql::sqlparser::ast::Ident::new(shown()), columns, at: None }),
+            };
+            *t = TableFactor::Derived { lateral: false, subquery: Box::new(q), alias, sample: None };
+            ControlFlow::Continue(())
+        }
+    }
+    let read = std::cell::RefCell::new(vec![]);
+    if let ControlFlow::Break(e) = crate::walk::visit_mut(q.as_mut(), &mut In { scopes: vec![], opened: vec![], views: &views, depth: 0, read: &read }) {
+        return Err(e);
+    }
+    Ok((q.to_string(), read.into_inner()))
+}
+
+/// The table a view follows, by its name in this lake (`ddl::resolve`): refused 0A000 when it names another lake's.
+pub(crate) async fn followed(lake: &Lake, table: &str) -> Result<String> {
+    let (other, source) = crate::ddl::resolve(lake, table).await?;
+    if other.is_some() {
+        return Err(coded("0A000", "a view follows a table of this lake"));
+    }
+    Ok(source)
+}
+
 /// Register view `name` (leader only): its table gets the query's output columns; a GROUP BY
 /// query makes it a merge table keyed by the group columns.
 pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()> {
+    let (written_in, from) = writing_in(lake, sql).await?; // (its CTEs and the plain views it reads, as subqueries: a view follows a table)
+    Box::pin(made(lake, name, &written_in, sql, o)).await?;
+    if written_in != sql {
+        as_written(lake, name, sql, from).await?;
+    }
+    Ok(())
+}
+
+/// What a view was made from, kept once it is made (audit 11-01 M5): the plain views written into its query, which can't
+/// be replaced or dropped while it reads them (`made_from`), and its query as written, which `SHOW CREATE` and the listings
+/// show (`View::query`). (A view that keeps each group or match once, or sessions, shows its query its own way: `once::written`.)
+async fn as_written(lake: &Lake, name: &str, sql: &str, from: Vec<String>) -> Result<()> {
+    for key in [view_key(name), view_key(&crate::once::open(name))] {
+        let Some(mut v) = lake.cat.get::<View>(&key).await? else { continue };
+        let plain = v.once.is_none() && v.sessions.is_none() && v.matches.is_none();
+        if v.from == from && (!plain || v.written.as_deref() == Some(sql)) {
+            return Ok(()); // (made again, the same)
+        }
+        v.from = from;
+        if plain {
+            v.written = Some(sql.to_string());
+        }
+        return lake.cat.commit(vec![(key, json(&v))], &[]).await;
+    }
+    Ok(())
+}
+
+/// The materialized views made from plain view `name` (`View::from`), as a refusal names them.
+pub(crate) async fn made_from(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    Ok(lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.from.iter().any(|f| f == name)).map(|(k, _)| format!("materialized view {}", k[2..].strip_suffix("$open").unwrap_or(&k[2..]))).collect())
+}
+
+/// `create`'s view, of its query with its CTEs and plain views written in (`sql`); `as_written` is the query as written.
+async fn made(lake: &Lake, name: &str, sql: &str, as_written: &str, o: Options) -> Result<()> {
     if o.once {
         return crate::once::create(lake, name, sql, o).await; // (`EMIT FINAL`)
     }
@@ -427,19 +628,18 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     };
     if let Some(v) = lake.cat.get::<View>(&view_key(name)).await? {
         let windows = |e: &Option<Emit>| e.as_ref().map(|e| (e.window.clone(), e.size_secs, e.lateness_secs, e.slide_secs));
-        let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs));
+        let gaps = |s: &Option<Sessions>| s.as_ref().map(|s| (s.time.clone(), s.gap_secs, s.lateness_secs, s.idle_secs));
         let joins = |j: &Option<Join>| j.as_ref().map(|j| (j.time.clone(), j.within_secs));
         let onces = |o: &Option<Once>| o.as_ref().map(|o| (o.bucket.clone(), o.lateness_secs, o.idle_secs));
         let kept = v.rerun.as_ref().map(|r| if r.full.is_some() { Refresh::Full } else { Refresh::ByKey }).unwrap_or(Refresh::Incremental);
-        let same = v.query() == sql && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep)
+        let same = (v.query() == sql || v.query() == as_written) && windows(&v.emit) == windows(&emit) && gaps(&v.sessions) == gaps(&sessions) && joins(&v.join) == joins(&join) && v.expect == expect && onces(&v.once) == onces(&keep)
             && refresh.is_none_or(|r| r == kept) && v.rerun.as_ref().and_then(|r| r.lag_secs) == lag_secs;
         ensure!(same, "view {name} already exists, with other SQL or options");
         return Ok(()); // (asked again, the same: a notebook cell run twice)
     }
     ensure!(lake.cat.get::<TableMeta>(&table_key(name)).await?.is_none(), "table {name} already exists");
     crate::ddl::unclaimed(lake, name).await?;
-    let (other, source) = crate::ddl::resolve(lake, &first_table(sql)?).await?;
-    ensure!(other.is_none(), "a view follows a table of this lake");
+    let source = followed(lake, &first_table(sql)?).await?;
     let src: TableMeta = lake.cat.get::<TableMeta>(&table_key(&source)).await?.with_context(|| format!("no table {source}"))?.logical(); // (SQL's names: ADR-022)
     // A view of a view: a flow (ADR-036 §1's pipeline). Its rows are derived from the other's in the
     // same flush, so in the same commit (`derive`). A GROUP BY view's table keeps partial rows,
@@ -454,7 +654,11 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     };
     ensure!(history.is_none() || (sessions.is_none() && join.is_none() && emit.is_none()), "a history view keeps each version as it comes: not with windows, sessions or a stream join");
     ensure!(expect.is_empty() || (sessions.is_none() && join.is_none() && emit.is_none()), "expectations check a view's rows as it writes them: a view that emits windows or sessions, or joins streams, writes them later. Put them on a view before it");
-    ensure!(upstream.as_ref().is_none_or(|u| u.rerun.is_none()) || (sessions.is_none() && join.is_none()), "{source} is kept by key: its rows are replaced as their groups are worked out again, and sessions and stream joins take each row once. Make {name} from {source}'s own source");
+    // (a view kept by key, or one that follows such a view row by row: its rows are replaced as their groups are worked out again)
+    let replaced_by = replaced(lake, &source).await?;
+    if let (Some(k), Some(_)) = (&replaced_by, &sessions) {
+        return Err(kept_by_key(&source, k, name, "sessions"));
+    }
     if let Some(s) = sessions {
         ensure!(emit.is_none() && join.is_none(), "a view emits windows or sessions, or joins streams: one of them");
         ensure!(!partial, "{source} is a GROUP BY view, whose table keeps partial rows: sessions are cut from rows, so make {name} from {source}'s own source");
@@ -541,18 +745,23 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     // (row by row over a table, or over a view that is, or one kept by key, whose rows change:
     // then a row keeps its first source row's id)
     let ids = merge.is_empty() && alone(&plan, false) && upstream.as_ref().is_none_or(|u| u.ids || u.rerun.is_some());
-    if upstream.as_ref().is_some_and(|u| u.rerun.is_some()) {
+    if let Some(k) = &replaced_by {
         // (its rows are replaced as their groups are worked out again: what follows must take them back)
+        let again = match k == &source {
+            true => format!("{source} runs its query again"),
+            false => format!("{source} follows {k}, which runs its query again"),
+        };
         let subtracts = !merge.is_empty() && alone(&plan, true) && merge.values().all(|f| ["sum", "count", crate::finish::MOMENTS].contains(&f.as_str())) && merge.values().any(|f| f == "count");
         if !(ids || subtracts) && plain && refresh.is_none() {
-            let why = format!("{source} runs its query again, replacing its rows, and only a view row by row or of sums and counts takes them back");
+            let why = format!("{again}, replacing its rows, and only a view row by row or of sums and counts takes them back");
             return match fits {
                 true => rerun(crate::rerun::How::ByKey, Some(format!("{why}: the groups a change touches are worked out again"))).await,
                 false => whole(why).await,
             };
         }
-        ensure!(emit.is_none() && keep.is_none() && history.is_none() && (ids || subtracts),
-            "{source} runs its query again: its rows are replaced as it works them out, so a view of it takes rows back: row by row, or a GROUP BY of sums and counts (with count(*)), or one that runs its query again itself (WITH (refresh = 'full'))");
+        if !(emit.is_none() && keep.is_none() && history.is_none() && (ids || subtracts)) {
+            return Err(coded("0A000", format!("{again}: its rows are replaced as it works them out, so a view of it takes rows back: row by row, or a GROUP BY of sums and counts (with count(*)), or one that runs its query again itself (WITH (refresh = 'full'))")));
+        }
     }
     ensure!(expect.is_empty() || merge.is_empty(), "{name} is a GROUP BY view: its table keeps partial rows, so expectations can't check its totals. Put them on the rows before it (a view of {source} without GROUP BY, which {name} then follows)");
     if let Some(h) = &history {
@@ -605,7 +814,7 @@ pub async fn create(lake: &Lake, name: &str, sql: &str, o: Options) -> Result<()
     }
     let fill = Some(Fill { id: uuid::Uuid::new_v4().to_string(), upto: None }); // (from the rows already there)
     let written = finish.is_some().then(|| written.to_string());
-    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None })));
+    puts.push((view_key(name), json(&View { source, sql: sql.into(), emit, sessions: None, ids, join: None, fill, expect, once: keep, written, rerun: None, matches: None, from: vec![] })));
     lake.cat.commit(puts, &[]).await
 }
 
@@ -637,7 +846,7 @@ async fn finished(lake: &Lake, ctx: &datafusion::prelude::SessionContext, sql: &
 }
 
 /// `pondra$expectations`: what each view's expectations failed, and its late rows (`once::late`).
-fn expected_table(lake: &Lake) -> TableMeta {
+pub(crate) fn expected_table(lake: &Lake) -> TableMeta {
     let s = |c: &str| (c.to_string(), "Utf8".to_string());
     let columns = vec![s("view"), s("id"), s("expectation"), s("action"), ("failed".into(), "Int64".into())];
     let key = ["view", "id", "expectation", "action"].map(String::from).to_vec();
@@ -741,7 +950,7 @@ async fn create_sessions(lake: &Lake, name: &str, sql: &str, source: String, src
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, &with, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: lake.visible(), sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: Some(s), ids: false, join: None, fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
     lake.cat.commit(vec![(view_key(name), json(&view)), (table_key(name), json(&meta))], &[]).await
 }
 
@@ -789,46 +998,234 @@ fn event_time(plan: &LogicalPlan, window: &str) -> Option<String> {
     Some(c.name.clone())
 }
 
-/// Leader: emit what the watermark has passed, once, for every window and session view (one
-/// that fails is tried again next round; the others go on).
-pub async fn emit_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
+/// How a view's runs have gone on this node: how many failed in a row, and the last one's error.
+#[derive(Default)]
+pub(crate) struct Failures {
+    pub(crate) failures: u32,
+    error: Option<String>,
+}
+
+impl Failures {
+    /// A run ended: `error` None if it worked. `what` starts the log line ("emission of v", "materialized view v"); an
+    /// error is logged when it is new, not at every try.
+    pub(crate) fn note(&mut self, what: &str, error: Option<String>) {
+        match error {
+            None => (self.failures, self.error) = (0, None),
+            Some(e) => {
+                if self.error.as_ref() != Some(&e) {
+                    eprintln!("{what}: {e}");
+                }
+                (self.failures, self.error) = (self.failures + 1, Some(e));
+            }
+        }
+    }
+
+    /// The last error, once two runs in a row failed (one may be passing).
+    pub(crate) fn failing(&self) -> Option<String> {
+        if self.failures >= 2 { self.error.clone() } else { None }
+    }
+
+    /// The pause before the next run: none, then 1 s doubling to 30 s.
+    pub(crate) fn backoff(&self) -> std::time::Duration {
+        if self.failures == 0 { std::time::Duration::ZERO } else { std::time::Duration::from_secs((1u64 << self.failures.min(6)).min(60) / 2) }
+    }
+}
+
+/// A background view's runs on this node: one at a time, the next not before `after` (its failures' backoff).
+#[derive(Default)]
+struct Runs {
+    of: String, // (the view these runs are for: its `identity`)
+    running: bool,
+    after: Option<datafusion::common::instant::Instant>, // (a page's clock too: std's Instant has none there)
+    failed: Failures,
+}
+
+crate::per_node!(static RUNS: std::sync::Mutex<std::collections::HashMap<(String, String), Runs>> = Default::default());
+
+/// A view's turn to run here, given back by `ended` when its run ends (or by `drop`, when it stops unfinished).
+struct Turn {
+    key: (String, String),
+    what: &'static str,
+    done: bool,
+}
+
+/// `key`'s turn to run for the view `of` (`identity`), if it has none running and its backoff is over; the run is then its
+/// own. A view made again under the name has another identity: it starts afresh, once the old one's run has ended.
+fn turn_of(key: (String, String), of: &str, what: &'static str) -> Option<Turn> {
+    let mut runs = RUNS.lock().unwrap();
+    let run = runs.entry(key.clone()).or_default();
+    if run.of != of {
+        if run.running {
+            return None; // (the old view's run is still going: the new one waits for it to end)
+        }
+        *run = Runs { of: of.to_string(), ..Default::default() };
+    }
+    if run.running || run.after.is_some_and(|t| t > datafusion::common::instant::Instant::now()) {
+        return None;
+    }
+    run.running = true;
+    Some(Turn { key, what, done: false })
+}
+
+/// The turn of view `view` on `lake` to run, as `turn_of`.
+fn turn(lake: &Lake, view: &str, of: &str, what: &'static str) -> Option<Turn> {
+    turn_of((lake.url.clone(), view.to_string()), of, what)
+}
+
+/// Ends `key`'s run: its failures noted (`what` starts the log line), and the next run not before its backoff.
+fn record(key: &(String, String), what: &str, error: Option<String>) {
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner()); // (it runs in a Drop: a poisoned lock is used as it is)
+    let Some(run) = runs.get_mut(key) else { return }; // (its node stopped: its state is gone)
+    run.running = false;
+    run.failed.note(&format!("{what} {}", key.1), error);
+    run.after = (run.failed.failures > 0).then(|| datafusion::common::instant::Instant::now() + run.failed.backoff());
+}
+
+impl Turn {
+    /// The run ended with `out`.
+    fn ended(mut self, out: &Result<()>) {
+        self.done = true;
+        record(&self.key, self.what, out.as_ref().err().map(|e| format!("{e:#}")));
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        if !self.done {
+            record(&self.key, self.what, Some("its run stopped unfinished (a panic, or its node stopped)".into()));
+        }
+    }
+}
+
+/// Why `key`'s runs keep failing, if they do (two in a row), for the view `of`.
+fn failing_of(key: &(String, String), of: &str) -> Option<String> {
+    RUNS.lock().unwrap().get(key).filter(|run| run.of == of).and_then(|run| run.failed.failing())
+}
+
+/// Which view of its name `v` is: the id it was made with (its rerun's first, as rerun's runs know it by: `rerun::turn`;
+/// else its pattern's or its fill's), else its query (a session view, a stream join, a view made before Pondra 0.21: none
+/// has an id). A view made again under the same name has another, unless it is one without an id made again with the same
+/// query, which may keep the old one's failures.
+pub(crate) fn identity(v: &View) -> &str {
+    v.rerun.as_ref().map(|r| r.id.as_str()).or(v.matches.as_ref().map(|m| m.id.as_str())).or(v.fill.as_ref().map(|f| f.id.as_str())).unwrap_or(v.sql.as_str())
+}
+
+/// Why view `view`'s runs on `lake` keep failing, if they do: `pondra.flows`' `error`. `of`: the view's `identity`.
+pub fn failing(lake: &Lake, view: &str, of: &str) -> Option<String> {
+    failing_of(&(lake.url.clone(), view.to_string()), of)
+}
+
+/// Forgets the runs of views `lake` no longer has: `views` is every view it scans now (stream joins' too, so they are kept
+/// whatever their kind). Only names are compared here: a view made again under a name starts afresh at its next turn, as
+/// `turn_of` sees that its identity differs.
+fn forget_runs(lake: &Lake, views: &[(String, View)]) {
+    let names: std::collections::HashSet<&str> = views.iter().map(|(k, _)| &k[2..]).collect();
+    RUNS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(url, name), _| url != &lake.url || names.contains(name.as_str()));
+}
+
+crate::per_node!(
+    /// How many background view runs go at once on a node (`PONDRA_VIEW_RUNS`; half its cores, at least 2), rerun's
+    /// included. Taken inside a run's own task (a Semaphore is first come first served: every view gets its turn).
+    static SLOTS: std::sync::RwLock<Option<std::sync::Arc<tokio::sync::Semaphore>>> = Default::default());
+
+/// A slot for one background view run: waits until one is free.
+pub(crate) async fn slot() -> tokio::sync::OwnedSemaphorePermit {
+    let slots = SLOTS.get_or(|| std::sync::Arc::new(tokio::sync::Semaphore::new(crate::env::or("PONDRA_VIEW_RUNS", (crate::env::cores() / 2).max(2)).max(1))));
+    slots.acquire_owned().await.expect("never closed")
+}
+
+/// A background view run, stopped as a statement is once it has run `PONDRA_VIEW_RUN_SECS` (3600; 0: none): its future
+/// dropped, its stop flag set (`audit::stoppable`), so a MATCH_RECOGNIZE search still running ends too; 57014.
+pub(crate) async fn bounded(f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    bounded_by(crate::env::or("PONDRA_VIEW_RUN_SECS", 3600u64), f).await
+}
+
+async fn bounded_by(secs: u64, f: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if secs == 0 {
+        return crate::audit::stoppable(flag, f).await;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(secs), crate::audit::stoppable(flag, f))
+        .await
+        .unwrap_or_else(|_| Err(coded("57014", format!("a run went past {secs} s (PONDRA_VIEW_RUN_SECS) and was stopped; it is tried again later, and stopped again if it takes as long: a view whose whole run takes longer needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"))))
+}
+
+/// Start `name`'s run if it is its turn here: in a task of its own on the queries' runtime (invariant 231), once a slot is
+/// free; the view read again then (dropped meanwhile: nothing; made again: the new one), the run bounded, how it went noted.
+fn hand_out<F, Fut>(lake: &Arc<Lake>, name: &str, of: &str, what: &'static str, run: F)
+where
+    F: FnOnce(Arc<Lake>, String, View) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    let Some(turn) = turn(lake, name, of, what) else { return };
+    let (lake, name) = (lake.clone(), name.to_string());
+    crate::panics::aside(async move {
+        let _slot = slot().await;
+        let out = match lake.cat.get::<View>(&view_key(&name)).await {
+            Ok(Some(v)) => bounded(run(lake.clone(), name.clone(), v)).await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        turn.ended(&out);
+    });
+}
+
+/// Leader: start the runs of the views that emit windows, sessions, once or matches, each whose turn it is: in a task of
+/// its own, once a slot is free, bounded, and backed off after failures (a run that keeps failing shows its error in
+/// `pondra.flows`). A matches view's run writes through `seq`, under `lock`.
+pub async fn emit_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>, seq: &Arc<crate::log::Sequencer>, lock: &Arc<tokio::sync::Mutex<()>>) -> Result<()> {
     if crate::backup::frozen(lake) {
         return Ok(()); // (a backup emits nothing: ADR-070)
     }
-    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        let done = match (&v.emit, &v.sessions, &v.once) {
-            (Some(e), _, _) => emit(lake, log, &key[2..], &v, e).await,
-            (_, Some(s), _) => sessions(lake, log, &key[2..], &v, s).await,
-            (_, _, Some(o)) => crate::once::emit(lake, log, &key[2..], &v, o).await,
-            _ => Ok(()),
-        };
-        if let Err(e) = done {
-            eprintln!("emission of {}: {e:#}", &key[2..]);
+    let views = lake.cat.scan::<View>("v/", "v0").await?;
+    forget_runs(lake, &views);
+    crate::matches::forget(lake, &views);
+    for (key, v) in views {
+        if v.matches.is_none() && v.emit.is_none() && v.sessions.is_none() && v.once.is_none() {
+            continue;
         }
+        let (log, seq, lock) = (log.clone(), seq.clone(), lock.clone());
+        hand_out(lake, &key[2..], identity(&v), "emission of", move |lake, name, v| async move {
+            match (&v.matches, &v.emit, &v.sessions, &v.once) {
+                (Some(m), _, _, _) => crate::matches::run(&lake, &log, &seq, &lock, &name, &v, m).await,
+                (_, Some(e), _, _) => emit(&lake, &log, &name, &v, e).await,
+                (_, _, Some(s), _) => sessions(&lake, &log, &name, &v, s).await,
+                (_, _, _, Some(o)) => crate::once::emit(&lake, &log, &name, &v, o).await,
+                _ => Ok(()),
+            }
+        });
     }
     Ok(())
 }
 
-/// The newest event time `table` holds in `time`, in µs: what its files' ranges say, then each
-/// log row after them, read once (kept in memory per table; it only grows, as a watermark does).
-async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
+/// The part of a table a row's progress is counted in, for the watermark: each part's newest time is kept apart, and the
+/// watermark is the least of them (`watermark`). Today a table is one part, `""`. After 1.0 a feed's rows are counted per
+/// Kafka partition (its producer `feed:{view}:{p}`, ADR-073 step 9), so a partition behind holds the watermark back
+/// rather than seeing its rows counted late; this is where that goes.
+fn part_of(_producer: Option<&str>) -> &'static str { "" }
+
+/// The newest event time of each part of `table` in `time` (`part_of`), in µs: what its files' ranges say, then each
+/// log row after them, read once (kept in memory per table; each part only grows, as a watermark does). Empty when the
+/// table has no time yet.
+async fn newest_parts(lake: &Lake, table: &str, time: &str) -> Result<BTreeMap<String, i64>> {
     use datafusion::arrow::{array::AsArray, compute::{cast, max}, datatypes::{DataType, TimeUnit, TimestampMicrosecondType}};
     use datafusion::common::ScalarValue;
     use std::sync::Mutex;
-    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, Option<i64>)>> = Default::default());
+    crate::per_node!(static SEEN: Mutex<std::collections::HashMap<String, (u64, BTreeMap<String, i64>)>> = Default::default());
     let key = format!("{}|{table}|{time}", lake.url);
     let meta: TableMeta = lake.cat.get(&table_key(table)).await?.with_context(|| format!("no table {table}"))?;
     let stored = meta.stored(time).unwrap_or(time).to_string(); // (files' ranges know it by its stored name: ADR-022)
     let upto = lake.visible();
-    let (mut seen, mut newest) = SEEN.lock().unwrap().get(&key).copied().unwrap_or((0, None));
+    let (mut seen, mut parts) = SEEN.lock().unwrap().get(&key).cloned().unwrap_or((0, BTreeMap::new()));
     let us = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let part = part_of(None);
     if seen < meta.tiered {
         // (rows went into files since: their ranges say how new they were)
         let s = crate::answer::schema(&meta.columns)?;
         let ranges = crate::manifest::ranges(&crate::manifest::list(lake, &meta).await?, &meta.files, &s);
         if let Some((_, hi)) = ranges.get(&stored) {
-            if let ScalarValue::TimestampMicrosecond(v, _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
-                newest = newest.max(v);
+            if let ScalarValue::TimestampMicrosecond(Some(v), _) = ScalarValue::try_from_string(hi.clone(), s.field_with_name(&stored)?.data_type())?.cast_to(&us)? {
+                parts.entry(part.to_string()).and_modify(|n| *n = (*n).max(v)).or_insert(v);
             }
         }
         seen = meta.tiered;
@@ -836,37 +1233,55 @@ async fn newest(lake: &Lake, table: &str, time: &str) -> Result<Option<i64>> {
     if upto > seen {
         for b in crate::query::tail(lake, table, seen, Some(upto), false).await? {
             if let Some(c) = b.column_by_name(time) {
-                newest = newest.max(max(cast(c, &us)?.as_primitive::<TimestampMicrosecondType>()));
+                if let Some(v) = max(cast(c, &us)?.as_primitive::<TimestampMicrosecondType>()) {
+                    parts.entry(part.to_string()).and_modify(|n| *n = (*n).max(v)).or_insert(v);
+                }
             }
         }
         seen = upto;
     }
-    SEEN.lock().unwrap().insert(key, (seen, newest));
-    Ok(newest)
+    // (views run side by side: the state that read further is kept, and its parts with it)
+    let mut known = SEEN.lock().unwrap();
+    let kept = known.entry(key).or_insert((seen, parts.clone()));
+    if seen > kept.0 {
+        *kept = (seen, parts);
+    }
+    let out = kept.1.clone();
+    drop(known);
+    Ok(out)
+}
+
+/// The least watermark over `parts` (`newest_parts`), in µs: each part's newest time less the lateness, and with `idle_secs`
+/// moved on by how long that part has been quiet (`since`: the clock, in ms, from when its newest time was first seen, as
+/// `watermark` keeps it). None when there are no parts.
+fn least_of(parts: &BTreeMap<String, i64>, lateness_secs: u64, idle_secs: Option<u64>, since: impl Fn(&str, i64) -> u64, now: u64) -> Option<i64> {
+    parts.iter().map(|(part, &newest)| {
+        let wm = newest - (lateness_secs * 1_000_000) as i64;
+        let Some(idle) = idle_secs else { return wm };
+        let quiet = now.saturating_sub(since(part.as_str(), newest));
+        if quiet >= idle * 1000 { wm + (quiet * 1000) as i64 } else { wm }
+    }).min()
 }
 
 /// The watermark of a view over `table`'s `time`, in µs: its newest event time less the lateness.
 /// With `idle`, once no newer row has come for that long, it moves on with the clock from there
 /// (the leader's clock, from when it first saw that newest time), so a quiet source's last groups
 /// are kept too; off by default, since a table loaded in batches of older rows would see its next
-/// batch counted as late.
+/// batch counted as late. With several parts (`part_of`), each part's newest time less the lateness,
+/// moved on by `idle` as above, and the least of them (`least_of`).
 pub(crate) async fn watermark(lake: &Lake, table: &str, time: &str, lateness_secs: u64, idle_secs: Option<u64>) -> Result<Option<i64>> {
     use std::sync::Mutex;
     crate::per_node!(static SINCE: Mutex<std::collections::HashMap<String, (i64, u64)>> = Default::default());
-    let Some(newest) = newest(lake, table, time).await? else { return Ok(None) };
-    let wm = newest - (lateness_secs * 1_000_000) as i64;
-    let Some(idle) = idle_secs else { return Ok(Some(wm)) };
+    let parts = newest_parts(lake, table, time).await?;
     let now = crate::log::now_ms();
-    let since = {
+    Ok(least_of(&parts, lateness_secs, idle_secs, |part, newest| {
         let mut seen = SINCE.lock().unwrap();
-        let e = seen.entry(format!("{}|{table}|{time}", lake.url)).or_insert((newest, now));
-        if e.0 != newest {
+        let e = seen.entry(format!("{}|{table}|{time}|{part}", lake.url)).or_insert((newest, now));
+        if newest > e.0 {
             *e = (newest, now);
         }
         e.1
-    };
-    let quiet = now.saturating_sub(since);
-    Ok(Some(if quiet >= idle * 1000 { wm + (quiet * 1000) as i64 } else { wm }))
+    }, now))
 }
 
 /// A timestamp column's values in µs.
@@ -885,8 +1300,8 @@ async fn emit(lake: &Lake, log: &crate::log::Log, view: &str, v: &View, e: &Emit
         Some(t) => t.clone(),
         None => event_time(crate::engine::sql(&session(lake, &v.sql, "").await?, &crate::sys::planned(&v.sql)?).await?.logical_plan(), &e.window).context("a window view whose window has no event-time column")?,
     };
-    let Some(newest) = newest(lake, &v.source, &time).await? else { return Ok(()) };
-    let upto = newest - ((e.size_secs + e.lateness_secs) * 1_000_000) as i64; // windows starting at or before this have ended
+    // (a window starting at or before `upto` has ended: the watermark, with the window's size and lateness as its lateness)
+    let Some(upto) = watermark(lake, &v.source, &time, e.size_secs + e.lateness_secs, None).await? else { return Ok(()) };
     let (producer, final_table) = (format!("emit:{view}"), format!("{view}_final"));
     let done: u64 = lake.cat.get(&producer_key(&producer)).await?.unwrap_or(0);
     if upto <= done as i64 {
@@ -986,13 +1401,13 @@ pub async fn can_follow(lake: &Lake, table: &str, append: bool) -> Result<()> {
 /// What follows `table` and can't take its rows' changes, and why: its views, what follows them
 /// (a flow: a row-by-row view's rows change as its source's do; a GROUP BY view's partial rows
 /// taken back arrive as new ones), and its tasks.
-async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
+pub(crate) async fn cannot_follow(lake: &Lake, table: &str, append: bool) -> Result<Vec<String>> {
     let mut not = vec![];
     for (k, v) in lake.cat.scan::<View>("v/", "v0").await?.into_iter().filter(|(_, v)| v.follows(table)) {
         let name = &k[2..];
         let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
         let why = match () {
-            _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() => Some("emits windows or sessions once"),
+            _ if v.emit.is_some() || v.sessions.is_some() || v.once.is_some() || v.matches.is_some() => Some("emits windows, sessions or matches once"),
             _ if v.join.is_some() => Some("pairs two streams' rows as they arrive"),
             _ if v.rerun.is_some() => None, // (it works the groups a change touches out again)
             _ if !append => None,
@@ -1181,18 +1596,47 @@ pub async fn filling(lake: &Lake, table: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// The earliest commit up to which a view of `table` not filled yet reads its rows (`Fill::upto`),
+/// and that view, if any. `tier::tier_table` folds a keyed table's log no further meanwhile: its
+/// files hold one row per key, as of the last commit folded in, so a key's rows folded from both
+/// sides of that end read as after it, and the filling lacked the ones before (a rollup of a GROUP
+/// BY view, made while rows streamed in, came out short whenever a tiering round ran between the
+/// commit that set its end and its filling). A filling that keeps failing holds nothing back: the
+/// log would grow until backpressure stopped every writer. Its table is tiered on, and once it
+/// works the filling refuses a source folded past its end (`fill_one`).
+pub async fn fill_end(lake: &Lake, table: &str) -> Result<Option<(String, u64)>> {
+    let mut end: Option<(String, u64)> = None;
+    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
+        let Some(upto) = v.fill.as_ref().and_then(|f| f.upto) else { continue }; // (one whose end isn't set: it is set past every commit there is)
+        let name = &key[2..];
+        if v.source == table && end.as_ref().is_none_or(|e| upto < e.1) && failing(lake, name, identity(&v)).is_none() && lake.cat.get::<u64>(&producer_key(&format!("fill:{name}"))).await?.is_none() {
+            end = Some((name.to_string(), upto));
+        }
+    }
+    Ok(end)
+}
+
+/// The test hook `PONDRA_TEST_FILL_PAUSE_MS` (read once): the leader waits this long before it fills the views waiting
+/// for it, outside the lake's lock, so tiering rounds run between the commit that set a filling's end and the filling
+/// (`tools/harness.py fill_while_tiering`).
+static FILL_PAUSE: std::sync::LazyLock<Option<std::time::Duration>> = std::sync::LazyLock::new(|| crate::env::parse::<u64>("PONDRA_TEST_FILL_PAUSE_MS").map(std::time::Duration::from_millis));
+
 /// Leader: fill the views made since, from their sources' rows up to where their filling ends,
 /// once each (producer `fill:{view}`, seq 1). One whose end isn't set yet gets a commit to set it.
 /// Under the lake's lock: a view dropped (and made again) meanwhile would get another's rows.
 pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log::Log, lock: &tokio::sync::Mutex<()>) -> Result<()> {
-    let mut waiting = vec![];
+    let (mut waiting, mut ended) = (vec![], false);
     for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
         if v.fill.is_some() && lake.cat.get::<u64>(&producer_key(&format!("fill:{}", &key[2..]))).await?.is_none() {
+            ended |= v.fill.as_ref().is_some_and(|f| f.upto.is_some());
             waiting.push(key[2..].to_string());
         }
     }
     if waiting.is_empty() {
         return Ok(());
+    }
+    if let (Some(pause), true) = (*FILL_PAUSE, ended) {
+        tokio::time::sleep(pause).await;
     }
     let _guard = lock.lock().await;
     for name in &waiting {
@@ -1203,22 +1647,40 @@ pub async fn fill_all(lake: &Lake, seq: &crate::log::Sequencer, log: &crate::log
             seq.number().await?; // (a commit: the sequencer sets `upto` in it)
             continue;
         };
-        // The source as it was at `upto`: its rows (and changes) from then, none from after.
-        // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
-        // of that row later takes this one back — `{view}$deleted` names the source's version)
-        let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
-        let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
-        let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
-        let out = match rows.iter().any(|b| b.num_rows() > 0) {
-            true => view_rows(lake, &v, &meta, &rows, false).await?,
-            false => RecordBatch::new_empty(crate::answer::schema(&meta.columns)?),
-        };
-        let (out, failed) = expected(name, &v, out, true)?;
-        if let Some(failed) = failed {
-            log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
-        }
-        log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
+        // (a filling that fails is tried again after its backoff, and its error is the view's in `pondra.flows`, and
+        // `ddl::settle`'s: CREATE says so instead of waiting for it; the views after it are filled meanwhile)
+        let Some(turn) = turn(lake, name, identity(&v), "filling materialized view") else { continue };
+        let out = fill_one(lake, log, name, &v, upto, producer).await;
+        turn.ended(&out);
     }
+    Ok(())
+}
+
+/// Fills view `name` (`v`) from its source's rows up to `upto`, once: its rows appended under `producer` (`fill:{name}`),
+/// seq 1, and the rows its expectations refused under `{producer}:expect`.
+async fn fill_one(lake: &Lake, log: &crate::log::Log, name: &str, v: &View, upto: u64, producer: String) -> Result<()> {
+    // The source as it was at `upto`: its rows (and changes) from then, none from after.
+    // (with each row's `_version`: a row-by-row view's row keeps its source row's, so a change
+    // of that row later takes this one back — `{view}$deleted` names the source's version)
+    // (a keyed source's files fold each key's rows into one, and its read combines a key's rows: one in a file past
+    // `upto` (`DataFile::ord`), which only a filling that kept failing lets happen (`fill_end`), reads as after it
+    // with the key's rows from before. Under the lake's lock, as tiering is: none is folded meanwhile)
+    let src: Option<TableMeta> = lake.cat.get(&table_key(&v.source)).await?;
+    if src.is_some_and(|m| !m.key.is_empty() && m.files.iter().any(|f| f.ord > upto)) {
+        bail!("{} was tiered past where {name}'s filling ends while the filling failed: its rows from before that end are folded with later ones now, so DROP {name} and make it again", v.source);
+    }
+    let sql = format!("SELECT *, \"{}\", \"{}\", \"{v2}\" FROM {} WHERE \"{v2}\" <= {upto}", crate::text::ROW_ID, crate::text::CREATED, crate::write::sql_name(&v.source), v2 = crate::text::VERSION);
+    let rows = crate::engine::sql(&session_at(lake, &sql, "", Some(upto)).await?, &crate::sys::planned(&sql)?).await?.collect().await?;
+    let meta: TableMeta = lake.cat.get(&table_key(name)).await?.context("view without table")?;
+    let out = match rows.iter().any(|b| b.num_rows() > 0) {
+        true => view_rows(lake, v, &meta, &rows, false).await?,
+        false => RecordBatch::new_empty(crate::answer::schema(&meta.columns)?),
+    };
+    let (out, failed) = expected(name, v, out, true)?;
+    if let Some(failed) = failed {
+        log.append(EXPECTED.into(), crate::log::Src { producer: format!("{producer}:expect"), seq: 1, prev: None }, failed).await?; // (once, as the filling is)
+    }
+    log.append(name.to_string(), crate::log::Src { producer, seq: 1, prev: None }, out).await?;
     Ok(())
 }
 
@@ -1394,8 +1856,9 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let named = if tables.is_empty() { "none".to_string() } else { tables.join(", ") };
     ensure!(tables.len() == 2 && tables[0] == source, "join = 'streams': the query joins {source} with one other append table of this lake (the append tables it reads: {named})");
     for t in &tables {
-        let kept = lake.cat.get::<View>(&view_key(t)).await?.is_some_and(|v| v.rerun.is_some());
-        ensure!(!kept, "{t} is kept by key: its rows are replaced as their groups are worked out again, and a stream join pairs each row once. Join its own source");
+        if let Some(k) = replaced(lake, t).await? {
+            return Err(kept_by_key(t, &k, name, "stream joins"));
+        }
     }
     for (i, t) in tables.iter().enumerate() {
         if let Some(c) = j.time.get(i).or(j.time.first()) {
@@ -1409,19 +1872,26 @@ async fn create_join(lake: &Lake, name: &str, sql: &str, source: String, mut j: 
     let names: Vec<String> = columns.iter().map(|(c, _)| c.clone()).collect();
     let sql_types = crate::write::query_types(lake, sql, &names).await;
     let meta = TableMeta { columns, publish: default_publish(), ids: true, tiered: now, sql_types, ..Default::default() };
-    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None };
+    let view = View { source, sql: sql.into(), emit: None, sessions: None, ids: false, join: Some(j), fill: None, expect: vec![], once: None, written: None, rerun: None, matches: None, from: vec![] };
     lake.cat.commit(vec![(table_key(name), json(&meta)), (view_key(name), json(&view)), (producer_key(&format!("join:{name}")), json(&now))], &[]).await
 }
 
-/// Leader, right after commits: every stream join view brought up to date (one that fails is
-/// tried again next time; the others go on).
-pub async fn join_all(lake: &Lake, log: &crate::log::Log) -> Result<()> {
-    for (key, v) in lake.cat.scan::<View>("v/", "v0").await? {
-        if let Some(j) = &v.join {
-            if let Err(e) = join(lake, log, &key[2..], &v, j).await {
-                eprintln!("stream join {}: {e:#}", &key[2..]);
-            }
+/// Leader, right after commits: every stream join view brought up to date, each whose turn it is in a task of its own
+/// (`hand_out`: a slot, bounded, backed off after failures).
+pub async fn join_all(lake: &Arc<Lake>, log: &Arc<crate::log::Log>) -> Result<()> {
+    let views = lake.cat.scan::<View>("v/", "v0").await?;
+    forget_runs(lake, &views);
+    for (key, v) in views {
+        if v.join.is_none() {
+            continue;
         }
+        let log = log.clone();
+        hand_out(lake, &key[2..], identity(&v), "stream join", move |lake, name, v| async move {
+            match &v.join {
+                Some(j) => join(&lake, &log, &name, &v, j).await,
+                None => Ok(()),
+            }
+        });
     }
     Ok(())
 }
@@ -1511,8 +1981,9 @@ fn span(rows: &[RecordBatch], c: &str, within_secs: u64) -> Option<(i64, i64)> {
 }
 
 /// `pondra.flows` (a row per materialized view: what it follows, its kind, what else it reads,
-/// its expectations) and `pondra.expectations` (a row per expectation, with the rows that broke it:
-/// `counts`, the rows of `pondra$expectations`). What a user may read only.
+/// its expectations, and `error`: the last error of its runs on the node that runs them, once two
+/// in a row failed; NULL while they work) and `pondra.expectations` (a row per expectation, with the
+/// rows that broke it: `counts`, the rows of `pondra$expectations`). What a user may read only.
 pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'static str, std::sync::Arc<dyn datafusion::catalog::TableProvider>)>> {
     use datafusion::arrow::array::{Array, AsArray, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
@@ -1528,6 +1999,7 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
             histories.insert(name.clone());
         }
         kinds.push(match () {
+            _ if v.matches.is_some() => "matches",
             _ if v.emit.is_some() || v.once.is_some() => "window",
             _ if v.sessions.is_some() => "sessions",
             _ if v.join.is_some() => "stream join",
@@ -1549,27 +2021,161 @@ pub async fn system(lake: &Lake, counts: Vec<RecordBatch>) -> Result<Vec<(&'stat
     }
     let s = |f: &dyn Fn(usize, &(String, View)) -> Option<String>| std::sync::Arc::new(views.iter().enumerate().map(|(i, x)| f(i, x)).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let reads = |v: &View| crate::spmd::tables(&v.sql).map(|t| t.into_iter().filter(|t| *t != v.source).collect::<Vec<_>>().join(", ")).filter(|r| !r.is_empty());
-    let late = |v: &View| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), crate::once::LATE.to_string())).copied().unwrap_or(0);
+    // (a view's late rows are counted under its fill's id; a matches view's, under its own)
+    let late = |v: &View| {
+        let id = v.matches.as_ref().map(|m| m.id.clone()).or_else(|| v.fill.as_ref().map(|f| f.id.clone())).unwrap_or_default();
+        failed.get(&(id, crate::once::LATE.to_string())).copied().unwrap_or(0)
+    };
     let flows = RecordBatch::try_from_iter(vec![
         ("name", s(&|_, (n, v)| Some(v.shown(n).to_string()))),
-        ("follows", s(&|_, (_, v)| Some(v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
+        ("follows", s(&|_, (_, v)| code_for_caller(|| v.join.as_ref().map_or_else(|| crate::rerun::follows(v).join(", "), |j| j.tables.join(", "))))),
         ("kind", s(&|i, _| Some(kinds[i].to_string()))),
         ("refresh", s(&|_, (_, v)| Some(v.rerun.as_ref().map_or("incremental", |r| if r.full.is_some() { "full" } else { "by key" }).to_string()))),
         ("reason", s(&|_, (_, v)| v.rerun.as_ref().map(|b| b.reason.clone()))),
-        ("reads", s(&|_, (_, v)| reads(v))),
+        ("reads", s(&|_, (_, v)| code_for_caller(|| reads(v)).flatten())),
         ("expectations", std::sync::Arc::new(views.iter().map(|(_, v)| v.expect.len() as i64).collect::<Int64Array>())),
-        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| v.once.as_ref().map(|_| late(v))).collect::<Int64Array>())),
-        ("definition", s(&|_, (_, v)| Some(shown(v.query())))),
+        ("late_rows", std::sync::Arc::new(views.iter().map(|(_, v)| (v.once.is_some() || v.matches.is_some()).then(|| late(v))).collect::<Int64Array>())),
+        ("error", s(&|_, (n, v)| code_for_caller(|| if v.rerun.is_some() { crate::rerun::failing(lake, n, identity(v)) } else { failing(lake, n, identity(v)) }).flatten())), // (an error names tables and keys: S27)
+        ("definition", s(&|_, (_, v)| code_for_caller(|| shown(v.query())))),
     ])?;
     let all: Vec<(&String, &View, &Expect)> = views.iter().flat_map(|(n, v)| v.expect.iter().map(move |e| (n, v, e))).collect();
     let e = |f: &dyn Fn(&(&String, &View, &Expect)) -> String| std::sync::Arc::new(all.iter().map(|x| Some(f(x))).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef;
     let expectations = RecordBatch::try_from_iter(vec![
         ("view", e(&|(n, _, _)| n.to_string())),
         ("expectation", e(&|(_, _, x)| x.name.clone())),
-        ("condition", e(&|(_, _, x)| x.check.clone())),
+        ("condition", std::sync::Arc::new(all.iter().map(|(_, _, x)| code_for_caller(|| x.check.clone())).collect::<StringArray>()) as datafusion::arrow::array::ArrayRef),
         ("on_violation", e(&|(_, _, x)| x.on.word().to_string())),
         ("failed_rows", std::sync::Arc::new(all.iter().map(|(_, v, x)| failed.get(&(v.fill.as_ref().map_or(String::new(), |f| f.id.clone()), x.name.clone())).copied().unwrap_or(0)).collect::<Int64Array>())),
     ])?;
     let mem = |b: RecordBatch| -> Result<std::sync::Arc<dyn datafusion::catalog::TableProvider>> { Ok(std::sync::Arc::new(MemTable::try_new(b.schema(), vec![vec![b]])?)) };
     Ok(vec![("flows", mem(flows)?), ("expectations", mem(expectations)?)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{Principal, Role, WHO};
+
+    /// A view's CTEs and the plain views it reads are written in as subqueries, so it follows their table: a CTE read by
+    /// another, its column names under any alias, a table inside a CTE that has the CTE's name, a plain view over a plain
+    /// view; a recursive CTE and a query with neither stay as written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_views_ctes_and_plain_views_are_written_in() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-written-in-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let view = |sql: &str| json(&crate::ddl::StoredView { sql: sql.into(), external: false, facts: vec![] });
+        lake.cat.commit(vec![(crate::ddl::query_key("vx"), view("SELECT x FROM a WHERE x > 1")), (crate::ddl::query_key("vy"), view("SELECT x FROM vx"))], &[]).await?;
+        let w = |sql: &'static str| written_in(&lake, sql);
+        assert_eq!(w("SELECT x FROM a").await?, "SELECT x FROM a");
+        assert_eq!(w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?, "SELECT count(*) AS n FROM (SELECT x FROM a) AS t");
+        assert_eq!(first_table(&w("WITH t AS (SELECT x FROM a) SELECT count(*) AS n FROM t").await?)?, "a");
+        assert_eq!(w("WITH t AS (SELECT x FROM a), u AS (SELECT x FROM t) SELECT x FROM u").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a) AS t) AS u");
+        assert_eq!(w("WITH t (y) AS (SELECT x FROM a) SELECT y FROM t AS s").await?, "SELECT y FROM (SELECT x FROM a) AS s (y)");
+        assert_eq!(w("WITH a AS (SELECT x FROM a) SELECT x FROM a").await?, "SELECT x FROM (SELECT x FROM a) AS a", "inside it, a is the table");
+        assert_eq!(w("SELECT x FROM vy").await?, "SELECT x FROM (SELECT x FROM (SELECT x FROM a WHERE x > 1) AS vx) AS vy");
+        assert_eq!(first_table(&w("SELECT x FROM vy").await?)?, "a");
+        assert_eq!(writing_in(&lake, "SELECT x FROM vy JOIN vx USING (x)").await?.1, ["vy", "vx"], "the plain views written in, each once");
+        assert!(writing_in(&lake, "WITH vx AS (SELECT 1 AS x) SELECT x FROM vx").await?.1.is_empty(), "a CTE is no plain view");
+        let recursive = "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r";
+        assert_eq!(w(recursive).await?, recursive);
+        let pattern = "WITH t AS (SELECT * FROM a WHERE x > 1) SELECT * FROM t MATCH_RECOGNIZE (ORDER BY x PATTERN (b+) DEFINE b AS true) m";
+        assert_eq!(w(pattern).await?, pattern, "a pattern reads its CTE as written");
+        let write = w("WITH m AS (DELETE FROM a WHERE x > 1 RETURNING *) SELECT x FROM m").await.unwrap_err();
+        assert_eq!(crate::codes::of(&write), "0A000", "{write:#}");
+        assert!(write.to_string().starts_with("WITH m AS (DELETE …): a view can't hold a write"), "{write:#}");
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_view_query_is_shown_to_a_caller_who_may_see_code_only() {
+        // a user granted tables (no APPLY, no CLONE) is shown no view's query; an admin is shown it
+        let reader = Principal { access: Some(std::sync::Arc::new(crate::users::Access::default())), ..Principal::of(Role::Read) };
+        let query = |who: Principal| WHO.scope(who, async { code_for_caller(|| "SELECT id FROM t WHERE region = 'EU'".to_string()) });
+        assert_eq!(query(reader).await, None);
+        assert_eq!(query(Principal::of(Role::Admin)).await.as_deref(), Some("SELECT id FROM t WHERE region = 'EU'"));
+    }
+
+    #[test]
+    fn failures_back_off_and_name_their_error_once_two_in_a_row_failed() {
+        let mut f = Failures::default();
+        assert_eq!(f.backoff(), std::time::Duration::ZERO);
+        for (n, secs) in [(1, 1), (2, 2), (6, 30), (20, 30)] {
+            f.failures = n;
+            assert_eq!(f.backoff(), std::time::Duration::from_secs(secs), "after {n} failures");
+        }
+        f.failures = 0;
+        f.note("emission of v", Some("boom".into()));
+        assert_eq!(f.failing(), None, "one failure is not yet failing");
+        f.note("emission of v", Some("boom".into()));
+        assert_eq!(f.failing().as_deref(), Some("boom"));
+        f.note("emission of v", None);
+        assert_eq!(f.failing(), None, "a run that works ends it");
+    }
+
+    #[tokio::test]
+    async fn a_run_past_its_deadline_is_stopped_with_its_statement_flag_set() {
+        let flag = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen = flag.clone();
+        let started = std::time::Instant::now();
+        let err = bounded_by(1, async move {
+            *seen.lock().unwrap() = crate::audit::stop();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(crate::codes::of(&err), "57014");
+        assert!(err.to_string().contains("needs PONDRA_VIEW_RUN_SECS raised (0: no limit)"), "{err:#}"); // (11-01 audit L10: says what to do)
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "stopped at its deadline, not when it would end");
+        assert!(flag.lock().unwrap().as_ref().is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)));
+        assert!(bounded_by(0, async { Ok(()) }).await.is_ok(), "0: no limit");
+    }
+
+    #[tokio::test]
+    async fn a_views_runs_take_turns_back_off_and_forget_a_run_that_stopped() {
+        let key = ("test-lake-runs".to_string(), "registry_a".to_string());
+        let t = turn_of(key.clone(), "", "emission of").expect("its first turn");
+        assert!(turn_of(key.clone(), "", "emission of").is_none(), "one run at a time");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        assert!(turn_of(key.clone(), "", "emission of").is_none(), "after a failure, its backoff");
+        assert_eq!(failing_of(&key, ""), None, "one failure is not yet failing");
+        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        let t = turn_of(key.clone(), "", "emission of").expect("its backoff is over");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        assert_eq!(failing_of(&key, "").as_deref(), Some("boom"));
+        RUNS.lock().unwrap().get_mut(&key).unwrap().after = None;
+        drop(turn_of(key.clone(), "", "emission of").expect("a turn"));
+        assert!(RUNS.lock().unwrap().get(&key).is_some_and(|r| !r.running), "a turn dropped unfinished is given back");
+    }
+
+    #[tokio::test]
+    async fn a_view_made_again_under_its_name_starts_afresh() {
+        let key = ("test-lake-again".to_string(), "registry_again".to_string());
+        let t = turn_of(key.clone(), "a", "emission of").expect("a's first turn");
+        assert!(turn_of(key.clone(), "b", "emission of").is_none(), "while a's run is going, b's waits for it to end");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        RUNS.lock().unwrap().get_mut(&key).unwrap().after = Some(datafusion::common::instant::Instant::now());
+        let t = turn_of(key.clone(), "a", "emission of").expect("a's backoff is over");
+        t.ended(&Err(anyhow::anyhow!("boom")));
+        assert_eq!(failing_of(&key, "a").as_deref(), Some("boom"));
+        assert_eq!(failing_of(&key, "b"), None, "a's failures are not b's");
+        let t = turn_of(key.clone(), "b", "emission of").expect("b's first turn: no backoff of a's");
+        assert_eq!(failing_of(&key, "a"), None, "a is gone: its failures went with it");
+        t.ended(&Ok(()));
+    }
+
+    #[test]
+    fn the_watermark_is_the_least_of_its_parts() {
+        fn parts(v: &[(&str, i64)]) -> BTreeMap<String, i64> { v.iter().map(|(p, t)| (p.to_string(), *t)).collect() }
+        let nothing = |_: &str, _: i64| 0u64;
+        assert_eq!(least_of(&BTreeMap::new(), 0, None, nothing, 0), None, "no parts, no watermark");
+        assert_eq!(least_of(&parts(&[("", 100_000_000)]), 10, None, nothing, 0), Some(90_000_000), "one part: its newest less the lateness");
+        assert_eq!(least_of(&parts(&[("a", 100_000_000), ("b", 50_000_000)]), 0, None, nothing, 0), Some(50_000_000), "the least of two");
+        // (idle 5 s: b has been quiet for 7 s, so it moves on by 7 s; a has just moved)
+        let now: u64 = 1_000_000;
+        let since = |part: &str, _: i64| if part == "b" { now - 7_000 } else { now };
+        assert_eq!(least_of(&parts(&[("a", 100_000_000), ("b", 50_000_000)]), 0, Some(5), since, now), Some(57_000_000));
+    }
 }

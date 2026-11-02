@@ -1,0 +1,39 @@
+package pondra:extension@1.0.0;
+
+/// What every Pondra 1.x calls an extension's WebAssembly part by (ADR-075 §2). An extension never links Pondra's Rust: it
+/// exports these two, and imports only Pondra's own capabilities, each a package versioned on its own (`deps/`): 1.0 offers
+/// `pondra:log/log@1.0.0` and `pondra:clock/clock@1.0.0`. A part imports only those it uses, and a Pondra loads it when it
+/// offers every one (§3); a later capability comes as a new import, and an import's `@2` beside its `@1`, which stays.
+world extension {
+  import pondra:log/log@1.0.0;
+  import pondra:clock/clock@1.0.0;
+
+  /// What the extension has, as JSON that only grows (a host passes over fields it doesn't know):
+  /// `{"name": "words", "version": "0.1", "functions": [{"name": "word_count", "arguments": ["Utf8"], "returns": "Int64",
+  /// "volatile": false}]}`. A type is Arrow's, written as its `DataType` displays it (`Int64`, `Float64`, `Utf8`,
+  /// `Boolean`, `Date32`, …).
+  export describe: func() -> string;
+
+  /// Runs the scalar function `name` over one batch: Arrow IPC stream bytes in, a column per argument in the types
+  /// `describe` gave; Arrow IPC stream bytes out, one column of the same number of rows in its `returns` type. An error is
+  /// the function's own words: it fails the query that called it.
+  export call: func(name: string, batch: list<u8>) -> result<list<u8>, string>;
+}
+
+/// An extension with table functions as well (E3): `describe` names each with `"columns"` in place of `"returns"`,
+/// `[{"name": "word", "type": "Utf8"}, …]`, and these three give its rows. A host calls an extension by this world only when
+/// `describe` names a table function, so an extension of scalars alone exports the two above and nothing more.
+world extension-with-tables {
+  include extension;
+
+  /// Starts one call of the table function `name`: Arrow IPC stream bytes in, one row with a column per argument in the
+  /// types `describe` gave. Its handle names the call to `next` and `close`.
+  export open: func(name: string, arguments: list<u8>) -> result<u32, string>;
+
+  /// The call's next batch of rows, Arrow IPC stream bytes with the columns `describe` gave, or none once it has given
+  /// them all. A host asks for each batch as its query reads it, so a call never has to hold its rows at once.
+  export next: func(handle: u32) -> result<option<list<u8>>, string>;
+
+  /// Lets the call go: asked once its rows are read, or its query stops reading.
+  export close: func(handle: u32);
+}

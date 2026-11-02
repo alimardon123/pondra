@@ -381,10 +381,28 @@ def collect_javascript():
     return json.loads(r.stdout), "ok"
 
 
+def collect_extension_world():
+    """The world an extension's WebAssembly part is called by (ADR-075 §2-3), from wit/: each world's exports and imports,
+    and each capability's functions and types, as `world extension: export describe: func() -> string` and
+    `pondra:log/log@1.0.0: write: func(level: level, message: string)`. A later 1.x adds imports and fields, and removes none."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(REPO, "wit", "**", "*.wit"), recursive=True)):
+        with open(path, encoding="utf-8") as f:
+            text = re.sub(r"//[^\n]*", "", f.read())
+        package = re.search(r"^\s*package\s+([^;\s]+);", text, re.M).group(1)
+        for kind, name, start in ((m.group(1), m.group(2), m.end()) for m in re.finditer(r"\b(world|interface)\s+([\w-]+)\s*\{", text)):
+            body = text[start:closing(text, start)]
+            owner = f"world {name}" if kind == "world" else package.replace("@", f"/{name}@", 1)
+            for statement in re.findall(r"[^;{}]+;|enum\s+[\w-]+\s*\{[^}]*\}", body):
+                out.append(f"{owner}: {' '.join(statement.rstrip(';').split())}")
+    return out
+
+
 # ---- collect, write, compare ----
 
 def collect(bin_path):
-    data = {"cli": collect_cli(bin_path), "http": collect_http(), "sqlstates": collect_sqlstates(), "console": collect_console()}
+    data = {"cli": collect_cli(bin_path), "http": collect_http(), "sqlstates": collect_sqlstates(), "console": collect_console(),
+            "extension_world": collect_extension_world()}
     node, how = collect_node(bin_path)
     data.update(node)
     data["python"], how["python"] = collect_python()

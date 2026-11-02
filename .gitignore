@@ -2,6 +2,7 @@
 /dist
 /web/target
 /web/pkg
+/web/pkg-lake
 __pycache__/
 *.pyc
 *.stderr

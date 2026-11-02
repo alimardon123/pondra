@@ -8,7 +8,7 @@ name: deploy
 # GitHub's identity) and the chart to GitHub's container registry; with PUBLISH_PACKAGES `true`,
 # the formula to <owner>/homebrew-pondra and the manifest to <owner>/scoop-pondra (the secret
 # PACKAGES_TOKEN: contents read and write on both), and a pull request to microsoft/winget-pkgs
-# (the secret WINGET_TOKEN: a classic token with public_repo).
+# (the secret WINGET_TOKEN: a machine account's token with public_repo and no write access to this repository).
 #
 # A merge's or a pull request's run of the same checks is build.yml's, once its build is done (main,
 # or `full-ci`, and what they try changes): waiting here for its packages held runners, and pull requests' CI runs
@@ -77,9 +77,9 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      TOKEN: ${{ secrets.PACKAGES_TOKEN }}
-      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    env: # (whether each token is set, and nothing more: a step's `if` can't read `secrets`, and each token is its step's alone)
+      HAS_PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN != '' }}
+      HAS_WINGET_TOKEN: ${{ secrets.WINGET_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -94,7 +94,9 @@ jobs:
           echo "::error::no release $GITHUB_REF_NAME with its archives after 30 minutes" && exit 1
       - run: python tools/distribute.py --version "${GITHUB_REF_NAME#v}" --release --date "$(date -u +%F)" --out out
       - name: The tap (<owner>/homebrew-pondra) and the bucket (<owner>/scoop-pondra)
-        if: env.TOKEN != ''
+        if: env.HAS_PACKAGES_TOKEN == 'true'
+        env:
+          TOKEN: ${{ secrets.PACKAGES_TOKEN }}
         run: |
           v=${GITHUB_REF_NAME#v}
           for target in "homebrew-pondra Formula/pondra.rb homebrew/pondra.rb" "scoop-pondra bucket/pondra.json scoop/pondra.json"; do
@@ -107,9 +109,13 @@ jobs:
             fi
             rm -rf repo
           done
-      - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork)
-        if: env.WINGET_TOKEN != ''
+      - name: winget (a pull request to microsoft/winget-pkgs, from the token's own fork; a release, not a candidate)
+        if: env.HAS_WINGET_TOKEN == 'true' && !contains(github.ref_name, '-') # (v1.0.0-rc.1 goes to our own tap and bucket only: winget's reviewers take releases)
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
           v=${GITHUB_REF_NAME#v}
-          curl -fsSL -o wingetcreate.exe https://aka.ms/wingetcreate/latest
+          # (pinned, its hash checked, since it runs with the token; bump both together)
+          curl -fsSL -o wingetcreate.exe https://github.com/microsoft/winget-create/releases/download/v1.12.13.0/wingetcreate.exe
+          echo "24042bd37915805615e6cf969ac57c6439124c3fe85823327f5f3fb24bd9ffea  wingetcreate.exe" | sha256sum -c -
           ./wingetcreate.exe submit --token "$WINGET_TOKEN" --prtitle "New version: Pondra.Pondra version $v" "out/winget/manifests/p/Pondra/Pondra/$v"

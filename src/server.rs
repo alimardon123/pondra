@@ -7,7 +7,7 @@ use crate::store::*;
 use crate::tasks::Task;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -89,10 +89,12 @@ pub fn router(app: App) -> Router {
                 None => crate::apply::export_here(&app.lake).await?,
             }))
         }))
-        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::console::objects(&app.lake).await?)) }))
+        .route("/objects", get(|State(app): State<App>| async move { Ok::<_, E>(Json(crate::objects::listed(&app.lake).await?)) }))
         .route("/metrics", get(|State(app): State<App>| async move { crate::metrics::render(&app).await.map_err(E) }))
         .route("/cluster/commit", post(commit))
         .route("/cluster/log", get(feed))
+        .route("/cluster/kv", get(kv))
+        .route("/cluster/records", post(records).layer(axum::extract::DefaultBodyLimit::max(1 << 20))) // (a joined page's own statements: 256 lines, a 1 MB body)
         .route("/cluster/stage", post(stage))
         .route("/cluster/copy", post(copy))
         .route("/cluster/insert", post(insert_share))
@@ -101,10 +103,12 @@ pub fn router(app: App) -> Router {
         .route("/cluster/probe", get(|Query(p): Query<HashMap<String, usize>>| async move { crate::guard::probe(p.get("bytes").copied().unwrap_or(0)) }))
         .route("/cluster/beat", post(beat))
         .nest_service("/cluster/store", crate::served::door_for(app.lake.store.clone(), crate::cluster::of(&app).is_some_and(|c| c.serves_store))) // (a lake's store, for nodes on other machines: ADR-072 §8)
+        .nest_service("/store", crate::served::files_door(app.lake.store.clone())) // (a page's reads of the lake's files and log: an admin's sign-in, `Auth::needed`)
         .route("/cluster/ack", post(ack))
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { crate::cluster::of(&app).map(|c| Json(c.leader_status())).ok_or(StatusCode::NOT_FOUND) }))
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
+        .route("/cluster/committed", get(|State(app): State<App>| async move { Json(app.lake.cat.committed()) })) // (the leader's last commit: `write::seen_here`, `cluster::catch_up`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg_rest::rest())
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
@@ -139,80 +143,37 @@ async fn drop_function(State(app): State<App>, Path(name): Path<String>) -> Resu
 /// if nobody replaced it meanwhile (412 if so; ADR-034). Each save is kept as a version too
 /// (`files::keep`, ADR-035 §8).
 async fn put_file(State(app): State<App>, Path(path): Path<String>, headers: HeaderMap, body: Bytes) -> Result<Response, E> {
-    let (path, bytes) = (crate::lake_files::under_files(&path)?, body.len());
-    let expect = headers.get("if-match").and_then(|v| v.to_str().ok()).map(|v| v.trim_matches('"').to_string());
-    let done = match &expect {
-        Some(v) => app.lake.replace(&path, body.to_vec(), v).await,
-        None => match app.lake.put(&path, body.to_vec()).await {
-            Ok(()) => app.lake.version(&path).await,
-            Err(e) => Err(e),
-        },
-    };
-    match done {
-        Ok(version) => {
-            if let Err(e) = crate::files::keep(&app.lake, &path, &body).await {
-                eprintln!("{path}: saved, but not kept as a version: {e:#}");
-            }
-            Ok(Json(j!({"path": path, "bytes": bytes, "version": version})).into_response())
+    let if_match = headers.get("if-match").and_then(|v| v.to_str().ok());
+    Ok(filed(crate::files::put(&app.lake, &path, if_match, body).await?))
+}
+
+/// A `Filed` as the node's HTTP answer: its status, its content type and, when it is the file's bytes, its version as
+/// `etag` (quoted) with `cache-control: no-store`.
+fn filed(f: crate::lake_files::Filed) -> Response {
+    let status = StatusCode::from_u16(f.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    match f.etag {
+        Some(version) => {
+            let etag = format!("\"{version}\"");
+            (status, [("content-type", f.content_type), ("etag", etag.as_str()), ("cache-control", "no-store")], f.body).into_response()
         }
-        Err(e) if e.is::<crate::store::Changed>() => Ok((StatusCode::PRECONDITION_FAILED, crate::lake_files::changed(&path)).into_response()),
-        Err(e) if expect.is_none() && format!("{e:#}").contains("already exists") =>
-            Ok((StatusCode::CONFLICT, crate::lake_files::there_already(&path)).into_response()),
-        Err(e) => Err(E(e)),
+        None => (status, [("content-type", f.content_type)], f.body).into_response(),
     }
 }
 
 /// `GET /files/<path>`: that object's bytes, its version (`etag`, for `If-Match`) and a content
 /// type by its name. `?versions`: the versions it keeps, newest first; `?version=<id>`: one's bytes.
 async fn get_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
-    let path = crate::lake_files::under_files(&path)?;
-    if q.contains_key("versions") {
-        let all = crate::files::versions(&app.lake, &path).await?;
-        return Ok(Json(all.iter().map(|v| j!({"id": v.id, "at": v.ms, "who": v.who, "bytes": v.bytes})).collect::<Vec<_>>()).into_response());
-    }
-    let found = match q.get("version") {
-        Some(id) => match crate::files::version(&app.lake, &path, id).await {
-            Ok(b) => Ok((b, id.clone())),
-            Err(e) => return Ok((StatusCode::NOT_FOUND, crate::ext::said(&e)).into_response()), // (not one of its versions, or gone)
-        },
-        None => app.lake.file(&path).await,
-    };
-    let (bytes, version) = match found {
-        Ok(found) => found,
-        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
-            return Ok((StatusCode::NOT_FOUND, crate::lake_files::not_found(&path)).into_response());
-        }
-        Err(e) => return Err(E(e)),
-    };
-    Ok(([("content-type", crate::lake_files::content_type(&path)), ("etag", &format!("\"{version}\"")), ("cache-control", "no-store")], bytes).into_response())
+    Ok(filed(crate::files::get(&app.lake, &path, &q).await?))
 }
 
 /// `POST /files/<path>?restore=<id>`: that version made the file again (itself kept as the newest).
-async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Json<Value>, E> {
-    let path = crate::lake_files::under_files(&path)?;
-    let id = q.get("restore").ok_or_else(|| E(anyhow::anyhow!("POST /files/<path>?restore=<a version's id> (GET ?versions lists them)")))?;
-    let bytes = crate::files::version(&app.lake, &path, id).await?;
-    let version = match app.lake.version(&path).await {
-        Ok(now) => app.lake.replace(&path, bytes.to_vec(), &now).await?,
-        Err(_) => {
-            app.lake.put(&path, bytes.to_vec()).await?; // (deleted since: back again)
-            app.lake.version(&path).await?
-        }
-    };
-    crate::files::keep(&app.lake, &path, &bytes).await?;
-    Ok(Json(j!({"path": path, "version": version, "restored": id})))
+async fn restore_file(State(app): State<App>, Path(path): Path<String>, Query(q): Query<HashMap<String, String>>) -> Result<Response, E> {
+    Ok(filed(crate::files::restore(&app.lake, &path, &q).await?))
 }
 
 /// `DELETE /files/<path>`: that object gone (a writer's, as `PUT`); its versions stay. A path no file is at: 404.
 async fn delete_file(State(app): State<App>, Path(path): Path<String>) -> Result<Response, E> {
-    let path = crate::lake_files::under_files(&path)?;
-    match app.lake.remove_file(&path).await {
-        Ok(()) => Ok(Json(j!({"removed": path})).into_response()),
-        Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(|e| matches!(e, object_store::Error::NotFound { .. })) => {
-            Ok((StatusCode::NOT_FOUND, crate::lake_files::not_found(&path)).into_response())
-        }
-        Err(e) => Err(E(e)),
-    }
+    Ok(filed(crate::files::remove(&app.lake, &path).await?))
 }
 
 /// `GET /sessions/{id}/python`: the variables a session's Python holds, as the console's panel
@@ -297,7 +258,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     }
     let header = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
     let from = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().map(|c| c.0.addr);
-    let vouched = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().is_some_and(|c| c.0.local || c.0.signed); // (`users::nodes_key`)
+    let vouched = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>().is_some_and(|c| c.0.signed || c.0.own(req.headers())); // (`users::nodes_key`)
     if let Some(axum::extract::ConnectInfo(peer)) = req.extensions().get::<axum::extract::ConnectInfo<crate::tls::Peer>>() {
         if !peer.allowed() {
             return (StatusCode::FORBIDDEN, crate::tls::PLAIN).into_response(); // (`tls.rs`)
@@ -309,7 +270,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
             return (StatusCode::UNAUTHORIZED, "the nodes' key is taken only with a certificate the nodes' authority signed (PONDRA_TLS_CA)").into_response();
         }
         if header.as_deref().is_some_and(|h| h.starts_with("Bearer pn_")) && !app.auth.admin_set() && !crate::users::nodes_key(false, crate::ext::shared_master(), vouched) {
-            return (StatusCode::UNAUTHORIZED, "the lake's keys are in the clear in its bucket, so the nodes' key is taken only from this machine or with a certificate the nodes' authority signed (PONDRA_TLS_CA): to run nodes on other machines, give every node --admin-token (or PONDRA_SECRET_KEY)").into_response();
+            return (StatusCode::UNAUTHORIZED, "the lake's keys are in the clear in its bucket, so the nodes' key is taken only from this machine, not through a proxy, or with a certificate the nodes' authority signed (PONDRA_TLS_CA): to run nodes on other machines, give every node --admin-token (or PONDRA_SECRET_KEY)").into_response();
         }
     }
     if header.as_deref().is_some_and(|h| h.starts_with("Bearer pb_")) {
@@ -344,7 +305,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
     if let Some((name, ip)) = &basic_by {
         if let Some(wait) = crate::auth::guessing(*ip, name) {
             let why = crate::auth::guessing_says(name, wait);
-            crate::audit::refused(&app, name, "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does: refused at once, guesses would cost nothing)
             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
         }
@@ -353,13 +314,20 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), vouched).await,
         None => None,
     };
+    let mut open = false; // (a node with no tokens and no users: anyone who reaches it is its admin and one of its nodes)
     let who = match signed {
         Some(p) => p,
         None if crate::statement::owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
+        // (still catching up after 10 s: its catalog may lack its leader's users, so nobody it can't sign in is let in as an
+        // open node's caller: asked again in a moment, as a table it doesn't hold yet is, `Lake::table_meta_if`)
+        None if !*app.lake.caught.borrow() => return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::store::CATCHING_UP).into_response(),
         None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, app.members.me()) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
-            None => crate::auth::Principal::of(crate::auth::Role::Admin),
+            None => {
+                open = true;
+                crate::auth::Principal::of(crate::auth::Role::Admin)
+            }
         },
         None if header.is_some() => {
             if let Some((name, ip)) = &basic_by {
@@ -371,7 +339,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                 None => None,
             };
             let why = why.unwrap_or_else(|| "wrong token, or user name and password".into());
-            crate::audit::refused(&app, &basic_user(header.as_deref()), "http", from, &format!("{} {}", req.method(), req.uri().path()), &why);
+            crate::audit::refused_by(&app, &basic_user(header.as_deref()), "http", from, client, &format!("{} {}", req.method(), req.uri().path()), &why).await;
             tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
             return challenge(&app, req.uri().path(), req.headers(), (StatusCode::UNAUTHORIZED, why).into_response()).await;
         }
@@ -391,24 +359,36 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
                     true => "a pin needs CLONE on this database or a schema of it (GRANT CLONE ON DATABASE … TO …)",
                     false => "this needs more rights than this token's or user's",
                 };
-                crate::audit::refused(&app, &who.name, "http", from, &format!("{} {}", req.method(), req.uri().path()), why);
+                crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await;
                 (StatusCode::FORBIDDEN, why).into_response()
             }
         };
     }
-    // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. It only narrows: the user's
-    // rights within the caller's role, so a read or write token never acts as more than itself, as a superuser)
+    // (the cluster's routes are the nodes' own: their tokens, their key, the program that started this one, anyone at an
+    // open node. A user's sign-in, a superuser's too, reaches only what `Auth::users_reach` names: the rest carry the
+    // lake's keys (the commit stream, the replica log) or write what only the nodes write (a raw flush, the audit's own
+    // tables, acks and beats). Checked before `AS_USER`, which makes a node's call its user's)
+    if req.uri().path().starts_with("/cluster/") && !(who.operator || open) && !crate::auth::Auth::users_reach(req.uri().path()) {
+        let why = "this route is the nodes' own: a user's sign-in, a superuser's too, reaches the cluster's routes only for a branch's pin";
+        crate::audit::refused_by(&app, &who.name, "http", from, client, &format!("{} {}", req.method(), req.uri().path()), why).await; // (audited, as every refusal is)
+        return (StatusCode::FORBIDDEN, why).into_response();
+    }
+    // (a change a node sends its leader for a user runs as that user: `auth::AS_USER`. Only from the nodes (their key, the
+    // admin token, the program that started this one) and only to `/cluster/*`; any other caller is itself, so a token
+    // never acts or is recorded as a user. It only narrows: the user's rights within the caller's role. The audit names
+    // the node it came through: door `node`, from the node's address)
+    let by_node = who.operator && who.role == crate::auth::Role::Admin && req.uri().path().starts_with("/cluster/");
     let who = match req.headers().get(crate::auth::AS_USER).and_then(|v| v.to_str().ok()) {
-        Some(user) if who.operator => match crate::users::principal(&app.lake, user).await {
-            Ok(p) if p.role > who.role => crate::auth::Principal { role: who.role, ..p.at("http", from) },
-            Ok(p) => p.at("http", from),
+        Some(user) if by_node => match crate::users::principal(&app.lake, user).await {
+            Ok(p) if p.role > who.role => crate::auth::Principal { role: who.role, ..p.at("node", from) },
+            Ok(p) => p.at("node", from),
             Err(e) => return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(),
         },
         _ => who,
     };
     req.extensions_mut().insert(who.role);
     let heavy = queries(req.uri().path());
-    let stoppable = stoppable(req.uri().path()); // (a query the node may stop for memory: `oom.rs`)
+    let stoppable = stoppable(req.uri().path(), req.uri().query()); // (a query the node may stop for memory: `oom.rs`)
     // (a stopped statement fails its session's transaction: who asked, and the headers `temp::of` reads the session from)
     let asked = stoppable.then(|| (who.clone(), req.headers().clone()));
     // (a Python procedure of an apply calls back with its lent token: those calls are the apply's, as its statements are)
@@ -424,7 +404,7 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Ok(r) => r,
         Err(m) => {
             if let (true, Some((who, headers))) = (m == crate::oom::OOM, asked) {
-                failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
+                crate::statement::failed_for_memory(who, &headers); // (the node stopped the statement: its transaction fails, as an error's does)
             }
             E(anyhow::anyhow!(m)).into_response() // (and the node stays up)
         }
@@ -432,19 +412,11 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
 }
 
 /// The queries the node may stop for memory (`oom.rs`): a client's query, which its client asks again
-/// or gives up on. Not the cluster's own calls, the bulk writes or a live query, which lives as long as
-/// its client.
-fn stoppable(path: &str) -> bool {
-    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/")
-}
-
-/// A statement the node stopped for memory fails its session's transaction, as an error does
-/// (`txn::failed`): the session is found as `sql` finds it, for the caller that asked.
-fn failed_for_memory(who: crate::auth::Principal, headers: &axum::http::HeaderMap) {
-    let session = crate::auth::WHO.sync_scope(who, || crate::temp::of(headers)).ok().flatten();
-    if let Some(s) = session {
-        crate::temp::SESSION.sync_scope(Some(s), || crate::txn::failed(crate::oom::OOM));
-    }
+/// or gives up on, and a joined page's staged INSERT (`insert_staged`), which its page sends again. Not
+/// the cluster's own calls, the other bulk writes or a live query, which lives as long as its client.
+fn stoppable(path: &str, query: Option<&str>) -> bool {
+    let staged = || path.starts_with("/insert/") && query.is_some_and(|q| q.split('&').any(|p| p == "staged=1"));
+    matches!(path, "/sql" | "/mcp") || path.starts_with("/sql/pages/") || staged()
 }
 
 /// The routes whose work is queries' (`panics::work`): planned and run on a runtime of their own,
@@ -500,13 +472,13 @@ async fn login(State(app): State<App>, axum::extract::ConnectInfo(peer): axum::e
     let ip = Some(peer.client(&headers));
     if let Some(wait) = crate::auth::guessing(ip, user) {
         let why = crate::auth::guessing_says(user, wait);
-        crate::audit::refused(&app, user, "http", Some(peer.addr), "sign in", &why);
+        crate::audit::refused_by(&app, user, "http", Some(peer.addr), ip, "sign in", &why).await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (as a wrong guess does)
         return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", wait.to_string())], why).into_response();
     }
     if !crate::users::password_ok(&app.lake, user, password).await {
         crate::auth::guessed(ip, user);
-        crate::audit::refused(&app, user, "http", crate::auth::current().and_then(|p| p.from), "sign in", "wrong user name or password");
+        crate::audit::refused_by(&app, user, "http", crate::auth::current().and_then(|p| p.from), ip, "sign in", "wrong user name or password").await;
         tokio::time::sleep(Duration::from_millis(400)).await; // (a guess costs time)
         return (StatusCode::UNAUTHORIZED, "wrong user name or password").into_response();
     }
@@ -525,10 +497,11 @@ async fn whoami(State(app): State<App>) -> Json<Value> {
         crate::auth::Role::Read => "read",
         crate::auth::Role::None => "none",
     };
-    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "open": app.open().await}))
+    Json(j!({"user": p.name, "role": role, "superuser": p.role == crate::auth::Role::Admin && p.access.is_none(), "slug": crate::auth::slug(&p), "open": app.open().await}))
 }
 
-/// Followers forward metadata writes to the leader, unchanged.
+/// Followers forward metadata writes to the leader, unchanged. The leader checks the caller's own sign-in (security pass 3,
+/// K1): only the cluster's own calls go with the node's credential; anyone else's goes on with theirs.
 async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response {
     if app.seq.is_some() {
         return next.run(req).await;
@@ -536,15 +509,30 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
     if app.members.reader() {
         return E(anyhow::anyhow!("read-only node")).into_response();
     }
-    proxy(&app.members.leader().addr, req).await.unwrap_or_else(|e| E(e).into_response())
+    let operator = crate::auth::operator(); // (read now, while the request's scope holds: `auth::WHO`)
+    // (a caller's own sign-in goes on as it came, at an open node too, whose open leader takes it as it takes none: a node
+    // never puts its own credential behind a caller's. One that took itself for open, its catalog not yet holding its
+    // leader's users, did, and a branch's key made a user's token at the leader: CI run 41359432087, attempt 2)
+    let as_caller = match req.headers().get(axum::http::header::AUTHORIZATION) {
+        _ if operator => None, // (the cluster itself: the node's own credential)
+        Some(v) => Some(v.clone()),
+        None if app.open().await => None, // (an open node: as `nodes_own` says)
+        None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
+    };
+    proxy(&app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
 }
 
-async fn proxy(addr: &str, req: Request) -> anyhow::Result<Response> {
+/// Sends `req` to the leader at `addr`. `as_caller`: the caller's own `Authorization`, which replaces the node's default one
+/// (`cluster::http`; reqwest fills a default header only when the request lacks it). None: the node's own credential.
+async fn proxy(addr: &str, req: Request, as_caller: Option<HeaderValue>) -> anyhow::Result<Response> {
     let (parts, body) = req.into_parts();
     let url = crate::tls::url(&format!("{addr}{}", parts.uri.path_and_query().map_or("", |p| p.as_str())));
     let mut out = crate::cluster::http().request(parts.method, url).body(axum::body::to_bytes(body, usize::MAX).await?);
     if let Some(ct) = parts.headers.get("content-type") {
         out = out.header("content-type", ct);
+    }
+    if let Some(v) = as_caller {
+        out = out.header(axum::http::header::AUTHORIZATION, v);
     }
     let res = out.send().await?;
     // (the leader's answer as it is: its status, content type and the x-pondra- headers, the SQLSTATE and notices among
@@ -628,18 +616,160 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
     Ok(Json(crate::tier::run_job(&app.lake, job).await?))
 }
 
-/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one.
+/// The commit stream (see `Frame`): who leads, then the recent frames, then every new one. A follower's are the leader's
+/// frames as it relayed them (`members::follow`, `Catalog::relay`), so a page that joins a follower reads the leader's
+/// stream from its own node, and the leader serves one stream per follower, not per page. A caller that isn't one of
+/// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`). Its sign-in revoked or expired, the
+/// stream ends (`until_revoked`).
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
+    let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
+    let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
+    let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
+    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
     let cat = &app.lake.cat;
-    let streamed = crate::format::Streamed::to(crate::format::said(&headers).1); // (held while the stream is open: `format::raise`)
+    let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
     let (recent, rx) = cat.subscribe();
     let live = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.ok().map(|f| (f, rx)) }); // a lagging follower reconnects
     let frames = futures::stream::iter([start].into_iter().chain(recent)).chain(live).map(move |f| {
         let _ = &streamed;
-        Ok::<_, std::io::Error>(f.encode())
+        Ok::<_, std::io::Error>(for_caller(f, operator).encode())
     });
-    Body::from_stream(crate::drain::endless(frames)).into_response() // (never ends by itself: it ends when the node's door closes)
+    Body::from_stream(crate::drain::endless(frames.take_until(revoked))).into_response() // (the node's door closing ends it too: `drain::endless`)
+}
+
+/// `POST /cluster/records`: a joined page's own statements, which this node writes as its own (`page_records::record`), under the
+/// sign-in's name, as the door `page`. Only a superuser's own sign-in sends them (`page_records::refusal`: never the nodes' key, a
+/// user with grants, or a procedure's lent token); a batch past `BATCH_LINES` lines is 413.
+async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(batch): Json<crate::page_records::Batch>) -> Response {
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    let Some(who) = crate::auth::current() else { return (StatusCode::FORBIDDEN, "a joined page's lines need a sign-in").into_response() };
+    if let Some(why) = crate::page_records::refusal(&who, token) {
+        return (StatusCode::FORBIDDEN, why).into_response();
+    }
+    if batch.lines.len() > crate::page_records::BATCH_LINES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    crate::page_records::record(&app, &who, batch).await;
+    StatusCode::OK.into_response()
+}
+
+/// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query) may no longer have it: its
+/// sign-in revoked, expired, or changed so that `still` refuses it (a grant taken back, a superuser no more); a caller that
+/// came in with nothing signed, at an open node, once the node is open no more. Checked every 5 s, as `guard` checks a
+/// request (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier), so such an
+/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest). A node, a token and the program
+/// that started this node never end.
+pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send) {
+    if operator {
+        return futures::future::pending().await;
+    }
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let signed = match &header {
+            Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), false).await.is_some_and(|p| still(&p)),
+            None => false,
+        };
+        if !signed && !app.open().await {
+            return;
+        }
+    }
+}
+
+/// The caller of a request, as `until_revoked` checks it again: whether it is one of the nodes' own (`auth::operator`, read
+/// while the request's scope holds), and its `Authorization`.
+fn caller(headers: &HeaderMap) -> (bool, Option<String>) {
+    (crate::auth::operator(), headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from))
+}
+
+/// Is the request being served one of the nodes' own: their tokens, their key, the program that started this node
+/// (`auth::operator`), or anyone at an open node, as `guard` lets the cluster's routes through. A node that follows its
+/// leader on an open lake sends no token, and must get every key.
+async fn nodes_own(app: &App) -> bool { crate::auth::operator() || app.open().await }
+
+/// What a caller sees of one frame: a change with only the keys it may hold (`objects::readable`). The frame stays, so
+/// the ids run on without a gap.
+fn for_caller(f: Frame, operator: bool) -> Frame {
+    match f {
+        Frame::Change(d) if !operator => Frame::Change(Arc::new(d.only(crate::objects::readable))),
+        f => f,
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct KvParams {
+    key: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<usize>,
+    since: Option<u64>,
+    start: Option<String>,
+}
+
+/// A page of a range on `GET /cluster/kv`: at most this many keys, and past about this many bytes of values it ends (after
+/// at least one key). A range past these bounds without a `limit` is refused (413): an old page asks whole, and is told to ask in pages.
+const KV_KEYS: usize = 5_000;
+const KV_BYTES: usize = 8 << 20;
+
+/// `GET /cluster/kv`: what a page reads of this node's catalog, as base64url of the bytes (no padding). `?key=K` answers
+/// `{"value": …}` (null when there is none), `?from=F[&to=T][&limit=N]` answers `{"entries": [[key, value], …], "more": …,
+/// "at": …}` for the range [F, T): no `to` is to the end. `limit` (1 to 5,000) is the page's keys at most; `more` says keys
+/// follow it, which the next request asks for (from the last key + `"\0"`, the same `to`), and `at` is the commit the
+/// page was read as of. A range's later pages ask `since=` the first page's `at` and `start=` the range's own start, and
+/// `moved` says a key the caller may see from that start to `to` changed after that commit (then the range starts over). A caller that isn't one of the nodes
+/// (`nodes_own`) is answered only for the keys `objects::readable` allows.
+async fn kv(State(app): State<App>, Query(p): Query<KvParams>) -> Result<Json<Value>, Response> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD as B64, Engine};
+    let operator = nodes_own(&app).await;
+    let may = |k: &str| operator || crate::objects::readable(k);
+    let cat = &app.lake.cat;
+    let failed = |e: anyhow::Error| E(e).into_response();
+    if let Some(key) = p.key {
+        let value = match may(key.as_str()) {
+            true => cat.get_raw(&key).await.map_err(failed)?,
+            false => None,
+        };
+        return Ok(Json(j!({"value": value.map(|v| B64.encode(v))})));
+    }
+    // (keys are UTF-8 strings: no key sorts after U+10FFFF, which is therefore "to the end")
+    let text = |b64: &str| B64.decode(b64).ok().and_then(|b| String::from_utf8(b).ok()).ok_or_else(|| (StatusCode::BAD_REQUEST, "a bound is base64url of a key").into_response());
+    let from = text(&p.from.ok_or_else(|| (StatusCode::BAD_REQUEST, "?key= or ?from= says what to read").into_response())?)?;
+    let to = match p.to {
+        Some(to) => text(&to)?,
+        None => "\u{10ffff}".to_string(),
+    };
+    // (one more key than a page holds, so that `more` is known; no `limit` is the whole range, if it fits a page's bounds)
+    let asked = p.limit.map_or(KV_KEYS, |n| n.clamp(1, KV_KEYS));
+    let (got, at) = cat.scan_page(&from, &to, asked + 1, &may).await.map_err(failed)?;
+    let (kept, more) = match p.limit {
+        Some(_) => {
+            let (mut kept, mut bytes, mut more) = (Vec::new(), 0, got.len() > asked);
+            for (k, v) in got.into_iter().take(asked) {
+                if !kept.is_empty() && bytes + v.len() > KV_BYTES {
+                    more = true; // (the rest of the range is the next page's)
+                    break;
+                }
+                bytes += v.len();
+                kept.push((k, v));
+            }
+            (kept, more)
+        }
+        None => {
+            if got.len() > asked || got.iter().map(|(_, v)| v.len()).sum::<usize>() > KV_BYTES {
+                return Err((StatusCode::PAYLOAD_TOO_LARGE, "this range is more than 5,000 keys or 8 MB: read it in pages, with ?limit=N, and from the last key + \"\\0\" for as long as `more` is true").into_response());
+            }
+            (got, false)
+        }
+    };
+    // (`since`: a page after the first of a range asks whether the keys it may see moved since that first page's `at`)
+    let start = match p.start {
+        Some(start) => text(&start)?, // (the range's own start: its earlier pages' keys count too)
+        None => from.clone(),
+    };
+    let moved = p.since.is_some_and(|since| cat.moved_since(&start, &to, since, at, &may));
+    let entries: Vec<(String, String)> = kept.into_iter().map(|(k, v)| (k, B64.encode(v))).collect();
+    Ok(Json(j!({"entries": entries, "more": more, "at": at, "moved": moved})))
 }
 
 #[derive(Deserialize, Default)]
@@ -738,14 +868,18 @@ async fn append_rows(app: &App, name: &str, p: AppendParams, headers: HeaderMap,
 #[derive(Deserialize)]
 struct InsertParams {
     job: String,
+    staged: Option<u8>, // (1: the body is the columns of rows a joined page staged, `insert_staged`; else it is SQL)
 }
 
 /// Bulk `INSERT INTO name <body SQL>`: this node runs the query and writes the Parquet (no log);
 /// the leader records the files, together with `job` so a retried job is applied once. Creates
-/// the table if missing.
-async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, query: String) -> Result<Json<Value>, E> {
+/// the table if missing. With `staged=1` the body is the columns of a joined page's staged rows (`insert_staged`).
+async fn insert(State(app): State<App>, Path(name): Path<String>, Query(p): Query<InsertParams>, body: String) -> Result<Json<Value>, E> {
     let start = std::time::Instant::now();
-    let out = insert_rows(&app, &name, p, query).await;
+    let out = match p.staged {
+        Some(1) => insert_staged(&app, &name, &p.job, &body).await,
+        _ => insert_rows(&app, &name, p, body).await,
+    };
     crate::audit::rows(&app, "/insert", &name, out.as_ref().err().map(|e| e.to_string()), start.elapsed()); // (the audit log's line for the rows: S23)
     out
 }
@@ -757,6 +891,11 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     }
     crate::auth::check_rows(&name)?; // (its INSERT grant, as SQL's)
     let query = crate::routines::expand(&app.lake, &query).await?;
+    // (a table that moved a column: the query's columns fill SQL's first ones, as an INSERT's do: `write::in_sql_order`)
+    let query = match app.lake.table_meta_if(name).await? {
+        Some(m) if !m.shown.is_empty() => crate::write::whole_rows_of(&app.lake, name, &m, &crate::write::filled(&app.lake, &m, name, &query).await?, &query).await?,
+        _ => query,
+    };
     let ctx = session(&app.lake, &query, "").await?;
     match crate::write::write_files(&app.lake, &ctx, &name, &query, &p.job, crate::write::stamp(&app.lake, &name, Some(&app.to())).await?).await? {
         Some(f) => Ok(Json(app.record_files(f).await?)),
@@ -764,10 +903,92 @@ async fn insert_rows(app: &App, name: &str, p: InsertParams, query: String) -> R
     }
 }
 
+/// A joined page's rows, staged (`staged=1`): this node runs `INSERT INTO name (columns) SELECT c0 AS "a", … FROM` the files the
+/// page put in `stage/<slug>/<job>/` (`auth::page_creates`), as the signed-in user, through its own write (`write::on_node_as`):
+/// the table's types, NOT NULL, CHECK, keys, identity and defaults, the INSERT grant, the job's duplicate answer and the record
+/// are all this node's. The page's files are only a transport, so the node reads what they hold by position and checks it. The
+/// staged files are deleted once the INSERT has answered, whatever the answer, or was stopped, so a resend finds none and is
+/// answered by the job. `files` is how many the page staged: the node takes the INSERT only when exactly those are there, so a
+/// file lost on the way (or swept: `tier::collect_orphans`) is a refusal, never a quiet loss of its rows.
+async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<Json<Value>, E> {
+    #[derive(Deserialize)]
+    struct Staged { columns: Vec<String>, files: u64 }
+    ensure!(!app.members.reader(), "read-only node");
+    let who = crate::auth::current().unwrap_or_else(|| crate::auth::Principal::of(crate::auth::Role::None));
+    let Some(slug) = crate::auth::slug(&who) else { return Err(crate::codes::coded("42501", "a staged INSERT is a user's: its sign-in has no name to stage under").into()) };
+    ensure!(crate::auth::staged_job(job), "a staged INSERT's job is letters, digits and hyphens, 64 at most");
+    crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
+    let Staged { columns, files } = serde_json::from_str(body)?;
+    if files > crate::write::STAGED_FILES_MOST {
+        return Err(crate::codes::coded("54000", format!("a staged INSERT takes {} files at most, and this one says {files}", crate::write::STAGED_FILES_MOST)).into());
+    }
+    let dir = format!("stage/{slug}/{job}/");
+    let unstage = Unstage(Some((app.lake.clone(), dir.clone()))); // (whether it answers, fails or is stopped: the page's files are its transport only)
+    let there = staged_files(&app.lake, &dir).await?;
+    // (none there: a resend after its INSERT took them, which the job answers as a duplicate, or nothing to take)
+    // (compared in place: the count is the sender's, and a range collected from it was a vector as long as it says, which
+    // for 2^40 files asked for 8 TiB and aborted the node: 11-02 audit H2)
+    if !there.is_empty() && (there.len() as u64 != files || there.iter().enumerate().any(|(i, &n)| n != i as u64)) {
+        return Err(crate::codes::coded("55000", format!("the page staged {files} files for this INSERT and {} are here: it is sent again whole", there.len())).into());
+    }
+    let meta = app.lake.table_meta(name).await?;
+    let live: Vec<&str> = meta.live().map(|(_, logical, _)| logical).collect();
+    if let Some(c) = columns.iter().find(|c| !live.contains(&c.as_str())) {
+        return Err(crate::codes::coded("42703", format!("{name} has no column {c}")).into());
+    }
+    let picks: Vec<String> = columns.iter().enumerate().map(|(i, c)| format!("c{i} AS \"{}\"", c.replace('"', "\"\""))).collect();
+    let url = format!("{}/stage/{slug}/{job}/*.parquet", app.lake.url.trim_end_matches('/')).replace('\'', "''");
+    let stmt = crate::write::Stmt::InsertInto(name.to_string(), columns, format!("SELECT {} FROM '{url}'", picks.join(", ")));
+    app.auth.allows(who.role, &stmt)?;
+    let out = crate::write::on_node_as(app, stmt, Some(format!("staged:{slug}:{job}")), true).await;
+    unstage.now().await; // (before the answer, so a resend of the same job stages afresh)
+    Ok(Json(out?))
+}
+
+/// The numbers of the staged files in `dir` (`<n>.parquet`, `auth::page_creates`), in order.
+async fn staged_files(lake: &crate::store::Lake, dir: &str) -> anyhow::Result<Vec<u64>> {
+    use futures::TryStreamExt;
+    let listed = lake.store.list(Some(&object_store::path::Path::parse(dir)?)).try_collect::<Vec<_>>().await?;
+    let mut n: Vec<u64> = listed.iter().filter_map(|o| o.location.filename()?.strip_suffix(".parquet")?.parse().ok()).collect();
+    n.sort_unstable();
+    Ok(n)
+}
+
+/// A staged INSERT's folder, deleted once its INSERT has answered (`now`), or in the background when it was dropped unanswered (a
+/// stopped INSERT: `stoppable`). A failure is not the answer's, and the leader's orphan sweep takes what is left
+/// (`tier::collect_orphans`).
+struct Unstage(Option<(Arc<crate::store::Lake>, String)>);
+
+impl Unstage {
+    async fn now(mut self) {
+        if let Some((lake, dir)) = self.0.take() {
+            unstage(&lake, &dir).await;
+        }
+    }
+}
+
+impl Drop for Unstage {
+    fn drop(&mut self) {
+        if let Some((lake, dir)) = self.0.take() {
+            crate::panics::spawn(async move { unstage(&lake, &dir).await });
+        }
+    }
+}
+
+/// Deletes what is stored under `dir`.
+async fn unstage(lake: &crate::store::Lake, dir: &str) {
+    use futures::TryStreamExt;
+    let Ok(at) = object_store::path::Path::parse(dir) else { return };
+    let Ok(listed) = lake.store.list(Some(&at)).try_collect::<Vec<_>>().await else { return };
+    for o in listed {
+        let _ = object_store::ObjectStoreExt::delete(&lake.store, &o.location).await;
+    }
+}
+
 /// Record an INSERT's files (from another node, or a `pondra sql` somewhere else).
 async fn files(State(app): State<App>, Json(f): Json<crate::write::Files>) -> Result<Json<Value>, E> {
     let meta = app.lake.cat.meta(&table_key(f.table())).await?;
-    crate::auth::files_from_writer(meta.as_ref().map(|m| m.folder(f.table())), &f.paths())?; // (a write token's: into its table's folder)
+    crate::auth::files_from_writer(f.table(), meta.as_ref().map(|m| m.folder(f.table())), &f.paths())?; // (a write token's: into its table's folder)
     Ok(Json(app.record_files(f).await?))
 }
 
@@ -790,7 +1011,7 @@ async fn create_view(State(app): State<App>, Path(name): Path<String>, Query(opt
         let _guard = app.lock.lock().await;
         crate::ddl::apply(&app.lake, d.clone()).await?
     };
-    crate::ddl::settle(&app.lake, &d).await?; // (once it's filled from the rows already there)
+    app.settle(&d).await?; // (once it's filled from the rows already there)
     Ok(Json(out))
 }
 
@@ -816,12 +1037,13 @@ fn cluster_call(app: &App, headers: &HeaderMap) -> bool {
 /// A `CREATE`/`DROP` of a schema, view or table that a follower's SQL asked for (`ddl.rs`), and a
 /// branch's pin (ADR-058). A follower sends it to the leader, asked with the caller's own token.
 async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Extension<crate::auth::Role>>, Json(mut d): Json<crate::ddl::Ddl>) -> Result<Json<Value>, E> {
+    crate::backup::sent(&d)?;
     let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).map(String::from);
     let key = bearer.as_deref().filter(|k| k.starts_with("pb_"));
     if let Some(key) = key {
         crate::branch::keyed(&app.lake, &d, key).await?; // (a branch's key: its own pin, nothing else)
-    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) {
-        crate::branch::cloning(&d)?; // (a user with CLONE: a pin, and nothing else)
+    } else if role.is_none_or(|r| r.0 < crate::auth::Role::Admin) || !cluster_call(&app, &headers) {
+        crate::branch::cloning(&d)?; // (a user with CLONE, or a user's own sign-in, a superuser's too: a pin, and nothing else)
     }
     if !cluster_call(&app, &headers) && key.is_none() {
         crate::protect::check_ddl(&app.lake, &d).await?;
@@ -835,7 +1057,13 @@ async fn ddl(State(app): State<App>, headers: HeaderMap, role: Option<axum::Exte
             crate::ddl::apply(&app.lake, d.clone()).await?
         }
     };
-    crate::ddl::settle(&app.lake, &d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    app.settle(&d).await?; // (ATTACH, CREATE DATABASE: the leader too at once, not in a second)
+    let mut out = out;
+    if key.is_some() {
+        // (a renewal by a branch's key gets no key back: one given before the lake's keys were sealed would get the
+        // new one, which lets the pin go (11-01 audit L12), and the branch keeps the key it has: `branch::renew`)
+        out.as_object_mut().map(|o| o.remove("key"));
+    }
     Ok(Json(out))
 }
 
@@ -848,10 +1076,12 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
     let lake = &app.lake;
     let meta = lake.table_meta(&name).await?;
     ensure!(!meta.key.is_empty(), "{name} has no key: use /sql");
+    // (SQL's order, for a table that moved a column: as `SELECT *` lists them)
+    let in_order = |b: RecordBatch| -> anyhow::Result<RecordBatch> { if meta.shown.is_empty() { Ok(b) } else { Ok(crate::answer::batch_reordered(&b, &meta.sql_order())?) } };
     if meta.merge.is_empty() && meta.ttl.is_none() && meta.order.is_none() {
         let shown = crate::answer::schema(&meta.columns.iter().filter(|(c, _)| c != "_deleted").cloned().collect::<Vec<_>>())?; // (as `SELECT *` shows it)
         let row = crate::serve::lookup(lake, &name, &meta, &key).await?.map(|r| crate::query::conform(&r, &shown)).transpose()?; // (by name: a row from before an ADD COLUMN lacks it)
-        let row = row.map(|r| meta.to_logical(&r)).transpose()?;
+        let row = row.map(|r| meta.to_logical(&r).and_then(in_order)).transpose()?;
         let mut w = arrow_json::ArrayWriter::new(Vec::new());
         w.write_batches(&row.iter().collect::<Vec<_>>())?;
         w.finish()?;
@@ -877,7 +1107,7 @@ async fn lookup(State(app): State<App>, Path((name, key)): Path<(String, String)
         false => format!("{} ", latest_sql(&meta, "__raw", false, false)).replace(" GROUP BY ", &format!(" WHERE {where_} GROUP BY ")),
     };
     let shown = |b: &RecordBatch| b.project(&(0..b.num_columns()).filter(|&i| b.schema().field(i).name() != "_deleted").collect::<Vec<_>>());
-    let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?)).collect::<anyhow::Result<Vec<_>>>()?;
+    let batches = ctx.sql(&sql).await?.collect().await?.iter().map(|b| meta.to_logical(&shown(b)?).and_then(in_order)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut w = arrow_json::ArrayWriter::new(Vec::new());
     w.write_batches(&batches.iter().collect::<Vec<_>>())?;
     w.finish()?;
@@ -896,7 +1126,7 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
         Err(e) => E::from(e).into_response(),
     };
     r = held_session(r, said.session.as_deref());
-    if let Some(h) = notices(&said.heard) {
+    if let Some(h) = crate::statement::notices(&said.heard).and_then(|t| axum::http::HeaderValue::from_str(&t).ok()) {
         r.headers_mut().insert("x-pondra-notices", h);
     }
     r
@@ -905,29 +1135,10 @@ async fn sql(State(app): State<App>, Query(p): Query<crate::statement::SqlParams
 /// The header that keeps a client to this node while its session holds temporary tables (`temp::holds`).
 fn held_session(mut r: Response, session: Option<&str>) -> Response {
     if session.is_some_and(crate::temp::holds) {
-        r.headers_mut().insert("x-pondra-session", axum::http::HeaderValue::from_static("held")); // (a client keeps to this node meanwhile)
+        let (name, value) = crate::statement::HELD_SESSION;
+        r.headers_mut().insert(name, axum::http::HeaderValue::from_static(value)); // (a client keeps to this node meanwhile)
     }
     r
-}
-
-/// What the statement's procedures printed, for the caller: a JSON list of lines in a header (all
-/// of it in ASCII, the first 32 KB of it; the run log has the rest).
-fn notices(heard: &[String]) -> Option<axum::http::HeaderValue> {
-    if heard.is_empty() {
-        return None;
-    }
-    let (mut kept, mut size) = (vec![], 0);
-    for n in heard {
-        size += n.len() + 4;
-        if size > 32 << 10 {
-            kept.push("…".to_string());
-            break;
-        }
-        kept.push(n.clone());
-    }
-    let text = serde_json::to_string(&kept).ok()?;
-    let ascii: String = text.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c.to_string() } else { c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect() }).collect();
-    axum::http::HeaderValue::from_str(&ascii).ok()
 }
 
 /// `GET /secrets/{name}`: a secret's values (`CREATE SECRET`), for a Python procedure's own code
@@ -973,7 +1184,7 @@ fn respond(r: Rendered, format: Option<&str>) -> Response {
 /// The body of an answer in pieces (`query::Handed`): its first piece, then the rest as they are written. A channel
 /// that closes before the last piece was written fails the body, so a client never takes a cut answer for a whole one.
 fn pieces(h: crate::query::Handed) -> Body {
-    let crate::query::Handed { first, rest, ended } = h;
+    let crate::query::Handed { first, rest, ended, stop } = h;
     // (counted until the body's last piece is read, not until its writer ends: the pieces still in the channel are what
     // a node stopping after the writer would cut short, so a node told to stop waits for them: `drain::Busy::carried`)
     let busy = crate::drain::Busy::carried();
@@ -986,7 +1197,11 @@ fn pieces(h: crate::query::Handed) -> Body {
             None => Some((Err(std::io::Error::other("the answer stopped before its end")), None)),
         }
     });
-    Body::from_stream(head.chain(rest))
+    // (a client that goes mid-answer stops the plan's search still running: the statement's flag, if it has one)
+    match stop {
+        Some(flag) => Body::from_stream(crate::audit::guarded(flag, head.chain(rest))),
+        None => Body::from_stream(head.chain(rest)),
+    }
 }
 
 /// `GET /sql/pages/{id}?from=10000&rows=10000`: more rows of an answer the console was sent
@@ -1017,10 +1232,17 @@ struct WatchParams {
 
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
-async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
+async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>, headers: HeaderMap) -> Response {
     if let Err(e) = crate::auth::check_all(&name) {
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
+    // (the rows come after this request's scope has ended: its sign-in is checked again, and the table's whole rows with it, so
+    // a REVOKE, a DROP USER or a session's end stops them within 5 s: 11-02 audit H3)
+    let (operator, header) = caller(&headers);
+    let table = name.clone();
+    let revoked = until_revoked(app.clone(), operator, header, move |p| {
+        p.role >= crate::auth::Role::Read && crate::auth::WHO.sync_scope(p.clone(), || crate::auth::check_all(&table)).is_ok()
+    });
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
     let (marks, changes) = (p.marks, p.changes);
@@ -1039,13 +1261,25 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
                     true => crate::change::feed(&app.lake, &name, after, Some(now)).await,
                     false => tail(&app.lake, &name, after, Some(now), false).await,
                 };
+                let rows = match rows {
+                    Ok(b) => sql_ordered(&app.lake, &name, b).await, // (a table that moved a column: SQL's order)
+                    e => e,
+                };
                 let chunk = rows.and_then(|b| ndjson(&b)).map(mark);
                 return Some((chunk.map_err(|e| std::io::Error::other(e.to_string())), (app, hwm, now, name)));
             }
             hwm.changed().await.ok()?;
         }
     });
-    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))))).into_response() // (never ends by itself: `drain::endless`)
+    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))).take_until(revoked))).into_response() // (never ends by itself: `drain::endless`)
+}
+
+/// A table's rows (`tail`'s, the change feed's) with its columns in SQL's order (`TableMeta::sql_order`), the system
+/// columns where they are; as they are for a table that never moved a column.
+async fn sql_ordered(lake: &crate::store::Lake, table: &str, batches: Vec<RecordBatch>) -> anyhow::Result<Vec<RecordBatch>> {
+    let Some(meta) = lake.table_meta_if(table).await?.filter(|m| !m.shown.is_empty()) else { return Ok(batches) };
+    let order = meta.sql_order();
+    Ok(batches.iter().map(|b| crate::answer::batch_reordered(b, &order)).collect::<Result<_, _>>()?)
 }
 
 fn ndjson(batches: &[RecordBatch]) -> anyhow::Result<Vec<u8>> {

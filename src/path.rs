@@ -6,11 +6,11 @@
 //! `crm.t`, and one made without a path reads `t` as public, whoever reads it (`routines::expand_stored`).
 //! Names already full, and this lake's own `public`, come out as they went in.
 use crate::ddl::{self, lake_name};
-use crate::text::{join, PUBLIC};
+use crate::text::{contains_ci, join, PUBLIC};
 use crate::codes::coded;
 use crate::store::{table_key, Lake};
 use anyhow::{Context, Result};
-use datafusion::sql::sqlparser::ast::{self, CommentObject, CopySource, CreateTableLikeKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, ObjectName, ObjectNamePart, ObjectType, Query, Statement, TableFactor, TableObject, Value, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, CommentObject, CopySource, CreateTableLikeKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GrantObjects, ObjectName, ObjectNamePart, ObjectType, Query, Statement, TableFactor, TableObject, Value, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser};
 use regex::Regex;
 use std::collections::HashSet;
@@ -105,7 +105,11 @@ pub fn is_use(sql: &str) -> bool {
 /// a schema here is refused by name, and so is one that is both.
 pub async fn use_of(lake: &Lake, sql: &str) -> Result<String> {
     static USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?is)^\s*use\s+(?:(database|catalog|schema)\s+)?({NAME})(?:\s*\.\s*({NAME}))?\s*;?\s*$")).expect("a regex"));
-    let m = USE.captures(sql).context("USE takes a database, a schema or database.schema (USE crm; USE DATABASE dev)")?;
+    static WAREHOUSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*use\s+warehouse\s+\S").expect("a regex"));
+    if WAREHOUSE.is_match(sql) {
+        return Err(crate::codes::coded("0A000", "USE WAREHOUSE is Snowflake's: a Pondra node is its own compute; USE takes a database, a schema or database.schema"));
+    }
+    let m = USE.captures(sql).ok_or_else(|| crate::codes::coded("42601", "USE takes a database, a schema or database.schema (USE crm; USE DATABASE dev)"))?;
     let kw = m.get(1).map(|k| k.as_str().to_lowercase());
     let first = name_parts(&m[2]).into_iter().next().unwrap_or_default();
     let second = m.get(3).map(|s| name_parts(s.as_str()).into_iter().next().unwrap_or_default());
@@ -197,9 +201,9 @@ pub fn currents(lake: &Lake, sql: &str) -> String {
 /// has none, comes back as it came.
 fn currents_of(path: &Path, sql: &str) -> String {
     let Some(mut stmts) = parse_text(sql) else { return sql.to_string() };
-    let mut walk = Currents { path, changed: false };
+    let mut walk = Currents { path, changed: false, kept: false };
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     match walk.changed {
         true => stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join(";\n"),
@@ -207,16 +211,45 @@ fn currents_of(path: &Path, sql: &str) -> String {
     }
 }
 
-/// Writes a reader's `current_*` into a stored view's text (`currents_of`); nothing else changes.
+/// Writes a reader's `current_*` into a stored view's text (`currents_of`); nothing else changes. A statement that
+/// stores a body for its readers or callers (a view, a function, a macro) keeps its own, as `door` keeps them.
 struct Currents<'a> {
     path: &'a Path,
     changed: bool,
+    kept: bool,
+}
+
+/// Does `s` store a body whose `current_*` are its readers' or callers' (a view, not a materialized or temporary one; a
+/// function; a macro)?
+fn keeps_currents(s: &Statement) -> bool {
+    matches!(s, Statement::CreateView(v) if !v.materialized && !v.temporary)
+        || matches!(s, Statement::AlterView { .. } | Statement::CreateFunction(_) | Statement::CreateMacro { .. })
 }
 
 impl VisitorMut for Currents<'_> {
     type Break = ();
 
+    fn pre_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
+        self.kept = keeps_currents(s);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_statement(&mut self, _: &mut Statement) -> ControlFlow<()> {
+        self.kept = false;
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, s: &mut ast::Select) -> ControlFlow<()> {
+        if !self.kept {
+            named_currents(s);
+        }
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_expr(&mut self, e: &mut Expr) -> ControlFlow<()> {
+        if self.kept {
+            return ControlFlow::Continue(());
+        }
         if let Some(w) = current_word(e) {
             *e = current_value(self.path, &w);
             self.changed = true;
@@ -230,6 +263,13 @@ impl VisitorMut for Currents<'_> {
 /// never kept. Any error says yes: the caller then neither spreads the query nor keeps its answer.
 pub async fn reads_current(lake: &Lake, sql: &str) -> bool {
     stored_current(lake, sql).await.unwrap_or(true)
+}
+
+/// Is `name` a stored view that reads `current_*` (or reads one that does), while this session's path isn't this lake's
+/// public? Its leader would read it as no session's, so a change sends its rows as this session reads them
+/// (`change::for_leader`). An error says no: the leader reads it then.
+pub async fn session_view(lake: &Lake, name: &str) -> bool {
+    current(lake).is_some() && stored_current(lake, name).await.unwrap_or(false)
 }
 
 /// `reads_current`, with its errors: the stored views `sql` names, and the views those name, read as
@@ -285,12 +325,13 @@ fn text_of(here: &str, entries: &[(String, String)]) -> String {
     entries.iter().map(|(d, s)| if d.as_str() == here { quoted(s) } else { format!("{}.{}", quoted(d), quoted(s)) }).collect::<Vec<_>>().join(", ")
 }
 
-/// Does `hay` hold `needle`, whatever its case?
-fn contains_ci(hay: &str, needle: &str) -> bool { hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes())) }
-
 fn mentions_current(sql: &str) -> bool {
-    ["current_schema", "current_database", "current_catalog"].iter().any(|w| contains_ci(sql, w))
+    CURRENT.iter().any(|w| contains_ci(sql, w))
 }
+
+/// The words a session answers its own way: its schema, its database, and who it is (Postgres's `current_user`,
+/// `session_user` and `current_role`; a bare `user` stays a column's name, as DuckDB reads it).
+const CURRENT: [&str; 6] = ["current_schema", "current_database", "current_catalog", "current_user", "session_user", "current_role"]; // (the place's, then who's)
 
 /// The database a name is: this lake, or an attached one (or the error that names it).
 async fn db_lake(lake: &Lake, name: &str) -> Result<Arc<Lake>> {
@@ -460,7 +501,7 @@ async fn expr(lake: &Lake, skip: &HashSet<String>, e: &str) -> Result<String> {
 fn collect(path: &Path, skip: &HashSet<String>, stmts: &mut [Statement]) -> Vec<(Fam, String)> {
     let mut walk = Walk::new(path, skip, None);
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     let mut wanted = walk.wanted;
     wanted.sort();
@@ -472,7 +513,7 @@ fn collect(path: &Path, skip: &HashSet<String>, stmts: &mut [Statement]) -> Vec<
 fn apply(path: &Path, skip: &HashSet<String>, w: &World, stmts: &mut [Statement]) -> bool {
     let mut walk = Walk::new(path, skip, Some(w));
     for s in stmts.iter_mut() {
-        let _ = s.visit(&mut walk);
+        let _ = crate::walk::visit_mut(s, &mut walk);
     }
     walk.changed
 }
@@ -526,6 +567,7 @@ struct Walk<'a> {
     world: Option<&'a World>, // (None: collecting)
     ctes: Vec<Vec<String>>,   // the CTE names of the queries around: `WITH t AS …` makes no table `t`
     temp: Vec<String>,        // the session's temporary tables and views, and the tables sent with the request
+    temp_routines: Vec<String>, // the session's temporary functions
     wanted: Vec<(Fam, String)>,
     changed: bool,
     view: bool,               // inside a stored view's query: its current_* stay, worked out as each reader reads it (`currents`)
@@ -536,15 +578,16 @@ impl<'a> Walk<'a> {
         let (tables, views) = crate::temp::listed();
         let sent = crate::query::SENT.try_with(|t| t.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()).unwrap_or_default();
         let temp = tables.into_iter().map(|(n, _)| n).chain(views.into_iter().map(|(n, _)| n)).chain(sent).collect();
-        Walk { path, skip, world, ctes: vec![], temp, wanted: vec![], changed: false, view: false }
+        Walk { path, skip, world, ctes: vec![], temp, temp_routines: crate::temp::routine_names(), wanted: vec![], changed: false, view: false }
     }
 
     /// Names a name the path never changes: a CTE, a temporary table, a table sent with the request
-    /// or one a view names (for a relation), Postgres's catalog, and a file or a table as it was
-    /// (`ext:`, `at:`).
+    /// or one a view names (for a relation), a temporary function, Postgres's catalog, and a file or
+    /// a table as it was (`ext:`, `at:`).
     fn free(&self, parts: &[String], fam: Fam) -> bool {
         let [n] = parts else { return false };
-        let shadowed = fam == Fam::Relation && (self.skip.contains(n) || self.temp.contains(n) || self.ctes.iter().any(|c| c.contains(n)));
+        let shadowed = fam == Fam::Relation && (self.skip.contains(n) || self.temp.contains(n) || self.ctes.iter().any(|c| c.contains(n)))
+            || fam == Fam::Routine && self.temp_routines.contains(n);
         shadowed || n.starts_with("pg_") || n.contains(['.', '/', ':']) // (a file's or a past's name: `"ext:…"`, `"at:…"`, `"x.parquet"`)
     }
 
@@ -652,6 +695,13 @@ impl VisitorMut for Walk<'_> {
 
     fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<()> {
         self.ctes.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, s: &mut ast::Select) -> ControlFlow<()> {
+        if self.world.is_some() && !self.view {
+            named_currents(s);
+        }
         ControlFlow::Continue(())
     }
 
@@ -787,9 +837,11 @@ impl VisitorMut for Walk<'_> {
             }
             Statement::CreateFunction(f) => {
                 self.name(&mut f.name, Fam::Routine, true);
+                self.view = true; // (a function's body is its caller's: its current_schema() is read where it is called)
             }
             Statement::CreateMacro { name, .. } => {
                 self.name(name, Fam::Routine, true);
+                self.view = true; // (a macro's body is written into its caller's SQL: its current_schema() is the caller's)
             }
             Statement::Call(f) => {
                 self.name(&mut f.name, Fam::Routine, false);
@@ -807,9 +859,9 @@ impl VisitorMut for Walk<'_> {
         ControlFlow::Continue(())
     }
 
-    /// A stored view's statement ends here: what follows is the session's again.
+    /// A stored view's (or a function's or a macro's) statement ends here: what follows is the session's again.
     fn post_visit_statement(&mut self, s: &mut Statement) -> ControlFlow<()> {
-        if matches!(s, Statement::CreateView(_) | Statement::AlterView { .. }) {
+        if matches!(s, Statement::CreateView(_) | Statement::AlterView { .. } | Statement::CreateFunction(_) | Statement::CreateMacro { .. }) {
             self.view = false;
         }
         ControlFlow::Continue(())
@@ -824,21 +876,40 @@ fn one_part(name: &ObjectName) -> Option<String> {
     }
 }
 
-/// The `current_*` word an expression is: `current_database`, `current_catalog` or `current_schema`,
-/// called with no arguments or written bare (unquoted). None for anything else.
+/// The `current_*` word an expression is (`CURRENT`), called with no arguments or written bare (unquoted). None for
+/// anything else, and for who is asking on the Postgres port, which says its sign-in's name there (`pg_catalog::rewrite`,
+/// as Postgres does, even on a node nobody signs in to).
 fn current_word(e: &Expr) -> Option<String> {
     let word = match e {
         Expr::Function(f) => one_part(&f.name),
         Expr::Identifier(i) if i.quote_style.is_none() => Some(i.value.to_lowercase()),
         _ => None,
     }?;
-    matches!(word.as_str(), "current_database" | "current_catalog" | "current_schema").then_some(word)
+    let port = || crate::auth::current().is_some_and(|p| p.door == "postgres");
+    (CURRENT[..3].contains(&word.as_str()) || CURRENT.contains(&word.as_str()) && !port()).then_some(word)
 }
 
-/// What a `current_*` word is in `path`: the schema for `current_schema`, else the database, as text.
+/// What a `current_*` word is in `path`: the schema for `current_schema`, who is asking for `current_user` and its
+/// kind (`auth::name`), else the database, as text.
 fn current_value(path: &Path, word: &str) -> Expr {
-    let value = if word == "current_schema" { path.schema() } else { path.database() };
-    Expr::Value(Value::SingleQuotedString(value.to_string()).into())
+    let value = match word {
+        "current_schema" => path.schema().to_string(),
+        "current_user" | "session_user" | "current_role" => crate::auth::name(),
+        _ => path.database().to_string(),
+    };
+    Expr::Value(Value::SingleQuotedString(value).into())
+}
+
+/// A select's `current_*` written as a column on its own keeps its word as its name (`SELECT current_user` is a
+/// column `current_user`, as in Postgres), once it is a value.
+fn named_currents(s: &mut ast::Select) {
+    for item in s.projection.iter_mut() {
+        if let ast::SelectItem::UnnamedExpr(e) = item {
+            if let Some(w) = current_word(e) {
+                *item = ast::SelectItem::ExprWithAlias { expr: e.clone(), alias: ast::Ident::new(w) };
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -944,14 +1015,44 @@ mod tests {
         assert!(rewrite(&crm, &none, "SELECT current_schema() AS s").contains("'crm'"));
         let two = rewrite(&crm, &none, "CREATE VIEW v AS SELECT current_schema() AS s; SELECT current_schema() AS s");
         assert!(two.contains("SELECT 'crm' AS s"), "the view's flag ends with its statement: {two}");
+        // (a macro's and a SQL function's body are their callers': current_schema() stays; a macro with no parameters
+        // is written back with its `()`, so the text parses again)
+        let m = rewrite(&crm, &none, "CREATE MACRO sch() AS current_schema(); SELECT current_schema() AS s");
+        assert!(m.contains("sch() AS current_schema()") && m.contains("SELECT 'crm' AS s"), "{m}");
+        assert!(parse_text(&m).is_some(), "{m}");
+        let f = rewrite(&crm, &none, "CREATE FUNCTION f() RETURNS VARCHAR RETURN current_schema()");
+        assert!(f.contains("current_schema()") && !f.contains("'crm'"), "{f}");
     }
 
     #[test]
     fn reads_a_stored_views_current_names_as_its_reader() {
         let crm = parse("lake", "crm");
+        let kept = currents_of(&crm, "CREATE VIEW v AS SELECT current_schema() AS s; CREATE MACRO m() AS current_schema(); SELECT current_schema() AS s");
+        assert!(kept.matches("current_schema()").count() == 2 && kept.contains("SELECT 'crm' AS s"), "a view's and a macro's are their readers': {kept}");
         let s = currents_of(&crm, "SELECT current_schema() AS s, current_database() AS d FROM crm.t");
         assert!(s.contains("'crm'") && s.contains("'lake'") && s.contains("crm.t"), "{s}");
         assert_eq!(currents_of(&crm, "SELECT 1 AS one"), "SELECT 1 AS one");
+    }
+
+    #[test]
+    fn says_who_is_asking_as_postgres_does() {
+        let crm = parse("lake", "crm");
+        let none = world(&[], &[]);
+        // (nobody signed in: `pondra`, as the Postgres port says it; a column on its own is named by its word)
+        assert_eq!(rewrite(&crm, &none, "SELECT current_user, session_user AS s, current_role"), "SELECT 'pondra' AS current_user, 'pondra' AS s, 'pondra' AS current_role");
+        let ann = crate::auth::Principal { name: "ann".into(), ..crate::auth::Principal::of(crate::auth::Role::Read) };
+        let mine = crate::auth::WHO.sync_scope(ann.clone(), || rewrite(&crm, &none, "SELECT a FROM t WHERE owner = current_user"));
+        assert_eq!(mine, "SELECT a FROM crm.t WHERE owner = 'ann'");
+        assert_eq!(rewrite(&crm, &none, "SELECT current_schema(), current_database()"), "SELECT 'crm' AS current_schema, 'lake' AS current_database");
+        // (a view's is its reader's, as its current_schema() is; a bare `user` is a column's name)
+        let v = rewrite(&crm, &none, "CREATE VIEW mine AS SELECT a FROM t WHERE owner = current_user");
+        assert!(v.contains("owner = current_user"), "{v}");
+        let read = crate::auth::WHO.sync_scope(ann, || currents_of(&crm, "SELECT a FROM t WHERE owner = current_user"));
+        assert!(read.contains("owner = 'ann'"), "{read}");
+        assert!(rewrite(&crm, &none, "SELECT user FROM t").contains("SELECT user FROM crm.t"));
+        let port = crate::auth::Principal::of(crate::auth::Role::Admin).at("postgres", None);
+        let kept = crate::auth::WHO.sync_scope(port, || rewrite(&crm, &none, "SELECT current_user, current_schema()"));
+        assert_eq!(kept, "SELECT current_user, 'crm' AS current_schema", "the port says its sign-in's name (pg_catalog::rewrite)");
     }
 
     #[test]

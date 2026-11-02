@@ -1,14 +1,18 @@
 //! How a query that ran out of memory is planned again. `query::frugally` runs it once more in a frugal session
 //! (`query::frugal`), and the rules here change nothing unless the session is frugal (`is_on`), so a query that fits
-//! plans exactly as before. A window over whole partitions (`count(*) OVER ()`, `avg(x) OVER (PARTITION BY k)`) holds
-//! every row it has seen until the end (`held.rs`), which is what ran out. `WholePartition` answers such a window
-//! instead as each partition's aggregates in a GROUP BY, joined back to the rows on their keys, so no row is held.
-//! The answers are the same; only how much is kept at once changes.
+//! plans exactly as before; with one exception, below. A window over whole partitions (`count(*) OVER ()`,
+//! `avg(x) OVER (PARTITION BY k)`) holds every row it has seen until the end (`held.rs`), which is what ran out.
+//! `WholePartition` answers such a window instead as each partition's aggregates in a GROUP BY, joined back to the rows
+//! on their keys, so no row is held. The answers are the same; only how much is kept at once changes. Over a table's
+//! rows as they are read, it does so in every session: the table read twice streams, where the window sorts them all.
 //! A median holds every value of its group, which a spill can't help. `MiddleRows` answers a GROUP BY over medians
-//! from a sort instead: each group's values numbered in order, the one or two in the middle kept.
+//! from a sort instead: each group's values numbered in order, the one or two in the middle kept. A hash join holds its
+//! build side, which can't spill: over one partition, where DataFusion's planner makes every join a hash join,
+//! `SpillingJoins` makes it a sort-merge join, as the planner does over more.
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::{ConfigExtension, ConfigOptions};
-use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{extensions_options, Column, NullEquality, Result};
 use datafusion::functions_aggregate::expr_fn::count;
 use datafusion::functions_aggregate::sum::sum_udaf;
@@ -16,6 +20,10 @@ use datafusion::functions_window::expr_fn::row_number;
 use datafusion::logical_expr::expr::{AggregateFunction, Sort, WindowFunction, WindowFunctionDefinition};
 use datafusion::logical_expr::{cast, lit, Aggregate, Distinct, Expr, ExprFunctionExt, JoinType, LogicalPlan, LogicalPlanBuilder, Window, WindowFrameBound};
 use datafusion::optimizer::{optimizer::ApplyOrder, OptimizerConfig, OptimizerRule};
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+use datafusion::physical_plan::ExecutionPlan;
+use std::sync::Arc;
 
 extensions_options! {
     /// The frugal session's switch, set by `query::frugal`.
@@ -41,6 +49,39 @@ pub fn is_on(o: &ConfigOptions) -> bool {
     o.extensions.get::<Frugal>().is_some_and(|f| f.on)
 }
 
+/// A frugal session's hash joins of one partition, as sort-merge joins. DataFusion's planner makes a join a sort-merge
+/// join (`prefer_hash_join` off, `query::frugal`) only over more than one partition, so a page's retry (one partition,
+/// `store::partitions`) or one after `SET threads = 1` held its join's build side again, and was refused again
+/// ("Failed to allocate … for HashJoinInput"). Placed right after `JoinSelection`, so `EnsureRequirements` sorts each side
+/// by the keys, and those sorts spill. Not over more partitions, where the planner made them already; and not a
+/// null-aware join (`NOT IN`), which DataFusion keeps a hash join for its answers, or one a sort-merge join can't take.
+#[derive(Debug)]
+pub struct SpillingJoins;
+
+impl PhysicalOptimizerRule for SpillingJoins {
+    fn optimize(&self, plan: Arc<dyn ExecutionPlan>, config: &ConfigOptions) -> Result<Arc<dyn ExecutionPlan>> {
+        if !is_on(config) || config.execution.target_partitions > 1 {
+            return Ok(plan);
+        }
+        Ok(plan.transform_up(|p| {
+            let Some(join) = p.downcast_ref::<HashJoinExec>() else { return Ok(Transformed::no(p)) };
+            if join.null_aware || join.projection.is_some() {
+                return Ok(Transformed::no(p));
+            }
+            // (a side of more than one partition is merged into one by `EnsureRequirements`, and on a page in its task, `in_task.rs`)
+            let sorted = vec![SortOptions::default(); join.on().len()];
+            match SortMergeJoinExec::try_new(join.left().clone(), join.right().clone(), join.on().to_vec(), join.filter().cloned(), *join.join_type(), sorted, join.null_equality()) {
+                Ok(merge) => Ok(Transformed::yes(Arc::new(merge) as Arc<dyn ExecutionPlan>)),
+                Err(_) => Ok(Transformed::no(p)), // (a join type or key it can't take: the hash join, as before)
+            }
+        })?.data)
+    }
+
+    fn name(&self) -> &str { "spilling_joins" }
+
+    fn schema_check(&self) -> bool { true }
+}
+
 /// The aggregates a window can be answered with as a GROUP BY. Each gives every row of a partition the same answer,
 /// whatever order the rows come in. `first_value`, `rank` and `array_agg` depend on the order or the frame, so their
 /// windows are left to DataFusion.
@@ -61,9 +102,6 @@ impl OptimizerRule for WholePartition {
     }
 
     fn rewrite(&self, plan: LogicalPlan, config: &dyn OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
-        if !is_on(&config.options()) {
-            return Ok(Transformed::no(plan));
-        }
         Ok(match rewritten(&plan, config)? {
             Some(new) => Transformed::yes(new),
             None => Transformed::no(plan),
@@ -71,16 +109,25 @@ impl OptimizerRule for WholePartition {
     }
 }
 
-/// The rewrite of `plan`, when it is a window over whole partitions that can be read twice (`None` otherwise).
+/// The rewrite of `plan`, when it is a window over whole partitions that can be read twice (`None` otherwise). In a
+/// frugal session, any such window. In any session, one over a table's rows as they are read (`read_alone`): the
+/// table read twice streams, where the window sorts and holds every row (a whole-partition `avg() OVER` of 60M rows
+/// under 2 GB spilled 4.6 GB and took 58 s, B50 10-31). One over a join or a GROUP BY is left to the window unless
+/// memory runs out, since its input would be worked out twice; and so is one over files named by path or URL, which
+/// would be fetched twice (`read_again_alike`).
 fn rewritten(plan: &LogicalPlan, config: &dyn OptimizerConfig) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Window(window) = plan else { return Ok(None) };
+    let frugal = is_on(&config.options());
+    if !frugal && !read_alone(&window.input)? {
+        return Ok(None);
+    }
     let Some((keys, calls)) = whole(window) else { return Ok(None) };
     // The input is read twice (`build`), both reads at the one end the session fixed (`session_at`, invariant 265),
     // so under ingest they see the same commit.
     if any_node(plan, differs_by_reading)? {
         return Ok(None);
     }
-    let Ok(new) = build(window, &keys, calls, config) else { return Ok(None) }; // (a rewrite that can't be made leaves the query as it was: refused as before, never another error)
+    let Ok(new) = build(window, &keys, calls, frugal, config) else { return Ok(None) }; // (a rewrite that can't be made leaves the query as it was: refused as before, never another error)
     let same = same_fields(&new, plan);
     Ok(same.then_some(new))
 }
@@ -131,6 +178,27 @@ fn any_node(plan: &LogicalPlan, bad: impl Fn(&LogicalPlan) -> bool) -> Result<bo
     Ok(found)
 }
 
+/// Whether a plan is a table's rows as they are read: scans of tables read again alike (`read_again_alike`), filters,
+/// projections and aliases, nothing that works rows out of others (a join, a GROUP BY, a window, a union) and so would
+/// cost as much again when read twice.
+fn read_alone(plan: &LogicalPlan) -> Result<bool> {
+    let other = |n: &LogicalPlan| match n {
+        LogicalPlan::TableScan(t) => !read_again_alike(t),
+        LogicalPlan::Filter(_) | LogicalPlan::Projection(_) | LogicalPlan::SubqueryAlias(_) => false,
+        _ => true,
+    };
+    Ok(!any_node(plan, other)?)
+}
+
+/// Whether a scan, read a second time, gives the same rows as cheaply: one of the lake's own tables, which a query reads
+/// as of one commit however often it reads it (`session_at`, invariant 265), from its hot columns once they are read; or
+/// a table held in memory. Files named by path or URL (`read_parquet('s3://…/*')`, a CSV folder, a web page) are
+/// fetched again, so a window over them that has the memory it needs is cheaper left as it is (audit 11-01 M12); the
+/// frugal retry still rewrites it, as one listing serves the whole statement (`ext::LISTED`).
+fn read_again_alike(t: &datafusion::logical_expr::TableScan) -> bool {
+    datafusion::datasource::source_as_provider(&t.source).is_ok_and(|p| crate::query::lakes_own(p.as_ref()) || p.is::<datafusion::datasource::MemTable>())
+}
+
 /// Whether a node gives other rows, or other values, when it is read again. A row limit or a DISTINCT ON picks its
 /// rows by the order they come in; a volatile expression gives a new value each time, and a correlated one (an outer
 /// reference) belongs to a query around it.
@@ -147,9 +215,10 @@ fn differs_by_reading(n: &LogicalPlan) -> bool {
 /// The rewrite of a window over `keys` with `calls`. The input's rows come first, each key as a column of its own
 /// (`read`). Each partition's aggregates are a GROUP BY over `read`, one row per key, joined back to `read` on the
 /// keys. A NULL key is a partition too. The frugal session's sort-merge join streams its left side and holds only the
-/// right side's rows of one key, so `read` is on the left and the one row per key on the right. With no keys, that
-/// one row is on the left of a cross join, the side a cross join holds.
-fn build(window: &Window, keys: &[Expr], calls: Vec<Expr>, config: &dyn OptimizerConfig) -> Result<LogicalPlan> {
+/// right side's rows of one key, so there `read` is on the left and the one row per key on the right; elsewhere a hash
+/// join holds its left side, so the one row per key is on the left and `read` streams past it. With no keys, that one
+/// row is on the left of a cross join, the side a cross join holds.
+fn build(window: &Window, keys: &[Expr], calls: Vec<Expr>, frugal: bool, config: &dyn OptimizerConfig) -> Result<LogicalPlan> {
     let ids = config.alias_generator(); // (each name is new, so two rewrites in one plan never clash)
     let input = window.input.as_ref();
     let columns = input.schema().columns();
@@ -170,9 +239,12 @@ fn build(window: &Window, keys: &[Expr], calls: Vec<Expr>, config: &dyn Optimize
     let joined = if keys.is_empty() {
         LogicalPlanBuilder::from(each).cross_join(read)?.build()?
     } else {
-        let left: Vec<Column> = pk.iter().map(|p| Column::from_name(p)).collect();
-        let right: Vec<Column> = gk.iter().map(|g| Column::from_name(g)).collect();
-        LogicalPlanBuilder::from(read).join_detailed(each, JoinType::Inner, (left, right), None, NullEquality::NullEqualsNull)?.build()?
+        let rows: Vec<Column> = pk.iter().map(|p| Column::from_name(p)).collect();
+        let groups: Vec<Column> = gk.iter().map(|g| Column::from_name(g)).collect();
+        match frugal {
+            true => LogicalPlanBuilder::from(read).join_detailed(each, JoinType::Inner, (rows, groups), None, NullEquality::NullEqualsNull)?.build()?,
+            false => LogicalPlanBuilder::from(each).join_detailed(read, JoinType::Inner, (groups, rows), None, NullEquality::NullEqualsNull)?.build()?,
+        }
     };
     // The window's columns as the window had them: the input's, then each aggregate under the name the window gave it.
     let mut out: Vec<Expr> = columns.iter().cloned().map(Expr::Column).collect();
@@ -400,6 +472,14 @@ mod tests {
         ctx
     }
 
+    /// DataFusion's own session, none of Pondra's rules, over the same tables: what a rewrite's answers are checked against.
+    fn reference() -> SessionContext {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        ctx.register_table("t", Arc::new(table())).unwrap();
+        ctx.register_table("m", Arc::new(medians())).unwrap();
+        ctx
+    }
+
     async fn answer(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
         ctx.sql(sql).await.unwrap().collect().await.unwrap()
     }
@@ -457,9 +537,11 @@ mod tests {
         }
     }
 
+    /// Each answers as DataFusion's own window does, in a plain session (a table read alone: rewritten there too) and
+    /// in a frugal one; over a GROUP BY, only the frugal session rewrites it.
     #[tokio::test]
     async fn whole_partitions_answer_as_the_plain_session_does() {
-        let (plain, frugal) = (session(false), session(true));
+        let (reference, plain, frugal) = (reference(), session(false), session(true));
         for sql in [
             "SELECT k, x, count(*) OVER () AS n FROM t",
             "SELECT k, x, avg(x) OVER (PARTITION BY g) AS a, sum(x) OVER (PARTITION BY g) AS s FROM t",
@@ -467,10 +549,12 @@ mod tests {
             "SELECT k, count(x) OVER (PARTITION BY g, k % 2) AS n, max(s) OVER (PARTITION BY g, k % 2) AS m FROM t WHERE k > 10",
             "SELECT * FROM (SELECT g, avg(x) OVER (PARTITION BY g) AS a FROM t) WHERE g = 2",
             "SELECT k, count(*) OVER (PARTITION BY g) AS a, count(*) OVER () AS b FROM t",
+            "SELECT g, n, sum(n) OVER () AS s, max(n) OVER (PARTITION BY g % 2) AS m FROM (SELECT g, count(*) AS n FROM t GROUP BY g)",
         ] {
-            let (want, got) = (answer(&plain, sql).await, answer(&frugal, sql).await);
+            let want = answer(&reference, sql).await;
             assert!(!rows(&want).is_empty(), "{sql}");
-            assert_same(&want, &got, sql);
+            assert_same(&want, &answer(&plain, sql).await, sql);
+            assert_same(&want, &answer(&frugal, sql).await, sql);
         }
     }
 
@@ -491,10 +575,24 @@ mod tests {
         assert!(joined.find("__pk").is_some_and(|p| p < joined.find("Aggregate:").expect("the aggregates")), "{text}");
     }
 
+    /// In a plain session the join is a hash join, which holds its left side: there the aggregates (one row a key, `__gk`)
+    /// are on the left and the rows stream past them, so no row is held.
+    #[tokio::test]
+    async fn in_a_plain_session_the_aggregates_are_the_hash_joins_left_side() {
+        let text = plan(&session(false), "SELECT k, avg(x) OVER (PARTITION BY g) AS a FROM t").await;
+        assert!(text.contains("Inner Join: __gk"), "{text}");
+        assert!(text.contains("HashJoinExec") && !text.contains("WindowAggExec") && !text.contains("SortMergeJoin"), "{text}");
+    }
+
     #[tokio::test]
     async fn the_rewrite_takes_whole_partition_windows_out_and_leaves_the_rest() {
         let (plain, frugal) = (session(false), session(true));
         for sql in ["SELECT k, x, count(*) OVER () AS n FROM t", "SELECT k, count(*) OVER () AS n FROM t WHERE k < 0"] {
+            assert!(!plan(&plain, sql).await.contains("WindowAggExec"), "{sql}: a table read alone, rewritten in any session");
+            assert!(!plan(&frugal, sql).await.contains("WindowAggExec"), "{sql}");
+        }
+        // (over a GROUP BY or a join the input would be worked out twice: the plain session leaves it to the window)
+        for sql in ["SELECT g, sum(n) OVER () AS s FROM (SELECT g, count(*) AS n FROM t GROUP BY g)", "SELECT a.k, count(*) OVER (PARTITION BY a.g) AS n FROM t a JOIN t b ON a.k = b.k"] {
             assert!(plan(&plain, sql).await.contains("WindowAggExec"), "{sql}");
             assert!(!plan(&frugal, sql).await.contains("WindowAggExec"), "{sql}");
         }
@@ -507,7 +605,25 @@ mod tests {
             "SELECT count(*) OVER () FROM (SELECT * FROM t LIMIT 10)",
         ] {
             assert!(plan(&frugal, sql).await.contains("WindowAggExec"), "{sql}");
+            assert!(plan(&plain, sql).await.contains("WindowAggExec"), "{sql}");
         }
+    }
+
+    /// A window over files named by path is left to the window in a plain session, as they would be fetched twice; the
+    /// frugal retry still rewrites it (audit 11-01 M12).
+    #[tokio::test]
+    async fn files_named_by_path_are_rewritten_only_when_frugal() {
+        let file = std::env::temp_dir().join(format!("frugal-{}.csv", uuid::Uuid::new_v4()));
+        std::fs::write(&file, "k,g\n1,1\n2,1\n3,2\n").unwrap();
+        let sql = "SELECT k, count(*) OVER (PARTITION BY g) AS n FROM f";
+        for frugal in [false, true] {
+            let ctx = session(frugal);
+            ctx.register_csv("f", file.to_str().unwrap(), datafusion::prelude::CsvReadOptions::new()).await.unwrap();
+            assert_eq!(plan(&ctx, sql).await.contains("WindowAggExec"), !frugal, "frugal: {frugal}");
+            let n: Vec<String> = rows(&answer(&ctx, &format!("{sql} ORDER BY k")).await).into_iter().map(|(text, _)| text.join(",")).collect();
+            assert_eq!(n, ["1,2", "2,2", "3,1"], "frugal: {frugal}");
+        }
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Each median query answers as the plain session does: groups of odd and even sizes, ties, NULLs in the values
@@ -527,6 +643,27 @@ mod tests {
             assert!(!rows(&want).is_empty(), "{sql}");
             assert_same(&want, &got, sql);
         }
+    }
+
+    /// A frugal session of one partition (a page's, or after `SET threads = 1`) joins with a sort-merge join, as one of
+    /// more does: DataFusion plans a join of one partition as a hash join, which can't spill, whatever `prefer_hash_join`
+    /// says. The answer is the same, and on a page the repartition into one partition under each sort runs in its task.
+    #[tokio::test]
+    async fn a_frugal_join_of_one_partition_is_a_sort_merge_join() {
+        let state = SessionStateBuilder::new()
+            .with_config(crate::optimize::config(SessionConfig::new().with_target_partitions(1)))
+            .with_default_features()
+            .with_physical_optimizer_rules(crate::optimize::physical_rules())
+            .build();
+        let ctx = crate::in_task::planned(SessionContext::new_with_state(state)); // (as a page plans: `t`'s three partitions merged in this task)
+        ctx.register_table("t", Arc::new(table())).unwrap();
+        let sql = "SELECT count(*) AS n FROM t a JOIN t b ON a.g = b.g";
+        assert!(plan(&ctx, sql).await.contains("HashJoinExec"), "{sql}");
+        let want = answer(&ctx, sql).await;
+        crate::query::frugal(&ctx);
+        let text = plan(&ctx, sql).await;
+        assert!(text.contains("SortMergeJoin") && !text.contains("HashJoinExec") && !text.contains("RepartitionExec"), "{text}");
+        assert_same(&want, &answer(&ctx, sql).await, sql);
     }
 
     /// No rows: one row of NULL for the whole table either way, and no rows for the groups.

@@ -337,6 +337,14 @@ fn token(w: &mut Words, create: bool) -> Result<Change> {
     Ok(Change::CreateToken { name, user, expires_secs, hash: None })
 }
 
+/// Snowflake's `TO ROLE r` (and `FROM ROLE r`): the word ROLE before the grantee is dropped, when a name follows it (a user
+/// named role is still one).
+fn role_word(w: &mut Words) {
+    if w.0.len() > 1 {
+        w.is("role");
+    }
+}
+
 /// `GRANT privileges [(columns)] ON [TABLE] t | SCHEMA s | ALL TABLES IN SCHEMA s | ALL TABLES |
 /// SECRET s TO grantees`, `GRANT roles TO users`, and REVOKE's of each, `FROM`.
 fn grant(w: &mut Words, grant: bool) -> Result<Change> {
@@ -362,6 +370,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     let to = if grant { "to" } else { "from" };
     if !w.is("on") {
         w.expect(to)?;
+        role_word(w);
         let users = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
         w.done()?;
         let roles = list.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
@@ -400,6 +409,7 @@ fn grant(w: &mut Words, grant: bool) -> Result<Change> {
     ensure!(!privileges.iter().any(|p| p == "apply") || database.is_some(), "APPLY is a database's: GRANT APPLY ON DATABASE prod TO ci");
     ensure!(database.is_none() || privileges.iter().all(|p| p == "clone" || p == "apply"), "ON DATABASE is for CLONE and APPLY alone: a database's tables are ON ALL TABLES");
     w.expect(to)?;
+    role_word(w);
     let who = w.names()?.iter().map(|n| plain(n)).collect::<Result<Vec<_>>>()?;
     w.done()?;
     Ok(if grant { Change::Grant { privileges, on, columns, to: who, database } } else { Change::Revoke { privileges, on, columns, from: who, database } })
@@ -443,7 +453,7 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
     };
     let get = |n: &str| { let k = user_key(n); async move { lake.cat.get::<User>(&k).await } };
     let put = |n: &str, u: &User| (user_key(n), json(u));
-    let must = |n: &str, u: Option<User>| u.ok_or_else(|| anyhow!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})"));
+    let must = |n: &str, u: Option<User>| u.ok_or_else(|| crate::codes::coded("42704", format!("no user or role {n} (CREATE USER {n}, CREATE ROLE {n})")));
     let mut out = match c {
         Change::Create { name, login, if_not_exists, verifier, superuser, limits } => {
             if get(&name).await?.is_some() {
@@ -474,7 +484,9 @@ pub async fn apply(lake: &Lake, c: Change) -> Result<Value> {
         }
         Change::Drop { name, if_exists } => {
             if get(&name).await?.is_none() {
-                ensure!(if_exists, "no user or role {name}");
+                if !if_exists {
+                    return Err(crate::codes::coded("42704", format!("no user or role {name}")));
+                }
                 return Ok(j!({"user": name, "dropped": false}));
             }
             // (out of every role it was in, and every member of it out of it)
@@ -628,7 +640,7 @@ async fn grantee(lake: &Lake, name: &str) -> Result<User> {
     match lake.cat.get::<User>(&user_key(name)).await? {
         Some(u) => Ok(u),
         None if name == "public" => Ok(User::default()),
-        None => bail!("no user or role {name} (CREATE ROLE {name})"),
+        None => Err(crate::codes::coded("42704", format!("no user or role {name} (CREATE ROLE {name})"))),
     }
 }
 
@@ -782,6 +794,10 @@ impl Scram {
 struct Keys {
     session: String,
     node: String,
+    /// The sessions' key from before `seal_keys` made a new one: a branch's key given then still renews its pin with
+    /// it, and does nothing else (`signed_before_sealing`, `branch::keyed`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branches: Option<String>,
 }
 
 /// `z/auth` as kept: sealed (`ext::seal`, at format 3), or in the clear (a lake whose nodes share no
@@ -825,16 +841,9 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     };
     let k = match found {
         Some(Kept::Clear(k)) => k,
-        Some(Kept::Sealed { sealed, key }) => {
-            let plain = crate::ext::unseal(&sealed, &key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY, PONDRA_ADMIN_TOKEN or PONDRA_SHARED_KEY_FILE (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
-            serde_json::from_slice(&plain)?
-        }
+        Some(Kept::Sealed { sealed, key }) => opened(&sealed, &key)?,
         None => {
-            let mut a = [0u8; 32];
-            let mut b = [0u8; 32];
-            crate::crypto::random(&mut a)?;
-            crate::crypto::random(&mut b)?;
-            let k = Keys { session: B64.encode(a), node: format!("pn_{}", B64U.encode(b)) };
+            let k = Keys { session: new_session_key()?, node: new_node_key()?, branches: None };
             ensure!(lake.cat.is_writer(), "the lake's keys aren't made yet: its leader makes them when it starts");
             // (sealed from the first write when no release older than format 3 can read the lake; otherwise
             // in the clear, and `seal_keys` seals them once every node can read them sealed)
@@ -854,8 +863,42 @@ async fn keys(lake: &Lake) -> Result<Keys> {
     Ok(k)
 }
 
+fn opened(sealed: &str, key: &str) -> Result<Keys> {
+    let plain = crate::ext::unseal(sealed, key).map_err(|e| anyhow!("the lake's own keys are sealed by a master key this node doesn't have ({e:#}): every node needs the same PONDRA_SECRET_KEY, PONDRA_ADMIN_TOKEN or PONDRA_SHARED_KEY_FILE (or PONDRA_KMS_COMMAND; the one before a change as PONDRA_SECRET_KEY_PREVIOUS or PONDRA_ADMIN_TOKEN_PREVIOUS)"))?;
+    Ok(serde_json::from_slice(&plain)?)
+}
+
+fn new_session_key() -> Result<String> {
+    let mut a = [0u8; 32];
+    crate::crypto::random(&mut a)?;
+    Ok(B64.encode(a))
+}
+
+fn new_node_key() -> Result<String> {
+    let mut b = [0u8; 32];
+    crate::crypto::random(&mut b)?;
+    Ok(format!("pn_{}", B64U.encode(b)))
+}
+
+/// The nodes' key as sealed in this node's own view of the bucket, kept here with the sessions' key when it is new: a
+/// leader that seals keys that were in the clear seals new ones (`seal_keys`), and a follower that knew the old ones
+/// takes the new ones from the bucket, since its commit stream, which the old nodes' key signed it in to, is refused
+/// now. Only sealed keys are taken: a view from before the seal still shows the old ones in the clear.
+pub async fn sealed_node_key(lake: &Lake) -> Option<String> {
+    let Ok(Some(Kept::Sealed { sealed, key })) = lake.cat.from_view(KEYS).await.ok()?.map(|v| serde_json::from_slice::<Kept>(&v)).transpose() else { return None };
+    let k = opened(&sealed, &key).ok()?;
+    let mut here = KEYS_HERE.lock().unwrap();
+    if here.get(&lake.url).is_none_or(|h| h.node != k.node) {
+        here.insert(lake.url.clone(), k.clone());
+    }
+    Some(k.node)
+}
+
 /// Leader: make the lake's keys if there are none yet (when it starts).
 pub async fn make_keys(lake: &Lake) -> Result<()> { keys(lake).await.map(|_| ()) }
+
+/// How often a node looks for a new nodes' key in the bucket (`sealed_node_key`).
+pub const NODE_KEY_LOOK: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Leader: the lake's own keys sealed by the master key once every node can read them sealed
 /// (format 3), when every node shares one (`ext::shared_master`); and wrapped again after the
@@ -865,8 +908,15 @@ pub async fn seal_keys(lake: &Lake) -> Result<()> {
     match lake.cat.get::<Kept>(KEYS).await? {
         Some(Kept::Clear(k)) if crate::ext::shared_master() => {
             crate::format::require(lake, SEALED, "the lake's own keys, sealed").await?;
+            // (keys in the clear could be read from the bucket, and copied: sealed, they'd go on signing in whoever
+            // copied them, the nodes' key now from anywhere (`nodes_key`), so new ones are sealed (audit 10-31 M7).
+            // Everyone signs in again; a share's links and a sign-in's flow last minutes. Branches' keys given before,
+            // which last, still renew their pins with the old sessions' key, and let none go: `branch::keyed`)
+            let k = Keys { session: new_session_key()?, node: new_node_key()?, branches: k.branches.or(Some(k.session)) };
             lake.cat.commit(vec![(KEYS.to_string(), json(&sealed(&k)?))], &[]).await?;
-            eprintln!("the lake's own keys are sealed by its master key now");
+            KEYS_HERE.lock().unwrap().insert(lake.url.clone(), k.clone());
+            crate::dial::set_node_key(k.node);
+            eprintln!("the lake's own keys are sealed by its master key now, made new (the ones in the clear could be read from the bucket): everyone signs in again, and its other nodes take them from the bucket within {} s", NODE_KEY_LOOK.as_secs());
         }
         Some(Kept::Sealed { sealed, key }) => {
             if let Some(key) = crate::ext::rewrapped(&key)? {
@@ -959,7 +1009,14 @@ async fn sign(lake: &Lake, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac2
 /// (`vend.rs`), a branch's key (`branch.rs`). The purpose is signed with it, so a value made for one is never
 /// taken for another, nor for a session, which alone is signed bare (`ps_`). Signed alike, a flow's cookie, a
 /// command line's code and a session each passed for the others (H1 of the 10-17 audit).
-pub async fn sign_for(lake: &Lake, purpose: &str, data: &[u8]) -> Result<String> { sign(lake, &labelled(purpose, data)).await }
+pub async fn sign_for(lake: &Lake, purpose: &str, data: &[u8]) -> Result<String> { Ok(B64U.encode(hmac256(&B64.decode(keys(lake).await?.session)?, &labelled(purpose, data)))) }
+
+/// `data` signed for `purpose` as `sign_for` signed it before `seal_keys` made the lake's keys new, if it did: with
+/// the sessions' key that was kept in the clear, which whoever copied it from the bucket can sign with too.
+pub async fn signed_before_sealing(lake: &Lake, purpose: &str, data: &[u8]) -> Result<Option<String>> {
+    let Some(old) = keys(lake).await?.branches else { return Ok(None) };
+    Ok(Some(B64U.encode(hmac256(&B64.decode(old)?, &labelled(purpose, data)))))
+}
 
 /// `payload` (base64url JSON) if `sig` is the lake's key's signature of it for `purpose` (`sign_for`).
 pub async fn signed_for(lake: &Lake, purpose: &str, payload: &str, sig: &str) -> Option<Value> { verified(lake, &labelled(purpose, payload.as_bytes()), payload, sig).await }
@@ -1481,6 +1538,8 @@ mod tests {
         let g = p("GRANT SELECT (id, name) ON TABLE sales.orders TO analyst, bob");
         assert_eq!((g["on"]["name"].as_str(), g["columns"].as_array().unwrap().len(), g["to"].as_array().unwrap().len()), (Some("sales.orders"), 2, 2));
         assert_eq!(p("GRANT ALL ON ALL TABLES IN SCHEMA sales TO analyst")["privileges"].as_array().unwrap().len(), 4);
+        assert_eq!(p("GRANT SELECT ON ALL TABLES IN SCHEMA PUBLIC TO ROLE analyst")["do"], "grant"); // (Snowflake's TO ROLE)
+        assert_eq!(p("REVOKE SELECT ON ALL TABLES IN SCHEMA PUBLIC FROM ROLE analyst")["do"], "revoke");
         assert_eq!(p("GRANT USAGE ON SECRET s3_sales TO analyst")["on"]["kind"], "secret");
         assert!(p("GRANT USAGE ON TABLE t TO analyst")["error"].is_string());
         assert_eq!(p("GRANT analyst TO ann")["do"], "grant_role");

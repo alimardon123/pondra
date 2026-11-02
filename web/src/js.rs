@@ -1,9 +1,10 @@
-//! What the page's stores and its node share (`fetch.rs` and `node.rs` over `fetch`, `opfs.rs` over the origin's private
-//! file system): JavaScript calls and properties, the one way to call `fetch`, promises awaited, a failure's words, the
-//! task a store's work runs as, what a read of an object asks for, and the Web Lock a kept folder is held by (`lock`).
-//! Both stores read an object the same way (an empty range, and a HEAD, want the meta and no body).
+//! What the page's store and its node share (`node.rs` over `fetch`, `opfs.rs` over the origin's private file system):
+//! JavaScript calls and properties, the one way to call `fetch`, promises awaited, a failure's words, the task a store's
+//! work runs as, what a read of an object asks for, and the Web Lock a kept folder is held by (`lock`). An empty range,
+//! and a HEAD, want the meta and no body (`read_of`).
 
-use futures::channel::oneshot;
+use futures::channel::{mpsc, oneshot};
+use futures::SinkExt;
 use object_store::{GetOptions, GetRange};
 use std::cell::RefCell;
 use std::future::Future;
@@ -39,6 +40,14 @@ pub(crate) fn function(object: &JsValue, name: &str) -> Result<js_sys::Function,
 
 pub(crate) fn call_method(object: &JsValue, name: &str) -> Result<JsValue, String> {
     function(object, name)?.call0(object).map_err(js_words)
+}
+
+/// Calls `object`'s method `name` with `args` now, and gives what it answers: a synchronous method, as a sync access handle's
+/// `write` is. A throw is the JavaScript error itself, so a caller can read its `name`.
+pub(crate) fn call_with(object: &JsValue, name: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    let method = js_sys::Reflect::get(object, &name.into())?.dyn_into::<js_sys::Function>()?;
+    let args: js_sys::Array = args.iter().collect();
+    method.apply(object, &args)
 }
 
 /// Calls `object`'s method `name` with `args` and awaits what it answers. A method that answers a promise is awaited;
@@ -126,6 +135,50 @@ pub(crate) async fn body_within(response: &JsValue, most: Option<usize>) -> Resu
         value.copy_to(&mut read[at..]);
     }
 }
+
+/// A response's body, read as it comes: a task on the page's thread (`spawn_local`) reads the body's reader and sends each
+/// chunk down `tx`, so the body is never held whole. A body that fails sends its failure's words and ends. When the receiver
+/// is dropped, the next send fails and the rest of the body is cancelled, so it is never fetched. No body (a null stream)
+/// sends nothing: `tx` drops and the receiver ends.
+pub(crate) fn pump(response: &JsValue, mut tx: mpsc::Sender<Result<Vec<u8>, String>>) -> Result<(), String> {
+    let stream = get(response, "body")?;
+    if stream.is_null() {
+        return Ok(());
+    }
+    let reader = call_method(&stream, "getReader")?;
+    spawn_local(async move {
+        loop {
+            let chunk = match awaited(&reader, "read", &[]).await {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    let _ = tx.send(Err(js_words(e))).await;
+                    return;
+                }
+            };
+            if get(&chunk, "done").ok().and_then(|done| done.as_bool()) == Some(true) {
+                return;
+            }
+            let bytes = get(&chunk, "value").and_then(|value| value.dyn_into::<js_sys::Uint8Array>().map_err(js_words)).map(|value| value.to_vec());
+            if tx.send(bytes).await.is_err() {
+                let _ = awaited(&reader, "cancel", &[]).await;
+                return;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Cancels a response's body unread, so the rest of it is never fetched (a HEAD's, which wants the meta only).
+pub(crate) async fn cancel(response: &JsValue) {
+    if let Ok(stream) = get(response, "body") {
+        if !stream.is_null() {
+            let _ = awaited(&stream, "cancel", &[]).await;
+        }
+    }
+}
+
+/// Whether a JavaScript failure is an error of the kind named (its `name`: `TypeError`, `TimeoutError`).
+pub(crate) fn named_error(e: &JsValue, kind: &str) -> bool { get(e, "name").ok().and_then(|name| name.as_string()).as_deref() == Some(kind) }
 
 /// A JavaScript failure's words: an Error's message, a thrown string, or none of those. (`JsString::from` on an object
 /// throws, so an object is never turned into a string that way.)

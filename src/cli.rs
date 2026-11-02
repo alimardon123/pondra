@@ -87,7 +87,7 @@ pub(crate) enum Cmd {
         #[arg(long, default_value_t = node::Start::default().backlog)]
         backlog: u64,
         /// Lakes on object storage: where this node keeps its local SSD copy of recent objects
-        /// (default: <temp dir>/pondra-cache).
+        /// (default: <temp dir>/pondra-cache-<uid>, the user's own).
         #[arg(long)]
         cache_dir: Option<String>,
         /// Size of that SSD tier in GB (0 turns it off; default: 20, or a quarter of the free
@@ -196,6 +196,7 @@ pub(crate) enum Cmd {
     /// here too; the leader records them — over HTTP, or through the bucket if this machine can't
     /// reach it — or this process does if nobody leads.
     Sql {
+        /// The lake: a folder, s3://bucket/prefix, or `:memory:` for one held in this process's memory for its statements.
         #[arg(long, visible_alias = "lake")]
         dir: String,
         /// Other lakes to read as `name.table` (`name=dir`, repeatable).
@@ -614,17 +615,19 @@ async fn run() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&backup::restore(&from, &to, at).await?)?);
         }
         Cmd::Sql { dir, query, attach: attached } if write::checkpoint(&query) => {
-            // (the leader's work; with nobody leading, the next node to start tiers the log)
+            // (the leader's work: a node that runs the lake is asked; with nobody leading, this process leads for the
+            // moment, as a one-off write does, tiers the log, writes the catalog down, and ends, so a lake no node
+            // serves can be kept tidy by a scheduled `pondra sql --dir … CHECKPOINT`)
+            let dir = crate::memory::place(&dir);
             let store = store::open_store(&dir)?.1;
             match terms::latest(&store).await? {
                 Some(t) if !t.addr.is_empty() && terms::alive(&store, &t).await => {
                     println!("{}", cluster::http().post(crate::tls::url(&format!("{}/sql", t.addr))).body("CHECKPOINT").send().await?.error_for_status()?.text().await?)
                 }
-                _ => println!("{}", serde_json::json!({"checkpoint": false, "why": "no node runs this lake: the next one to start tiers its log"})),
+                _ => sql_on_guest(&dir, &query, &attached).await?,
             }
-            let _ = attached;
         }
-        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&dir, &query, &attached).await?,
+        Cmd::Sql { dir, query, attach: attached } => sql_on_guest(&crate::memory::place(&dir), &query, &attached).await?, // (`:memory:`: in this process's memory, as `serve`'s)
         Cmd::Token { dir, user, name } => {
             let Ok(lake) = store::Lake::open(&dir, false, false).await else { anyhow::bail!("no lake at {dir} (pondra token takes a lake's folder, or its s3:// prefix)") };
             let no_user = lake.cat.scan_raw("u/", "u0").await?.is_empty();
@@ -647,7 +650,8 @@ async fn run() -> anyhow::Result<()> {
 
 /// `pondra sql`, and `pondra backup` (its one statement, `backup_sql`): one statement, asked of a guest node of the lake
 /// (`node::Options::guest`), which answers it as `POST /sql` does, and ends. A plain query or an export (`COPY … TO`) reads;
-/// anything else may write, and leads the lake for the moment if nobody does. The output is what the node gives: the
+/// anything else may write, and leads the lake for the moment if nobody does; a write to a lake whose leader is alive but
+/// doesn't answer from here goes through the bucket's inbox (`write::by_inbox`). The output is what the node gives: the
 /// notices its procedures printed, then the answer.
 async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
     // `USE` sets a session's path, and this command has no session (`path.rs`).
@@ -658,10 +662,8 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
     let guest = if reads { node::Guest::Reads } else { node::Guest::Writes };
     let node = match node::Node::open(node::Options::guest(dir, attached.to_vec(), guest)).await {
         Ok(node) => node,
-        // (its leader is alive and doesn't answer from here: the write goes through the bucket's inbox)
-        Err(e) if e.downcast_ref::<node::Unreached>().is_some() => return through_inbox(dir, &query, attached).await,
         // (fenced out by a newer writer while it started, before its statement ran: run again, as a write fenced later is)
-        Err(e) if write::fenced(&e) && write::tries() < 5 => run_again("fenced while starting"),
+        Err(e) if write::fenced(&e) && write::tries() < 5 => write::start_over("fenced while starting", write::job()),
         Err(e) => return Err(e),
     };
     // (the answer is read, and the node finished, on every path: a leader's term is given back whatever the answer)
@@ -682,54 +684,17 @@ async fn sql_on_guest(dir: &str, query: &str, attached: &[String]) -> anyhow::Re
             if let Err(e) = finished {
                 eprintln!("the guest didn't end cleanly before the run again: {e:#}");
             }
-            run_again("fenced while writing");
+            write::start_over("fenced while writing", write::job());
         }
         return Err(err);
     }
     // (fenced out as it finished, before what it wrote was durable: run again, and the job says whether it was recorded)
     if finished.as_ref().is_err_and(|e| write::fenced(e) && write::tries() < 5) {
-        run_again("fenced while finishing");
+        write::start_over("fenced while finishing", write::job());
     }
     finished?;
     print!("{heard}");
     println!("{body}");
-    Ok(())
-}
-
-/// A `pondra sql` guest fenced out by a newer writer runs again with the same job, so whoever records its write
-/// records it once (`write::deliver` does the same), one more try each time.
-fn run_again(why: &str) -> ! {
-    crate::node::restart_with(why, &[("PONDRA_JOB", write::job().to_string()), ("PONDRA_TRIES", (write::tries() + 1).to_string())])
-}
-
-/// A write whose lake's leader is alive but doesn't answer from this machine's guest start (`node::Unreached`): it is
-/// sent as a one-off writer sends it (`write::through_bucket_statement`): over HTTP if this machine reaches the leader after
-/// all, else through the bucket's inbox, where the leader records it, or this process leads for a moment. The inbox carries
-/// one statement that writes, so a text of several, a CALL, a script or a setting is refused by name.
-async fn through_inbox(dir: &str, query: &str, attached: &[String]) -> anyhow::Result<()> {
-    let refused = |why: &str| anyhow::anyhow!("{}, and {why}", node::Unreached);
-    if routines::split(query).len() > 1 {
-        return Err(refused("this text is several statements: the inbox takes one statement at a time, so send each one by itself"));
-    }
-    // As a node takes SQL: a write to a folder with no lake yet makes one, led for a moment as `pondra lead` leads it.
-    let lake = match (write::parse(query).is_some(), store::Lake::open(dir, false, false).await) {
-        (_, Ok(lake)) => lake,
-        (true, Err(_)) => {
-            write::lead_only(dir).await?;
-            store::Lake::open(dir, false, false).await?
-        }
-        (false, Err(e)) => return Err(e),
-    };
-    for spec in attached {
-        node::attach(&lake, spec, "", false).await?;
-    }
-    ddl::sync(&lake, false).await?;
-    // As a node takes SQL: functions and files (`read_csv(…)`, `'x.parquet'`) expanded, then a write.
-    let query = routines::expand(&lake, query).await?;
-    let Some(stmt) = write::parse(&query) else {
-        return Err(refused("this statement isn't a write the inbox carries (a CALL, a script or a setting): it needs the leader"));
-    };
-    println!("{}", ext::scope(true, write::through_bucket_statement(&lake, stmt)).await?); // (its user's own machine: its files, its credentials)
     Ok(())
 }
 

@@ -102,6 +102,8 @@ pub struct Pin {
     pub at_ms: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub lease: bool, // (a branch on another server's: it renews it, and it goes when it isn't renewed: `lapse`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>, // (the limited user who made it, a CLONE grant's: it renews only its own pins; none for the cluster's, an admin's, a superuser's)
 }
 
 /// `CLONE a [WITH (schemas = (x, y))] [WITH NO DATA]`.
@@ -179,6 +181,14 @@ pub fn rebase_file(f: &mut crate::store::DataFile, id: &str) {
 /// on another server is read with the bucket key its branch keeps (ADR-058).
 pub async fn load(lake: &Lake) -> Result<()> {
     if let Some(b) = lake.cat.get::<Bases>(BASES).await? {
+        // (a backup keeps its bases' files as its own, under `data/_bases` (`backup::place`): one whose catalog names a base
+        // was written so, and its bases are not opened, since a read of one reads whatever path or node its catalog names)
+        if !b.lakes.is_empty() && crate::backup::frozen(lake) {
+            bail!("{} is a backup, whose base files are its own (data/_bases): its catalog names bases, so it isn't opened", lake.url);
+        }
+        for base in b.lakes.values() {
+            ensure!(same_kind(&lake.url, &base.url), "{} can't be a base of {}: a branch lives where its base does", base.url, lake.url);
+        }
         let secrets = match b.lakes.values().any(|b| b.read_only) {
             true => crate::ext::list(lake).await?,
             false => vec![],
@@ -193,6 +203,18 @@ pub async fn load(lake: &Lake) -> Result<()> {
     Ok(())
 }
 
+/// Whether a branch at `lake` may have `base`: it lives where its base does, a folder's on this machine, a bucket's in a
+/// bucket, a lake in memory's in memory (`store::place`), and a node's lake (`pondra://`) is a base only of that same lake.
+/// A catalog's bases are opened with this node's own credentials, so one named anywhere else is never opened (pass 3, S1).
+fn same_kind(lake: &str, base: &str) -> bool {
+    use crate::store::{place, Place};
+    match (place(lake), place(base)) {
+        (Ok(Place::Served), Ok(Place::Served)) => base.trim_end_matches('/') == lake.trim_end_matches('/'),
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `CREATE DATABASE name CLONE from` (this lake's leader, under its lock).
 pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<String>, of: CloneOf) -> Result<Value> {
     crate::ddl::database_name(name)?;
@@ -200,7 +222,7 @@ pub async fn create(lake: &Lake, name: &str, if_not_exists: bool, dir: Option<St
     let (base, inherited) = base(lake, &of.from).await?;
     let away = crate::store::reach_of(&base); // (a base on another server: its key and its leader's URL, ADR-058)
     let dir = crate::ddl::full(&dir.unwrap_or_else(|| crate::ddl::beside(&lake.url, name)))?;
-    ensure!(dir.contains("://") == base.contains("://"), "a branch lives where its base does: {base} is {}", if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
+    ensure!(same_kind(&dir, &base), "a branch lives where its base does: {base} is {}", if crate::store::served(&base) { "a node's lake" } else if base.contains("://") { "in a bucket" } else { "a folder on this machine" });
     if crate::ddl::has_catalog(&dir).await? {
         ensure!(if_not_exists, "a lake is at {dir} already: ATTACH '{dir}' AS {name} (or CREATE DATABASE IF NOT EXISTS {name} CLONE {})", of.from);
         return Box::pin(crate::ddl::apply(lake, Ddl::Attach { name: name.into(), dir, read_only: false, endpoint: None })).await;
@@ -332,11 +354,23 @@ pub async fn pin(lake: &Lake, branch: &str, ms: Option<u64>, lease: bool) -> Res
     let mut ms = ms.unwrap_or(now.saturating_sub(MARGIN_MS));
     // (a user who may only clone is a server elsewhere's: its pin is a lease, and once one, always)
     let mut lease = lease || crate::auth::limited().and_then(|a| a.clones()).is_some();
+    // (a user who may only clone makes the pins it makes its own: it renews those alone, so it is never given
+    // another branch's key, nor makes another's pin a lease)
+    let limited = crate::auth::limited().is_some();
+    let me = match limited {
+        true => crate::auth::current().map(|p| p.name),
+        false => None,
+    };
+    let mut by = me.clone();
     if let Some(p) = lake.cat.get::<Pin>(&key).await? {
+        ensure!(!limited || p.by == me, crate::codes::coded("42501", format!("permission denied: {branch} is pinned by another; a CLONE grant renews only the pins it made")));
         ms = ms.min(p.ms);
         lease |= p.lease;
+        if !limited {
+            by = p.by; // (a cluster's or an admin's renewal keeps who made the pin)
+        }
     }
-    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease }))], &[]).await?;
+    lake.cat.commit(vec![(key, json(&Pin { lake: branch.into(), ms, at_ms: now, lease, by }))], &[]).await?;
     let mut out = j!({"pinned": branch, "ms": ms, "at_ms": now, "key": key_for(lake, branch).await?});
     // (a user granted CLONE on some schemas only: the branch takes only those, and says so here)
     if let Some(s) = crate::auth::limited().and_then(|a| a.clones()).filter(|s| !s.is_empty()) {
@@ -351,8 +385,8 @@ pub async fn unpin(lake: &Lake, branch: &str) -> Result<Value> {
 }
 
 /// A branch's key in this lake: its pin renewed and let go with it, nothing else (`keyed`).
-/// Derived from the lake's own key, so asked again (a retried CLONE) it is the same.
-/// (`sign_for` signs the same bytes as before, so keys already given stay good.)
+/// Derived from the lake's own key, so asked again (a retried CLONE) it is the same, until the
+/// lake's keys are made new as they are sealed (`users::seal_keys`).
 pub async fn key_for(lake: &Lake, branch: &str) -> Result<String> {
     Ok(format!("pb_{}", crate::users::sign_for(lake, "branch-key", branch.as_bytes()).await?))
 }
@@ -365,7 +399,19 @@ pub async fn keyed(lake: &Lake, d: &Ddl, key: &str) -> Result<()> {
         _ => bail!("permission denied: a branch's key renews or lets go of its own pin, and does nothing else"),
     };
     let want = key_for(lake, branch).await?;
-    ensure!(crate::crypto::same(want.as_bytes(), key.as_bytes()), "permission denied: not {branch}'s key");
+    if !crate::crypto::same(want.as_bytes(), key.as_bytes()) {
+        // (a key given before the lake's keys were sealed, signed with the sessions' key that was kept in the clear:
+        // whoever copied that from the bucket can make any branch's. It renews its pin, so a branch made then keeps
+        // reading its base; it never lets one go, which would have the base's retention delete what a branch reads
+        // (11-01 audit L12). Such a branch's pin, its lease no longer renewed once the branch is dropped, lapses.)
+        let old = crate::users::signed_before_sealing(lake, "branch-key", branch.as_bytes()).await?.map(|s| format!("pb_{s}"));
+        ensure!(old.is_some_and(|o| crate::crypto::same(o.as_bytes(), key.as_bytes())), "permission denied: not {branch}'s key");
+        ensure!(
+            !matches!(d, Ddl::Unpin { .. }),
+            "permission denied: {branch}'s key was given before {}'s keys were sealed, so it renews its pin and doesn't let it go: the pin lapses once it isn't renewed (PONDRA_PIN_LEASE_SECS)",
+            lake.url
+        );
+    }
     ensure!(matches!(d, Ddl::Unpin { .. }) || lake.cat.get::<Pin>(&pin_key(branch)).await?.is_some(), "permission denied: {branch} has no pin in {}: a branch's key renews its pin, it never makes one", lake.url);
     Ok(())
 }
@@ -392,6 +438,7 @@ pub async fn may(lake: &Lake, d: &Ddl) -> Result<()> {
 /// one; a branch is dropped by its owner and by nobody else. Admins and superusers are checked as
 /// before (`may`).
 pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
+    places(d)?;
     match crate::auth::limited() {
         Some(a) => user_door(lake, d, &a).await?,
         None => may(lake, d).await?,
@@ -399,10 +446,25 @@ pub async fn door(lake: &Lake, d: &mut Ddl) -> Result<()> {
     stamp(lake, d).await
 }
 
+/// A node's lake (`pondra://host:port`) is opened with this node's admin token, so ATTACH and CREATE DATABASE name one only
+/// for the node's owner (`ext::owners_only`). A folder's and a bucket's are not decided here.
+fn places(d: &Ddl) -> Result<()> {
+    let dir = match d {
+        Ddl::Attach { dir, .. } | Ddl::CreateDatabase { dir: Some(dir), .. } => dir,
+        _ => return Ok(()),
+    };
+    if matches!(crate::store::place(dir), Ok(crate::store::Place::Served)) {
+        crate::ext::owners_only(dir, format!("ATTACH/CREATE DATABASE … '{dir}': a node's lake (pondra://) is opened with this node's admin token, so only the node's owner names it (the shell, `pondra sql`, connect())"))?;
+    }
+    Ok(())
+}
+
 /// A user who isn't a superuser: its grants decide a branch or a drop (`Auth::allows` lets nothing
 /// else of its through).
 async fn user_door(lake: &Lake, d: &mut Ddl, a: &crate::users::Access) -> Result<()> {
-    if let Ddl::CreateDatabase { clone: Some(of), .. } = d {
+    if let Ddl::CreateDatabase { clone: Some(of), dir, .. } = d {
+        // (a branch's files go beside its base's, on its base's server: a folder or a URL named here would be opened with this node's own credentials)
+        ensure!(dir.is_none(), crate::codes::coded("42501", "permission denied: a branch made with CLONE lives beside the database it is made on; LOCATION is a superuser's choice"));
         return clone_as(lake, of, a);
     }
     if let Ddl::DropDatabase { name, if_exists } = d {
@@ -650,6 +712,7 @@ pub async fn make(lake: &Lake, m: Make) -> Result<Value> {
     }
     // The workspace's files (their current versions): a project's code, as the base has it.
     objects.extend(workspace(&base).await?);
+    objects.extend(crate::extension::files(&snap)); // (and each installed extension's file, as its record names it)
     use futures::{StreamExt, TryStreamExt};
     futures::stream::iter(objects).map(|p| copy(&base, lake, p)).buffer_unordered(16).try_collect::<Vec<_>>().await?;
     puts.push(("n".into(), json(&next.max(lake.cat.get::<u64>("n").await?.unwrap_or(0)))));
@@ -745,7 +808,7 @@ pub async fn databases(lake: &Lake) -> Result<datafusion::arrow::record_batch::R
     let s = |f: &dyn Fn(&(String, String, Option<String>, Option<i64>, i64, Option<String>)) -> Option<String>| Arc::new(rows.iter().map(f).collect::<StringArray>()) as ArrayRef;
     Ok(datafusion::arrow::record_batch::RecordBatch::try_from_iter(vec![
         ("name", s(&|r| Some(r.0.clone()))),
-        ("location", s(&|r| Some(r.1.clone()))),
+        ("location", s(&|r| crate::auth::shows_code().then(|| r.1.clone()))), // (the server's folder is the operator's: a caller who may see code only)
         ("base", s(&|r| r.2.clone())),
         ("owner", s(&|r| r.5.clone())), // (the user who made a branch; none for an admin's branch and for a database that isn't one)
         ("branched_at", Arc::new(rows.iter().map(|r| r.3).collect::<TimestampMicrosecondArray>().with_timezone("UTC")) as ArrayRef),
@@ -878,4 +941,22 @@ pub async fn refresh(lake: &Lake, seq: &crate::log::Sequencer, lock: &tokio::syn
     crate::views::forget(lake); // (the sequencer's views as they are now: invariant 77)
     crate::log::forget_producers(fills);
     Ok(j!({"refreshed": all, "from": me.base}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pin_with_no_maker_has_no_by_key_and_old_pins_read_back() {
+        let p = Pin { lake: "_base/x".into(), ms: 1, at_ms: 2, lease: false, by: None };
+        let v = serde_json::to_value(&p).unwrap();
+        assert!(v.get("by").is_none(), "{v}");
+        let old: Pin = serde_json::from_str(r#"{"lake":"_base/x","ms":1,"at_ms":2}"#).unwrap();
+        assert!(old.by.is_none());
+        assert!(!old.lease);
+        let made = Pin { by: Some("ann".into()), ..p };
+        let back: Pin = serde_json::from_value(serde_json::to_value(&made).unwrap()).unwrap();
+        assert_eq!(back.by.as_deref(), Some("ann"));
+    }
 }

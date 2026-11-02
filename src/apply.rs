@@ -201,13 +201,20 @@ impl Project {
     }
 }
 
-/// A YAML file under `objects/`: a pipeline or a dashboard (1.1), which 1.0 refuses by name (`project`). The gatherers list
-/// one by its name with no text, so it is never skipped silently.
-pub(crate) fn yaml_object(path: &str) -> bool { path.starts_with("objects/") && (path.ends_with(".yaml") || path.ends_with(".yml")) }
+/// A file under `objects/` that comes in 1.1, which 1.0 refuses by name (`project`): YAML (a pipeline or a dashboard) and
+/// Python (a pipeline). Its words, or None. The gatherers list one by its name with no text, so it is never skipped
+/// silently, and a project that holds one doesn't change meaning when 1.1 reads it.
+pub(crate) fn later_object(path: &str) -> Option<&'static str> {
+    match path.strip_prefix("objects/")?.rsplit_once('.')?.1 {
+        "yaml" | "yml" => Some("pipelines and dashboards in YAML come in 1.1"),
+        "py" => Some("pipelines in Python come in 1.1"),
+        _ => None,
+    }
+}
 
 pub(crate) fn project(ask: &Ask) -> Result<Project> {
-    if let Some(path) = ask.files.keys().find(|p| yaml_object(p.as_str())) {
-        return Err(crate::codes::coded("0A000", format!("{path}: pipelines and dashboards in YAML come in 1.1; until then a project's objects are .sql files")));
+    if let Some((path, what)) = ask.files.keys().find_map(|p| Some((p, later_object(p)?))) {
+        return Err(crate::codes::coded("0A000", format!("{path}: {what}; until then a project's objects are .sql files")));
     }
     let toml: Toml = match ask.files.get("pondra.toml") {
         Some(t) => toml::from_str(t).context("pondra.toml")?,
@@ -1330,7 +1337,7 @@ pub async fn call(app: &App, name: &str, args: &[datafusion::sql::sqlparser::ast
         if rel.split('/').any(|p| p.starts_with('.')) {
             continue;
         }
-        if yaml_object(&rel) {
+        if later_object(&rel).is_some() {
             files.insert(rel, String::new()); // (listed, not read: `project` refuses it by name)
             continue;
         }
@@ -1438,14 +1445,17 @@ mod tests {
     }
 
     #[test]
-    fn yaml_objects_are_refused_by_name() {
-        assert!(yaml_object("objects/sales/overview.dashboard.yaml") && yaml_object("objects/p.yml"));
-        assert!(!yaml_object("objects/a.sql") && !yaml_object("seeds/a.yaml") && !yaml_object("pondra.toml"));
-        let mut files = BTreeMap::new();
-        files.insert("pondra.toml".to_string(), "[project]\nname = \"sales\"\n".to_string());
-        files.insert("objects/a.dashboard.yaml".to_string(), String::new());
-        let err = project(&Ask { files, ..Default::default() }).err().unwrap();
-        assert!(err.to_string().contains("objects/a.dashboard.yaml: pipelines and dashboards in YAML come in 1.1"));
+    fn later_objects_are_refused_by_name() {
+        let later = |p: &str| later_object(p).is_some();
+        assert!(later("objects/sales/overview.dashboard.yaml") && later("objects/p.yml") && later("objects/sales/load.py"));
+        assert!(!later("objects/a.sql") && !later("seeds/a.yaml") && !later("tests/a.py") && !later("pondra.toml") && !later("objects/py"));
+        for (file, words) in [("objects/a.dashboard.yaml", "pipelines and dashboards in YAML come in 1.1"), ("objects/sales/load.py", "pipelines in Python come in 1.1")] {
+            let mut files = BTreeMap::new();
+            files.insert("pondra.toml".to_string(), "[project]\nname = \"sales\"\n".to_string());
+            files.insert(file.to_string(), String::new());
+            let err = project(&Ask { files, ..Default::default() }).err().unwrap();
+            assert!(err.to_string().contains(&format!("{file}: {words}")), "{err}");
+        }
     }
 
     #[test]

@@ -23,9 +23,10 @@ pub fn leaves(path: &str) -> bool {
 /// A name a client or a page writes in SQL (`'orders.csv'`, `'./d/*.parquet'`), as a URL in a folder's own files: `root`
 /// (ending in `/`: the lake's URL, or a page's `mem:///`) then `files/`. None for a name that already says where it is:
 /// one with a scheme (`s3://`, `https://`) or an absolute path (`/x`, `\x`, `C:/x`), which the caller reads as it always
-/// did. A name that leaves its folder is refused: a file is read where the caller is, and never outside `files/`.
+/// did. A name that leaves its folder is refused: a file is read where the caller is, and never outside `files/`. A blob URL
+/// (`blob:nodedata:x`, which has no `://`) is a tab's own file, never a lake's, so it is none of these names.
 pub fn relative(root: &str, name: &str) -> Option<anyhow::Result<String>> {
-    if name.contains("://") || is_absolute(name) {
+    if name.contains("://") || crate::ext_names::is_blob(name) || is_absolute(name) {
         return None;
     }
     let name = name.strip_prefix("./").unwrap_or(name);
@@ -73,6 +74,27 @@ pub fn content_type(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
         _ => "application/octet-stream",
+    }
+}
+
+/// What a `/files` request answers on any door (the node's HTTP, a page): its status, its content type, the file's
+/// version when the answer is the file's bytes (sent as `etag`, quoted, with `cache-control: no-store`), and its body.
+pub struct Filed {
+    pub status: u16,
+    pub content_type: &'static str,
+    pub etag: Option<String>,
+    pub body: bytes::Bytes,
+}
+
+impl Filed {
+    /// An answer of 200 with `v` as its JSON body.
+    pub fn json(v: serde_json::Value) -> Filed {
+        Filed { status: 200, content_type: "application/json", etag: None, body: serde_json::to_vec(&v).unwrap_or_default().into() }
+    }
+
+    /// An answer of `status` with `words` as its plain-text body (as axum sends a `(StatusCode, String)`).
+    pub fn text(status: u16, words: String) -> Filed {
+        Filed { status, content_type: "text/plain; charset=utf-8", etag: None, body: words.into() }
     }
 }
 

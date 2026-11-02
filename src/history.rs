@@ -25,6 +25,8 @@ use crate::store::{json, table_key, Lake, TableMeta};
 use anyhow::Result;
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, ListBuilder, RecordBatch, StringArray, StringBuilder, TimestampMicrosecondArray};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::datasource::physical_plan::FileScanConfig;
+use datafusion::datasource::source::DataSourceExec;
 use crate::reset::Once;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use datafusion::common::instant::Instant;
@@ -43,6 +45,9 @@ pub struct Note {
     plan_id: Option<String>,
     misestimate: Option<f64>,
     learned: Vec<crate::learned::Fact>,
+    queries: u32, // (planned: a statement that ran more than one query, a script's or a procedure's, sums their costs)
+    cost: (Option<i64>, Option<i64>), // (cpu_ms and bytes_read: `cost`, over the statement's queries)
+    peak_memory: Option<i64>,
 }
 
 /// A part of a statement's work: what it was, on which node, from when and for how long (ms).
@@ -90,8 +95,10 @@ pub fn read_at(version: u64) { with(|_, note| note.version = Some(version)); }
 /// A plan it ran (and the plan the planner made, `logical`): its shape always; how far its joins and
 /// its tables' filters were from what was expected when it took `PONDRA_LEARN_MS` or more; the plan
 /// itself, each operator's rows beside the rows it expected, when it is slow by now or that was ten
-/// times off.
-pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn ExecutionPlan>) {
+/// times off. And its cost (`cost`, read here: the plan itself is not kept, since the state its operators
+/// hold, a join's built tables among it, would stay reserved until the writer wrote the row), with `peak`:
+/// the most its statement's reservations held at once (`query::peak_pool`), read after the run.
+pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn ExecutionPlan>, peak: usize) {
     with(|start, note| {
         note.plan_id = Some(plan_id(plan));
         let took = start.elapsed();
@@ -105,7 +112,43 @@ pub fn planned(logical: &datafusion::logical_expr::LogicalPlan, plan: &Arc<dyn E
             let text = datafusion::physical_plan::display::DisplayableExecutionPlan::with_metrics(plan.as_ref()).set_show_statistics(true).indent(true).to_string();
             note.plan = Some(cut(crate::explain::expected(&text), 64 << 10));
         }
+        let (cpu, bytes) = cost(plan);
+        note.queries += 1;
+        note.cost = match note.queries {
+            1 => (cpu, bytes),
+            _ => (note.cost.0.zip(cpu).map(|(a, b)| a + b), note.cost.1.zip(bytes).map(|(a, b)| a + b)),
+        };
+        note.peak_memory = match note.queries {
+            1 => Some(peak as i64),
+            _ => None, // (queries one after another each have a peak of their own: no one peak for the statement)
+        };
     });
+}
+
+/// What a plan's operators measured, in one walk: their compute time in ms (`elapsed_compute`, summed over
+/// every operator and partition), and the bytes its Parquet scans read (`bytes_scanned`). Hot columns and
+/// the log tail are memory, not files, so their scans add no bytes. A scan of files that don't count their
+/// bytes (CSV, JSON, Arrow, Avro) leaves the bytes unknown (None), not a part. Nothing measured (no operator
+/// has metrics: a plan that never ran) is (None, None).
+fn cost(plan: &Arc<dyn ExecutionPlan>) -> (Option<i64>, Option<i64>) {
+    let (mut nanos, mut bytes, mut measured, mut counted) = (0usize, 0usize, false, true);
+    let mut todo = vec![plan.clone()];
+    while let Some(p) = todo.pop() {
+        todo.extend(p.children().into_iter().cloned());
+        if let Some(scan) = p.downcast_ref::<DataSourceExec>() {
+            if let Some(files) = scan.data_source().downcast_ref::<FileScanConfig>() {
+                counted &= files.file_source().file_type() == "parquet";
+            }
+        }
+        let Some(m) = p.metrics() else { continue };
+        measured = true;
+        nanos += m.elapsed_compute().unwrap_or(0);
+        bytes += m.sum_by_name("bytes_scanned").map_or(0, |v| v.as_usize());
+    }
+    if !measured {
+        return (None, None);
+    }
+    (Some((nanos / 1_000_000) as i64), counted.then_some(bytes as i64))
 }
 
 /// The worst ratio between a join's expected and actual rows, where either is 1,000 or more: where a
@@ -246,19 +289,34 @@ struct Line {
 }
 
 /// A statement a door ran has ended (`audit::statement`): its row, and a line in the node's log
-/// when it was slow.
+/// when it was slow. A joined page keeps no rows: its statement goes to its node (`page_records::add`), which
+/// keeps the row with the sign-in's name (`page_ended`).
 pub fn ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note) {
-    if !on() || app.log.is_none() {
+    if !app.members.keeps_records() {
+        return crate::page_records::add(sql, outcome, error, took);
+    }
+    record(app, class, sql, outcome, error, took, note, false)
+}
+
+/// A joined page's statement, as its node keeps it (`page_records::record`, under the sign-in's name): the row `ended`
+/// keeps, with no line in the node's log for a slow one, and counted against the rate limit whatever its outcome.
+#[cfg_attr(not(feature = "doors"), allow(dead_code))] // (the node's half: `server::records`)
+pub(crate) fn page_ended(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration) {
+    record(app, class, sql, outcome, error, took, Note::default(), true)
+}
+
+fn record(app: &App, class: &'static str, sql: &str, outcome: &'static str, error: Option<String>, took: Duration, note: Note, page: bool) {
+    if !on() || app.log.is_none() || !app.members.keeps_records() {
         return; // (a read-only node writes nothing)
     }
     let slow = took >= slow();
-    if !slow && outcome == "ok" && note.learned.is_empty() && skipped() {
+    if (page || !slow && outcome == "ok" && note.learned.is_empty()) && skipped() {
         return; // (counted: nothing else to do, on the path of every statement)
     }
     let who = crate::auth::current();
     let (user, door, from) = who.map_or((String::new(), "node", None), |p| (p.name, p.door, p.from.map(|a| a.to_string())));
     let statement = crate::audit::redacted(sql, class);
-    if slow {
+    if slow && !page {
         // (a library's host or a `pondra sql` guest doesn't print it: `node::say`. It is in pondra.history)
         crate::node::say(format!("slow statement: {} ms, {user} by {door}{}: {}", took.as_millis(), note.nodes.map(|n| format!(" on {n} nodes")).unwrap_or_default(), cut(statement.replace('\n', " "), 300)));
     }
@@ -290,6 +348,9 @@ fn skipped() -> bool {
 
 crate::per_node!(static WRITER: RwLock<Option<tokio::sync::mpsc::UnboundedSender<Line>>> = RwLock::new(None));
 
+/// The history's columns. The cost of a read: `cpu_ms` is its operators' compute time, and `bytes_read` the bytes
+/// read from files (its Parquet scans; rows still in the log and hot columns held in memory count none). `peak_memory`
+/// is the most its statement's own memory pool held at once, in bytes.
 fn columns() -> Vec<(String, String)> {
     use datafusion::arrow::datatypes::{DataType, TimeUnit};
     let ts = crate::answer::type_name(&DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())));
@@ -297,7 +358,8 @@ fn columns() -> Vec<(String, String)> {
     let int = |n: &str| (n.to_string(), "Int64".to_string());
     // (stored columns only grow, at the end: a lake's history made before keeps its rows, `create_log`)
     vec![("at".into(), ts), text("id"), text("user"), text("door"), text("from"), text("node"), text("session"), text("class"), text("statement"), text("outcome"), text("error"), int("ms"), int("rows"), int("nodes"), text("plan"), text("trace"),
-         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into()), ("writes".into(), "Utf8[]".into()), text("learned")]
+         text("fingerprint"), text("plan_id"), int("version"), ("reads".into(), "Utf8[]".into()), ("misestimate".into(), "Float64".into()), ("writes".into(), "Utf8[]".into()), text("learned"),
+         int("cpu_ms"), int("bytes_read"), int("peak_memory")]
 }
 
 /// Leader: the table, made the first time a node has a row for it (`Ddl::HistoryLog`), or given
@@ -317,6 +379,11 @@ pub async fn create_log(lake: &Lake) -> Result<serde_json::Value> {
     }
     Ok(serde_json::json!({"table": "pondra.history"}))
 }
+
+/// The note whose cost columns are kept: a read that ran here. A write, a DDL, a CALL or a DO has none (their
+/// work is more than the plan a read ran, and only a read's plan is measured here), and a read spread over the
+/// nodes has none too, since the other nodes' parts come back as rows, not as metrics.
+fn costed(l: &Line) -> Option<&Note> { (l.class == "read" && l.note.nodes.is_none()).then_some(&l.note) }
 
 fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
     let text = |f: &dyn Fn(&Line) -> Option<String>| Arc::new(lines.iter().map(f).collect::<StringArray>()) as ArrayRef;
@@ -349,7 +416,12 @@ fn batch(app: &App, lines: &[Line]) -> Result<RecordBatch> {
         let facts: Vec<_> = l.note.learned.iter().map(|f| crate::learned::Fact { object: local(&f.object), ..f.clone() }).collect();
         serde_json::to_string(&facts).unwrap_or_default()
     }));
-    let arrays = [arrays, vec![reads, Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef, writes, learned]].concat();
+    let misestimate = Arc::new(lines.iter().map(|l| l.note.misestimate).collect::<Float64Array>()) as ArrayRef;
+    let costs: Vec<(Option<i64>, Option<i64>)> = lines.iter().map(|l| costed(l).map_or((None, None), |n| n.cost)).collect();
+    let cpu_ms = Arc::new(costs.iter().map(|c| c.0).collect::<Int64Array>()) as ArrayRef;
+    let bytes_read = Arc::new(costs.iter().map(|c| c.1).collect::<Int64Array>()) as ArrayRef;
+    let peak_memory = int(&|l| costed(l).and_then(|n| n.peak_memory));
+    let arrays = [arrays, vec![reads, misestimate, writes, learned, cpu_ms, bytes_read, peak_memory]].concat();
     Ok(RecordBatch::try_new(crate::answer::schema(&columns())?, arrays)?)
 }
 
@@ -411,7 +483,7 @@ fn relations(sql: &str) -> Option<Vec<String>> {
     let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [stmt] = &stmts[..] else { return None };
     let mut names = Names::default();
-    let _ = stmt.visit(&mut names);
+    let _ = crate::walk::visit(stmt, &mut names);
     let mut seen = std::collections::HashSet::new();
     let tables: Vec<String> = names.tables.into_iter().filter(|t| !names.ctes.contains(t) && seen.insert(t.clone())).collect();
     (!tables.is_empty()).then_some(tables)
@@ -512,4 +584,61 @@ pub fn visible(ctx: &datafusion::prelude::SessionContext, table: Arc<dyn datafus
 /// `pondra.history` before its first row: the columns, no rows.
 pub fn empty() -> Result<Arc<dyn datafusion::catalog::TableProvider>> {
     Ok(Arc::new(datafusion::datasource::MemTable::try_new(crate::query::read_schema(&columns())?, vec![vec![]])?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::parquet::arrow::ArrowWriter;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::prelude::SessionContext;
+
+    #[test]
+    fn a_plan_that_never_ran_has_no_cost() {
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        assert_eq!(cost(&plan), (None, None));
+    }
+
+    /// A query over a Parquet file, run to its end as `App::run_query` runs it: its cost is measured, and its
+    /// statement's pool kept the peak of what the aggregate reserved.
+    #[tokio::test]
+    async fn a_query_over_a_parquet_file_has_its_cpu_its_bytes_and_its_peak() {
+        let dir = std::env::temp_dir().join(format!("pondra-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let mut writer = ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema.clone(), None).unwrap();
+        writer.write(&RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..10_000))]).unwrap()).unwrap();
+        writer.close().unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_parquet("t", path.to_str().unwrap(), Default::default()).await.unwrap();
+        let peak = crate::query::peak_pool(&ctx);
+        let df = ctx.sql("SELECT a % 7 AS k, sum(a) AS s FROM t GROUP BY 1 ORDER BY 1").await.unwrap();
+        let (state, logical) = df.into_parts();
+        let task = crate::query::task_with_peak(&state, &peak).unwrap();
+        let logical = state.optimize(&logical).unwrap();
+        let plan = state.query_planner().create_physical_plan(&logical, &state).await.unwrap();
+        datafusion::physical_plan::collect(plan.clone(), task).await.unwrap();
+        let (cpu, bytes) = cost(&plan);
+        assert!(cpu.is_some_and(|c| c >= 0), "cpu_ms: {cpu:?}");
+        assert!(bytes.is_some_and(|b| b > 0), "bytes_read: {bytes:?}");
+        assert!(peak.peak_reserved() > 0, "the aggregate's reservations didn't go through the statement's pool");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A statement's task has a memory pool of its own; everything else in its runtime is the lake's, shared.
+    #[test]
+    fn a_tasks_pool_is_its_statements_and_the_rest_of_its_runtime_is_shared() {
+        let ctx = SessionContext::new();
+        let peak = crate::query::peak_pool(&ctx);
+        let task = crate::query::task_with_peak(&ctx.state(), &peak).unwrap();
+        let (lake, mine) = (ctx.runtime_env(), task.runtime_env());
+        assert!(Arc::ptr_eq(&lake.disk_manager, &mine.disk_manager));
+        assert!(Arc::ptr_eq(&lake.object_store_registry, &mine.object_store_registry));
+        assert!(Arc::ptr_eq(&lake.cache_manager.get_file_metadata_cache(), &mine.cache_manager.get_file_metadata_cache()));
+        assert!(!Arc::ptr_eq(&lake.memory_pool, &mine.memory_pool));
+        assert_eq!(peak.peak_reserved(), 0);
+    }
 }

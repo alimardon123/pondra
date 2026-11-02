@@ -1,7 +1,7 @@
 //! A plan's partitions run in the task that asks for them, so a page can run a plan of more than one partition.
 //!
 //! DataFusion runs the partitions of a plan on tasks of their own, where it has more than one: the
-//! `CoalescePartitionsExec` the planner puts under an aggregate or a sort, `collect` and `collect_partitioned` (a
+//! `CoalescePartitionsExec` the planner puts under an aggregate or a sort, a `RepartitionExec` into one partition, `collect` and `collect_partitioned` (a
 //! table made from a query) at the root of a plan, and `ScalarSubqueryExec`, which runs each subquery the same way. A
 //! page has no tokio runtime to start those tasks on, so each of them panics there, and takes every table of the page
 //! with it. Here every partition runs in the task that asks, and all of them run at once, interleaved: a hash join's
@@ -16,6 +16,7 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::replace_children_if_necessary;
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::scalar_subquery::ScalarSubqueryExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -119,6 +120,13 @@ impl PhysicalOptimizerRule for InTask {
 fn in_task_node(plan: Arc<dyn ExecutionPlan>) -> Result<Transformed<Arc<dyn ExecutionPlan>>> {
     if let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() {
         return Ok(Transformed::yes(Arc::new(InTaskExec::replacing(coalesce))));
+    }
+    // (a repartition into one partition merges its input, as a coalesce does, and starts a task per input partition too:
+    // `EnsureRequirements` puts one under a sort-merge join or a window keyed on columns, whose input has more than one)
+    if let Some(repartition) = plan.downcast_ref::<RepartitionExec>() {
+        if repartition.partitioning().partition_count() == 1 && !repartition.preserve_order() {
+            return Ok(Transformed::yes(Arc::new(InTaskExec::merging(repartition.input().clone()))));
+        }
     }
     if plan.downcast_ref::<ScalarSubqueryExec>().is_none() {
         return Ok(Transformed::no(plan));

@@ -6,16 +6,16 @@
 //!    one to notice;
 //! 2. new requests are turned away with an answer a client retries elsewhere (HTTP 503 with
 //!    `Retry-After`; a new Postgres connection is refused, a new statement on an open one answered
-//!    57P01), except the cluster's own calls, which a leader's followers and a query's other nodes
-//!    still need;
-//! 3. requests in flight at every door that has them (HTTP, each Postgres statement) finish, for up
-//!    to `PONDRA_DRAIN_SECS` (30). Only those that came before the signal are waited for: a leader's
+//!    57P01; a new Kafka connection is closed at once, and an open one before its next request),
+//!    except the cluster's own calls, which a leader's followers and a query's other nodes still need;
+//! 3. requests in flight at every door that has them (HTTP, each Postgres statement, each Kafka produce
+//!    and offset commit until its answer is written) finish, for up to `PONDRA_DRAIN_SECS` (30). Only those that came before the signal are waited for: a leader's
 //!    followers keep sending it flushes until it steps down, and on a bucket one is always in flight,
 //!    so waiting for none held a leader the whole 30 s (and a scheduler's kill came first);
 //! 4. then the leader checkpoints its catalog. Everything acknowledged was durable already
 //!    (`--ack durable`) or is held by the followers (`--ack replicated`), so nothing waits on the
 //!    bucket here;
-//! 5. then the HTTP door closes (`close_door`, from `Held::stop`): an answer still being written goes
+//! 5. then the HTTP and Flight doors close (`close_door`, from `Held::stop`): an answer still being written goes
 //!    out whole, for at most what is left of `PONDRA_DRAIN_SECS` (and at least 250 ms, for the last
 //!    bytes hyper holds, once it took a connection), and the streams that never end by themselves (a
 //!    commit feed, a watch, a live query) end there, their clients reconnecting to another node.
@@ -41,6 +41,8 @@ crate::per_node!(static DRAIN_START: Mutex<Option<tokio::time::Instant>> = Mutex
 // Whether the HTTP door took a connection: only then may a client still be reading an answer's last bytes.
 crate::per_node!(static TOOK: AtomicBool = AtomicBool::new(false));
 crate::per_node!(static HURRIED: AtomicBool = AtomicBool::new(false));
+// The doors besides HTTP's that close with it (Flight: `flight::serve`), counted while each serves, as `IN_FLIGHT` counts.
+crate::per_node!(static SERVING: RwLock<Arc<AtomicUsize>> = RwLock::default());
 
 /// The HTTP door's state, in order: not opened, serving, closing (its streams end and its answers go out), closed.
 #[derive(Clone, Copy, Default, PartialEq, PartialOrd)]
@@ -77,6 +79,10 @@ impl Busy {
     /// The request's count, held again by the body of an answer sent in pieces, which goes on after its response: counted
     /// whatever the drain says, so it is taken only while the request's own `Busy` (`panics::door`) is held.
     pub fn carried() -> Busy { let count = in_flight(); count.fetch_add(1, SeqCst); Busy(Some(count)) }
+
+    /// Whether it is counted: false for a request that came once the drain began, which a door then doesn't take
+    /// (Kafka's: `kafka::conn`).
+    pub fn counted(&self) -> bool { self.0.is_some() }
 }
 
 impl Drop for Busy {
@@ -119,6 +125,23 @@ pub(crate) fn took() { TOOK.store(true, SeqCst); }
 /// The HTTP door's serve has ended (its task, when it ends).
 pub(crate) fn door_closed() { DOOR.send_replace(Door::Closed); }
 
+/// Held by a door besides HTTP's while it serves (Flight's): `close_door` waits for it to be dropped, as it waits for the HTTP
+/// door to close. The door closes gracefully on `closing`, and its serve returns once its connections have closed: an answer
+/// whose last messages a slow client hasn't read yet is still in its connection when the answer's own `Busy` is dropped.
+pub(crate) struct Serving(Arc<AtomicUsize>);
+
+impl Serving {
+    pub(crate) fn new() -> Serving {
+        let count = SERVING.read().unwrap_or_else(|e| e.into_inner()).clone();
+        count.fetch_add(1, SeqCst);
+        Serving(count)
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) { self.0.fetch_sub(1, SeqCst); }
+}
+
 /// Resolves once this node's door starts closing. Takes this node's receiver when it is called.
 pub fn closing() -> impl Future<Output = ()> + Send + 'static {
     let mut door = DOOR.subscribe();
@@ -160,11 +183,19 @@ pub async fn close_door() {
     });
     let bound = door_bound();
     let mut door = DOOR.subscribe();
-    let shut = tokio::time::timeout(bound, async { drop(door.wait_for(|d| *d == Door::Closed).await) }).await.is_ok();
+    let others = SERVING.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let shut = tokio::time::timeout(bound, async {
+        drop(door.wait_for(|d| *d == Door::Closed).await);
+        while others.load(SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await; // (Flight's door: its connections closing, `Serving`)
+        }
+    })
+    .await
+    .is_ok();
     if !HURRIED.load(SeqCst) && TOOK.load(SeqCst) {
         tokio::time::sleep_until(started + Duration::from_millis(250)).await;
     }
     if !shut {
-        eprintln!("stopping with the HTTP door still open after {:?}", started.elapsed());
+        eprintln!("stopping with a door still open after {:?}", started.elapsed());
     }
 }

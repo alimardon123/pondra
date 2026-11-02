@@ -29,7 +29,7 @@ def duck(lake):
     """A DuckDB connection with the delta, iceberg and httpfs extensions (and the bucket's secret)."""
     import duckdb, glob, site
     con = duckdb.connect()
-    for ext in ("delta", "avro", "iceberg", "httpfs"):  # from the pip packages (duckdb-extension-…), else DuckDB's download
+    for ext in ("delta", "avro", "iceberg", "httpfs"):  # from pip packages (duckdb-extension-…) when there are some, else DuckDB's download
         found = [f for d in site.getsitepackages() for f in glob.glob(f"{d}/duckdb_extension_{ext}/**/{ext}.duckdb_extension", recursive=True)]
         con.execute(f"LOAD '{found[0]}'" if found else f"INSTALL {ext}; LOAD {ext}")
     if lake.startswith("s3://"):

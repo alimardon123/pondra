@@ -13,7 +13,7 @@
 use crate::store::{json, table_key, Lake, TableMeta};
 use crate::write::Stmt;
 use anyhow::{bail, ensure, Context, Result};
-use datafusion::sql::sqlparser::ast::{self, visit_expressions, visit_expressions_mut};
+use datafusion::sql::sqlparser::ast;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use serde::{Deserialize, Serialize};
 use serde_json::{json as j, Value};
@@ -233,7 +233,7 @@ async fn find(lake: &Lake, name: &str) -> Result<Option<(String, Index)>> {
 fn rewrite(text: &str, quoted: bool, to: &dyn Fn(&str) -> Result<String>) -> Result<String> {
     let mut e = Parser::new(&GenericDialect {}).try_with_sql(text)?.parse_expr()?;
     let mut failed = None;
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         let named = match x {
             ast::Expr::Identifier(i) => Some(crate::text::ident(i)),
             ast::Expr::CompoundIdentifier(p) => p.last().map(crate::text::ident), // (t.c is c: an index is on one table)
@@ -260,7 +260,7 @@ fn rewrite(text: &str, quoted: bool, to: &dyn Fn(&str) -> Result<String>) -> Res
 fn columns(text: &str) -> Vec<String> {
     let mut out = vec![];
     if let Ok(e) = Parser::new(&GenericDialect {}).try_with_sql(text).and_then(|mut p| p.parse_expr()) {
-        let _ = visit_expressions(&e, |x| {
+        let _ = crate::walk::visit_expressions(&e, |x| {
             if let ast::Expr::Identifier(i) = x {
                 out.push(i.value.clone());
             }

@@ -15,7 +15,7 @@ use crate::store::Lake;
 use anyhow::{bail, ensure, Context, Result};
 use datafusion::logical_expr::{LogicalPlan, SetVariable, Statement as Plan};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, Reset, Set, Statement, Value, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
 
@@ -26,7 +26,7 @@ pub fn is(sql: &str) -> bool {
     let word = crate::text::first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or("").to_uppercase();
     (matches!(word.as_str(), "SET" | "RESET" | "PREPARE" | "EXECUTE" | "EXEC" | "DEALLOCATE" | "ANALYZE" | "ANALYSE" | "REFRESH" | "USE")
         && crate::runs::execute_of(sql).is_none()) // (EXECUTE TASK: the leader's)
-        || crate::extension::statement(sql).is_some() // (DuckDB's INSTALL, FORCE INSTALL and LOAD: `extension.rs`)
+        || crate::extension::is(sql) // (DuckDB's INSTALL, FORCE INSTALL and LOAD, and Pondra's: `extension.rs`)
 }
 
 /// What Postgres's tools send that has nothing to do here (dbt and BI tools send both): `ANALYZE
@@ -63,7 +63,7 @@ pub enum Done {
 
 /// Carry out a `SET`, `RESET`, `PREPARE`, `EXECUTE` or `DEALLOCATE` for the current session.
 pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
-    if let Some(said) = crate::extension::statement(sql) {
+    if let Some(said) = crate::extension::statement(lake, sql).await {
         let said = said?; // (DuckDB's INSTALL and LOAD: no session needed; the notice goes to the client as the others do)
         crate::routines::heard(&said.notice);
         return Ok(Done::Said(said.tag));
@@ -160,11 +160,11 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
         Statement::Execute { name: Some(name), parameters, .. } if !name.to_string().starts_with('\'') => {
             let name = name.to_string().to_lowercase();
             let kept = crate::temp::with(&session()?, false, |s| Ok(s.prepared.get(&name).cloned()))?;
-            let kept = kept.with_context(|| format!("Prepared statement '{name}' does not exist"))?;
+            let kept = kept.ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist")))?;
             let Some(Statement::Prepare { data_types, statement, .. }) = Parser::parse_sql(&GenericDialect {}, &kept)?.pop() else { bail!("{name}: not a prepared statement (PREPARE {name} AS … makes one)") };
             let mut statement = *statement;
             let mut args = Arguments { values: parameters, types: data_types, wrong: None };
-            let _ = VisitMut::visit(&mut statement, &mut args);
+            let _ = crate::walk::visit_mut(&mut statement, &mut args);
             if let Some(e) = args.wrong {
                 bail!(e);
             }
@@ -175,7 +175,7 @@ pub async fn statement(lake: &Lake, sql: &str) -> Result<Done> {
             let name = name.value.to_lowercase();
             crate::temp::with(&session()?, false, |s| match name.as_str() {
                 "all" => Ok(s.prepared.clear()),
-                _ => s.prepared.remove(&name).map(drop).with_context(|| format!("Prepared statement '{name}' does not exist")),
+                _ => s.prepared.remove(&name).map(drop).ok_or_else(|| crate::codes::coded("26000", format!("Prepared statement '{name}' does not exist"))),
             })?;
             Done::Said("DEALLOCATE")
         }
@@ -246,7 +246,7 @@ fn one_way(n: &str, value: &str) -> Option<(&'static str, String)> {
 fn set(session: &str, variable: &str, value: String) -> Result<()> {
     let n = name(variable);
     if let Some(v) = n.strip_prefix('@') {
-        return Err(crate::codes::coded("0A000", format!("SET @{v} is MySQL's for a variable: here a variable is ${v} = …, and ${v} reads it")));
+        return Err(crate::codes::coded("0A000", crate::dialect_stmts::user_variable(v)));
     }
     if let Some((code, why)) = one_way(&n, &value) {
         return Err(crate::codes::coded(code, why));
@@ -258,7 +258,16 @@ fn set(session: &str, variable: &str, value: String) -> Result<()> {
         return Err(crate::codes::coded("55P02", format!("{n} is the node's, not a session's: start the node with --memory-gb (PONDRA_MEMORY_GB) for its queries' memory; spill files go to the system's temporary folder (TMPDIR)")));
     }
     if n.contains('.') {
-        datafusion::config::ConfigOptions::new().set(&n, &value)?; // (a name DataFusion has, a value it takes)
+        // (a name DataFusion has is datafusion.…: any other dotted name is no setting of Pondra's, refused as Postgres refuses
+        // one it doesn't have; a Spark one says where its settings are)
+        if !n.starts_with("datafusion.") {
+            let spark = match n.starts_with("spark.") {
+                true => ": Spark's settings aren't Pondra's (SHOW ALL lists Pondra's)",
+                false => "",
+            };
+            return Err(crate::codes::coded("42704", format!("unrecognized configuration parameter \"{n}\"{spark}")));
+        }
+        datafusion::config::ConfigOptions::new().set(&n, &value)?; // (a value DataFusion takes for a name it has)
     }
     crate::temp::with(session, false, |s| Ok(s.settings.insert(n, value)))?;
     Ok(())

@@ -1017,7 +1017,7 @@ fn spread(p: &Arc<dyn ExecutionPlan>, exchanges: &mut Vec<Exchange>) -> Option<S
     match p.name() {
         "DataSourceExec" | "EmptyExec" | "PlaceholderRowExec" => Some(Whole),
         "ProjectionExec" | "FilterExec" | "UnnestExec" | "CoalesceBatchesExec" | "CooperativeExec" | "LocalLimitExec" => one,
-        "HeldInExec" | "HeldOutExec" | "LeanExec" => one, // (a window's memory counted: its rows as they are; a sort's output as it is)
+        "HeldInExec" | "HeldOutExec" | "LeanExec" | "HeldValuesExec" | "HeldValuesInExec" => one, // (a window's memory counted: its rows as they are; a sort's output as it is; a median's held values)
         "async_func" => one, // (AsyncFuncExec: a Python or Flight function, row by row: each node its own rows, through its own workers)
         // (within a node — and a limit within one node, over rows spread across them all, is wrong)
         "CoalescePartitionsExec" | "SortPreservingMergeExec" => (!has("fetch=")).then_some(one?),
@@ -1118,7 +1118,7 @@ fn ranged(p: &Arc<dyn ExecutionPlan>, i: usize) -> bool {
             (JoinSide::Right, _) => ranged(j.right(), c.index),
         });
     }
-    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "LeanExec" | "SortPreservingMergeExec") && ranged(p.children()[0], i)
+    matches!(p.name(), "CoalesceBatchesExec" | "CooperativeExec" | "RepartitionExec" | "CoalescePartitionsExec" | "SortExec" | "LeanExec" | "HeldValuesExec" | "HeldValuesInExec" | "SortPreservingMergeExec") && ranged(p.children()[0], i)
 }
 
 /// A join of two sides cut by the same ranges that runs where the rows are: a pair of its keys is
@@ -1529,7 +1529,7 @@ pub fn tables(sql: &str) -> Option<Vec<String>> {
     let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [stmt @ Statement::Query(_)] = &stmts[..] else { return None };
     let mut names = Names::default();
-    let _ = stmt.visit(&mut names);
+    let _ = crate::walk::visit(stmt, &mut names);
     let mut seen = std::collections::HashSet::new();
     let tables: Vec<String> = names.tables.into_iter().filter(|t| !names.ctes.contains(t) && seen.insert(t.clone())).collect();
     (!tables.is_empty()).then_some(tables)

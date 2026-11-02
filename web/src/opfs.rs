@@ -1,7 +1,9 @@
-//! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, as
-//! `fetch.rs` is one web origin's objects. A page keeps its files and its tables there (`Page::kept`), so they are there
-//! after a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes
-//! one writer at a time, so two tabs never write over each other's tables.
+//! The page's store over the origin's private file system (OPFS, designs/l2-b4-web.md section 4j): one folder of it, which
+//! is the lake's store of a kept page (`Page::kept`). A page keeps its files and its tables there, so they are there after
+//! a reload. A folder is one page's at a time: `Page::kept` holds a Web Lock on it (`js::lock`), which is what makes one
+//! writer at a time across tabs, so two tabs never write over each other's tables. Inside the module, each object's
+//! changes take its lock (`hold`), so a put that creates an object, or replaces one version, is checked and written as one
+//! step, even when two requests for the same object are in flight at once.
 //!
 //! A write is whole or not at all. Over an existing file, Chromium keeps the old bytes until the new ones are closed. A
 //! new object is written under a temporary name (`{name}#writing`: object_store encodes `#`, so no object has one) and
@@ -22,23 +24,58 @@ use object_store::{
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::{Arc, PoisonError};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 /// The most bytes one part of a read holds: a large file is read a part at a time, as the stream is polled.
 const PART: u64 = 4 << 20;
 
+/// The objects being changed now, each with the lock its changes take in turn (`hold`). An entry goes once no change
+/// holds or waits for it.
+type Changing = std::sync::Mutex<std::collections::HashMap<Path, std::sync::Arc<futures::lock::Mutex<()>>>>;
+
 /// One folder of the origin's private file system, its objects the files under it. The name is checked by the page
 /// (`lib.rs`). Each operation reaches the folder afresh: a JavaScript handle is never kept.
 #[derive(Debug)]
 pub struct Opfs {
     folder: String,
+    changing: Arc<Changing>,
 }
 
 impl Opfs {
     pub fn new(folder: String) -> Opfs {
-        Opfs { folder }
+        Opfs { folder, changing: Arc::default() }
     }
+}
+
+/// A change's hold on one object: until it is dropped, no other change to the object is checked or written.
+struct Held {
+    guard: Option<futures::lock::OwnedMutexGuard<()>>,
+    at: Path,
+    changing: Arc<Changing>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // (the guard goes first: the entry's count falls only once this hold's lock is let go)
+        drop(self.guard.take());
+        let mut map = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        if map.get(&self.at).is_some_and(|entry| Arc::strong_count(entry) == 1) {
+            map.remove(&self.at);
+        }
+    }
+}
+
+/// Waits for the lock on an object's changes, which take it in turn, and holds it until the `Held` is dropped. The
+/// object's entry is made if there is none. The std mutex is let go before the wait: it is never held across an await.
+async fn hold(changing: &Arc<Changing>, at: &Path) -> Held {
+    let entry = {
+        let mut map = changing.lock().unwrap_or_else(PoisonError::into_inner);
+        map.entry(at.clone()).or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))).clone()
+    };
+    let guard = entry.lock_owned().await;
+    Held { guard: Some(guard), at: at.clone(), changing: changing.clone() }
 }
 
 impl fmt::Display for Opfs {
@@ -59,10 +96,15 @@ pub fn available() -> bool {
 impl ObjectStore for Opfs {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> StoreResult<PutResult> {
         let chunks: Vec<Bytes> = payload.into_iter().collect();
-        let folder = self.folder.clone();
-        let outcome = step(location, put(folder, location.clone(), opts.mode, chunks)).await?;
+        // (the hold is taken inside the work: `step` runs the work to its end, even if this caller is dropped)
+        let (folder, changing, at) = (self.folder.clone(), self.changing.clone(), location.clone());
+        let outcome = step(location, async move {
+            let _held = hold(&changing, &at).await;
+            put(folder, at, opts.mode, chunks).await
+        })
+        .await?;
         match outcome {
-            Put::Written(e_tag) => Ok(PutResult { e_tag: Some(e_tag), version: None }),
+            Put::Written(e_tag) => Ok(PutResult { e_tag: Some(e_tag), version: None, extensions: Default::default() }),
             Put::Exists => Err(Error::AlreadyExists {
                 path: location.to_string(),
                 source: "an object is there already, and this put is to create one".into(),
@@ -87,7 +129,7 @@ impl ObjectStore for Opfs {
         let at = location.clone();
         let meta = step(location, async move { meta_at(&folder, &at).await }).await?;
         options.check_preconditions(&meta)?;
-        // (what is read, and whether a body is wanted, is `js::read_of`'s, as `fetch.rs` reads it)
+        // (what is read, and whether a body is wanted, is `js::read_of`'s)
         let read = js::read_of(options);
         let range = answered(&read, meta.size, location)?;
         let payload = if read.body {
@@ -96,17 +138,22 @@ impl ObjectStore for Opfs {
         } else {
             stream::empty().boxed()
         };
-        Ok(GetResult { payload: GetResultPayload::Stream(payload), meta, range, attributes: Attributes::default() })
+        Ok(GetResult { payload: GetResultPayload::Stream(payload), meta, range, attributes: Attributes::default(), extensions: Default::default() })
     }
 
     fn delete_stream(&self, locations: BoxStream<'static, StoreResult<Path>>) -> BoxStream<'static, StoreResult<Path>> {
-        let folder = self.folder.clone();
+        let (folder, changing) = (self.folder.clone(), self.changing.clone());
         locations
             .then(move |location| {
-                let folder = folder.clone();
+                let (folder, changing) = (folder.clone(), changing.clone());
                 async move {
                     let at = location?;
-                    step(&at, remove_at(folder, at.clone())).await?;
+                    let removing = at.clone();
+                    step(&at, async move {
+                        let _held = hold(&changing, &removing).await;
+                        remove_at(folder, removing).await
+                    })
+                    .await?;
                     Ok(at)
                 }
             })
@@ -127,7 +174,7 @@ impl ObjectStore for Opfs {
         let (folder, names) = (self.folder.clone(), names_under(prefix));
         let at = prefix.cloned().unwrap_or_default();
         let level = step(&at, level_of(folder, names)).await?;
-        Ok(ListResult { common_prefixes: level.folders, objects: level.files })
+        Ok(ListResult { common_prefixes: level.folders, objects: level.files, extensions: Default::default() })
     }
 
     async fn copy_opts(&self, _from: &Path, _to: &Path, _options: CopyOptions) -> StoreResult<()> {
@@ -137,7 +184,7 @@ impl ObjectStore for Opfs {
 
 /// Why a step of a store's work failed: the object is not there (the browser's `NotFoundError`, or `TypeMismatchError`,
 /// a file where a folder is or the other way), or the browser's words.
-enum Failed {
+pub(crate) enum Failed {
     Missing,
     Words(String),
 }
@@ -224,7 +271,7 @@ async fn file_at(dir: &JsValue, name: &str, create: bool) -> Result<JsValue, Fai
 }
 
 /// The `{create}` option of getDirectoryHandle and getFileHandle.
-fn create_option(create: bool) -> Result<JsValue, String> {
+pub(crate) fn create_option(create: bool) -> Result<JsValue, String> {
     let options = JsValue::from(js_sys::Object::new());
     js::set(&options, "create", create)?;
     Ok(options)
@@ -514,7 +561,7 @@ async fn files_under(folder: String, names: Vec<String>) -> Result<Vec<ObjectMet
 
 /// A folder's entries as (name, handle), in the order the browser gives them. Left out: a write in progress (a name with
 /// `#`) and Chromium's file for an open writable (`.crswap`), which are not objects yet.
-async fn entries(dir: &JsValue) -> Result<Vec<(String, JsValue)>, Failed> {
+pub(crate) async fn entries(dir: &JsValue) -> Result<Vec<(String, JsValue)>, Failed> {
     let iterator = js::call_method(dir, "entries")?;
     let mut found = vec![];
     loop {

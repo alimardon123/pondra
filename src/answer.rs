@@ -436,7 +436,7 @@ pub fn schema(columns: &[(String, String)]) -> Result<SchemaRef> {
 /// that keeps its name is passed as it is, never aliased to its own name, as SQL's planner does for `t.id AS id`:
 /// DataFusion 55's push_down_leaf_projections, which takes a JSON or struct field down to the scan, adds `?table?.id`
 /// beside such an alias's `id`, and refused the plan as ambiguous (`doc->'a'` on every keyed table, and on any table with
-/// a renamed column). Shared by a node's tables (`query::named`) and a page's Delta tables (`page::delta_table`).
+/// a renamed column). Used by a node's tables (`query::named`).
 pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&str) -> bool) -> datafusion::error::Result<DataFrame> {
     let keep: Vec<Expr> = df.schema().fields().iter().filter(|f| shown(f.name())).map(|f| {
         let name = name_of(f.name());
@@ -444,6 +444,24 @@ pub fn renamed(df: DataFrame, name_of: impl Fn(&str) -> String, shown: impl Fn(&
         if name == *f.name() { column } else { column.alias(name) }
     }).collect();
     df.select(keep)
+}
+
+/// `df` with the columns `order` names in that order, in the places they hold among its columns (a table's columns in SQL's
+/// order, `TableMeta::sql_order`); the others (the system columns) where they are.
+pub fn reordered(df: DataFrame, order: &[String]) -> datafusion::error::Result<DataFrame> {
+    let names: Vec<String> = df.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let mut next = order.iter().filter(|c| names.contains(c));
+    let list: Vec<Expr> = names.iter().map(|n| if order.contains(n) { next.next().unwrap_or(n) } else { n }).map(|n| ident(n)).collect();
+    df.select(list)
+}
+
+/// `b` with its columns as `reordered` puts a frame's: those `order` names in that order, in the places they hold.
+pub fn batch_reordered(b: &RecordBatch, order: &[String]) -> datafusion::error::Result<RecordBatch> {
+    let schema = b.schema();
+    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let mut next = order.iter().filter_map(|c| names.iter().position(|n| n == c));
+    let picks: Vec<usize> = names.iter().enumerate().map(|(i, n)| if order.iter().any(|c| c == n) { next.next().unwrap_or(i) } else { i }).collect();
+    Ok(b.project(&picks)?)
 }
 
 /// A column's type by name: Arrow's own (`Utf8`, `Int64`, `Timestamp(Microsecond, None)`,

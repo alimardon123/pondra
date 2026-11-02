@@ -36,10 +36,18 @@ pub async fn backlog(lake: &Lake, after: u64, upto: Option<u64>) -> Result<BTree
 /// Tier one table's log up to segment `hwm`, at most ~4M rows at a time (bounded memory; the
 /// caller repeats). The leader only decides and commits: the data work (reading the log and
 /// files, writing Parquet) is dealt out to the live `nodes` as jobs, SPMD style. Returns the
-/// rows tiered and whether it's done.
+/// rows tiered and whether it's done. A keyed table's log is folded no further than where a
+/// view still to be filled from it reads its rows (`views::fill_end`).
 pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me: &str) -> Result<(u64, bool)> {
     const MAX_ROWS: u64 = 4_000_000;
     let Some(mut meta) = lake.cat.get::<TableMeta>(&table_key(table)).await? else { return Ok((0, true)) };
+    if hwm <= meta.tiered {
+        return Ok((0, true));
+    }
+    let hwm = match meta.key.is_empty() {
+        true => hwm, // (an append table's rows keep their own versions in its files: a filling reads those up to its end)
+        false => crate::views::fill_end(lake, table).await?.map_or(hwm, |(_, end)| hwm.min(end)),
+    };
     if hwm <= meta.tiered {
         return Ok((0, true));
     }
@@ -81,6 +89,21 @@ pub async fn tier_table(lake: &Lake, table: &str, hwm: u64, nodes: &[String], me
     lake.backlog.fetch_sub(n.min(lake.backlog.load(std::sync::atomic::Ordering::Relaxed)), std::sync::atomic::Ordering::Relaxed);
     lake.cat.commit(vec![(table_key(table), json(&meta))], &[]).await?;
     Ok((rows, n < MAX_ROWS))
+}
+
+/// Every row of `table`'s log up to `upto` in its files, as a statement that moves its entry or another engine's
+/// commit needs them (`ddl::still`, `iceberg::up_to_date`). Refused (40001: try again) while a view of a keyed
+/// table is filled from its rows short of `upto` (`views::fill_end`): its log isn't folded that far meanwhile, as
+/// changes of its rows wait for the filling too. (A filling whose end is set after this looks is set past `upto`.)
+pub async fn all_to_files(lake: &Lake, table: &str, upto: u64, nodes: &[String], me: &str) -> Result<()> {
+    let keyed = lake.cat.get::<TableMeta>(&table_key(table)).await?.is_some_and(|m| !m.key.is_empty());
+    if let (true, Some((view, end))) = (keyed, crate::views::fill_end(lake, table).await?) {
+        if end < upto {
+            return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {view} is still being filled from {table}'s rows: try again once it is (in a moment)")));
+        }
+    }
+    while !tier_table(lake, table, upto, nodes, me).await?.1 {}
+    Ok(())
 }
 
 /// Keep a table's file count down, once its new rows are committed (so fresh rows never wait
@@ -826,6 +849,19 @@ async fn collect_orphans(lake: &Lake) -> Result<()> {
     // since, purged): it stays while that branch's pin does (ADR-047).
     let pinned = crate::branch::pins(lake).await?.map_or(0, |p| p.1) as i64;
     use object_store::path::Path;
+    // A joined page's staged files (`stage/<slug>/<job>/`, taken by their INSERT as it runs: `server::insert_staged`) go a job
+    // folder at a time, once its newest file is an hour old: a page that never sent its INSERT. Never a file at a time, so a long
+    // staging loses no early file while its last ones are still coming (the INSERT also counts them: `insert_staged`).
+    let mut jobs: std::collections::HashMap<String, (i64, Vec<Path>)> = Default::default();
+    for o in lake.store.list(Some(&Path::from("stage"))).try_collect::<Vec<object_store::ObjectMeta>>().await? {
+        let job = o.location.as_ref().rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+        let (newest, files) = jobs.entry(job).or_default();
+        *newest = (*newest).max(o.last_modified.timestamp_millis());
+        files.push(o.location);
+    }
+    for f in jobs.into_values().filter(|(newest, _)| now as i64 - newest > HOUR as i64).flat_map(|(_, files)| files) {
+        let _ = object_store::ObjectStoreExt::delete(&lake.store, &f).await;
+    }
     let key = |raw: &str| Path::from(raw).to_string(); // (a path as the store lists it: a few characters escaped)
     let mut tables = lake.cat.scan::<TableMeta>("t/", "t0").await?;
     for (n, d) in crate::ddl::dropped(lake).await? {
@@ -918,7 +954,7 @@ impl Seen {
 /// table held hundreds of MB a partition (ClickBench's 105 columns on four cores: a top-10 of every
 /// column peaked at 1.9 GB, and a node in a 1.6 GB container was killed; 1.0 GB in groups of this
 /// size, and faster). A narrower table's million rows stay one group (TPC-H's lineitem: 34 MB).
-fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
+pub(crate) fn writer(schema: datafusion::arrow::datatypes::SchemaRef, keys: &[String]) -> Result<ArrowWriter<Vec<u8>>> {
     let mut props = WriterProperties::builder().set_compression(codec()).set_max_row_group_bytes(Some(ROW_GROUP_BYTES));
     if !keys.is_empty() {
         props = props.set_max_row_group_row_count(Some(256 << 10));

@@ -1,0 +1,22 @@
+# An extension written with the kit (`extensions/kit`): the example of the guide "Write an extension", built to
+# tests/fixtures/extensions/hello-0.1.wasm by tools/extension_fixture.sh, which each platform's build runs (tools/smoke.py).
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pondra-extension = { path = "../kit" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]

@@ -139,12 +139,27 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
    - A match is decided when no thread could still extend or replace it, or `WITHIN` has passed.
    - Only rows up to the watermark are matched (ADR-052).
    - Each key keeps a resume point, in a hidden keyed table `{v}$resume`: the first row an
-     undecided match could start at, less the rows `PREV` looks back.
-   - A run reads each touched key's rows from its resume point, appends the matches decided since,
-     and moves the resume points, in one commit with the producer `match:{v}` (seq the watermark,
-     `prev` the last one: invariant 24's mechanism).
-   - A row behind its key's resume point is late: it stays in its table, and counts as the view's
-     `$late` (ADR-052 §4).
+     undecided match could start at, less the rows `PREV` looks back. The rows from it on are
+     held in `{v}$held`, keyed by their `_row_id`.
+   - A run reads the rows in the watermark's new span and the held rows of the keys they touch
+     (with `WITHIN`, also of the keys whose live thread the watermark has passed). A run reads
+     about `PONDRA_MATCH_RUN_ROWS` (1,000,000) new rows: past that it decides up to just past the
+     time of its last such row, and the next step goes on from there, so a catch-up takes steps.
+     It appends the matches decided since, and moves the held rows and the resume points, in one
+     commit with the producer `match:{v}` (seq the time it decided up to, `prev` the last one:
+     invariant 24's mechanism).
+   - A row is late when its time is at or before the time a run decided up to (the watermark, or
+     earlier when the run was cut) and the run read before the row came, or when its time is NULL:
+     it stays in its table, is never matched, and counts as the
+     view's `$late` (ADR-052 §4). (This was "a row behind its key's resume point". That rule let a
+     late row into a run whose earlier matches had already read past its place, so a match
+     written once could differ from the query's.)
+   - The view takes a lake table read directly, with a projection and a `WHERE` around the
+     pattern, one ascending time column in `ORDER BY`, and no `$`, `^`, `NEXT`, `WITH UNMATCHED
+     ROWS` or volatile function; anything else is refused `0A000` with what to write.
+   - A search that never ends: without `WITHIN`, a search a row can always extend (as `(a b* c)` with no `c`) holds its
+     key's rows until it is decided; past `PONDRA_MATCH_HELD_ROWS` (1,000,000) rows of one key the view stops with 54000,
+     and the node's log names the key. Give the pattern a `WITHIN`.
 
 9. **Per-partition watermarks** come with L4's Kafka partitions (round 36). A feed commits each
    partition's newest event time with its offsets (`feeds::shard`), and `views::newest` takes the
@@ -154,7 +169,7 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
 ## Phases (all before the freeze)
 
 1. Steps 1, 2, 4 and 6: conditions on the row and its neighbours, every pattern operator, both
-   `ROWS PER MATCH`, every skip rule, the measures, spread. A live view needs `rerun::window`'s
+   `ROWS PER MATCH`, every skip rule, the measures, spread. A materialized view needs `rerun::window`'s
    change (step 7).
 2. Steps 3 and 5: conditions reading the match so far, and `WITHIN`.
 3. Step 8 with L1's view runs (dealt to every node, roadmap task "view runs on every node"), then
@@ -167,7 +182,7 @@ it, and sqlparser 0.62 parses it with the dialect Pondra uses (`TableFactor::Mat
     against Pondra on random sequences and random patterns (every operator, every skip rule, both
     row modes, empty matches), as `random_sql.py` checks against DuckDB.
   - Every example in Trino's and Oracle's documentation, with their published answers.
-  - The same on three nodes == one node, over Postgres, in a stored view, a live view through
+  - The same on three nodes == one node, over Postgres, in a stored view, a materialized view through
     changes and a restart, and an `EMIT FINAL` view through a leader's kill: each match once.
 - **Against Flink 2.3** (`tools/bench/patterns.py`, Flink's own CEP examples and a stock ticker of
   10M rows over 1,000 symbols):

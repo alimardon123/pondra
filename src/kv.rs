@@ -12,6 +12,8 @@ pub(crate) mod slate;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) mod page;
 
+pub(crate) mod remote;
+
 /// The catalog's store as its leader opens it: SlateDB's writer on a node.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn writer(store: crate::store::Store, cache_dir: Option<std::path::PathBuf>, local: bool) -> Result<Arc<dyn Kv>, Error> {
@@ -27,13 +29,13 @@ pub(crate) async fn reader(store: crate::store::Store, streamed: bool, cache_dir
 /// The catalog's store as its leader opens it on a page: a `page::Log` in the lake's own store (designs/page-same-core.md P2).
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn writer(store: crate::store::Store, _: Option<std::path::PathBuf>, _: bool) -> Result<Arc<dyn Kv>, Error> {
-    Ok(Arc::new(page::Log::open(store, true).await?))
+    Ok(Arc::new(page::Log::writer(store).await?))
 }
 
 /// The catalog's store as a follower or a reader opens it on a page: the same log, read only.
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, _: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
-    Ok(Arc::new(page::Log::open(store, false).await?))
+pub(crate) async fn reader(store: crate::store::Store, _: bool, _: Option<std::path::PathBuf>, poll: std::time::Duration) -> Result<Arc<dyn Kv>, Error> {
+    Ok(Arc::new(page::Log::reader(store, poll).await?))
 }
 
 /// The catalog's ordered key-value store: SlateDB on a node (`kv::slate`), a page's log in the lake's store (`kv::page`).
@@ -50,6 +52,13 @@ pub(crate) trait Kv: Send + Sync {
     async fn write(&self, puts: &[(String, Bytes)], deletes: &[String]) -> Result<Arc<dyn Written>, Error>;
     /// Writes what the memtable holds into the bucket.
     async fn checkpoint(&self) -> Result<(), Error>;
+    /// A writer's level-0 files waiting for compaction (0: none, or a store without levels).
+    fn waiting(&self) -> usize { 0 }
+    /// A writer that lives for one statement (`pondra sql`): its compactor starts now, and this waits, `cap` at
+    /// most, until fewer than `below` level-0 files wait (none of its own runs long enough to start it alone).
+    async fn compact(&self, _below: usize, _cap: std::time::Duration) -> Result<(), Error> { Ok(()) }
+    /// Its garbage collector once, now: old WAL, manifests and compacted files that no reader needs.
+    async fn collect(&self) {}
     async fn close(&self) -> Result<(), Error>;
     /// The bytes its block caches hold (`/metrics`).
     fn cached(&self) -> usize;

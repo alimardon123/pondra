@@ -7,14 +7,15 @@
 /// The content type of a body with tables of its own (`write`, `read`).
 pub const CONTENT_TYPE: &str = "application/vnd.pondra.request";
 
-/// A request body: the JSON `head`, then each of `tables` (an Arrow IPC stream) after it, each with its length.
-pub fn write(head: &[u8], tables: &[Vec<u8>]) -> bytes::Bytes {
-    let mut body = Vec::with_capacity(4 + head.len() + tables.iter().map(|t| 8 + t.len()).sum::<usize>());
+/// A request body: the JSON `head`, then each of `tables` (an Arrow IPC stream) after it, each with its length. A table is
+/// any bytes: a page's node's answer is written as it is held (`Bytes`), not copied first.
+pub fn write(head: &[u8], tables: &[impl AsRef<[u8]>]) -> bytes::Bytes {
+    let mut body = Vec::with_capacity(4 + head.len() + tables.iter().map(|t| 8 + t.as_ref().len()).sum::<usize>());
     body.extend_from_slice(&(head.len() as u32).to_le_bytes());
     body.extend_from_slice(head);
     for table in tables {
-        body.extend_from_slice(&(table.len() as u64).to_le_bytes());
-        body.extend_from_slice(table);
+        body.extend_from_slice(&(table.as_ref().len() as u64).to_le_bytes());
+        body.extend_from_slice(table.as_ref());
     }
     body.into()
 }

@@ -510,9 +510,9 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    claimer's own machine nobody waits: a term names its lock file (invariant 370), and a free one
    means its process ended, so the next node or writer there claims at once. Elsewhere, a claimer
    that says so in its term (`Term::bell`) looks at the inbox's bell every second and marks its
-   term when it rang (`cluster::listen`), on bucket turns of its own (`budget::urgent`), so a scan
+   term when it rang (`terms::listen`), on bucket turns of its own (`budget::urgent`), so a scan
    holding every other turn doesn't stop it. A writer that would wait rings and watches the mark
-   (`cluster::deaf`, `cluster::Ear`): none in 5 s, by its own clock, means the claimer is gone (a
+   (`terms::deaf`, `terms::Ear`, `terms::wait_for`): none in 5 s, by its own clock, means the claimer is gone (a
    process killed or a machine lost: nothing marks for it), and it claims. One that answered isn't
    rung again by that process for 30 s. `harness.py serverless`: a writer elsewhere that can't
    reach a live leader writes through the inbox and leaves its term; after the leader is killed,
@@ -530,7 +530,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    by ours: our catalog never lists another lake's files.
 21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
    or MCP runs with `engine::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
-   DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
+   DDL); writes go through `write.rs`. Local files (`engine::with_files`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
    sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`, or
@@ -1078,7 +1078,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    every part, with and without an extension.
 139. **A view of files is a view** (`StoredView.external`, `ext.rs`): `CREATE EXTERNAL TABLE` stores
    `SELECT … FROM read_*(…)`, copies nothing, and `INSERT` into one over a folder is `COPY … TO
-   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::through_bucket_statement` calls
+   folder/ (APPEND true, …)`, from a node and from `pondra sql` (`write::by_inbox`, a guest's inbox path, calls
    `view_write` too); an `INSERT` into any other view is refused, never a table made. A folder's
    keys are declared (`hive_types`), so an empty folder has its columns. The `ext:` tables such
    views read are deregistered in listing sessions. `harness.py external`.
@@ -1981,7 +1981,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 266. **In a protected database, a project's objects change only through an apply by a holder of
    APPLY, and lifting the protection is an admin's, audited** (`protect.rs`, `apply::authorize`,
    ADR-058). `protect::door`, where every statement comes in (`write::on_node_listed`,
-   `write::through_bucket_statement`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
+   which an inbox guest's statements pass before `write::by_inbox`, and for a user's direct call `server::ddl` and `create_table`), refuses a change
    to anything a project's last finished apply declared (`apply::declared`), unless
    `protect::APPLYING` is set. Only an apply sets it, from its claim to its record (tests included),
    and a procedure it calls back through gets it for that call alone. Its matches over `Stmt` and
@@ -2148,7 +2148,10 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 286. **A view's `current_schema()` is its reader's** (`path.rs`): `door` leaves `current_schema()`,
    `current_database()` and `current_catalog()` in a `CREATE VIEW`'s or `ALTER VIEW … AS`'s query (not a
    materialized or temporary view's: `Walk.view`), and `routines::expand_stored` puts in the reader's
-   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A query
+   session's values (`path::currents`; this lake's public with none), as Postgres reads a view. A macro's
+   or a SQL function's body keeps them too, and `routines::expand` writes in its caller's once it is
+   expanded (`currents` leaves a stored body's alone). A follower's change that reads such a view sends
+   its rows as the session reads them (`path::session_view` in `change::for_leader`). A query
    read under a path of the session's own that reads such a view (`path::reads_current`, over the
    views' stored text) runs on its node (`App::here_only`: the other nodes read it with no session)
    and is never a remembered answer (`server::query`). The Postgres port no longer puts them in itself
@@ -2156,10 +2159,11 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`sparksql::inline` in `door`), and `SHOW COLUMNS FROM t` is placed. `harness.py use`: "a view's
    current_schema() and current_database() are its reader's…", "a view made over Postgres keeps its
    current_schema()…", "…a view's current_schema() asked to spread is crm's on every row", "…spark_sql('…')'s
-   text reads crm.t… SHOW COLUMNS…".
+   text reads crm.t… SHOW COLUMNS…", "under USE crm on a follower, an UPDATE and a MERGE reading a view's
+   current_schema() write crm…", "a macro with no parameters is made under USE crm…".
 287. **SQL's INSERT writes only into a table that is there** (`write::is_there`, `no_table`: 42P01, "no table
    x"), as Postgres and DuckDB refuse it: in `on_node_listed`, looked at again once a follower holds what
-   its leader had (`seen_here`), and in `write::through_bucket_statement`. `CREATE TABLE … AS SELECT` defines its table first;
+   its leader had (`seen_here`), and in `write::by_inbox`. `CREATE TABLE … AS SELECT` defines its table first;
    `POST /insert/{t}`, the bulk door, still makes one (`record`). A file, another engine's attached table
    and a name this lake can't resolve go on to their own paths. `harness.py objects`: "an INSERT into a
    name no table has is refused…"; `doors`: "an INSERT into no table, 42P01" at every door;
@@ -2490,7 +2494,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    keeps its SQLSTATE (`matcher::external`). `harness.py patterns`: 600 random patterns == a reference matcher
    written from the standard; three nodes == one node.
 370. **A term's lock file says at once, on its machine only, that its claimer's process ended**
-   (`cluster::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
+   (`terms::new_lock`, `gone_here`, `relock`). A claim takes an OS lock (`File::try_lock`) on
    `{id}.lock` in the user's own folder of the temporary folder (`pondra-terms-{uid}`, 0700, used
    only while it is the user's alone), and names `id` in its term (`Term.lock`, 32 hex characters,
    never a path). The OS lets go when the process ends, however it ends. A node or writer on that
@@ -2564,7 +2568,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    0.33 can't read a user holding one, so it waits until every node knows format 4. A new kind of grant
    is stored as one an older node reads (a sequence's as `On::Table`), or waits for its format.
    `upgrade_check.py format`: "…a grant on another database, to 4; and Pondra 0.33.0 then refuses it by
-   name". And `cluster::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
+   name". And `terms::alive` asks for `cluster/left` too: a leader's last mark, in flight as it stepped
    down, can land after `release` deleted it (`environments_check.py --s3`'s teardown).
 
 378. **A node a program started answers only that program** (`Auth::owned`, `App::open`,
@@ -2836,20 +2840,20 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 417. **A node stops the query that grew it past its memory line, not the node** (`oom.rs`, `panics::work`): some
    operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
    pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
-   of growth could pass the line: every 20 ms near it, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
+   of growth could pass the line: every 5 ms near it, 20 ms while a stop settles, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
    machine's or container's memory; 0 is off, and a host's process has none) stops the client query (`/sql`, `/mcp`,
    pages, every Postgres statement) that grew it. Of those that have run 200 ms and started a tenth of the line lower,
    that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else
    the oldest. `oom::Meter` reads jemalloc's own thread counters around each poll, and DataFusion's spawned tasks are
    metered too (its join-set tracer, `oom::start`), so nothing is counted per allocation. Its future is dropped, it
-   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s, while the allocator gives the pages back. The cluster's own
+   answers 53200, and its transaction fails as after an error. A stop holds the watch 10 s while the node stays past its line, and at each look then the freed pages go back to the system at once; under the line nothing holds (held 10 s whatever came next, the next heavy query was killed: `logs/round36/bigger-than-memory/` `watch.py`). A group's `string_agg` tells the pool what its string holds and is refused by name past an eighth of a partition's share (`string_agg.rs`). The cluster's own
    calls, bulk writes and live queries are never stopped. A pool wrapper that looked only when asked found 1.8–1.9 GB
    already resident (parked). `harness.py scale`: "a query the pool doesn't see grow (array_agg over 30M rows) is
    stopped at the node's memory line (53200)…" (a 1 GB line: peak 1,072 MB; 2.1 GB without; looking every second
    below half the line and stopping only after a second, CI's runner reached 1.75 GB), and "the memory watch stops the
    request that grew the node, not an older cheap one beside it…" (the cheap one was stopped by age). The same one watch gives the
-   hot columns back first, past seven tenths of the line (`oom::trim_line`; three fifths of the machine's memory where
-   there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
+   hot columns back first, past 85% of the line, or 320 MB under a small one and never under 70% (`oom::trim_line`; of
+   85% of the machine's memory where there is no line), and the cache loads only while the node is under that (`Hot::room_for`), since a column can be
    decoded again and a query can't. After a trim it has jemalloc give its free pages back (`oom::purge`) and reads
    resident memory again, never crediting what was freed: a query growing meanwhile takes those very pages, and with a
    credit the node passed its line by what the cache gave back. A request takes the watch's last reading as it starts
@@ -2927,11 +2931,15 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    concatenated views keep every batch's buffers, so below it each view column no partition key or window function
    reads is cast plain, and cast back above `HeldOutExec` (a key stays a view: the window finds its partitions by its
    ordering, which a cast hides). Its reservation is spillable, though it never spills, so `FairSpillPool` gives it a
-   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). A merge of
-   spilled runs takes at most `memory_limit / partitions / 32 MB` runs at once (4 to 64; `PONDRA_SPILL_FAN_IN`, 0 for
-   DataFusion's own, no limit): unlimited, each partition's merge reserved the whole pool and the window above it was
-   refused. Fewer runs at once means more passes, so a small node writes more spill (9M long strings: 1.3 GB at 4,
-   1.07 GB unlimited). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
+   share of its own beside the sorts feeding it (an unspillable grow is refused once their shares are full). The sorts
+   feeding a window run on a spill disk of their own (`store::window_sorts`, from `HeldInExec`), whose merges take at
+   most as many spilled runs as half a partition's share holds at about 4 MB a run (`merge_fan_in`: `memory_limit /
+   partitions / 8 MB`, 4 to 64): a sort's merge reserves memory no one may take back, and with as many runs as the pool
+   held the window above it was refused (at 256 MB the check below passes at 16 and is refused at 32). Every other merge
+   takes up to 512 open files over the partitions (`merge_files`, 4 to 64), bounded first by memory (a GROUP BY's merge
+   reserves from its own fair share): fewer runs at once means more passes, each writing the rows again, and at 5 runs
+   under a 2 GB cap (#150) spilling GROUP BYs and joins ran 40-90% slower (B50, 10-31). `PONDRA_SPILL_FAN_IN` sets both
+   (0: DataFusion's own, no limit). `harness.py scale`: "a rank() over one partition of 9M long strings streams…" (stopped by the 1 GB
    watch before) and "a rank() over 3 partitions of 6M long strings…" (a 501 MB peak; refused before, 53200).
 424. **A GROUP BY over medians that ran out of memory is answered from a sort's middle rows, and only then**
    (`frugal::MiddleRows`, retry-only as invariant 422's rule). DataFusion's median holds every value of its group and
@@ -3009,16 +3017,42 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    (`smallint`, `bigint`; `numeric field overflow` for a decimal); never a quiet NULL, never Arrow's words. INSERT, a
    bulk INSERT, COPY INTO, the Postgres port's COPY, setval and a DEFAULT's check all cast through `casts::into`, and
    a new write path does too. `cargo test --lib casts:: codes::`, harness `loads`, `found`.
-434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`cluster::claim`,
+434. **A lake keeps its newest 16 to 32 leadership records, and a claim that finds a newer term lets go** (`terms::claim`,
    `prune`). After its put, a claim lists `cluster/term` while it writes its `alive` mark, one round trip for both: a term
    above its own number means a newer leader holds the lake, so the claim deletes its own `alive` mark, lets its lock go,
    and returns no term (its record stays; a later prune removes it). Above 32 terms, the claim also lists `alive` and `left`
    (one round trip) and deletes everything below the newest 16, awaited and capped at 10 s, so a one-off writer's prune
    finishes before it exits. A lake of 32 or fewer pays no more than the term listing. The superseded check holds
-   (`cluster::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
-   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib cluster::`; harness `serverless`
+   (`terms::superseded`): a leader is superseded when term m+1 exists or its own `term/m` is gone, and a record goes only
+   once 16 newer terms exist, so a gone record means a newer leader. `cargo test --lib terms::`; harness `serverless`
    (34 one-off INSERTs, which cross 32: at most 32 terms kept, the newest among them, the table reads back 34 rows, and
    nothing below the oldest kept in `alive` or `left`).
+435. **The hot columns take up to half of RAM, beside the query memory; the watch gives them back past 85% of the line**
+   (`Hot::new`, `Hot::room_for`, `oom::trim_line`; Alimardon's call, 11-01). Inside a third of RAM, less what queries
+   reserved, ClickBench's 10 M rows (7.3 GB decoded) didn't fit on a 15 GB machine and its queries read a third of the
+   columns from Parquet, while DuckDB held its tables in 7.9 GB. `PONDRA_HOT_GB` still sets the budget. Where no watch runs
+   (`oom::watching`: `pondra sql`, a page), nothing would give the columns back, so they stay inside what queries don't
+   reserve. At 70% of the line (60% of RAM) a full cache was trimmed as soon as a query took a tenth of RAM; at 85% (72%)
+   queries have a fifth of RAM beside it first, and the line is still an eighth further. Under a small line the trim stays
+   320 MB under it (never under 70%): at 85% of a 1 GB line, a query passed it by 11% while the columns went (CI). Harness `hot` (a 1 GB line: the
+   columns trimmed and the query answered; past the line, one stop near it); `cargo test --lib oom:: hot::`;
+   `logs/round36/singlenode-clickbench-10m-half-ram.json` (6.99 s from memory, was 7.79).
+436. **A median's values count as memory that can't spill** (`held::HeldValues`). DataFusion's pool (`FairSpillPool`)
+   gives each operator that may spill an even share of the query memory, idle ones counted: a median over 3 groups of
+   60 M values planned in one step (`held::HeldOnce`) on four partitions had an eighth of a 683 MB pool for its 480 MB
+   of values beside the exchanges and sorts, was refused, and answered on the frugal retry's sort (invariant 424) in
+   19-40 s under a 2 GB cap; DuckDB 2.0.0 takes 2.8-3.3 s on the same box. Its spill helps nothing (a group needs all
+   its values back at once, and spilling its state copied them twice over first), so `HeldValuesExec` above the
+   aggregate runs it with no disk to spill to: DataFusion then counts it as memory that can't spill, which takes what
+   the pool has free, and past that refuses it at once, for the retry. `HeldValuesInExec` below it runs its input in
+   the query's own context, so the exchange and the scan below spill as before. Placed last
+   (`optimize::physical_rules`), after the exchanges are in; spread queries pass both through (`spmd.rs`). Its values
+   are held in chunks of 64 K (`median::ChunkedMedian`), not DataFusion's arrays that double: those copied each time
+   and freed the old one late, so the node's memory reached twice what the pool counted and passed its line first.
+   Its middle is picked from the values between two sampled bounds, not a copy of the group in one array (that copy,
+   uncounted, got a 2 GB run stopped); the answer is DataFusion's (`cargo test --lib median::`).
+   0.8-1.2 s now (`logs/round36/median-3-groups-2gb.json`). `cargo test --lib held:: median::`; `harness.py scale`
+   (its medians: 72 M values past a 0.5 GB pool still answer on the retry, no try stopped by the watch).
 ## Tests: run these before and after any change
 
 ```bash

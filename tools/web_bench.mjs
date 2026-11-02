@@ -223,7 +223,9 @@ async function child(o) {
       let answer;
       for (let r = 0; r < o.runs; r++) {
         const s = performance.now();
-        answer = await engine.run(sql); // (the answer as an Arrow table: both engines' timed step)
+        // (a comment makes each run a new query, as tools/bench/tpch.py does: a page keeps a repeated query's answer
+        // until the next commit, so the same text again would time a lookup, not the query)
+        answer = await engine.run(`${sql} -- run ${r}`); // (the answer as an Arrow table: both engines' timed step)
         best = Math.min(best, performance.now() - s);
       }
       emit({ q, ms: round1(best), cols: answer.numCols, rows: tableRows(answer, arrow.Type), maxrss_mb: maxrss() });

@@ -95,7 +95,7 @@ pub async fn params(lake: &Lake, sql: &str) -> Vec<usize> {
     let Some((stmt, known)) = read(lake, sql).await else { return vec![] };
     let t = Trace::new(&known);
     t.statement(&stmt);
-    let _ = ast::visit_expressions(&stmt, |e| {
+    let _ = crate::walk::visit_expressions(&stmt, |e| {
         t.params.borrow_mut().extend(match e {
             Expr::Cast { expr, data_type: ast::DataType::Uuid, .. } => param(expr),
             Expr::Function(f) if object(&f.name) == "pondra_uuid" => first_arg(f).and_then(param),

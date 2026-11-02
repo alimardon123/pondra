@@ -11,7 +11,7 @@ use datafusion::common::{not_impl_err, plan_err, Column, DFSchema, DataFusionErr
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::{Expr, Filter, Join, JoinType, LogicalPlan, Projection, SubqueryAlias, Unnest};
 use datafusion::optimizer::analyzer::AnalyzerRule;
-use datafusion::sql::sqlparser::ast::{self, FunctionArg, FunctionArgExpr, Statement, Visit, Visitor, VisitMut, VisitorMut};
+use datafusion::sql::sqlparser::ast::{self, FunctionArg, FunctionArgExpr, Statement, Visitor, VisitorMut};
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -295,7 +295,7 @@ fn unouter(e: Expr, left: &DFSchema) -> Result<Expr> {
 
 /// The set functions a FROM item may call with a column (`generate_series(1, t.n)`, `range`, and
 /// `unnest(t.xs)`, which takes its one argument).
-const SET_FUNCTIONS: &[&str] = &["generate_series", "range", "unnest"];
+pub(crate) const SET_FUNCTIONS: &[&str] = &["generate_series", "range", "unnest"];
 
 /// Writes the FROM items DataFusion can't plan with a column in them as LATERAL subqueries it can:
 /// `FROM t, generate_series(1, t.n) AS g` becomes `LATERAL (SELECT unnest(generate_series(1, t.n)) AS
@@ -327,7 +327,7 @@ pub fn functions(stmt: &mut Statement) -> anyhow::Result<bool> {
         }
     }
     let mut f = Functions { changed: false, failed: None };
-    let _ = VisitMut::visit(stmt, &mut f);
+    let _ = crate::walk::visit_mut(stmt, &mut f);
     match f.failed {
         Some(e) => Err(e),
         None => Ok(f.changed),
@@ -432,7 +432,7 @@ fn reads_column(e: &ast::Expr) -> bool {
         }
     }
     let mut c = Columns { depth: 0, found: false };
-    let _ = Visit::visit(e, &mut c);
+    let _ = crate::walk::visit(e, &mut c);
     c.found
 }
 

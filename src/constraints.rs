@@ -450,9 +450,13 @@ async fn send(addr: &str, table: &str, src: &Src, batch: &RecordBatch) -> Result
 
 /// A checked append as the leader is sent it: u32 header length | JSON (table, src) | Arrow IPC.
 fn encode(table: &str, src: &Src, batch: &RecordBatch) -> Result<Vec<u8>> {
+    framed(table, src, &crate::log::encode_ipc(std::slice::from_ref(batch))?)
+}
+
+/// `encode`'s body around the rows' IPC bytes.
+fn framed(table: &str, src: &Src, rows: &[u8]) -> Result<Vec<u8>> {
     let head = serde_json::to_vec(&(table, src))?;
-    let rows = crate::log::encode_ipc(std::slice::from_ref(batch))?;
-    Ok([&(head.len() as u32).to_le_bytes()[..], &head, &rows].concat())
+    Ok([&(head.len() as u32).to_le_bytes()[..], &head, rows].concat())
 }
 
 /// `encode`'s body, read back: a body cut short is an error (`tools/fuzz_doors.py` sends such).
@@ -460,8 +464,13 @@ pub fn decode(body: bytes::Bytes) -> Result<(String, Src, RecordBatch)> {
     let n = u32::from_le_bytes(body.get(..4).ok_or_else(|| anyhow::anyhow!("an empty append"))?.try_into()?) as usize;
     body.get(4..4usize.saturating_add(n)).ok_or_else(|| anyhow::anyhow!("an append cut short"))?;
     let (table, src): (String, Src) = serde_json::from_slice(&body[4..4 + n])?;
-    let rows = crate::log::decode(body.get(4 + n..).ok_or_else(|| anyhow::anyhow!("an append cut short"))?)?;
-    let batch = rows.into_iter().next().ok_or_else(|| anyhow::anyhow!("an append with no rows"))?;
+    let mut rows = crate::log::decode(body.get(4 + n..).ok_or_else(|| anyhow::anyhow!("an append cut short"))?)?;
+    // (a big batch comes in row slices, `log::encode_ipc`: all of them are the append)
+    let batch = match rows.len() {
+        0 => bail!("an append with no rows"),
+        1 => rows.remove(0),
+        _ => datafusion::arrow::compute::concat_batches(&rows[0].schema(), &rows)?,
+    };
     Ok((table, src, batch))
 }
 
@@ -503,6 +512,19 @@ mod tests {
         assert!(crate::codes::words(&err).contains(r#""t_pkey""#), "{}", crate::codes::words(&err));
         lake.cat.close().await?;
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_checked_append_sent_in_slices_reaches_the_leader_whole() -> Result<()> {
+        // (audit 10-31 H2: a big batch goes in row slices, `log::encode_ipc`, and the leader took the first only)
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(Int64Array::from_iter_values(0..1000)) as ArrayRef)])?;
+        let src = Src { producer: "p".into(), seq: 1, prev: None };
+        for k in [1, 3] {
+            let body = framed("s.t", &src, &crate::log::encode_sliced(std::slice::from_ref(&batch), |_| k)?)?;
+            let (table, back, rows) = decode(body.into())?;
+            assert_eq!((table.as_str(), back.seq, &rows), ("s.t", 1, &batch), "{k} slices");
+        }
         Ok(())
     }
 }

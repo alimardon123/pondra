@@ -203,7 +203,7 @@ impl AsyncScalarUDFImpl for Function {
                 None => column,
             })
         };
-        Ok(ColumnarValue::Array(go.await.map_err(|e| exec_datafusion_err!("{e:#}"))?))
+        Ok(ColumnarValue::Array(go.await.map_err(crate::codes::for_datafusion)?)) // (its SQLSTATE kept: a Python function's own error is 38000)
     }
 }
 

@@ -12,7 +12,7 @@
 //!   kept only as a version (`Outside`): the e-tag and size the statement's own listing saw.
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use object_store_df::path::Path;
 use object_store_df::{
     CopyOptions, Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -136,6 +136,19 @@ static OUTSIDE: std::sync::LazyLock<Mutex<Outside>> = std::sync::LazyLock::new(|
 
 fn files_cache_bytes() -> usize { crate::env::or("PONDRA_FILES_CACHE_MB", 512usize) << 20 }
 
+/// Keeps a range (or a block) of a file outside the lakes, the least recently used going past `files_cache_bytes`.
+fn keep_outside(key: String, entry: Entry) {
+    let mut o = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    o.bytes += entry.0.len();
+    if let Some((old, ..)) = o.ranges.put(key, entry) {
+        o.bytes -= old.len();
+    }
+    while o.bytes > files_cache_bytes() {
+        let Some((_, (old, ..))) = o.ranges.pop_lru() else { break };
+        o.bytes -= old.len();
+    }
+}
+
 #[derive(Debug)]
 pub struct CachedStore {
     inner: Arc<dyn object_store::ObjectStore>,
@@ -144,7 +157,17 @@ pub struct CachedStore {
     disk: Option<(Arc<Disk>, String)>, // the SSD tier, and the lake's prefix in the bucket
     lakes: std::sync::RwLock<Vec<String>>, // the prefix of each lake read through it (`a/b/`, or `` at the bucket's root)
     id: String, // (this store, in the keys of `OUTSIDE`)
+    blocks: Arc<tokio::sync::Semaphore>, // the blocks (and pieces) in flight from it at once (`side_by_side`)
 }
+
+/// A file outside the lakes is read in blocks of this size (`in_blocks`), and a longer range of a lake's file not on this
+/// node's disk yet in pieces of it (`in_pieces`): one connection to a bucket carries some tens of MB a second, so a few MB
+/// of column chunks fetched as one range waited on one connection. (TPC-H's first runs over Parquet files on R2 took 1.65x
+/// DuckDB's, which fetches 2 MB pieces, up to 16 at once.)
+const BLOCK: u64 = 2 << 20;
+/// A range's blocks in flight at once, and a store's.
+const BLOCKS_A_RANGE: usize = 16;
+const BLOCKS_A_STORE: usize = 64;
 
 impl std::fmt::Debug for Disk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "Disk({:?})", self.dir) }
@@ -153,14 +176,14 @@ impl std::fmt::Debug for Disk {
 impl CachedStore {
     pub fn new(inner: Arc<dyn object_store::ObjectStore>, max_bytes: usize, disk: Option<(Arc<Disk>, String)>, prefix: &str) -> Self {
         let id = uuid::Uuid::new_v4().simple().to_string();
-        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default(), id };
+        let this = Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes, disk, lakes: Default::default(), id, blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) };
         this.add_lake(prefix);
         this
     }
 
     /// A store of files outside any lake (a bucket `CREATE SECRET` covers, a web server).
     pub fn files(inner: Arc<dyn object_store::ObjectStore>) -> Self {
-        Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes: 0, disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string() }
+        Self { inner, cache: Mutex::new((lru::LruCache::unbounded(), 0)), max_bytes: 0, disk: None, lakes: Default::default(), id: uuid::Uuid::new_v4().simple().to_string(), blocks: Arc::new(tokio::sync::Semaphore::new(BLOCKS_A_STORE)) }
     }
 
     /// The bytes of objects' ranges held in memory now (at most `max_bytes`).
@@ -184,22 +207,98 @@ impl CachedStore {
             return Ok(result(entry));
         }
         options.if_match = e_tag; // (changed since it was listed: an error, not another version's bytes)
+        if let GetRange::Bounded(r) = &range {
+            if let Some(entry) = self.in_blocks(&bridge, location, &options, &at, &listed, r.clone()).await? {
+                return Ok(result(entry));
+            }
+        }
         let r = bridge.get_opts(location, options).await?;
         let (meta, range) = (r.meta.clone(), r.range.clone());
         let entry = (r.bytes().await?, meta, range);
         if version(&entry.1) == listed {
             // (a store without e-tags whose file changed meanwhile: read, not kept)
-            let mut o = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            o.bytes += entry.0.len();
-            if let Some((old, ..)) = o.ranges.put(key, entry.clone()) {
-                o.bytes -= old.len();
-            }
-            while o.bytes > files_cache_bytes() {
-                let Some((_, (old, ..))) = o.ranges.pop_lru() else { break };
-                o.bytes -= old.len();
-            }
+            keep_outside(key, entry.clone());
         }
         Ok(result(entry))
+    }
+
+    /// Range `r` of the version `listed` of a file outside the lakes, out of its blocks: the `BLOCK`s of the file, at
+    /// multiples of `BLOCK`, each kept on its own (`Outside`), so a range a query reads finds the blocks an earlier
+    /// query's ranges brought in, though DataFusion merged those otherwise (a query touching other columns of a file
+    /// fetched again all it read). The blocks not here are fetched side by side (`BLOCKS_A_RANGE` at once, and
+    /// `BLOCKS_A_STORE` from this store). None for a range under a quarter of a block that its blocks don't all hold:
+    /// fetched as it is (a footer's few KB aren't worth a block).
+    async fn in_blocks(&self, bridge: &crate::bridge::Bridge, location: &Path, options: &GetOptions, at: &str, listed: &str, r: Range<u64>) -> Result<Option<Entry>> {
+        let Some(size) = listed.rsplit_once(':').and_then(|(_, n)| n.parse::<u64>().ok()) else { return Ok(None) }; // (`version`)
+        if r.start >= r.end || r.end > size {
+            return Ok(None);
+        }
+        let (first, last) = (r.start / BLOCK, (r.end - 1) / BLOCK);
+        let key = |i: u64| format!("{at}|{listed}|#{i}");
+        let mut have: Vec<Option<Entry>> = {
+            let mut o = OUTSIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (first..=last).map(|i| o.ranges.get(&key(i)).cloned()).collect()
+        };
+        let missing: Vec<u64> = (first..=last).zip(&have).filter(|(_, h)| h.is_none()).map(|(i, _)| i).collect();
+        if !missing.is_empty() && r.end - r.start < BLOCK / 4 {
+            return Ok(None);
+        }
+        let fetched = self.side_by_side(bridge, location, options, missing.iter().copied().map(|i| i * BLOCK..((i + 1) * BLOCK).min(size))).await?;
+        for (i, e) in missing.iter().zip(&fetched) {
+            if version(&e.1) == listed {
+                keep_outside(key(*i), e.clone());
+            }
+        }
+        let mut fetched = fetched.into_iter();
+        have.iter_mut().filter(|h| h.is_none()).for_each(|h| *h = fetched.next());
+        let blocks: Vec<Entry> = have.into_iter().flatten().collect();
+        let meta = blocks[0].1.clone();
+        if blocks.iter().any(|b| version(&b.1) != version(&meta)) {
+            return Err(Error::Generic { store: "files", source: format!("{location} changed while it was read").into() });
+        }
+        let base = first * BLOCK;
+        let bytes = match &blocks[..] {
+            [one] => one.0.slice((r.start - base) as usize..((r.end - base) as usize).min(one.0.len())),
+            _ => {
+                let mut all = bytes::BytesMut::with_capacity((r.end - r.start) as usize);
+                for (k, b) in blocks.iter().enumerate() {
+                    let at = base + k as u64 * BLOCK;
+                    let (from, to) = (r.start.max(at) - at, (r.end.min(at + b.0.len() as u64)).saturating_sub(at));
+                    all.extend_from_slice(&b.0[from as usize..to.max(from) as usize]);
+                }
+                all.freeze()
+            }
+        };
+        Ok(Some((bytes, meta, r)))
+    }
+
+    /// Range `whole` of a lake's file, fetched as pieces of a `BLOCK` side by side (`side_by_side`) and put together.
+    async fn in_pieces(&self, location: &Path, whole: Range<u64>) -> Result<Entry> {
+        let bridge = crate::bridge::Bridge(self.inner.clone());
+        let pieces = (whole.start..whole.end).step_by(BLOCK as usize).map(|at| at..(at + BLOCK).min(whole.end));
+        let got = self.side_by_side(&bridge, location, &GetOptions::default(), pieces).await?; // (a lake's file never changes)
+        let mut all = bytes::BytesMut::with_capacity((whole.end - whole.start) as usize);
+        got.iter().for_each(|(b, ..)| all.extend_from_slice(b));
+        Ok((all.freeze(), got[0].1.clone(), whole))
+    }
+
+    /// `ranges` of a file, each with `options` (a version to match, if any), fetched side by side: `BLOCKS_A_RANGE` at
+    /// once, and `BLOCKS_A_STORE` from this store; in `ranges`' order.
+    async fn side_by_side(&self, bridge: &crate::bridge::Bridge, location: &Path, options: &GetOptions, ranges: impl Iterator<Item = Range<u64>>) -> Result<Vec<Entry>> {
+        stream::iter(ranges)
+            .map(|r| {
+                let mut o = options.clone();
+                o.range = Some(GetRange::Bounded(r));
+                async move {
+                    let _turn = self.blocks.acquire().await.map_err(|e| Error::Generic { store: "bucket", source: Box::new(e) })?;
+                    let got = bridge.get_opts(location, o).await?;
+                    let (meta, range) = (got.meta.clone(), got.range.clone());
+                    Ok::<_, Error>((got.bytes().await?, meta, range))
+                }
+            })
+            .buffered(BLOCKS_A_RANGE)
+            .try_collect()
+            .await
     }
 
     /// Another lake in this bucket (attached): its files are cached too.
@@ -254,6 +353,11 @@ impl CachedStore {
     }
 
     async fn fetch(&self, location: &Path, range: Option<GetRange>, head: bool) -> Result<Entry> {
+        if let (Some(GetRange::Bounded(r)), false) = (&range, head) {
+            if r.end - r.start > BLOCK {
+                return self.in_pieces(location, r.clone()).await;
+            }
+        }
         let range = range.map(|r| match r {
             GetRange::Bounded(r) => object_store::GetRange::Bounded(r),
             GetRange::Offset(o) => object_store::GetRange::Offset(o),
@@ -353,4 +457,63 @@ impl ObjectStore for CachedStore {
         Ok(r)
     }
     async fn copy_opts(&self, _: &Path, _: &Path, _: CopyOptions) -> Result<()> { unsupported() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A range of a lake's file longer than a block, not on disk, is fetched in pieces and put together in order; one
+    /// shorter as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lake_file_s_long_range_is_fetched_in_pieces() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use object_store_df::ObjectStoreExt as _;
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let size = 3 * BLOCK + 777;
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 % 253) as u8).collect();
+        inner.put(&object_store::path::Path::from("lk/data/t/a.parquet"), data.clone().into()).await.unwrap();
+        let store = CachedStore::new(inner, 64 << 20, None, "lk");
+        let path = Path::from("lk/data/t/a.parquet");
+        for r in [5..size - 3, BLOCK - 1..2 * BLOCK + 2, 0..BLOCK + 1, 0..size, 10..20] {
+            assert_eq!(store.get_range(&path, r.clone()).await?, Bytes::copy_from_slice(&data[r.start as usize..r.end as usize]), "{r:?}");
+        }
+        Ok(())
+    }
+
+    /// A file outside the lakes is read in blocks: ranges across blocks, within one, at the file's end, and one too small
+    /// for a block, each its bytes; and once the file is gone from the bucket, ranges its blocks hold are still read, from
+    /// them, though no read asked for those ranges before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_outside_is_read_in_blocks_that_later_ranges_find() -> Result<()> {
+        use object_store::ObjectStoreExt as _;
+        use object_store_df::ObjectStoreExt as _;
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let size = 5 * BLOCK + 12_345;
+        let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+        let at = object_store::path::Path::from("files/a.parquet");
+        inner.put(&at, data.clone().into()).await.unwrap();
+        let store = CachedStore::files(inner.clone());
+        let listed: Vec<_> = store.list(None).collect().await; // (a statement's listing: the version its blocks are kept under)
+        assert_eq!(listed.len(), 1);
+        let path = Path::from("files/a.parquet");
+        let want = |r: &Range<u64>| Bytes::copy_from_slice(&data[r.start as usize..r.end as usize]);
+        for r in [BLOCK - 10..3 * BLOCK + 7, 0..BLOCK, 4 * BLOCK..size, 2 * BLOCK + 1..2 * BLOCK + 600_000, size - 8..size] {
+            assert_eq!(store.get_range(&path, r.clone()).await?, want(&r), "{r:?}");
+        }
+        inner.delete(&at).await.unwrap();
+        for r in [BLOCK..2 * BLOCK + 5, 3 * BLOCK + 100..3 * BLOCK + 200, 4 * BLOCK + 3..size, 0..size] {
+            assert_eq!(store.get_range(&path, r.clone()).await?, want(&r), "{r:?}, from its blocks");
+        }
+        // A small range whose block isn't held is fetched as it is, and kept so, not as a block.
+        let b = object_store::path::Path::from("files/b.parquet");
+        inner.put(&b, data.clone().into()).await.unwrap();
+        let _: Vec<_> = store.list(None).collect().await;
+        let (path, footer) = (Path::from("files/b.parquet"), size - 8..size);
+        assert_eq!(store.get_range(&path, footer.clone()).await?, want(&footer));
+        inner.delete(&b).await.unwrap();
+        assert_eq!(store.get_range(&path, footer.clone()).await?, want(&footer), "kept as it was read");
+        assert!(store.get_range(&path, size - 9..size).await.is_err(), "no block of b was fetched");
+        Ok(())
+    }
 }

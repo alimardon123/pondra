@@ -88,7 +88,8 @@ SELECT count(*) FROM orders USING SAMPLE 50%;
 
 The standard's `PIVOT (… FOR … IN (…))` and `UNPIVOT (… FOR … IN (…))` work too, and so do
 `FETCH FIRST n ROWS ONLY`, `TABLESAMPLE`, `LAMBDA x: …`, `arg_max`, `arg_min`, `min_by`, `list()`,
-`string_split`, `json_extract` and `json_extract_string`, `({'a': 1}).a`, and DuckDB's
+`string_split`, `json_extract` and `json_extract_string`, `strftime`, `strptime`, `epoch`, `regexp_extract`,
+`date_diff('day', a, b)` (and Snowflake's `DATEDIFF(day, a, b)` and `DATEADD(day, 7, ts)`), `({'a': 1}).a`, and DuckDB's
 `ASOF JOIN … ON a.k = b.k AND a.t >= b.t` (only matched rows; `ASOF LEFT JOIN` keeps the rest).
 
 <Aside type="caution">
@@ -329,7 +330,8 @@ curl -s -X POST "http://localhost:8080/sql?spread=0" -d "SELECT count(*) AS n FR
 
 Answers are the same on one node and on many, and a sum over `DOUBLE` comes out the same whatever
 order its rows arrive in. Queries that need more memory than `--memory-gb` allows (a third of the
-machine's by default) spill to disk.
+machine's by default) spill to disk. A window over whole partitions of a table (`avg(x) OVER (PARTITION BY k)`,
+`count(*) OVER ()`) holds no rows at all: it is answered as a `GROUP BY` joined back to the table read again.
 [Clusters](/pondra/guides/clusters/) covers running several nodes.
 
 <Aside type="caution">

@@ -12,6 +12,11 @@ name: limits-r2
 # (30 MiB of 1 KB values a second through the Kafka port, 30 s to warm up, 90 s measured) on one node
 # and on three, the bucket's requests a second by the class R2 and S3 bill them in, and dollars a month.
 #
+# A third reads from the bucket cold: TPC-H SF1's 22 queries (`tools/bench/files_tpch.py --stores r2`)
+# from a lake on R2 and from Parquet files on R2 as views, each node started with an empty disk cache,
+# and DuckDB 2.0 over httpfs on the same files from a fresh connection. `cold_s` is each query's first
+# run, `total_s` its best of three. Its lakes and files go under cold/ and are deleted the same way.
+#
 # Nightly on main, and by hand. The bucket and its keys are the cluster bench's secrets (R2_*). The
 # lakes go under limits/ in the bucket and are deleted after every run, whatever happened (R2's free
 # tier is 10 GB).
@@ -123,3 +128,37 @@ jobs:
       - name: The lakes deleted, whatever happened
         if: always()
         run: aws s3 rm "s3://$PONDRA_BUCKET/cost/" --recursive --only-show-errors
+
+  cold:
+    name: TPC-H's reads from R2, cold and warm, beside DuckDB
+    needs: cost # (after the others: they share the bucket)
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: boto3, DuckDB and tpchgen-cli
+        run: pip install -r <(grep -E '^(boto3$|duckdb==)' tools/requirements.txt) tpchgen-cli==3.0.0
+      - name: This commit's Linux binary (the build workflow's)
+        run: |
+          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+      - name: TPC-H SF1's files
+        run: tpchgen-cli parquet -s 1 --output-dir tpch-sf1
+      - name: The 22 queries from the lake and from files on R2, and DuckDB 2.0 on the same files
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: python tools/bench/files_tpch.py --data tpch-sf1 --stores r2 --runs 3 --out cold-r2.json
+      - name: The numbers, as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-r2
+          path: cold-r2.json
+          if-no-files-found: ignore
+      - name: The lakes and files deleted, whatever happened
+        if: always()
+        run: aws s3 rm "s3://$PONDRA_BUCKET/cold/" --recursive --only-show-errors

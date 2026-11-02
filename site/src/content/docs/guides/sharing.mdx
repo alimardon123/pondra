@@ -96,6 +96,14 @@ its token works too: `ATTACH 'https://…/delta-sharing' AS acme (TYPE share, SH
 '…')`. A server of another product that speaks the Delta Sharing protocol attaches the same way. The
 tests run against Pondra's own server, read by Pondra and by the delta-sharing client.
 
+The provider says where its files are, so the reading lake checks each place before it goes there. A
+link on the provider's own address (its scheme, host and port) is read as the provider is, and a
+redirect is followed only on that address. A link anywhere else, and a redirect away from it, is read
+only on the public internet: never an address of your own network, and never through a proxy, which
+would look names up past that check. When the provider's files are in a bucket on your network, an
+admin names it with a secret whose scope covers it, such as
+`CREATE SECRET bucket (TYPE http, SCOPE 'http://minio.internal:9000/')`.
+
 ## Share less than a table
 
 A share hands out whole files, so it can hold a table's partitions by its `partition_by` column, under

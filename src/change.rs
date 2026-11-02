@@ -204,7 +204,7 @@ impl Merge {
     pub fn written(&self, t: &crate::rules::Table) -> Written {
         use crate::rules::keys::Said;
         let is_default = |v: &str| crate::rules::rows::is_word(v);
-        let table: Vec<String> = t.columns.iter().map(|c| c.name.clone()).filter(|c| c != "_deleted").collect();
+        let table: Vec<String> = t.order.iter().filter(|c| *c != "_deleted").cloned().collect(); // (SQL's order: an INSERT without a column list fills its first columns)
         let mut given: Vec<(Vec<String>, Said)> = vec![];
         let mut set: Vec<String> = vec![];
         for c in &self.clauses {
@@ -329,7 +329,7 @@ impl Merge {
         let width = crate::rules::rows::rows_width(&u.query);
         let given: Vec<String> = match u.columns.is_empty() {
             true => {
-                let columns: Vec<String> = stored.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+                let columns: Vec<String> = stored.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's order)
                 crate::write::implicit(&columns, width).to_vec()
             }
             false => u.columns.clone(),
@@ -419,7 +419,7 @@ impl Upsert {
     fn given(&self, meta: &TableMeta, target: &str) -> Result<Vec<String>> {
         let width = crate::rules::rows::rows_width(&self.query);
         let given: Vec<String> = match self.columns.is_empty() {
-            true => crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(),
+            true => crate::write::implicit(&meta.sql_order().into_iter().filter(|c| c != "_deleted").collect::<Vec<_>>(), width).to_vec(), // (SQL's order)
             false => self.columns.clone(),
         };
         if let Some(w) = width.filter(|&w| w != given.len()) {
@@ -480,7 +480,7 @@ tokio::task_local! {
 /// `__pondra_proposed`, registered as `query::SENT`'s tables are.
 async fn session(lake: &Lake, sql: &str, upto: u64) -> Result<datafusion::prelude::SessionContext> {
     let ctx = crate::query::session_at(lake, sql, "", Some(upto)).await?;
-    let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { ctx.enable_url_table() } else { ctx };
+    let ctx = if FILES.try_with(|f| *f).unwrap_or(false) { crate::engine::with_files(ctx) } else { ctx };
     if let Ok(rows) = PROPOSED.try_with(|r| r.clone()) {
         ctx.deregister_table(PROPOSED_TABLE)?;
         ctx.register_table(PROPOSED_TABLE, Arc::new(datafusion::datasource::MemTable::try_new(rows.schema(), vec![vec![(*rows).clone()]])?))?;
@@ -563,7 +563,7 @@ pub async fn run(lake: &Lake, seq: &Sequencer, sql: &str, job: &str) -> Result<V
     if takes_back {
         crate::views::can_follow(lake, &table, append).await?;
         if let Some(v) = crate::views::filling(lake, &table).await? {
-            bail!("materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"); // (it reads them as they were)
+            return Err(crate::codes::coded("40001", format!("could not serialize access: materialized view {v} is still being filled from {table}'s rows: change them once it is (in a moment)"))); // (it reads them as they were; 40001 as the others say it: try again)
         }
     }
     // A plain INSERT's keys must be new (23505: `constraints.rs`), and so must the keys a MERGE inserts. One that matches on
@@ -720,11 +720,13 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
             // A row takes the first clause of its kind whose condition holds.
             let earlier: Vec<String> = m.clauses[..i].iter().filter(|e| e.kind == c.kind).map(|e| format!(" AND NOT coalesce(({}), false)", e.when.as_deref().unwrap_or("true"))).collect();
             let when = format!("coalesce(({}), false){}", c.when.as_deref().unwrap_or("true"), earlier.concat());
+            // (joins, never a subquery's WHERE: there `s.id` would be a field of a column `s` of the target, which Postgres
+            // reads as the source's column; in a join both are in scope, and the alias wins)
             let rest = match c.kind {
-                Kind::Matched if m.semi => format!("FROM {t} WHERE EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
+                Kind::Matched if m.semi => format!("FROM {t} LEFT SEMI JOIN {s} ON {on} WHERE {when}"),
                 Kind::Matched => format!("FROM {t} JOIN {s} ON {on} WHERE {when}"),
-                Kind::NotMatched => format!("FROM {s} WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {on}) AND {when}"),
-                Kind::NotMatchedBySource => format!("FROM {t} WHERE NOT EXISTS (SELECT 1 FROM {s} WHERE {on}) AND {when}"),
+                Kind::NotMatched => format!("FROM {s} LEFT ANTI JOIN {t} ON {on} WHERE {when}"),
+                Kind::NotMatchedBySource => format!("FROM {t} LEFT ANTI JOIN {s} ON {on} WHERE {when}"),
             };
             let (o, n) = match (&c.action, c.kind) {
                 (Action::Insert(..), Kind::Matched | Kind::NotMatchedBySource) => bail!("MERGE: INSERT goes with WHEN NOT MATCHED"),
@@ -739,7 +741,7 @@ async fn merge(lake: &Lake, table: &str, meta: &TableMeta, rules: &Arc<crate::ru
                 (Action::Delete, _) => select_as(lake, meta, None, None, &rest, upto, &a).await?,
                 (Action::Insert(columns, values), _) => {
                     // (no list: the table's first columns, as many as the values, as an INSERT's: `write::implicit`)
-                    let given = if columns.is_empty() { crate::write::implicit(&meta.columns.iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() };
+                    let given = if columns.is_empty() { crate::write::implicit(&meta.sql_order().into_iter().filter(|c| c != "_deleted").collect::<Vec<_>>(), Some(values.len())).to_vec() } else { columns.clone() }; // (SQL's order)
                     if given.len() != values.len() {
                         let what = if values.len() > given.len() { "INSERT has more expressions than target columns" } else { "INSERT has more target columns than expressions" };
                         return Err(crate::codes::coded("42601", format!("{what} (MERGE: INSERT gives {} values for {} columns)", values.len(), given.len())));
@@ -1062,7 +1064,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         }
     }
     let mut seen = Seen { ctes: HashSet::new(), tables: vec![], key };
-    let _ = Visit::visit(&stmts, &mut seen);
+    let _ = crate::walk::visit(&stmts, &mut seen);
     let same = std::ptr::eq(query, target);
     let (mut renamed, mut sent, mut kept) = (HashMap::new(), vec![], HashMap::new());
     for (k, name, rows_of_call) in seen.tables {
@@ -1078,6 +1080,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
                 continue;
             }
             false if crate::temp::mentioned(&n) => true, // (the session's own)
+            false if crate::path::session_view(query, &n).await => true, // (a view whose current_schema() is this session's: its leader would read it as public's)
             false => match crate::ddl::resolve(query, &n).await {
                 Ok((Some(o), t)) if std::ptr::eq(&*o, target) => {
                     renamed.insert(k, t);
@@ -1091,7 +1094,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
         if here {
             let read = format!("SELECT * FROM {k}");
             let ctx = crate::query::session(query, &read, "").await?;
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             let batches = ctx.sql(&crate::sys::planned(&read)?).await?.collect().await.with_context(|| format!("reading {k} for the change"))?;
             let alias = if rows_of_call { None } else { name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.clone()) }; // (a table's name stays its rows' name)
             let as_sent = format!("__sent_{}", sent.len() + 1);
@@ -1127,7 +1130,7 @@ pub async fn for_leader(query: &Lake, target: &Lake, written: &str, local: &str,
             ControlFlow::Continue(())
         }
     }
-    let _ = VisitMut::visit(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
+    let _ = crate::walk::visit_mut(&mut stmts, &mut Rewrite { renamed: &renamed, kept: &kept });
     // An INSERT's target is no table factor, so the visits above never see it: it is named as that
     // lake names it, like the UPDATEs' and DELETEs' targets are (`plain` INSERTs into attached keyed tables).
     for s in stmts.iter_mut() {

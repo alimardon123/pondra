@@ -1,6 +1,6 @@
 //! SQL as text: names as SQL resolves them, a table's name inside the lake, a statement written back.
 use anyhow::{bail, ensure, Result};
-use datafusion::sql::sqlparser::ast::{self, visit_expressions_mut, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement, Value, VisitMut};
+use datafusion::sql::sqlparser::ast::{self, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Statement, Value};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::LazyLock;
@@ -55,6 +55,15 @@ fn to_point(words: &[String]) -> bool {
     at(1) == Some("TO") || (matches!(at(1), Some("WORK" | "TRANSACTION")) && at(2) == Some("TO"))
 }
 
+/// Is a BEGIN's or COMMIT's first words SQL Server's `TRAN` (or `TRANSACTION` with a name after it)? (`words` holds at most three.)
+fn tsql_tran(words: &[String]) -> bool {
+    match words.get(1).map(String::as_str) {
+        Some("TRAN") => true,
+        Some("TRANSACTION") => words.get(2).is_some(),
+        _ => false,
+    }
+}
+
 /// `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, and the savepoint words: which, if `sql` is one.
 /// (`SET TRANSACTION` is `settings.rs`'s.)
 pub fn control(sql: &str) -> Option<&'static str> {
@@ -62,12 +71,17 @@ pub fn control(sql: &str) -> Option<&'static str> {
     let words = first_words(sql, 3);
     let rest_ok = |from: usize| words.get(from..).unwrap_or(&[]).iter().all(|w| BEGIN_WORDS.contains(&w.as_str()) || w.starts_with("ISOLATION"));
     match words.first().map(String::as_str) {
-        Some("BEGIN") if rest_ok(1) => Some("BEGIN"),
+        // (SQL Server's `BEGIN TRAN [name]` and `BEGIN TRANSACTION name`: a transaction, its name labelling nothing here)
+        Some("BEGIN") if rest_ok(1) || tsql_tran(&words) => Some("BEGIN"),
         Some("START") if words.get(1).map(String::as_str) == Some("TRANSACTION") => Some("BEGIN"),
-        Some("COMMIT" | "END") if rest_ok(1) => Some("COMMIT"),
+        // (SQL Server's `COMMIT TRAN [name]`: a COMMIT)
+        Some("COMMIT") if rest_ok(1) || tsql_tran(&words) => Some("COMMIT"),
+        Some("END") if rest_ok(1) => Some("COMMIT"),
         // ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT] name: a savepoint's, not the transaction's
         Some("ROLLBACK") if to_point(&words) => Some("ROLLBACK TO"),
-        Some("ROLLBACK" | "ABORT") if rest_ok(1) => Some("ROLLBACK"),
+        // (SQL Server's `ROLLBACK TRAN` with no name is a ROLLBACK; `ROLLBACK TRAN name` is refused as it always was)
+        Some("ROLLBACK") if rest_ok(1) || (words.len() == 2 && words[1] == "TRAN") => Some("ROLLBACK"),
+        Some("ABORT") if rest_ok(1) => Some("ROLLBACK"),
         Some("SAVEPOINT") => Some("SAVEPOINT"),
         Some("RELEASE") => Some("RELEASE"),
         _ => None,
@@ -81,9 +95,17 @@ pub(crate) fn text(stmts: &[Statement]) -> String { stmts.iter().map(sql).collec
 /// which reads back as a comment, so a minus before anything written with a minus first gets
 /// parentheses.
 pub fn sql(s: &Statement) -> String {
+    // (sqlparser writes a macro with no parameters as `CREATE MACRO m AS …`, which it doesn't read back: its `()` kept)
+    if let Statement::CreateMacro { args: None, .. } = s {
+        let mut s = s.clone();
+        if let Statement::CreateMacro { args, .. } = &mut s {
+            *args = Some(vec![]);
+        }
+        return sql(&s);
+    }
     let twice = |e: &Expr| matches!(e, Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if expr.to_string().starts_with('-'));
     let mut doubled = false;
-    let _ = ast::visit_expressions(s, |e| {
+    let _ = crate::walk::visit_expressions(s, |e| {
         doubled |= twice(e);
         ControlFlow::<()>::Continue(())
     });
@@ -91,7 +113,7 @@ pub fn sql(s: &Statement) -> String {
         return s.to_string();
     }
     let mut s = s.clone();
-    let _ = visit_expressions_mut(&mut s, |e| {
+    let _ = crate::walk::visit_expressions_mut(&mut s, |e| {
         if let (true, Expr::UnaryOp { expr, .. }) = (twice(e), &mut *e) {
             **expr = Expr::Nested(Box::new(std::mem::replace(&mut **expr, Expr::Value(ast::Value::Null.into()))));
         }
@@ -122,6 +144,9 @@ pub fn mentions(sql: &str, t: &str) -> bool {
 pub fn head(sql: &str) -> String {
     first_word(sql).split(|c: char| !c.is_ascii_alphabetic()).next().unwrap_or_default().to_ascii_lowercase()
 }
+
+/// Does `hay` hold `needle`, whatever its case? (A byte scan: a query is not lower-cased to ask.)
+pub fn contains_ci(hay: &str, needle: &str) -> bool { hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes())) }
 
 /// The word of the write a query makes (`WITH … INSERT`, `… UPDATE`, `… DELETE`, `… MERGE`), or None for one that only
 /// reads. sqlparser reads each of those as a query whose body is the write, so the body is what says it.
@@ -297,7 +322,7 @@ pub(crate) fn at(e: &Expr) -> usize { std::ptr::from_ref(e) as usize }
 /// `change` changed anything.
 pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statement) -> bool) -> bool {
     let mut written = HashMap::new();
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+    let _ = crate::walk::visit_mut(stmt, &mut Items(|item: &mut SelectItem| {
         if let SelectItem::UnnamedExpr(e) = item {
             written.insert(at(e), e.to_string());
         }
@@ -305,7 +330,7 @@ pub(crate) fn names_kept(stmt: &mut Statement, change: impl FnOnce(&mut Statemen
     if !change(stmt) {
         return false;
     }
-    let _ = stmt.visit(&mut Items(|item: &mut SelectItem| {
+    let _ = crate::walk::visit_mut(stmt, &mut Items(|item: &mut SelectItem| {
         if let SelectItem::UnnamedExpr(e) = item {
             if let Some(text) = written.get(&at(e)).filter(|text| **text != e.to_string()) {
                 let expr = std::mem::replace(e, Expr::value(Value::Null));
@@ -408,7 +433,7 @@ mod tests {
         // (every `upper(…)` becomes 'x': the items it changed keep their names, the others are as they were)
         let upper = |s: &mut Statement| {
             let mut changed = false;
-            let _ = ast::visit_expressions_mut(s, |e| {
+            let _ = crate::walk::visit_expressions_mut(s, |e| {
                 if matches!(e, Expr::Function(f) if object(&f.name) == "upper") {
                     *e = Expr::value(Value::SingleQuotedString("x".into()));
                     changed = true;

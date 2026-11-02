@@ -28,6 +28,11 @@ And every setting goes through `env.rs` (ADR-061 §8): a `PONDRA_*` name read wi
 anywhere else fails (by its text, or a constant that names it), so does a `"PONDRA_…"` name its NAMES table doesn't list, and a name the table
 lists that nothing reads (env.rs's own rules, the memory line's, read outside the table).
 
+And every walk of the SQL tree goes through `crate::walk` (`src/walk.rs`): sqlparser's `Visit` and `VisitMut` are
+generic over the visitor, so each walk is compiled again for every visitor type. Outside walk.rs, a `use` of either
+trait, or a call of `visit_expressions`, `visit_expressions_mut`, `visit_relations`, `visit_relations_mut`,
+`visit_statements` or `visit_statements_mut` not through `walk::`, fails here by file and line.
+
 Only the standard library; it reads the source, not a build.
 """
 import argparse, os, re, sys
@@ -48,6 +53,7 @@ PROCESS = {
     "cache.rs:OUTSIDE": "files outside the lakes, kept by the version each was listed at (invariant 96): nothing of a lake's own",
     "cli.rs:ERROR_LINES": "the process's logger, set by the command (`log` keeps one a process): it holds nothing",
     "codes.rs:SEEN": "the SQLSTATE codes other nodes answered with, each kept once as a &'static: the same five letters for every node",
+    "matcher.rs:LIVE_STEPS": "a count of the path steps alive on this thread, which a search makes and frees within one partition: a partition reads it against its own start, so no node's state is in it",
     "console.rs:FILES": "the console's files, built into the binary",
     "console.rs:PAGE": "the console's page, built into the binary",
     "console.rs:SERVER": "the server's page, built into the binary",
@@ -60,6 +66,8 @@ PROCESS = {
     "env.rs:GIVEN": "what the process was given (open's options, the command line's flags): fixed by its first open (ADR-061 §8)",
     "ext.rs:BARE": "a client with no token and no time limit (`bare`): only its keep-alive sockets",
     "ext.rs:CLIENT": "a client with no token, for other engines' REST catalogs: only its keep-alive sockets",
+    "ext.rs:WEB": "a page's store of a web origin, the browser's fetch (`web_with`): set once a module, as its allocator is",
+    "ext.rs:BLOB": "a page's store of its tab's blob: URLs, the browser's fetch (`blob_with`): set once a module, as WEB is",
     "engine.rs:SUBSTR": "a function's definition",
     "fit.rs:ANALYZER": "the analyzer's rules, DataFusion's and Pondra's, for a point change's SET: no state, nothing of a lake",
     "flight.rs:INFO": "what Flight SQL says of the server: constants",
@@ -74,8 +82,10 @@ PROCESS = {
     "main.rs:ALLOC": "the allocator: one a process, the program's (ADR-061 §1)",
     "metrics.rs:RUNNING": "a gauge of the process's queries running now: a stopped node's last ones count themselves down (set back to 0, it would wrap)",
     "metrics.rs:WAITING": "a gauge of the process's queries waiting for a turn, as RUNNING",
+    "node.rs:CLAIMED": "a live page holds the module's page (`node::claim_page`, `page::Page::claim`): plain, not per_node!, since a freed page's member closes in the background, and its reset() would give back the claim of the page made after it",
     "node.rs:HOSTED": "what the process is: a library's, from its first open (ADR-061 §5)",
     "node.rs:MOVER": "the host's end of a lake's moves (`node::mover`): taken by each host before its node starts, so it outlives the node it starts; a stopped host's receiver closes it",
+    "node.rs:PAGED": "a page's member is open in this process (`node::open_page`): plain, not per_node!, since reset() would set it back before the other statics, and a page opened in that gap would have them cleared under it; end_page sets it back last",
     "node.rs:SUPERVISOR": "the supervisor of the node open now, which outlives each start of that node (a restart in place)",
     "optimize.rs:NEXT": COUNTER,
     "origins.rs:ORIGINS": SETTING + " (PONDRA_WEB_ORIGINS)",
@@ -89,6 +99,7 @@ PROCESS = {
     "pg_json_sets.rs:SETS": "the JSON set functions' names and columns, built into the binary",
     "pyfn.rs:SEEN": "SQL type names worked out by a session with nothing of a lake",
     "public.rs:CLIENT": "a client with no token, for links someone other than the admin named (a share's): only its keep-alive sockets",
+    "sharing_client.rs:CLIENT": "a client with no token, for a share provider's own calls (redirects followed on its origin alone): only its keep-alive sockets",
     "python.rs:BUSY": LOCK,
     "python.rs:CHOSEN": "the Python chosen in the console: the machine's, kept in python.txt beside the console's settings",
     "python.rs:EXE": SETTING + " (--python)",
@@ -104,6 +115,7 @@ PROCESS = {
     "service.rs:CONFIG": "the Windows service's file, set by its entry point once a process",
     "memory.rs:MADE": "the spill folders this process made and hasn't removed: a folder of a static (`store::SPILLS`) outlives a node until the program ends, when `memory::leave` removes what is left; `sweep` skips them",
     "memory.rs:MEMORY": "the lakes held in this process's memory: a node restarting in place finds its own; the library's close lets it go (`forget_memory`), and the program's end (`memory::leave`) empties the map",
+    "memory.rs:PROCESS": "the spill disk is the machine's: every lake in memory in this process counts its bytes on disk in one count (a lake that goes gives its bytes back in its drop)",
     "oom.rs:POINTERS": "a thread's own allocation counters (jemalloc's), found once a thread: they belong to the thread, not to a node",
     "oom.rs:TEST_ALLOCATOR": "the unit tests' allocator, jemalloc as the node's (main.rs), so the meter has counters to read",
     "oom.rs:TRACER": "DataFusion's one join-set tracer for the process, set once: it reads the task-local of whichever request spawns",
@@ -112,10 +124,17 @@ PROCESS = {
     "store.rs:UPDATES": LOCK,
     "store.rs:PARTS": SETTING + " (PONDRA_CORES, --memory-gb)",
     "store.rs:RAM": "the machine's memory, or its container's",
+    "store.rs:READER": "a page's reading of its live bytes, the program's (`read_resident_with`): set once a process, as its allocator is (`main.rs:ALLOC`)",
+    "store.rs:SAID": "a warning said once a process: the cache folder under the temp dir is the machine's, so it fails the same for every lake (`cache_base`)",
     "store.rs:SPILLS": "the process's own spill folder, made by the first spill and held until the program ends: `memory::leave` removes it then, or where it can't (Windows, lock open) the next process's sweep does (memory::sweep)",
     "store.rs:SPILLERS": "the spill disk is the machine's: every lake's spills in this process share its room (held weakly, a lake's goes with it)",
+    "store.rs:SPILL_FACTORY": "a page's spill factory (`give_spills`, wasm32): plain, not per_node!, since a freed page's member closes in the background, and its reset() would wipe the factory of the page made after it (`take_spills` takes it back when its page ends)",
     "store.rs:START": "the clock the spill disk's last look is measured from: the disk is the machine's",
     "store.rs:LOOKED": "when the spill disk was last looked at: the disk is the machine's, so one look serves every lake",
+    "extension.rs:PARTS": "extensions' parts loaded in this process, by their file's SHA-256: a part holds no lake's state and its file never changes under its hash, so one serves every node",
+    "extension.rs:TURNS": "the extension calls running in this process, against one a core: the cores are the machine's, so every node in a process shares one count (each call gives its turn back as it ends)",
+    "wasm.rs:ENGINE": "Wasmtime's engine, the process's compiler: compiled code is shared by every node in a process, and holds no node's state",
+    "store.rs:DISK": "the window sorts' spill disk (`window_sorts`, invariant 423), made once from settings read once (PONDRA_SPILL_FAN_IN, --memory-gb, PONDRA_CORES, PONDRA_SPILL_GB): the disk is the machine's, as SPILLERS says",
     "engine.rs:SPARK": "Spark's functions, made against a session with nothing of a lake",
     "temp.rs:CHANGES": "a counter live queries wait on: it only grows, so a waiter never misses a change",
     "tier.rs:SLOTS": SETTING + " (tiering's slots, sized by --memory-gb)",
@@ -323,6 +342,38 @@ def clocks():
     return bad
 
 
+# A walk of the SQL tree: a `use` of sqlparser's Visit or VisitMut trait, and a call of one of its free functions
+# that isn't through `walk::` (src/walk.rs makes every walk, so the one compiled walk serves all of them).
+WALK_USE = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?[ \t]+)?use\s[^;]*;")
+WALK_TRAIT = re.compile(r"\bVisit(?:Mut)?\b")
+WALK_CALL = re.compile(r"(?<![\w:])((?:\w+::)*)(visit_(?:expressions|relations|statements)(?:_mut)?)\s*\(")
+WALK_WHY = "walk the SQL tree through crate::walk (one compiled walk; sqlparser's own compiles the whole tree again for each visitor)"
+
+
+def walks():
+    """Walks of the SQL tree outside src/walk.rs: a `use` of Visit or VisitMut, or a free walk not through `walk::`."""
+    bad = []
+    for base, _, files in os.walk(SRC):
+        for f in sorted(files):
+            if not f.endswith(".rs"):
+                continue
+            path = os.path.join(base, f)
+            rel = os.path.relpath(path, SRC).replace(os.sep, "/")
+            if rel == "walk.rs":
+                continue
+            text = open(path, encoding="utf-8").read()
+            for m in WALK_USE.finditer(text):
+                trait = WALK_TRAIT.search(m.group(0))
+                if trait:
+                    line = text.count("\n", 0, m.start() + trait.start()) + 1
+                    bad.append(f"src/{rel}:{line}: {WALK_WHY}")
+            for m in WALK_CALL.finditer(text):
+                if not m.group(1).endswith("walk::"):
+                    line = text.count("\n", 0, m.start(2)) + 1
+                    bad.append(f"src/{rel}:{line}: {WALK_WHY}")
+    return bad
+
+
 def poisoned(found):
     """A process's lock read with `.unwrap()`: a library's node restarting in place unwinds through
     whatever lock it holds (`node::restart`), and the next start must still read it."""
@@ -351,7 +402,7 @@ def main():
         if not ok:
             bad.append(f"src/{rel}:{line} {name} ({ty}): {why}")
     stale = sorted(k for k in PROCESS if k not in keys)
-    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found)
+    more = [f"PROCESS names {k}, which src/ no longer has: take it out" for k in stale] + leaks() + settings() + clocks() + poisoned(found) + walks()
     bad += more
     for b in bad if not args.list else more:
         print(f"FAIL {b}")

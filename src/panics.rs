@@ -28,16 +28,34 @@ pub async fn door<T>(f: impl Future<Output = T>) -> Result<T, String> {
 ///
 /// A `stoppable` request is one the node may stop for memory (`oom.rs`), where the node has a line to
 /// stop it at: then it answers [`crate::oom::OOM`] and its future is dropped, its memory let go, and its
-/// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node.
+/// polls' allocations are counted to it (`oom::charge`), so the watch stops the one that grew the node. A page (wasm32) has no
+/// watch loop, so it watches each poll of one instead (`oom::polled`), and answers its own [`crate::oom::PAGE_OOM`].
 /// Any other request is not wrapped, and runs where it came in or on the queries' runtime, as the others do.
 pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T> + Send + 'static) -> Result<T, String> {
     use futures::future::{Aborted, Either};
     use std::sync::atomic::Ordering::Relaxed;
+    // (a page's one thread runs no watch loop beside a request, so each poll of a stoppable one is watched: `oom::polled`)
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(line) = stoppable.then(crate::oom::line).flatten() {
+            return door(crate::oom::polled(|| crate::store::resident().unwrap_or(0), line, f)).await?.map_err(|()| crate::oom::PAGE_OOM.to_string());
+        }
+    }
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     struct Stop(u64, Option<tokio::task::AbortHandle>);
     impl Drop for Stop {
         fn drop(&mut self) {
-            RUNNING.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.0);
+            let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+            match running.get_mut(&self.0) {
+                // (stopped, its tasks end at their next poll, and until then they may still grow the node: their
+                // last polls took the node over its line again after the stop, and the watch stopped the cheap
+                // query beside it, by age: CI, 11-01)
+                Some(r) if r.stopped && r.spawned() => r.left = Some(Instant::now()),
+                _ => {
+                    running.remove(&self.0);
+                }
+            }
+            drop(running);
             if let Some(t) = self.1.take() {
                 t.abort();
             }
@@ -45,6 +63,7 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     }
     let id = NEXT.fetch_add(1, Relaxed);
     let stoppable = stoppable && crate::oom::line().is_some(); // (nothing could stop it otherwise)
+    let f = REQUEST.scope(id, f); // (a first try in it finds its entry: `first_try`)
     // A request the node may stop is charged the memory its polls allocate (`oom::charge`): the watch stops the one that grew it.
     let used = stoppable.then(|| std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)));
     let (f, handle) = match &used {
@@ -57,7 +76,7 @@ pub async fn work<T: Send + 'static>(stoppable: bool, f: impl Future<Output = T>
     let long = {
         let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
         let long = running.first_key_value().is_some_and(|(_, r)| r.since.elapsed() >= LONG);
-        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, used });
+        running.insert(id, crate::oom::Running { since: Instant::now(), noted: crate::oom::seen(), stop: handle, stopped: false, resting: false, used, left: None, first_try: None });
         long
     };
     crate::oom::wake(); // (the watch looks now, once this request is in RUNNING: it may be one to stop)
@@ -95,6 +114,92 @@ pub(crate) fn running() -> bool {
     !RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
+/// Is a request the watch stopped still running, or work it spawned (a DataFusion task ends at its next poll): until
+/// it has all ended, the memory is still its own (`oom::pick` stops no other meanwhile). A stopped request whose own
+/// future and spawned work have ended leaves here, as one does whose spawned work runs past [`crate::oom::HOLD`] (a
+/// blocking closure runs to its end). Only the watch's loop calls it, at each look.
+pub(crate) fn stopping() -> bool {
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    running.retain(|_, r| r.left.is_none_or(|at| r.spawned() && at.elapsed() < crate::oom::HOLD));
+    running.values().any(|r| r.stopped)
+}
+
+tokio::task_local! {
+    /// The request running through [`work`] that this task's work is part of, by its id in `RUNNING`.
+    static REQUEST: u64;
+}
+
+/// Runs `f`, the first try of work that can be tried again in a frugal session (`query::frugally`), so that when the
+/// memory watch picks its request to stop, it stops this try alone: the try's future is dropped and its memory let
+/// go, and the request runs on to its second try, which the watch stops whole. What the pool refuses
+/// comes back as an error and is tried again there; what grows the node without asking the pool (a median's copies of
+/// its groups' values) is stopped by the watch, and was answered 53200 with no second try (B50 under 2 GB, 10-31).
+/// Outside a request the node may stop, and inside another first try, `f` runs as it is. Stopped, it returns once the
+/// node's memory has come back under its line (`oom::come_back`): [`Stopped::Again`], and the request may be stopped
+/// again; [`Stopped::Over`] if the memory stayed over it, and the request ends out of memory. A try that ended in a
+/// way the caller tries again (`again`: the pool refused it) waits the same way, and is answered as it ended whether or
+/// not the memory came back (it was tried again before the watch could stop it). (Refused by the pool at the line, the
+/// median's first try ended on its own, and the watch stopped the request whole for that try's memory as its second try
+/// began: harness scale, 11-01.)
+///
+/// While it waits, the request rests: the watch doesn't stop it, and stops another that grows the node. Only a try the
+/// watch stopped holds every stop (`oom::pick`), and only until its future and the tasks it spawned have ended (at most
+/// [`crate::oom::HOLD`]): until then the memory over the line is still its own. (A pool refusal held every stop for up to
+/// 10 s, while a median beside it grew the node unwatched: audit 11-01 H5.)
+pub async fn first_try<T>(f: impl Future<Output = T>, again: impl Fn(&T) -> bool) -> Result<T, Stopped> {
+    let Ok(id) = REQUEST.try_with(|id| *id) else { return Ok(f.await) };
+    let (f, handle) = futures::future::abortable(f);
+    let mine = match RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        Some(r) if r.stop.is_some() && !r.stopped && r.first_try.is_none() => {
+            r.first_try = Some(handle);
+            Some(r.holders()) // (what holds its counter before the try: the request alone, and work of its own)
+        }
+        _ => None,
+    };
+    let out = f.await; // (stopped, the try's future is dropped here, before the request goes on)
+    let Some(before) = mine else {
+        return out.map_err(|_| Stopped::Over); // (never stopped: only a registered try is)
+    };
+    let tried_again = out.as_ref().map_or(true, &again);
+    let noted = match RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        Some(r) => {
+            r.first_try = None;
+            r.resting = tried_again; // (its memory is going: the watch doesn't stop it for that)
+            r.noted
+        }
+        None => usize::MAX,
+    };
+    if out.is_err() {
+        // (the watch stopped it, and holds every stop while the try's tasks end, at their next poll)
+        let since = Instant::now();
+        let ending = || RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get(&id).is_some_and(|r| r.holders() > before);
+        while ending() && since.elapsed() < crate::oom::HOLD {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+            r.stopped = false;
+        }
+    }
+    let back = !tried_again || crate::oom::come_back(noted).await;
+    if let Some(r) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+        r.resting = false; // (its try and the try's memory gone, or not coming back: the request may be stopped, whole)
+    }
+    match out {
+        Ok(v) => Ok(v),
+        Err(_) if back => Err(Stopped::Again),
+        Err(_) => Err(Stopped::Over),
+    }
+}
+
+/// How a [`first_try`] the memory watch stopped ended.
+#[derive(Debug, PartialEq)]
+pub enum Stopped {
+    /// The node's memory came back under its line: the work may be tried again.
+    Again,
+    /// It stayed over it: the request is out of memory.
+    Over,
+}
+
 /// Gives each request that started while the watch waited (no reading: `oom::seen` was `usize::MAX`) the
 /// reading of the watch's look after it started, which the watch calls before any stop decision. The
 /// others keep theirs. Only the watch's loop calls it: a request's `noted` is one reading, never a file read.
@@ -106,17 +211,22 @@ pub(crate) fn note(resident: usize) {
     }
 }
 
-/// Stops the request the watch chose (`oom::pick`), if one qualifies: it is aborted, so its future is
-/// dropped and answers [`crate::oom::OOM`]. True if one was stopped.
-pub(crate) fn stop_one(now: Instant, margin: usize) -> bool {
+/// Stops the request the watch chose (`oom::pick`), if one qualifies: its first try, if it is in one ([`first_try`]),
+/// which it then runs again frugally; else the request, which is aborted, so its future is dropped and answers
+/// [`crate::oom::OOM`]. `None` if none qualified, else whether a first try was what stopped.
+pub(crate) fn stop_one(now: Instant, margin: usize) -> Option<bool> {
     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(id) = crate::oom::pick(&running, now, crate::oom::seen(), margin) else { return false };
-    let Some(r) = running.get_mut(&id) else { return false };
-    r.stopped = true;
+    let id = crate::oom::pick(&running, now, crate::oom::seen(), margin)?;
+    let r = running.get_mut(&id)?;
+    r.stopped = true; // (until the stopped future is gone: `first_try` or the request's end)
+    if let Some(first) = r.first_try.take() {
+        first.abort(); // (as below, at its next poll)
+        return Some(true);
+    }
     if let Some(stop) = &r.stop {
         stop.abort(); // (its next poll finds it aborted: the future is dropped there)
     }
-    true
+    Some(false)
 }
 
 /// Start work of the leader's own that reads and writes as queries do (a view running its query
@@ -171,7 +281,7 @@ fn queries() -> &'static tokio::runtime::Runtime {
 /// holds one), and a cap could leave none for files.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn runtime() -> tokio::runtime::Builder {
-    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let cores = crate::env::cores();
     let most = crate::env::or("PONDRA_BLOCKING_THREADS", if cfg!(windows) { 512 } else { 16.max(4 * cores) });
     let mut b = tokio::runtime::Builder::new_multi_thread();
     b.enable_all().thread_stack_size(8 << 20).thread_keep_alive(std::time::Duration::from_secs(1)).max_blocking_threads(most);
@@ -272,8 +382,8 @@ mod tests {
     // keeps the others'; the entries are this test's own, with no stop, so no other test can stop them)
     #[test]
     fn a_request_that_started_unread_takes_the_watchs_next_reading() {
-        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, used: None };
-        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, used: None };
+        let unread = crate::oom::Running { since: Instant::now(), noted: usize::MAX, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None };
+        let read = crate::oom::Running { since: Instant::now(), noted: 5, stop: None, stopped: false, resting: false, used: None, left: None, first_try: None };
         RUNNING.lock().unwrap().insert(u64::MAX - 1, unread);
         RUNNING.lock().unwrap().insert(u64::MAX, read);
         note(7 << 20);
@@ -294,14 +404,74 @@ mod tests {
             let later = || Instant::now() + std::time::Duration::from_secs(2); // (a request that has run a second or more)
             let asked = tokio::spawn(work(false, std::future::pending::<()>()));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            assert!(!stop_one(later(), 0), "a request that may not be stopped is passed over");
+            assert_eq!(stop_one(later(), 0), None, "a request that may not be stopped is passed over");
             asked.abort();
             let stoppable = tokio::spawn(work(true, std::future::pending::<()>()));
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            assert!(stop_one(later(), 0), "a stoppable request is stopped");
+            assert_eq!(stop_one(later(), 0), Some(false), "a stoppable request is stopped");
             assert_eq!(stoppable.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
-            assert!(!stop_one(later(), 0), "a stopped request is not stopped again");
+            assert_eq!(stop_one(later(), 0), None, "a stopped request is not stopped again");
             assert_eq!(work(true, async { 5 }).await, Ok(5), "a request that ends on its own answers");
+            // A stopped request whose spawned work still runs holds the stop until that work has ended: the cheap
+            // request beside it is not stopped meanwhile, and is once the work is done (and the memory still over).
+            let cheap = tokio::spawn(work(true, std::future::pending::<()>()));
+            let (done, held) = tokio::sync::oneshot::channel::<()>();
+            let grower = tokio::spawn(work(true, async move {
+                let used = crate::oom::counter().expect("a stoppable request's counter");
+                tokio::spawn(async move {
+                    let _used = used; // (as a DataFusion task holds it: `oom::TRACER`)
+                    let _ = held.await;
+                });
+                std::future::pending::<()>().await
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            {
+                let mut running = RUNNING.lock().unwrap();
+                let first = running.values_mut().find(|r| r.stop.is_some()).expect("the cheap one");
+                first.used.as_ref().expect("its counter").store(-(1 << 40), std::sync::atomic::Ordering::Relaxed); // (it freed, not grew)
+                let last = running.values_mut().last().expect("the grower");
+                last.used.as_ref().expect("its counter").store(1 << 40, std::sync::atomic::Ordering::Relaxed);
+            }
+            assert_eq!(stop_one(later(), 0), Some(false), "the grower is stopped");
+            assert_eq!(grower.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
+            assert!(stopping(), "its spawned work still runs: the stop holds");
+            assert_eq!(stop_one(later(), 0), None, "the cheap one is not stopped for the grower's memory");
+            drop(done);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(!stopping(), "its spawned work has ended: the grower has left");
+            assert_eq!(stop_one(later(), 0), Some(false), "a stop now takes the cheap one, the one left");
+            assert_eq!(cheap.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
+            // A request in a first try: the stop takes the try, the request goes on to its second, and a stop then
+            // takes the request. A first try inside another isn't one of its own, and outside a request it just runs.
+            let (tried, mut told) = tokio::sync::watch::channel(0);
+            let twice = tokio::spawn(work(true, async move {
+                let first = first_try(async {
+                    assert_eq!(first_try(async { 1 }, |_| false).await, Ok(1), "a try inside a first try runs as it is");
+                    let _ = tried.send(1);
+                    std::future::pending::<()>().await
+                }, |_| false).await;
+                let _ = tried.send(2);
+                std::future::pending::<()>().await;
+                first
+            }));
+            told.wait_for(|n| *n == 1).await.expect("the first try runs");
+            assert_eq!(stop_one(later(), 0), Some(true), "a request in its first try: the try is stopped");
+            told.wait_for(|n| *n == 2).await.expect("the request goes on after its first try");
+            assert_eq!(stop_one(later(), 0), Some(false), "past its first try, the request is stopped");
+            assert_eq!(twice.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
+            assert_eq!(first_try(async { 7 }, |_| false).await, Ok(7), "outside a request, a first try just runs");
+            // A first try that ends in a way its caller tries again (the pool refused it) is answered as it ended, once its
+            // memory has gone, and its request may then be stopped whole, as after a stopped try.
+            let (tried, mut told) = tokio::sync::watch::channel(0);
+            let refused = tokio::spawn(work(true, async move {
+                let first = first_try(async { 8 }, |n| *n == 8).await;
+                let _ = tried.send(1);
+                std::future::pending::<()>().await;
+                first
+            }));
+            told.wait_for(|n| *n == 1).await.expect("the first try ends");
+            assert_eq!(stop_one(later(), 0), Some(false), "after a try tried again, the request is stopped whole");
+            assert_eq!(refused.await.expect("the task ends"), Err(crate::oom::OOM.to_string()));
         });
     }
 }

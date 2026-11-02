@@ -257,15 +257,7 @@ async fn take_here(to: &str, t: Take) -> Result<Value> {
         Ok(())
     })
     .await?;
-    let marks = Marks(crate::panics::task({
-        let (store, n) = (store.clone(), term.n);
-        async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let _ = crate::terms::mark_alive(&store, n).await;
-            }
-        }
-    }));
+    let marks = Marks(crate::terms::mark_every(store.clone(), term.n)); // (it answers the bell, as its term says: `terms::deaf`)
     let out = match Lake::open(to, true, false).await {
         Ok(lake) => {
             let run = AssertUnwindSafe(take_led(&lake, t, term.n)).catch_unwind().await;
@@ -354,6 +346,19 @@ pub fn instant(s: &str) -> Result<u64> {
 }
 
 // ---------------------------------------------------------------- the backup's leader
+
+/// A backup's run that reached a node (its `/cluster/ddl`, or the inbox a node that lives drains), not the `pondra lead` the
+/// statement started for a new place: only a later run of a backup the node holds (`take` checks its source) or one resuming.
+/// A first run and a restore make a new lake in a place no node serves, after the statement's checks; one sent to a node
+/// would choose what it copies in, from its own disk or with its own credentials (invariant 260).
+pub(crate) fn sent(d: &Ddl) -> Result<()> {
+    match d {
+        Ddl::Backup(t) => ensure!(!t.fresh && !t.restore, crate::codes::coded("42501", "a backup's first run or a restore is led for its new place by the statement that asked (BACKUP DATABASE, RESTORE), never sent to a node")),
+        Ddl::Unless { then, .. } | Ddl::Replacing { then, .. } => sent(then)?, // (what they wrap is applied as it is: ddl.rs)
+        _ => {}
+    }
+    Ok(())
+}
 
 /// The backup's (or the restored lake's) leader: take the run.
 pub async fn take(lake: &Lake, t: Take) -> Result<Value> {
@@ -732,11 +737,22 @@ async fn copy_all(from: &Lake, to: &Store, objects: Vec<(String, String, Wanted)
         .await
 }
 
-/// The workspace's files (`files/`, their kept versions too): each one that is new or changed since
-/// the last run, and none that the source deleted. (Not in the catalog: a run copies them as they
-/// are when it gets to them.)
+/// The workspace's files (`files/`, their kept versions too) and the extensions' (`ext/`, each named
+/// by its hash, so an earlier run's record finds its own): each one that is new or changed since the
+/// last run, and none that the source deleted. (Not in the catalog: a run copies them as they are
+/// when it gets to them.)
 async fn workspace(from: &Lake, to: &Store) -> Result<(u64, u64)> {
-    let folder = Path::from("files");
+    let (mut copied, mut bytes) = (0, 0);
+    for folder in ["files", "ext"] {
+        let (c, b) = folder_of(from, to, folder).await?;
+        (copied, bytes) = (copied + c, bytes + b);
+    }
+    Ok((copied, bytes))
+}
+
+/// One folder of `workspace`'s.
+async fn folder_of(from: &Lake, to: &Store, folder: &str) -> Result<(u64, u64)> {
+    let folder = Path::from(folder);
     let theirs: Vec<object_store::ObjectMeta> = from.store.list(Some(&folder)).try_collect().await?;
     let mine: std::collections::HashMap<String, object_store::ObjectMeta> = to.list(Some(&folder)).map_ok(|o| (o.location.to_string(), o)).try_collect().await?;
     let changed: Vec<_> = theirs.iter().filter(|o| mine.get(&o.location.to_string()).is_none_or(|m| m.size != o.size || m.last_modified < o.last_modified)).collect();
@@ -806,5 +822,18 @@ mod tests {
         for place in ["s3://b/a", "gs://b/a", "https://h/a"] {
             assert!(!crate::ext::on_disk(place), "{place} is a bucket or a server's");
         }
+    }
+
+    #[test]
+    fn a_backup_sent_to_a_node_is_never_a_first_run_or_a_restore() {
+        let run = |fresh: bool, restore: bool| Take { source: "/var/lib/pondra/other".into(), pin: "x#backup".into(), retention_days: None, restore, at: None, fresh };
+        let refused = |d: Ddl| crate::codes::of(&sent(&d).unwrap_err());
+        assert_eq!(refused(Ddl::Backup(run(true, false))), "42501", "a first run");
+        assert_eq!(refused(Ddl::Backup(run(false, true))), "42501", "a restore");
+        let unless = |then: Ddl| Ddl::Unless { name: "b".into(), kind: "relation".into(), then: Box::new(then) };
+        assert_eq!(refused(unless(Ddl::Backup(run(true, false)))), "42501", "a first run, IF NOT EXISTS");
+        assert_eq!(refused(Ddl::Replacing { name: "b".into(), then: Box::new(Ddl::Backup(run(false, true))) }), "42501", "a restore, OR REPLACE");
+        assert!(sent(&Ddl::Backup(run(false, false))).is_ok(), "a later run of a backup");
+        assert!(sent(&Ddl::Pin { lake: "x".into(), ms: None, lease: false }).is_ok(), "another Ddl");
     }
 }

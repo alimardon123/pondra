@@ -119,7 +119,8 @@ async fn stored_parts(l: &Lake, o: &Object, partial: Option<&HashSet<String>>) -
         let comment = comments.get(stored).cloned();
         out.push(part(o, "column", name.clone(), Some(ty), comment, None));
     }
-    if partial.is_some() {
+    // A materialized view's facts and expectations are its definition: a caller who may not see code is not shown them.
+    if partial.is_some() || (o.kind == "materialized view" && !crate::auth::shows_code()) {
         return Ok(out);
     }
     if !d.key.is_empty() {
@@ -170,12 +171,13 @@ async fn view_parts(session: Option<&SessionContext>, l: &Lake, o: &Object, here
     let mut out: Vec<PartRow> = columns.map(|(name, ty)| {
         let comment = comments.get(&name).cloned();
         match measures.get(&name) {
-            Some(e) => part(o, "measure", name, Some(ty), comment, Some(e.clone())),
+            Some(e) => part(o, "measure", name, Some(ty), comment, crate::views::code_for_caller(|| e.clone())),
             None => part(o, "column", name, Some(ty), comment, None),
         }
     }).collect();
-    // A view's key facts are listed as a table's are, unless a limited caller may not see the columns they name.
-    if partial.is_none() {
+    // A view's key facts are listed as a table's are, unless a limited caller may not see the columns they name, or the
+    // code they are written in (`views::code_for_caller`: a link names the table it refers to).
+    if partial.is_none() && crate::auth::shows_code() {
         for c in stored.iter().flat_map(|v| &v.facts) {
             let link = c.kind == crate::constraints::Kind::ForeignKey;
             out.push(part(o, if link { "link" } else { "key" }, c.name.clone(), None, None, Some(c.def(&ident))));

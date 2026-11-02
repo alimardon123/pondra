@@ -202,14 +202,18 @@ class Train:
     def runs(self):
         return self.gh.api("GET", f"repos/{self.repo}/actions/workflows/build.yml/runs?per_page=100")["workflow_runs"]
 
+    def ours(self, r):
+        """Whether a run is this repository's: a fork's pull request's run takes no slot and stands for no main."""
+        return (r.get("head_repository") or {}).get("full_name") == self.repo
+
     def train_runs(self):
         """The build runs dispatched on the train, newest first."""
-        return [r for r in self.runs() if r["event"] == "workflow_dispatch" and r["head_branch"] == "train"]
+        return [r for r in self.runs() if self.ours(r) and r["event"] == "workflow_dispatch" and r["head_branch"] == "train"]
 
     def slots(self, stopped=()):
         """Going runs that take a slot: a PR's run or a car's, but those just `stopped`. SLOTS may go at once
         (ci-slots.yml), no more."""
-        return sum(1 for r in self.runs() if r["status"] != "completed" and r["id"] not in stopped and (
+        return sum(1 for r in self.runs() if self.ours(r) and r["status"] != "completed" and r["id"] not in stopped and (
             r["event"] == "pull_request" or (r["event"] == "workflow_dispatch" and r["head_branch"] == "train")))
 
     def jobs(self, run_id):
@@ -239,7 +243,7 @@ class Train:
     def bisecting(self, tip):
         """Whether the train's run before this one failed: then this train was cut from a red one (halved, or cut
         again on a moved main) to test its riders alone, and nobody joins it."""
-        prev = next((r for r in self.runs() if r["event"] == "workflow_dispatch" and r["head_branch"] == "train"
+        prev = next((r for r in self.runs() if self.ours(r) and r["event"] == "workflow_dispatch" and r["head_branch"] == "train"
                      and r["head_sha"] != tip), None)
         if prev is None or prev["conclusion"] == "success":
             return False
@@ -251,11 +255,11 @@ class Train:
         with a landing, and none comes while the train waits, so a red run of main's older than the cut is started
         again, once: green, the train is judged; red again, main needs a fix of its own (which rides the train)."""
         runs = self.runs()
-        ran = next((r for r in runs if r["head_branch"] == "main" and r["status"] == "completed"
+        ran = next((r for r in runs if self.ours(r) and r["head_branch"] == "main" and r["status"] == "completed"
                     and r["conclusion"] not in ("cancelled", "skipped")), None)
         if ran is None or not set(failed) <= set(self.failed_jobs(ran["id"])):
             return False
-        newest = next(r for r in runs if r["head_branch"] == "main")
+        newest = next(r for r in runs if self.ours(r) and r["head_branch"] == "main")
         if newest["status"] == "completed" and stamp(newest["created_at"]) < int(git("log", "-1", "--format=%ct", tip)):
             self.dispatch("main", "main")
             say(f"started main's run again: its last ({ran['html_url']}) is older than the train and fails the same way")

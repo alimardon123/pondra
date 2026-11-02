@@ -8,7 +8,7 @@
 //!   (`[x * 2 FOR x IN l IF x > 0]`) as `x -> …`; DuckDB's `PIVOT` and `UNPIVOT` statements as the
 //!   standard's; DuckDB's `ASOF JOIN … ON a.t >= b.t` as Snowflake's; `USING SAMPLE`.
 //! - In the syntax tree (`rewrite`): `FETCH FIRST`, `ORDER BY ALL`, `({…}).a`, `max_by` and
-//!   `arg_max`, `string_split`, `::json`, `json_extract`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
+//!   `arg_max`, `string_split`, `::json`, `json_extract`, `payload->>'$.a'`, `PIVOT`, `UNPIVOT`, `TABLESAMPLE` (which
 //!   DataFusion ignored), `COLUMNS(…)`, `* RENAME`, a select's alias in its WHERE.
 //! - Whole statements: `SUMMARIZE` (`summarize`).
 //! - Where a query is planned (`lambdas`): a higher-order function's `x -> …` as a lambda.
@@ -26,28 +26,41 @@ use std::ops::ControlFlow;
 use std::sync::LazyLock;
 
 fn expr(sql: &str) -> Result<Expr> { Ok(Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_expr()?) }
-fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
-fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
+pub(crate) fn query(sql: &str) -> Result<Query> { Ok(*Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_query()?) }
+pub(crate) fn quote(s: &str) -> String { format!("'{}'", s.replace('\'', "''")) }
 fn name(s: &str) -> String { format!("\"{}\"", s.replace('"', "\"\"")) }
 
 /// Whether `sql` may hold any of them: a look before anything is parsed.
 pub fn wanted(sql: &str) -> bool {
+    // (the last alternatives: BigQuery's `SAFE.f(`, and Snowflake's `payload:page` (a colon after a word or a closing
+    // bracket, then a letter, `_`, a quote or `[`: not `x::INT`, nor `a = :p`, a parameter))
     static WORDS: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list)\s*\(|\)\s*\.\s*[a-z_]").expect("a regex")
+        Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
+    // (a type DuckDB names otherwise, or one Pondra refuses by name: `DUCKDB_TYPES`, `OTHER_TYPES`, and the ones sqlparser
+    // reads as its own; only where a type stands, after AS or `::`, before a literal's text, or in a CREATE, ALTER or
+    // DECLARE: `year`, `long` or `money` as a column's name sends a query through no parse)
+    static TYPES: LazyLock<Regex> = LazyLock::new(|| {
+        let names: Vec<&str> = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).collect();
+        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)", names.join("|"));
+        Regex::new(&format!(r"(?i)(?:\bas\s+|::\s*){t}\b|\b{t}\s*'|(?:^|;)\s*(?:--[^\n]*\n\s*)*(?:create|alter|declare)\b[^;]*\b{t}\b")).expect("a regex")
+    });
+    // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
+    static OURS_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("|"))).expect("a regex"));
     // (a materialized view whose query is in parentheses, dbt's `AS (SELECT …)`: nothing else in its
     // text is a friendly form, so `unparen` is what it needs)
     static PAREN_VIEW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b.*?\bas\s*\(").expect("a regex"));
     // (the forms the rewrites below take: a timestamp's one-digit zone, a number with an exponent, a bytea
     // literal in either of its forms (matched by the word, since the escape form has no `\x` to match),
     // `(a, b) IN (SELECT …)`, a character type's Postgres name, DEFAULT VALUES, LIKE … ESCAPE, an array literal
-    // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`))
+    // `[…]` or `ARRAY[…]` (a `[` straight after a word, `)`, `]` or `"` is a subscript, `arr[1]`), and a JSONPath
+    // after `->` or `->>` (`payload->>'$.a'`, DuckDB's and MySQL's), and a national string `N'…'`)
     static MORE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\["#).expect("a regex")
+        Regex::new(r#"(?i)[+-]\d'|\d[e][+-]?\d|\bbytea\b|\)\s*(?:not\s+)?in\s*\(\s*(?:select|with)\b|\bcharacter\b|\bchar\s+varying\b|\bdefault\s+values\b|\bescape\s+'|\barray\s*\[|(?:^|[^\w)\]"])\[|->>?\s*'\$|(?:^|[^\w'])[nN]'"#).expect("a regex")
     });
     // (a call of one of Postgres's bytea-only functions, whose string literal `expression` reads as a bytea)
     static BYTEA_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::pg_bytea::TAKES_BYTEA.join("|"))).expect("a regex"));
-    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
+    WORDS.is_match(sql) || PAREN_VIEW.is_match(sql) || MORE.is_match(sql) || BYTEA_CALL.is_match(sql) || OURS_CALL.is_match(sql) || TYPES.is_match(sql) || alias_in_where(sql) || alias_after_table(sql)
 }
 
 /// Whether a name given with `AS` comes up again after a WHERE (a select's alias it may use).
@@ -72,13 +85,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, property_keys] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -277,6 +290,27 @@ fn lock_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
     Ok(edits)
 }
 
+/// SQL Server's system variables: `@@version` (any case) at a code position (a word the tokens read: not in a string or
+/// a comment) is `version()`. Any other `@@x` is refused by name, with the way Pondra gives a setting; a call `@@x(…)` is
+/// a function's name and is left as it is.
+fn at_at_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in 0..t.toks.len() {
+        let Token::Word(w) = &t.toks[i] else { continue };
+        let Some(name) = w.value.strip_prefix("@@") else { continue };
+        if w.quote_style.is_some() || t.toks.get(t.next(i)) == Some(&Token::LParen) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("version") {
+            edits.push((t.at[i], t.end(i), "version()".to_string()));
+        } else {
+            let lower = name.to_lowercase();
+            return Err(crate::codes::coded("0A000", format!("@@{name} is SQL Server's: Pondra's settings are SHOW {lower} / current_setting('{lower}')")));
+        }
+    }
+    Ok(edits)
+}
+
 /// Spark's `TBLPROPERTIES (write.delete.mode = 'merge-on-read')`: a dotted key written bare, which the
 /// parser reads only quoted, quoted (`'write.delete.mode' = …`), so the property is refused or kept by
 /// its name as the quoted one is, never as a statement that doesn't parse.
@@ -314,6 +348,29 @@ fn property_keys(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
             if t.toks.get(at) != Some(&Token::Comma) {
                 break;
             }
+        }
+    }
+    Ok(edits)
+}
+
+/// SQL Server's `TOP` where it is a name (`top.amount`, `) top ON true`, `AS top`, `SELECT top FROM t`): quoted, so the
+/// parser reads an alias, a column or a table. After SELECT, DISTINCT, ALL, UPDATE, DELETE or INSERT, a `TOP` before a
+/// number or a parenthesis is SQL Server's own (`SELECT TOP 3`, `TOP (3)`, `TOP 10 PERCENT`), and is left as it is.
+fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
+    let mut edits = Vec::new();
+    for i in 0..t.toks.len() {
+        let Token::Word(w) = &t.toks[i] else { continue };
+        if w.quote_style.is_some() || !w.value.eq_ignore_ascii_case("top") {
+            continue;
+        }
+        let before = (0..i).rev().find(|&j| !matches!(t.toks[j], Token::Whitespace(_)));
+        let after = t.toks.get(t.next(i));
+        let after_select = before.is_some_and(|j| {
+            matches!(&t.toks[j], Token::Word(p) if p.quote_style.is_none() && matches!(p.keyword, Keyword::SELECT | Keyword::DISTINCT | Keyword::ALL | Keyword::UPDATE | Keyword::DELETE | Keyword::INSERT))
+        });
+        let sql_server = after_select && matches!(after, Some(Token::Number(..)) | Some(Token::LParen));
+        if !sql_server {
+            edits.push((t.at[i], t.end(i), "\"top\"".to_string()));
         }
     }
     Ok(edits)
@@ -388,7 +445,7 @@ fn statements(sql: &str) -> Result<Option<String>> {
                     cols.push(e);
                 }
             }
-            let _ = visit_expressions(&aggs, |e| {
+            let _ = crate::walk::visit_expressions(&aggs, |e| {
                 if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
                     let e = e.to_string();
                     if !cols.contains(&e) {
@@ -460,7 +517,7 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     // (a stored view keeps its text: it is expanded as it is read, as its functions are)
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = s.visit(&mut f) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut f) {
             return Err(e);
         }
     }
@@ -471,11 +528,15 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     }
     f.asks = Asks::Apply(answers);
     for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = s.visit(&mut f) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut f) {
             return Err(e);
         }
     }
-    Ok(before != stmts)
+    // (after the loop above: TOP and FETCH FIRST are LIMIT by now, and `*` and ORDER BY ALL are expanded)
+    for s in stmts.iter_mut().filter(|s| !kept(s)) {
+        crate::lateral_join::rewrite(s)?;
+    }
+    Ok(before != stmts) // (a LATERAL join rewritten changes the statement, so it counts here too)
 }
 
 tokio::task_local! {
@@ -609,7 +670,7 @@ impl VisitorMut for Friendly {
         if self.collecting() {
             return ControlFlow::Continue(());
         }
-        or_break(fetch(q).and_then(|_| order_by_all(q, n)))
+        or_break(top(q).and_then(|_| fetch(q)).and_then(|_| order_by_all(q, n)))
     }
 
     fn pre_visit_select(&mut self, s: &mut Select) -> ControlFlow<anyhow::Error> {
@@ -705,15 +766,21 @@ impl VisitorMut for Friendly {
         match s {
             Statement::CreateTable(c) => {
                 for col in c.columns.iter_mut() {
-                    spell(&mut col.data_type); // (a JSON column keeps its type: `pg_casts::rewrite` holds it as text, checked)
+                    // (a JSON column keeps its type: `pg_casts::rewrite` holds it as text, checked)
+                    if let Err(e) = spell(&mut col.data_type) {
+                        return ControlFlow::Break(e);
+                    }
                 }
             }
             Statement::AlterTable(a) => {
                 for op in a.operations.iter_mut() {
-                    match op {
+                    let spelled = match op {
                         AlterTableOperation::AddColumn { column_def, .. } => spell(&mut column_def.data_type),
                         AlterTableOperation::AlterColumn { op: AlterColumnOperation::SetDataType { data_type, .. }, .. } => spell(data_type),
-                        _ => {}
+                        _ => Ok(()),
+                    };
+                    if let Err(e) = spelled {
+                        return ControlFlow::Break(e);
                     }
                 }
             }
@@ -760,14 +827,14 @@ fn unalias(s: &mut Statement) -> Result<()> {
     let mut r = Renamed { alias: alias.clone(), table: table.clone(), shadow: None };
     match s {
         Statement::Delete(d) => {
-            let _ = VisitMut::visit(&mut d.selection, &mut r);
-            let _ = VisitMut::visit(&mut d.using, &mut r);
+            let _ = crate::walk::visit_mut(&mut d.selection, &mut r);
+            let _ = crate::walk::visit_mut(&mut d.using, &mut r);
             returning(&mut d.returning, &mut r);
         }
         Statement::Update(u) => {
-            let _ = VisitMut::visit(&mut u.assignments, &mut r);
-            let _ = VisitMut::visit(&mut u.from, &mut r);
-            let _ = VisitMut::visit(&mut u.selection, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.assignments, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.from, &mut r);
+            let _ = crate::walk::visit_mut(&mut u.selection, &mut r);
             returning(&mut u.returning, &mut r);
         }
         _ => {}
@@ -780,7 +847,7 @@ fn unalias(s: &mut Statement) -> Result<()> {
 
 /// A RETURNING list's references to the alias, `t.*` too, written as the table's name (`returning.rs` reads them so).
 fn returning(items: &mut Option<Vec<SelectItem>>, r: &mut Renamed) {
-    let _ = VisitMut::visit(items, r);
+    let _ = crate::walk::visit_mut(items, r);
     for item in items.iter_mut().flatten() {
         if let SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(n), _) = item {
             if n.0.len() == 1 && n.0[0].as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case(&r.alias)) {
@@ -845,17 +912,79 @@ fn row_in(e: &Expr) -> Result<Option<String>> {
     Ok(Some(format!("EXISTS (SELECT 1 FROM ({subquery}) AS __in({}) WHERE {})", cols.join(", "), same.join(" AND "))))
 }
 
-/// Postgres's names for types DataFusion doesn't read as written, as the names it reads.
-fn spell(t: &mut DataType) {
+/// DuckDB's names for types Pondra has under another name (each DuckDB's own alias: DATETIME is TIMESTAMP, …), by their
+/// lower-cased name as sqlparser leaves it (a type it doesn't know is `Custom`).
+const DUCKDB_TYPES: &[(&str, &str)] = &[("datetime", "TIMESTAMP"), ("bpchar", "VARCHAR"), ("logical", "BOOLEAN"), ("int1", "TINYINT"), ("short", "SMALLINT"),
+    ("long", "BIGINT"), ("utinyint", "TINYINT UNSIGNED"), ("usmallint", "SMALLINT UNSIGNED"), ("uinteger", "INT UNSIGNED"), ("ubigint", "BIGINT UNSIGNED"),
+    ("timestamp_s", "TIMESTAMP(0)"), ("timestamp_ms", "TIMESTAMP(3)"), ("timestamp_ns", "TIMESTAMP(9)"), ("blob", "BYTEA"),
+    ("varbinary", "BYTEA"), ("binary", "BYTEA")];
+
+/// Types Pondra doesn't have, refused by name (0A000) with what to write: (name, whose, what Pondra has).
+const OTHER_TYPES: &[(&str, &str, &str)] = &[("hugeint", "DuckDB's 128-bit integer", "DECIMAL(38, 0)"), ("uhugeint", "DuckDB's 128-bit integer", "DECIMAL(38, 0)"),
+    ("varint", "DuckDB's integer of any size", "DECIMAL(38, 0)"), ("bit", "a bit string in Postgres and DuckDB, and SQL Server's boolean", "BOOLEAN, or BYTEA for bits"),
+    ("bitstring", "DuckDB's bit string", "BYTEA"), ("varbit", "Postgres's bit string", "BYTEA"), ("timetz", "a time of day with a zone", "TIME, or TIMESTAMPTZ for an instant"),
+    ("datetime2", "SQL Server's", "TIMESTAMP"), ("smalldatetime", "SQL Server's", "TIMESTAMP"), ("datetimeoffset", "SQL Server's", "TIMESTAMPTZ"),
+    ("uniqueidentifier", "SQL Server's", "UUID"), ("money", "SQL Server's and Postgres's", "DECIMAL(19, 4)"), ("smallmoney", "SQL Server's", "DECIMAL(10, 4)"),
+    ("tinytext", "MySQL's", "TEXT"), ("mediumtext", "MySQL's", "TEXT"), ("longtext", "MySQL's", "TEXT"), ("tinyblob", "MySQL's", "BYTEA"),
+    ("mediumblob", "MySQL's", "BYTEA"), ("longblob", "MySQL's", "BYTEA"), ("year", "MySQL's", "SMALLINT")];
+
+/// Postgres's names for types DataFusion doesn't read as written, as the names it reads (and a few of BigQuery's and
+/// Snowflake's, and DuckDB's own aliases, `DUCKDB_TYPES`); a type Pondra doesn't have is refused by name (`OTHER_TYPES`).
+fn spell(t: &mut DataType) -> Result<()> {
+    let named = |name: &str| -> Result<Option<DataType>> {
+        let lower = name.to_lowercase();
+        if let Some((_, ours)) = DUCKDB_TYPES.iter().find(|(n, _)| *n == lower) {
+            return Ok(Some(datatype(ours)?));
+        }
+        if let Some((n, whose, ours)) = OTHER_TYPES.iter().find(|(n, _, _)| *n == lower) {
+            return Err(crate::codes::coded("0A000", format!("{} is {whose}: write {ours}", n.to_uppercase())));
+        }
+        Ok(None)
+    };
     let spelled = match t {
         DataType::CharacterVarying(n) | DataType::CharVarying(n) => Some(DataType::Varchar(n.take())),
         DataType::Character(n) => Some(DataType::Char(n.take())),
+        // (BigQuery's INT64 and FLOAT64, Snowflake's NUMBER(p, s) (38, 0 when not given) and BYTEINT)
+        DataType::Int64 => Some(DataType::BigInt(None)),
+        DataType::Float64 => Some(DataType::Double(ExactNumberInfo::None)),
+        DataType::Custom(name, args) if name.to_string().eq_ignore_ascii_case("number") => {
+            let at = |i: usize| args.get(i).and_then(|a| a.trim().parse::<u64>().ok());
+            Some(DataType::Decimal(ExactNumberInfo::PrecisionAndScale(at(0).unwrap_or(38), at(1).unwrap_or(0) as i64)))
+        }
+        DataType::Custom(name, args) if args.is_empty() && name.to_string().eq_ignore_ascii_case("byteint") => Some(DataType::TinyInt(None)),
+        // (DuckDB's names sqlparser reads as its own types, and the ones it leaves as written; Spark's and Snowflake's
+        // TIMESTAMP_NTZ is TIMESTAMP too, nearly free and common in their DDL)
+        DataType::Datetime(p) | DataType::TimestampNtz(p) => Some(DataType::Timestamp(*p, TimezoneInfo::None)),
+        DataType::Blob(_) | DataType::Binary(_) | DataType::Varbinary(_) => Some(DataType::Bytea),
+        DataType::UTinyInt => Some(DataType::TinyIntUnsigned(None)),
+        DataType::USmallInt => Some(DataType::SmallIntUnsigned(None)),
+        DataType::UBigInt => Some(DataType::BigIntUnsigned(None)),
+        DataType::HugeInt => named("hugeint")?,
+        DataType::UHugeInt => named("uhugeint")?,
+        DataType::Bit(_) => named("bit")?,
+        DataType::BitVarying(_) => named("varbit")?,
+        DataType::Time(_, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => named("timetz")?,
+        DataType::Custom(name, args) if args.is_empty() => named(&name.to_string())?,
         _ => None,
     };
     if let Some(s) = spelled {
         *t = s;
     }
+    Ok(())
 }
+
+/// A type as a routine's parameter or its RETURNS writes it (routines.rs keeps types as text), spelled as a column's
+/// type is: DuckDB's DATETIME is TIMESTAMP, and a type Pondra doesn't have is refused by name. A type `spell` leaves
+/// is kept as written.
+pub(crate) fn spelled(t: &str) -> Result<String> {
+    let Ok(mut ty) = datatype(t) else { return Ok(t.to_string()) };
+    let was = ty.clone();
+    spell(&mut ty)?;
+    Ok(if ty == was { t.to_string() } else { ty.to_string() })
+}
+
+/// The type `sql` names (`TIMESTAMP(3)`, `INT UNSIGNED`), as sqlparser reads it.
+fn datatype(sql: &str) -> Result<DataType> { Ok(Parser::new(&GenericDialect {}).try_with_sql(sql)?.parse_data_type()?) }
 
 /// A string literal written the way its type reads it, where DataFusion doesn't read Postgres's
 /// spelling: a timestamp's zone of one hour digit (`-0`, `+5`) gets two (`-00:00`, `+05:00`), since
@@ -892,7 +1021,7 @@ fn numeric(t: &DataType) -> bool { matches!(t, DataType::Numeric(_) | DataType::
 fn typed_literal(e: &mut Expr) -> Result<Option<String>> {
     match e {
         Expr::Cast { data_type, expr: inner, .. } => {
-            spell(data_type);
+            spell(data_type)?;
             match inner.as_mut() {
                 Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => literal(data_type, s),
                 // (`1E-7::numeric`: the number itself, as its plain digits)
@@ -906,7 +1035,7 @@ fn typed_literal(e: &mut Expr) -> Result<Option<String>> {
             }
         }
         Expr::TypedString(TypedString { data_type, value, .. }) => {
-            spell(data_type);
+            spell(data_type)?;
             let Value::SingleQuotedString(s) = &mut value.value else { return Ok(None) };
             literal(data_type, s)
         }
@@ -1023,15 +1152,38 @@ async fn default_values<H: crate::front::Host>(host: &H, s: &mut Statement) -> R
     Ok(true)
 }
 
+/// SQL Server's `SELECT TOP n …` (or `TOP (n)`) as `LIMIT n`, where the query is that select. A TOP in a UNION's branch
+/// is left to DataFusion's refusal.
+fn top(q: &mut Query) -> Result<()> {
+    let SetExpr::Select(s) = &mut *q.body else { return Ok(()) };
+    let Some(t) = s.top.take() else { return Ok(()) };
+    if t.with_ties || t.percent {
+        return Err(crate::codes::coded("0A000", format!("SELECT TOP … {}: not taken; LIMIT n", if t.percent { "PERCENT" } else { "WITH TIES" })));
+    }
+    let n = match t.quantity {
+        Some(TopQuantity::Expr(e)) => e,
+        Some(TopQuantity::Constant(c)) => expr(&c.to_string())?,
+        None => return Err(crate::codes::coded("42601", "SELECT TOP without a number: LIMIT n")),
+    };
+    match &mut q.limit_clause {
+        None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
+        Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
+        _ => return Err(crate::codes::coded("42601", "SELECT TOP and LIMIT together: write one of them (LIMIT n)")),
+    }
+    Ok(())
+}
+
 /// `FETCH FIRST n ROWS ONLY` as `LIMIT n`.
 fn fetch(q: &mut Query) -> Result<()> {
     let Some(f) = q.fetch.take() else { return Ok(()) };
-    ensure!(!f.with_ties && !f.percent, "FETCH FIRST … {}: not taken; LIMIT n", if f.percent { "PERCENT" } else { "WITH TIES" });
+    if f.with_ties || f.percent {
+        return Err(crate::codes::coded("0A000", format!("FETCH FIRST … {}: not taken; LIMIT n", if f.percent { "PERCENT" } else { "WITH TIES" })));
+    }
     let n = f.quantity.unwrap_or_else(|| expr("1").expect("a literal"));
     match &mut q.limit_clause {
         None => q.limit_clause = Some(LimitClause::LimitOffset { limit: Some(n), offset: None, limit_by: vec![] }),
         Some(LimitClause::LimitOffset { limit: l @ None, .. }) => *l = Some(n),
-        _ => bail!("FETCH FIRST and LIMIT together: write one of them (LIMIT n, or FETCH FIRST n ROWS ONLY)"),
+        _ => return Err(crate::codes::coded("42601", "FETCH FIRST and LIMIT together: write one of them (LIMIT n, or FETCH FIRST n ROWS ONLY)")),
     }
     Ok(())
 }
@@ -1072,7 +1224,7 @@ fn order_by_all(q: &mut Query, n: Option<usize>) -> Result<()> {
     Ok(())
 }
 
-fn function_name(f: &Function) -> String { f.name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.to_lowercase()).unwrap_or_default() }
+pub(crate) fn function_name(f: &Function) -> String { f.name.0.last().and_then(|p| p.as_ident()).map(|i| i.value.to_lowercase()).unwrap_or_default() }
 
 fn args(f: &Function) -> Vec<&Expr> {
     match &f.args {
@@ -1082,6 +1234,216 @@ fn args(f: &Function) -> Vec<&Expr> {
         }).collect(),
         _ => vec![],
     }
+}
+
+/// SQL Server's and Snowflake's `string_agg(x, sep) WITHIN GROUP (ORDER BY y)` (`listagg` too, which is `string_agg` here):
+/// the ORDER BY is the aggregate's own, as `string_agg(x, sep ORDER BY y)` takes it. Other aggregates keep their WITHIN GROUP.
+fn within_group(f: &mut Function) -> Result<()> {
+    let n = function_name(f);
+    if f.within_group.is_empty() || !matches!(n.as_str(), "string_agg" | "listagg") {
+        return Ok(());
+    }
+    let FunctionArguments::List(list) = &mut f.args else { return Err(crate::codes::coded("42601", format!("{n}(x, sep) WITHIN GROUP (ORDER BY y): the arguments come first"))) };
+    if list.clauses.iter().any(|c| matches!(c, FunctionArgumentClause::OrderBy(_))) {
+        return Err(crate::codes::coded("42601", format!("{n}: an ORDER BY among its arguments and one in WITHIN GROUP: write one of them")));
+    }
+    list.clauses.push(FunctionArgumentClause::OrderBy(std::mem::take(&mut f.within_group)));
+    f.name = ObjectName::from(vec![Ident::new("string_agg")]);
+    Ok(())
+}
+
+/// MySQL's and DuckDB's `group_concat(x [ORDER BY …] [SEPARATOR ', '])`: `string_agg(x, ', ' [ORDER BY …])`, its
+/// separator `,` when none is given.
+fn group_concat(f: &mut Function) {
+    if function_name(f) != "group_concat" {
+        return;
+    }
+    let FunctionArguments::List(l) = &mut f.args else { return };
+    if l.args.len() != 1 {
+        return;
+    }
+    let sep = l.clauses.iter().position(|c| matches!(c, FunctionArgumentClause::Separator(_))).map(|i| l.clauses.remove(i));
+    let sep = match sep {
+        Some(FunctionArgumentClause::Separator(v)) => Expr::Value(v),
+        _ => expr("','").expect("a literal"),
+    };
+    l.args.push(FunctionArg::Unnamed(FunctionArgExpr::Expr(sep)));
+    f.name = ObjectName::from(vec![Ident::new("string_agg")]);
+}
+
+/// BigQuery's `array_agg(x ORDER BY y LIMIT n)`: the first `n` of the list, `array_slice(array_agg(x ORDER BY y), 1, n)`.
+fn array_agg_limit(f: &mut Function) -> Option<String> {
+    if function_name(f) != "array_agg" {
+        return None;
+    }
+    let FunctionArguments::List(l) = &mut f.args else { return None };
+    let i = l.clauses.iter().position(|c| matches!(c, FunctionArgumentClause::Limit(_)))?;
+    let FunctionArgumentClause::Limit(n) = l.clauses.remove(i) else { return None };
+    Some(format!("array_slice({f}, 1, {n})"))
+}
+
+/// A string literal's text.
+fn string_of(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => Some(s),
+        _ => None,
+    }
+}
+
+/// A date part as DuckDB, Snowflake and SQL Server spell it (`'day'`, `dd`, `HOURS`): its name in `date_trunc`, or
+/// None for any other expression (a column holding the part is DuckDB's, not taken). A string that isn't a part is
+/// refused by name, and so are the letters the databases read apart: `m` (DuckDB's minute, SQL Server's month), `y`
+/// (DuckDB's year, SQL Server's day of the year) and `w` (DuckDB's week, SQL Server's weekday).
+pub(crate) fn part_word(e: &Expr, call: &str) -> Result<Option<&'static str>> {
+    let (w, word) = match e {
+        Expr::Identifier(i) if i.quote_style.is_none() => (i.value.to_lowercase(), true),
+        _ => match string_of(e) {
+            Some(s) => (s.trim().to_lowercase(), false),
+            None => return Ok(None),
+        },
+    };
+    let apart = |means: &str| crate::codes::coded("22023", format!("{call}: '{w}' is {means} in other databases: write the part's name (year, month, week, day, minute, …)"));
+    Ok(Some(match w.as_str() {
+        "m" => return Err(apart("DuckDB's minute and SQL Server's month")),
+        "y" => return Err(apart("DuckDB's year and SQL Server's day of the year")),
+        "w" => return Err(apart("DuckDB's week and SQL Server's weekday")),
+        "year" | "years" | "yr" | "yrs" | "yy" | "yyyy" => "year",
+        "quarter" | "quarters" | "q" | "qq" | "qtr" => "quarter",
+        "month" | "months" | "mon" | "mons" | "mm" => "month",
+        "week" | "weeks" | "wk" | "wks" | "ww" => "week",
+        "day" | "days" | "d" | "dd" | "dayofmonth" => "day",
+        "hour" | "hours" | "h" | "hh" | "hr" | "hrs" => "hour",
+        "minute" | "minutes" | "mi" | "min" | "mins" | "n" => "minute",
+        "second" | "seconds" | "s" | "ss" | "sec" | "secs" => "second",
+        "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => "millisecond",
+        "microsecond" | "microseconds" | "us" | "usec" | "usecs" | "mcs" => "microsecond",
+        _ if word => return Ok(None),
+        _ => return Err(crate::codes::coded("22023", format!("{call}: '{w}' isn't a date part here: year, quarter, month, week, day, hour, minute, second, millisecond or microsecond"))),
+    }))
+}
+
+/// Whose format codes a `strftime` or `strptime` takes.
+#[derive(Clone, Copy, PartialEq)]
+enum Codes {
+    DuckDb,
+    Sqlite,
+}
+use Codes::{DuckDb, Sqlite};
+
+/// A format in DuckDB's codes (or SQLite's) as chrono's, which `to_char` and `to_timestamp` read. Most are the same;
+/// DuckDB's `%f` is microseconds, `%g` milliseconds and `%n` nanoseconds (chrono's `%6f`, `%3f`, `%9f`), its `%c` and
+/// `%x` ISO's date and time; SQLite's `%f` is the seconds with their milliseconds. A code the other database hasn't is
+/// refused by name (22023), as DuckDB refuses it.
+fn strftime_codes(f: &str, from: Codes, call: &str) -> Result<String> {
+    const SAME: &str = "aAwdbhBmyYHIpMSjUWXGVuzZ";
+    const SQLITE_TOO: &str = "eFkPlRsTg";
+    let (mut out, mut chars) = (String::new(), f.chars().peekable());
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let dash = chars.next_if_eq(&'-').is_some();
+        let k = chars.next().unwrap_or('%');
+        let code = match (from, k) {
+            (_, '%') => "%%".to_string(),
+            (DuckDb, 'f') => "%6f".into(),
+            (DuckDb, 'g') => "%3f".into(),
+            (DuckDb, 'n') => "%9f".into(),
+            (DuckDb, 'c') => "%Y-%m-%d %H:%M:%S".into(),
+            (DuckDb, 'x') => "%Y-%m-%d".into(),
+            (Sqlite, 'f') => "%S%.3f".into(),
+            (_, k) if SAME.contains(k) || (from == Sqlite && SQLITE_TOO.contains(k)) => format!("%{}{k}", if dash { "-" } else { "" }),
+            (_, k) => {
+                let whose = if from == DuckDb { "DuckDB's" } else { "SQLite's" };
+                return Err(crate::codes::coded("22023", format!("{call}: %{}{k} isn't one of {whose} format codes (%Y %m %d %H %M %S %f, …)", if dash { "-" } else { "" })));
+            }
+        };
+        out += &code;
+    }
+    Ok(out)
+}
+
+/// DuckDB's `strftime(ts, '%Y-%m')` (SQLite's `strftime('%Y', ts)` too), `strptime(text, format)`, `epoch(ts)` and
+/// `regexp_extract(s, pattern[, group[, flags]])` (the group's text, '' with no match); `date_diff(part, a, b)` (also
+/// `datediff`: Snowflake's and SQL Server's), the part boundaries from `a` to `b` as DuckDB counts them (a week is 7 of
+/// the days between, whole ones); `dateadd(part, n, ts)` (Snowflake's and SQL Server's, and `timestampadd`); `date_add(ts, INTERVAL …)` and
+/// `date_sub` (DuckDB's and MySQL's). The text each is, or None: Spark's own `date_add(d, n)` and `datediff(end, start)`
+/// stay as they are, `date_add`'s days as an INT (a literal is a BIGINT, which Spark's doesn't take).
+fn dates(name: &str, a: &[&Expr]) -> Result<Option<String>> {
+    Ok(Some(match (name, a.len()) {
+        // (each format's codes as chrono's: DuckDB's `%f` is microseconds, SQLite's seconds with milliseconds)
+        ("strftime", 2) => match (string_of(a[0]), string_of(a[1])) {
+            (Some(f), None) if f.contains('%') => format!("to_char({}, {})", a[1], quote(&strftime_codes(f, Sqlite, name)?)),
+            (_, Some(f)) => format!("to_char({}, {})", a[0], quote(&strftime_codes(f, DuckDb, name)?)),
+            _ => format!("to_char({}, {})", a[0], a[1]),
+        },
+        ("strptime", 2) => match string_of(a[1]) {
+            Some(f) => format!("to_timestamp({}, {})", a[0], quote(&strftime_codes(f, DuckDb, name)?)),
+            None => format!("to_timestamp({}, {})", a[0], a[1]),
+        },
+        ("epoch", 1) => format!("date_part('epoch', {})", a[0]),
+        ("regexp_extract", 2..=4) => {
+            let group = match a.get(2) {
+                None => 1,
+                Some(Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. })) => match n.parse::<u64>() {
+                    Ok(g) => g + 1,
+                    Err(_) => return Ok(None),
+                },
+                Some(_) => return Ok(None), // (DuckDB's list of names for a struct: not taken)
+            };
+            let pattern = match string_of(a[1]) {
+                Some(p) => quote(&format!("({p})")), // (the whole match is the first group: the pattern's own come after)
+                None => format!("concat('(', {}, ')')", a[1]),
+            };
+            let flags = a.get(3).map(|f| format!(", {f}")).unwrap_or_default();
+            format!("coalesce(regexp_match({s}, {pattern}{flags})[{group}], CASE WHEN ({s}) IS NOT NULL THEN '' END)", s = a[0])
+        }
+        ("date_diff" | "datediff", 3) => {
+            let Some(part) = part_word(a[0], name)? else { return Ok(None) };
+            // (the part a bare word: Snowflake's and SQL Server's DATEDIFF, which count week boundaries, from Monday in
+            // Snowflake and from Sunday in SQL Server; DuckDB's `date_diff('week', …)` counts whole weeks)
+            if part == "week" && matches!(a[0], Expr::Identifier(i) if i.quote_style.is_none()) {
+                return Err(crate::codes::coded("22023", format!("{name}(week, a, b) counts Sundays crossed in SQL Server and Mondays in Snowflake, so it isn't guessed: date_diff('week', a, b) counts whole weeks, as DuckDB does, and date_diff('day', date_trunc('week', a), date_trunc('week', b)) / 7 the Mondays crossed")));
+            }
+            let (from, to) = (a[1], a[2]);
+            let at = |p: &str, x: &Expr| format!("date_part('{p}', {x})");
+            let n = match part {
+                "year" => format!("{} - {}", at("year", to), at("year", from)),
+                "quarter" => format!("({} * 4 + {}) - ({} * 4 + {})", at("year", to), at("quarter", to), at("year", from), at("quarter", from)),
+                "month" => format!("({} * 12 + {}) - ({} * 12 + {})", at("year", to), at("month", to), at("year", from), at("month", from)),
+                _ => {
+                    let scale = match part {
+                        "day" | "week" => " / 86400",
+                        "hour" => " / 3600",
+                        "minute" => " / 60",
+                        "millisecond" => " * 1000",
+                        "microsecond" => " * 1000000",
+                        _ => "",
+                    };
+                    let unit = if part == "week" { "day" } else { part };
+                    let n = format!("round((date_part('epoch', date_trunc('{unit}', {to})) - date_part('epoch', date_trunc('{unit}', {from}))){scale})");
+                    match part {
+                        "week" => format!("trunc({n} / 7)"), // (whole weeks of the days between, as DuckDB counts them)
+                        _ => n,
+                    }
+                }
+            };
+            format!("CAST({n} AS BIGINT)")
+        }
+        ("dateadd" | "date_add" | "timestampadd" | "timeadd", 3) => {
+            let Some(part) = part_word(a[0], name)? else { return Ok(None) };
+            let (n, one) = match part {
+                "quarter" => (format!("CAST({} AS BIGINT) * 3", a[1]), "month"),
+                "week" => (format!("CAST({} AS BIGINT) * 7", a[1]), "day"),
+                p => (format!("CAST({} AS BIGINT)", a[1]), p),
+            };
+            format!("({}) + {n} * INTERVAL '1 {one}'", a[2])
+        }
+        ("date_add" | "date_sub", 2) if matches!(a[1], Expr::Interval(_)) => format!("({}) {} {}", a[0], if name == "date_add" { "+" } else { "-" }, a[1]),
+        ("date_add" | "date_sub", 2) if !matches!(a[1], Expr::Cast { .. }) => format!("{name}({}, CAST({} AS INT))", a[0], a[1]),
+        _ => return Ok(None),
+    }))
 }
 
 /// One expression's own forms.
@@ -1097,7 +1459,27 @@ fn expression(e: &mut Expr) -> Result<()> {
         *e = expr(&text)?;
         return Ok(());
     }
+    if let Some(text) = json_arrow(e)? {
+        *e = expr(&text)?;
+        return Ok(());
+    }
     match e {
+        // (Postgres's `N'…'`, the standard's national character string: a string, as Postgres reads it)
+        Expr::Value(ValueWithSpan { value: v @ Value::NationalStringLiteral(_), .. }) => {
+            let Value::NationalStringLiteral(s) = std::mem::replace(v, Value::Null) else { unreachable!() };
+            *v = Value::SingleQuotedString(s);
+        }
+        // (Snowflake's `payload:page::STRING`: DataFusion can't plan it, and Pondra's JSON is text, so it is refused with
+        // the forms that read it: `->>` for a key, json_extract_string for a path. The path is written as it was)
+        Expr::JsonAccess { value, path } => {
+            let steps: String = path.path.iter().map(json_step).collect();
+            let first = match path.path.first() {
+                Some(JsonPathElem::Dot { key, .. }) => key.clone(),
+                Some(elem) => format!("${}", json_step(elem)),
+                None => String::new(),
+            };
+            return Err(crate::codes::coded("0A000", format!("{value}{path} is Snowflake's path: Pondra's JSON is text, read with {value}->>'{first}' or json_extract_string({value}, '${steps}')")));
+        }
         // `({'a': 1}).a`, `f(x).a`: a field of a struct that isn't a column, as `…['a']`
         Expr::CompoundFieldAccess { root, access_chain } if !matches!(**root, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) => {
             for a in access_chain.iter_mut() {
@@ -1106,9 +1488,41 @@ fn expression(e: &mut Expr) -> Result<()> {
                 }
             }
         }
+        // (SQL Server's `CONVERT(INT, x)` and MySQL's `CONVERT(x, SIGNED)` put the type on either side, so neither is
+        // guessed: CAST names it one way. A `TRY_CONVERT(type, 'literal')` the parser reads as a call is `dialect_fns`')
+        Expr::Convert { is_try, .. } => {
+            let (name, cast) = if *is_try { ("TRY_CONVERT", "TRY_CAST") } else { ("CONVERT", "CAST") };
+            return Err(crate::codes::coded("0A000", format!("{name}(…) puts the type first in SQL Server and last in MySQL, so it isn't guessed: write {cast}(x AS type)")));
+        }
         Expr::Function(f) => {
+            // (BigQuery's `SAFE.f(…)`, its NULL-on-error prefix, which Pondra doesn't have: a name of two parts, the first `safe`)
+            if let [first, last] = f.name.0.as_slice() {
+                if first.as_ident().is_some_and(|i| i.value.eq_ignore_ascii_case("safe")) {
+                    let name = last.as_ident().map(|i| i.value.to_uppercase()).unwrap_or_default();
+                    return Err(crate::codes::coded("0A000", format!("SAFE.{name}(…) is BigQuery's NULL-on-error prefix, which Pondra doesn't have: TRY_CAST(x AS type) is NULL where a cast fails, and SAFE_DIVIDE(a, b) where b is 0")));
+                }
+            }
+            within_group(f)?;
+            group_concat(f);
+            if let Some(text) = array_agg_limit(f) {
+                *e = expr(&text)?;
+                return Ok(());
+            }
             let n = function_name(f);
             let a = args(f);
+            // (other databases' names for Pondra's functions, a plain call: unqualified (BigQuery's `SAFE.` and a schema's own
+            // function are left as written), no OVER, FILTER, DISTINCT or named argument)
+            let plain = f.name.0.len() == 1 && f.over.is_none() && f.filter.is_none() && match &f.args {
+                FunctionArguments::List(l) => l.args.len() == a.len() && l.duplicate_treatment.is_none() && l.clauses.is_empty(),
+                FunctionArguments::None => true,
+                FunctionArguments::Subquery(_) => false,
+            };
+            if plain {
+                if let Some(text) = crate::dialect_fns::call(&n, &a)? {
+                    *e = expr(&text)?;
+                    return Ok(());
+                }
+            }
             match (n.as_str(), a.len()) {
                 ("max_by" | "arg_max" | "min_by" | "arg_min", 2) => {
                     ensure!(f.over.is_none(), "{n}(…) OVER (…): first_value(a) OVER (… ORDER BY b DESC) is the window's form");
@@ -1119,11 +1533,19 @@ fn expression(e: &mut Expr) -> Result<()> {
                     };
                     *e = expr(&format!("first_value({x} ORDER BY {by} {} NULLS LAST) FILTER (WHERE {only})", if desc { "DESC" } else { "ASC" }))?;
                 }
-                ("string_split" | "str_split", 2) => f.name = ObjectName::from(vec![Ident::new("string_to_array")]),
+                ("string_split" | "str_split" | "split", 2) => f.name = ObjectName::from(vec![Ident::new("string_to_array")]),
+                // (DuckDB's dates and patterns, and the part-first DATEDIFF and DATEADD of Snowflake and SQL Server: `dates`)
+                ("strftime" | "strptime" | "epoch" | "regexp_extract" | "date_diff" | "datediff" | "dateadd" | "date_add" | "date_sub" | "timestampadd" | "timeadd", _) => {
+                    if let Some(text) = dates(&n, &a)? {
+                        *e = expr(&text)?;
+                    }
+                }
                 ("list", 1) => f.name = ObjectName::from(vec![Ident::new("array_agg")]), // (DuckDB's name for it)
                 ("apply" | "list_apply" | "array_apply", 2) => f.name = ObjectName::from(vec![Ident::new("array_transform")]),
                 ("filter", 2) if matches!(a[1], Expr::BinaryOp { op: BinaryOperator::Arrow, .. }) => f.name = ObjectName::from(vec![Ident::new("array_filter")]),
-                ("json_extract" | "json_extract_string" | "json_extract_path_text" | "json_value", 2) => {
+                ("transform", 2) if matches!(a[1], Expr::BinaryOp { op: BinaryOperator::Arrow, .. }) => f.name = ObjectName::from(vec![Ident::new("array_transform")]), // (Spark's `transform(arr, x -> …)`)
+                // (Spark's get_json_object and BigQuery's json_extract_scalar give a string, as json_as_text does)
+                ("json_extract" | "json_extract_string" | "json_extract_path_text" | "json_value" | "get_json_object" | "json_extract_scalar", 2) => {
                     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = a[1] else { bail!("{n}(json, path): the path is a literal, such as '$.a.b'; json_get(json, key, …) takes expressions") };
                     let keys = json_path(path)?.join(", ");
                     let call = if n == "json_extract" { "json_get_json" } else { "json_as_text" };
@@ -1163,7 +1585,7 @@ fn expression(e: &mut Expr) -> Result<()> {
 /// a select's names keep its text). DataFusion plans a literal's elements with no outer columns, CTEs or
 /// parameter types (`sql_array_literal`); a call with them is planned with the query's own, as any call is.
 fn arrays(s: &mut Statement) {
-    let _ = visit_expressions_mut(s, |e| {
+    let _ = crate::walk::visit_expressions_mut(s, |e| {
         if let Expr::Array(Array { elem, .. }) = e {
             *e = make_array(std::mem::take(elem)); // (post-order: a nested literal is already a call)
         }
@@ -1212,6 +1634,36 @@ fn json_path(path: &str) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// `payload->>'$.a.b'` (DuckDB's and MySQL's JSONPath after `->>`) as `json_as_text(payload, 'a', 'b')`; after `->` it is
+/// `json_get_json`, which keeps the JSON, and `'$'` alone is the value itself. A key that isn't a path (Postgres's
+/// `->> 'a'`, or a key such as MongoDB's `'$oid'` or `'$ref'`: `$` then neither `.` nor `[`) is None, as it is.
+fn json_arrow(e: &Expr) -> Result<Option<String>> {
+    let Expr::BinaryOp { left, op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow), right } = e else { return Ok(None) };
+    let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = &**right else { return Ok(None) };
+    if !(path == "$" || path.starts_with("$.") || path.starts_with("$[")) {
+        return Ok(None);
+    }
+    let keys = json_path(path)?.join(", ");
+    let text = match (keys.is_empty(), matches!(op, BinaryOperator::LongArrow)) {
+        (true, false) => left.to_string(),
+        (true, true) => format!("json_as_text({left})"),
+        (false, false) => format!("json_get_json({left}, {keys})"),
+        (false, true) => format!("json_as_text({left}, {keys})"),
+    };
+    Ok(Some(text))
+}
+
+/// One step of a Snowflake path as a JSON path writes it: `.key`, `[n]`, `['key']`.
+fn json_step(elem: &JsonPathElem) -> String {
+    match elem {
+        JsonPathElem::Dot { key, .. } => format!(".{key}"),
+        JsonPathElem::Bracket { key } | JsonPathElem::ColonBracket { key } => match key {
+            Expr::Value(ValueWithSpan { value: Value::Number(n, _), .. }) => format!("[{n}]"),
+            _ => format!("['{}']", key.to_string().trim_matches('\'')),
+        },
+    }
+}
+
 /// A table factor's `TABLESAMPLE` / `SAMPLE`, which DataFusion ignores, as a subquery that samples.
 fn table_sample(t: &mut TableFactor) -> Result<()> {
     let TableFactor::Table { sample, alias, name, .. } = t else { return Ok(()) };
@@ -1219,7 +1671,9 @@ fn table_sample(t: &mut TableFactor) -> Result<()> {
         Some(TableSampleKind::BeforeTableAlias(s) | TableSampleKind::AfterTableAlias(s)) => s,
         None => return Ok(()),
     };
-    ensure!(s.seed.is_none() && s.bucket.is_none() && s.offset.is_none(), "a sample with a seed, a bucket or an offset isn't taken");
+    if s.seed.is_some() || s.bucket.is_some() || s.offset.is_some() {
+        return Err(crate::codes::coded("0A000", "a sample with a seed, a bucket or an offset isn't taken"));
+    }
     let q = s.quantity.context("TABLESAMPLE (n PERCENT) or (n ROWS)")?;
     let rows = matches!(q.unit, Some(TableSampleUnit::Rows));
     let named = alias.take().unwrap_or_else(|| TableAlias { explicit: true, name: name.0.last().and_then(|p| p.as_ident()).cloned().unwrap_or_else(|| Ident::new("t")), columns: vec![], at: None });
@@ -1313,7 +1767,7 @@ fn pivot(t: &TableFactor, found: Option<Vec<Column>>) -> Result<TableFactor> {
     };
     let mut used: Vec<String> = vec![col.to_string()];
     for a in aggregate_functions {
-        let _ = visit_expressions(&a.expr, |e| {
+        let _ = crate::walk::visit_expressions(&a.expr, |e| {
             if let Expr::Identifier(_) | Expr::CompoundIdentifier(_) = e {
                 let e = e.to_string();
                 if !used.contains(&e) {
@@ -1424,7 +1878,7 @@ fn reference(c: &Column, cols: &[Column]) -> String {
 }
 
 fn has_columns(s: &Select) -> bool {
-    let found = |e: &Expr| visit_expressions(e, |e| match columns_call(e) {
+    let found = |e: &Expr| crate::walk::visit_expressions(e, |e| match columns_call(e) {
         Some(_) => ControlFlow::Break(()),
         None => ControlFlow::Continue(()),
     }).is_break();
@@ -1438,7 +1892,7 @@ fn has_columns(s: &Select) -> bool {
 fn substituted(e: &Expr, col: &str) -> Result<Expr> {
     let mut e = e.clone();
     let col = expr(col)?;
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if columns_call(x).is_some() {
             *x = col.clone();
         }
@@ -1452,7 +1906,7 @@ fn substituted(e: &Expr, col: &str) -> Result<Expr> {
 fn expand_columns(s: &mut Select, cols: &[Column]) -> Result<()> {
     let pattern_in = |e: &Expr| {
         let mut p = None;
-        let _ = visit_expressions(e, |x| {
+        let _ = crate::walk::visit_expressions(e, |x| {
             if let Some(found) = columns_call(x) {
                 p = Some(found);
                 return ControlFlow::Break(());
@@ -1572,7 +2026,7 @@ fn aliases(s: &Select) -> HashMap<String, Expr> {
         return HashMap::new();
     }
     let mut used = HashMap::new();
-    let _ = visit_expressions(w, |e| {
+    let _ = crate::walk::visit_expressions(w, |e| {
         if let Expr::Identifier(i) = e {
             if let Some(x) = named.get(&i.value.to_lowercase()).filter(|_| i.quote_style.is_none()) {
                 used.insert(i.value.to_lowercase(), (*x).clone());
@@ -1612,7 +2066,7 @@ fn with_aliases(s: &mut Select, cols: &[Column]) -> Result<()> {
         }
     }
     if let Some(w) = &mut s.selection {
-        let _ = w.visit(&mut Put(&used, 0));
+        let _ = crate::walk::visit_mut(w, &mut Put(&used, 0));
     }
     Ok(())
 }
@@ -1674,7 +2128,7 @@ pub fn lambdas(sql: &str) -> Option<datafusion::sql::parser::Statement> {
     let mut stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let [stmt @ Statement::Query(_)] = stmts.as_mut_slice() else { return None };
     let mut found = false;
-    let _ = visit_expressions_mut(stmt, |e| {
+    let _ = crate::walk::visit_expressions_mut(stmt, |e| {
         if let Expr::Function(f) = e {
             if HIGHER.contains(&function_name(f).as_str()) {
                 if let FunctionArguments::List(l) = &mut f.args {
@@ -1743,6 +2197,123 @@ mod tests {
             "ALTER TABLE t SET TBLPROPERTIES ('write.delete.mode' = 'merge-on-read', 'a.b' = '1', c = 2)"
         );
         assert_eq!(text("SELECT tblproperties.x FROM tblproperties").unwrap(), "SELECT tblproperties.x FROM tblproperties");
+        // (SQL Server's @@version at a code position, any case; not in a string or a comment; another @@x refused by name)
+        assert_eq!(text("SELECT @@VERSION AS version, @@Version").unwrap(), "SELECT version() AS version, version()");
+        assert_eq!(text("SELECT '@@x', 1 -- @@y").unwrap(), "SELECT '@@x', 1 -- @@y");
+        assert!(text("SELECT @@spid").unwrap_err().to_string().contains("@@spid is SQL Server's: Pondra's settings are SHOW spid"));
+    }
+
+    #[test]
+    fn top_is_a_name_unless_it_is_sql_servers_top() {
+        // (a LATERAL named top is an alias: quoted, so it parses; SELECT TOP n, TOP (n) and TOP … PERCENT are left as they are)
+        let lateral = "SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) top ON true";
+        let read = text(lateral).unwrap();
+        assert!(read.contains(r#""top".amount"#) && read.contains(r#") "top" ON true"#), "{read}");
+        assert!(Parser::parse_sql(&GenericDialect {}, &read).is_ok());
+        assert_eq!(text("SELECT TOP 3 * FROM t").unwrap(), "SELECT TOP 3 * FROM t");
+        assert_eq!(text("SELECT DISTINCT TOP (2) x FROM t").unwrap(), "SELECT DISTINCT TOP (2) x FROM t");
+        assert_eq!(text("SELECT TOP 10 PERCENT x FROM t").unwrap(), "SELECT TOP 10 PERCENT x FROM t");
+    }
+
+    #[test]
+    fn duckdbs_dates_and_patterns_and_the_part_first_datediff() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("strftime(created_at, '%Y-%m-%d')").unwrap(), "to_char(created_at, '%Y-%m-%d')");
+        assert_eq!(call("strftime('%Y', created_at)").unwrap(), "to_char(created_at, '%Y')");
+        assert_eq!(call("strptime('01/03/2026', '%d/%m/%Y')").unwrap(), "to_timestamp('01/03/2026', '%d/%m/%Y')");
+        assert_eq!(call("epoch(ts)").unwrap(), "date_part('epoch', ts)");
+        assert_eq!(call("split(tags, ',')").unwrap(), "string_to_array(tags, ',')");
+        assert_eq!(call("regexp_extract(email, '@(.+)$', 1)").unwrap(), "coalesce(regexp_match(email, '(@(.+)$)')[2], CASE WHEN (email) IS NOT NULL THEN '' END)");
+        assert_eq!(call("regexp_extract(email, p)").unwrap(), "coalesce(regexp_match(email, concat('(', p, ')'))[1], CASE WHEN (email) IS NOT NULL THEN '' END)");
+        assert!(call("date_diff('week', a, b)").unwrap().starts_with("CAST(trunc(round((date_part('epoch', date_trunc('day', b))"));
+        assert_eq!(call("date_diff('day', a, b)").unwrap(), "CAST(round((date_part('epoch', date_trunc('day', b)) - date_part('epoch', date_trunc('day', a))) / 86400) AS BIGINT)");
+        assert_eq!(call("DATEDIFF(month, a, b)").unwrap(), "CAST((date_part('year', b) * 12 + date_part('month', b)) - (date_part('year', a) * 12 + date_part('month', a)) AS BIGINT)");
+        assert_eq!(call("DATEADD(week, 2, ts)").unwrap(), "(ts) + CAST(2 AS BIGINT) * 7 * INTERVAL '1 day'");
+        assert_eq!(call("date_add(d, INTERVAL 7 DAY)").unwrap(), "(d) + INTERVAL 7 DAY");
+        assert_eq!(call("date_sub(d, INTERVAL '1 month')").unwrap(), "(d) - INTERVAL '1 month'");
+        // (Spark's own: its days as an INT, once; a column holding the part is left as written)
+        assert_eq!(call("date_add(d, 7)").unwrap(), "date_add(d, CAST(7 AS INT))");
+        assert_eq!(call("date_add(d, CAST(7 AS INT))").unwrap(), "date_add(d, CAST(7 AS INT))");
+        assert_eq!(call("datediff(b, a)").unwrap(), "datediff(b, a)");
+        assert_eq!(call("date_diff(unit, a, b)").unwrap(), "date_diff(unit, a, b)");
+        let m = call("date_diff('m', a, b)").unwrap_err();
+        assert!(crate::codes::of(&m) == "22023" && m.to_string().contains("'m' is DuckDB's minute and SQL Server's month"), "{m:#}");
+        assert!(call("DATEDIFF(y, a, b)").unwrap_err().to_string().contains("'y' is DuckDB's year and SQL Server's day of the year"));
+        assert!(call("date_diff('fortnight', a, b)").unwrap_err().to_string().contains("'fortnight' isn't a date part here"));
+        assert!(wanted("SELECT strftime(ts, '%Y') FROM t") && wanted("SELECT DATEDIFF (day, a, b) FROM t") && !wanted("SELECT epoch FROM t"));
+        // (11-01 audit M6, M7: DuckDB's and SQLite's codes as chrono's; a part-first week refused by name)
+        assert_eq!(call("strftime(ts, '%S.%f %g %n %c|%x %-d %%')").unwrap(), "to_char(ts, '%S.%6f %3f %9f %Y-%m-%d %H:%M:%S|%Y-%m-%d %-d %%')");
+        assert_eq!(call("strftime('%H:%M:%f %s', ts)").unwrap(), "to_char(ts, '%H:%M:%S%.3f %s')");
+        assert_eq!(call("strptime(s, '%d.%m.%Y %H:%M:%S.%f')").unwrap(), "to_timestamp(s, '%d.%m.%Y %H:%M:%S.%6f')");
+        let f = call("strftime(ts, '%F')").unwrap_err();
+        assert!(crate::codes::of(&f) == "22023" && f.to_string().contains("%F isn't one of DuckDB's format codes"), "{f:#}");
+        let w = call("DATEDIFF(week, a, b)").unwrap_err();
+        assert!(crate::codes::of(&w) == "22023" && w.to_string().contains("Sundays crossed in SQL Server and Mondays in Snowflake"), "{w:#}");
+        assert!(call("datediff('week', a, b)").is_ok()); // (DuckDB's, the part a string)
+    }
+
+    #[test]
+    fn top_group_concat_array_agg_limit_and_other_databases_types() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("GROUP_CONCAT(status ORDER BY id SEPARATOR ', ')").unwrap(), "string_agg(status, ', ' ORDER BY id)");
+        assert_eq!(call("group_concat(status)").unwrap(), "string_agg(status, ',')");
+        assert_eq!(call("ARRAY_AGG(x ORDER BY y DESC LIMIT 2)").unwrap(), "array_slice(ARRAY_AGG(x ORDER BY y DESC), 1, 2)");
+        assert_eq!(call("CAST(x AS INT64)").unwrap(), "CAST(x AS BIGINT)");
+        assert_eq!(call("x::NUMBER(10,2)").unwrap(), "x::DECIMAL(10,2)");
+        assert_eq!(call("CAST(x AS NUMBER)").unwrap(), "CAST(x AS DECIMAL(38,0))");
+        assert_eq!(call("CAST(x AS FLOAT64)").unwrap(), "CAST(x AS DOUBLE)");
+        let mut q = query("SELECT TOP 3 id FROM t ORDER BY id DESC").unwrap();
+        top(&mut q).unwrap();
+        assert_eq!(q.to_string(), "SELECT id FROM t ORDER BY id DESC LIMIT 3");
+        let mut q = query("SELECT TOP (2) PERCENT id FROM t").unwrap();
+        let e = top(&mut q).unwrap_err();
+        assert!(e.to_string().contains("PERCENT: not taken; LIMIT n") && crate::codes::of(&e) == "0A000", "{e:#}"); // (11-01 audit L1: coded, not XX000)
+        let mut q = query("SELECT TOP 2 id FROM t LIMIT 3").unwrap();
+        assert_eq!(crate::codes::of(&top(&mut q).unwrap_err()), "42601");
+        assert!(wanted("SELECT TOP 3 id FROM t") && wanted("SELECT CAST(x AS INT64)") && wanted("SELECT GROUP_CONCAT(s) FROM t") && !wanted("SELECT topping FROM t"));
+    }
+
+    #[test]
+    fn duckdbs_type_names_are_pondras_and_others_are_refused_by_name() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("CAST(x AS DATETIME)").unwrap(), "CAST(x AS TIMESTAMP)");
+        // (looked for only where a type stands: `year` or `money` as a column's name is no reason to parse)
+        assert!(!wanted("SELECT year, long, short, money FROM t WHERE bit = 1"));
+        assert!(wanted("SELECT CAST(x AS ubigint) FROM t") && wanted("SELECT x::Datetime FROM t") && wanted("SELECT DATETIME '2026-01-01 10:00'"));
+        assert!(wanted("CREATE TABLE t (a INT, b MONEY)") && wanted("SELECT 1; ALTER TABLE t ADD COLUMN y HUGEINT") && wanted("-- made\nCREATE TABLE t (y year)"));
+        assert_eq!(call("CAST(x AS UBIGINT)").unwrap(), "CAST(x AS BIGINT UNSIGNED)");
+        assert_eq!(call("CAST(x AS UINTEGER)").unwrap(), "CAST(x AS INT UNSIGNED)");
+        assert_eq!(call("CAST(x AS TIMESTAMP_MS)").unwrap(), "CAST(x AS TIMESTAMP(3))");
+        assert_eq!(call("x::BLOB").unwrap(), "x::BYTEA");
+        assert_eq!(call("CAST(x AS LOGICAL)").unwrap(), "CAST(x AS BOOLEAN)");
+        let e = call("CAST(x AS HUGEINT)").unwrap_err();
+        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("HUGEINT is DuckDB's 128-bit integer: write DECIMAL(38, 0)"), "{e:#}");
+        assert!(call("CAST(x AS DATETIME2)").unwrap_err().to_string().contains("DATETIME2 is SQL Server's: write TIMESTAMP"));
+        assert!(call("CAST(x AS TIME WITH TIME ZONE)").unwrap_err().to_string().contains("TIMETZ is a time of day with a zone"));
+        assert!(wanted("CREATE TABLE t (a UBIGINT, b DATETIME)") && wanted("SELECT CAST(x AS hugeint)") && !wanted("SELECT datetimes FROM t"));
+    }
+
+    #[test]
+    fn within_group_is_the_aggregates_own_order() {
+        // (SQL Server's and Snowflake's string_agg and listagg WITHIN GROUP: the ORDER BY moves into the arguments, as
+        // string_agg(x, sep ORDER BY y) has it; another aggregate keeps its WITHIN GROUP)
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        assert_eq!(call("STRING_AGG(status, ', ') WITHIN GROUP (ORDER BY id)").unwrap(), "string_agg(status, ', ' ORDER BY id)");
+        assert_eq!(call("LISTAGG(status, ',') WITHIN GROUP (ORDER BY id DESC)").unwrap(), "string_agg(status, ',' ORDER BY id DESC)");
+        assert_eq!(call("percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)").unwrap(), "percentile_cont(0.5) WITHIN GROUP (ORDER BY amount)");
+        assert!(wanted("SELECT STRING_AGG(status, ', ') WITHIN GROUP (ORDER BY id) FROM orders"));
     }
 
     #[test]
@@ -1778,6 +2349,12 @@ mod tests {
         assert_eq!(backslash_pattern("a\\b", Some('/')).unwrap(), "a\\\\b");
         assert_eq!(backslash_pattern("a\\b", None).unwrap(), "a\\\\b");
         assert!(backslash_pattern("a/", Some('/')).is_err());
+        // (Postgres's N'…' is a string; the gate sees it after a space or a bracket, and not inside a word or a string)
+        let mut n = expr("N'gift'").unwrap();
+        expression(&mut n).unwrap();
+        assert_eq!(n.to_string(), "'gift'");
+        assert!(wanted("INSERT INTO t VALUES (1, N'gift')") && wanted("SELECT n'x'"));
+        assert!(!wanted("SELECT 'ann' AS x") && !wanted("SELECT 'it''s' AS x"));
     }
 
     #[test]
@@ -1823,6 +2400,35 @@ mod tests {
         assert_eq!(json_path("/a/1").unwrap(), ["'a'", "1"]);
         assert_eq!(json_path("$").unwrap(), Vec::<String>::new());
         assert!(json_path("$.a[*]").is_err());
+    }
+
+    #[test]
+    fn json_arrows_read_jsonpaths_and_other_databases_names_are_refused() {
+        let call = |sql: &str| {
+            let mut e = expr(sql).unwrap();
+            expression(&mut e).map(|_| e.to_string())
+        };
+        // (DuckDB's and MySQL's JSONPath after the arrows; Postgres's key after `->>` is as it was)
+        assert_eq!(call("j->>'$.a.b'").unwrap(), "json_as_text(j, 'a', 'b')");
+        assert_eq!(call("j->'$[0].x'").unwrap(), "json_get_json(j, 0, 'x')");
+        assert_eq!(call("j->>'$'").unwrap(), "json_as_text(j)");
+        assert_eq!(call("j->'$'").unwrap(), "j");
+        assert_eq!(call("j->>'page'").unwrap(), "j ->> 'page'");
+        assert_eq!(call("doc->'_id'->>'$oid'").unwrap(), "doc -> '_id' ->> '$oid'"); // (a key starting with `$`, MongoDB's: Postgres's key)
+        assert_eq!(call("s->>'$ref'").unwrap(), "s ->> '$ref'");
+        // (Spark's get_json_object and Spark's transform; a transform whose second argument isn't a lambda is as it was)
+        assert_eq!(call("get_json_object(j, '$.a')").unwrap(), "json_as_text(j, 'a')");
+        assert_eq!(call("transform(l, x -> x + 1)").unwrap(), "array_transform(l, x -> x + 1)");
+        assert_eq!(call("transform(l, 1)").unwrap(), "transform(l, 1)");
+        // (Snowflake's path, and BigQuery's SAFE. prefix, refused with what to write)
+        let refusal = call("p:a.b").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("p->>'a'") && refusal.to_string().contains("json_extract_string(p, '$.a.b')"), "{refusal:#}");
+        let refusal = call("SAFE.PARSE_DATE('%Y', s)").unwrap_err();
+        assert!(crate::codes::of(&refusal) == "0A000" && refusal.to_string().contains("SAFE.PARSE_DATE(…) is BigQuery's"), "{refusal:#}");
+        // (the look: a colon after a word and before a letter is a path, not `x::INT` nor a parameter `:p`)
+        assert!(wanted("SELECT p:a FROM t") && !wanted("SELECT x::INT FROM t") && !wanted("SELECT * FROM t WHERE a = :p"));
+        assert!(wanted("SELECT payload->>'$.a', payload -> '$.a' FROM t") && !wanted("SELECT payload->>'page' FROM t"));
+        assert!(wanted("SELECT SAFE.PARSE_DATE('%Y', s) FROM t") && wanted("SELECT PARSE_JSON(p) FROM t") && wanted("SELECT format(ts, 'yyyy') FROM t"));
     }
 
     #[test]

@@ -24,7 +24,8 @@ built() {
 tree=$(tree_of "$sha")
 [ -n "$tree" ] || exit 0
 declare -A trees=(["$sha"]="$tree")
-runs=$(gh run list --repo "$repo" --workflow build.yml --status success --limit 60 --json databaseId,headSha --jq '.[] | "\(.databaseId) \(.headSha)"' 2>/dev/null)
+# (security pass 3: a fork's run never supplies what ships, so only runs whose head repository is this one)
+runs=$(gh api "repos/$repo/actions/workflows/build.yml/runs?status=success&per_page=60" --jq ".workflow_runs[] | select(.head_repository.full_name == \"$repo\") | \"\(.id) \(.head_sha)\"" 2>/dev/null)
 for pass in own same; do # (this commit's own runs first)
   while read -r run head; do
     [ -n "$run" ] || continue

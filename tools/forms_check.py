@@ -18,7 +18,7 @@ Every form is reached through the one request contract, request(method, path, he
 - server: a node over HTTP; cluster: three nodes on one lake, each query spread over them (`?spread=1`);
 - inprocess and memory: a node in this process through the library's pondra_request (python/pondra/inprocess.py),
   on a folder and on `:memory:`;
-- page: web/pkg's Page in Node behind a port (page_serve.mjs), over HTTP as a node.
+- page: web/pkg's Page, a member on the core's lake, in Node behind a port (page_serve.mjs), over HTTP as a node.
 
 docs/forms.json's `refusals` are the only differences a form may have. On that form, the file's first record that
 doesn't pass must be refused with the listed SQLSTATE and words, and the rest of the file isn't run. Each names its
@@ -113,7 +113,8 @@ class InProcess:
 
 
 class Page(Nodes):
-    """page: web/pkg's Page in Node behind a port (page_serve.mjs), made afresh (`POST /reset`) for each file."""
+    """page: web/pkg's Page, a member on the core's lake, in Node behind a port (page_serve.mjs), made afresh
+    (`POST /reset`) for each file."""
 
     def __init__(self, pkg):
         super().__init__(1, None)
@@ -121,7 +122,8 @@ class Page(Nodes):
 
     def open(self):
         if self.child is None:
-            self.child = subprocess.Popen(["node", os.path.join(HERE, "page_serve.mjs"), "--pkg", self.pkg], stdout=subprocess.PIPE, text=True)
+            cmd = ["node", os.path.join(HERE, "page_serve.mjs"), "--pkg", self.pkg]
+            self.child = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
             self.port = int(json.loads(self.child.stdout.readline())["url"].rsplit(":", 1)[1])
         status, _, said = self.request("POST", "/reset", {}, b"")
         if status != 204:
@@ -207,9 +209,9 @@ def run_file(name, form, path, refusal):
 
 
 def split(table):
-    """src/lib.rs's modules built for the server only (its `lake` and `doors`) that forms.json's `server_only` doesn't
-    list, and those it lists that aren't."""
-    built = set(re.findall(r'^#\[cfg\((?:all\()?feature = "(?:server|lake|doors)"[^\]]*\)\] (?:pub )?mod (\w+);', open(os.path.join(REPO, "src/lib.rs")).read(), re.M))
+    """src/lib.rs's modules built for the server only (its `doors`: a page builds the lake) that forms.json's
+    `server_only` doesn't list, and those it lists that aren't."""
+    built = set(re.findall(r'^#\[cfg\((?:all\()?feature = "(?:server|doors)"[^\]]*\)\] (?:pub )?mod (\w+);', open(os.path.join(REPO, "src/lib.rs")).read(), re.M))
     listed = {m for group in table["server_only"].values() for m in group["modules"]}
     return sorted(built - listed), sorted(listed - built)
 
@@ -265,7 +267,7 @@ def main():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--form", default=",".join(FORMS))
+    ap.add_argument("--form", default=",".join(FORMS), help="forms, comma-separated, by name: " + ", ".join(FORMS))
     ap.add_argument("--only", default="", help="files by name, without .slt: keys,defaults")
     ap.add_argument("--bin", default=os.environ.get("PONDRA_BIN", os.path.join(REPO, "target/release/pondra")))
     ap.add_argument("--lib", default=os.environ.get("PONDRA_LIBRARY", os.path.join(REPO, "target/release/libpondra_lib.so")))

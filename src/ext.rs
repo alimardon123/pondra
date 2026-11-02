@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::ext_names::{attached_table, is, names, spec, Attached, Spec};
-use crate::ext_names::{quoted, scheme};
+use crate::ext_names::{is_blob, quoted, scheme};
 use crate::ext_names::{file_format, listed};
 
 tokio::task_local! {
@@ -50,7 +50,7 @@ pub async fn scope<F: std::future::Future>(owner: bool, f: F) -> F::Output {
     OWNER.scope(owner, listing(f)).await
 }
 
-/// Run `f`, a statement sent to the lake at `url` (`ROOT`, `statement::run`).
+/// Run `f`, a statement sent to the lake at `url` (`ROOT`): `audit::statement` runs every door's so.
 pub async fn rooted<F: std::future::Future>(url: &str, f: F) -> F::Output {
     let root = format!("{}/", url.trim_end_matches('/'));
     ROOT.scope(root, f).await
@@ -68,15 +68,33 @@ pub fn listing<F: std::future::Future>(f: F) -> impl std::future::Future<Output 
 
 pub(crate) fn owner() -> bool { OWNER.try_with(|o| *o).unwrap_or(false) }
 
+/// May this caller read a URL no secret covers? The program that started the node, with the node's own credentials; and on a
+/// page, anyone, since what its browser's fetch may read is any script's of the page: the browser is its fence (a page has
+/// no paths of a machine: its relative names are its lake's files, `for_caller`). `check`, `check_urls` and `check_files` ask it.
+fn reads_any_url() -> bool { owner() || cfg!(target_arch = "wasm32") }
+
 /// Is a place on this machine's own disk (no scheme, or `file://`), rather than a bucket or a server's (`s3://`, `https://`,
 /// `kafka://`)? A client may name only the places its secrets reach: a folder here is the node's owner's (`owner`). A scheme
 /// `scheme` doesn't name, such as `memory://`, counts as this machine's too, as COPY has always had it.
 pub(crate) fn on_disk(place: &str) -> bool { scheme(place).is_none_or(|s| s == "file") }
 
-/// A place on this machine's own disk is the node's owner's to use, as COPY's is (`on_disk`, `owner`): `words` is the
-/// refusal a client gets for it, saying what it may do instead. BACKUP, RESTORE and SET LOCATION all say it this way.
+/// A folder on this machine, and a node's door (`pondra://`, which the nodes open with their admin token), are the node
+/// owner's to use (`owner`), as is a lake in this process's memory: `words` is the refusal a client gets for one, saying what
+/// it may do instead. A bucket is anyone's, as the statement's role lets it be. BACKUP, RESTORE and SET LOCATION say it so.
 pub(crate) fn owners_only(place: &str, words: String) -> Result<()> {
-    ensure!(owner() || !on_disk(place), crate::codes::coded("42501", words));
+    let owned = match crate::store::place(place)? {
+        crate::store::Place::Folder | crate::store::Place::Served | crate::store::Place::Memory => true, // (memory: this process's own lakes)
+        crate::store::Place::Bucket => false,
+    };
+    ensure!(owner() || !owned, crate::codes::coded("42501", words));
+    Ok(())
+}
+
+/// A blob URL on a native build (a node, the shell, `pondra sql`): refused by name, for the owner and for any client alike.
+/// Only a page's tab reads its own blob (`blob_with`, wasm32), so nothing off the page may read one, and no secret covers one.
+/// On a page there is nothing to refuse.
+fn off_page(u: &str) -> Result<()> {
+    ensure!(!(cfg!(not(target_arch = "wasm32")) && is_blob(u)), crate::codes::coded("0A000", format!("{u}: a blob: URL is a browser tab's own file: only that tab's page reads it")));
     Ok(())
 }
 
@@ -118,9 +136,7 @@ pub fn external(c: &datafusion::sql::parser::CreateExternalTable) -> Result<crat
             ("csv", "terminator") => args.push(format!("new_line => {}", text(&v))),
             ("csv", "double_quote") => {} // (how quotes inside quotes are written: read either way)
             ("json", "newline_delimited") if yes => {} // (as Pondra reads them)
-            ("csv" | "json", "compression" | "file_compression_type") if !["", "uncompressed"].contains(&v.to_lowercase().as_str()) => {
-                bail!("{v} files aren't read yet: Parquet, CSV, JSON and Arrow as they are")
-            }
+            ("csv" | "json", "compression" | "file_compression_type") => args.push(format!("compression => {}", text(&v))), // (read as its reader reads: `ext_names::compression`)
             (_, k) if WRITING.contains(&k) || (format == "parquet" && (PARQUET_WRITING.contains(&k) || k.starts_with("content_defined_chunking") || PARQUET_TUNING.contains(&k))) => {} // (how files are written, or read faster: not what is read)
             _ => bail!("CREATE EXTERNAL TABLE … OPTIONS ('{k}' …): Pondra doesn't read files with it{}", if format == "csv" { " (CSV takes format.has_header, format.delimiter, format.quote, format.escape, format.comment and format.terminator)" } else { "" }),
         }
@@ -195,6 +211,9 @@ pub async fn view_write(lake: &Lake, stmt: &crate::write::Stmt) -> Result<Option
     let aliases = given.iter().map(|n| quoted(n)).collect::<Vec<_>>().join(", ");
     let rows = format!("SELECT {select} FROM ({query}) AS s({aliases})");
     let mut options = BTreeMap::from([("format".to_string(), spec.format.clone()), ("append".to_string(), "true".to_string())]);
+    if let Some(c) = spec.options.get("compression") {
+        options.insert("compression".into(), c.clone()); // (a folder of compressed files gets compressed ones: named as they are read)
+    }
     if spec.format == "csv" {
         options.insert("header".into(), spec.options.get("header").cloned().unwrap_or_else(|| "true".into()));
         if let Some(d) = spec.options.get("delim").or(spec.options.get("sep")).or(spec.options.get("delimiter")) {
@@ -224,6 +243,7 @@ const PARQUET_TUNING: [&str; 8] = ["pushdown_filters", "reorder_filters", "enabl
 /// so its relative name stays as written and is read where it reads every relative name, in the
 /// lake's files (`for_caller`), as a view over `'x.csv'` is; one that leaves them is refused here.
 fn located(l: &str) -> Result<String> {
+    off_page(l)?;
     if scheme(l).is_some() {
         return Ok(l.to_string());
     }
@@ -294,6 +314,7 @@ pub async fn prime(lake: &Lake, tables: &[(String, TableMeta)]) -> Result<()> {
 /// relative names are read where a page reads them: in the lake's files (`lake_files::relative`, `PUT /files/…`'s
 /// place). A URL with a scheme, or an absolute path, stays as it is, and `check` decides it.
 fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
+    spec.urls.iter().try_for_each(|u| off_page(u))?; // (before `lake_files::relative` could make a blob URL a lake's file)
     if owner() {
         return Ok(spec);
     }
@@ -306,8 +327,9 @@ fn for_caller(lake: &Lake, spec: Spec) -> Result<Spec> {
 /// node. A URL: with the secret whose scope covers it (an admin made it: the grant), or, if none
 /// does, only that program again, with the node's own credentials.
 pub async fn check(lake: &Lake, spec: &Spec) -> Result<()> {
-    if owner() || spec.urls.iter().all(|u| own_file(lake, u)) {
-        return Ok(()); // (the lake's own files: whoever reads the lake reads them, as GET /files/… does)
+    spec.urls.iter().try_for_each(|u| off_page(u))?;
+    if reads_any_url() || spec.urls.iter().all(|u| own_file(lake, u) || own_stage(lake, u)) {
+        return Ok(()); // (the lake's own files, or the caller's own staged rows: whoever reads the lake reads them, as GET /files/… does)
     }
     if let (Some(name), [url]) = (spec.options.get("catalog"), &spec.urls[..]) {
         if crate::catalogs::signed(lake, name, url).await? {
@@ -326,6 +348,15 @@ fn own_file(lake: &Lake, u: &str) -> bool {
     u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
 }
 
+/// Is `u` in the caller's own staged rows (`stage/<its slug>/`, `auth::page_creates`): the folder a joined page stages its
+/// INSERT's files in, which only its own user's staged INSERT reads (`server::insert_staged`)? Nobody else's slug is read, and
+/// no `..` either. A caller with no slug reads none.
+fn own_stage(lake: &Lake, u: &str) -> bool {
+    let Some(me) = crate::auth::current().and_then(|p| crate::auth::slug(&p)) else { return false };
+    let area = format!("{}/stage/{me}/", lake.url.trim_end_matches('/'));
+    u.starts_with(&area) && !crate::lake_files::leaves(&u[area.len()..])
+}
+
 /// May the caller read `url`, a file a catalog named (a REST table's metadata), as `check` asks of a
 /// spec's own URLs? A catalog that vouches for its files' credentials is asked nothing here.
 pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
@@ -336,7 +367,8 @@ pub async fn check_url(lake: &Lake, url: &str) -> Result<()> {
 /// manifests, a Delta checkpoint's sidecars), before the node reads them with its own credentials? Asked as `check_url`
 /// asks, with the secrets read once. A file under the location a catalog vouched for (`catalogs::scoped`) needs none.
 pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
-    if owner() {
+    urls.iter().try_for_each(|u| off_page(u))?; // (as `check` does: before anything is listed, for the owner too)
+    if reads_any_url() {
         return Ok(());
     }
     let asked: Vec<&str> = urls.iter().copied().filter(|u| !own_file(lake, u) && crate::catalogs::scoped(u).is_none()).collect();
@@ -348,6 +380,7 @@ pub async fn check_urls(lake: &Lake, urls: &[&str]) -> Result<()> {
 }
 
 fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
+    off_page(u)?;
     match scheme(u).filter(|s| *s != "file") {
         None => return Err(crate::codes::coded("42501", format!("{u} is a path on the server's own disk, which a client reads only through a node it started itself (the `pondra` shell, `pondra sql`, `connect()` of a lake): read it there, or from a bucket (s3://, gs://, az://, https://)"))),
         Some(_) => match covering(secrets, u) {
@@ -363,7 +396,7 @@ fn allowed(secrets: &[(String, Secret)], u: &str) -> Result<()> {
 /// each must be one this caller may read, as the table is. A folder under `vouched` (a catalog's
 /// table's location, whose credentials its catalog vouched for) needs no secret.
 async fn check_files(lake: &Lake, m: &TableMeta, vouched: Option<&str>) -> Result<()> {
-    if owner() {
+    if reads_any_url() {
         return Ok(());
     }
     let secrets = list(lake).await?;
@@ -507,6 +540,9 @@ fn root(url: &str) -> Option<String> {
 /// DataFusion reads `url` through a store for its bucket, made with the secret covering it (or,
 /// for the node's owner, the node's own credentials). The lake's own bucket keeps its store.
 pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
+    if is_blob(url) {
+        return register_blob(lake, url).await; // (before any secret is listed or covers it)
+    }
     let Some(root) = root(url).filter(|_| scheme(url).is_some_and(|s| s != "file" && s != "kafka")) else { return Ok(()) }; // (this machine's: DataFusion's own; a topic: a Kafka client's)
     let lake_root = self::root(&lake.url);
     let attached: Vec<Option<String>> = lake.attached.read().unwrap().iter().map(|(_, o)| self::root(&o.url)).collect();
@@ -527,6 +563,21 @@ pub(crate) async fn register(lake: &Lake, url: &str) -> Result<()> {
     MADE.lock().unwrap().get_or_insert_default().insert(root, made_with);
     Ok(())
 }
+
+/// A blob URL's store, registered under `blob://` bare, which every blob's stand-in (`ext_names::stand_in`) is read through.
+/// Nothing is listed, covered or unsealed for it, and the store is not wrapped in `CachedStore` (which keeps ranges up to
+/// 512 MB, a second copy of a file the tab holds already): `bridge::Bridge` offers it to DataFusion, uncached. Off the page
+/// it is refused (`off_page`).
+#[cfg(target_arch = "wasm32")]
+async fn register_blob(lake: &Lake, url: &str) -> Result<()> {
+    let store = BLOB.get().with_context(|| format!("{url}: no blob store is set for this page"))?;
+    lake.rt.register_object_store(&url::Url::parse("blob://")?, Arc::new(crate::bridge::Bridge(store.clone())));
+    Ok(())
+}
+
+/// Off the page a blob URL is refused by name (`off_page`), before any store is looked for.
+#[cfg(not(target_arch = "wasm32"))]
+async fn register_blob(_: &Lake, url: &str) -> Result<()> { off_page(url) }
 
 /// The store `url` is read through (made as `register` makes it), and its path there.
 pub async fn store(lake: &Lake, url: &str) -> Result<(Arc<dyn object_store_df::ObjectStore>, object_store_df::path::Path)> {
@@ -563,6 +614,32 @@ pub(crate) enum For {
     Files,
     /// Files read with a temporary secret its maker brought: the public internet only (`public.rs`).
     Public,
+}
+
+/// A page's store of a web origin (`web_with`), on wasm32 only.
+#[cfg(target_arch = "wasm32")]
+pub type Web = Box<dyn Fn(&str) -> Arc<dyn object_store::ObjectStore> + Send + Sync>;
+#[cfg(target_arch = "wasm32")]
+static WEB: std::sync::OnceLock<Web> = std::sync::OnceLock::new();
+
+/// Gives a page's store of a web origin, the browser's `fetch` (web/'s `fetch.rs`), which `build` uses for an http(s) URL
+/// with no bearer token. A browser's server may hide `Content-Range` and lists no folder (WebDAV's PROPFIND), where
+/// object_store's HTTP client needs both: the page's store reads a part from the range it asked and refuses a listing by
+/// name. Set once per module; a later call changes nothing.
+#[cfg(target_arch = "wasm32")]
+pub fn web_with(web: Web) {
+    let _ = WEB.set(web);
+}
+
+/// A page's store of its blob URLs, the tab's own files (web/'s `fetch.rs`, `Blob`): one store for every blob, since a blob's
+/// stand-in names its URL (`ext_names::blob_of`). Set once per module, as `web_with` is.
+#[cfg(target_arch = "wasm32")]
+static BLOB: std::sync::OnceLock<Arc<dyn object_store::ObjectStore>> = std::sync::OnceLock::new();
+
+/// Gives a page the store its blob URLs are read through (`register_blob`). Set once per module; a later call changes nothing.
+#[cfg(target_arch = "wasm32")]
+pub fn blob_with(store: Arc<dyn object_store::ObjectStore>) {
+    let _ = BLOB.set(store);
 }
 
 /// A store for a bucket, container or host, with a secret's settings or the environment's.
@@ -651,6 +728,10 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             Arc::new(b.build()?)
         }
         "http" | "https" => {
+            #[cfg(target_arch = "wasm32")]
+            if let (None, Some(web)) = (get("bearer_token"), WEB.get()) {
+                return Ok(web(&url.origin().ascii_serialization())); // (a page's own fetch: `web_with`)
+            }
             let mut options = object_store::ClientOptions::new().with_allow_http(url.scheme() == "http");
             let mut headers = object_store::HeaderMap::new();
             if let Some(t) = get("bearer_token") {
@@ -660,6 +741,7 @@ pub(crate) fn build(url: &url::Url, p: Option<&BTreeMap<String, String>>, to: Fo
             let b = HttpBuilder::new().with_url(url.as_str()).with_client_options(options);
             Arc::new(if public { b.with_http_connector(crate::public::Connector { headers }) } else { b }.build()?)
         }
+        "blob" => bail!("a blob: URL is a browser tab's own file: only that tab's page reads it"), // (`register_blob` reads one; no store is built for it)
         s => bail!("{s}:// isn't read (s3, r2, gs, az, abfss, https)"),
     })
 }
@@ -687,6 +769,9 @@ pub async fn outside_target(lake: &Lake, name: &str) -> Result<Option<String>> {
 /// Leader: keep an attachment of another engine's tables.
 pub async fn attach(lake: &Lake, name: &str, url: &str, kind: &str, options: BTreeMap<String, String>) -> Result<serde_json::Value> {
     crate::ddl::check(name)?;
+    if matches!(kind, "postgres" | "mysql" | "sqlserver") {
+        return Err(crate::codes::coded("0A000", format!("ATTACH … (TYPE {kind}): another database is attached in 1.1 (TYPE postgres, mysql or sqlserver); today TYPE is delta, iceberg, kafka or share")));
+    }
     ensure!(["delta", "iceberg", "kafka", "share"].contains(&kind), "ATTACH … (TYPE {kind}): delta, iceberg, kafka or share (or a Pondra lake, with no TYPE)");
     ensure!((kind == "kafka") == url.starts_with("kafka://"), "ATTACH … (TYPE kafka) takes a kafka://brokers URL, and only it does");
     let mut options = options;
@@ -1044,20 +1129,36 @@ fn copy_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Option<
         return None;
     }
     let invalid = |e: String| Some(crate::write::Stmt::Invalid(format!("COPY … TO 'url' (FORMAT parquet, …): {e}")));
-    let query = match p.consume_token(&Token::LParen) {
+    let (query, table) = match p.consume_token(&Token::LParen) {
         true => match p.parse_query().and_then(|q| p.expect_token(&Token::RParen).map(|_| q)) {
-            Ok(q) => q.to_string(),
+            Ok(q) => (q.to_string(), None),
             Err(e) => return invalid(e.to_string()),
         },
         false => match p.parse_object_name(false) {
-            Ok(t) => format!("SELECT * FROM {t}"),
+            Ok(t) => (format!("SELECT * FROM {t}"), Some(t.to_string())),
             Err(e) => return invalid(e.to_string()),
         },
     };
+    // (COPY … FROM STDIN and TO STDOUT are the Postgres port's, which `pg.rs` takes before this; another door has no
+    // client stream for them, and Postgres's COPY t FROM 'file' reads its own server's file: each refused by name)
+    let refused = |words: String| Some(crate::write::Stmt::Refused("0A000", words));
     if !p.parse_keyword(Keyword::TO) {
-        return None; // (COPY … FROM: the Postgres port's)
+        if p.consume_token(&Token::LParen) {
+            let _ = p.parse_comma_separated(|p| p.parse_identifier()).and_then(|_| p.expect_token(&Token::RParen)); // (a column list, `t (a, b)`)
+        }
+        if !p.parse_keyword(Keyword::FROM) {
+            return None;
+        }
+        let t = table.unwrap_or_else(|| "t".into());
+        return match p.parse_keyword(Keyword::STDIN) {
+            true => refused(format!("COPY {t} FROM STDIN is the Postgres port's (psql, a driver's copy): elsewhere, COPY INTO {t} FROM 'path or URL' loads files, and POST /append/{t} appends rows")),
+            false => refused(format!("COPY {t} FROM a file reads a file of Postgres's own server: write COPY INTO {t} FROM 'path or URL'")),
+        };
     }
-    let Ok(to) = p.parse_literal_string() else { return None }; // (TO STDOUT)
+    if p.parse_keyword(Keyword::STDOUT) {
+        return refused("COPY … TO STDOUT is the Postgres port's (psql, a driver's copy): elsewhere, run the query as CSV (POST /sql?format=csv), or COPY it TO 's3://…' (FORMAT csv)".into());
+    }
+    let Ok(to) = p.parse_literal_string() else { return None };
     let mut options = BTreeMap::new();
     // DataFusion's words for the same: STORED AS csv, PARTITIONED BY (…), OPTIONS ('format.has_header' 'false', …).
     loop {
@@ -1151,10 +1252,10 @@ fn copy_into_statement(p: &mut datafusion::sql::sqlparser::parser::Parser) -> Op
     } else {
         match p.parse_literal_string() {
             Ok(path) if path.starts_with('@') => {
-                // (Snowflake's stage: Pondra has none, it reads the files where they are)
+                // (Snowflake's stage: Pondra has none, it reads the files where they are; a connection's '@name/path' is 1.1's)
                 let stage = path.split('/').next().unwrap_or(&path);
                 return Some(crate::write::Stmt::Invalid(format!(
-                    "COPY INTO {table} FROM {stage}: a stage isn't supported; name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
+                    "COPY INTO {table} FROM {stage}: a stage isn't supported (a connection's '@name/path' comes in 1.1); name the files where they are: COPY INTO {table} FROM 's3://bucket/folder/*.csv' (FORMAT csv, HEADER true)"
                 )));
             }
             Ok(path) => Source::Path(path),
@@ -1219,6 +1320,7 @@ fn made(name: &str, mut params: BTreeMap<String, String>) -> Result<Secret> {
     let scope = params.remove("scope");
     ensure!(t != "git" || scope.is_some(), "a git secret says where its token may go: SCOPE 'https://github.com/acme'");
     if let Some(s) = &scope {
+        ensure!(!is_blob(s), crate::codes::coded("0A000", format!("{s}: a blob: URL is a browser tab's own file: only that tab's page reads it, so no secret's SCOPE may be one")));
         ensure!(scheme(s).is_some_and(|x| schemes.contains(&x)), "a {t} secret's SCOPE is a URL of {}", schemes.iter().map(|s| format!("{s}://")).collect::<Vec<_>>().join(" or "));
     }
     let (sealed, key) = seal_new(&serde_json::to_vec(&params)?)?;
@@ -1624,6 +1726,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn copy_to_stdout_and_from_stdin_off_the_port_are_refused_by_name() {
+        let said = |sql: &str| match statement(sql) {
+            Some(crate::write::Stmt::Refused(code, words)) => (code, words),
+            _ => panic!("{sql}: not refused"),
+        };
+        let (code, words) = said("COPY (SELECT id FROM customers) TO STDOUT WITH (FORMAT csv, HEADER true)");
+        assert!(code == "0A000" && words.contains("POST /sql?format=csv"), "{words}");
+        assert!(said("COPY orders (id, amount) FROM STDIN").1.contains("COPY INTO orders FROM 'path or URL' loads files, and POST /append/orders"));
+        assert!(said("COPY orders FROM '/srv/orders.csv'").1.starts_with("COPY orders FROM a file reads a file of Postgres's own server"));
+        assert!(matches!(statement("COPY orders TO 's3://b/o.parquet' (FORMAT parquet)"), Some(crate::write::Stmt::CopyTo(..))), "a COPY to a file is as it was");
+    }
+
+    #[test]
     fn a_machine_key_file_is_whole_or_refused() {
         let key = "ab".repeat(32);
         let p = std::path::Path::new("secret.key");
@@ -1674,13 +1789,34 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn own_stage_takes_only_the_callers_slug_and_no_escaped_dot_dot() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-own-stage-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        let stage = format!("{}/stage", lake.url.trim_end_matches('/'));
+        let ali = crate::auth::Principal { name: "ali".into(), role: crate::auth::Role::Write, access: None, door: "http", from: None, operator: false };
+        assert!(!own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "with no sign-in, none");
+        crate::auth::WHO
+            .scope(ali, async {
+                assert!(own_stage(&lake, &format!("{stage}/616c69/j1/*.parquet")), "the caller's own staged rows");
+                assert!(!own_stage(&lake, &format!("{stage}/626f62/j1/*.parquet")), "another user's slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/%2E%2E/%2E%2E/files/x.parquet")), "an escaped .. reaches past the slug");
+                assert!(!own_stage(&lake, &format!("{stage}/616c69/../../files/x.parquet")), "a plain .. reaches past the slug");
+                assert!(!own_file(&lake, &format!("{stage}/616c69/j1/*.parquet")), "not the lake's files");
+            })
+            .await;
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// One statement as `pondra sql` runs it (`cli.rs`), for a caller that is the program that started the node or not:
     /// its rows, or its error.
     async fn run(lake: &Lake, owner: bool, sql: &str) -> Result<Vec<datafusion::arrow::record_batch::RecordBatch>> {
         let expanded = crate::routines::expand(lake, sql).await?;
         let planned = crate::sys::planned(&expanded)?;
         scope(owner, async {
-            anyhow::Ok(crate::query::session(lake, &expanded, "").await?.enable_url_table().sql(&planned).await?.collect().await?)
+            anyhow::Ok(crate::engine::with_files(crate::query::session(lake, &expanded, "").await?).sql(&planned).await?.collect().await?)
         })
         .await
     }
@@ -1734,6 +1870,32 @@ mod tests {
         assert_eq!(crate::codes::of(&err), "42P01");
         assert!(said.contains("files/missing.csv") && !said.contains(&lake.url), "{said}");
 
+        lake.cat.close().await?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A blob URL is a tab's own file: off the page, a node refuses it by name, as the owner and as a client alike, before any
+    /// lake file or secret is looked at (`off_page`). `LOCATION` and `CREATE SECRET … SCOPE` refuse it the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blob_url_is_refused_by_name_off_the_page() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("pondra-blob-{}", uuid::Uuid::new_v4()));
+        let lake = Lake::open(dir.to_str().unwrap(), true, false).await?;
+        for owner in [true, false] {
+            for sql in ["SELECT * FROM read_csv('blob:https://o/6f1c')", "SELECT * FROM read_csv('blob:nodedata:6f1c')", "SELECT * FROM read_csv('BLOB:https://o/6f1c')"] {
+                let err = run(&lake, owner, sql).await.unwrap_err();
+                assert_eq!(crate::codes::of(&err), "0A000", "{sql} as owner {owner}");
+                assert!(crate::codes::words(&err).contains("a blob: URL is a browser tab's own file: only that tab's page reads it"), "{}", crate::codes::words(&err));
+            }
+        }
+        assert!(scope(true, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as the owner");
+        assert!(scope(false, async { located("blob:https://o/6f1c") }).await.is_err(), "a LOCATION, as a client");
+        for owner in [true, false] {
+            let listed = scope(owner, check_urls(&lake, &["blob:https://o/6f1c"])).await.unwrap_err();
+            assert_eq!(crate::codes::of(&listed), "0A000", "check_urls as owner {owner}: {listed}");
+        }
+        let scoped = BTreeMap::from([("type".to_string(), "s3".to_string()), ("scope".to_string(), "blob:https://o/".to_string())]);
+        assert!(made("s", scoped).is_err(), "a secret's SCOPE is no blob");
         lake.cat.close().await?;
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())

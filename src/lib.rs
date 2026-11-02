@@ -14,15 +14,18 @@ pub mod env;
 pub mod reset;
 pub mod fsum;
 pub mod avg;
+mod string_agg;
 pub mod casts;
 pub mod intervals;
 pub mod xlsx;
 pub mod answer;
 pub mod engine;
 pub mod in_task;
-pub mod page;
+#[cfg(feature = "lake")] pub mod page; // (a page is a member on the core's lake, one per module)
 pub mod request_body;
 pub mod text;
+// The one walk of the SQL tree (every module's walks go through it: `walk.rs`).
+mod walk;
 // The statements 1.1 brings, refused by name in every form (`page.rs` and the node read the same list).
 mod kept;
 pub mod extension;
@@ -40,10 +43,14 @@ mod expander;
 mod front;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod codes;
+mod dialect_fns;
+mod dialect_stmts;
 mod friendly;
 mod matcher;
 mod pattern;
 mod lateral;
+#[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's rewrites, as friendly.rs calls them: a node's statements)
+mod lateral_join;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (the front's passes; a page calls them from step 4)
 mod measures;
 // Postgres's JSON and text functions: every session has them (`engine::session`), a page's too.
@@ -67,6 +74,7 @@ mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
 mod held;
+mod median;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
 mod data_file;
 #[cfg_attr(not(feature = "lake"), allow(dead_code))] // (another engine's files: a page reads them from step 4i-3)
@@ -128,6 +136,7 @@ mod rules;
 #[cfg(feature = "lake")] mod iceberg;
 #[cfg(feature = "doors")] mod iceberg_rest;
 #[cfg(feature = "lake")] mod inbox;
+#[cfg(feature = "lake")] pub mod joined; // (a page's store for the lake it joined: its node's `/store`, read with the page's sign-in)
 #[cfg(feature = "doors")] mod kafka;
 #[cfg(feature = "lake")] mod kafka_client;
 #[cfg(feature = "lake")] mod kafka_wire;
@@ -155,14 +164,18 @@ mod rules;
 #[cfg(feature = "lake")] mod oom;
 #[cfg(all(feature = "doors", target_os = "linux", target_env = "gnu"))] mod jemalloc;
 #[cfg(feature = "lake")] mod once;
+#[cfg(feature = "lake")] mod matches;
 #[cfg(feature = "doors")] mod origins;
 #[cfg(feature = "lake")] mod metrics;
 #[cfg(feature = "doors")] pub mod library;
 #[cfg(feature = "lake")] mod pages;
 #[cfg(feature = "lake")] mod panics;
+#[cfg(feature = "lake")] mod page_records; // (a joined page's own statements, written by its node: audit 11-01 M8)
 #[cfg(feature = "doors")] mod tls;
 #[cfg(feature = "lake")] mod txn;
 #[cfg(feature = "lake")] mod returning;
+#[cfg(feature = "lake")] mod with_writes;
+#[cfg(all(feature = "lake", not(target_arch = "wasm32")))] mod wasm; // (extensions' WebAssembly parts: a page has no host before 1.1)
 #[cfg(feature = "doors")] mod mcp;
 #[cfg(feature = "doors")] mod pg;
 #[cfg(feature = "lake")] mod past;
@@ -197,6 +210,7 @@ mod rules;
 #[cfg(feature = "lake")] mod status;
 #[cfg(feature = "lake")] mod kv;
 #[cfg(feature = "lake")] mod store;
+#[cfg(feature = "lake")] mod store_wire;
 #[cfg(feature = "doors")] mod sync;
 #[cfg(feature = "lake")] mod sys;
 #[cfg(feature = "lake")] mod tasks;

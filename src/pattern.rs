@@ -14,14 +14,17 @@
 //! - L5 (ALL ROWS only): the partition and ORDER BY columns, the measures, then the input's other columns, without the
 //!   rows a `{- … -}` leaves out and the internal columns.
 //!
-//! `text` writes FINAL and RUNNING before a measure as calls that parse, and each PATTERN as one quoted name, since
-//! sqlparser refuses some standard forms; `matcher::read` reads the text. What isn't taken is refused by name.
+//! `text` writes FINAL and RUNNING before a measure as calls that parse, each PATTERN as one quoted name, since
+//! sqlparser refuses some standard forms, and a subquery before a clause as a CTE in a derived table, since sqlparser
+//! reads the clause only after a table's name; `matcher::read` reads the text. What isn't taken is refused by name.
 use crate::codes::coded;
 use crate::matcher::Pattern;
 use crate::text::{ident, object, ROW_ID};
 use anyhow::{bail, Result};
 use datafusion::sql::sqlparser::ast::*;
 use datafusion::common::{DataFusionError, SchemaError};
+use datafusion::execution::FunctionRegistry;
+use datafusion::logical_expr::Volatility;
 use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser, tokenizer::Token};
 use regex::Regex;
 use serde_json::json;
@@ -49,11 +52,12 @@ pub fn wanted(sql: &str) -> bool {
     WORD.is_match(sql)
 }
 
-/// `sql` as the parser reads it, with two rewrites. FINAL and RUNNING before a call are wrapped as calls that parse
+/// `sql` as the parser reads it, with three rewrites. FINAL and RUNNING before a call are wrapped as calls that parse
 /// (`FINAL last(x)` is `pondra_final(last(x))`; the rewrite takes the wrapper away, since ONE ROW PER MATCH reads at the
 /// last row, where both agree). Each PATTERN is written as one quoted name that holds its text in hex, because sqlparser
 /// refuses forms standard SQL has (`{- b -}` of more than a symbol, PERMUTE of alternatives); `matcher::read` reads the
-/// text instead. A word in a string or a comment is left as it is.
+/// text instead. A subquery before a MATCH_RECOGNIZE is written as a CTE in a derived table (`hoists`), so the clause can
+/// read it as a table. A word in a string or a comment is left as it is.
 pub fn text(sql: &str) -> Cow<'_, str> {
     if !wanted(sql) {
         return Cow::Borrowed(sql);
@@ -61,6 +65,9 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     let code = code_mask(sql);
     let mut edits = calls(sql, &code);
     edits.extend(patterns(sql, &code));
+    if crate::once::emit_final(sql).is_none() {
+        edits.extend(hoists(sql, &code)); // (an EMIT FINAL view's subquery stays as it is: `write` refuses it, with its words)
+    }
     if edits.is_empty() {
         return Cow::Borrowed(sql);
     }
@@ -69,7 +76,7 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     let mut last = 0;
     for (start, end, new) in edits {
         if start < last {
-            continue; // inside an edit already made: a FINAL call in a PATTERN is read as the pattern
+            continue; // inside an edit already made: a FINAL call in a PATTERN is read as the pattern, a clause in a hoisted subquery as its own text
         }
         out.push_str(&sql[last..start]);
         out.push_str(&new);
@@ -79,50 +86,63 @@ pub fn text(sql: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read.
-/// `front::expand` asks first, at every door.
+/// Refuses, by name and with what to write, a MATCH_RECOGNIZE that `text` can't take: SUBSET, which sqlparser doesn't read,
+/// and a materialized view over one of a subquery or a CTE, which reads a lake table by its name (an EMIT FINAL one is refused by
+/// `write`, in its own words). `front::expand` asks first, at every door.
 pub fn refused(sql: &str) -> Result<()> {
     static SUBSET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bsubset\s+[a-z_][a-z0-9_]*\s*=").expect("a regex"));
+    static VIEW: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^\s*create\s+(?:or\s+replace\s+)?materialized\s+view\b").expect("a regex"));
     if !wanted(sql) {
         return Ok(());
     }
     let code = code_mask(sql);
-    match SUBSET.find_iter(sql).any(|m| code[m.start()]) {
-        true => Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions")),
-        false => Ok(()),
+    if SUBSET.find_iter(sql).any(|m| code[m.start()]) {
+        return Err(coded("0A000", "MATCH_RECOGNIZE: SUBSET isn't supported yet: write a measure per symbol, as LAST(b.price) and LAST(c.price), or one symbol whose DEFINE ORs the two conditions"));
     }
+    if VIEW.is_match(sql) && crate::once::emit_final(sql).is_none() {
+        let what = if !hoists(sql, &code).is_empty() {
+            "subquery"
+        } else if reads_cte(sql, &code) {
+            "CTE"
+        } else {
+            return Ok(());
+        };
+        return Err(coded("0A000", format!("a materialized view over a MATCH_RECOGNIZE of a {what} isn't supported yet: the view reads a lake table by its name, CREATE MATERIALIZED VIEW v AS SELECT … FROM t MATCH_RECOGNIZE (…); a query or a plain view takes the {what}")));
+    }
+    Ok(())
 }
 
-/// Refuses `EMIT FINAL` on a view of MATCH_RECOGNIZE. `once::create` asks first: its window is a GROUP BY's time bucket, and
-/// a MATCH_RECOGNIZE has none.
-pub fn emit_final_refused(sql: &str) -> Result<()> {
-    if !wanted(sql) {
-        return Ok(());
-    }
-    let Ok(stmts) = Parser::parse_sql(&GenericDialect {}, sql) else { return Ok(()) };
-    let mut scan = Scan::default();
-    for s in &stmts {
-        let _ = Visit::visit(s, &mut scan);
-    }
-    match scan.found {
-        true => Err(coded(
-            "0A000",
-            "a view of MATCH_RECOGNIZE with EMIT FINAL comes later: make it without EMIT FINAL, and each run matches again only the partitions that changed",
-        )),
-        false => Ok(()),
-    }
+/// Whether a MATCH_RECOGNIZE in `sql` reads a CTE of it by name (`WITH t AS (…) … FROM t [AS x] MATCH_RECOGNIZE`): a
+/// materialized view follows a lake table, and `views::written_in` leaves a query with MATCH_RECOGNIZE as written.
+fn reads_cte(sql: &str, code: &[bool]) -> bool {
+    static INPUT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:from|join)\s+([a-z_][a-z0-9_]*)\s+(?:as\s+)?(?:[a-z_][a-z0-9_]*\s+)?match_recognize\b").expect("a regex")
+    });
+    static CTE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(?:\bwith(?:\s+recursive)?|,)\s*([a-z_][a-z0-9_]*)\s*(?:\([^()]*\)\s*)?as\s*(?:(?:not\s+)?materialized\s*)?\(").expect("a regex")
+    });
+    let names = |re: &Regex| re.captures_iter(sql).filter(|c| code[c.get(0).expect("a match").start()]).map(|c| c[1].to_ascii_lowercase()).collect::<Vec<_>>();
+    let ctes = names(&CTE);
+    names(&INPUT).iter().any(|n| ctes.contains(n))
 }
 
 /// The reverse of `text`, for showing a stored view as it was written: each `PATTERN ("__mr_pattern_<hex>")` reads
 /// `PATTERN (<text>)`, with its WITHIN after the `)` when the name carries one, and each `pondra_final(…)` and
-/// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A name written before WITHIN reads as it did. Text with neither is
-/// borrowed.
+/// `pondra_running(…)` reads `FINAL …` and `RUNNING …`. A subquery written as a CTE for a clause (`hoists`) reads as the
+/// subquery it was, with the text between it and the clause as written. A name written before WITHIN reads as it did.
+/// Text with none of these is borrowed.
 pub fn shown(sql: &str) -> Cow<'_, str> {
     static NAMED: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r#"(?i)\bpattern\s*\(\s*"__mr_pattern_([0-9a-f]*)(?:__within_([0-9a-f]*))?"\s*\)"#).expect("a regex")
     });
     static CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bpondra_(final|running)\(").expect("a regex"));
-    if !sql.contains("__mr_pattern_") && !sql.contains("pondra_") {
+    // the hoisted subquery's head, and what follows its CTE: the input's name, then the clause (as sqlparser or `text` wrote it)
+    static HOIST: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\(with\s+__mr_input\s+as\s*\(").expect("a regex"));
+    static READ: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^\s*select\s+\*\s+from\s+__mr_input(?P<between>(?:\s+(?:as\s+)?[a-z_][a-z0-9_]*)?\s+)(?P<clause>match_recognize\b)").expect("a regex")
+    });
+    if !sql.contains("__mr_pattern_") && !sql.contains("pondra_") && !sql.contains("__mr_input") {
         return Cow::Borrowed(sql);
     }
     let code = code_mask(sql);
@@ -146,6 +166,21 @@ pub fn shown(sql: &str) -> Cow<'_, str> {
         let open = whole.end() - 1;
         let Some(close) = close_of(sql, &code, open) else { continue };
         edits.push((whole.start(), close + 1, format!("{} {}", c[1].to_uppercase(), &sql[open + 1..close])));
+    }
+    for h in HOIST.find_iter(sql) {
+        let (open, inner_open) = (h.start(), h.end() - 1);
+        if !code[open] {
+            continue;
+        }
+        let (Some(inner_close), Some(outer_close)) = (close_of(sql, &code, inner_open), close_of(sql, &code, open)) else { continue };
+        if inner_close >= outer_close {
+            continue;
+        }
+        let rest = &sql[inner_close + 1..outer_close];
+        let Some(read) = READ.captures(rest) else { continue };
+        let (between, clause) = (read.name("between").expect("the text between"), read.name("clause").expect("the clause"));
+        let subquery = shown(&sql[inner_open + 1..inner_close]);
+        edits.push((open, outer_close + 1, format!("({subquery}){}{}", between.as_str(), shown(&rest[clause.start()..]))));
     }
     if edits.is_empty() {
         return Cow::Borrowed(sql);
@@ -221,6 +256,85 @@ fn patterns(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
         out.push((whole.start(), end, name));
     }
     out
+}
+
+/// Each subquery that a MATCH_RECOGNIZE reads, written as a CTE in a derived table: `(<inner>)<between>MATCH_RECOGNIZE
+/// (<clause>)` becomes `(WITH __mr_input AS (<inner>) SELECT * FROM __mr_input<between>MATCH_RECOGNIZE (<clause>))`. sqlparser
+/// reads the clause only after a table's name, and a CTE is one, so the clause reads the subquery as it reads a table. Each
+/// part is written by `text` on its own, so the clauses inside it are written too; this edit covers them, and `text` skips
+/// their edits. A `(` that opens a parenthesised join is not a subquery, so it is left for the parser to refuse. `text` does
+/// not call this for an EMIT FINAL view, whose subquery `write` refuses with its own words.
+fn hoists(sql: &str, code: &[bool]) -> Vec<(usize, usize, String)> {
+    static CLAUSE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\)(\s+(?:as\s+)?(?:[a-z_][a-z0-9_]*\s+)?)match_recognize\b").expect("a regex"));
+    let mut out = vec![];
+    for c in CLAUSE.captures_iter(sql) {
+        let whole = c.get(0).expect("a whole match");
+        let between = c.get(1).expect("the text between");
+        let close = whole.start();
+        if !code[close] {
+            continue;
+        }
+        let Some(open) = open_of(sql, code, close) else { continue };
+        if !is_query(sql, code, open) {
+            continue;
+        }
+        let Some(clause_open) = (whole.end()..sql.len()).find(|&i| code[i] && sql.as_bytes()[i] == b'(') else { continue };
+        let Some(clause_close) = close_of(sql, code, clause_open) else { continue };
+        let inner = text(&sql[open + 1..close]);
+        let clause = text(&sql[between.end()..=clause_close]);
+        out.push((open, clause_close + 1, format!("(WITH __mr_input AS ({inner}) SELECT * FROM __mr_input{}{clause})", between.as_str())));
+    }
+    out
+}
+
+/// Whether the `(` at `open` opens a query: its content starts (past spaces and comments) with SELECT, WITH or VALUES, or
+/// with another `(` that does, as `((SELECT 1) UNION (SELECT 2))` does. A parenthesised join starts with a table, so it is
+/// no query.
+fn is_query(sql: &str, code: &[bool], open: usize) -> bool {
+    static START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(select|with|values)\b").expect("a regex"));
+    let b = sql.as_bytes();
+    let mut i = open + 1;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b[i..].starts_with(b"--") {
+            i = b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p);
+        } else if b[i..].starts_with(b"/*") {
+            i = sql[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2);
+        } else {
+            break;
+        }
+    }
+    if i >= b.len() || !code[i] {
+        return false;
+    }
+    if b[i] == b'(' {
+        return is_query(sql, code, i);
+    }
+    START.is_match(&sql[i..])
+}
+
+/// The `(` that opens the `)` at `close`, counting only the parentheses that are code: the reverse of `close_of`.
+fn open_of(sql: &str, code: &[bool], close: usize) -> Option<usize> {
+    let mut depth = 0;
+    for i in (0..=close).rev() {
+        if !code[i] {
+            continue;
+        }
+        match sql.as_bytes()[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The WITHIN that follows a PATTERN's `)` at `from`, when one does: where it ends (the interval's last character, before
@@ -330,14 +444,25 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
     let kept = |s: &Statement| matches!(s, Statement::CreateMacro { .. } | Statement::CreateView(CreateView { materialized: false, .. }));
     let mut scan = Scan::default();
     for s in stmts.iter().filter(|s| !kept(s)) {
-        let _ = Visit::visit(s, &mut scan);
+        let _ = crate::walk::visit(s, &mut scan);
     }
     if !scan.found {
         return Ok(false);
     }
-    // The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
-    // that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
-    // one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
+    let lake_cols = lake_columns(host, &scan).await?;
+    let mut r = Rewrite { lake: &lake_cols };
+    for s in stmts.iter_mut().filter(|s| !kept(s)) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut r) {
+            return Err(e);
+        }
+    }
+    Ok(true)
+}
+
+/// The lake inputs' columns, by the input's name: a lake table's rows that have `_row_id` are tied on their ORDER BY in
+/// that order, so every run finds the same matches (a CTE of the same name is not the table), and a measure named like
+/// one of the columns is refused. An input that isn't a lake table has no entry, so DataFusion's own errors stand.
+async fn lake_columns<H: crate::front::Host>(host: &H, scan: &Scan) -> Result<HashMap<String, Vec<String>>> {
     let lake = host.name();
     let mut local = BTreeSet::new();
     let mut named = vec![];
@@ -347,20 +472,24 @@ pub async fn rewrite<H: crate::front::Host>(host: &H, stmts: &mut [Statement]) -
             named.push((name.clone(), l));
         }
     }
-    let lake_cols: HashMap<String, Vec<String>> = match local.is_empty() {
+    Ok(match local.is_empty() {
         true => HashMap::new(),
         false => {
             let cols = host.columns(local).await?;
             named.into_iter().filter_map(|(n, l)| cols.get(&l).map(|c| (n, c.clone()))).collect()
         }
-    };
-    let mut r = Rewrite { lake: &lake_cols };
-    for s in stmts.iter_mut().filter(|s| !kept(s)) {
-        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
-            return Err(e);
-        }
+    })
+}
+
+/// The lake columns `open` takes for `sql` (an EMIT FINAL view's query): its inputs' columns, read from `host` as `rewrite`
+/// reads them. Asked first, so the session's functions are passed to `open` after this await.
+pub async fn open_columns<H: crate::front::Host>(host: &H, sql: &str) -> Result<HashMap<String, Vec<String>>> {
+    let mut scan = Scan::default();
+    {
+        let query = crate::expander::parse_query(&text(sql))?;
+        let _ = crate::walk::visit(&query, &mut scan);
     }
-    Ok(true)
+    lake_columns(host, &scan).await
 }
 
 /// A plan error for a measure with the name of a column of its input, in the refusal a lake table's rows get (42701): the
@@ -386,6 +515,298 @@ pub fn reworded(err: DataFusionError, sql: &str) -> anyhow::Error {
         Some(name) => coded("42701", format!("MATCH_RECOGNIZE: the measure {name} has the name of a PARTITION BY column or of another measure: name each one apart")),
         None => anyhow::Error::new(err),
     }
+}
+
+/// An EMIT FINAL view's query in open mode (`open`): the MATCH_RECOGNIZE that the run matches each key's rows with, and the
+/// view's query over the matches it writes. The run reads each key's look-back rows and its counts from these parts.
+#[derive(Debug)]
+pub struct Open {
+    /// The MATCH_RECOGNIZE in open mode, alone: its rows are the matches, and each key's marker (`__mr_resume` set).
+    pub inner: String,
+    /// The view's query with its clause read from `__matches`, keeping its alias; None when the query is `SELECT * FROM t
+    /// MATCH_RECOGNIZE (…)` with no WHERE.
+    pub outer: Option<String>,
+    /// The input table, a lake table read directly.
+    pub table: String,
+    /// The ORDER BY column: the event time.
+    pub time: String,
+    /// The PARTITION BY columns.
+    pub part: Vec<String>,
+    /// P: the most rows a PREV reaches back (`PREV(x)` is 1, `PREV(x, 3)` is 3); 0 with no PREV.
+    pub look: u64,
+    /// Whether the pattern has WITHIN.
+    pub within: bool,
+}
+
+/// The query of an EMIT FINAL view (the text after `AS`, without EMIT FINAL), in open mode. `lake` is each lake table's
+/// columns by its name, as `rewrite` takes them, and `functions` the session's, the lake's own among them, which say what
+/// a later run would answer differently. What open mode can't take is refused here, each with what to write.
+pub fn open(sql: &str, lake: &HashMap<String, Vec<String>>, functions: &dyn FunctionRegistry) -> Result<Open> {
+    let mut query = crate::expander::parse_query(&text(sql))?;
+    let (clause, plain) = {
+        let s = around(&query)?;
+        projected(s, functions)?;
+        if let Some(f) = s.selection.as_ref().and_then(|w| rerun_in(w, functions)) {
+            return Err(rerun_refusal(&f, "WHERE"));
+        }
+        let plain = matches!(s.projection.as_slice(), [SelectItem::Wildcard(_)]) && s.selection.is_none();
+        (s.from[0].relation.clone(), plain)
+    };
+    let TableFactor::MatchRecognize { table, partition_by, order_by, measures, rows_per_match, pattern, symbols, alias, .. } = &clause else {
+        bail!("MATCH_RECOGNIZE: the view's query has no MATCH_RECOGNIZE to open");
+    };
+    let TableFactor::Table { name, .. } = table.as_ref() else {
+        return Err(open_refusal("reads a table directly: make it a plain view, or WITH (refresh = 'by key')"));
+    };
+    let input = object(name);
+    let Some(columns) = lake.get(&input) else {
+        return Err(open_refusal("reads a table directly: make it a plain view, or WITH (refresh = 'by key')"));
+    };
+    let key = match order_by.as_slice() {
+        [] => return Err(open_refusal("has no ORDER BY: order by its time column, a date or a timestamp, ascending")),
+        [k] if k.options.asc != Some(false) && k.options.nulls_first != Some(true) => k,
+        _ => return Err(open_refusal("orders by its time alone, ascending: a plain view orders by more")),
+    };
+    let time = match named_column(&key.expr) {
+        Some(c) if columns.contains(&c) => c,
+        _ => {
+            return Err(open_refusal(format!(
+                "orders by {}, which isn't a column of {input}: order by its time column, a column of the table",
+                key.expr
+            )))
+        }
+    };
+    let part = partition_by
+        .iter()
+        .map(|e| named_column(e).ok_or_else(|| coded("0A000", format!("MATCH_RECOGNIZE: PARTITION BY takes columns; {e} isn't one"))))
+        .collect::<Result<Vec<String>>>()?;
+    let (written, within) = pattern_text(pattern);
+    let (read, _) = crate::matcher::read(&written)?;
+    if anchored(&read) {
+        return Err(open_refusal(
+            "can't have $ or ^ in its pattern: a stream has no last row, and a run's rows don't start at the key's first: make it a plain view, or WITH (refresh = 'by key')",
+        ));
+    }
+    if has_call(&query, "next") {
+        return Err(open_refusal("can't have NEXT: it reads a row that may not have come yet: write the condition with PREV"));
+    }
+    if matches!(rows_per_match, Some(RowsPerMatch::AllRows(Some(EmptyMatchesMode::WithUnmatched)))) {
+        return Err(open_refusal("can't take WITH UNMATCHED ROWS: an unmatched row has no match to be decided by: make it a plain view"));
+    }
+    for d in symbols {
+        if let Some(f) = rerun_in(&d.definition, functions) {
+            return Err(rerun_refusal(&f, "DEFINE"));
+        }
+    }
+    for m in measures {
+        if let Some(f) = rerun_in(&m.expr, functions) {
+            return Err(rerun_refusal(&f, "measure"));
+        }
+    }
+    let TableFactor::Derived { subquery, .. } = layer(&clause, lake, true)? else {
+        bail!("MATCH_RECOGNIZE: open mode gave no derived table");
+    };
+    let inner = format!("SELECT * FROM ({subquery}) AS __mr_open");
+    let outer = match plain {
+        true => None,
+        false => {
+            // the view's query, with its clause read from `__matches` under the clause's alias
+            let SetExpr::Select(s) = &mut *query.body else {
+                bail!("MATCH_RECOGNIZE: the view's query is not a SELECT");
+            };
+            let mut read_matches = crate::expander::parse_query("SELECT * FROM __matches")?;
+            let SetExpr::Select(r) = &mut *read_matches.body else {
+                bail!("MATCH_RECOGNIZE: no SELECT to read the matches with");
+            };
+            let mut relation = r.from.remove(0).relation;
+            if let TableFactor::Table { alias: a, .. } = &mut relation {
+                *a = alias.clone();
+            }
+            s.from[0].relation = relation;
+            Some(query.to_string())
+        }
+    };
+    Ok(Open { inner, outer, table: input, time, part, look: look_of(measures, symbols)?, within: within.is_some() })
+}
+
+/// The SELECT of an EMIT FINAL view's query, when it is a projection and a WHERE around one MATCH_RECOGNIZE of a table.
+/// Open mode writes each match once, so anything else around the pattern is refused.
+fn around(q: &Query) -> Result<&Select> {
+    if q.with.is_some() {
+        return Err(kept_once("a WITH"));
+    }
+    if q.order_by.is_some() {
+        return Err(kept_once("an ORDER BY"));
+    }
+    if q.limit_clause.is_some() || q.fetch.is_some() {
+        return Err(kept_once("a LIMIT"));
+    }
+    if !q.locks.is_empty() || q.for_clause.is_some() || q.settings.is_some() || q.format_clause.is_some() || !q.pipe_operators.is_empty() {
+        return Err(kept_once("this clause"));
+    }
+    let s: &Select = match &*q.body {
+        SetExpr::Select(s) => s.as_ref(),
+        SetExpr::SetOperation { .. } => return Err(kept_once("a set operation")),
+        _ => return Err(kept_once("a nested query")),
+    };
+    if s.distinct.is_some() {
+        return Err(kept_once("DISTINCT"));
+    }
+    if s.top.is_some() {
+        return Err(kept_once("a LIMIT"));
+    }
+    let relation = match s.from.as_slice() {
+        [t] if t.joins.is_empty() => &t.relation,
+        [] => bail!("MATCH_RECOGNIZE: the view's query has no MATCH_RECOGNIZE to open"),
+        _ => return Err(kept_once("a join")),
+    };
+    match relation {
+        TableFactor::MatchRecognize { .. } => {}
+        TableFactor::Derived { .. } => return Err(kept_once("a subquery")),
+        _ => bail!("MATCH_RECOGNIZE: the view's query has no MATCH_RECOGNIZE to open"),
+    }
+    let grouped = match &s.group_by {
+        GroupByExpr::All(_) => true,
+        GroupByExpr::Expressions(e, m) => !e.is_empty() || !m.is_empty(),
+    };
+    if grouped {
+        return Err(kept_once("a GROUP BY"));
+    }
+    if s.having.is_some() {
+        return Err(kept_once("a HAVING"));
+    }
+    if s.qualify.is_some() || !s.named_window.is_empty() {
+        return Err(kept_once("a window"));
+    }
+    if !s.cluster_by.is_empty() || !s.distribute_by.is_empty() || !s.sort_by.is_empty() {
+        return Err(kept_once("an ORDER BY"));
+    }
+    if s.into.is_some() || !s.lateral_views.is_empty() || !s.connect_by.is_empty() || s.prewhere.is_some() {
+        return Err(kept_once("this clause"));
+    }
+    Ok(s)
+}
+
+/// The refusal of a construct around an EMIT FINAL view's pattern: each match is kept once, so a group or a join goes in a
+/// view over this view.
+fn kept_once(what: &str) -> anyhow::Error {
+    open_refusal(format!("has {what} around the pattern, which is kept once per match: group or join in a view over this view"))
+}
+
+/// The refusal of an EMIT FINAL view of MATCH_RECOGNIZE that open mode can't take, with what to write.
+fn open_refusal(what: impl Display) -> anyhow::Error {
+    coded("0A000", format!("an EMIT FINAL view of MATCH_RECOGNIZE {what}"))
+}
+
+/// The refusal of a volatile or stable function in a view's `place`: a later run would match the same rows again, and must
+/// get the same answer.
+fn rerun_refusal(f: &str, place: &str) -> anyhow::Error {
+    open_refusal(format!("has {f}() in a {place}: it is matched again in later runs, which must answer the same: make it a plain view"))
+}
+
+/// What open mode refuses in a projection or a WHERE: a window, or an aggregate, which would add up the matches of a run.
+fn projected(s: &Select, ctx: &dyn FunctionRegistry) -> Result<()> {
+    let items = s.projection.iter().filter_map(|i| match i {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        _ => None,
+    });
+    for e in items.chain(s.selection.as_ref()) {
+        let mut around_it = None;
+        let _ = crate::walk::visit_expressions(e, |x| {
+            if let Expr::Function(f) = x {
+                if f.over.is_some() {
+                    around_it = Some("a window");
+                    return ControlFlow::Break(());
+                }
+                if ctx.udaf(&lower_name(f)).is_ok() {
+                    around_it = Some("an aggregate");
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(what) = around_it {
+            return Err(kept_once(what));
+        }
+    }
+    Ok(())
+}
+
+/// The first function of `e` that a later run could answer differently: DataFusion's Volatile functions, and its Stable
+/// ones (now() and the current date and time, which each run reads at its own time). The session's registry tells them.
+fn rerun_in(e: &Expr, ctx: &dyn FunctionRegistry) -> Option<String> {
+    let mut found = None;
+    let _ = crate::walk::visit_expressions(e, |x| {
+        if let Expr::Function(f) = x {
+            let name = lower_name(f);
+            let volatility = ctx
+                .udf(&name)
+                .map(|u| u.signature().volatility)
+                .or_else(|_| ctx.udaf(&name).map(|u| u.signature().volatility));
+            if matches!(volatility, Ok(Volatility::Volatile | Volatility::Stable)) {
+                found = Some(name);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether a call to `name` (in lower case) is anywhere in `q`.
+fn has_call(q: &Query, name: &str) -> bool {
+    crate::walk::visit_expressions(q, |x| match x {
+        Expr::Function(f) if lower_name(f) == name => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_break()
+}
+
+/// Whether a pattern has `^` or `$` anywhere in it.
+fn anchored(p: &Pattern) -> bool {
+    match p {
+        Pattern::Start | Pattern::End => true,
+        Pattern::Exclude(b) => anchored(b),
+        Pattern::Seq(v) | Pattern::Alt(v) | Pattern::Permute(v) => v.iter().any(anchored),
+        Pattern::Rep { body, .. } => anchored(body),
+        Pattern::Sym(_) => false,
+    }
+}
+
+/// The column an expression names (`ts`, or `t.ts` by its last part), as `ident` reads a name; None for anything else.
+fn named_column(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Identifier(i) => Some(ident(i)),
+        Expr::CompoundIdentifier(p) => p.last().map(ident),
+        _ => None,
+    }
+}
+
+/// P: the most rows a PREV in the clause's DEFINEs and measures reaches back (`PREV(x)` is 1, `PREV(x, 3)` is 3); 0 with no
+/// PREV.
+fn look_of(measures: &[Measure], symbols: &[SymbolDefinition]) -> Result<u64> {
+    let mut look = 0u64;
+    for e in measures.iter().map(|m| &m.expr).chain(symbols.iter().map(|d| &d.definition)) {
+        let mut err = None;
+        let _ = crate::walk::visit_expressions(e, |x| {
+            if let Expr::Function(f) = x {
+                if lower_name(f) == "prev" {
+                    match positional(f).and_then(|a| whole(a.get(1).copied())) {
+                        Ok(n) => look = look.max(n.unwrap_or(1)),
+                        Err(e2) => {
+                            err = Some(e2);
+                            return ControlFlow::Break(());
+                        }
+                    }
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    Ok(look)
 }
 
 /// The statements' clauses (outside the kept ones): whether any is there, and the names its inputs and CTEs have.
@@ -429,7 +850,7 @@ impl VisitorMut for Rewrite<'_> {
         if !matches!(t, TableFactor::MatchRecognize { .. }) {
             return ControlFlow::Continue(());
         }
-        match layer(t, self.lake) {
+        match layer(t, self.lake, false) {
             Ok(d) => {
                 *t = d;
                 ControlFlow::Continue(())
@@ -480,8 +901,9 @@ struct Cx {
     inline: bool,
 }
 
-/// One `MATCH_RECOGNIZE` as the derived table it stands for (the layers of the module doc).
-fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFactor> {
+/// One `MATCH_RECOGNIZE` as the derived table it stands for (the layers of the module doc). `open` writes it in open mode:
+/// `pondra_open` answers each key's list, the marker is `__mr_resume`, and the run's columns are read (see `open`).
+fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>, open: bool) -> Result<TableFactor> {
     let TableFactor::MatchRecognize { table, partition_by, order_by, measures, rows_per_match, after_match_skip, pattern, symbols, alias } = t
     else {
         bail!("MATCH_RECOGNIZE: not a MATCH_RECOGNIZE clause");
@@ -577,6 +999,9 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
         spec["rows"] = json!(cx.rows.len());
         spec["values"] = json!(cx.values.len());
     }
+    if open {
+        spec["look"] = json!(look_of(measures, symbols)?);
+    }
     let spec = spec.to_string();
     let mut call: String = (0..cx.syms.len()).map(|k| format!(", __mr_d{k}")).collect();
     if let Some(interval) = &within {
@@ -584,25 +1009,36 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
     }
     call.extend((0..cx.rows.len()).map(|j| format!(", __mr_r{j}")));
     call.extend((0..cx.values.len()).map(|j| format!(", __mr_v{j}")));
+    if open {
+        // the run's columns: the key's look-back count, its match count and the watermark (see `Open`)
+        call.push_str(", __mr_ok, __mr_om, __mr_w");
+    }
     let mut order2: Vec<String> = dirs.iter().enumerate().map(|(i, d)| format!("__mr_o{i}{d}")).collect();
     if has_row {
         order2.push("__mr_row".to_string());
     }
-    let (fun, col) = match overlap {
-        true => ("pondra_matches", "__mr_ms"),
-        false => ("pondra_match", "__mr_m"),
+    // open mode answers a list per row, as the overlapping skip rules do, so its rows unnest in L3
+    let lists = overlap || open;
+    let (fun, col) = match (open, overlap) {
+        (true, _) => ("pondra_open", "__mr_ms"),
+        (false, true) => ("pondra_matches", "__mr_ms"),
+        (false, false) => ("pondra_match", "__mr_m"),
     };
     let l2 = format!("SELECT *, {fun}({}{call}) {} AS {col} FROM ({l1}) AS __mr_c", quote(&spec), over(&part, &order2));
 
     // L3: the rows in a match, with its fields as columns. SHOW keeps the rows in a match, OMIT those with a place in it
     // (an empty match's row has none), WITH UNMATCHED ROWS all of them (a row in no match has NULL fields).
-    let fields = "SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x";
+    let mut fields = "SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x".to_string();
+    if open {
+        // the marker (seq -1) carries the key's resume fields; a match's row has none
+        fields.push_str(", CASE WHEN __mr_m['seq'] = -1 THEN named_struct('keep', __mr_m['keep'], 'k', __mr_m['k'], 'next_m', __mr_m['next_m'], 'due', __mr_m['due']) END AS __mr_resume");
+    }
     let keep = match (omit, unmatched) {
         (true, _) => " WHERE __mr_m['seq'] IS NOT NULL",
         (false, false) => " WHERE __mr_m IS NOT NULL",
         (false, true) => "",
     };
-    let l3 = match overlap {
+    let l3 = match lists {
         true => format!("{fields} FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM ({l2}) AS __mr_mm) AS __mr_u{keep}"),
         false => format!("{fields} FROM ({l2}) AS __mr_mm{keep}"),
     };
@@ -613,9 +1049,17 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
             let mut group = part.clone();
             group.push("__mr_match".to_string());
             let mut proj = part.clone();
-            proj.extend(texts.iter().zip(measures).map(|(t, m)| format!("{t} AS {}", m.alias)));
+            // open mode: the measures are NULL on the marker, whose group is the one with no match
+            proj.extend(texts.iter().zip(measures).map(|(t, m)| match open {
+                true => format!("CASE WHEN __mr_match IS NOT NULL THEN ({t}) END AS {}", m.alias),
+                false => format!("{t} AS {}", m.alias),
+            }));
             if proj.is_empty() {
                 return Err(coded("0A000", "MATCH_RECOGNIZE: no PARTITION BY and no MEASURES: no column to give"));
+            }
+            if open {
+                // the marker's group is the only one with no match: its fields are each key's max, and NULL on a match
+                proj.push("CASE WHEN __mr_match IS NULL THEN named_struct('keep', max(__mr_resume['keep']), 'k', max(__mr_resume['k']), 'next_m', max(__mr_resume['next_m']), 'due', max(__mr_resume['due'])) END AS __mr_resume".to_string());
             }
             format!("SELECT {} FROM ({l3}) AS __mr_r GROUP BY {}", proj.join(", "), group.join(", "))
         }
@@ -623,7 +1067,8 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
             // L4: each measure over the match's rows; WITH UNMATCHED ROWS, NULL where a row is in no match
             let mut sel = vec!["*".to_string()];
             for (i, t) in texts.iter().enumerate() {
-                let wrapped = match unmatched {
+                // (open mode: a measure is NULL on the marker's row, as on an unmatched row)
+                let wrapped = match unmatched || open {
                     true => format!("CASE WHEN __mr_match IS NOT NULL THEN ({t}) END"),
                     false => t.clone(),
                 };
@@ -640,8 +1085,11 @@ fn layer(t: &TableFactor, lake: &HashMap<String, Vec<String>>) -> Result<TableFa
                 }
             }
             let mut hidden: Vec<String> = ["__mr_m", "__mr_match", "__mr_symbol", "__mr_seq", "__mr_x"].iter().map(|c| c.to_string()).collect();
-            if overlap {
+            if lists {
                 hidden.push("__mr_ms".to_string());
+            }
+            if open {
+                hidden.extend(["__mr_ok", "__mr_om", "__mr_w"].map(String::from));
             }
             if has_row {
                 hidden.push("__mr_row".to_string());
@@ -731,7 +1179,7 @@ fn one_define(e: Expr, k: usize, cx: &mut Cx, glued: &mut Vec<serde_json::Value>
 
 /// Whether a PREV, NEXT, FIRST or LAST of `e` has a CLASSIFIER() anywhere in its arguments.
 fn nav_of_classifier(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if ["first", "last", "prev", "next"].contains(&lower_name(f).as_str()) && has_classifier(x) => {
             ControlFlow::Break(())
         }
@@ -742,7 +1190,7 @@ fn nav_of_classifier(e: &Expr) -> bool {
 
 /// Whether `e` has a CLASSIFIER() call anywhere in it.
 fn has_classifier(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if lower_name(f) == "classifier" => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -752,7 +1200,7 @@ fn has_classifier(e: &Expr) -> bool {
 /// RUNNING takes its argument as it is (a DEFINE reads the rows so far); FINAL is for MEASURES and is refused.
 fn unwrap_running(e: &mut Expr) -> Result<()> {
     let mut err = None;
-    let _ = visit_expressions_mut(e, |x| {
+    let _ = crate::walk::visit_expressions_mut(e, |x| {
         let replacement = match x {
             Expr::Function(f) if lower_name(f) == "pondra_running" => match positional(f).and_then(|a| first_arg(&a, "RUNNING").cloned()) {
                 Ok(inner) => Some(inner),
@@ -790,7 +1238,7 @@ fn conjuncts(e: &Expr) -> Vec<Expr> {
 /// Whether a DEFINE's expression reads the match so far: another variable's column, a navigation, an aggregate, or
 /// MATCH_NUMBER(). A PREV or NEXT of the row's own columns reads the row only, and so does CLASSIFIER().
 fn reads_match(e: &Expr, k: usize, cx: &Cx) -> bool {
-    visit_expressions(e, |x| {
+    crate::walk::visit_expressions(e, |x| {
         let reads = match x {
             Expr::CompoundIdentifier(p) => match p.as_slice() {
                 [q, _] => cx.syms.iter().position(|s| *s == ident(q)).is_some_and(|j| j != k),
@@ -814,7 +1262,7 @@ fn reads_match(e: &Expr, k: usize, cx: &Cx) -> bool {
 fn glue_text(e: Expr, k: usize, cx: &mut Cx) -> Result<String> {
     let mut x = e;
     let mut glue = Glue { cx, k, err: None };
-    let _ = VisitMut::visit(&mut x, &mut glue);
+    let _ = crate::walk::visit_mut(&mut x, &mut glue);
     if let Some(err) = glue.err {
         return Err(err);
     }
@@ -914,7 +1362,7 @@ fn function_slot(f: &Function, k: usize, cx: &mut Cx) -> Result<Option<String>> 
 /// The name of the first navigation or aggregate in `e` (lower case), when there is one.
 fn nested(e: &Expr) -> Option<String> {
     let mut found = None;
-    let _ = visit_expressions(e, |x| match x {
+    let _ = crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) => {
             let name = lower_name(f);
             if NAVIGATIONS.contains(&name.as_str()) || AGGREGATES.contains(&name.as_str()) {
@@ -1064,7 +1512,7 @@ fn quote(s: &str) -> String {
 fn variable_of<V: Visit + Display>(v: &V, cx: &Cx) -> Result<Option<usize>> {
     let mut found: Vec<usize> = vec![];
     let mut err = None;
-    let _ = visit_expressions(v, |e| {
+    let _ = crate::walk::visit_expressions(v, |e| {
         if let Expr::CompoundIdentifier(p) = e {
             if let [q, _] = p.as_slice() {
                 match symbol_named(&ident(q), cx) {
@@ -1102,7 +1550,7 @@ fn symbol_named(name: &str, cx: &Cx) -> Result<usize> {
 /// An expression as SQL with its variables dropped (`down.price` is `price`): the column a navigation reads.
 fn plain(e: &Expr) -> String {
     let mut e = e.clone();
-    let _ = visit_expressions_mut(&mut e, |x| {
+    let _ = crate::walk::visit_expressions_mut(&mut e, |x| {
         if let Some(last) = match x {
             Expr::CompoundIdentifier(p) => p.last().cloned(),
             _ => None,
@@ -1116,7 +1564,7 @@ fn plain(e: &Expr) -> String {
 
 /// Whether an expression reads the match (a navigation, CLASSIFIER or MATCH_NUMBER) anywhere in it.
 fn navigates(e: &Expr) -> bool {
-    visit_expressions(e, |x| match x {
+    crate::walk::visit_expressions(e, |x| match x {
         Expr::Function(f) if NAVIGATIONS.contains(&lower_name(f).as_str()) => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -1181,7 +1629,7 @@ fn define_error(sym: &str, what: String) -> anyhow::Error {
 /// translation keeps its place among operators).
 fn written<T: VisitMut + Display>(mut x: T, cx: &mut Cx) -> Result<String> {
     let mut swap = Swap { cx, texts: vec![], err: None };
-    let _ = VisitMut::visit(&mut x, &mut swap);
+    let _ = crate::walk::visit_mut(&mut x, &mut swap);
     if let Some(e) = swap.err {
         return Err(e);
     }
@@ -1489,7 +1937,7 @@ pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
     let mut stmts = Parser::parse_sql(&GenericDialect {}, &t)?;
     let mut r = Rewrite { lake: &HashMap::new() };
     for s in stmts.iter_mut() {
-        if let ControlFlow::Break(e) = VisitMut::visit(s, &mut r) {
+        if let ControlFlow::Break(e) = crate::walk::visit_mut(s, &mut r) {
             return Err(e);
         }
     }
@@ -1500,6 +1948,11 @@ pub(crate) fn rewritten(sql: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
     use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+
+    /// The engine's own functions, as a session has them (open mode asks them what a later run answers differently).
+    fn engine_functions() -> datafusion::prelude::SessionContext {
+        crate::engine::session(datafusion::prelude::SessionConfig::new(), std::sync::Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()))
+    }
 
     #[test]
     fn wanted_by_the_word() {
@@ -1534,7 +1987,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new(), false).expect("a layer") else { panic!("a derived table") };
         let text = subquery.to_string();
         assert!(text.contains("pondra_matches("));
         assert!(text.contains("GROUP BY symbol, __mr_match"));
@@ -1565,12 +2018,12 @@ mod tests {
         let no_order = "SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(no_order)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
-        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        let err = layer(&s.from.remove(0).relation, &HashMap::new(), false).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "42601");
         let desc = "SELECT * FROM t MATCH_RECOGNIZE (ORDER BY ts DESC PATTERN (a) WITHIN INTERVAL '1' HOUR DEFINE a AS true) AS m";
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(desc)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
-        let err = layer(&s.from.remove(0).relation, &HashMap::new()).expect_err("a refusal");
+        let err = layer(&s.from.remove(0).relation, &HashMap::new(), false).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "0A000");
     }
 
@@ -1582,10 +2035,10 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let err = layer(&clause, &lake).expect_err("a refusal");
+        let err = layer(&clause, &lake, false).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "42701");
         // an input that isn't a lake table keeps DataFusion's own error
-        assert!(layer(&clause, &HashMap::new()).is_ok());
+        assert!(layer(&clause, &HashMap::new(), false).is_ok());
     }
 
     #[test]
@@ -1597,7 +2050,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new()).expect("a layer") else { panic!("a derived table") };
+        let TableFactor::Derived { subquery, .. } = layer(&clause, &HashMap::new(), false).expect("a layer") else { panic!("a derived table") };
         let text = subquery.to_string();
         assert!(text.contains("pondra_match("));
         assert!(text.contains("pondra_nav("));
@@ -1611,7 +2064,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        let err = layer(&clause, &HashMap::new()).expect_err("a refusal");
+        let err = layer(&clause, &HashMap::new(), false).expect_err("a refusal");
         assert_eq!(crate::codes::of(&err), "42601");
     }
 
@@ -1629,7 +2082,7 @@ mod tests {
         let Statement::Query(q) = Parser::parse_sql(&GenericDialect {}, &text(sql)).expect("a query").remove(0) else { panic!("a query") };
         let SetExpr::Select(mut s) = *q.body else { panic!("a select") };
         let clause = s.from.remove(0).relation;
-        layer(&clause, &HashMap::new())
+        layer(&clause, &HashMap::new(), false)
     }
 
     /// The clause of `sql` as its derived table's SQL, and the spec its matcher call carries.
@@ -1677,6 +2130,19 @@ mod tests {
         assert!(spec.get("defines").is_none());
         assert_eq!(derived_sql, TICKER_GOLDEN);
     }
+
+    /// The ticker's clause in ALL ROWS PER MATCH: its derived table is what it was before open mode.
+    #[test]
+    fn the_ticker_all_rows_clause_keeps_its_derived_text() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day \
+                   MEASURES strt.day AS start_day ALL ROWS PER MATCH AFTER MATCH SKIP TO LAST up \
+                   PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m";
+        let (derived_sql, spec) = derived(sql);
+        assert!(spec.get("defines").is_none());
+        assert_eq!(derived_sql, TICKER_ALL_GOLDEN);
+    }
+
+    const TICKER_ALL_GOLDEN: &str = "SELECT symbol, day, __mr_q0 AS start_day, * EXCLUDE (symbol, day, __mr_m, __mr_match, __mr_symbol, __mr_seq, __mr_x, __mr_ms, __mr_o0, __mr_d0, __mr_d1, __mr_d2, __mr_q0) FROM (SELECT *, (pondra_nav(day, __mr_symbol = 'strt', 0, false, false) OVER (PARTITION BY symbol, __mr_match ORDER BY __mr_seq)) AS __mr_q0 FROM (SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM (SELECT *, pondra_matches('{\"pattern\":\"strt down+ up+\",\"skip\":{\"to\":\"last\",\"symbol\":\"up\"},\"unmatched\":false,\"within\":false}', __mr_d0, __mr_d1, __mr_d2) OVER (PARTITION BY symbol ORDER BY __mr_o0) AS __mr_ms FROM (SELECT *, day AS __mr_o0, true AS __mr_d0, (price) < (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d1, (price) > (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d2 FROM ticker) AS __mr_c) AS __mr_mm) AS __mr_u WHERE __mr_m IS NOT NULL) AS __mr_r) AS __mr_a WHERE __mr_x IS NOT TRUE";
 
     const TICKER_GOLDEN: &str = "SELECT symbol, (last_value(day ORDER BY __mr_seq) FILTER (WHERE __mr_symbol = 'strt')) AS start_day FROM (SELECT *, __mr_m['match'] AS __mr_match, __mr_m['symbol'] AS __mr_symbol, __mr_m['seq'] AS __mr_seq, __mr_m['excluded'] AS __mr_x FROM (SELECT *, unnest(__mr_ms) AS __mr_m FROM (SELECT *, pondra_matches('{\"pattern\":\"strt down+ up+\",\"skip\":{\"to\":\"last\",\"symbol\":\"up\"},\"unmatched\":false,\"within\":false}', __mr_d0, __mr_d1, __mr_d2) OVER (PARTITION BY symbol ORDER BY __mr_o0) AS __mr_ms FROM (SELECT *, day AS __mr_o0, true AS __mr_d0, (price) < (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d1, (price) > (lag(price, 1) OVER (PARTITION BY symbol ORDER BY day)) AS __mr_d2 FROM ticker) AS __mr_c) AS __mr_mm) AS __mr_u WHERE __mr_m IS NOT NULL) AS __mr_r GROUP BY symbol, __mr_match";
 
@@ -1812,17 +2278,219 @@ mod tests {
     }
 
     #[test]
-    fn subset_and_emit_final_are_refused_by_name() {
+    fn subset_is_refused_by_name() {
         let subset = refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a b c) SUBSET u = (b, c) DEFINE b AS true) AS m").expect_err("a refusal");
         assert_eq!(crate::codes::of(&subset), "0A000");
         assert!(subset.to_string().contains("write a measure per symbol, as LAST(b.price) and LAST(c.price)"), "{subset}");
         assert!(refused("SELECT * FROM t MATCH_RECOGNIZE (PATTERN (a) DEFINE a AS subset = 1) AS m").is_ok());
         assert!(refused("SELECT subset FROM t").is_ok());
-        let view = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a) DEFINE a AS true) AS m";
-        let emit = emit_final_refused(view).expect_err("a refusal");
-        assert_eq!(crate::codes::of(&emit), "0A000");
-        assert!(emit.to_string().starts_with("a view of MATCH_RECOGNIZE with EMIT FINAL comes later"), "{emit}");
-        assert!(emit_final_refused("SELECT s, count(*) AS n FROM t GROUP BY s").is_ok());
+    }
+
+    /// A subquery before a MATCH_RECOGNIZE, its input aliased `t` and the clause aliased `m`.
+    const SUBQUERY: &str = "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts \
+                            MEASURES FIRST(a.ts) AS s, LAST(b.ts) AS e ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m";
+
+    #[test]
+    fn a_subquery_before_match_recognize_is_a_cte_in_a_derived_table() {
+        let written = text(SUBQUERY);
+        assert!(written.contains("(WITH __mr_input AS (SELECT * FROM ticks WHERE venue = 'x') SELECT * FROM __mr_input t MATCH_RECOGNIZE"), "{written}");
+        assert!(written.contains("PATTERN (\"__mr_pattern_6120622b\")"), "{written}");
+        Parser::parse_sql(&GenericDialect {}, &written).expect("the hoisted text parses");
+    }
+
+    #[test]
+    fn the_hoisted_input_is_a_cte_not_a_lake_table() {
+        let stmts = Parser::parse_sql(&GenericDialect {}, &text(SUBQUERY)).expect("a query");
+        let mut scan = Scan::default();
+        for s in &stmts {
+            let _ = crate::walk::visit(s, &mut scan);
+        }
+        assert!(scan.found);
+        assert!(scan.ctes.contains("__mr_input"));
+        assert!(scan.inputs.difference(&scan.ctes).next().is_none(), "{:?}", scan.inputs);
+    }
+
+    #[test]
+    fn the_hoisted_clause_rewrites_over_its_cte() {
+        let rewritten_sql = rewritten(SUBQUERY).expect("a rewrite");
+        assert!(rewritten_sql.contains("__mr_input"), "{rewritten_sql}");
+        assert!(!rewritten_sql.contains("MATCH_RECOGNIZE"), "{rewritten_sql}");
+    }
+
+    #[test]
+    fn a_subquery_before_match_recognize_reads_back_as_written() {
+        let subquery_within = "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts \
+                               PATTERN (a b+ c) WITHIN INTERVAL '1' HOUR DEFINE b AS true) m";
+        let nested = "SELECT * FROM (SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s \
+                      ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m2) t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts \
+                      MEASURES FIRST(a.s) AS f ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS true) m";
+        let cases = [
+            SUBQUERY,
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') AS t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) AS m",
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)) m",
+            "SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE (PARTITION BY sym ORDER BY ts MEASURES FIRST(a.ts) AS s ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > PREV(b.price))",
+            nested,
+            subquery_within,
+        ];
+        for sql in cases {
+            assert_eq!(shown(&text(sql)).as_ref(), sql);
+        }
+    }
+
+    #[test]
+    fn a_subquery_as_sqlparser_stores_it_reads_back_as_written() {
+        let stored = Parser::parse_sql(&GenericDialect {}, &text(SUBQUERY)).expect("a query")[0].to_string();
+        let back = shown(&stored);
+        assert!(back.contains("(SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE(PARTITION BY sym"), "{back}");
+        assert!(back.contains("PATTERN (a b+) DEFINE b AS b.price > PREV(b.price)"), "{back}");
+        assert!(!back.contains("__mr_"), "{back}");
+    }
+
+    #[test]
+    fn a_join_or_a_table_before_match_recognize_is_not_hoisted() {
+        let join = "SELECT * FROM (a JOIN b ON a.k = b.k) MATCH_RECOGNIZE (PARTITION BY k ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        let written = text(join);
+        assert!(!written.contains("__mr_input"), "{written}");
+        assert!(Parser::parse_sql(&GenericDialect {}, &written).is_err());
+        let table = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        let written = text(table);
+        assert_eq!(written, "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (\"__mr_pattern_6120622b\") DEFINE b AS true) m");
+        assert_eq!(shown(&written).as_ref(), table);
+    }
+
+    #[test]
+    fn an_emit_final_view_over_a_subquery_is_refused_with_its_words() {
+        let err = open(SUBQUERY, &HashMap::new(), &engine_functions()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+        assert!(err.to_string().contains("has a subquery around the pattern"), "{err}");
+    }
+
+    #[test]
+    fn a_materialized_view_over_a_subquery_is_refused_by_name_and_a_plain_one_is_not() {
+        let err = refused(&format!("CREATE MATERIALIZED VIEW v AS {SUBQUERY}")).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+        assert!(err.to_string().contains("a materialized view over a MATCH_RECOGNIZE of a subquery"), "{err}");
+        assert!(refused(&format!("create or replace materialized view v as {SUBQUERY}")).is_err());
+        assert!(refused(&format!("CREATE VIEW v AS {SUBQUERY}")).is_ok());
+        assert!(refused(SUBQUERY).is_ok());
+        assert!(refused("CREATE MATERIALIZED VIEW v AS SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m").is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS {SUBQUERY} EMIT FINAL")).is_ok(), "write refuses it, in its own words");
+    }
+
+    #[test]
+    fn a_materialized_view_over_a_cte_is_refused_by_name_and_one_over_a_table_is_not() {
+        let clause = "MATCH_RECOGNIZE (PARTITION BY s ORDER BY ts PATTERN (a b+) DEFINE b AS true) m";
+        for sql in [
+            format!("CREATE MATERIALIZED VIEW v AS WITH t AS (SELECT * FROM ticks WHERE venue = 'x') SELECT * FROM t {clause}"),
+            format!("CREATE MATERIALIZED VIEW v AS WITH a AS (SELECT 1), t (s, ts) AS MATERIALIZED (SELECT s, ts FROM ticks) SELECT * FROM t AS x {clause}"),
+        ] {
+            let err = refused(&sql).expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "0A000");
+            assert!(err.to_string().contains("a materialized view over a MATCH_RECOGNIZE of a CTE"), "{err}");
+        }
+        // (a CTE the pattern doesn't read, a query, a plain view and EMIT FINAL are not this refusal's)
+        let other = format!("CREATE MATERIALIZED VIEW v AS WITH k AS (SELECT 1 AS n) SELECT * FROM ticks {clause}");
+        assert!(refused(&other).is_ok());
+        let cte = format!("WITH t AS (SELECT * FROM ticks) SELECT * FROM t {clause}");
+        assert!(refused(&cte).is_ok());
+        assert!(refused(&format!("CREATE VIEW v AS {cte}")).is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS {cte} EMIT FINAL")).is_ok());
+        assert!(refused(&format!("CREATE MATERIALIZED VIEW v AS SELECT 'WITH t AS (' AS w FROM ticks {clause}")).is_ok());
+    }
+
+    #[test]
+    fn an_emit_final_view_over_a_subquery_is_not_hoisted_so_write_refuses_it() {
+        let view = format!("CREATE MATERIALIZED VIEW v AS {} EMIT FINAL", SUBQUERY);
+        let written = text(&view);
+        assert!(!written.contains("__mr_input"), "{written}");
+        assert!(written.starts_with("CREATE MATERIALIZED VIEW v AS SELECT * FROM (SELECT * FROM ticks WHERE venue = 'x') t MATCH_RECOGNIZE"), "{written}");
+    }
+
+    /// A lake with one table of these columns.
+    fn lake_of(table: &str, cols: &[&str]) -> HashMap<String, Vec<String>> {
+        HashMap::from([(table.to_string(), cols.iter().map(|c| c.to_string()).collect())])
+    }
+
+    #[test]
+    fn open_mode_of_the_ticker_is_one_list_call_with_its_marker() {
+        let sql = "SELECT * FROM ticker MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY day \
+                   MEASURES strt.day AS start_day ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up \
+                   PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price))";
+        let o = open(sql, &lake_of("ticker", &["symbol", "day", "price"]), &engine_functions()).expect("an open view");
+        assert!(o.inner.starts_with("SELECT * FROM (SELECT "), "{}", o.inner);
+        assert!(o.inner.ends_with(") AS __mr_open"), "{}", o.inner);
+        assert!(o.inner.contains("pondra_open("), "{}", o.inner);
+        assert!(o.inner.contains("__mr_d2, __mr_ok, __mr_om, __mr_w) OVER"), "{}", o.inner);
+        assert_eq!(spec_in(&o.inner)["look"], json!(1));
+        assert!(o.inner.contains("AS __mr_resume"), "{}", o.inner);
+        assert!(o.outer.is_none());
+        assert_eq!(o.table, "ticker");
+        assert_eq!(o.time, "day");
+        assert_eq!(o.part, vec!["symbol".to_string()]);
+        assert_eq!((o.look, o.within), (1, false));
+    }
+
+    #[test]
+    fn a_where_reads_the_matches_and_both_texts_parse() {
+        let sql = "SELECT symbol, bottom FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts \
+                   MEASURES LAST(down.price) AS bottom ONE ROW PER MATCH PATTERN (strt down+ up+) \
+                   DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price)) AS m WHERE bottom < 10";
+        let o = open(sql, &lake_of("ticks", &["symbol", "ts", "price"]), &engine_functions()).expect("an open view");
+        let outer = o.outer.expect("a view that reads the matches");
+        assert_eq!(outer, "SELECT symbol, bottom FROM __matches AS m WHERE bottom < 10");
+        crate::expander::parse_query(&o.inner).expect("the inner text parses");
+        crate::expander::parse_query(&outer).expect("the outer text parses");
+    }
+
+    #[test]
+    fn look_is_the_most_a_prev_reaches_back() {
+        let lake = lake_of("ticks", &["symbol", "ts", "price"]);
+        let none = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES LAST(b.price) AS p \
+                    ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > a.price)";
+        assert_eq!(open(none, &lake, &engine_functions()).expect("an open view").look, 0);
+        let three = "SELECT * FROM ticks MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES PREV(price, 3) AS p \
+                     ONE ROW PER MATCH PATTERN (a b+) DEFINE b AS b.price > a.price)";
+        assert_eq!(open(three, &lake, &engine_functions()).expect("an open view").look, 3);
+    }
+
+    #[test]
+    fn open_refusals_say_what_to_write() {
+        const CLAUSE: &str = "MATCH_RECOGNIZE (PARTITION BY symbol ORDER BY ts MEASURES LAST(down.price) AS bottom ONE ROW PER MATCH \
+                              PATTERN (strt down+ up+) DEFINE down AS down.price < PREV(down.price), up AS up.price > PREV(up.price))";
+        let lake = lake_of("ticks", &["symbol", "ts", "price"]);
+        let cases: Vec<(String, &str)> = vec![
+            (format!("SELECT symbol, count(*) AS n FROM ticks {CLAUSE} AS m"), "has an aggregate around the pattern, which is kept once per match"),
+            (format!("SELECT symbol, row_number() OVER () AS r FROM ticks {CLAUSE} AS m"), "has a window around the pattern"),
+            (format!("SELECT symbol FROM ticks {CLAUSE} AS m GROUP BY symbol"), "has a GROUP BY around the pattern"),
+            (format!("SELECT DISTINCT symbol FROM ticks {CLAUSE} AS m"), "has DISTINCT around the pattern"),
+            (format!("SELECT * FROM ticks {CLAUSE} AS m ORDER BY symbol"), "has an ORDER BY around the pattern"),
+            (format!("SELECT * FROM ticks {CLAUSE} AS m LIMIT 5"), "has a LIMIT around the pattern"),
+            (format!("SELECT * FROM ticks {CLAUSE} AS m, other"), "has a join around the pattern"),
+            (CLAUSE.replace("ORDER BY ts", "ORDER BY ts DESC"), "orders by its time alone, ascending: a plain view orders by more"),
+            (CLAUSE.replace("ORDER BY ts", "ORDER BY ts, symbol"), "orders by its time alone, ascending: a plain view orders by more"),
+            (CLAUSE.replace("ORDER BY ts", "ORDER BY ts NULLS FIRST"), "orders by its time alone, ascending: a plain view orders by more"),
+            (CLAUSE.replace("ORDER BY ts ", ""), "has no ORDER BY"),
+            (CLAUSE.replace("ORDER BY ts", "ORDER BY nope"), "orders by nope, which isn't a column of ticks"),
+            (CLAUSE.replace("PATTERN (strt down+ up+)", "PATTERN (strt down+ up+ $)"), "can't have $ or ^ in its pattern"),
+            (CLAUSE.replace("PATTERN (strt down+ up+)", "PATTERN (^ strt down+ up+)"), "can't have $ or ^ in its pattern"),
+            (CLAUSE.replace("PREV(down.price)", "NEXT(down.price)"), "can't have NEXT: it reads a row that may not have come yet"),
+            (CLAUSE.replace("ONE ROW PER MATCH", "ALL ROWS PER MATCH WITH UNMATCHED ROWS"), "can't take WITH UNMATCHED ROWS"),
+            (CLAUSE.replace("down.price < PREV(down.price)", "random() < 0.5"), "has random() in a DEFINE: it is matched again in later runs"),
+            (CLAUSE.replace("LAST(down.price) AS bottom", "now() AS bottom"), "has now() in a measure: it is matched again in later runs"),
+            (format!("SELECT * FROM ticks {CLAUSE} AS m WHERE random() < 0.5"), "has random() in a WHERE: it is matched again in later runs"),
+        ];
+        for (sql, words) in cases {
+            let sql = if sql.starts_with("SELECT") { sql } else { format!("SELECT * FROM ticks {sql} AS m") };
+            let err = open(&sql, &lake, &engine_functions()).expect_err("a refusal");
+            assert_eq!(crate::codes::of(&err), "0A000", "{sql}: {err}");
+            assert!(err.to_string().contains(words), "{sql}: {err}");
+        }
+        let err = open(&format!("SELECT * FROM ticks {CLAUSE} AS m"), &HashMap::new(), &engine_functions()).expect_err("a refusal");
+        assert_eq!(crate::codes::of(&err), "0A000");
+        assert_eq!(
+            err.to_string(),
+            "an EMIT FINAL view of MATCH_RECOGNIZE reads a table directly: make it a plain view, or WITH (refresh = 'by key')"
+        );
     }
 
     #[tokio::test]

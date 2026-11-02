@@ -1,10 +1,13 @@
 //! Postgres's interval arithmetic (round 31): `n * INTERVAL '37 seconds'`, `INTERVAL '1 month' *
 //! 2.5`, `INTERVAL '1 day' / 3`, which DataFusion refuses. An interval scaled as Postgres scales one
 //! (`interval_mul`): what a fraction of a month leaves goes to days (30 a month), what a fraction of
-//! a day leaves goes to time (24 hours a day).
+//! a day leaves goes to time (24 hours a day). And `DATE '…' + INTERVAL '1 hour'`: a TIMESTAMP, as
+//! Postgres and DuckDB answer it, where DataFusion kept a DATE and dropped the hour (`on_a_date`).
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Float64Array, IntervalMonthDayNanoArray};
 use datafusion::arrow::datatypes::{DataType, IntervalMonthDayNano, IntervalUnit};
-use datafusion::common::{DFSchema, Result};
+use datafusion::arrow::datatypes::TimeUnit;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::{DFSchema, Result, ScalarValue};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::planner::{ExprPlanner, PlannerResult, RawBinaryExpr};
 use datafusion::logical_expr::{cast, lit, ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
@@ -20,6 +23,7 @@ impl ExprPlanner for Arithmetic {
     fn plan_binary_op(&self, e: RawBinaryExpr, schema: &DFSchema) -> Result<PlannerResult<RawBinaryExpr>> {
         let interval = |x: &Expr| x.get_type(schema).is_ok_and(|t| matches!(t, DataType::Interval(_)));
         let number = |x: &Expr| x.get_type(schema).is_ok_and(|t| t.is_numeric());
+        let e = on_a_date(e, schema, &interval);
         let (i, n, divide) = match e.op {
             BinaryOperator::Multiply if interval(&e.left) && number(&e.right) => (&e.left, &e.right, false),
             BinaryOperator::Multiply if number(&e.left) && interval(&e.right) => (&e.right, &e.left, false),
@@ -31,6 +35,31 @@ impl ExprPlanner for Arithmetic {
         let i = cast(i.clone(), DataType::Interval(IntervalUnit::MonthDayNano));
         Ok(PlannerResult::Planned(Expr::ScalarFunction(ScalarFunction::new_udf(SCALE.clone(), vec![i, factor]))))
     }
+}
+
+/// A DATE plus or minus an interval that names hours, minutes or seconds (a literal of one, scaled or not: `INTERVAL '1
+/// hour'`, `n * INTERVAL '30 minutes'`), with the date read as a TIMESTAMP at its midnight, as Postgres and DuckDB read it:
+/// DataFusion kept a DATE and dropped the time (`DATE '2026-01-01' + INTERVAL '25 hours'` was 2026-01-02). A DATE plus
+/// days or months stays a DATE, as before; so does one plus an interval whose time can't be seen as it is planned (a
+/// column of intervals, `INTERVAL '1 day' / 3`).
+fn on_a_date(mut e: RawBinaryExpr, schema: &DFSchema, interval: &dyn Fn(&Expr) -> bool) -> RawBinaryExpr {
+    let date = |x: &Expr| x.get_type(schema).is_ok_and(|t| matches!(t, DataType::Date32 | DataType::Date64));
+    let time = |x: &Expr| {
+        interval(x)
+            && x.exists(|y| Ok(match y {
+                Expr::Literal(ScalarValue::IntervalMonthDayNano(Some(v)), _) => v.nanoseconds != 0,
+                Expr::Literal(ScalarValue::IntervalDayTime(Some(v)), _) => v.milliseconds != 0,
+                _ => false,
+            }))
+            .unwrap_or(false)
+    };
+    let at_midnight = |x: Expr| cast(x, DataType::Timestamp(TimeUnit::Microsecond, None)); // (microseconds, as DuckDB keeps them: every DATE has one, where nanoseconds end in 2262)
+    match e.op {
+        BinaryOperator::Plus | BinaryOperator::Minus if date(&e.left) && time(&e.right) => e.left = at_midnight(e.left),
+        BinaryOperator::Plus if time(&e.left) && date(&e.right) => e.right = at_midnight(e.right),
+        _ => {}
+    }
+    e
 }
 
 static SCALE: LazyLock<Arc<ScalarUDF>> = LazyLock::new(|| Arc::new(ScalarUDF::new_from_impl(Scale(Signature::exact(vec![DataType::Interval(IntervalUnit::MonthDayNano), DataType::Float64], Volatility::Immutable)))));

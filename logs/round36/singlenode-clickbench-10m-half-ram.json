@@ -1,0 +1,454 @@
+{
+ "what": "ClickBench's 43 queries over its 10 M-row hits on one 4-core, 15 GB machine (this project's sandbox) against DuckDB 2.0.0's own tables in memory; Pondra at main 615ff08 plus claude/l1-hot-half-ram (hot columns within half of RAM, beside the query memory, the node's own default: no PONDRA_HOT_GB). Hot = the best of 3 runs. DuckDB's q29 is FAIL here (its subprocess printed a pyarrow warning on stderr); round 35 timed it at 3.05 s, Pondra 1.45 s here.",
+ "suite": "clickbench",
+ "data": "/tmp/l1/clickbench-bench",
+ "sf": 1,
+ "cores": 4,
+ "runs": 3,
+ "info": {
+  "pondra_load_s": 30.8,
+  "pondra_warm_s": 24.4,
+  "pondra_wall_s": 23.5,
+  "duckdb-native_load_s": 7.9,
+  "duckdb-native_version": "2.0.0",
+  "duckdb-native_wall_s": 31.0
+ },
+ "results": {
+  "pondra": {
+   "1": {
+    "hot": 0.004,
+    "first": 0.034,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.008,
+    "first": 0.008,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.011,
+    "first": 0.011,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.009,
+    "first": 0.009,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.07,
+    "first": 0.089,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.137,
+    "first": 0.14,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.007,
+    "first": 0.008,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.013,
+    "first": 0.017,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.154,
+    "first": 0.16,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.134,
+    "first": 0.138,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.034,
+    "first": 0.034,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.047,
+    "first": 0.047,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.125,
+    "first": 0.154,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.157,
+    "first": 0.169,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.113,
+    "first": 0.113,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.107,
+    "first": 0.107,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.23,
+    "first": 0.295,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.211,
+    "first": 0.235,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.477,
+    "first": 0.524,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.004,
+    "first": 0.006,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.079,
+    "first": 0.09,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.058,
+    "first": 0.061,
+    "same_as_duckdb": true
+   },
+   "23": {
+    "hot": 0.362,
+    "first": 0.486,
+    "same_as_duckdb": true
+   },
+   "24": {
+    "hot": 0.402,
+    "first": 0.468,
+    "same_as_duckdb": true
+   },
+   "25": {
+    "hot": 0.008,
+    "first": 0.01,
+    "same_as_duckdb": true
+   },
+   "26": {
+    "hot": 0.041,
+    "first": 0.041,
+    "same_as_duckdb": true
+   },
+   "27": {
+    "hot": 0.009,
+    "first": 0.01,
+    "same_as_duckdb": true
+   },
+   "28": {
+    "hot": 0.242,
+    "first": 0.269,
+    "same_as_duckdb": true
+   },
+   "29": {
+    "hot": 1.447,
+    "first": 1.562,
+    "same_as_duckdb": true
+   },
+   "30": {
+    "hot": 0.025,
+    "first": 0.033,
+    "same_as_duckdb": true
+   },
+   "31": {
+    "hot": 0.09,
+    "first": 0.095,
+    "same_as_duckdb": true
+   },
+   "32": {
+    "hot": 0.102,
+    "first": 0.109,
+    "same_as_duckdb": true
+   },
+   "33": {
+    "hot": 0.432,
+    "first": 0.592,
+    "same_as_duckdb": true
+   },
+   "34": {
+    "hot": 0.69,
+    "first": 0.707,
+    "same_as_duckdb": true
+   },
+   "35": {
+    "hot": 0.655,
+    "first": 0.722,
+    "same_as_duckdb": true
+   },
+   "36": {
+    "hot": 0.085,
+    "first": 0.097,
+    "same_as_duckdb": true
+   },
+   "37": {
+    "hot": 0.046,
+    "first": 0.05,
+    "same_as_duckdb": true
+   },
+   "38": {
+    "hot": 0.021,
+    "first": 0.023,
+    "same_as_duckdb": true
+   },
+   "39": {
+    "hot": 0.015,
+    "first": 0.019,
+    "same_as_duckdb": true
+   },
+   "40": {
+    "hot": 0.082,
+    "first": 0.082,
+    "same_as_duckdb": true
+   },
+   "41": {
+    "hot": 0.017,
+    "first": 0.022,
+    "same_as_duckdb": true
+   },
+   "42": {
+    "hot": 0.017,
+    "first": 0.017,
+    "same_as_duckdb": true
+   },
+   "43": {
+    "hot": 0.013,
+    "first": 0.013,
+    "same_as_duckdb": true
+   },
+   "total_hot": 6.99,
+   "answers_match": 43
+  },
+  "duckdb-native": {
+   "1": {
+    "hot": 0.001,
+    "first": 0.037,
+    "same_as_duckdb": true
+   },
+   "2": {
+    "hot": 0.005,
+    "first": 0.014,
+    "same_as_duckdb": true
+   },
+   "3": {
+    "hot": 0.006,
+    "first": 0.014,
+    "same_as_duckdb": true
+   },
+   "4": {
+    "hot": 0.013,
+    "first": 0.014,
+    "same_as_duckdb": true
+   },
+   "5": {
+    "hot": 0.045,
+    "first": 0.092,
+    "same_as_duckdb": true
+   },
+   "6": {
+    "hot": 0.093,
+    "first": 0.126,
+    "same_as_duckdb": true
+   },
+   "7": {
+    "hot": 0.005,
+    "first": 0.012,
+    "same_as_duckdb": true
+   },
+   "8": {
+    "hot": 0.006,
+    "first": 0.012,
+    "same_as_duckdb": true
+   },
+   "9": {
+    "hot": 0.068,
+    "first": 0.08,
+    "same_as_duckdb": true
+   },
+   "10": {
+    "hot": 0.105,
+    "first": 0.148,
+    "same_as_duckdb": true
+   },
+   "11": {
+    "hot": 0.029,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "12": {
+    "hot": 0.034,
+    "first": 0.034,
+    "same_as_duckdb": true
+   },
+   "13": {
+    "hot": 0.099,
+    "first": 0.112,
+    "same_as_duckdb": true
+   },
+   "14": {
+    "hot": 0.137,
+    "first": 0.172,
+    "same_as_duckdb": true
+   },
+   "15": {
+    "hot": 0.108,
+    "first": 0.108,
+    "same_as_duckdb": true
+   },
+   "16": {
+    "hot": 0.054,
+    "first": 0.084,
+    "same_as_duckdb": true
+   },
+   "17": {
+    "hot": 0.173,
+    "first": 0.173,
+    "same_as_duckdb": true
+   },
+   "18": {
+    "hot": 0.148,
+    "first": 0.157,
+    "same_as_duckdb": true
+   },
+   "19": {
+    "hot": 0.347,
+    "first": 0.352,
+    "same_as_duckdb": true
+   },
+   "20": {
+    "hot": 0.003,
+    "first": 0.004,
+    "same_as_duckdb": true
+   },
+   "21": {
+    "hot": 0.124,
+    "first": 0.134,
+    "same_as_duckdb": true
+   },
+   "22": {
+    "hot": 0.078,
+    "first": 0.083,
+    "same_as_duckdb": true
+   },
+   "23": {
+    "hot": 0.106,
+    "first": 0.139,
+    "same_as_duckdb": true
+   },
+   "24": {
+    "hot": 0.101,
+    "first": 0.103,
+    "same_as_duckdb": true
+   },
+   "25": {
+    "hot": 0.005,
+    "first": 0.005,
+    "same_as_duckdb": true
+   },
+   "26": {
+    "hot": 0.025,
+    "first": 0.026,
+    "same_as_duckdb": true
+   },
+   "27": {
+    "hot": 0.006,
+    "first": 0.006,
+    "same_as_duckdb": true
+   },
+   "28": {
+    "hot": 0.139,
+    "first": 0.144,
+    "same_as_duckdb": true
+   },
+   "29": {
+    "error": "<string>:31: UserWarning: Arrow output on a DB-API result makes an extra copy of the rows, use con.sql(query).to_arrow_table() instead."
+   },
+   "30": {
+    "hot": 0.018,
+    "first": 0.034,
+    "same_as_duckdb": true
+   },
+   "31": {
+    "hot": 0.075,
+    "first": 0.076,
+    "same_as_duckdb": true
+   },
+   "32": {
+    "hot": 0.09,
+    "first": 0.096,
+    "same_as_duckdb": true
+   },
+   "33": {
+    "hot": 0.39,
+    "first": 0.411,
+    "same_as_duckdb": true
+   },
+   "34": {
+    "hot": 0.422,
+    "first": 0.458,
+    "same_as_duckdb": true
+   },
+   "35": {
+    "hot": 0.438,
+    "first": 0.438,
+    "same_as_duckdb": true
+   },
+   "36": {
+    "hot": 0.057,
+    "first": 0.06,
+    "same_as_duckdb": true
+   },
+   "37": {
+    "hot": 0.031,
+    "first": 0.031,
+    "same_as_duckdb": true
+   },
+   "38": {
+    "hot": 0.015,
+    "first": 0.016,
+    "same_as_duckdb": true
+   },
+   "39": {
+    "hot": 0.007,
+    "first": 0.009,
+    "same_as_duckdb": true
+   },
+   "40": {
+    "hot": 0.085,
+    "first": 0.093,
+    "same_as_duckdb": true
+   },
+   "41": {
+    "hot": 0.007,
+    "first": 0.008,
+    "same_as_duckdb": true
+   },
+   "42": {
+    "hot": 0.006,
+    "first": 0.009,
+    "same_as_duckdb": true
+   },
+   "43": {
+    "hot": 0.006,
+    "first": 0.006,
+    "same_as_duckdb": true
+   },
+   "total_hot": null,
+   "answers_match": 42
+  }
+ }
+}

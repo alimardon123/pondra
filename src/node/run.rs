@@ -36,24 +36,15 @@ impl Options {
     /// address and no doors, and none of the loops a node that lives keeps (`Node::start`). Its tokens are the
     /// environment's, and its own calls are signed with a key it makes, as a library's node's are.
     pub fn guest(dir: &str, attach: Vec<String>, guest: Guest) -> Options {
+        // (a lake in this process's memory is new: nobody wrote it, so a guest that only reads leads it, and reads its empty
+        // catalog, as `pondra sql --dir :memory: "SELECT 1"` asks; a reader would find no lake there. An empty folder is still
+        // refused, which catches a mistyped path)
+        let guest = if crate::memory::in_memory(dir) { Guest::Writes } else { guest };
         let auth = auth::Auth::from_env().owned_by(Some(uuid::Uuid::new_v4().simple().to_string()));
         Options { dir: dir.into(), listen: String::new(), advertise: None, start: Start { tier_secs: 0.0, auth: Arc::new(auth), ..Start::default() },
                   pg: None, kafka: None, kafka_advertise: None, flight: None, attach, attach_found: None, guest: Some(guest) }
     }
 }
-
-/// A guest's start found its lake's leader alive but not answering from here: its write goes through the bucket's
-/// inbox instead (the program downcasts it to know so).
-#[derive(Debug)]
-pub struct Unreached;
-
-impl std::fmt::Display for Unreached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "the lake's leader is alive but doesn't answer from here")
-    }
-}
-
-impl std::error::Error for Unreached {}
 
 /// What a node holds as it starts (its term when it leads, then its lake), so a stop at any point gives back what was taken (ADR-061, invariant 300).
 #[derive(Default)]
@@ -213,11 +204,7 @@ impl Node {
         let mut beside = Beside::start(&dir, guest);
         let cluster = match guest {
             None => cluster::Cluster::join(&store, &addr, start.reader, !store::served(&dir), serve_store).await?,
-            Some(g) => match cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))? {
-                Some(c) => c,
-                // (its leader is alive and answers nobody here: the program sends the write through the bucket's inbox)
-                None => return Err(anyhow::Error::new(Unreached)),
-            },
+            Some(g) => cluster::Cluster::guest(&store, g, !store::served(&dir)).await.map_err(|e| e.context(dir.clone()))?,
         };
         // (a guest that reads is a reader from here on: no log, whose history and audit lines would go to a leader it doesn't have)
         let reader = start.reader || cluster.reader;
@@ -242,9 +229,12 @@ impl Node {
         // so their reads are as fresh as a follower's instead of waiting for catalog polls.
         // (a guest's mode said whether its leader answers: a guest that follows one streams, and asks no more)
         let streamed = !leader && !cluster.leader.addr.is_empty() && (!reader || (lives && cluster.leader_alive().await));
-        // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`)
+        // (a guest that reads one snapshot for one statement never polls the bucket for newer manifests: `READER_ONE_SNAPSHOT`;
+        // an inbox guest polls as a follower does: its `seen_there` waits for the leader's mark, which a snapshot never shows)
+        // (a node that follows the commit stream answers from it, and polls less: `FOLLOWER_POLL`)
         let poll = match guest {
             Some(Guest::Reads) if !streamed => store::READER_ONE_SNAPSHOT,
+            None if streamed => store::FOLLOWER_POLL,
             _ => store::READER_POLL,
         };
         let opened = match beside.keep(streamed).await {
@@ -277,8 +267,8 @@ impl Node {
             lake => lake?,
         };
         let _ = held.lake.set(lake.clone()); // (a stop from here on makes the lake durable first: `Held::stop`)
-        if guest == Some(Guest::Reads) && !streamed {
-            let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`)
+        if (guest == Some(Guest::Reads) || cluster.by_inbox()) && !streamed {
+            let _ = held.detach.set(()); // (a reader owes nothing: its close is let go, `Held::stop`; an inbox guest's writes are answered before it)
         }
         tr("the lake open");
         for spec in &attached {
@@ -292,7 +282,7 @@ impl Node {
         }
         // The lakes attached in SQL (`ATTACH … AS …`), and later ATTACHes and DETACHes.
         tr("lakes attached");
-        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr))?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
+        let replica = if !lives || reader || crate::memory::in_memory(&dir) { None } else { Some(replica::ReplicaLog::open(replica::dir(&dir, &addr)?)?) }; // (a lake in memory has no followers to hold changes for; a guest is on no network)
         let app = node::start_app(lake.clone(), cluster.clone(), replica.clone(), &start).await?;
         tr("the app");
         // A door whose port is taken stops the start, as HTTP's does: beside a Postgres on 5432, psql would
@@ -394,8 +384,12 @@ impl Node {
         };
         let drained = async {
             if let Some(seq) = &app.seq {
-                inbox::drain(&app.lake, seq, &app.lock).await?;
+                inbox::drain(&app.lake, seq, &app.lock, false).await?;
                 app.lake.cat.wait_durable(app.lake.cat.committed()).await; // (no cap: the answer is printed after this, and a leader's acks are durable already)
+                // (what it wrote is durable: a full catalog level 0 or a long log is tidied on the way out; one that fails is left to the next)
+                if let Err(e) = app.tidy_one_off().await {
+                    eprintln!("the log stays untiered for now: {e:#}");
+                }
             }
             anyhow::Ok(())
         }

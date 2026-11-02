@@ -56,12 +56,18 @@ pub fn answer(e: &anyhow::Error, shows_code: bool) -> (u16, &'static str, String
 
 /// DataFusion's words for a spill that ran past its cap, and for spilling turned off, said with the
 /// setting a user can change: `PONDRA_SPILL_GB`, not DataFusion's `datafusion.runtime.*` (which Pondra
-/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. Spilling is off on a page too (it has no
-/// disk), so the words for it are true of both.
+/// refuses, invariant 188). The first words stay, so `codes::of` still reads them. A page has no disk to spill to, so its
+/// words name its query pool (`memory_gb`) instead.
 const SPILL_SAYS: &[(&str, &str)] = &[
     ("Please try increasing the config: `datafusion.runtime.max_temp_directory_size`.", "Raise PONDRA_SPILL_GB to let it spill more."),
-    ("(DiskManager is disabled)", "(nothing spills to disk: PONDRA_SPILL_GB is 0, or this is a page)"),
+    ("(DiskManager is disabled)", DISABLED),
 ];
+
+/// What a spill that is off says, in the setting a user can change: a page's query pool, `memory_gb`, or a node's `PONDRA_SPILL_GB`.
+#[cfg(target_arch = "wasm32")]
+const DISABLED: &str = "(nothing spills to disk on a page outside a Worker: run it in a Worker (new Worker(…, { type: 'module' })) to spill to the browser's storage, or raise memory_gb, up to memory_max_gb)";
+#[cfg(not(target_arch = "wasm32"))]
+const DISABLED: &str = "(nothing spills to disk: PONDRA_SPILL_GB is 0)";
 
 /// A worker's error without the code it quotes, for a caller not shown it (S27): `failure` in worker.py ends it
 /// with `  line 3: <the line>` for each place in the body, which become `  line 3`. Here for a procedure (and its
@@ -78,6 +84,16 @@ pub fn unquoted(error: &str) -> String {
 /// An error that says its own SQLSTATE.
 #[derive(Debug)]
 pub struct Coded(pub &'static str, pub String);
+
+/// An error for DataFusion that keeps its SQLSTATE: a coded one anywhere in its chain goes as `DataFusionError::External`,
+/// where `of` finds it again as the error's source (a function's own error is 38000 at every door, not an internal one);
+/// the rest go in words. A Python function's and an extension's both (`pyfn.rs`, `extension.rs`).
+pub fn for_datafusion(e: anyhow::Error) -> datafusion::error::DataFusionError {
+    match e.chain().find_map(|c| c.downcast_ref::<Coded>()) {
+        Some(c) => datafusion::error::DataFusionError::External(Box::new(Coded(c.0, format!("{e:#}")))),
+        None => datafusion::error::DataFusionError::Execution(format!("{e:#}")),
+    }
+}
 
 impl std::fmt::Display for Coded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.1) }
@@ -115,6 +131,11 @@ pub fn received(code: &str) -> Option<&'static str> {
     Some(c)
 }
 
+/// The words of a write the site's browser storage can't keep, because its quota is full (`web/` says so when the browser
+/// refuses a write). A node's full disk is 53100 too, so this is the same answer at every door: `page::FULL` re-exports it.
+#[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
+pub const FULL: &str = "this site's browser storage is full";
+
 /// The code an error's words point to (the first that matches, most particular first).
 fn by_words(text: &str) -> &'static str {
     let t = text.to_lowercase();
@@ -142,6 +163,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("type \"") && has("does not exist") => "42704",                                // undefined_object (`types.rs`)
         _ if has("because column") && (has("uses it") || has("use it")) => "2BP01",              // dependent_objects_still_exist (DROP TYPE)
         _ if has(" is read by ") => "2BP01",                                                     // dependent_objects_still_exist (DROP TABLE that a view or a task reads)
+        _ if has("can't change while these follow it") => "2BP01",                               // dependent_objects_still_exist (UPDATE or DELETE under a view that can't take it)
         _ if first_said("is a view") || first_said("is a table") => "42809",                    // wrong_object_type (a view's name where a table's goes, or the other way)
         _ if has("already has a column") => "42701",                                           // duplicate_column (ALTER TABLE … ADD or RENAME COLUMN)
         _ if has("already exists") || has("exists already") => "42P07",                        // duplicate_table
@@ -151,6 +173,7 @@ fn by_words(text: &str) -> &'static str {
         _ if has("can't cast value") || has("too large to store in a decimal") || int_overflow_text(&t) => "22003", // (Arrow's words for a number that doesn't fit: a value cast to a narrower integer, a decimal's precision, digits that overflow an integer)
         _ if has("csv error") => "22P04", // bad_copy_file_format (a file read as CSV is malformed: Arrow's words, e.g. a line with more fields than the schema has)
         _ if nan_into_decimal(&t) => "0A000", // feature_not_supported (NaN into a decimal: the planner's own cast, as `casts::into` refuses it)
+        _ if has("error parsing timestamp from") => "22007", // invalid_datetime_format (to_date, to_timestamp and their other names: text their format doesn't read)
         _ if has("cast error") || has("cannot cast") || has("can't cast") || has("invalid input syntax") || has("could not parse") || has("invalid input value for enum") => "22P02", // invalid_text_representation
         _ if has("can't reach the bucket") || has("catching up with its leader") => "57P03",   // cannot_connect_now (a leader cut off, a node just started: ask another node)
         _ if has("error sending request") => "58030",                                           // io_error (the bucket or another node didn't answer: try again)
@@ -159,11 +182,13 @@ fn by_words(text: &str) -> &'static str {
         _ if has("this node is stopping") => "57P01",                                           // admin_shutdown (a drain ends a wait)
         _ if has("statement timeout") || has("canceling statement") || has("timed out") => "57014", // query_canceled
         _ if has("used disk space during the spilling") => "53100", // disk_full (a query spilled past PONDRA_SPILL_GB: DataFusion's words, before "out of memory" could match)
-        _ if has(crate::page::FULL) => "53100",                                                 // disk_full (a page's browser storage is over its quota: `page::FULL`, `web/`'s words)
+        #[cfg(feature = "lake")] // (a page's words: the page is the core's lake, built with it)
+        _ if has(FULL) => "53100",                                                              // disk_full (a page's browser storage is over its quota: `FULL`, `web/`'s words)
         _ if has("or move the lake to a folder (alter database") => "53100", // a lake in memory past its spill cap or the disk's room (memory::full)
         _ if has("resources exhausted") || has("out of memory") || has("memory limit") => "53200", // out_of_memory
         _ if has("too many") && has("at once") => "53300",                                      // too_many_connections (a user's queries at once)
         _ if has("come in 1.1") || has("comes in 1.1") || has("coming in 1.1") => "0A000", // feature_not_supported (a statement 1.1 brings, refused by name where it is read as text: `kept.rs`)
+        _ if has("come with extensions") || has("comes with vector indexes") => "0A000", // feature_not_supported (a table's format or a vector's type, kept free for 1.2 and after 1.0: `kept.rs`)
         _ if has("not supported") || has("isn't supported") || has("not implemented") || has("not yet supported") => "0A000", // feature_not_supported
         _ if has("would have no value for it") || has(" column: it stays") || has("takes its type alone") || has("one table at a time") || has("'s last column (drop table") => "0A000", // (a node's ALTER TABLE: a column filled over rows already there, or a key, partition, TTL or order column dropped)
         _ if has("read-only") || has("read only") => "25006",                                   // read_only_sql_transaction
@@ -215,7 +240,7 @@ pub fn http(code: &str) -> u16 {
         "57014" | "57P03" | "58030" | "53200" => 503,                     // timeout, catching up / cut off, bucket or node silent, out of memory: try again
         c if c.starts_with("40") || c.starts_with("55") || c.starts_with("2B") => 409, // serialize / deadlock, wrong state, still depended on
         c if c.starts_with("08") || c.starts_with("53") || c.starts_with("57") => 503, // connection, resources, operator intervention
-        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE)
+        c if c.starts_with("21") || c.starts_with("22") || c.starts_with("23") || c.starts_with("25") || c.starts_with("42") || c.starts_with("P0") || c.starts_with("38") => 400, // a bad request (cardinality, data, constraint, transaction state, syntax, a procedure's RAISE, a Python routine's own error)
         _ => 500,                                                         // XX, 58, unknown: a real fault
     }
 }
@@ -235,6 +260,7 @@ mod tests {
         assert_eq!(of("SQL error: ParserError(\"Expected: an SQL statement, found: SELEC at Line: 1, Column: 1\")"), "42601");
         assert_eq!(of("Inconsistent data length across values list: got 1 values in row 2 but expected 2"), "42601");
         assert_eq!(of("Arrow error: Divide by zero error"), "22012");
+        assert_eq!(of("Execution error: Error parsing timestamp from 'not a date' using format '%Y-%m-%d': input contains invalid characters"), "22007"); // (to_date, PARSE_DATE, STR_TO_DATE)
         assert_eq!(of("orders.id is NOT NULL, and a row gives it no value"), "23502");
         assert_eq!(of("Invalid batch column at '0' has null but schema specifies non-nullable"), "23502"); // (a page's INSERT of a NULL: DataFusion's words)
         assert_eq!(of("Column 'id' is declared as non-nullable but contains null values"), "23502"); // (a page's UPDATE of one: Arrow's words)
@@ -249,11 +275,14 @@ mod tests {
         assert_eq!(of("cannot drop type mood because column t.m uses it"), "2BP01");
         assert_eq!(of("cannot drop type mood because columns use it: a.m, b.n; drop or change them first"), "2BP01");
         assert_eq!(of("t is read by view v: DROP TABLE t CASCADE drops them too, or drop them first"), "2BP01");
+        assert_eq!(of("orders's rows can't change while these follow it: view biggest (keeps a min or max). Drop them first, or change a copy of the table"), "2BP01");
         assert_eq!(of("no view nov"), "42P01");
         assert_eq!(of("column \"d2\" of relation \"at2\" does not exist"), "42703");
         assert_eq!(of("constraint \"c\" of relation \"t\" does not exist"), "42704");
         assert_eq!(of("t already has a column w"), "42701");
         assert_eq!(of("key is t's key column: it stays"), "0A000");
+        assert_eq!(of("CREATE TABLE … USING lance: tables kept in another format come with extensions (1.2); Pondra keeps its tables in its own lake, published as Delta or Iceberg with WITH (publish = …)"), "0A000");
+        assert_eq!(of("VECTOR(n): comes with vector indexes (ADR-051, after 1.0); a vector is FLOAT[] until then"), "0A000");
         assert_eq!(of("a is t's last column (DROP TABLE t)"), "0A000");
         assert_eq!(of("ALTER TABLE t ADD COLUMN d … NOT NULL, DEFAULT or an identity: the rows already there would have no value for it (add it, then UPDATE t SET d = …)"), "0A000");
         assert_eq!(of("v is a view: write to the tables it reads"), "42809");
@@ -289,7 +318,7 @@ mod tests {
         assert_eq!(of("External error: The used disk space during the spilling process has exceeded the allowable limit of 10.00 MB. Raise PONDRA_SPILL_GB to let it spill more."), "53100");
         assert_eq!(of("Resources exhausted: Memory Exhausted while Sorting (DiskManager is disabled)"), "53200"); // (PONDRA_SPILL_GB=0: nothing spills)
         // a lake in memory past its spill cap, or the room its disk keeps (memory::full: the same way out for both)
-        assert_eq!(of("Generic memory error: a lake in memory may spill 2 MB to disk and holds 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
+        assert_eq!(of("Generic memory error: this process's spills may take 2 MB of disk and hold 2 MB there: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
         assert_eq!(of("Generic memory error: the disk a lake in memory spills to has 3 MB free, and a lake keeps 256 MB: raise PONDRA_SPILL_GB or PONDRA_MEMORY_LAKE_GB, or move the lake to a folder (ALTER DATABASE … SET LOCATION)"), "53100");
         // a page's browser storage over its quota, and a write the page then undid for it: disk_full, which HTTP answers 503
         let full = of("Generic opfs error: this site's browser storage is full: Failed to execute 'write' on 'FileSystemWritableFileStream'");
@@ -319,6 +348,7 @@ mod tests {
         assert_eq!(h("23502"), 400); // not_null_violation
         assert_eq!(h("22P02"), 400); // invalid_text_representation
         assert_eq!(h("22003"), 400); // numeric_value_out_of_range
+        assert_eq!(h("38000"), 400); // external_routine_exception: a Python routine's own error
         assert_eq!(h("428C9"), 400); // generated_always
         assert_eq!(h("42601"), 400); // syntax_error
         assert_eq!(h("25006"), 400); // read_only_sql_transaction

@@ -6,7 +6,8 @@
 //!
 //! As with Delta, it is derived from committed catalog state only. Version N is snapshot N and
 //! sequence number N; a version an earlier attempt wrote but never recorded is skipped, never
-//! rewritten. Pondra's Parquet files carry no Iceberg field ids, so columns are mapped by name
+//! rewritten. Pondra's Parquet files carry each column's Iceberg field id (`tier.rs`, `field_ids`);
+//! files written before round 26 carry none, so the metadata also maps columns by name
 //! (`schema.name-mapping.default`).
 use crate::delta::{columns, file_ranges, Column, Range};
 use crate::store::*;
@@ -489,8 +490,10 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
         Some(item) => Some(json!({"type": "list", "element-id": n + i + 1, "element": iceberg(item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
-    let live = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c));
-    live.map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
+    let mut live: Vec<(usize, &(String, String))> = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).collect();
+    let order = meta.in_order(); // (listed in SQL's order: a field is known by its id, wherever it is listed)
+    live.sort_by_key(|(_, (c, _))| order.iter().position(|(s, _)| s == c));
+    live.into_iter().map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need
@@ -1103,7 +1106,7 @@ async fn still_deleting(lake: &Lake, c: &Commit, meta: &TableMeta) -> Result<()>
 async fn up_to_date(lake: &Lake, table: &str, nodes: &[String], me: &str, retain_ms: u64) -> Result<()> {
     let upto = lake.visible();
     for t in [table.to_string(), crate::sys::deleted(table)] {
-        while !crate::tier::tier_table(lake, &t, upto, nodes, me).await?.1 {}
+        crate::tier::all_to_files(lake, &t, upto, nodes, me).await?;
     }
     crate::tier::purge(lake, table, nodes, me, retain_ms, true).await?;
     crate::delta::publish_all(lake).await

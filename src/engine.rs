@@ -33,6 +33,22 @@ pub fn with_catalog(mut state: datafusion::execution::SessionState, catalog: Arc
     SessionContext::new_with_state(state)
 }
 
+/// `ctx`, which reads files by their path or URL as tables (`FROM 'jan.parquet'`): DataFusion's `enable_url_table`,
+/// with the session's own state changed in place, where DataFusion builds the whole state again (7% of a short
+/// query). Every caller's session is its statement's own (`query::session`), so no other session sees the change.
+pub fn with_files(ctx: SessionContext) -> SessionContext {
+    use datafusion::catalog::{DynamicFileCatalog, UrlTableFactory};
+    let factory = Arc::new(datafusion::datasource::dynamic_file::DynamicListTableFactory::new(Default::default()));
+    {
+        let state = ctx.state_ref();
+        let mut state = state.write();
+        let current = Arc::clone(state.catalog_list());
+        state.register_catalog_list(Arc::new(DynamicFileCatalog::new(current, Arc::clone(&factory) as Arc<dyn UrlTableFactory>)));
+    }
+    factory.session_store().with_state(ctx.state_weak_ref()); // (as DataFusion's: the factory plans its tables in this session)
+    ctx
+}
+
 /// The session every query starts from: DataFusion's, with Pondra's rules and planners, and the functions
 /// that need no lake. `Lake::made` adds the node's own.
 pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
@@ -49,6 +65,7 @@ pub fn session(config: SessionConfig, rt: Arc<RuntimeEnv>) -> SessionContext {
     crate::asof::register(&ctx); // (ASOF JOIN's marker)
     crate::fsum::register(&ctx); // sum(DOUBLE): the same answer in any order
     crate::avg::register(&ctx); // avg(DECIMAL): rounded at its last place
+    crate::string_agg::register(&ctx); // string_agg: one group's string held to a share of the query memory
     crate::casts::register(&ctx); // pondra_whole(x): what a cast to an integer rounds by
     crate::finish::register(&ctx); // pondra_moments(x): what a view keeps for a variance
     crate::optimize::register_zoned(&ctx); // to_timestamp(column): in the zone its type says
@@ -450,6 +467,27 @@ mod tests {
             let got = array_value_to_string(batches[0].column(0), 0).unwrap();
             assert_eq!(got, want, "{sql}");
         }
+    }
+
+    /// `with_files` lets a session read a file by its path as a table, which a plain session can't, and keeps the session's id.
+    #[tokio::test]
+    async fn with_files_reads_a_file_by_its_path() {
+        async fn rows_of(ctx: &SessionContext, sql: &str) -> datafusion::common::Result<Vec<RecordBatch>> {
+            ctx.sql(sql).await?.collect().await
+        }
+        let dir = std::env::temp_dir().join(format!("pondra-with-files-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.csv");
+        std::fs::write(&path, "a,b\n1,x\n2,y\n").unwrap();
+        let sql = format!("SELECT count(*) FROM '{}'", path.display());
+        assert!(rows_of(&SessionContext::new(), &sql).await.is_err(), "a plain session reads no file by its path");
+        let ctx = SessionContext::new();
+        let id = ctx.session_id();
+        let ctx = with_files(ctx);
+        assert_eq!(ctx.session_id(), id, "the session keeps its id");
+        let batches = rows_of(&ctx, &sql).await.unwrap();
+        assert_eq!(array_value_to_string(batches[0].column(0), 0).unwrap(), "2");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `EXPLAIN ANALYZE` is answered by `collect` (`analyzed`, this file's copy of DataFusion's `create_output_batch`) and

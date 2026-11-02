@@ -101,7 +101,7 @@ pub fn hide(sql: &str) -> Cow<'_, str> {
     }
     let names = NAMES.iter().copied().filter(|_| mentioned(sql)).chain(deleted.then_some("_deleted")).collect();
     let mut v = Hide { ctes: vec![], changed: false, names };
-    let _ = VisitMut::visit(&mut stmts, &mut v);
+    let _ = crate::walk::visit_mut(&mut stmts, &mut v);
     match v.changed {
         true => Cow::Owned(stmts.iter().map(crate::text::sql).collect::<Vec<_>>().join("; ")),
         false => Cow::Borrowed(sql),
@@ -252,9 +252,12 @@ pub fn compact(b: &RecordBatch) -> Result<RecordBatch> {
     Ok(b.with_schema(schema)?)
 }
 
-/// A batch as the log kept it, as it was: the `_row_id` column back (`compact`), the metadata gone.
-pub fn expand(b: RecordBatch) -> Result<RecordBatch> {
+/// A batch as the log kept it, as it was: the `_row_id` column back (`compact`), the metadata gone. `skip`: the rows of
+/// the same logged batch before this one. A big batch is logged in row slices (`log::encode_ipc`), each under the stream's
+/// one schema and so the one first id: its ids run on across the slices (`log::decode_part`).
+pub fn expand(b: RecordBatch, skip: i64) -> Result<RecordBatch> {
     let Some(first) = b.schema().metadata().get(FIRST).and_then(|f| f.parse::<i64>().ok()) else { return Ok(b) };
+    let first = first + skip;
     let b = RecordBatch::try_new(Arc::new(Schema::new(b.schema().fields().clone())), b.columns().to_vec())?;
     set(&b, ROW_ID, Arc::new(Int64Array::from_iter_values(first..first + b.num_rows() as i64)))
 }

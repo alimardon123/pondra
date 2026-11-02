@@ -89,7 +89,7 @@ Turning a format off deletes its metadata, so nobody reads a stale copy.
 
 Not in the lake, on each node:
 
-- **The SSD tier** (lakes on object storage only): `<temp dir>/pondra-cache/<bucket>_<prefix>/`,
+- **The SSD tier** (lakes on object storage only): `<temp dir>/pondra-cache-<uid>/<bucket>_<prefix>/` (0700),
   or `--cache-dir`. It holds copies of immutable objects under their lake paths, plus the
   catalog's SST cache (`….catalog`). Delete it any time.
 - **Replica files** (`--ack replicated`): `….replica/<node address>/`. They hold the leader's
@@ -122,7 +122,9 @@ Not in the lake, on each node:
 catalog; nothing already written changes. Parquet files and log segments written before read
 the column as null (log rows are conformed to the current columns by name). Delta gets a new
 `metaData` action; the next Iceberg snapshot carries the new schema (columns mapped by name).
-Only adding is supported.
+`RENAME COLUMN`, `DROP COLUMN` and `ALTER COLUMN c TYPE` (a type only widens: a bigger integer,
+FLOAT to DOUBLE, a DECIMAL with more digits) change the catalog alone too: no file is rewritten
+(*Columns renamed or dropped*, below).
 
 SQL `TIMESTAMP` columns are stored in microseconds (`Timestamp(µs)`), the unit Iceberg, Delta,
 Spark and Postgres use; tables with them publish to Iceberg (`timestamp` / `timestamptz`) and

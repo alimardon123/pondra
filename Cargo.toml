@@ -10,7 +10,9 @@ publish = false # (not on crates.io yet: pip and npm carry the binary)
 [features]
 default = ["server"]
 # A node: the lake and its doors. Without it the library is the parts a browser build shares (`src/lib.rs`).
-server = ["lake", "doors"]
+# DataFusion's decoders and encoders for compressed CSV and JSON (gzip, zstd, bzip2, xz) are a node's: a page has none,
+# and refuses a compressed file by name (`ext_names::compression`).
+server = ["lake", "doors", "datafusion/compression"]
 # What answers a statement: the store, catalog, log, writes, DDL, transactions, queries, views and the rest
 # (designs/page-same-core.md §1). A page is to build it too: the deps here that a page can't build (SlateDB, moka,
 # aws-lc-rs, sysinfo, libc, tonic, tokio-rustls) go behind the platform layer, and `cargo check --no-default-features
@@ -18,7 +20,7 @@ server = ["lake", "doors"]
 lake = ["dep:http", "dep:slatedb", "dep:reqwest", "tokio/full", "dep:toml", "dep:chrono-tz", "dep:postgres-types",
         "dep:zstd", "dep:object_store", "dep:object_store_df", "dep:aws-lc-rs", "dep:sysinfo", "dep:libc", "dep:moka",
         "dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-rustls", "dep:rustls-platform-verifier",
-        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom"]
+        "dep:sha1", "dep:sha2", "dep:hmac", "dep:subtle", "dep:getrandom", "dep:wasmtime"]
 # What listens and how a node is run: the HTTP, Postgres, Kafka and Flight doors, the cluster's own calls, the command
 # line and the service. A module is `lake` unless it is one of these; what reaches outside to answer a statement (Python,
 # Git, another Kafka cluster, a function's Flight server) is lake, and on a page it is the platform's or refused by name.
@@ -62,6 +64,7 @@ lru = "0.18"
 chrono = { version = "0.4", default-features = false } # (already built for object_store: ObjectMeta timestamps)
 chrono-tz = { version = "0.10", default-features = false, optional = true } # (already built for arrow: time zones; tasks' cron schedules)
 url = "2"
+percent-encoding = "2" # (a page's `/files/…` names, decoded as the HTTP door's path is: `page.rs`'s `file_name`; already in Cargo.lock through url)
 http = { version = "1", optional = true } # (an AWS catalog's requests signed by object_store's signer, which takes http's; already built for reqwest)
 datafusion-functions-json = "0.55" # json_get(…), ->, ->> over JSON strings (Kafka raw values, semi-structured columns)
 datafusion-spark = "55.1" # Spark's functions DataFusion doesn't name itself (format_string, pmod, parse_url…): PySpark's vocabulary in SQL
@@ -87,6 +90,7 @@ tokio = { version = "1", features = ["sync", "rt"] } # (asof.rs's OnceCell in ev
 # memory reading and no gRPC or TLS sockets (designs/page-same-core.md §5). Each is still `lake`'s, in `[features]`.
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"], optional = true } # (files outside the lake too: ADR-026)
 slatedb = { version = "0.16", default-features = false, features = ["aws", "moka"], optional = true } # moka: in-memory block cache (foyer adds a disk tier we don't need)
+wasmtime = { version = "50", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "anyhow", "parallel-compilation"], optional = true } # extensions' WebAssembly parts, sandboxed (`wasm.rs`, ADR-075 §2); a page's host comes after 1.0
 moka = { version = "0.12.8", features = ["future"], optional = true } # (the catalog's block caches, as slatedb's own over the same moka, saying what they hold: `store::blocks`)
 # Arrow Flight and Flight SQL (gRPC): ADBC, JDBC and pyarrow clients, columnar in and out
 arrow-flight = { version = "59", features = ["flight-sql"], optional = true }

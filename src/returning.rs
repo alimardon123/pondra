@@ -129,7 +129,7 @@ impl Returning {
                 *item = SelectItem::Wildcard(o);
             }
         }
-        let _ = ast::visit_expressions_mut(&mut items, |e| {
+        let _ = crate::walk::visit_expressions_mut(&mut items, |e| {
             if let Expr::CompoundIdentifier(parts) = e {
                 if parts.len() >= 2 && ours(&parts[..parts.len() - 1]) {
                     *e = Expr::CompoundIdentifier(vec![ast::Ident::new(ROWS), parts[parts.len() - 1].clone()]);
@@ -177,6 +177,7 @@ pub async fn columns(app: &App, r: &Returning) -> Result<SchemaRef> {
 fn parsed(r: &Returning) -> Result<Stmt> {
     match crate::write::parse(&r.write) {
         Some(Stmt::Invalid(why)) => bail!(why),
+        Some(Stmt::Refused(code, why)) => Err(crate::codes::coded(code, why)),
         Some(stmt) => Ok(stmt),
         None => bail!("{} … RETURNING: not a write Pondra takes", r.word()),
     }
@@ -215,7 +216,7 @@ async fn target(app: &App, r: &Returning, stmt: &Stmt) -> Result<(String, Schema
     let Some(meta) = app.lake.cat.meta(&crate::store::table_key(&name)).await? else {
         return Err(crate::codes::coded("42P01", format!("no table {table} (RETURNING answers for this database's own tables)")));
     };
-    let columns: Vec<(String, String)> = meta.logical_columns().into_iter().filter(|(c, _)| c != "_deleted").collect();
+    let columns: Vec<(String, String)> = meta.sql_columns().into_iter().filter(|(c, _)| c != "_deleted").collect(); // (SQL's order)
     Ok((name, crate::answer::schema(&columns)?))
 }
 

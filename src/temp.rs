@@ -1,6 +1,12 @@
-//! Temporary tables and views (ADR-028): `CREATE TEMP TABLE` and `CREATE TEMP VIEW` are a
-//! session's own, as in Postgres. Nobody else sees them, they shadow a lake table or view of the
-//! same name, and they end with the session.
+//! Temporary tables, views and functions (ADR-028): `CREATE TEMP TABLE`, `CREATE TEMP VIEW` and `CREATE TEMP MACRO`
+//! (or `TEMP FUNCTION`, SQL's) are a session's own, as in Postgres and DuckDB. Nobody else sees them, they shadow a
+//! lake table, view or function of the same name, and they end with the session.
+//!
+//! A temporary function is expanded where it is called, as the lake's SQL functions are (`routines.rs`): what runs,
+//! spreads or is remembered is plain SQL, so nothing of it is anywhere but in its session. A lake's view or function
+//! can't be made calling one (its readers have no such function), and one named as a lake function shadows it in the
+//! statement's own text alone: never in a stored view or a lake function's body (`front::Routines`, `stored`), which
+//! read the same for every reader.
 //!
 //! A temporary table lives in the memory of the node the session talks to, within
 //! `PONDRA_TEMP_MB` (1024) for all of them, with system columns of its own: INSERT, UPDATE, DELETE
@@ -16,7 +22,7 @@ use crate::text::mentions;
 use crate::app::App;
 use crate::store::TableMeta;
 use crate::write::Stmt;
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Int64Type, TimeUnit};
 use datafusion::datasource::MemTable;
@@ -31,7 +37,13 @@ use std::time::Duration;
 tokio::task_local! {
     /// The session a request belongs to, if any.
     pub static SESSION: Option<String>;
+    /// While a stored view's query is read (`stored`).
+    static STORED: bool;
 }
+
+/// `f` reading a stored view's query (`routines::expand_stored`): its functions are the lake's alone, whatever the
+/// session made (`routines`).
+pub async fn stored<T>(f: impl std::future::Future<Output = T>) -> T { STORED.scope(true, f).await }
 
 /// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
 /// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
@@ -90,6 +102,7 @@ pub fn made(name: &str) -> Option<(&'static str, String)> {
 }
 
 const NO_SESSION: &str = "a temporary table or view is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)";
+const NO_SESSION_FN: &str = "a temporary function is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)";
 
 struct Table {
     meta: TableMeta, // its definition as a lake table's is (columns, PRIMARY KEY, NOT NULL, DEFAULT, CHECK, the typed columns): every write is checked as a lake table's is
@@ -111,6 +124,7 @@ impl Table {
 pub struct Session {
     tables: HashMap<String, Table>,
     views: HashMap<String, String>,
+    routines: HashMap<String, crate::expander::Routine>, // CREATE TEMP MACRO | FUNCTION: SQL's, expanded where called (`routines` below)
     secrets: std::collections::BTreeMap<String, crate::ext::Secret>, // (CREATE TEMPORARY SECRET: in memory only)
     pub settings: std::collections::BTreeMap<String, String>,       // SET name = value (`settings.rs`)
     pub prepared: HashMap<String, String>,                          // PREPARE name AS …: its text
@@ -194,7 +208,7 @@ pub fn touch(session: &str) {
 /// nodes keeps to this one while it does: `POST /sql` says so (`x-pondra-session: held`).
 pub fn holds(session: &str) -> bool {
     let kept = SESSIONS.lock().unwrap().get(session).is_some_and(|x| {
-        !(x.tables.is_empty() && x.views.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
+        !(x.tables.is_empty() && x.views.is_empty() && x.routines.is_empty() && x.secrets.is_empty() && x.settings.is_empty() && x.prepared.is_empty() && x.variables.is_empty())
     });
     kept || crate::txn::held(session) || crate::python::held(session)
 }
@@ -224,6 +238,37 @@ pub fn end(session: &str) -> bool {
     gone
 }
 
+/// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands in a
+/// statement's own text (`host.rs`; a lake function's body calls the lake's, `front::Routines`). Without any, or
+/// while a stored view is read (`stored`), the lake's as they are.
+pub fn routines(all: Arc<HashMap<String, crate::expander::Routine>>) -> Arc<HashMap<String, crate::expander::Routine>> {
+    if STORED.try_with(|s| *s).unwrap_or(false) {
+        return all;
+    }
+    let Some(own) = current().and_then(|s| peek(&s, |x| (!x.routines.is_empty()).then(|| x.routines.clone()))) else { return all };
+    let mut both = (*all).clone();
+    both.extend(own);
+    Arc::new(both)
+}
+
+/// The names of the current session's temporary functions (the search path leaves them as written: `path.rs`).
+pub fn routine_names() -> Vec<String> {
+    current().and_then(|s| peek(&s, |x| Some(x.routines.keys().cloned().collect()))).unwrap_or_default()
+}
+
+/// One of the current session's temporary functions that `sql` calls (its name, unqualified, then `(`), if any.
+pub fn called(sql: &str) -> Option<String> {
+    let s = current()?;
+    let text = sql.to_lowercase();
+    peek(&s, |x| x.routines.keys().find(|f| calls(&text, &f.to_lowercase())).cloned())
+}
+
+/// Does `text` (lower case) call `f`: its name as a word not after a `.` (`s.f` is a schema's), then `(`?
+fn calls(text: &str, f: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
+    text.match_indices(f).any(|(i, _)| !text[..i].ends_with(word) && text[i + f.len()..].trim_start().starts_with('('))
+}
+
 /// Does `sql` read one of this session's temporary tables or views?
 pub fn mentioned(sql: &str) -> bool {
     let Some(s) = current() else { return false };
@@ -239,11 +284,12 @@ pub fn own(stmt: &Stmt) -> bool {
     let Some(s) = current() else { return false };
     match stmt {
         Stmt::Create(c) => c.temporary,
-        Stmt::TempView(..) | Stmt::TempSecret(..) => true,
+        Stmt::TempView(..) | Stmt::TempSecret(..) | Stmt::TempRoutine(..) => true,
         Stmt::Ddl(d) => !d.is_empty() && d.iter().all(|d| match d {
             Ddl::DropTable { name, made_by: None, .. } => has(&s, name, true), // (a failed CREATE TABLE … AS's drop is the lake's table, never a session's)
             Ddl::DropView { name, .. } => has(&s, name, false),
             Ddl::DropSecret { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.secrets.contains_key(name)),
+            Ddl::DropRoutine { name, .. } => SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.routines.contains_key(name)), // (the session's, over the lake's of the name)
             _ => false,
         }),
         Stmt::Insert(t, _) | Stmt::InsertInto(t, ..) | Stmt::Update(t, ..) | Stmt::Delete(t, _) => has(&s, t, true),
@@ -310,9 +356,22 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            crate::engine::sql(&crate::query::session(&app.lake, sql, "").await?, &crate::sys::planned(sql)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
+            let expanded = crate::routines::expand_temp_view(&app.lake, sql).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
+            crate::engine::sql(&crate::query::session(&app.lake, &expanded, "").await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
+        }
+        Stmt::TempRoutine(name, r, replace, quiet) => {
+            let s = session.context(NO_SESSION_FN)?;
+            ensure!(!name.contains('.'), "{name}: a temporary function's name has no schema (it is the session's)");
+            let (what, had) = (r.what(), SESSIONS.lock().unwrap().get(&s).is_some_and(|x| x.routines.contains_key(name)));
+            if *quiet && had {
+                return Ok(Some(j!({what: name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
+            }
+            ensure!(*replace || !had, "temporary {what} {name} exists (CREATE OR REPLACE TEMP {} replaces it)", what.to_uppercase());
+            let r = crate::routines::temporary(&app.lake, name, (**r).clone()).await?;
+            with(&s, true, |x| Ok(x.routines.insert(name.clone(), r)))?;
+            return Ok(Some(j!({what: name, "temporary": true})));
         }
         Stmt::TempSecret(name, params, replace, quiet) => {
             let s = session.context("a temporary secret is a session's: a Postgres connection's, or the Python or JavaScript client's (over HTTP, send x-pondra-session: <id>, 8 to 128 letters, digits, - or _)")?;
@@ -331,6 +390,12 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
             for d in d {
                 if let Ddl::CreateView { name, sql, .. } | Ddl::CreateMaterialized { name, sql, .. } = d {
                     ensure!(!mentioned(sql), "view {name} reads a temporary table or view, which ends with the session: CREATE TEMP VIEW {name} …");
+                    if let Some(f) = called(sql) {
+                        bail!("view {name} calls {f}, a temporary function, which ends with the session: CREATE TEMP VIEW {name} …");
+                    }
+                }
+                if let Some((name, f)) = match d { Ddl::CreateRoutine { name, routine, .. } => called(&routine.body).map(|f| (name, f)), _ => None } {
+                    bail!("{name} calls {f}, a temporary function, which ends with the session: CREATE TEMP FUNCTION {name} …");
                 }
             }
             if !own(stmt) {
@@ -341,6 +406,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
                 Ddl::DropTable { name, made_by: None, .. } => x.tables.remove(name).map(|_| name.clone()),
                 Ddl::DropView { name, .. } => x.views.remove(name).map(|_| name.clone()),
                 Ddl::DropSecret { name, .. } => x.secrets.remove(name).map(|_| name.clone()),
+                Ddl::DropRoutine { name, .. } => x.routines.remove(name).map(|_| name.clone()),
                 _ => None,
             }).collect::<Vec<_>>()))?;
             return Ok(Some(j!({"dropped": dropped, "temporary": true})));
@@ -411,7 +477,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     let rows = crate::write::rows(&app.lake, &ctx, &rules, name, &query, crate::rules::How::Load).await?; // (Load: its key is checked over all its rows, `check_key`: R6)
     let n = rows.rows().num_rows();
     apply(s, name, HashSet::new(), vec![rows])?;
@@ -545,6 +611,23 @@ pub fn settings_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_temporary_function_is_the_sessions_and_called_by_its_name() {
+        let s = "unit-temp-routines";
+        let r = crate::routines::of_macro(&None, &ast::MacroDefinition::Expr(crate::expander::parse_expr("41 + 1").unwrap()));
+        SESSIONS.lock().unwrap().entry(s.to_string()).or_default().routines.insert("answer".to_string(), r);
+        SESSION.sync_scope(Some(s.to_string()), || {
+            assert_eq!(called("SELECT answer() AS a").as_deref(), Some("answer"));
+            assert_eq!(called("SELECT ANSWER ( ) FROM t").as_deref(), Some("answer"), "any case, spaced");
+            assert_eq!(called("SELECT answer FROM t"), None, "a column of the name isn't a call");
+            assert_eq!(called("SELECT s.answer(), the_answer(), answers() FROM t"), None, "nor another schema's, nor another name");
+            assert_eq!(routine_names(), ["answer"]);
+            assert!(routines(Arc::new(HashMap::new())).contains_key("answer"), "over the lake's");
+        });
+        assert_eq!(SESSION.sync_scope(Some("unit-temp-other".to_string()), || called("SELECT answer()")), None, "another session has none");
+        SESSIONS.lock().unwrap().remove(s);
+    }
 
     #[test]
     fn a_temporary_table_keeps_its_types_for_its_writes_and_its_shape() {
