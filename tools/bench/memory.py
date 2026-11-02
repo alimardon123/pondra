@@ -7,8 +7,8 @@
 measured, in that process: importing and opening up to the first answer of `SELECT 1`, and the process's memory
 then (idle); a table of `--rows` rows made from a series; a grouped aggregate (of a DOUBLE, then of a DECIMAL) and a key's row over it (warm: the
 median of several, each a new text so no answer is remembered); 500 one-row INSERTs; the process's memory after
-the load; and, with `--tpch`, its 8 tables loaded from Parquet and the 22 queries run once cold and once warm (the
-warm total is reported). With `--settle`, each engine waits that long after each load before its queries, so a
+the load; and, with `--tpch`, its 8 tables loaded from Parquet and the 22 queries run once cold, then three times
+warm (each query's best of the three, summed). With `--settle`, each engine waits that long after each load before its queries, so a
 lake's merges after a load don't count in them. Pondra finds its library through PONDRA_LIBRARY
 (target/release/libpondra_lib.so here by default). Before each run, each engine's library is dropped from the
 page cache (`startup_order.from_disk`), so idle memory is what a process that reads it from disk holds, not what a
@@ -81,19 +81,23 @@ def child(engine):
         out["TPC-H load"] = time.perf_counter() - t
         time.sleep(A.settle)
         qs = os.path.join(HERE, "tpch-queries")
-        cold = warm = 0.0
-        rows = {}
-        for n in range(1, 23):
-            # (q15 makes a view, asks it and drops it: its query's rows are the answer)
-            steps = [s.strip() for s in open(os.path.join(qs, f"q{n}.sql")).read().split(";") if s.strip()]
-            run = lambda tag: [q(f"{s}\n-- {tag}").num_rows if s.lower().startswith(("select", "with")) else do(s) for s in steps]
+        cold, best, rows = 0.0, {}, {}
+        # (q15 makes a view, asks it and drops it: its query's rows are the answer)
+        steps = {n: [s.strip() for s in open(os.path.join(qs, f"q{n}.sql")).read().split(";") if s.strip()] for n in range(1, 23)}
+        run = lambda n, tag: [q(f"{s}\n-- {tag}").num_rows if s.lower().startswith(("select", "with")) else do(s) for s in steps[n]]
+        for n in steps:
             t = time.perf_counter()
-            rows[n] = next(r for r in run("cold") if isinstance(r, int))
+            rows[n] = next(r for r in run(n, "cold") if isinstance(r, int))
             cold += time.perf_counter() - t
-            t = time.perf_counter()
-            run("warm")
-            warm += time.perf_counter() - t
-        out["TPC-H 22 (cold)"], out["TPC-H 22 (warm)"] = cold, warm
+        # Warm: the best of 3 passes after the cold one. A query run again straight after its first run read Parquet
+        # for the files a lake in memory was still decoding into its columns (hot.rs), so it timed half-warm: 1.88 s
+        # against 1.04-1.15 s for SF1's 22 (11-02).
+        for i in range(3):
+            for n in steps:
+                t = time.perf_counter()
+                run(n, f"warm {i}")
+                best[n] = min(best.get(n, float("inf")), time.perf_counter() - t)
+        out["TPC-H 22 (cold)"], out["TPC-H 22 (warm)"] = cold, sum(best.values())
         out["TPC-H rows"] = rows
         out["memory after TPC-H (MB)"] = rss_mb()
     t = time.perf_counter()
