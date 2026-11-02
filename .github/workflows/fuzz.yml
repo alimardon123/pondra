@@ -1,0 +1,68 @@
+name: fuzz
+
+# Each night, about 15 minutes of input nobody wrote (the PGX review's B2, 11-02: "a mechanism nobody runs is not
+# coverage"). Two checks on main's Linux build, both seeded with the date, so a night's run is repeated by its seed:
+# - tools/random_sql.py, for 9 minutes: random queries over random tables, each answered by one node, by three
+#   (every tenth), by DuckDB 2.0 on the same rows, and split three ways by a random condition (SQLancer's oracles);
+# - tools/fuzz_doors.py, 24 s a door (2 minutes): malformed input at HTTP, SQL, Postgres, Kafka and Flight.
+# It fails only on a wrong answer or a node that stopped. A query only Pondra refuses is listed in random.json and
+# fails nothing. What failed is kept as the artifact `fuzz`: random.json holds each wrong answer's query and the
+# tables it ran on, and fuzz/ the inputs a door sent before its node stopped, with the node's log.
+# By hand: Actions -> fuzz -> Run workflow (a session gets 403). Locally: the same commands with --seed.
+on:
+  schedule:
+    - cron: "56 4 * * *" # (beside startup.yml's 04:41)
+  workflow_dispatch:
+
+permissions:
+  actions: read # (the build run's packages)
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SHA: ${{ github.sha }}
+
+jobs:
+  fuzz:
+    name: random SQL and malformed input
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40 # (the build's packages are waited for: up to WAIT_MINUTES when main's own run is still going)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: DuckDB and pyarrow (tools/requirements.txt's versions)
+        run: pip install -q $(grep -E '^(duckdb|pyarrow)==' tools/requirements.txt | sed 's/ *#.*//')
+      - name: Main's Linux binary (the build workflow's)
+        env:
+          WAIT_MINUTES: "20"
+        run: |
+          bash tools/ci_artifact.sh linux-x64 "$SHA"
+          mkdir -p bin && tar xzf dist/pondra-linux-x64.tar.gz -C bin && ls -l bin
+          echo "SEED=$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
+      - name: Random queries against DuckDB, three nodes and partitions (9 minutes, seed = the date)
+        env:
+          PONDRA_BIN: ${{ github.workspace }}/bin/pondra
+        run: python3 tools/random_sql.py --secs 540 --queries 100000000 --seed "$SEED" --out random.json
+      - name: Malformed input at every door (24 s a door, seed = the date)
+        if: success() || failure() # (whatever the queries found)
+        run: |
+          mkdir -p "$RUNNER_TEMP/fuzz"
+          set -o pipefail
+          TMPDIR="$RUNNER_TEMP/fuzz" python3 tools/fuzz_doors.py --bin bin/pondra --secs 24 --seed "$SEED" | tee fuzz.json
+      - name: What was found, kept
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz
+          path: |
+            random.json
+            fuzz.json
+            ${{ runner.temp }}/fuzz/
+          if-no-files-found: ignore
+          retention-days: 30

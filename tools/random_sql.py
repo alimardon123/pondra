@@ -4,7 +4,11 @@ one Pondra node, the same query spread over three nodes, and DuckDB's on the sam
 agree; and each query split by a random condition `p` into `WHERE p`, `WHERE NOT p` and
 `WHERE p IS NULL` must give back its rows exactly (ternary logic partitioning), on Pondra alone.
 
-  random_sql.py [--queries 100000] [--seed 1] [--nodes 3] [--out logs/round31/random.json]
+  random_sql.py [--queries 100000] [--secs 600] [--seed 1] [--nodes 3] [--out logs/round31/random.json]
+
+Exits 1 on a wrong answer (DuckDB's, the three nodes' or the partitions' differ) or a node that stopped,
+and 0 otherwise: a query only Pondra refuses is listed (`kind: refused`), for the list of what it doesn't
+take yet, but doesn't fail the run. The nightly job (fuzz.yml) runs it with seed = the date.
 
 The tables are made afresh each `--every` queries (a few hundred rows of integers, decimals,
 doubles, text, booleans and dates, NULLs and repeats among them). The queries keep to SQL both
@@ -132,7 +136,8 @@ def main():
     harness.A = argparse.Namespace(s3=False, keep=False, port=A.port)
     stats = {"queries": 0, "agree": 0, "both_refused": 0, "pondra_refused": 0, "duckdb_refused": 0, "partitions_checked": 0, "spread_checked": 0}
     found, t0 = [], time.time()
-    while stats["queries"] < A.queries:
+    over = lambda: stats["queries"] >= A.queries or (A.secs and time.time() - t0 >= A.secs)
+    while not over():
         lake = harness.new_lake()
         nodes = [harness.Node(lake, A.port + i).start() for i in range(A.nodes)]
         duck = duckdb.connect()
@@ -145,6 +150,8 @@ def main():
                 harness.call(A.port, "POST", "/sql", s.encode())
                 duck.execute(s)
             for _ in range(min(A.every, A.queries - stats["queries"])):
+                if over():
+                    break
                 head, tail, cols = g.query(tables)
                 where = f" WHERE {g.pred(cols)}" if rnd.random() < 0.5 else ""
                 sql = head + where + tail
@@ -157,47 +164,66 @@ def main():
                     mine = pondra(A.port, sql)
                 except Exception as e:
                     mine = e
+                if isinstance(mine, Exception) and not all(n.alive() for n in nodes):  # (a refusal from a node that stopped is a stop)
+                    found.append({"kind": "stopped", "tables": made, "sql": sql, "pondra": str(mine)[:300],
+                                  "said": [open(n.log, errors="replace").read()[-2000:] for n in nodes if not n.alive()]})
+                    break
                 if isinstance(mine, Exception) or isinstance(theirs, Exception):
                     key = "both_refused" if isinstance(mine, Exception) and isinstance(theirs, Exception) else "pondra_refused" if isinstance(mine, Exception) else "duckdb_refused"
                     stats[key] += 1
                     if key == "pondra_refused":
-                        found.append({"oracle": "duckdb", "sql": sql, "pondra": str(mine)[:300]})
+                        found.append({"kind": "refused", "oracle": "duckdb", "sql": sql, "pondra": str(mine)[:300]})
                     continue
                 if bag(mine) != bag(theirs):
-                    found.append({"oracle": "duckdb", "sql": sql, "pondra": str(bag(mine)[:5])[:400], "duckdb": str(bag(theirs)[:5])[:400]})
+                    found.append({"kind": "wrong", "tables": made, "oracle": "duckdb", "sql": sql, "pondra": str(bag(mine)[:5])[:400], "duckdb": str(bag(theirs)[:5])[:400]})
                     continue
                 stats["agree"] += 1
                 if A.nodes > 1 and stats["queries"] % A.spread_every == 0:
                     stats["spread_checked"] += 1
-                    spread = pondra(A.port, sql, True)
+                    try:
+                        spread = pondra(A.port, sql, True)
+                    except Exception as e:  # (spread, refused where one node answered: listed, as any refusal)
+                        stopped = not all(n.alive() for n in nodes)
+                        found.append({"kind": "stopped" if stopped else "refused", "tables": made if stopped else None, "oracle": "three nodes", "sql": sql, "pondra": str(e)[:300]})
+                        if stopped:
+                            break
+                        continue
                     if bag(spread) != bag(mine):
-                        found.append({"oracle": "three nodes", "sql": sql, "one": str(bag(mine)[:5])[:400], "three": str(bag(spread)[:5])[:400]})
+                        found.append({"kind": "wrong", "tables": made, "oracle": "three nodes", "sql": sql, "one": str(bag(mine)[:5])[:400], "three": str(bag(spread)[:5])[:400]})
                 if not tail and "DISTINCT" not in head:  # (ternary logic partitioning: a plain query's rows, split three ways)
                     p = g.pred(cols)
                     glue = " AND " if where else " WHERE "
                     try:
                         parts = [pondra(A.port, head + where + glue + c) for c in (f"({p})", f"(NOT ({p}))", f"(({p}) IS NULL)")]
                     except Exception as e:  # (a part refused that the whole query took is a finding too)
-                        found.append({"oracle": "partitions", "sql": head + where + glue + f"({p})", "pondra": str(e)[:300]})
+                        stopped = not all(n.alive() for n in nodes)
+                        found.append({"kind": "stopped" if stopped else "refused", "tables": made if stopped else None, "oracle": "partitions", "sql": head + where + glue + f"({p})", "pondra": str(e)[:300]})
+                        if stopped:
+                            break
                         continue
                     stats["partitions_checked"] += 1
                     if bag([r for part in parts for r in part]) != bag(mine):
-                        found.append({"oracle": "partitions", "sql": sql, "split_on": p})
+                        found.append({"kind": "wrong", "tables": made, "oracle": "partitions", "sql": sql, "split_on": p})
         finally:
             [n.kill() for n in nodes]
             harness.clean_up()
         print(f"{stats['queries']} queries, {len(found)} found, {round(time.time() - t0)} s", flush=True)
-    out = {**stats, "seed": A.seed, "nodes": A.nodes, "secs": round(time.time() - t0), "found": found[:200]}
+    bad = [f for f in found if f["kind"] != "refused"]  # (wrong answers and stops first: they're what fails the run)
+    found = bad + [f for f in found if f["kind"] == "refused"]
+    out = {**stats, "seed": A.seed, "nodes": A.nodes, "secs": round(time.time() - t0), "wrong": sum(f["kind"] == "wrong" for f in found),
+           "stopped": sum(f["kind"] == "stopped" for f in found), "found": found[:200]}
     print(json.dumps({k: v for k, v in out.items() if k != "found"}))
     for f in found[:20]:
-        print(json.dumps(f)[:600])
+        print(json.dumps({k: v for k, v in f.items() if k != "tables"})[:600])  # (the tables are in --out)
     if A.out:
         json.dump(out, open(A.out, "w"), indent=1)
+    sys.exit(1 if bad else 0)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--queries", type=int, default=1000)
+    ap.add_argument("--secs", type=float, default=0, help="stop once this long has passed (0: run every query)")
     ap.add_argument("--every", type=int, default=500, help="queries a set of tables")
     ap.add_argument("--spread-every", type=int, default=10, help="every n-th query also spread over the nodes")
     ap.add_argument("--seed", type=int, default=1)
