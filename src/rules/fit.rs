@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
 
@@ -159,10 +160,28 @@ fn analyzed(base: &SessionContext, e: datafusion::logical_expr::Expr, schema: &d
 /// Which of `rows` break `check`, a condition over their columns by name: those it is false for
 /// (NULL passes, as with Postgres's CHECK). Expectations (`views::Expect`) and tables' CHECKs.
 pub fn breaking(base: &SessionContext, rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
-    use datafusion::common::DFSchema;
-    let schema = DFSchema::try_from(rows.schema().as_ref().clone())?;
+    refused(&plan(base, &rows.schema(), check)?.0, rows, check)
+}
+
+/// `check` planned in `base` for rows of `schema`, and whether that plan holds for later rows: not when the condition calls a
+/// function whose answer can change (`now()`, `random()`), which planning fixes at one value. `now()` is the time of the
+/// planning, as a query's is its start (planned without it, a CHECK calling `now()` was refused at CREATE with an internal error).
+pub fn plan(base: &SessionContext, schema: &SchemaRef, check: &str) -> Result<(Arc<dyn PhysicalExpr>, bool)> {
+    use datafusion::common::{tree_node::TreeNode, DFSchema};
+    use datafusion::logical_expr::{simplify::SimplifyContext, Expr, Volatility};
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+    let schema = Arc::new(DFSchema::try_from(schema.as_ref().clone())?);
     let expr = base.parse_sql_expr(check, &schema).and_then(crate::optimize::whole_literals)?;
-    let value = base.create_physical_expr(expr, &schema)?.evaluate(rows)?.into_array(rows.num_rows())?;
+    let changing = expr.exists(|e| Ok(matches!(e, Expr::ScalarFunction(f) if f.func.signature().volatility != Volatility::Immutable)))?;
+    let options = Arc::new(datafusion::config::ConfigOptions::clone(base.state_ref().read().config_options()));
+    let now = ExprSimplifier::new(SimplifyContext::builder().with_schema(schema.clone()).with_config_options(options).with_current_time().build());
+    let expr = now.simplify(now.coerce(expr, &schema)?)?;
+    Ok((base.create_physical_expr(expr, &schema)?, !changing))
+}
+
+/// Which of `rows` break a CHECK planned for their schema (`plan`): as `breaking`.
+pub fn refused(planned: &Arc<dyn PhysicalExpr>, rows: &RecordBatch, check: &str) -> Result<BooleanArray> {
+    let value = planned.evaluate(rows)?.into_array(rows.num_rows())?;
     let Some(b) = value.as_boolean_opt() else { bail!("CHECK ({check}) is not a condition: it gives {}, not true or false (a condition, such as CHECK (amount > 0))", value.data_type()) };
     Ok(b.iter().map(|v| Some(v == Some(false))).collect())
 }

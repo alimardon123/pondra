@@ -646,6 +646,7 @@ impl Table {
             unique: d.constraints.iter().filter(|c| c.enforced && c.kind == Kind::Unique).map(|c| (c.name.clone(), c.columns.clone())).collect(),
             checks: d.checks.clone(),
             mapped: false,
+            planned: Default::default(),
         })
     }
 }

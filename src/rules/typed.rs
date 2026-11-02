@@ -176,7 +176,7 @@ mod tests {
 
     /// A table of these columns, with no key and no constraint.
     fn table(columns: Vec<Column>) -> Table {
-        Table { schema: Arc::new(Schema::empty()), order: columns.iter().map(|c| c.name.clone()).collect(), columns, key: vec![], key_checked: false, unique: vec![], checks: vec![], mapped: false }
+        Table { schema: Arc::new(Schema::empty()), order: columns.iter().map(|c| c.name.clone()).collect(), columns, key: vec![], key_checked: false, unique: vec![], checks: vec![], mapped: false, planned: Default::default() }
     }
 
     /// A table with a jsonb column `j` and a json column `k`.

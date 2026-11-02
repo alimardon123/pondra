@@ -17,6 +17,7 @@ use anyhow::{bail, Result};
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use std::collections::HashMap;
 use std::future::Future;
@@ -42,6 +43,40 @@ pub struct Table {
     /// SQL's names in SQL's order (`TableMeta::sql_order`): the columns an INSERT without a column list fills, first to
     /// last. `columns` and `schema` keep the stored order.
     pub order: Vec<String>,
+    /// `checks` planned for `schema` once, at the first write a CHECK looks at (`checks`), not parsed and planned again at
+    /// every write: three CHECKs cost a one-row INSERT 0.3 ms that way, and 0.6 ms in a transaction, whose COMMIT checks again.
+    pub planned: Planned,
+}
+
+/// `Table::planned`: the session the plans were made in (`SessionContext::session_id`), and each CHECK's plan in the order
+/// `checks` meets them. A clone starts without them, since its checks may be changed; two tables are equal by their other
+/// fields.
+#[derive(Default)]
+pub struct Planned(std::sync::OnceLock<(String, Vec<Option<Arc<dyn PhysicalExpr>>>)>);
+
+impl Clone for Planned {
+    fn clone(&self) -> Self { Planned::default() }
+}
+
+impl PartialEq for Planned {
+    fn eq(&self, _: &Self) -> bool { true }
+}
+
+impl std::fmt::Debug for Planned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("Planned") }
+}
+
+impl Planned {
+    /// The plans of `checks` (in this order) for `schema`, made in `base` at the first call. None for a CHECK planned at each
+    /// write (`fit::breaking`): one whose plan wouldn't hold for later rows (`fit::plan`), one that doesn't plan (its write
+    /// says why), and every one in a session other than the one they were made in.
+    fn of(&self, base: &SessionContext, schema: &SchemaRef, checks: &[&(String, String)]) -> Vec<Option<Arc<dyn PhysicalExpr>>> {
+        let made = self.0.get_or_init(|| (base.session_id(), checks.iter().map(|(_, c)| fit::plan(base, schema, c).ok().filter(|p| p.1).map(|p| p.0)).collect()));
+        match made.0 == base.session_id() && made.1.len() == checks.len() {
+            true => made.1.clone(),
+            false => vec![None; checks.len()],
+        }
+    }
 }
 
 /// One column as the rules see it.
@@ -219,8 +254,12 @@ pub fn checks(t: &Table, name: &str, rows: &RecordBatch, sql_names: bool, base: 
             }
         };
         let all = fit::conform(&named, &t.schema)?;
-        for (check, condition) in ordered {
-            let bad = fit::breaking(base, &all, condition)?;
+        let plans = t.planned.of(base, &t.schema, &ordered);
+        for ((check, condition), planned) in ordered.into_iter().zip(plans) {
+            let bad = match planned {
+                Some(p) => fit::refused(&p, &all, condition)?,
+                None => fit::breaking(base, &all, condition)?,
+            };
             if (0..bad.len()).any(|i| bad.value(i) && !marker(i)) {
                 return Err(anyhow::Error::new(crate::codes::Violation(format!("new row for relation \"{name}\" violates check constraint \"{check}\": CHECK ({condition})"), "23514")));
             }
@@ -313,6 +352,7 @@ mod tests {
             unique: vec![],
             checks: checks.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect(),
             mapped: false,
+            planned: Default::default(),
         }
     }
 
@@ -519,6 +559,31 @@ mod tests {
         let err = checks(&t, "s.t", &rows, true, &SessionContext::new()).err().expect("two CHECKs");
         assert_eq!(crate::codes::of(&err), "23514");
         assert_eq!(crate::codes::words(&err), "new row for relation \"s.t\" violates check constraint \"aa\": CHECK (b > 0)");
+    }
+
+    #[test]
+    fn a_tables_checks_are_planned_once_and_one_whose_answer_changes_at_every_write() {
+        let t = table(&[], vec![(plain("a"), DataType::Int64), (plain("b"), DataType::Int64)], &[("a_pos", "a > 0"), ("b_small", "random() >= 0 AND b < 1000")]);
+        let base = SessionContext::new();
+        let row = |a: i64, b: i64| batch(vec![("a", ints(&[Some(a)])), ("b", ints(&[Some(b)]))]);
+        checks(&t, "s.t", &row(1, 1), true, &base).unwrap();
+        let made = &t.planned.0.get().expect("planned at the first write").1;
+        assert!(made[0].is_some(), "a > 0 holds for every later row");
+        assert!(made[1].is_none(), "random() changes: planned at each write");
+        let err = checks(&t, "s.t", &row(-1, 1), true, &base).err().expect("the kept plan refuses");
+        assert_eq!(crate::codes::words(&err), "new row for relation \"s.t\" violates check constraint \"a_pos\": CHECK (a > 0)");
+        let err = checks(&t, "s.t", &row(1, i64::MAX), true, &SessionContext::new()).err().expect("another session plans its own");
+        assert!(crate::codes::words(&err).contains("\"b_small\""), "{}", crate::codes::words(&err));
+        assert!(t.clone().planned.0.get().is_none(), "a clone plans its own: its checks may change");
+    }
+
+    #[test]
+    fn a_check_calling_now_reads_the_time_of_the_write() {
+        let t = table(&[], vec![(plain("b"), DataType::Int64)], &[("b_past", "b < extract(epoch from now())")]);
+        let row = |b: i64| batch(vec![("b", ints(&[Some(b)]))]);
+        checks(&t, "s.t", &row(1), true, &SessionContext::new()).unwrap();
+        let err = checks(&t, "s.t", &row(i64::MAX / 2), true, &SessionContext::new()).err().expect("a time to come breaks it");
+        assert_eq!(crate::codes::of(&err), "23514");
     }
 
     #[tokio::test]
