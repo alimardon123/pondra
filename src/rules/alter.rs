@@ -134,20 +134,114 @@ pub fn by_position(sql: &str) -> bool {
     })
 }
 
-/// Why a column can't move while `readers` read its table by position and keep what they read (`ddl::by_position`).
-pub fn read_by_position(table: &str, column: &str, readers: &[String]) -> anyhow::Error {
-    let (who, verb) = match readers {
-        [one] => (one.clone(), "reads"),
-        _ => (readers.join(", "), "read"),
-    };
-    crate::codes::coded("0A000", format!("{column} can't move while {who} {verb} {table}'s columns by position (a `*`, or a task's rows into it), keeping them in the order they were: name the columns in its query (CREATE OR REPLACE MATERIALIZED VIEW … AS SELECT a, b, …), then move it"))
-}
-
 /// Why `column` of view `name` (`kind`: VIEW or MATERIALIZED VIEW) can't move in its query, and the way that always
 /// works: the view made again with its columns listed in the order wanted.
 pub fn cant_move(name: &str, column: &str, why: &str, kind: &str) -> anyhow::Error {
     let again = if kind == "VIEW" { "" } else { " (its rows worked out again)" };
     crate::codes::coded("0A000", format!("{column} can't move in {name}'s query: {why}. CREATE OR REPLACE {kind} {name} AS … with its columns in the order you want{again}"))
+}
+
+/// `sql` (a query) with each table in its FROM that `is` names read as `columns`, in their order: `FROM t AS u` becomes
+/// `FROM (SELECT c1, c2, … FROM t) AS u`. Its `*`, `u.*`, EXCLUDE and COLUMNS(…) then list t's columns in that order
+/// whatever order t lists them in later, and nothing else about the query changes: its names and what it reads are the
+/// same. What reads t by position and keeps what it read stays as it was so while t's columns move (`ddl::keep_readers`).
+/// A table read so already is left as it is. None: nothing to change, or `sql` doesn't read back.
+pub fn frozen(sql: &str, is: &dyn Fn(&str) -> bool, columns: &[String]) -> Option<String> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let mut q = Parser::new(&GenericDialect {}).try_with_sql(sql).and_then(|mut p| p.parse_query()).ok()?;
+    let list = columns.iter().map(|c| crate::objects::ident(c)).collect::<Vec<_>>().join(", ");
+    let mut changed = false;
+    query(&mut q, is, &list, &mut changed);
+    return changed.then(|| q.to_string());
+
+    fn query(q: &mut ast::Query, is: &dyn Fn(&str) -> bool, list: &str, changed: &mut bool) {
+        for cte in q.with.iter_mut().flat_map(|w| w.cte_tables.iter_mut()) {
+            query(&mut cte.query, is, list, changed);
+        }
+        body(&mut q.body, is, list, changed);
+    }
+    fn body(b: &mut ast::SetExpr, is: &dyn Fn(&str) -> bool, list: &str, changed: &mut bool) {
+        match b {
+            ast::SetExpr::Select(s) => s.from.iter_mut().for_each(|t| joined(t, is, list, changed)),
+            ast::SetExpr::Query(q) => query(q, is, list, changed),
+            ast::SetExpr::SetOperation { left, right, .. } => {
+                body(left, is, list, changed);
+                body(right, is, list, changed);
+            }
+            _ => {}
+        }
+    }
+    fn joined(t: &mut ast::TableWithJoins, is: &dyn Fn(&str) -> bool, list: &str, changed: &mut bool) {
+        factor(&mut t.relation, is, list, changed);
+        t.joins.iter_mut().for_each(|j| factor(&mut j.relation, is, list, changed));
+    }
+    fn factor(f: &mut ast::TableFactor, is: &dyn Fn(&str) -> bool, list: &str, changed: &mut bool) {
+        match f {
+            ast::TableFactor::Table { name, alias, args: None, version: None, sample: None, .. } if is(&crate::text::object(name)) => {
+                let text = format!("SELECT * FROM (SELECT {list} FROM {name}) AS t");
+                let read = datafusion::sql::sqlparser::parser::Parser::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}).try_with_sql(&text).and_then(|mut p| p.parse_query());
+                let Ok(q) = read else { return };
+                let ast::SetExpr::Select(mut s) = *q.body else { return };
+                let Some(mut t) = s.from.pop() else { return };
+                // (its own alias, with any names for its columns; else the table's own name, as its columns are known by)
+                let ast::TableFactor::Derived { alias: Some(a), .. } = &mut t.relation else { return };
+                match alias {
+                    Some(was) => (a.name, a.columns) = (was.name.clone(), was.columns.clone()),
+                    None => match name.0.last().and_then(|p| p.as_ident()) {
+                        Some(last) => a.name = last.clone(),
+                        None => return,
+                    },
+                }
+                *f = t.relation;
+                *changed = true;
+            }
+            ast::TableFactor::Derived { subquery, .. } if !read_so(subquery, is) => query(subquery, is, list, changed),
+            ast::TableFactor::NestedJoin { table_with_joins, .. } => joined(table_with_joins, is, list, changed),
+            _ => {}
+        }
+    }
+    /// `SELECT a, b, … FROM t`, t one `is` names: a table read as its columns were (by `frozen` before).
+    fn read_so(q: &ast::Query, is: &dyn Fn(&str) -> bool) -> bool {
+        let ast::SetExpr::Select(s) = q.body.as_ref() else { return false };
+        let named = s.projection.iter().all(|i| matches!(i, ast::SelectItem::UnnamedExpr(ast::Expr::Identifier(_))));
+        named && s.selection.is_none() && matches!(s.from.as_slice(), [ast::TableWithJoins { relation: ast::TableFactor::Table { name, .. }, joins }] if joins.is_empty() && is(&crate::text::object(name)))
+    }
+}
+
+/// `sql` (a query) with `extra` left out of each `*` of its own select list (`* EXCLUDE (…)`, joined to one it has): the
+/// columns added to what a materialized view made with a `*` reads, which it hasn't, so that SHOW CREATE makes the same
+/// view again (`ddl::keep_readers`, which proves it). None: no `*` there, or `sql` doesn't read back.
+pub fn excluding(sql: &str, extra: &[String]) -> Option<String> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, parser::Parser};
+    let mut q = Parser::new(&GenericDialect {}).try_with_sql(sql).and_then(|mut p| p.parse_query()).ok()?;
+    let mut changed = false;
+    body(&mut q.body, extra, &mut changed);
+    return changed.then(|| q.to_string());
+
+    fn body(b: &mut ast::SetExpr, extra: &[String], changed: &mut bool) {
+        match b {
+            ast::SetExpr::Select(s) => {
+                for item in &mut s.projection {
+                    let (ast::SelectItem::Wildcard(o) | ast::SelectItem::QualifiedWildcard(_, o)) = item else { continue };
+                    let mut out = match o.opt_exclude.take() {
+                        Some(ast::ExcludeSelectItem::Single(n)) => vec![n],
+                        Some(ast::ExcludeSelectItem::Multiple(n)) => n,
+                        None => vec![],
+                    };
+                    let quoted = |c: &String| if crate::objects::ident(c) == *c { ast::Ident::new(c) } else { ast::Ident::with_quote('"', c) };
+                    out.extend(extra.iter().map(|c| ast::ObjectName::from(vec![quoted(c)])));
+                    o.opt_exclude = Some(ast::ExcludeSelectItem::Multiple(out));
+                    *changed = true;
+                }
+            }
+            ast::SetExpr::Query(q) => body(&mut q.body, extra, changed),
+            ast::SetExpr::SetOperation { left, right, .. } => {
+                body(left, extra, changed);
+                body(right, extra, changed);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A view's query with its outputs in a new order (`ALTER VIEW v ALTER COLUMN c AFTER b`): `order[i]` is the place, in
@@ -232,6 +326,33 @@ pub fn moved(sql: &str, order: &[usize]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_column_added_is_left_out_of_a_star_by_name() {
+        let f = |sql: &str, extra: &[&str]| super::excluding(sql, &extra.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        assert_eq!(f("SELECT * FROM t WHERE g > 0", &["z"]).as_deref(), Some("SELECT * EXCLUDE (z) FROM t WHERE g > 0"));
+        assert_eq!(f("SELECT *, x + y AS s FROM t", &["z", "W"]).as_deref(), Some("SELECT * EXCLUDE (z, \"W\"), x + y AS s FROM t"));
+        assert_eq!(f("SELECT * EXCLUDE (y) FROM t", &["z"]).as_deref(), Some("SELECT * EXCLUDE (y, z) FROM t"));
+        assert_eq!(f("SELECT u.* FROM t AS u UNION ALL SELECT * FROM v", &["z"]).as_deref(), Some("SELECT u.* EXCLUDE (z) FROM t AS u UNION ALL SELECT * EXCLUDE (z) FROM v"));
+        assert_eq!(f("SELECT g, x FROM t", &["z"]), None);
+    }
+
+    #[test]
+    fn a_table_read_by_position_is_read_as_its_columns_were() {
+        let t = |n: &str| n == "t";
+        let cols = ["g".to_string(), "x".to_string(), "Y".to_string()];
+        let f = |sql: &str| super::frozen(sql, &t, &cols);
+        assert_eq!(f("SELECT * FROM t WHERE g > 0").as_deref(), Some("SELECT * FROM (SELECT g, x, \"Y\" FROM t) AS t WHERE g > 0"));
+        assert_eq!(f("SELECT u.*, v.n FROM t AS u JOIN v ON u.g = v.g").as_deref(), Some("SELECT u.*, v.n FROM (SELECT g, x, \"Y\" FROM t) AS u JOIN v ON u.g = v.g"));
+        assert_eq!(f("SELECT * FROM t AS u (p, q, r)").as_deref(), Some("SELECT * FROM (SELECT g, x, \"Y\" FROM t) AS u (p, q, r)"));
+        assert_eq!(f("SELECT * FROM (SELECT * FROM t) AS pv").as_deref(), Some("SELECT * FROM (SELECT * FROM (SELECT g, x, \"Y\" FROM t) AS t) AS pv")); // (a view written in)
+        assert_eq!(f("WITH w AS (SELECT * EXCLUDE (x) FROM t) SELECT * FROM w UNION ALL SELECT * FROM t").as_deref(),
+            Some("WITH w AS (SELECT * EXCLUDE (x) FROM (SELECT g, x, \"Y\" FROM t) AS t) SELECT * FROM w UNION ALL SELECT * FROM (SELECT g, x, \"Y\" FROM t) AS t"));
+        let once = f("SELECT * FROM t").unwrap();
+        assert_eq!(super::frozen(&once, &t, &["x".to_string(), "g".to_string()]), None); // (read so already: as it was)
+        assert_eq!(f("SELECT * FROM u"), None);
+        assert_eq!(f("SELECT * FROM t.t"), None); // (another schema's)
+    }
+
     #[test]
     fn a_query_reads_columns_by_position_with_a_star_or_columns() {
         for sql in ["SELECT * FROM t", "SELECT a, * FROM t", "SELECT t.* FROM t JOIN u ON true", "SELECT DISTINCT * FROM t", "SELECT * EXCLUDE (a) FROM t",

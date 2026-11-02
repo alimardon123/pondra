@@ -1595,8 +1595,8 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
 }
 
 /// `ALTER TABLE t ALTER COLUMN c FIRST | AFTER b`: the order SQL lists the columns in changes (`TableMeta::shown`); the
-/// stored order, which every file's field ids are places in, and the files never do. Refused while something reads the
-/// table's columns by position (`by_position`), which would see them move.
+/// stored order, which every file's field ids are places in, and the files never do. What reads the table's columns by
+/// position keeps reading them as it did, in the same commit (`keep_readers`): a move is never refused for it.
 async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, place: &Place) -> Result<Value> {
     ensure!(m.stored(column).is_some(), crate::rules::alter::no_column(name, column));
     if let Place::After(b) = place {
@@ -1607,18 +1607,29 @@ async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, p
     if new == order {
         return Ok(j!({"table": name, "unchanged": true}));
     }
-    let readers = by_position(lake, name).await?;
-    if !readers.is_empty() {
-        return Err(crate::rules::alter::read_by_position(name, column, &readers));
-    }
+    let star = |m: &TableMeta| -> Vec<(String, String)> { m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect() }; // (what `SELECT *` lists)
+    let was = star(&m);
     let stored: Vec<String> = new.iter().map(|c| m.stored(c).expect("a live column").to_string()).collect();
     let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
     m.shown = if stored == as_stored { vec![] } else { stored }; // (back as stored: nothing to keep)
-    lake.cat.commit(vec![(table_key(name), json(&m))], &[]).await?;
-    if !m.publish.is_empty() {
-        crate::delta::publish_all(lake).await?; // (other engines list the columns in SQL's order too)
+    // (what reads it by position keeps reading it as it did, in the same commit: `keep_readers`)
+    let (mut puts, readers) = keep_readers(lake, name, column, was, star(&m)).await?;
+    puts.push((table_key(name), json(&m)));
+    lake.cat.commit(puts, &[]).await?;
+    published_after_move(lake, &m, &readers).await?;
+    let mut out = j!({"table": name, "altered": {"column": column, "place": place.sql()}});
+    if !readers.is_empty() {
+        out["readers"] = j!(readers);
     }
-    Ok(j!({"table": name, "altered": {"column": column, "place": place.sql()}}))
+    Ok(out)
+}
+
+/// Once columns moved: other engines list them in SQL's order too, the table's and its readers' that list them anew.
+async fn published_after_move(lake: &Lake, m: &TableMeta, readers: &[String]) -> Result<()> {
+    if !m.publish.is_empty() || readers.iter().any(|r| r.contains("new order")) {
+        crate::delta::publish_all(lake).await?;
+    }
+    Ok(())
 }
 
 /// A view's query's outputs, as it plans now: (name, type, may be NULL), in its order.
@@ -1646,8 +1657,8 @@ fn view_places(name: &str, was: &[String], column: &str, place: &Place) -> Resul
 
 /// `ALTER VIEW v ALTER COLUMN c FIRST | AFTER b`: its query with its outputs in the new order (`rules::alter::moved`: each
 /// SELECT list, VALUES row and `ORDER BY 2`), kept only once it plans to the very columns it had, in that order. A view
-/// keeps no rows, so nothing else changes: its key facts and comments go by name. What reads it by position is asked as
-/// for a table (`by_position`): a view with `*` follows; a materialized view made from it with `*`, or a task, refuses.
+/// keeps no rows, so nothing else changes: its key facts and comments go by name. A view with `*` over it follows; a
+/// materialized view made from it with `*` runs the query it was made with, and lists its columns anew (`keep_readers`).
 async fn place_view_column(lake: &Lake, name: &str, column: &str, place: &Place) -> Result<Value> {
     let Some(before) = lake.cat.get::<StoredView>(&query_key(name)).await? else {
         let materialized = lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_some() || lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_some();
@@ -1668,15 +1679,23 @@ async fn place_view_column(lake: &Lake, name: &str, column: &str, place: &Place)
     let now = view_outputs(lake, &sql).await.map_err(|e| crate::rules::alter::cant_move(name, column, &format!("moved, its query doesn't plan ({e:#})"), "VIEW"))?;
     let want: Vec<_> = order.iter().map(|&i| was[i].clone()).collect();
     ensure!(now == want, crate::rules::alter::cant_move(name, column, "moved, its query plans to other columns", "VIEW"));
-    let readers = by_position(lake, name).await?;
-    if !readers.is_empty() {
-        return Err(crate::rules::alter::read_by_position(name, column, &readers));
-    }
+    // (what reads it by position is a materialized view reading it with `*`, which holds its query as it was when it was
+    // made (`views::written_in`): it runs as it did, its rows kept)
     let (authored, notice) = authored_moved(lake, &before.authored, &before.sql, &order, &sql, false).await;
     lake.cat.commit(vec![(query_key(name), json(&StoredView { sql, authored, ..before }))], &[]).await?;
+    // (those that list their columns as it gives them list them in its new order then: `keep_readers`, once it reads so)
+    let typed = |c: &[(String, datafusion::arrow::datatypes::DataType, bool)]| c.iter().map(|(c, t, _)| (c.clone(), crate::answer::type_name(t))).collect::<Vec<_>>();
+    let (puts, readers) = keep_readers(lake, name, column, typed(&was), typed(&now)).await?;
+    if !puts.is_empty() {
+        lake.cat.commit(puts, &[]).await?;
+        crate::delta::publish_all(lake).await?;
+    }
     let mut out = j!({"view": name, "altered": {"column": column, "place": place.sql()}});
     if let Some(n) = notice {
         out["notice"] = n.into();
+    }
+    if !readers.is_empty() {
+        out["readers"] = j!(readers);
     }
     Ok(out)
 }
@@ -1716,7 +1735,7 @@ async fn finished_columns(lake: &Lake, partial: &datafusion::arrow::datatypes::S
 /// for one whose answers are finished as it is read (avg, HAVING: `finish.rs`), its finishing SELECT moved. SHOW CREATE
 /// gives its query so moved (`View::written`, proved to plan to its columns in the new order), which makes it again. Not
 /// for a view that keeps its rows in more than its table (EMIT FINAL, sessions, MATCH_RECOGNIZE, history): those name the
-/// way round. What reads it by position is asked as for a table (`by_position`).
+/// way round. What reads it by position keeps reading it as it did, as for a table (`keep_readers`).
 async fn place_materialized_column(lake: &Lake, name: &str, column: &str, place: &Place) -> Result<Value> {
     if lake.cat.get::<Value>(&crate::views::view_key(name)).await?.is_none() {
         if lake.cat.get::<Value>(&crate::views::view_key(&crate::once::open(name))).await?.is_some() {
@@ -1731,10 +1750,13 @@ async fn place_materialized_column(lake: &Lake, name: &str, column: &str, place:
     let names: Vec<String> = was.iter().map(|(c, ..)| c.clone()).collect();
     let Some(order) = view_places(name, &names, column, place)? else { return Ok(j!({"view": name, "unchanged": true})) };
     let written = crate::rules::alter::moved(v.query(), &order).map_err(|why| crate::rules::alter::cant_move(name, column, &why, MATERIALIZED))?;
-    let notice = reorder_materialized(lake, name, v, m, &was, &order, written, column, None).await?;
+    let (notice, readers) = reorder_materialized(lake, name, v, m, &was, &order, written, column, None).await?;
     let mut out = j!({"view": name, "altered": {"column": column, "place": place.sql()}});
     if let Some(n) = notice {
         out["notice"] = n.into();
+    }
+    if !readers.is_empty() {
+        out["readers"] = j!(readers);
     }
     Ok(out)
 }
@@ -1768,12 +1790,13 @@ async fn movable(lake: &Lake, name: &str, column: &str) -> Result<(crate::views:
 /// and the query it runs and writes them by kept. Reads list them so: its table's `shown`, as a table's (`place_column`),
 /// or, for one whose answers are finished as they are read (avg, HAVING: `finish.rs`), its finishing SELECT moved, proved
 /// over no rows. `written` (its query with its columns in that order) is what SHOW CREATE gives after (`View::written`),
-/// proved to plan to them. What reads it by position refuses it, as for a table (`by_position`). Its query as its author
+/// proved to plan to them. What reads it by position keeps reading it as it did (`keep_readers`). Its query as its author
 /// wrote it (`authored.rs`) is `text` when it is made again (CREATE OR REPLACE: its statement's, empty when it has none),
 /// else its own moved too; the answer's notice says when its comments couldn't be kept.
 #[allow(clippy::too_many_arguments)]
-async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View, mut m: TableMeta, was: &[(String, datafusion::arrow::datatypes::DataType, bool)], order: &[usize], written: String, column: &str, text: Option<String>) -> Result<Option<&'static str>> {
+async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View, mut m: TableMeta, was: &[(String, datafusion::arrow::datatypes::DataType, bool)], order: &[usize], written: String, column: &str, text: Option<String>) -> Result<(Option<&'static str>, Vec<String>)> {
     let names: Vec<String> = was.iter().map(|(c, ..)| c.clone()).collect();
+    let before = m.clone();
     let now = view_outputs(lake, &written).await.map_err(|e| crate::rules::alter::cant_move(name, column, &format!("moved, its query doesn't plan ({e:#})"), MATERIALIZED))?;
     let want: Vec<_> = order.iter().map(|&i| was[i].clone()).collect();
     ensure!(now == want, crate::rules::alter::cant_move(name, column, "moved, its query plans to other columns", MATERIALIZED));
@@ -1796,10 +1819,9 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
             m.shown = if as_stored.starts_with(&stored) { vec![] } else { stored };
         }
     }
-    let readers = by_position(lake, name).await?;
-    if !readers.is_empty() {
-        return Err(crate::rules::alter::read_by_position(name, column, &readers));
-    }
+    let star = |m: &TableMeta| -> Vec<(String, String)> { m.described().columns.into_iter().filter(|(c, _)| !m.marker(c)).collect() };
+    let (was, now) = (star(&before), star(&m));
+    let (mut puts, readers) = keep_readers(lake, name, column, was, now).await?; // (what reads it by position reads it as it did)
     let (query, authored) = (v.query().to_string(), v.authored.take());
     v.written = Some(written).filter(|w| *w != v.sql || v.written.is_some());
     // (its query as written: the statement's own when it is made again (CREATE OR REPLACE), else its columns moved too)
@@ -1809,11 +1831,10 @@ async fn reorder_materialized(lake: &Lake, name: &str, mut v: crate::views::View
         None => authored_moved(lake, &authored, &query, order, v.query(), true).await,
     };
     v.authored = authored;
-    lake.cat.commit(vec![(crate::views::view_key(name), json(&v)), (table_key(name), json(&m))], &[]).await?;
-    if !m.publish.is_empty() {
-        crate::delta::publish_all(lake).await?; // (other engines list its columns in the new order too)
-    }
-    Ok(notice)
+    puts.extend([(crate::views::view_key(name), json(&v)), (table_key(name), json(&m))]);
+    lake.cat.commit(puts, &[]).await?;
+    published_after_move(lake, &m, &readers).await?; // (other engines list its columns in the new order too)
+    Ok((notice, readers))
 }
 
 /// `CREATE OR REPLACE MATERIALIZED VIEW v AS …` of the very query it has, with its columns in another order, and the same
@@ -1849,29 +1870,32 @@ async fn reordered_in_place(lake: &Lake, name: &str, sql: &str, options: &std::c
     }
     let first = order.iter().enumerate().find(|(i, &p)| *i != p).map_or(names[0].clone(), |(i, _)| now[i].0.clone());
     // (made again, it is its statement's text that is kept, or none: not its old one moved)
-    let notice = reorder_materialized(lake, name, v, m, &was, &order, written, &first, Some(text.unwrap_or_default())).await?;
+    let (notice, readers) = reorder_materialized(lake, name, v, m, &was, &order, written, &first, Some(text.unwrap_or_default())).await?;
     let mut out = j!({"view": name, "materialized": true, "rows": "kept, its columns in the new order"});
     if let Some(n) = notice {
         out["notice"] = n.into();
     }
+    if !readers.is_empty() {
+        out["readers"] = j!(readers);
+    }
     Ok(Some(out))
 }
 
-/// What reads `name`'s columns by position and keeps what it read, so that moving one would break it: a materialized
-/// view whose query says `*` or `COLUMNS(…)` (`rules::alter::by_position`: its table's columns are its query's as it
-/// was made), a task that reads it so, and a task that writes into it (its rows fill the columns in SQL's order). A
-/// plain view that says `*` keeps nothing: it lists the columns in their new order, as it lists a column added, so it
-/// stops nothing itself; what reads that view so is asked in turn.
-pub(crate) async fn by_position(lake: &Lake, name: &str) -> Result<Vec<String>> {
+/// What reads `name`'s columns by position and keeps what it read, so that moving one would change it, by name: the
+/// materialized views whose query says `*` or `COLUMNS(…)` (`rules::alter::by_position`: its table's columns are its
+/// query's as it was made), and the tasks that read it so or write into it (their rows fill the columns in SQL's order).
+/// A plain view that says `*` keeps nothing: it lists the columns in their new order, as it lists a column added, so it
+/// is no reader itself; what reads that view so is one in turn. They keep reading as they did: `keep_readers`.
+async fn position_readers(lake: &Lake, name: &str) -> Result<(Vec<String>, Vec<String>)> {
     let (views, plain, tasks) = (lake.cat.scan::<crate::views::View>("v/", "v0").await?, lake.cat.scan::<StoredView>("q/", "q0").await?, lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?);
-    let (mut out, mut asked, mut follow): (Vec<String>, Vec<String>, Vec<String>) = (vec![], vec![], vec![name.to_string()]);
+    let (mut out, mut by, mut asked, mut follow): (Vec<String>, Vec<String>, Vec<String>, Vec<String>) = (vec![], vec![], vec![], vec![name.to_string()]);
     while let Some(t) = follow.pop() {
         if asked.contains(&t) {
             continue;
         }
         for (k, v) in &views {
-            if (v.source == t || v.from.contains(&t) || reads(lake, &v.sql, &t)) && crate::rules::alter::by_position(&v.sql) {
-                out.push(format!("materialized view {}", &k[2..]));
+            if (v.source == t || v.from.contains(&t) || reads(lake, &v.sql, &t)) && crate::rules::alter::by_position(&v.sql) && !out.contains(&k[2..].to_string()) {
+                out.push(k[2..].to_string());
             }
         }
         for (k, v) in &plain {
@@ -1880,14 +1904,152 @@ pub(crate) async fn by_position(lake: &Lake, name: &str) -> Result<Vec<String>> 
             }
         }
         for (k, task) in &tasks {
-            if task.target == t || (task.source == t && crate::rules::alter::by_position(&task.sql)) {
-                out.push(format!("task {}", &k[2..]));
+            if (task.target == t || (task.source == t && crate::rules::alter::by_position(&task.sql))) && !by.contains(&k[2..].to_string()) {
+                by.push(k[2..].to_string());
             }
         }
         asked.push(t);
     }
-    out.dedup();
-    Ok(out)
+    Ok((out, by))
+}
+
+/// What reads `name`'s columns by position (`position_readers`), kept reading them as it did while they move from `was`
+/// to `now` (what `SELECT *` lists: SQL's names and types, in SQL's order), so that a move is never refused for it:
+/// - a materialized view runs its query with `name` read as `was` lists it (`rules::alter::frozen`), proved to give its
+///   columns as it has them, and keeps its rows. It lists its columns in the order its query as written now gives (its
+///   table's `shown`), as a view with `*` does, when it can, and what reads it so is kept in turn; one that can't (EMIT
+///   FINAL, sessions, a history view, one finished as it is read) keeps their order, and SHOW CREATE gives the query it
+///   runs. One whose matches are MATCH_RECOGNIZE's writes its rows by name: it keeps its order as it is.
+/// - a task that writes into `name` has the columns it fills written out (`tasks::Task::columns`), and one that reads it
+///   by position reads it as `was` lists it.
+///
+/// Gives the catalog's writes that do so, for the move's own commit (each takes effect with it), and what each reader
+/// does now, for the answer.
+pub(crate) async fn keep_readers(lake: &Lake, name: &str, column: &str, was: Vec<(String, String)>, now: Vec<(String, String)>) -> Result<(Vec<(String, Vec<u8>)>, Vec<String>)> {
+    use std::collections::BTreeMap;
+    let mut over = vec![(name.to_string(), now)]; // (each table moved, as its columns are listed after: what proves it)
+    let mut queue = vec![(name.to_string(), was)];
+    let (mut views, mut metas, mut tasks, mut said): (BTreeMap<String, crate::views::View>, BTreeMap<String, TableMeta>, BTreeMap<String, crate::tasks::Task>, Vec<String>) = Default::default();
+    let cant = |who: &str, x: &str, why: String| crate::codes::coded("0A000", format!("{column} can't move: {who} reads {x}'s columns by position, and {why}"));
+    while let Some((x, was)) = queue.pop() {
+        let (readers, writers) = position_readers(lake, &x).await?;
+        let listed: Vec<String> = was.iter().map(|(c, _)| c.clone()).collect();
+        let is = |n: &str| local(lake, n).as_deref() == Some(x.as_str());
+        for r in readers {
+            let who = format!("materialized view {r}");
+            let mut v = match views.remove(&r) {
+                Some(v) => v,
+                None => lake.cat.get(&crate::views::view_key(&r)).await?.with_context(|| format!("no materialized view {r}"))?,
+            };
+            let mut m = match metas.remove(&r) {
+                Some(m) => m,
+                None => lake.cat.get::<TableMeta>(&table_key(&r)).await?.with_context(|| format!("materialized view {r} has no table"))?,
+            };
+            if v.matches.is_some() {
+                views.insert(r.clone(), v); // (its rows are written by name: `matches.rs`)
+                metas.insert(r, m);
+                continue;
+            }
+            ensure!(v.fill.as_ref().is_none_or(|f| f.upto.is_some()), cant(&who, &x, "it is still taking in the rows its tables had: move it a moment later".into())); // (`views::bound` writes its entry once more)
+            let has: Vec<(String, String)> = m.described().columns.into_iter().filter(|(c, _)| !m.marker(c)).collect();
+            let names: Vec<String> = has.iter().map(|(c, _)| c.clone()).collect();
+            let written = v.written.is_some();
+            if let Some(f) = crate::rules::alter::frozen(&v.sql, &is, &listed) {
+                // (proved: read as it was, after the move, its query gives what it gives now, before it, the columns it writes)
+                let ran = outputs_over(lake, &v.sql, &[]).await?;
+                let out = outputs_over(lake, &f, &over).await.map_err(|e| cant(&who, &x, format!("read as it was, its query doesn't plan ({e:#})")))?;
+                ensure!(out == ran, cant(&who, &x, format!("read as it was, its query gives {} where it gives {}", out.join(", "), ran.join(", "))));
+                if !written {
+                    v.written = Some(v.sql.clone()); // (what SHOW CREATE gives stays its query as written)
+                }
+                v.sql = f;
+            }
+            let follows = v.sessions.is_none() && v.once.is_none() && m.history.is_none() && m.finish.is_none() && crate::views::shown(v.query()) == v.query();
+            let gives = match follows {
+                true => outputs_over(lake, v.query(), &over).await.ok(), // (its query as written, once the columns moved)
+                false => None,
+            };
+            let then: Option<Vec<String>> = gives.as_ref().map(|t| t.iter().filter(|c| names.contains(c)).cloned().collect()); // (a column added is none of its own)
+            let mut sorted = (then.clone().unwrap_or_default(), names.clone());
+            (sorted.0.sort(), sorted.1.sort());
+            let mut what = match then {
+                Some(then) if then != names && sorted.0 == sorted.1 && names.iter().all(|c| m.stored(c) == Some(c.as_str())) => {
+                    // (its columns in the order its query now gives: by their stored names, the rest after, as `reorder_materialized`)
+                    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| !m.marker(s)).collect();
+                    m.shown = if as_stored.starts_with(&then) { vec![] } else { then };
+                    let now: Vec<(String, String)> = m.sql_columns().into_iter().filter(|(c, _)| !m.marker(c)).collect();
+                    over.push((r.clone(), now));
+                    queue.push((r.clone(), has));
+                    format!("{who} lists its columns in the new order, its rows kept")
+                }
+                Some(then) if then == names => format!("{who} keeps its rows"),
+                _ => {
+                    if !written {
+                        v.written = None; // (its columns stay in their order: SHOW CREATE gives the query it runs)
+                    }
+                    format!("{who} keeps its columns' order and its rows")
+                }
+            };
+            // (a column it hasn't, new in what its `*` reads: SHOW CREATE leaves it out by name, so that it makes this view)
+            let extra: Vec<String> = gives.iter().flatten().filter(|c| !names.contains(c)).cloned().collect();
+            if !extra.is_empty() {
+                let own: Vec<String> = m.sql_columns().into_iter().map(|(c, _)| c).filter(|c| !m.marker(c)).collect();
+                if let Some(w) = crate::rules::alter::excluding(v.query(), &extra) {
+                    if outputs_over(lake, &w, &over).await.ok().as_ref() == Some(&own) {
+                        what.push_str(&format!("; SHOW CREATE gives its `*` with EXCLUDE ({})", extra.join(", ")));
+                        v.written = Some(w);
+                    }
+                }
+            }
+            said.push(what);
+            views.insert(r.clone(), v);
+            metas.insert(r, m);
+        }
+        for k in writers {
+            let who = format!("task {k}");
+            let mut task = match tasks.remove(&k) {
+                Some(t) => t,
+                None => lake.cat.get(&crate::tasks::task_key(&k)).await?.with_context(|| format!("no task {k}"))?,
+            };
+            let gives = view_outputs(lake, &task.sql).await?; // (as it reads now: before the move)
+            if task.target == x && task.columns.is_none() {
+                ensure!(gives.len() <= listed.len(), cant(&who, &x, format!("its rows have {} columns, more than {x}'s {}", gives.len(), listed.len())));
+                task.columns = Some(listed[..gives.len()].to_vec()); // (the columns its rows filled: from now on, by name)
+                said.push(format!("{who} fills the columns it filled: {}", listed[..gives.len()].join(", ")));
+            }
+            if task.source == x {
+                if let Some(f) = crate::rules::alter::frozen(&task.sql, &is, &listed) {
+                    let out = outputs_over(lake, &f, &over).await.map_err(|e| cant(&who, &x, format!("read as it was, its query doesn't plan ({e:#})")))?;
+                    ensure!(out.iter().eq(gives.iter().map(|(c, ..)| c)), cant(&who, &x, "read as it was, its query gives other columns".into()));
+                    task.sql = f;
+                    said.push(format!("{who} reads {x}'s columns as it did"));
+                }
+            }
+            tasks.insert(k, task);
+        }
+    }
+    let mut puts: Vec<(String, Vec<u8>)> = views.iter().map(|(k, v)| (crate::views::view_key(k), json(v))).collect();
+    puts.extend(metas.iter().map(|(k, m)| (table_key(k), json(m))));
+    puts.extend(tasks.iter().map(|(k, t)| (crate::tasks::task_key(k), json(t))));
+    Ok((puts, said))
+}
+
+/// The names of `sql`'s outputs, planned with each table of `over` listing its columns as given there (an empty table
+/// of those columns stands for it): how a query reads once those tables' columns have moved, before they do.
+async fn outputs_over(lake: &Lake, sql: &str, over: &[(String, Vec<(String, String)>)]) -> Result<Vec<String>> {
+    let expanded = crate::routines::expand(lake, sql).await?;
+    let planned = crate::sys::planned(&expanded)?;
+    let ctx = crate::query::session(lake, &planned, "").await?;
+    for (t, columns) in over {
+        let table = crate::query::table_ref(t);
+        let _ = ctx.deregister_table(table.clone());
+        ctx.register_table(table, Arc::new(datafusion::datasource::MemTable::try_new(crate::answer::schema(columns)?, vec![vec![]])?))?;
+    }
+    // (a plain view was planned with the session, over the tables as they were: planned again, over these)
+    let views = crate::query::stored_views(lake, &planned, false).await?.into_iter().filter(|(v, _)| !over.iter().any(|(t, _)| t == v)).collect();
+    crate::query::register_views(&ctx, views, false, false).await?;
+    let df = crate::engine::sql(&ctx, &planned).await?;
+    Ok(df.schema().fields().iter().map(|f| f.name().clone()).collect())
 }
 
 /// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow.

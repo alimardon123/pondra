@@ -302,9 +302,10 @@ SELECT * FROM readings WHERE sensor = 's4';
 +-------+--------+------+---------+
 ```
 
-A view that reads the table with a `*` lists the new order too. A move is refused while a materialized
-view reads the table with a `*`, because its rows keep the order they were made in: name the columns in
-its query first.
+Nothing that reads the table stops a move. A view or materialized view that reads it with a `*` lists
+the new order too, in the same step, and a materialized view keeps its rows. `SHOW CREATE` still gives
+its query as you wrote it. A task that reads the table with a `*`, or writes into it by position, does
+just what it did before: the move writes out the columns it uses, in their old order.
 
 Views take the same words. `ALTER VIEW v ALTER COLUMN c FIRST` writes the view's query with its columns
 in the new order, and `ALTER MATERIALIZED VIEW` does the same and keeps the view's rows. Each column
