@@ -16,7 +16,7 @@
 # TPC-H: ab_compare, A and B alike, each loaded by CTAS: folder lake, memory lake, hot tier off (--hot-gb 0).
 # TPC-DS: tpcds_check run, A then B then A. ClickBench: singlenode pondra-cold, A then B then A.
 # Before each B of TPC-H and TPC-DS: each table is loaded into a scratch lake by B's binary, and its files are listed
-# by codec: SNAPPY is the source's own bytes (kept), anything else is pondra's (written). A table not kept is named.
+# by row groups: the source's row groups, in our LZ4, are kept; others are written. A table not kept is named.
 # ClickBench has no codec check: its lake is singlenode.py's own, and a second one would not fit on the disk.
 # A run that fails leaves its JSON out, and the table says so. Exit 0 whatever the answers: read the table.
 set -u
@@ -57,7 +57,8 @@ export PONDRA_BIN="$BIN"
 unset PONDRA_KEEP_PARQUET   # (B is the unset variable: nothing from this shell reaches it)
 
 # Before a B run. Loads each <table>.parquet of DATA into a scratch lake with B's binary (no A env), lists every
-# table's files' column-chunk codec with pyarrow, and names the tables not kept. Removes the scratch lake.
+# table's files' row groups and codecs with pyarrow, and names the tables not kept: a kept table has the source's row
+# groups (its pages recompressed in our LZ4), a written one its own (one per file, up to 4M rows). Removes the lake.
 codec_check() {
   local data=$1 lake f t
   lake=$(mktemp -d "$WORK/codec.XXXXXX")
@@ -67,7 +68,7 @@ codec_check() {
       || echo "codec check: load of $t failed"
   done
   "$BIN" catalog --dir "$lake" "t/" > "$WORK/catalog.txt" 2>/dev/null
-  "$PY" -I - "$lake" "$WORK/catalog.txt" <<'PY'
+  "$PY" -I - "$lake" "$WORK/catalog.txt" "$data" <<'PY'
 import collections, json, os, sys
 import pyarrow.parquet as pq
 lake = sys.argv[1]
@@ -77,23 +78,27 @@ for line in open(sys.argv[2]).read().splitlines():
     table = name.split("/", 1)[1]
     if table.startswith("pondra$"):  # (the lake's own system tables)
         continue
-    codecs = collections.Counter()
+    codecs, groups = collections.Counter(), 0
     for f in json.loads(js)["files"]:
         path = f["path"] if os.path.isabs(f["path"]) else os.path.join(lake, f["path"])
         md = pq.ParquetFile(path).metadata
+        groups += md.num_row_groups
         for g in range(md.num_row_groups):
             rg = md.row_group(g)
             for c in range(rg.num_columns):
                 codecs[rg.column(c).compression] += 1
-    label = ", ".join(f"{k} x{v}" for k, v in sorted(codecs.items())) or "no files"
-    # Kept = the source's Snappy chunks; anything else is pondra's own encoding (written). The codec names are as
-    # pyarrow reads them (main's own files read as LZ4, not LZ4_RAW).
-    if codecs and set(codecs) == {"SNAPPY"}:
-        kept.append(table); status = "Snappy (kept)"
-    elif codecs and "SNAPPY" not in codecs:
-        written.append(table); status = "written, not Snappy"
+    source = os.path.join(sys.argv[3], f"{table}.parquet")
+    want = pq.ParquetFile(source).metadata.num_row_groups if os.path.exists(source) else -1
+    label = ", ".join(f"{k} x{v}" for k, v in sorted(codecs.items())) + f"; {groups} row groups, the source {want}" if codecs else "no files"
+    # Kept = the source's row groups, in our codec (pyarrow names our LZ4_RAW "LZ4"); written = our own row groups. A
+    # source of one row group reads the same either way.
+    ours = bool(codecs) and set(codecs) <= {"LZ4", "LZ4_RAW"}
+    if ours and groups == want:
+        kept.append(table); status = "kept" if want > 1 else "kept or written (one row group)"
+    elif ours:
+        written.append(table); status = "written"
     else:
-        mixed.append(table); status = "mixed or no files"
+        mixed.append(table); status = "another codec, or no files"
     print(f"  codec {table:24} {status}  [{label}]")
 if written or mixed:
     print(f"  NOT KEPT: {', '.join(written + mixed)}")
