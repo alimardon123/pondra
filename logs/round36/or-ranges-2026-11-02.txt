@@ -1,0 +1,16 @@
+# RangesOnce (or_ranges.rs) A/B, in-process SF1, 4 cores; A/B = two worker processes taking turns per run (abpair.py), median ms; main = 50b49ad's library
+
+## Plans
+TPC-H: only q19's changes (lineitem: l_shipinstruct = .. AND l_quantity >= 1.00 AND l_quantity <= 30.00 AND (l_shipmode = AIR OR .. AIR REG)).
+TPC-DS, the filters' predicates of all 99: only q13, q48, q85 change, e.g. q13 (ss_net_profit 100-200 OR 150-300 OR 50-250) AND (ss_sales_price ...) -> ss_net_profit >= 50.00 AND <= 300.00 AND ss_sales_price >= 50.00 AND <= 200.00
+
+## Answers
+TPC-DS: all 99 digests equal (dsinproc.py), no errors. TPC-H q19: 3083843.0578 both.
+
+## Times (61 runs for q19, 41 for TPC-DS), main first then this, then this first
+q19  main 106.4 this 90.6 (0.851) cpu 253/215 | this 92.0 main 109.6 (1.191) cpu 214/250
+q13  main 89.8 this 74.9 (0.834) cpu 182/146 | this 80.1 main 98.8 (1.235) cpu 157/193
+q48  main 118.1 this 99.0 (0.839) cpu 231/190 | this 90.9 main 113.1 (1.244) cpu 176/219
+q85  main 124.8 this 102.7 (0.823) cpu 225/197 | this 106.7 main 108.6 (1.018) cpu 199/206
+
+## By hand, lineitem only (sqlalt.py, 61 runs each, in turn): the three ORed ranges 59.0 ms, written as one range 49.0 ms
