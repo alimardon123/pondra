@@ -16,7 +16,8 @@ world extension {
 
   /// Runs the scalar function `name` over one batch: Arrow IPC stream bytes in, a column per argument in the types
   /// `describe` gave; Arrow IPC stream bytes out, one column of the same number of rows in its `returns` type. An error is
-  /// the function's own words: it fails the query that called it.
+  /// the function's own words: it fails the query that called it. A function `describe` marks `"async": true` answers here
+  /// too, one batch at a time; a later Pondra that awaits calls asks a `call-async` export beside this one (ADR-075 §2).
   export call: func(name: string, batch: list<u8>) -> result<list<u8>, string>;
 }
 
