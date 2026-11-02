@@ -108,6 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/cluster/replica", get(replica))
         .route("/cluster/leader", get(|State(app): State<App>| async move { crate::cluster::of(&app).map(|c| Json(c.leader_status())).ok_or(StatusCode::NOT_FOUND) }))
         .route("/cluster/visible", get(|State(app): State<App>| async move { Json(app.lake.visible()) })) // (a follower's read-your-writes: `write::seen_here`)
+        .route("/cluster/committed", get(|State(app): State<App>| async move { Json(app.lake.cat.committed()) })) // (the leader's last commit: `write::seen_here`, `cluster::catch_up`)
         .route("/cluster/kafka", get(|| async { Json(crate::kafka::me()) }))
         .merge(crate::iceberg_rest::rest())
         .merge(crate::sharing::routes()) // (recipients sign in there with their own tokens: `sharing.rs`)
@@ -318,6 +319,9 @@ async fn guard(State(app): State<App>, mut req: Request, next: Next) -> Response
         Some(p) => p,
         None if crate::statement::owner(&app.auth, req.headers()) => crate::auth::Principal::token(crate::auth::Role::Admin), // (the shell's, local()'s: this machine's own folder)
         None if starting && needed == crate::auth::Role::None => crate::auth::Principal::of(crate::auth::Role::None), // (a probe while it catches up: answered, never held)
+        // (still catching up after 10 s: its catalog may lack its leader's users, so nobody it can't sign in is let in as an
+        // open node's caller: asked again in a moment, as a table it doesn't hold yet is, `Lake::table_meta_if`)
+        None if !*app.lake.caught.borrow() => return (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")], crate::store::CATCHING_UP).into_response(),
         None if app.open().await => match crate::auth::cross_site(req.headers(), req.method(), from, app.members.me()) {
             Some(why) => return (StatusCode::FORBIDDEN, why).into_response(), // (a browser's page from elsewhere: `auth::cross_site`)
             None => {
@@ -506,13 +510,14 @@ async fn to_leader(State(app): State<App>, req: Request, next: Next) -> Response
         return E(anyhow::anyhow!("read-only node")).into_response();
     }
     let operator = crate::auth::operator(); // (read now, while the request's scope holds: `auth::WHO`)
-    let as_caller = if operator || app.open().await {
-        None // (the cluster itself, or an open node: the node's own credential, as `nodes_own` says)
-    } else {
-        match req.headers().get(axum::http::header::AUTHORIZATION) {
-            Some(v) => Some(v.clone()),
-            None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
-        }
+    // (a caller's own sign-in goes on as it came, at an open node too, whose open leader takes it as it takes none: a node
+    // never puts its own credential behind a caller's. One that took itself for open, its catalog not yet holding its
+    // leader's users, did, and a branch's key made a user's token at the leader: CI run 41359432087, attempt 2)
+    let as_caller = match req.headers().get(axum::http::header::AUTHORIZATION) {
+        _ if operator => None, // (the cluster itself: the node's own credential)
+        Some(v) => Some(v.clone()),
+        None if app.open().await => None, // (an open node: as `nodes_own` says)
+        None => return (StatusCode::UNAUTHORIZED, "the leader checks the caller's own sign-in: send an Authorization header").into_response(),
     };
     proxy(&app.members.leader().addr, req, as_caller).await.unwrap_or_else(|e| E(e).into_response())
 }

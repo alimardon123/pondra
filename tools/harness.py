@@ -7631,10 +7631,26 @@ def followers():
     a = Node(lake, A.port, tier_secs=1, kafka=f"127.0.0.1:{kport}", changelog_secs=600).start()
     b = Node(lake, A.port + 1, tier_secs=1).start()
     q = lambda s, port=A.port: sql(port, s)
+    checks = {}
+    # A node answers once its /stats does, before it follows its leader's stream: a table it just made through its leader is in
+    # its own reads before the next step. A CREATE TABLE … AS of a file on this machine, sent by the shell's own key, said "no
+    # table" for its first seconds (L2, 11-01: a table's commit adds no log segment, which was all the follower waited for).
+    import pyarrow.parquet as pq
+    key = uuid.uuid4().hex
+    own, pf = {"x-pondra-owner": key}, os.path.join(tempfile.mkdtemp(), "f.parquet")
+    pq.write_table(pa.table({"id": pa.array(range(3000), pa.int64())}), pf, row_group_size=1000)
+    fresh = new_lake()
+    lead = Node(fresh, A.port + 5, env={"PONDRA_OWNER_KEY": key}).start()
+    fol = Node(fresh, A.port + 6, env={"PONDRA_OWNER_KEY": key}).start()
+    f = lambda s: _try(lambda: call(A.port + 6, "POST", "/sql", s.encode(), headers=own))
+    made = [f(f"CREATE TABLE made{i} AS FROM '{pf}'") for i in range(3)]
+    plain = (f("CREATE TABLE plain (id BIGINT)"), f("INSERT INTO plain VALUES (1), (2)"), f("SELECT count(*) AS n FROM plain"))
+    [x.kill() for x in (lead, fol)]
+    checks["a node just started reads what it made through its leader: three CREATE TABLE … AS of a file, and a CREATE TABLE, its INSERT and a count"] = \
+        made == [{"rows": 3000}] * 3 and plain[2] == [{"n": 2}]
     io = {"s3.endpoint": os.environ.get("AWS_ENDPOINT"), "s3.access-key-id": os.environ.get("AWS_ACCESS_KEY_ID"), "s3.secret-access-key": os.environ.get("AWS_SECRET_ACCESS_KEY"),
           "s3.region": os.environ.get("AWS_REGION", "auto"), "py-io-impl": "pyiceberg.io.fsspec.FsspecFileIO"} if A.s3 else {}
     cat = load_catalog("pondra", type="rest", uri=f"http://127.0.0.1:{A.port + 1}", **io)  # (the follower)
-    checks = {}
     q("CREATE TABLE ev (id BIGINT, g VARCHAR, amount DOUBLE) WITH (publish = 'iceberg')")
     q("CREATE MATERIALIZED VIEW per_g AS SELECT g, count(*) AS n, sum(amount) AS total FROM ev GROUP BY g")
     q("CREATE MATERIALIZED VIEW big AS SELECT id, g, amount FROM ev WHERE amount >= 500")
@@ -7698,6 +7714,7 @@ def followers():
     ok = all(checks.values())
     print(json.dumps({"followers": checks, "ok": ok}, indent=1))
     if not ok:
+        print(json.dumps({"made": made, "plain": plain}, default=str))  # (before the next, whose `want()` asks a node killed above)
         print(json.dumps({"appended": appended, "versions": versions, "files": files[:3], "deleted": deleted, "want": want(), "kinds": sorted(kinds), "state": len(state), "kafka": [len(got), got[:3], got[-3:]],
                           "task": task, "refused": refused[:300], "pairs": pairs}, default=str))
         sys.exit(1)
@@ -10652,13 +10669,18 @@ def _lake_keys():
         except Exception:
             return None  # (restarting to rejoin: a moment)
     led = until(lambda: any(role(A.port + i) == "leader" for i in (1, 2)), True, 40)
+    # (the new leader seals them once it has heard which formats its nodes know, 15 s at most, and the other looks for them
+    # every 10 s: the writes come after both, or they went through with the old key and the logs were read too soon)
+    said = lambda what: sum(what in open(f.log).read() for f in pair)
+    sealed_new = until(lambda: said("made new (the ones in the clear"), 1, 90)
+    took_new = until(lambda: said("took the lake's new keys from the bucket"), 1, 30)
     wrote = [until(lambda i=i: as_(A.port + i, basic, "INSERT INTO t VALUES (%d)" % (i + 10)), {"rows": 1}, 60) for i in (1, 2)]
     logs = [open(f.log).read() for f in pair]
     for f in pair:
         f.kill()
-    info["followers"] = {"joined": joined, "a follower took over": led, "wrote after": wrote, "logs": [l[-300:] for l in logs]}
+    info["followers"] = {"joined": joined, "a follower took over": led, "sealed, taken": [sealed_new, took_new], "wrote after": wrote, "logs": [l[-300:] for l in logs]}
     checks["followers that knew the lake's keys in the clear: the one that takes over seals new ones, and the other takes them from the bucket and writes through it"] = \
-        joined == [{"rows": 1}] * 2 and led is True and wrote == [{"rows": 1}] * 2 \
+        joined == [{"rows": 1}] * 2 and led is True and sealed_new == 1 and took_new == 1 and wrote == [{"rows": 1}] * 2 \
         and sum("made new (the ones in the clear" in l for l in logs) == 1 and sum("took the lake's new keys from the bucket" in l for l in logs) == 1
     return checks, info
 
