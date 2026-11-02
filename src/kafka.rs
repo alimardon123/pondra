@@ -139,7 +139,15 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         anyhow::Ok(())
     });
     let mut who = crate::auth::Principal::of(if app.open().await { Role::Admin } else { Role::None }).at("kafka", from);
+    let mut said = (who.role > Role::None).then_some(Said::Open); // (how it signed in, to check again: `again`)
+    let mut checked = std::time::Instant::now();
     while let Ok(size) = rd.read_i32().await {
+        if checked.elapsed() >= Duration::from_secs(5) {
+            checked = std::time::Instant::now();
+            if let Some(s) = &said {
+                who = again(&app, s).await.at("kafka", from);
+            }
+        }
         let most = if who.role == Role::None { 1 << 20 } else { 128 << 20 }; // (before signing in: ApiVersions, SASL and Metadata, all small)
         ensure!((0..=most).contains(&size), "request of {size} bytes");
         let mut buf = vec![0; size as usize];
@@ -149,7 +157,7 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
         if crate::drain::draining() || busy.as_ref().is_some_and(|b| !b.counted()) {
             break; // (stopping: not taken, see above)
         }
-        let reply = request(&app, &me, &mut who, &peer, Bytes::from(buf)).await?;
+        let reply = request(&app, &me, &mut who, &mut said, &peer, Bytes::from(buf)).await?;
         if tx.send((reply, busy)).await.is_err() {
             break;
         }
@@ -158,7 +166,28 @@ async fn conn(app: App, me: Arc<Broker>, socket: crate::tls::Conn) -> Result<()>
     writer.await?
 }
 
-async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
+/// How a connection signed in: at an open node, with a user's name and password (or a role's name and its token), or with a
+/// bearer token. Kept to sign it in again (`again`).
+enum Said {
+    Open,
+    Plain(String, String),
+    Bearer(String),
+}
+
+/// Who a connection that signed in is now, checked again every 5 s, as `server::until_revoked` checks an HTTP stream's
+/// caller (11-02 audit H3): its user dropped, made no superuser or its grants taken back, its password changed, its token
+/// or session expired, and it is nobody, so its next fetch or produce ends the connection; signed in at an open node, once
+/// the node is open no more. (A password is hashed at most once a minute: `users::password_ok` remembers it.)
+async fn again(app: &App, said: &Said) -> crate::auth::Principal {
+    let now = match said {
+        Said::Open => app.open().await.then(|| crate::auth::Principal::of(Role::Admin)),
+        Said::Plain(user, password) => crate::users::sign_in(&app.lake, &app.auth, user, password).await,
+        Said::Bearer(token) => crate::users::who(&app.lake, &app.auth, Some(&format!("Bearer {token}"))).await,
+    };
+    now.unwrap_or_else(|| crate::auth::Principal::of(Role::None))
+}
+
+async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, buf: Bytes) -> Result<Reply> {
     let mut r = Rd { b: buf, at: 0 };
     let (key, ver, corr) = (r.i16()?, r.i16()?, r.i32()?);
     r.nstr()?; // client id
@@ -174,7 +203,7 @@ async fn request(app: &App, me: &Broker, who: &mut crate::auth::Principal, peer:
         API_VERSIONS => done(api_versions(if supported { ver } else { 0 }, supported)),
         METADATA => done(metadata(app, me, ver, &mut r).await?),
         SASL_HANDSHAKE => done(sasl_handshake(&mut r)?),
-        SASL_AUTHENTICATE => done(sasl_authenticate(app, who, peer, ver, &mut r).await?),
+        SASL_AUTHENTICATE => done(sasl_authenticate(app, who, said, peer, ver, &mut r).await?),
         INIT_PRODUCER_ID => done(init_producer_id(&mut r)?),
         PRODUCE => produce(app, who, ver, &mut r).await?.map(move |body| body.map(|b| frame(corr, b))).boxed(),
         LIST_OFFSETS => done(list_offsets(app, ver, &mut r).await?),
@@ -306,7 +335,7 @@ fn sasl_handshake(r: &mut Rd) -> Result<Vec<u8>> {
 /// name (`reader`, `writer`, `admin`) and its token (`users::sign_in`). As on HTTP, a password crosses
 /// only TLS from another machine, a token may under `PONDRA_TLS=optional` (`tls::may_send_password`), and
 /// past ten failures a minute for a user from one address, that pair is refused (`auth::guessing`).
-async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
+async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, said: &mut Option<Said>, peer: &crate::tls::Peer, ver: i16, r: &mut Rd) -> Result<Vec<u8>> {
     let auth = r.nbytes()?.unwrap_or_default();
     let parts: Vec<&[u8]> = auth.split(|&b| b == 0).collect();
     let (mut user, password) = match parts[..] {
@@ -317,6 +346,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
     let token = crate::sso::bearer(&auth); // (OAUTHBEARER's; None: PLAIN's)
     let refused = if app.open().await {
         *who = crate::auth::Principal::of(Role::Admin).at("kafka", who.from);
+        *said = Some(Said::Open);
         None
     } else if let Some(token) = &token {
         // (a bearer token, as HTTP takes one: an identity provider's, or Pondra's own; never a guess)
@@ -324,6 +354,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
             Some(p) => {
                 user = p.name.clone();
                 *who = p.at("kafka", who.from);
+                *said = Some(Said::Bearer(token.clone()));
                 None
             }
             None => Some(crate::sso::why(&app.lake, token).await.unwrap_or_else(|| "wrong token".to_string())),
@@ -336,6 +367,7 @@ async fn sasl_authenticate(app: &App, who: &mut crate::auth::Principal, peer: &c
         match crate::users::sign_in(&app.lake, &app.auth, &user, &password).await {
             Some(p) => {
                 *who = p.at("kafka", who.from);
+                *said = Some(Said::Plain(user.clone(), password.clone()));
                 None
             }
             None => {

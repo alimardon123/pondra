@@ -309,6 +309,39 @@ pub enum Change {
     Type(String),
     Default(Option<String>), // SET DEFAULT expr (Some), DROP DEFAULT (None): `defaults::alter`
     NotNull(bool),           // SET NOT NULL (true), DROP NOT NULL (false): `defaults::alter`
+    Place(Place),            // FIRST, AFTER b: where SQL lists it (`TableMeta::shown`)
+}
+
+/// Where a column goes among a table's columns as SQL lists them: `ALTER COLUMN c FIRST | AFTER b`, `ADD COLUMN … FIRST |
+/// AFTER b` (Databricks' and MySQL's words).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    First,
+    After(String),
+}
+
+impl Place {
+    /// `order` (SQL names, SQL's order) with `column` put here; `column` may be new to it. Err: the column it goes after
+    /// isn't one of them, or is `column` itself.
+    pub fn put(&self, order: &[String], column: &str) -> Result<Vec<String>, String> {
+        let mut new: Vec<String> = order.iter().filter(|c| *c != column).cloned().collect();
+        let at = match self {
+            Place::First => 0,
+            Place::After(b) if b == column => return Err(format!("{column} can't go after itself")),
+            Place::After(b) => new.iter().position(|c| c == b).ok_or_else(|| b.clone())? + 1,
+        };
+        new.insert(at, column.to_string());
+        Ok(new)
+    }
+
+    /// As SQL says it.
+    pub fn sql(&self) -> String {
+        match self {
+            Place::First => "FIRST".into(),
+            Place::After(b) => format!("AFTER {}", crate::objects::ident(b)),
+        }
+    }
 }
 
 /// Leader: carry one out (under the lake's lock). Comments follow what it renames, and go with
@@ -467,6 +500,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
         Ddl::Attach { name, dir, read_only, endpoint } => {
             attachable(lake, &name, false).await?;
+            openable(&lake.url, &dir)?; // (what `sync` would never open is refused here, at once)
             ensure!(endpoint.is_none() || read_only, "ENDPOINT goes with READ_ONLY: a database on another server is read with its bucket's read-only key and asked through its leader's URL");
             ensure!(endpoint.as_deref().is_none_or(|e| e.starts_with("http://") || e.starts_with("https://")), "ENDPOINT is its server's URL: https://…");
             if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(&name)).await? {
@@ -765,6 +799,25 @@ crate::per_node!(
     /// The lakes this process attached because the catalog said so, per home lake.
     static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
 
+crate::per_node!(
+    /// The attachments `sync` refused (`openable`), each said on the log once.
+    static REFUSED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
+
+/// May a node open lake `dir` because the catalog of lake `home` names it? Every node opens what its catalog names, whoever
+/// wrote it there: a node's lake (`pondra://`) with this node's admin token, a folder from this node's own disk. Only a
+/// node's owner names those (`branch::places`, `ext::owners_only`), and a catalog in a bucket is anyone's who may write the
+/// bucket, so from one a node opens neither (11-02 audit M4): it is attached with `--attach` on the nodes that should open
+/// it. A catalog in a folder, in memory or on a node is the machine's own, or the admin token's. A place no door knows is
+/// refused everywhere (`store::place`).
+pub(crate) fn openable(home: &str, dir: &str) -> Result<()> {
+    let place = crate::store::place(&crate::memory::place(dir))?;
+    if matches!(crate::store::place(home), Ok(crate::store::Place::Bucket)) && matches!(place, crate::store::Place::Served | crate::store::Place::Folder) {
+        let what = if place == crate::store::Place::Served { "a node's lake, opened with this node's admin token" } else { "a folder on this machine" };
+        return Err(crate::codes::coded("42501", format!("{dir} is {what}, which only a node's owner names, and this database's catalog is in a bucket, which whoever may write the bucket can change: attach it with --attach on the nodes that should open it")));
+    }
+    Ok(())
+}
+
 /// Attach here the lakes the catalog lists (`ATTACH`), and let go of those it no longer does
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and
 /// tried again next time).
@@ -773,6 +826,15 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
     for (key, a) in &listed {
         let name = &key[2..];
         if lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        if let Err(e) = openable(&lake.url, &a.dir) {
+            let seen = (lake.url.clone(), format!("{key}={}", a.dir));
+            let mut refused = REFUSED.lock().unwrap();
+            if !refused.contains(&seen) {
+                eprintln!("not attaching {name}: {e:#}");
+                refused.push(seen);
+            }
             continue;
         }
         if a.read_only {
@@ -843,6 +905,10 @@ pub async fn settle(lake: &Lake, d: &Ddl) -> Result<()> {
                 Change::Type(_) => true, // (the same names either way)
                 Change::Default(d) => m.stored(column).is_none_or(|s| m.defaults.get(s) == d.as_ref()),
                 Change::NotNull(on) => m.stored(column).is_none_or(|s| m.not_null.iter().any(|c| c == s) == *on),
+                Change::Place(p) => {
+                    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect();
+                    m.stored(column).is_none() || p.put(&order, column).is_ok_and(|o| o == order) // (put again, nothing moves)
+                }
             };
             if done {
                 break;
@@ -1367,6 +1433,9 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
     if let c @ (Change::Default(_) | Change::NotNull(_)) = change {
         return crate::defaults::alter(lake, &name, column, c).await; // (no name or type changes: a view that reads the table doesn't stop it)
     }
+    if let Change::Place(place) = change {
+        return place_column(lake, &name, m, column, &place).await;
+    }
     // (Postgres's codes for a column a view uses: `rules::alter::used_by`)
     let readers = readers(lake, &name).await?;
     if !readers.is_empty() {
@@ -1447,6 +1516,7 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
             }
         }
         Change::Default(_) | Change::NotNull(_) => unreachable!("defaults::alter takes them, above"),
+        Change::Place(_) => unreachable!("place_column takes it, above"),
     };
     let mut puts = vec![(table_key(&name), json(&m))];
     let del = crate::sys::deleted(&name);
@@ -1461,6 +1531,66 @@ async fn alter_column(lake: &Lake, table: &str, column: &str, change: Change) ->
         crate::delta::publish_all(lake).await?; // (other engines see the new names at once: they write by them)
     }
     Ok(j!({"table": name, "altered": what}))
+}
+
+/// `ALTER TABLE t ALTER COLUMN c FIRST | AFTER b`: the order SQL lists the columns in changes (`TableMeta::shown`); the
+/// stored order, which every file's field ids are places in, and the files never do. Refused while something reads the
+/// table's columns by position (`by_position`), which would see them move.
+async fn place_column(lake: &Lake, name: &str, mut m: TableMeta, column: &str, place: &Place) -> Result<Value> {
+    ensure!(m.stored(column).is_some(), crate::rules::alter::no_column(name, column));
+    if let Place::After(b) = place {
+        ensure!(b == column || (m.stored(b).is_some() && b != "_deleted"), crate::rules::alter::no_column(name, b));
+    }
+    let order: Vec<String> = m.sql_order().into_iter().filter(|c| c != "_deleted").collect(); // (SQL's names, SQL's order)
+    let new = place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?; // (Postgres's invalid column reference)
+    if new == order {
+        return Ok(j!({"table": name, "unchanged": true}));
+    }
+    let readers = by_position(lake, name).await?;
+    if !readers.is_empty() {
+        return Err(crate::rules::alter::read_by_position(name, column, &readers));
+    }
+    let stored: Vec<String> = new.iter().map(|c| m.stored(c).expect("a live column").to_string()).collect();
+    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
+    m.shown = if stored == as_stored { vec![] } else { stored }; // (back as stored: nothing to keep)
+    lake.cat.commit(vec![(table_key(name), json(&m))], &[]).await?;
+    if !m.publish.is_empty() {
+        crate::delta::publish_all(lake).await?; // (other engines list the columns in SQL's order too)
+    }
+    Ok(j!({"table": name, "altered": {"column": column, "place": place.sql()}}))
+}
+
+/// What reads `name`'s columns by position and keeps what it read, so that moving one would break it: a materialized
+/// view whose query says `*` or `COLUMNS(…)` (`rules::alter::by_position`: its table's columns are its query's as it
+/// was made), a task that reads it so, and a task that writes into it (its rows fill the columns in SQL's order). A
+/// plain view that says `*` keeps nothing: it lists the columns in their new order, as it lists a column added, so it
+/// stops nothing itself; what reads that view so is asked in turn.
+pub(crate) async fn by_position(lake: &Lake, name: &str) -> Result<Vec<String>> {
+    let (views, plain, tasks) = (lake.cat.scan::<crate::views::View>("v/", "v0").await?, lake.cat.scan::<StoredView>("q/", "q0").await?, lake.cat.scan::<crate::tasks::Task>("k/", "k0").await?);
+    let (mut out, mut asked, mut follow): (Vec<String>, Vec<String>, Vec<String>) = (vec![], vec![], vec![name.to_string()]);
+    while let Some(t) = follow.pop() {
+        if asked.contains(&t) {
+            continue;
+        }
+        for (k, v) in &views {
+            if (v.source == t || reads(lake, &v.sql, &t)) && crate::rules::alter::by_position(&v.sql) {
+                out.push(format!("materialized view {}", &k[2..]));
+            }
+        }
+        for (k, v) in &plain {
+            if reads(lake, &v.sql, &t) && crate::rules::alter::by_position(&v.sql) {
+                follow.push(k[2..].to_string()); // (it follows the new order: what reads it so is asked too)
+            }
+        }
+        for (k, task) in &tasks {
+            if task.target == t || (task.source == t && crate::rules::alter::by_position(&task.sql)) {
+                out.push(format!("task {}", &k[2..]));
+            }
+        }
+        asked.push(t);
+    }
+    out.dedup();
+    Ok(out)
 }
 
 /// Does every value of type `old` read as `new`, exactly? The widenings Iceberg and Delta allow.

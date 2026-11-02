@@ -39,7 +39,8 @@ pub(crate) const HOLD: Duration = Duration::from_secs(10);
 const FIRST: Duration = Duration::from_millis(200);
 
 /// How fast the watch takes a query to grow, at most: it looks again before memory growing at this
-/// rate could pass the line, every 20 ms near it and every second at most far below it.
+/// rate could pass the line, every 5 ms near it (20 ms while a stop it made settles) and every second at most far
+/// below it.
 const RATE: f64 = 8.0 * (1u64 << 30) as f64;
 
 crate::per_node!(static SEEN: AtomicUsize = AtomicUsize::new(0));
@@ -203,6 +204,7 @@ pub fn start() {
         let mut last_stop = None; // when the last stop was made: it holds the watch (`pending`)
         let mut said = false; // the line for this stretch over the line, said once
         loop {
+            let mut settling = false; // (a stop this watch made still holds, or its request is still ending)
             let resident = crate::store::resident().unwrap_or(0);
             SEEN.store(resident, Relaxed); // (what the OS says: `noted` and `pick` compare it)
             crate::panics::note(resident); // (a request that started unread takes this look's reading, before any stop)
@@ -262,13 +264,14 @@ pub fn start() {
                         eprintln!("the node holds {} MB, past its line {} MB, and no query grew it", mb(felt), mb(line));
                     }
                 }
+                settling = winding || last_stop.is_some();
             }
             // The wait: as often as the trim and the stop need while a request runs (a plain sleep, since a wake on every
             // request would look on every statement); otherwise until a request starts, the cache changes, or
             // the timer ends: 2 s while the cache holds columns (Flight, Kafka and tiering grow the node outside
             // `work`, and the cache is what can answer them), else 30 s.
             match line {
-                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, if felt < trim { trim } else { line })).await,
+                Some(line) if crate::panics::running() => tokio::time::sleep(every(felt, if felt < trim { trim } else { line }, settling)).await,
                 _ => {
                     let timer = if givers().iter().any(|h| h.usage().0 > 0) { Duration::from_secs(2) } else { Duration::from_secs(30) };
                     IDLE.store(true, Relaxed);
@@ -283,8 +286,13 @@ pub fn start() {
 /// When to look again: before memory growing at [`RATE`] could pass the next mark from where it is now, the trim
 /// line while under it (the cache must go before the line comes), else the line. (Looking every second while under
 /// half the line, a query that grew from there in that second passed a 1 GB line by 0.75 GB before the watch saw it.)
-fn every(resident: usize, mark: usize) -> Duration {
-    Duration::from_secs_f64(mark.saturating_sub(resident) as f64 / RATE).clamp(Duration::from_millis(20), Duration::from_secs(1))
+/// No sooner than 5 ms: near the line a GROUP BY's `array_agg` grows the node 1-6 GB/s, and at 20 ms at least the watch
+/// stopped one up to 17 MB past a 1 GB line (its peak 1,031-1,041 MB, harness `hot`), at 5 ms 3 MB (1,029-1,033 MB:
+/// `logs/round36/memory-line-check.json`). While a stop it made settles (`settling`), 20 ms: the stop's memory is going,
+/// and each look then hands freed pages back (`purge`).
+fn every(resident: usize, mark: usize, settling: bool) -> Duration {
+    let soonest = Duration::from_millis(if settling { 20 } else { 5 });
+    Duration::from_secs_f64(mark.saturating_sub(resident) as f64 / RATE).clamp(soonest, Duration::from_secs(1))
 }
 
 /// Is a request to be stopped now: over the line, and no stop still holding.
@@ -545,10 +553,11 @@ mod tests {
 
     #[test]
     fn the_watch_looks_sooner_the_nearer_the_line() {
-        assert_eq!(every(0, 64 << 30), Duration::from_secs(1), "far below a big line: a look a second");
-        assert_eq!(every(LINE - (1 << 20), LINE), Duration::from_millis(20), "near it: every 20 ms");
-        assert_eq!(every(2 * LINE, LINE), Duration::from_millis(20), "past it too");
-        let half = every(LINE / 2, LINE);
+        assert_eq!(every(0, 64 << 30, false), Duration::from_secs(1), "far below a big line: a look a second");
+        assert_eq!(every(LINE - (1 << 20), LINE, false), Duration::from_millis(5), "near it: every 5 ms");
+        assert_eq!(every(2 * LINE, LINE, false), Duration::from_millis(5), "past it too");
+        assert_eq!(every(2 * LINE, LINE, true), Duration::from_millis(20), "past it, a stop settling: every 20 ms");
+        let half = every(LINE / 2, LINE, false);
         assert!(half > Duration::from_millis(50) && half < Duration::from_millis(70), "half a 1 GB line: before 8 GB/s could pass it ({half:?})");
     }
 

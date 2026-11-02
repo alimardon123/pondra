@@ -530,7 +530,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    by ours: our catalog never lists another lake's files.
 21. **SQL from users never touches a node's disk.** Every query that arrives over HTTP, Postgres
    or MCP runs with `engine::read_only()` (no `COPY … TO`, no `CREATE EXTERNAL TABLE`, no session
-   DDL); writes go through `write.rs`. Local files (`enable_url_table`) are for `pondra sql` on
+   DDL); writes go through `write.rs`. Local files (`engine::with_files`) are for `pondra sql` on
    its user's own machine only (`prepare(…, files: true)`). `harness.py clients` checks both.
 22. **A Kafka batch's seq comes from its producer id and sequence** (`kafka::queue`): seq = base
    sequence + record count, `prev` = base sequence, producer `kafka:{id}:{topic}`, or
@@ -2840,7 +2840,7 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
 417. **A node stops the query that grew it past its memory line, not the node** (`oom.rs`, `panics::work`): some
    operators grow without asking the query memory pool (`array_agg`, `median`, `string_agg` over huge groups), so the
    pool can't refuse them and the OS killed the node. A watch reads the process's resident memory (again before 8 GB/s
-   of growth could pass the line: every 20 ms near it, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
+   of growth could pass the line: every 5 ms near it, 20 ms while a stop settles, every second at most) and past `PONDRA_MEMORY_MAX_GB` (85% of the
    machine's or container's memory; 0 is off, and a host's process has none) stops the client query (`/sql`, `/mcp`,
    pages, every Postgres statement) that grew it. Of those that have run 200 ms and started a tenth of the line lower,
    that is the one whose polls allocated the most, less what they freed, if that is a tenth of the line or more; else

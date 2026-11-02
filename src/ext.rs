@@ -1816,7 +1816,7 @@ mod tests {
         let expanded = crate::routines::expand(lake, sql).await?;
         let planned = crate::sys::planned(&expanded)?;
         scope(owner, async {
-            anyhow::Ok(crate::query::session(lake, &expanded, "").await?.enable_url_table().sql(&planned).await?.collect().await?)
+            anyhow::Ok(crate::engine::with_files(crate::query::session(lake, &expanded, "").await?).sql(&planned).await?.collect().await?)
         })
         .await
     }

@@ -4,7 +4,9 @@
 //!
 //! A temporary function is expanded where it is called, as the lake's SQL functions are (`routines.rs`): what runs,
 //! spreads or is remembered is plain SQL, so nothing of it is anywhere but in its session. A lake's view or function
-//! can't call one (its readers have no such function).
+//! can't be made calling one (its readers have no such function), and one named as a lake function shadows it in the
+//! statement's own text alone: never in a stored view or a lake function's body (`front::Routines`, `stored`), which
+//! read the same for every reader.
 //!
 //! A temporary table lives in the memory of the node the session talks to, within
 //! `PONDRA_TEMP_MB` (1024) for all of them, with system columns of its own: INSERT, UPDATE, DELETE
@@ -35,7 +37,13 @@ use std::time::Duration;
 tokio::task_local! {
     /// The session a request belongs to, if any.
     pub static SESSION: Option<String>;
+    /// While a stored view's query is read (`stored`).
+    static STORED: bool;
 }
+
+/// `f` reading a stored view's query (`routines::expand_stored`): its functions are the lake's alone, whatever the
+/// session made (`routines`).
+pub async fn stored<T>(f: impl std::future::Future<Output = T>) -> T { STORED.scope(true, f).await }
 
 /// The session a request names (`x-pondra-session`), or that of the caller whose procedure sent it. A name
 /// that isn't 8 to 128 letters, digits, - or _ is refused and says so: it is never ignored, which would leave
@@ -230,9 +238,13 @@ pub fn end(session: &str) -> bool {
     gone
 }
 
-/// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands
-/// (`host.rs`). Without any, the lake's as they are.
+/// The lake's functions with the current session's own over them (`CREATE TEMP MACRO`): what the front expands in a
+/// statement's own text (`host.rs`; a lake function's body calls the lake's, `front::Routines`). Without any, or
+/// while a stored view is read (`stored`), the lake's as they are.
 pub fn routines(all: Arc<HashMap<String, crate::expander::Routine>>) -> Arc<HashMap<String, crate::expander::Routine>> {
+    if STORED.try_with(|s| *s).unwrap_or(false) {
+        return all;
+    }
     let Some(own) = current().and_then(|s| peek(&s, |x| (!x.routines.is_empty()).then(|| x.routines.clone()))) else { return all };
     let mut both = (*all).clone();
     both.extend(own);
@@ -344,7 +356,7 @@ pub async fn statement(app: &App, stmt: &Stmt, files: bool) -> Result<Option<Val
                 return Ok(Some(j!({"view": name, "temporary": true, "exists": true}))); // (IF NOT EXISTS)
             }
             ensure!(*replace || !has(&s, name, false), "temporary view {name} exists (CREATE OR REPLACE TEMP VIEW replaces it)");
-            let expanded = crate::routines::expand_stored(&app.lake, sql).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
+            let expanded = crate::routines::expand_temp_view(&app.lake, sql).await.with_context(|| format!("temporary view {name}"))?; // (as it is read: its functions' bodies in their places, `query.rs`)
             crate::engine::sql(&crate::query::session(&app.lake, &expanded, "").await?, &crate::sys::planned(&expanded)?).await.with_context(|| format!("temporary view {name}"))?; // (it plans)
             with(&s, true, |x| Ok(x.views.insert(name.clone(), sql.clone())))?;
             return Ok(Some(j!({"view": name, "temporary": true})));
@@ -465,7 +477,7 @@ async fn insert(app: &App, s: &str, name: &str, names: Option<&[String]>, query:
         None => query.to_string(),
     };
     let ctx = crate::query::session(&app.lake, &query, "").await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     let rows = crate::write::rows(&app.lake, &ctx, &rules, name, &query, crate::rules::How::Load).await?; // (Load: its key is checked over all its rows, `check_key`: R6)
     let n = rows.rows().num_rows();
     apply(s, name, HashSet::new(), vec![rows])?;

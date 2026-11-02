@@ -1149,15 +1149,16 @@ fn budgets(longest: Option<usize>, n: usize, most: usize) -> (usize, usize) {
 }
 
 /// The most rows of matches a partition's search keeps past its n, by their memory: a quarter of the queries' memory
-/// (`PONDRA_MEMORY_GB`), in memberships (`Mem`). A window function has no reservation of its statement's to charge them
-/// to, so this caps them instead: `PATTERN (a b{999}) AFTER MATCH SKIP TO NEXT ROW` over a million rows would keep a
-/// billion (11-01 audit M14). `KEEP` at least.
+/// (`PONDRA_MEMORY_GB`), in memberships (`Mem`), shared by the partitions a statement searches at once (one a core). A
+/// window function has no reservation of its statement's to charge them to, so this caps them instead: `PATTERN (a b{999})
+/// AFTER MATCH SKIP TO NEXT ROW` over a million rows would keep a billion (11-01 audit M14), and on 8 cores a quarter
+/// each was twice the queries' memory (11-02 M3). `KEEP` at least.
 fn kept_most() -> usize {
     #[cfg(feature = "lake")]
     let memory = crate::store::memory_limit();
     #[cfg(not(feature = "lake"))]
     let memory = crate::env::query_memory(|| 1 << 30);
-    (memory / 4 / size_of::<Mem>()).max(KEEP)
+    (memory / 4 / crate::env::cores().max(1) / size_of::<Mem>()).max(KEEP)
 }
 
 /// A row's membership in one match: the match's number, the row's symbol (None for the row of an empty match), its

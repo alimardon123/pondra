@@ -298,7 +298,10 @@ A user signs in at every door: over HTTP with its name and password (Basic) or a
 (`PONDRA_SESSION_HOURS`), which the console uses; Postgres clients sign in with SCRAM-SHA-256, as
 they do with Postgres (a user with only tokens gives one as its password); Kafka's SASL/PLAIN takes
 the name and password; Flight's handshake turns them into a session. A password is kept only as
-SCRAM's verifier and a token as its hash, so the catalog gives neither away.
+SCRAM's verifier and a token as its hash, so the catalog gives neither away. An answer that goes on
+(`/watch`, a live query, a Kafka connection, the commit stream) checks its sign-in again every 5
+seconds: once the user is dropped, its grant revoked, its superuser taken away or its session expired,
+the answer ends, and a Kafka client's next fetch is refused.
 
 ```python
 token = admin.sql("CREATE TOKEN nightly FOR USER ann EXPIRES IN '30 days'")["token"]

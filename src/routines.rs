@@ -616,8 +616,14 @@ pub async fn expand(lake: &Lake, sql: &str) -> Result<String> {
 /// `expand` for SQL that is already stored (a view's, a file's query): read as it was made, without
 /// the session's path. A view made under `USE crm` kept `crm.t` when it was made; one made without a
 /// path reads `t` as public, whoever reads it. Its `current_schema()` and the like are its reader's
-/// (`path::currents`), as Postgres reads a view's.
-pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> {
+/// (`path::currents`), as Postgres reads a view's. Its functions are the lake's: a session's temporary one of the same
+/// name never changes it (`temp::stored`), so it reads the same for every reader and may be kept for them.
+pub async fn expand_stored(lake: &Lake, sql: &str) -> Result<String> { crate::temp::stored(read_stored(lake, sql)).await }
+
+/// `expand_stored` for a temporary view: the session's own, so it calls the session's temporary functions too.
+pub async fn expand_temp_view(lake: &Lake, sql: &str) -> Result<String> { read_stored(lake, sql).await }
+
+async fn read_stored(lake: &Lake, sql: &str) -> Result<String> {
     Ok(crate::path::currents(lake, &crate::front::expand(lake, &crate::path::currents(lake, sql), &HashMap::new()).await?))
 }
 

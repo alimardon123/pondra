@@ -69,7 +69,28 @@ enum TableSpec {
         sql_types: BTreeMap<String, String>, // columns held as text of another SQL type: "uuid", "json", "jsonb", "varchar(n)" (`types.rs`)
         #[serde(default)]
         made_by: Option<String>, // the job of the CREATE TABLE that sends it (`made_by_job`); none: sent again freely
+        #[serde(default)]
+        shown: Option<Vec<String>>, // an existing table's columns in SQL's order, SQL's names (`ADD COLUMN … AFTER b`): `TableMeta::shown`
     },
+}
+
+/// Leader: `TableMeta::shown` for SQL's order `sql` (SQL's names, every live column but `_deleted`): empty when that is
+/// the stored order. Refused while something reads the table by position (`ddl::by_position`): its columns would move.
+async fn shown_as_stored(lake: &Lake, name: &str, m: &TableMeta, sql: &[String]) -> Result<Vec<String>> {
+    let as_stored: Vec<String> = m.live().map(|(s, _, _)| s.to_string()).filter(|s| s != "_deleted").collect();
+    let stored = sql.iter().map(|c| m.stored(c).map(str::to_string).ok_or_else(|| anyhow::anyhow!(crate::rules::alter::no_column(name, c)))).collect::<Result<Vec<_>>>()?;
+    let mut sorted = (stored.clone(), as_stored.clone());
+    (sorted.0.sort(), sorted.1.sort());
+    ensure!(sorted.0 == sorted.1, "{name}'s columns in SQL's order name each of its columns once: {}", sql.join(", "));
+    if stored == as_stored {
+        return Ok(vec![]);
+    }
+    if stored != m.in_order().into_iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect::<Vec<_>>() {
+        let readers = crate::ddl::by_position(lake, name).await?;
+        let moved = sql.iter().zip(&m.sql_order()).find(|(a, b)| a != b).map_or("a column", |(a, _)| a.as_str());
+        ensure!(readers.is_empty(), crate::rules::alter::read_by_position(name, moved, &readers));
+    }
+    Ok(stored)
 }
 
 /// A CREATE TABLE of a table that's there, refused as Postgres refuses it (42P07).
@@ -91,9 +112,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
     let name = &new_table(lake, name).await?; // (its schema exists; `public.t` is `t`; a staged name is checked by its table)
     let owner = crate::sys::staged_for(name.as_str()).unwrap_or(name.as_str()); // (a staged table takes its folder and sequences' names from the table it replaces)
     ensure!(lake.cat.get::<crate::ddl::StoredView>(&crate::ddl::query_key(name)).await?.is_none(), "{name} is a view");
-    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by) = match serde_json::from_str(spec)? {
-        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None),
-        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by),
+    let (columns, key, merge, publish, cluster, ttl, partition, order, not_null, mut defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown) = match serde_json::from_str(spec)? {
+        TableSpec::Columns(c) => (c, vec![], BTreeMap::new(), None, None, None, None, None, vec![], BTreeMap::new(), None, vec![], None, BTreeMap::new(), vec![], BTreeMap::new(), BTreeMap::new(), None, None),
+        TableSpec::Full { columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown } => (columns, key, merge, publish, cluster_by, ttl, partition_by, order_by, not_null, defaults, properties, checks, retention, identity, constraints, enums, sql_types, made_by, shown),
     };
     // (what the definition gets wrong is the statement's: 42P16 when it says no code of its own)
     let (retention, columns, ttl) = async {
@@ -192,7 +213,7 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
             let (recluster, rettl, reorder) = (cluster.as_ref().is_some_and(|c| *c != l.cluster), ttl.is_some() && ttl != l.ttl, order.is_some() && order != l.order);
             let reprop = properties.as_ref().is_some_and(|p| *p != m.properties);
             let reretain = retention.is_some() && retention != m.retention_secs;
-            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain {
+            if new <= old && !republish && !recluster && !rettl && !reorder && !reprop && !reretain && shown.is_none() {
                 return Ok(j!({"table": name, "publish": m.publish}));
             }
             if new > old {
@@ -224,6 +245,9 @@ pub async fn create_table(lake: &Lake, name: &str, spec: &str) -> Result<Value> 
                         lake.cat.commit(vec![(table_key(&del), json(&d))], &[]).await?;
                     }
                 }
+            }
+            if let Some(sql) = &shown {
+                m.shown = shown_as_stored(lake, name, &m, sql).await?; // (ADD COLUMN … AFTER b | FIRST: in the same commit)
             }
             let stored = |c: &String| m.stored(c).unwrap_or(c).to_string();
             let cluster = cluster.map(|c| c.iter().map(stored).collect());
@@ -273,7 +297,7 @@ pub enum Stmt {
     InsertInto(String, Vec<String>, String),             // INSERT INTO t (b, a) …: the columns it names (`whole_rows`)
     Update(String, Vec<(String, String)>, Option<String>), // table, column = expression, WHERE
     Delete(String, Option<String>),                      // table, WHERE
-    AddColumn(String, String, String, bool),             // table, column, SQL type, IF NOT EXISTS
+    AddColumn(String, String, String, bool, Option<crate::ddl::Place>), // table, column, SQL type, IF NOT EXISTS, FIRST | AFTER b
     SetOptions(String, Vec<(String, String)>),           // table, ALTER TABLE … SET (publish = 'delta', cluster_by = 'user', ttl = 'ts:3600')
     Ddl(Vec<crate::ddl::Ddl>),                            // schemas, views, drops: the leader's (`ddl.rs`)
     Merge(Box<crate::change::Merge>),                     // MERGE INTO … (`change.rs`)
@@ -329,7 +353,7 @@ impl Stmt {
             Stmt::InsertInto(_, c, q) => Stmt::InsertInto(table, c, q),
             Stmt::Update(_, set, w) => Stmt::Update(table, set, w),
             Stmt::Delete(_, w) => Stmt::Delete(table, w),
-            Stmt::AddColumn(_, c, ty, i) => Stmt::AddColumn(table, c, ty, i),
+            Stmt::AddColumn(_, c, ty, i, place) => Stmt::AddColumn(table, c, ty, i, place),
             Stmt::SetOptions(_, o) => Stmt::SetOptions(table, o),
             Stmt::Define(_, spec) => Stmt::Define(table, spec),
             Stmt::Merge(mut m) => {
@@ -493,6 +517,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
     }
     if let Some(s) = kinds.then(|| crate::types::statement(sql)).flatten() {
         return Some(s); // (CREATE TYPE … AS ENUM, ALTER and DROP TYPE)
+    }
+    if let Some(s) = (head == "alter").then(|| placed(sql)).flatten() {
+        return Some(s); // (ALTER TABLE t ALTER COLUMN c FIRST | AFTER b)
     }
     if let Some(sql) = kinds.then(|| crate::seq::in_order(sql)).flatten() {
         return parse(&sql); // (an identity's options as the parser takes them)
@@ -730,9 +757,9 @@ pub fn parse(sql: &str) -> Option<Stmt> {
         }
         Statement::AlterTable(a) => match &a.operations[..] {
             [ast::AlterTableOperation::AddColumn { column_def: c, .. }] if crate::rules::alter::fills_existing(c) => Stmt::Invalid(crate::rules::alter::owes_rows(&a.name.to_string(), &c.name.to_string())),
-            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, .. }] => match crate::rules::alter::beside_type(c) {
+            [ast::AlterTableOperation::AddColumn { if_not_exists, column_def: c, column_position, .. }] => match crate::rules::alter::beside_type(c) {
                 Some(what) => Stmt::Invalid(crate::rules::alter::not_alone(&a.name.to_string(), &c.name.to_string(), &what)), // (a CHECK or a key: not dropped unsaid)
-                None => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists),
+                None => Stmt::AddColumn(object(&a.name), ident(&c.name), added_type(&c.data_type), *if_not_exists, column_position.as_ref().map(place)),
             },
             // (renames, drops and types: the catalog's names change, the files never do: ADR-022)
             [ast::AlterTableOperation::RenameColumn { old_column_name: from, new_column_name: to }] => alter(&a, from, Change::Rename(ident(to))),
@@ -905,7 +932,7 @@ pub async fn create_spec(c: &ast::CreateTable, from: &Lake, files: bool) -> Resu
         (None, Some(q)) => {
             let sql = q.to_string();
             let ctx = session(from, &sql, "").await?;
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             let df = crate::engine::sql(&ctx, &sql).await?;
             // (the types the query gives: the analyzer's rules make 1e15 a whole decimal and a float meeting a decimal a float, and the table must hold what the query gives)
             let fields = crate::query::run_schema(&ctx, df.logical_plan())?.fields().iter().cloned().collect::<Vec<_>>();
@@ -948,6 +975,36 @@ pub async fn define(app: &crate::app::App, name: &str, spec: &str) -> Result<Val
     Ok(out)
 }
 
+/// sqlparser's `FIRST | AFTER b` (its MySQL's, which Databricks shares) as ours.
+fn place(p: &ast::MySQLColumnPosition) -> crate::ddl::Place {
+    match p {
+        ast::MySQLColumnPosition::First => crate::ddl::Place::First,
+        ast::MySQLColumnPosition::After(b) => crate::ddl::Place::After(ident(b)),
+    }
+}
+
+/// `ALTER TABLE t ALTER [COLUMN] c FIRST | AFTER b` (Databricks' and MySQL's words; sqlparser has none): where SQL lists
+/// `c` (`ddl::place_column`). None: not this statement.
+fn placed(sql: &str) -> Option<Stmt> {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, keywords::Keyword, parser::Parser, tokenizer::Token};
+    let mut p = Parser::new(&GenericDialect {}).try_with_sql(sql).ok()?;
+    if !p.parse_keywords(&[Keyword::ALTER, Keyword::TABLE]) {
+        return None;
+    }
+    let table = p.parse_object_name(false).ok()?;
+    if !p.parse_keyword(Keyword::ALTER) {
+        return None;
+    }
+    let _ = p.parse_keyword(Keyword::COLUMN);
+    let column = p.parse_identifier().ok()?;
+    let place = match p.parse_one_of_keywords(&[Keyword::FIRST, Keyword::AFTER])? {
+        Keyword::FIRST => crate::ddl::Place::First,
+        _ => crate::ddl::Place::After(ident(&p.parse_identifier().ok()?)),
+    };
+    while p.consume_token(&Token::SemiColon) {}
+    (p.peek_token().token == Token::EOF).then(|| Stmt::Ddl(vec![crate::ddl::Ddl::AlterColumn { table: object(&table), column: ident(&column), change: crate::ddl::Change::Place(place) }]))
+}
+
 /// `ALTER TABLE t ADD COLUMN c TYPE`: the table's definition with the new column at the end, sent
 /// like a CREATE TABLE (the leader adds it; old rows read it as null). None: IF NOT EXISTS, and it does.
 async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
@@ -957,10 +1014,18 @@ async fn alter_spec(lake: &Lake, stmt: &Stmt) -> Result<Option<String>> {
     let ttl = m.ttl.as_ref().map(|(c, s)| format!("{c}:{s}"));
     let mut spec = j!({"columns": m.columns, "key": m.key, "merge": m.merge, "publish": m.publish, "cluster_by": m.cluster, "ttl": ttl, "partition_by": m.partition, "order_by": m.order, "not_null": m.not_null, "defaults": m.defaults, "properties": m.properties, "checks": m.checks, "retention": m.retention_secs.map(|s| format!("{s} seconds"))});
     match stmt {
-        Stmt::AddColumn(_, column, sql_type, if_not_exists) => {
+        Stmt::AddColumn(_, column, sql_type, if_not_exists, place) => {
             if m.columns.iter().any(|(c, _)| c == column) {
                 ensure!(*if_not_exists, crate::rules::alter::has_column(&table, column));
                 return Ok(None);
+            }
+            if let Some(place) = place {
+                // (where SQL lists it, sent with it: one commit, `create_table`'s `shown`)
+                if let crate::ddl::Place::After(b) = place {
+                    ensure!(m.columns.iter().any(|(c, _)| c == b) && b != "_deleted", crate::rules::alter::no_column(&table, b));
+                }
+                let order: Vec<String> = m.in_order().into_iter().map(|(c, _)| c.clone()).filter(|c| c != "_deleted").collect();
+                spec["shown"] = j!(place.put(&order, column).map_err(|e| crate::codes::coded("42P10", e))?);
             }
             let ctx = SessionContext::new_with_config(crate::optimize::config(datafusion::prelude::SessionConfig::new())); // (TIMESTAMPTZ in UTC)
             let declared = Parser::new(&GenericDialect {}).try_with_sql(sql_type).and_then(|mut p| p.parse_data_type());
@@ -1049,7 +1114,8 @@ pub async fn whole_rows(lake: &Lake, table: &str, names: &[String], query: &str)
 /// statement gives): a one-row upsert's proposed row is worked out here once, before its locks (`txn::upsert_point`).
 pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, names: &[String], query: &str) -> Result<String> {
     let columns = crate::rules::rows::row_columns(meta.logical_columns().into_iter().map(|(c, _)| c), names);
-    let names = if names.is_empty() { implicit(&columns, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
+    let order = crate::rules::rows::row_columns(meta.sql_order(), names); // (SQL's order: what a row without a column list gives, first to last)
+    let names = if names.is_empty() { implicit(&order, crate::rules::rows::rows_width(query)) } else { names }; // (`INSERT INTO t VALUES (1, DEFAULT)`: the columns its rows give)
     let default = |c: &str| crate::rules::rows::default_sql(meta, c);
     if crate::rules::rows::plain_values(query).is_some() && meta.defaults.values().any(|d| crate::seq::calls(d)) {
         // (`nextval` in rows of VALUES: taken here, in the rows' order: `seq::taken`)
@@ -1059,6 +1125,34 @@ pub(crate) async fn whole_rows_of(lake: &Lake, table: &str, meta: &TableMeta, na
         return crate::rules::rows::rows_for(table, &columns, names, query, &|c| default(c).map(|d| crate::seq::put(&d, &mut taken.borrow_mut())));
     }
     crate::rules::rows::rows_for(table, &columns, names, query, &default)
+}
+
+/// A plain INSERT (no column list) into a table that moved a column (`TableMeta::shown`), as the INSERT that names the
+/// columns its rows fill: SQL's first ones, as `SELECT *` lists them. Below the doors, a query without a column list
+/// fills the columns as stored (`rows_sql`, `write_rows`), so this is the one place SQL's order is put in. Every other
+/// statement, and every INSERT into a table that never moved a column, as it is.
+pub(crate) async fn in_sql_order(lake: &Lake, stmt: Stmt) -> Result<Stmt> {
+    let Stmt::Insert(t, q) = &stmt else { return Ok(stmt) };
+    let Ok((other, name)) = crate::ddl::resolve(lake, t).await else { return Ok(stmt) }; // (refused by name further on)
+    let Some(meta) = other.as_deref().unwrap_or(lake).cat.meta(&table_key(&name)).await? else { return Ok(stmt) };
+    if meta.shown.is_empty() {
+        return Ok(stmt);
+    }
+    let names = filled(lake, &meta, t, q).await?;
+    Ok(Stmt::InsertInto(t.clone(), names, q.clone()))
+}
+
+/// The columns a query without a column list fills, in SQL's order: as many as it gives (planned, when its text doesn't say).
+pub(crate) async fn filled(lake: &Lake, meta: &TableMeta, table: &str, query: &str) -> Result<Vec<String>> {
+    let order = crate::rules::rows::row_columns(meta.sql_order(), &[]);
+    let width = match crate::rules::rows::rows_width(query) {
+        Some(w) => w,
+        None => crate::engine::sql(&session(lake, query, "").await?, &crate::sys::planned(query)?).await?.schema().fields().len(),
+    };
+    if width > order.len() {
+        return Err(crate::rules::rows::width_refused(table, order.len(), width));
+    }
+    Ok(order[..width].to_vec())
 }
 
 /// An INSERT's query takes its columns by position, so the same column twice is fine
@@ -1143,7 +1237,7 @@ pub async fn rows_of(lake: &Lake, home: &Lake, t: &Arc<crate::rules::Table>, nam
         return shaped(home, t, name, Some(all), how).await;
     }
     let ctx = crate::query::session_at(lake, sql, "", upto).await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     shaped(home, t, name, planned(&ctx, &t.schema, sql).await?, how).await
 }
 
@@ -1496,18 +1590,50 @@ async fn there(lake: &Lake, c: &ast::CreateTable) -> Result<Option<bool>> {
 }
 
 /// A write done through a follower is in its reads before it answers: the next statement on this
-/// node sees it (a script's INSERT, then its SELECT), as on the leader. The follower waits until
-/// its view holds everything the leader had committed once the write was done (5 s at most: a
-/// view that far behind catches up by itself).
+/// node sees it (a script's INSERT, then its SELECT; a CREATE TABLE … AS's INSERT into the table it
+/// made), as on the leader. The follower waits until it holds everything the leader had committed
+/// once the write was done (5 s at most: a view that far behind catches up by itself). By commit: a
+/// node just started, before it follows the stream, answered a CREATE TABLE … AS with "no table" for
+/// seconds, since a table's commit adds no log segment, which is all a leader older than this one
+/// can tell (`/cluster/visible`, still asked of it).
 pub async fn seen_here(app: &crate::app::App) {
     if app.seq.is_some() || app.members.reader() || !app.members.keeps_records() {
         return; // (a joined page's member: its node keeps the records, and answers its writes once its own view holds them)
     }
-    let asked = async { crate::dial::call(&app.members.leader().addr, crate::dial::Call::get("/cluster/visible").timeout(std::time::Duration::from_secs(2))).await?.json::<u64>().await };
-    let Ok(upto) = asked.await else { return };
-    let deadline = datafusion::common::instant::Instant::now() + std::time::Duration::from_secs(5);
-    while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let leader = &app.members.leader().addr;
+    let ask = |path: &'static str| async move { crate::dial::call(leader, crate::dial::Call::get(path).timeout(std::time::Duration::from_secs(2))).await };
+    let cap = std::time::Duration::from_secs(5);
+    let Ok(r) = ask("/cluster/committed").await else { return };
+    match r.status {
+        404 => {
+            // (a leader older than this release: its log's end, which a table's commit doesn't move)
+            let Ok(upto) = async { ask("/cluster/visible").await?.checked()?.json::<u64>().await }.await else { return };
+            let deadline = datafusion::common::instant::Instant::now() + cap;
+            while app.lake.visible() < upto && datafusion::common::instant::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+        _ => {
+            if let Ok(c) = async { r.checked()?.json::<u64>().await }.await {
+                holds(&app.lake, c, cap).await;
+            }
+        }
+    }
+}
+
+/// Waits, `cap` at most, until this node's reads include its leader's commit `c` (`Catalog::holds`), moving its view's mark
+/// as it goes when the stream isn't the whole catalog here. Does it hold `c` now?
+pub(crate) async fn holds(lake: &Lake, c: u64, cap: std::time::Duration) -> bool {
+    let deadline = datafusion::common::instant::Instant::now() + cap;
+    loop {
+        if lake.cat.holds(c) {
+            return true;
+        }
+        if datafusion::common::instant::Instant::now() >= deadline {
+            return false;
+        }
+        let _ = lake.cat.settle().await; // (the mirror's: nothing to do)
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -1584,6 +1710,7 @@ async fn on_node_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, 
     if let Some(out) = crate::temp::statement(app, &stmt, files).await? {
         return Ok(out); // (the session's own tables and views: on this node, in memory; a temporary table has no identity column)
     }
+    let stmt = in_sql_order(&app.lake, stmt).await?; // (an INSERT without a column list, into a table that moved a column)
     identity(&app.lake, &stmt).await?; // (every SQL write's identity, before the DDL and transaction splits: autocommit and transactions both meet it)
     // DDL in an open transaction runs at once, as a commit of its own (ADR-067 §7); the notice follows its success. A
     // CREATE TABLE … AS's steps run at once too (`at_once`), so they are not kept.
@@ -1660,7 +1787,7 @@ async fn run_listed(app: &crate::app::App, stmt: Stmt, job: Option<String>, file
     if let Stmt::CopyInto(table, from, options) = &stmt {
         return crate::copy::copy_into(app, table, from, options).await; // (files into a table, each once a version)
     }
-    let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let open = |ctx: SessionContext| if files { crate::engine::with_files(ctx) } else { ctx };
     // CREATE TABLE … AS SELECT, and OR REPLACE: the steps `create_as` takes, on this node.
     if let Stmt::Create(c) = &stmt {
         if let Some(out) = Box::pin(existing(app, c)).await? {
@@ -1828,11 +1955,11 @@ async fn stage_insert(app: &crate::app::App, table: &str, names: &[String], quer
     let slug = crate::dial::page_slug().context("a joined page stages its rows under its user's folder, and its node gave it none")?;
     let stage = stage_job(job);
     let ctx = session(lake, query, "").await?;
-    let ctx = if files { ctx.enable_url_table() } else { ctx };
+    let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
     in_order(&ctx);
     let df = crate::engine::sql(&ctx, &crate::sys::planned(query)?).await?;
     let width = df.schema().fields().len();
-    let live: Vec<String> = lake.table_meta(table).await?.live().map(|(_, logical, _)| logical.to_string()).collect();
+    let live: Vec<String> = lake.table_meta(table).await?.sql_order(); // (SQL's order: a query's columns fill them first to last)
     let names: Vec<String> = match names.is_empty() {
         true if width > live.len() => return Err(crate::codes::coded("42601", format!("INSERT has more expressions than target columns ({width} given, {table} has {})", live.len()))),
         true => live[..width].to_vec(),
@@ -1889,13 +2016,18 @@ async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: dataf
     Ok(())
 }
 
+/// The most files one staged INSERT takes (`stage_put`), and the most its node believes a page staged (`server::insert_staged`).
+pub(crate) const STAGED_FILES_MOST: u64 = 1_000_000;
+
 /// One staged file, finished, put as the next `<n>.parquet` of `dir`: a create, so a file that is there is an earlier try's and is
 /// refused, not overwritten.
 async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
     w.finish()?;
     let bytes = std::mem::take(w.inner_mut());
     let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    ensure!(n < 1_000_000, "a staged INSERT takes a million files at most");
+    if n >= STAGED_FILES_MOST {
+        return Err(crate::codes::coded("54000", "a staged INSERT takes a million files at most")); // (Postgres's program limit exceeded)
+    }
     ensure!(bytes.len() <= 64 << 20, "a staged file is past 64 MB: the INSERT's rows come in smaller files");
     let (at, bytes) = (object_store::path::Path::from(format!("{dir}{n}.parquet")), Bytes::from(bytes));
     let create = || object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
@@ -2302,7 +2434,7 @@ async fn prepare(query: &Lake, target: &Arc<Lake>, table: &str, stmt: &Stmt, job
     if crate::backup::frozen(target) && !crate::backup::reads_only(stmt) {
         return Err(crate::backup::refused(Some(&target.url))); // (before a file is written into it: ADR-070)
     }
-    let open = |ctx: SessionContext| if files { ctx.enable_url_table() } else { ctx };
+    let open = |ctx: SessionContext| if files { crate::engine::with_files(ctx) } else { ctx };
     match stmt {
         Stmt::Create(c) => return Ok(Some(Request::Table(table.into(), made_by_job(create_spec(c, query, files).await?, job)?))),
         Stmt::Define(_, spec) => return Ok(Some(Request::Table(table.into(), spec.clone()))),

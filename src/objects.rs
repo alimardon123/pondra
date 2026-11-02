@@ -560,7 +560,7 @@ pub(crate) fn sql_type(t: &str) -> String {
 
 /// `CREATE TABLE`, its layout as clauses (`layout.rs`): what makes the table again, without rows.
 pub(crate) fn table_sql(name: &str, m: &TableMeta) -> String {
-    let mut parts: Vec<String> = m.columns.iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (a keyed table's `_deleted` is its own)
+    let mut parts: Vec<String> = m.in_order().into_iter().filter(|(c, _)| !m.marker(c)).map(|(c, t)| { // (SQL's order; a keyed table's `_deleted` is its own)
         let merge = m.merge.get(c).map(|f| format!(" MERGE {f}")).unwrap_or_default();
         let null = if m.not_null.contains(c) && !m.key.contains(c) && !m.identity.contains_key(c) { " NOT NULL" } else { "" };
         let default = match m.identity.get(c) {
@@ -962,12 +962,12 @@ async fn or_alter(lake: &Lake, name: &str, sql: &str) -> Result<Value> {
     let strings = |v: &Value| -> Vec<String> { serde_json::from_value(v.clone()).unwrap_or_default() };
     // (a keyed table's `_deleted` is its own, wherever it is: never in a definition)
     let columns: Vec<(String, String)> = pairs(&s["columns"]).into_iter().filter(|(c, _)| !old.marker(c)).collect();
-    let was: Vec<&(String, String)> = old.columns.iter().filter(|(c, _)| !old.marker(c)).collect();
+    let was: Vec<&(String, String)> = old.in_order().into_iter().filter(|(c, _)| !old.marker(c)).collect(); // (SQL's order, as SHOW CREATE gives it)
     // What can't be brought along: a column taken away, moved or renamed; another key or merge.
     for (i, (c, _)) in was.iter().enumerate() {
         match columns.iter().position(|(n, _)| n == c) {
             None => bail!("{table}.{c} isn't in the definition: CREATE OR ALTER adds columns, it doesn't take them away (ALTER TABLE {table} DROP COLUMN {c}, or RENAME COLUMN {c} TO …)"),
-            Some(j) => ensure!(i == j, "{table}.{c} moved: columns are added at the end, after {}", was.last().map_or("", |l| l.0.as_str())),
+            Some(j) => ensure!(i == j, "{table}.{c} moved: CREATE OR ALTER adds columns at the end, after {}; ALTER TABLE {table} ALTER COLUMN {c} AFTER … | FIRST moves one", was.last().map_or("", |l| l.0.as_str())),
         }
     }
     let key = strings(&s["key"]);

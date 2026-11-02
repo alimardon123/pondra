@@ -445,12 +445,14 @@ pub fn named(ctx: &SessionContext, provider: Arc<dyn TableProvider>, meta: &Tabl
     let hide = !deleted && !meta.key.is_empty() && meta.columns.iter().any(|(c, _)| c == "_deleted");
     // (a view that finishes its answers reads under its query's names already: `finish.rs`, and a
     // view's table is never renamed or dropped a column of)
-    if (!meta.mapped() && !hide) || meta.finish.is_some() {
+    if (!meta.mapped() && !hide && meta.shown.is_empty()) || meta.finish.is_some() {
         return Ok(Arc::new(Table(provider)));
     }
     let df = ctx.read_table(provider)?;
     let shown = |c: &str| !meta.dropped.iter().any(|d| d == c) && !(hide && c == "_deleted");
-    Ok(Arc::new(Table(crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?.into_view())))
+    let df = crate::answer::renamed(df, |c| meta.name_of(c).to_string(), shown)?;
+    let df = if meta.shown.is_empty() { df } else { crate::answer::reordered(df, &meta.sql_order())? }; // (a column moved: SQL's order)
+    Ok(Arc::new(Table(df.into_view())))
 }
 
 /// `name` as the request being served may read it: as it is for a token or a superuser; for a user
@@ -1307,7 +1309,7 @@ pub async fn session_at(lake: &Lake, sql: &str, except: &str, upto: Option<u64>)
     let listing = ["information_schema", "show tables", "show columns"].iter().any(|w| sql.to_lowercase().contains(w)); // (every table)
     let mut temps = crate::temp::views(sql); // (the session's own: over the lake's of the same name)
     for (_, v) in temps.iter_mut() {
-        let expanded = crate::routines::expand_stored(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
+        let expanded = crate::routines::expand_temp_view(lake, v).await?; // (read as a stored view is: the door's rewrites, with the tables' types now; the text was kept as written)
         *v = expanded;
     }
     let seen = temps.iter().fold(sql.to_string(), |t, (_, s)| format!("{t} {s}"));

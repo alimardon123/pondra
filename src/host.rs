@@ -2,7 +2,6 @@
 
 use crate::ext_names::Attached;
 use crate::front::{Host, Own, Relation};
-use crate::expander::Routine;
 use crate::measures::Definition;
 use crate::pg_trace::Ty;
 use crate::store::{Lake, TableMeta};
@@ -20,7 +19,10 @@ impl Host for Lake {
     // which the compiler reports as a cycle (E0391). `own` below is the same pass.)
     fn own(&self, sql: &str) -> impl Future<Output = Result<Own>> + Send { own(self, sql) }
 
-    async fn routines(&self) -> Result<Arc<HashMap<String, Routine>>> { Ok(crate::temp::routines(crate::routines::listed(self).await?)) } // (the session's temporary ones over the lake's)
+    async fn routines(&self) -> Result<crate::front::Routines> {
+        let lake = crate::routines::listed(self).await?;
+        Ok(crate::front::Routines { own: crate::temp::routines(lake.clone()), lake }) // (the session's temporary ones over the lake's, for the statement's own text)
+    }
 
     async fn attached(&self) -> Result<Vec<(String, Attached)>> { crate::ext::attached(self).await }
 
@@ -28,7 +30,7 @@ impl Host for Lake {
         let mut out = HashMap::new();
         for n in tables {
             if let Some(m) = self.cat.meta(&crate::store::table_key(&n)).await? {
-                out.insert(n, m.logical_columns().into_iter().map(|(c, _)| c).chain(crate::text::NAMES.map(String::from)).collect());
+                out.insert(n, m.sql_order().into_iter().chain(crate::text::NAMES.map(String::from)).collect()); // (SQL's order, as `*` reads them)
             }
         }
         Ok(out)
@@ -150,5 +152,5 @@ async fn relation(lake: &Lake, name: &str) -> Option<Relation<Lake>> {
 /// A table's columns as SQL sees them, in order, without an upsert table's delete markers, each with the type the port names it
 /// by. `sql_types` is keyed by the stored name.
 fn typed_columns(m: &TableMeta) -> impl Iterator<Item = (&str, Option<Ty>)> + '_ {
-    m.live().filter(|(_, n, _)| !m.marker(n)).map(|(s, n, _)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
+    m.in_order().into_iter().map(|(s, _)| (s.as_str(), m.name_of(s))).filter(|(_, n)| !m.marker(n)).map(|(s, n)| (n, m.sql_types.get(s).and_then(|t| Ty::of(t))))
 }

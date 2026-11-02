@@ -330,9 +330,8 @@ pub async fn copy_into(app: &App, table: &str, from: &Source, options: &BTreeMap
         expire(app, &known).await?; // (the leader keeps the records as far as the retention: the next statement finds them gone)
     }
     let run = force.then(|| uuid::Uuid::new_v4().to_string());
-    let logical = meta.logical_columns();
-    let cols: Vec<String> = logical.iter().map(|(c, _)| c.clone()).collect();
-    let table_types: BTreeMap<String, String> = logical.into_iter().collect();
+    let cols = meta.sql_order(); // (SQL's order: a headerless CSV's columns fill them first to last)
+    let table_types: BTreeMap<String, String> = meta.logical_columns().into_iter().collect();
     let (now, mut loaded) = (now_ms(), vec![]);
     for p in pieces {
         let done = known.get(&ld_key(&folder, &p.url)).is_some_and(|e| e.version == p.version);

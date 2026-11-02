@@ -38,10 +38,12 @@ pub fn wanted(sql: &str) -> bool {
         Regex::new(r#"(?i)\b(?:fetch|order\s+by\s+all|max_by|min_by|arg_max|arg_min|string_split|str_split|jsonb?|json_extract\w*|json_value|get_json_object|tablesample|sample|pondra_sample|pivot|unpivot|rename|apply|list_apply|array_apply)\b|\b(?:columns|filter|list|split|lateral|strftime|strptime|epoch|regexp_extract|date_?diff|date_?add|date_sub|timestampadd|timeadd|group_concat|array_agg|iff|iif|zeroifnull|decode|array_construct|array_size|object_construct|isnull|charindex|convert|try_convert|getdate|sysdatetime|eomonth|datepart|curdate|unix_timestamp|unix_seconds|timestamp_seconds|str_to_date|date_format|timestampdiff|countif|safe_divide|date|date_trunc|timestamp_trunc|datetime_trunc|timestamp_diff|datetime_diff|format_date|format_timestamp|format_datetime|parse_date|parse_timestamp|parse_datetime|transform|format)\s*\(|\bselect\s+(?:all\s+|distinct\s+)?top\b|\b(?:int64|float64|number|byteint)\b|\bwithin\s+group\b|\)\s*\.\s*[a-z_]|\bsafe\s*\.\s*\w+\s*\(|(?:[\w)\]"])\s*:(?:[A-Za-z_"\[])"#).expect("a regex")
     });
     // (a type DuckDB names otherwise, or one Pondra refuses by name: `DUCKDB_TYPES`, `OTHER_TYPES`, and the ones sqlparser
-    // reads as its own)
+    // reads as its own; only where a type stands, after AS or `::`, before a literal's text, or in a CREATE, ALTER or
+    // DECLARE: `year`, `long` or `money` as a column's name sends a query through no parse)
     static TYPES: LazyLock<Regex> = LazyLock::new(|| {
         let names: Vec<&str> = DUCKDB_TYPES.iter().map(|(n, _)| *n).chain(OTHER_TYPES.iter().map(|(n, _, _)| *n)).collect();
-        Regex::new(&format!(r"(?i)\b(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)\b", names.join("|"))).expect("a regex")
+        let t = format!(r"(?:{}|timestamp_ntz|time\s+with\s+time\s+zone)", names.join("|"));
+        Regex::new(&format!(r"(?i)(?:\bas\s+|::\s*){t}\b|\b{t}\s*'|(?:^|;)\s*(?:--[^\n]*\n\s*)*(?:create|alter|declare)\b[^;]*\b{t}\b")).expect("a regex")
     });
     // (another database's function Pondra refuses by name: the names `dialect_fns::OURS` lists, as calls)
     static OURS_CALL: LazyLock<Regex> = LazyLock::new(|| Regex::new(&format!(r"(?i)\b(?:{})\s*\(", crate::dialect_fns::OURS.iter().map(|(n, _, _)| *n).collect::<Vec<_>>().join("|"))).expect("a regex"));
@@ -83,13 +85,13 @@ fn alias_after_table(sql: &str) -> bool {
 
 /// `sql` with what the parser can't read as it is written turned into what it can.
 pub fn text(sql: &str) -> Result<Cow<'_, str>> {
-    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b|\bpragma\b|\bcreate\s+extension\b|\bupsert\b").expect("a regex"));
+    static LOOK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\blambda\b|\[[^\]]*\bfor\b|^\s*(?:--[^\n]*\n\s*)*(?:pivot|unpivot)\b|\basof\b|\busing\s+sample\b|\bfor\s+(?:no\s+key\s+update|key\s+share)\b|\btblproperties\b|@@\w|\btop\b").expect("a regex"));
     if !LOOK.is_match(sql) {
         return Ok(Cow::Borrowed(sql));
     }
     let mut s = statements(sql)?.unwrap_or_else(|| sql.to_string());
     s = comprehensions(&s)?;
-    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias, pragma_words, extension_words, upsert_words] {
+    for pass in [lambda_words, asof_on, using_sample, lock_words, at_at_words, property_keys, top_alias] {
         if let Some(t) = Tokens::of(&s) {
             s = t.edit(pass(&t)?);
         }
@@ -372,107 +374,6 @@ fn top_alias(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
         }
     }
     Ok(edits)
-}
-
-/// The first token of each statement in `t`, past whitespace and comments.
-fn statement_starts(t: &Tokens) -> Vec<usize> {
-    let mut starts = Vec::new();
-    let mut start = true;
-    for (i, tok) in t.toks.iter().enumerate() {
-        match tok {
-            Token::Whitespace(_) => {}
-            Token::SemiColon => start = true,
-            _ => {
-                if start {
-                    starts.push(i);
-                }
-                start = false;
-            }
-        }
-    }
-    starts
-}
-
-/// DuckDB's and SQLite's `PRAGMA …` where a statement starts: refused by name, with Pondra's statement for it
-/// (`PRAGMA table_info('t')` is `DESCRIBE t`; a setting is SET and SHOW).
-fn pragma_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    for i in statement_starts(t) {
-        if !t.word(i, Keyword::PRAGMA) {
-            continue;
-        }
-        let at = t.next(i);
-        let name = match t.toks.get(at) {
-            Some(Token::Word(n)) => n.value.to_lowercase(),
-            _ => String::new(),
-        };
-        // (the table between the parentheses, as written: `'orders'` or `sales.orders`)
-        let open = t.next(at);
-        let close = (open..t.toks.len()).find(|&j| t.toks[j] == Token::RParen);
-        let table = match (t.toks.get(open), close) {
-            (Some(Token::LParen), Some(close)) => {
-                let raw = t.span(open + 1, close).trim();
-                match raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-                    Some(quoted) => quoted.replace("''", "'"),
-                    None => raw.to_string(),
-                }
-            }
-            _ => "t".to_string(),
-        };
-        let ours = match name.as_str() {
-            "table_info" | "show" => format!("DESCRIBE {table}"),
-            "show_tables" | "show_tables_expanded" => "SHOW TABLES".to_string(),
-            "database_list" | "show_databases" => "SHOW DATABASES".to_string(),
-            "version" => "SELECT version()".to_string(),
-            _ => format!("SET {0} = … to change a setting, SHOW {0} to read it", if name.is_empty() { "name" } else { &name }),
-        };
-        return Err(crate::codes::coded("0A000", format!("PRAGMA {name} is DuckDB's and SQLite's: write {ours}")));
-    }
-    Ok(Vec::new())
-}
-
-/// Postgres's `CREATE EXTENSION [IF NOT EXISTS] name …` where a statement starts: refused by name, with Pondra's
-/// INSTALL and LOAD (`extension.rs`), or the functions built in for the extensions most scripts ask for.
-/// `UPSERT INTO t …`, CockroachDB's, refused by name (0A000) with Pondra's two upserts (a plain INSERT of a key that is
-/// there is refused, so neither is read in its place).
-fn upsert_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    let named = |i: usize, word: &str| matches!(t.toks.get(i), Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word));
-    for i in statement_starts(t) {
-        if !named(i, "upsert") {
-            continue;
-        }
-        let into = t.next(i);
-        let name = match (t.word(into, Keyword::INTO), t.toks.get(t.next(into))) {
-            (true, Some(Token::Word(w))) => w.to_string(),
-            _ => "t".to_string(),
-        };
-        return Err(crate::codes::coded("0A000", format!("UPSERT is CockroachDB's: write INSERT OR REPLACE INTO {name} …, or INSERT INTO {name} … ON CONFLICT (key) DO UPDATE SET …")));
-    }
-    Ok(vec![])
-}
-
-fn extension_words(t: &Tokens) -> Result<Vec<(usize, usize, String)>> {
-    for i in statement_starts(t) {
-        let at = t.next(i);
-        if !(t.word(i, Keyword::CREATE) && t.word(at, Keyword::EXTENSION)) {
-            continue;
-        }
-        let mut n = t.next(at);
-        if t.word(n, Keyword::IF) {
-            n = t.next(t.next(t.next(n))); // (IF NOT EXISTS)
-        }
-        let name = match t.toks.get(n) {
-            Some(Token::Word(w)) => w.value.clone(),
-            _ => "name".to_string(),
-        };
-        let ours = match name.to_lowercase().as_str() {
-            "uuid-ossp" => "gen_random_uuid() is built in".to_string(),
-            "pgcrypto" => "gen_random_uuid(), digest(text, 'sha256'), sha256() and md5() are built in".to_string(),
-            "plpgsql" => "a procedure's body is Pondra's own SQL script (CREATE PROCEDURE … AS BEGIN … END), with nothing to install".to_string(),
-            _ => format!("a Pondra extension is installed from its file, INSTALL {name} FROM 'path or URL', then LOAD {name}"),
-        };
-        return Err(crate::codes::coded("0A000", format!("CREATE EXTENSION {name} is Postgres's: {ours}")));
-    }
-    Ok(Vec::new())
 }
 
 /// DuckDB's `PIVOT t ON g [IN (…)] [USING agg] [GROUP BY …]` and `UNPIVOT t ON a, b [INTO NAME n
@@ -1735,11 +1636,11 @@ fn json_path(path: &str) -> Result<Vec<String>> {
 
 /// `payload->>'$.a.b'` (DuckDB's and MySQL's JSONPath after `->>`) as `json_as_text(payload, 'a', 'b')`; after `->` it is
 /// `json_get_json`, which keeps the JSON, and `'$'` alone is the value itself. A key that isn't a path (Postgres's
-/// `->> 'a'`) is None, as it is.
+/// `->> 'a'`, or a key such as MongoDB's `'$oid'` or `'$ref'`: `$` then neither `.` nor `[`) is None, as it is.
 fn json_arrow(e: &Expr) -> Result<Option<String>> {
     let Expr::BinaryOp { left, op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow), right } = e else { return Ok(None) };
     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = &**right else { return Ok(None) };
-    if !path.starts_with('$') {
+    if !(path == "$" || path.starts_with("$.") || path.starts_with("$[")) {
         return Ok(None);
     }
     let keys = json_path(path)?.join(", ");
@@ -2303,37 +2204,6 @@ mod tests {
     }
 
     #[test]
-    fn pragma_is_refused_with_pondras_statement() {
-        let said = |sql: &str| text(sql).unwrap_err();
-        let e = said("PRAGMA table_info('orders')");
-        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("PRAGMA table_info is DuckDB's and SQLite's: write DESCRIBE orders"), "{e:#}");
-        assert!(said("-- columns\npragma show(sales.orders)").to_string().contains("write DESCRIBE sales.orders"));
-        assert!(said("SELECT 1; PRAGMA show_tables").to_string().contains("write SHOW TABLES"));
-        assert!(said("PRAGMA threads = 4").to_string().contains("write SET threads = … to change a setting, SHOW threads to read it"));
-        // (a column, a string or a comment called pragma is no statement)
-        assert_eq!(text("SELECT pragma FROM t -- pragma").unwrap(), "SELECT pragma FROM t -- pragma");
-        assert_eq!(text("SELECT 'PRAGMA x'").unwrap(), "SELECT 'PRAGMA x'");
-    }
-
-    #[test]
-    fn upsert_is_refused_naming_pondras_upserts() {
-        let e = text("UPSERT INTO orders VALUES (5, 'new')").unwrap_err();
-        assert_eq!(crate::codes::of(&e), "0A000");
-        assert_eq!(e.to_string(), "UPSERT is CockroachDB's: write INSERT OR REPLACE INTO orders …, or INSERT INTO orders … ON CONFLICT (key) DO UPDATE SET …");
-        assert!(text("SELECT upsert FROM t").is_ok() && text("SELECT 1; upsert into t values (1)").is_err(), "a column called upsert is a name");
-    }
-
-    #[test]
-    fn create_extension_is_refused_with_install_and_load() {
-        let said = |sql: &str| text(sql).unwrap_err();
-        let e = said("CREATE EXTENSION IF NOT EXISTS pg_trgm");
-        assert!(crate::codes::of(&e) == "0A000" && e.to_string().contains("CREATE EXTENSION pg_trgm is Postgres's: a Pondra extension is installed from its file, INSTALL pg_trgm FROM 'path or URL', then LOAD pg_trgm"), "{e:#}");
-        assert!(said(r#"create extension "uuid-ossp""#).to_string().contains("CREATE EXTENSION uuid-ossp is Postgres's: gen_random_uuid() is built in"));
-        assert!(said("SELECT 1; CREATE EXTENSION pgcrypto WITH SCHEMA public").to_string().contains("digest(text, 'sha256')"));
-        assert_eq!(text("SELECT 'create extension x'").unwrap(), "SELECT 'create extension x'");
-    }
-
-    #[test]
     fn top_is_a_name_unless_it_is_sql_servers_top() {
         // (a LATERAL named top is an alias: quoted, so it parses; SELECT TOP n, TOP (n) and TOP … PERCENT are left as they are)
         let lateral = "SELECT c.name, top.amount FROM customers c LEFT JOIN LATERAL (SELECT o.amount FROM orders o WHERE o.customer_id = c.id ORDER BY o.amount DESC LIMIT 1) top ON true";
@@ -2416,6 +2286,10 @@ mod tests {
             expression(&mut e).map(|_| e.to_string())
         };
         assert_eq!(call("CAST(x AS DATETIME)").unwrap(), "CAST(x AS TIMESTAMP)");
+        // (looked for only where a type stands: `year` or `money` as a column's name is no reason to parse)
+        assert!(!wanted("SELECT year, long, short, money FROM t WHERE bit = 1"));
+        assert!(wanted("SELECT CAST(x AS ubigint) FROM t") && wanted("SELECT x::Datetime FROM t") && wanted("SELECT DATETIME '2026-01-01 10:00'"));
+        assert!(wanted("CREATE TABLE t (a INT, b MONEY)") && wanted("SELECT 1; ALTER TABLE t ADD COLUMN y HUGEINT") && wanted("-- made\nCREATE TABLE t (y year)"));
         assert_eq!(call("CAST(x AS UBIGINT)").unwrap(), "CAST(x AS BIGINT UNSIGNED)");
         assert_eq!(call("CAST(x AS UINTEGER)").unwrap(), "CAST(x AS INT UNSIGNED)");
         assert_eq!(call("CAST(x AS TIMESTAMP_MS)").unwrap(), "CAST(x AS TIMESTAMP(3))");
@@ -2540,6 +2414,8 @@ mod tests {
         assert_eq!(call("j->>'$'").unwrap(), "json_as_text(j)");
         assert_eq!(call("j->'$'").unwrap(), "j");
         assert_eq!(call("j->>'page'").unwrap(), "j ->> 'page'");
+        assert_eq!(call("doc->'_id'->>'$oid'").unwrap(), "doc -> '_id' ->> '$oid'"); // (a key starting with `$`, MongoDB's: Postgres's key)
+        assert_eq!(call("s->>'$ref'").unwrap(), "s ->> '$ref'");
         // (Spark's get_json_object and Spark's transform; a transform whose second argument isn't a lambda is as it was)
         assert_eq!(call("get_json_object(j, '$.a')").unwrap(), "json_as_text(j, 'a')");
         assert_eq!(call("transform(l, x -> x + 1)").unwrap(), "array_transform(l, x -> x + 1)");

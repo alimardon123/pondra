@@ -119,8 +119,43 @@ fn condition_of(text: &str) -> Option<ast::Expr> {
     (parser.peek_token().token == Token::EOF).then_some(condition) // (an expression is read up to where it ends: the rest must be nothing)
 }
 
+/// Does this query read some table's columns by position: a `*` (`t.*`, `* EXCLUDE …`) or DuckDB's `COLUMNS(…)`, whose
+/// columns come in the table's order? Read by its tokens, so any of Pondra's statements is read, and a `*` that multiplies
+/// or counts (`count(*)`) is not one. A table's column moved (`ALTER COLUMN c AFTER b`) would move such a query's columns.
+pub fn by_position(sql: &str) -> bool {
+    use datafusion::sql::sqlparser::{dialect::GenericDialect, tokenizer::{Token, Tokenizer}};
+    let Ok(tokens) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else { return true }; // (unread: taken as one)
+    let tokens: Vec<Token> = tokens.into_iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    (0..tokens.len()).any(|i| match &tokens[i] {
+        Token::Mul => i == 0 || matches!(tokens[i - 1], Token::Comma | Token::Period) || ["SELECT", "DISTINCT", "ALL"].iter().any(|w| word(tokens.get(i - 1), w)),
+        Token::Word(_) => word(tokens.get(i), "COLUMNS") && tokens.get(i + 1) == Some(&Token::LParen),
+        _ => false,
+    })
+}
+
+/// Why a column can't move while `readers` read its table by position and keep what they read (`ddl::by_position`).
+pub fn read_by_position(table: &str, column: &str, readers: &[String]) -> anyhow::Error {
+    let (who, verb) = match readers {
+        [one] => (one.clone(), "reads"),
+        _ => (readers.join(", "), "read"),
+    };
+    crate::codes::coded("0A000", format!("{column} can't move while {who} {verb} {table}'s columns by position (a `*`, or a task's rows into it), keeping them in the order they were: name the columns in its query (CREATE OR REPLACE MATERIALIZED VIEW … AS SELECT a, b, …), then move it"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_query_reads_columns_by_position_with_a_star_or_columns() {
+        for sql in ["SELECT * FROM t", "SELECT a, * FROM t", "SELECT t.* FROM t JOIN u ON true", "SELECT DISTINCT * FROM t", "SELECT * EXCLUDE (a) FROM t",
+            "WITH x AS (SELECT * FROM t) SELECT a FROM x", "SELECT COLUMNS('a|b') FROM t", "SELECT a FROM t UNION ALL SELECT * FROM u"] {
+            assert!(by_position(sql), "{sql}");
+        }
+        for sql in ["SELECT a, b FROM t", "SELECT count(*) FROM t", "SELECT a * b, 2 * a FROM t", "SELECT '*' AS s, a FROM t", "SELECT a FROM t -- *", "SELECT x.columns FROM t x"] {
+            assert!(!by_position(sql), "{sql}");
+        }
+    }
+
     use super::*;
 
     #[test]

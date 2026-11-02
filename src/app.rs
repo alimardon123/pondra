@@ -105,7 +105,9 @@ impl App {
         if self.auth.on() || self.auth.network() || self.auth.owned() {
             return false;
         }
-        let _ = self.lake.caught_up().await; // (still catching up after 10 s: its own catalog decides)
+        if self.lake.caught_up().await.is_err() {
+            return false; // (still catching up after 10 s: its catalog may lack its leader's users, so it is never open on its word)
+        }
         if crate::users::signed(&self.lake).await {
             return false; // (served with tokens once: a node started without them answers no one, `users::signed`)
         }
@@ -231,7 +233,7 @@ impl App {
             let here = datafusion::common::instant::Instant::now();
             let ctx = session(&self.lake, query, "").await?;
             crate::query::mark("session with its tables");
-            let ctx = if files { ctx.enable_url_table() } else { ctx };
+            let ctx = if files { crate::engine::with_files(ctx) } else { ctx };
             crate::explain::prepare(&ctx, query); // (each operator's expected rows: `explain::expected`)
             let peak = &crate::query::peak_pool(&ctx); // (this statement's own memory pool: the peak its cost reports; the closure below runs again on a retry)
             let out = crate::query::frugally(&ctx, |ctx| async move {

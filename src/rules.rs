@@ -39,6 +39,9 @@ pub struct Table {
     pub checks: Vec<(String, String)>,
     /// Is any column renamed or dropped, so that a stored name is not SQL's.
     pub mapped: bool,
+    /// SQL's names in SQL's order (`TableMeta::sql_order`): the columns an INSERT without a column list fills, first to
+    /// last. `columns` and `schema` keep the stored order.
+    pub order: Vec<String>,
 }
 
 /// One column as the rules see it.
@@ -286,6 +289,7 @@ mod tests {
         }
         Table {
             schema: Arc::new(Schema::new(fields)),
+            order: cols.iter().map(|c| c.name.clone()).collect(),
             columns: cols,
             key: key.iter().map(|k| k.to_string()).collect(),
             key_checked: !key.is_empty(),

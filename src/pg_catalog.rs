@@ -48,7 +48,16 @@ fn names_catalog(sql: &str) -> bool {
         let names = CATALOG.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("|");
         regex::Regex::new(&format!(r"(?i)\bpg_catalog\s*\.\s*\w|\b(?:from|join)\s+(?:{names})\b")).expect("a regex")
     });
-    NAMES.is_match(sql)
+    if !NAMES.is_match(sql) {
+        return false; // (most queries: no tokens made)
+    }
+    // (the words themselves, not inside a string or a comment)
+    use datafusion::sql::sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(tokens) = Tokenizer::new(&datafusion::sql::sqlparser::dialect::GenericDialect {}, sql).tokenize() else { return true };
+    let t: Vec<&Token> = tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).collect();
+    let word = |t: &Token, w: &str| matches!(t, Token::Word(x) if x.quote_style.is_none() && x.value.eq_ignore_ascii_case(w));
+    t.windows(3).any(|w| word(w[0], "pg_catalog") && *w[1] == Token::Period && matches!(w[2], Token::Word(_)))
+        || t.windows(2).any(|w| (word(w[0], "from") || word(w[0], "join")) && CATALOG.iter().any(|(n, _)| word(w[1], n)))
 }
 
 /// A query over Postgres's catalog, as the Postgres port answers it: the catalog's tables and functions in

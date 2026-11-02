@@ -490,8 +490,10 @@ fn fields(meta: &TableMeta) -> Option<Vec<Value>> {
         Some(item) => Some(json!({"type": "list", "element-id": n + i + 1, "element": iceberg(item)?, "element-required": false})),
         None => Some(Value::String(iceberg(t)?)),
     };
-    let live = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c));
-    live.map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
+    let mut live: Vec<(usize, &(String, String))> = columns.iter().enumerate().filter(|(_, (c, _))| !meta.dropped.contains(c) && !meta.marker(c)).collect();
+    let order = meta.in_order(); // (listed in SQL's order: a field is known by its id, wherever it is listed)
+    live.sort_by_key(|(_, (c, _))| order.iter().position(|(s, _)| s == c));
+    live.into_iter().map(|(i, (c, t))| Some(json!({"id": i + 1, "name": meta.name_of(c), "required": meta.key.contains(c), "type": kind(i, t)?}))).collect() // (a key: identifier fields are required)
 }
 
 // ---------------------------------------------------------------- Avro, just what manifests need
