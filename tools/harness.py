@@ -11238,6 +11238,11 @@ def guarded():
     other = raw(P + 1, "PUT", f"/store/stage/{'bob'.encode().hex()}/j3/0.parquet", b"x", auth=boss, headers={"If-None-Match": "*"})  # (boss, a superuser, at bob's slug)
     stage("SELECT 2 AS c0, 3.5 AS c1", "j5", n=1)  # (file 1 of 2 only: file 0 never came)
     short = raw(P + 1, "POST", "/insert/orders?job=j5&staged=1", json.dumps({"columns": ["id", "amount"], "files": 2}).encode(), auth=boss, headers=ins)
+    # (a count the page says, of 2^40 files: compared with what is there in place, never collected, which asked for 8 TiB and
+    # aborted the node: 11-02 audit H2. One file staged, so the comparison is reached; past the page's million, refused first)
+    stage("SELECT 3 AS c0, 4.5 AS c1", "j6")
+    huge = {f: raw(P + 1, "POST", "/insert/orders?job=j6&staged=1", json.dumps({"columns": ["id", "amount"], "files": f}).encode(), auth=boss, headers=ins) for f in (1 << 40, 999_999)}
+    huge_alive = ask(P + 1, "SELECT 1 AS one", auth=boss)
     unchanged = ask(P, "SELECT count(*) AS n FROM orders", auth=boss)
     try:  # (its length says it is past 64 MB: the node answers 413 from the headers, so the body is not sent)
         c = http.client.HTTPConnection("127.0.0.1", P + 1, timeout=120)
@@ -11252,12 +11257,15 @@ def guarded():
     info["staged"] = {"slug": slug, "file": staged_put[0], "insert": [first[0], first[2][:200].decode(errors="replace")],
                       "again": [again[0], again[2][:200].decode(errors="replace")], "orders": [before, grown],
                       "not null": [nulled[0], nulled[1], nulled[2][:300].decode(errors="replace")], "another slug": other[0],
-                      "over 64 MB": big[0], "a file short": [short[0], short[1], short[2][:200].decode(errors="replace"), unchanged]}
+                      "over 64 MB": big[0], "a file short": [short[0], short[1], short[2][:200].decode(errors="replace"), unchanged],
+                      "files said 2^40, 999999": [[h[0], h[1], h[2][:200].decode(errors="replace")] for h in huge.values()], "alive after": huge_alive}
     checks["a joined page's INSERT, staged: the node-written file under the page's own slug, /insert on a follower adds its row (200), the same call again is answered duplicate"] = \
         staged_put[0] == 200 and first[0] == 200 and isinstance(before, list) and grown == [{"n": before[0]["n"] + 1}] and again[0] == 200 and json.loads(again[2] or b"{}") == {"duplicate": True}
     checks["a staged file of another user's slug: 403; a create past 64 MB: 413; a NULL for a NOT NULL column: the node's own refusal (23502)"] = \
         other[0] == 403 and big[0] == 413 and nulled[1] == "23502" and isinstance(nulled[0], int) and nulled[0] >= 400
     checks["a staged INSERT whose files aren't all there is refused (55000), and adds no row"] = short[1] == "55000" and unchanged == grown
+    checks["a staged INSERT that says 2^40 files is refused past the page's million (54000), one that says 999,999 of the one there as a short one (55000), and the node answers after both (11-02 audit H2)"] = \
+        huge[1 << 40][1] == "54000" and huge[999_999][1] == "55000" and huge_alive == [{"one": 1}] and unchanged == grown
     # What a page that joined the cluster follows, a superuser's sign-in: the catalog and the commit stream, with only
     # the keys a page may hold (`objects::readable`): never the lake's keys, its users or its secrets
     catalog = ask(P, b"", path="/cluster/kv?from=", method="GET", auth=boss)
@@ -11487,12 +11495,13 @@ def guarded():
     gina = ask(P, json.dumps({"user": "gina", "password": "gina-password-1"}), path="/login")
     gina_s = f"Bearer {gina['token']}" if isinstance(gina, dict) else "Bearer none"
     until(lambda: isinstance(ask(P + 1, b"", path="/whoami", method="GET", auth=gina_s), dict), True, 20)  # (the follower has the session)
-    def open_log(port, auth, out):
-        """`GET /cluster/log` read as a stream: its status, the bytes read, and when its body ended (or failed, but not a timeout)."""
+    def open_log(port, auth, out, path="/cluster/log", method="GET", body=None):
+        """`GET /cluster/log` (or another answer that goes on) read as a stream: its status, the bytes read, and when its body
+        ended (or failed, but not a timeout)."""
         import socket
         c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
         try:
-            c.request("GET", "/cluster/log", headers={"Authorization": auth})
+            c.request(method, path, body, headers={"Authorization": auth, "Content-Type": "application/json"})
             r = c.getresponse()
             out["status"] = r.status
             while chunk := r.read1(65536):
@@ -11519,6 +11528,47 @@ def guarded():
     checks["an open GET /cluster/log ends when its sign-in stops being a superuser's: NOSUPERUSER ends the leader's stream and the follower's within 12 s, and a new one is refused (H4)"] = \
         flowing is True and not str(revoked).startswith("ERROR") and set(ended_after) == {"leader", "follower"} \
         and all(v <= 12 for v in ended_after.values()) and again.get("status") in (401, 403)
+    # 11-02 H3: the other answers that go on end too when their caller may no longer have them, checked every 5 s (so within
+    # 12 s): `/watch` as a user granted SELECT, by REVOKE; a superuser's live query, by DROP USER, and another's, by
+    # NOSUPERUSER (its next answer is as its grants are then: none); a Kafka consumer signed in with a password, by the same
+    # REVOKE (its connection's grants are read again: the next fetch is refused, not served the new row)
+    from kafka import KafkaConsumer
+    from kafka.errors import TopicAuthorizationFailedError
+    for q in ["CREATE USER hana PASSWORD 'hana-password-1'", "GRANT SELECT ON stock TO hana",
+              "CREATE USER ivo PASSWORD 'ivo-password-1' SUPERUSER", "CREATE USER jon PASSWORD 'jon-password-1' SUPERUSER"]:
+        ask(P, q, auth=boss)
+    hana, ivo, jon = basic("hana", "hana-password-1"), basic("ivo", "ivo-password-1"), basic("jon", "jon-password-1")
+    kc = KafkaConsumer("stock", bootstrap_servers=f"127.0.0.1:{P + 41}", security_protocol="SASL_PLAINTEXT", sasl_mechanism="PLAIN",
+                       sasl_plain_username="hana", sasl_plain_password="hana-password-1", auto_offset_reset="earliest", consumer_timeout_ms=3000)
+    def fetched():
+        try:
+            return len(list(kc))
+        except TopicAuthorizationFailedError:
+            return "refused"
+        except Exception as e:
+            return f"ERROR {type(e).__name__}: {e}"
+    kafka_before = fetched()
+    live_sql = json.dumps({"sql": "SELECT count(*) AS n FROM stock"}).encode()
+    h3 = {"watch": {}, "live, dropped": {}, "live, no superuser": {}}
+    for name, auth, path, method, body in (("watch", hana, "/watch/stock", "GET", None), ("live, dropped", ivo, "/live", "POST", live_sql),
+                                           ("live, no superuser", jon, "/live", "POST", live_sql)):
+        threading.Thread(target=open_log, args=(P, auth, h3[name], path, method, body), daemon=True).start()
+    time.sleep(1)
+    ask(P, "INSERT INTO stock VALUES (11, 1.0)", auth=boss)  # (a new row: /watch sends it, the live queries a new count)
+    h3_flowing = until(lambda: all(s.get("status") == 200 and s.get("bytes", 0) > 0 for s in h3.values()), True, 20)
+    t0 = time.monotonic()
+    h3_said = [ask(P, q, auth=boss) for q in ("REVOKE SELECT ON stock FROM hana", "DROP USER ivo", "ALTER USER jon NOSUPERUSER")]
+    time.sleep(6)
+    ask(P, "INSERT INTO stock VALUES (12, 1.0)", auth=boss)  # (the no-longer-superuser's next answer is refused; the consumer's next fetch)
+    until(lambda: all("ended" in s for s in h3.values()), True, 20)
+    h3_ended = {k: round(s["ended"] - t0, 1) for k, s in h3.items() if "ended" in s}
+    kafka_after = fetched()
+    kc.close()
+    info["H3"] = {"streams": {k: {x: str(y)[:200] for x, y in s.items()} for k, s in h3.items()}, "said": [str(x)[:200] for x in h3_said],
+                  "ended after s": h3_ended, "kafka fetched": [kafka_before, kafka_after]}
+    checks["/watch, a live query and a Kafka consumer end when their sign-in may no longer have them: REVOKE, DROP USER and NOSUPERUSER end each within 12 s, and the consumer's next fetch is refused (11-02 H3)"] = \
+        h3_flowing is True and not any(str(x).startswith("ERROR") for x in h3_said) and set(h3_ended) == set(h3) \
+        and all(v <= 12 for v in h3_ended.values()) and isinstance(kafka_before, int) and kafka_before >= 1 and kafka_after == "refused"
     # M8: a joined page's own statements are written by its node, as the sign-in's (`POST /cluster/records`, page_records.rs): a
     # superuser's sign-in only (never the nodes' key, nor a user with grants), at most 256 lines, under the node's own class and
     # words, and kept as a history row whatever the audit classes say. Node a's classes here have no read (`role,ddl,function,write`).
@@ -11765,7 +11815,69 @@ def served():
     info["refusals"] = refusals
     checks["refused at the start, exit non-zero and saying why: a folder of lakes, a reader holder, an s3 URL, no admin token, a pondra:// lake with a path or no token, a second holder"] = \
         all(r["exit"] != 0 and r["match"] for r in refusals.values())
-    for n in (A_node, B_node, C_node, M, E, D, X):
+    # 11-02 M4: a catalog in a bucket is anyone's who may write the bucket, and every node opens what its catalog names, so from
+    # one no node opens a lake only a node's owner names: a node's lake (opened with this node's admin token) or a folder on its
+    # disk. ATTACH refuses one at once, the owner's too, and so does a raw Attach through /cluster/ddl with the admin token;
+    # nothing dials the node named. A bucket's lake attaches as before.
+    import boto3, socket
+    sim_p, bk_p, ear_p = P + 20, P + 21, P + 22
+    sim = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_r2.py"), "--port", str(sim_p), "--zero"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(sim.kill)
+    s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{sim_p}", region_name="us-east-1", aws_access_key_id="k", aws_secret_access_key="s")
+    for _ in range(600):  # (a first import of moto takes a while)
+        try:
+            s3.create_bucket(Bucket="m4lakes")
+            break
+        except Exception:
+            time.sleep(0.1)
+    heard = []
+    ear = socket.socket()
+    ear.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ear.bind(("127.0.0.1", ear_p))
+    ear.listen(5)
+    ear.settimeout(0.5)
+    def listen():  # (whatever dials the node named: its request's first bytes)
+        end = time.monotonic() + 90
+        while time.monotonic() < end:
+            try:
+                c, _ = ear.accept()
+            except OSError:
+                continue
+            c.settimeout(2)
+            try:
+                heard.append(c.recv(4096)[:200])
+            except OSError:
+                heard.append(b"(connected)")
+            c.close()
+    threading.Thread(target=listen, daemon=True).start()
+    owner_key = uuid.uuid4().hex
+    benv = {"AWS_ENDPOINT": f"http://127.0.0.1:{sim_p}", "AWS_ACCESS_KEY_ID": "k", "AWS_SECRET_ACCESS_KEY": "s", "AWS_REGION": "us-east-1",
+            "AWS_ALLOW_HTTP": "true", "PONDRA_OWNER_KEY": owner_key}
+    BK = Node("s3://m4lakes/home", bk_p, admin_token=T, env=benv).start()
+    def as_owner(q):
+        try:
+            return call(bk_p, "POST", "/sql", q.encode(), headers={"x-pondra-owner": owner_key})
+        except Exception as e:
+            return f"ERROR {e}"
+    def raw(d):
+        try:
+            return call(bk_p, "POST", "/cluster/ddl", json.dumps(d).encode(), headers={**H, "Content-Type": "application/json"})
+        except Exception as e:
+            return f"ERROR {e}"
+    m4 = {
+        "owner: a node's lake": as_owner(f"ATTACH 'pondra://127.0.0.1:{ear_p}' AS far"),
+        "owner: a folder": as_owner(f"ATTACH '{mk()}' AS here"),
+        "admin token: a raw Attach of a node's lake": raw({"op": "attach", "name": "far2", "dir": f"pondra://127.0.0.1:{ear_p}"}),
+        "owner: a bucket's lake": as_owner("ATTACH 's3://m4lakes/other' AS other"),
+    }
+    time.sleep(3)  # (a node syncs its attachments every second: had one been kept, it would have dialed by now)
+    m4["attached"] = as_owner("SELECT name FROM pondra.databases ORDER BY name")
+    info["M4"] = {k: str(v)[:300] for k, v in m4.items()} | {"heard": [h.decode(errors="replace") for h in heard]}
+    refused_m4 = [m4[k] for k in ("owner: a node's lake", "owner: a folder", "admin token: a raw Attach of a node's lake")]
+    checks["a database in a bucket attaches no node's lake or folder (ATTACH, the owner's, a raw Attach with the admin token): refused saying --attach; nothing dials the node named; a bucket's lake attaches (11-02 M4)"] = \
+        all(str(r).startswith("ERROR") and "--attach" in str(r) for r in refused_m4) and heard == [] \
+        and not str(m4["owner: a bucket's lake"]).startswith("ERROR") and "other" in str(m4["attached"]) and "far" not in str(m4["attached"])
+    for n in (A_node, B_node, C_node, M, E, D, X, BK):
         n.kill()
     ok = all(checks.values())
     print(json.dumps({"served": checks, "ok": ok, "info": info}, indent=1, default=str))

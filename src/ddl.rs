@@ -500,6 +500,7 @@ async fn carry_out(lake: &Lake, d: Ddl) -> Result<Value> {
         Ddl::DropView { name, if_exists } => drop_view(lake, &name, if_exists).await,
         Ddl::Attach { name, dir, read_only, endpoint } => {
             attachable(lake, &name, false).await?;
+            openable(&lake.url, &dir)?; // (what `sync` would never open is refused here, at once)
             ensure!(endpoint.is_none() || read_only, "ENDPOINT goes with READ_ONLY: a database on another server is read with its bucket's read-only key and asked through its leader's URL");
             ensure!(endpoint.as_deref().is_none_or(|e| e.starts_with("http://") || e.starts_with("https://")), "ENDPOINT is its server's URL: https://…");
             if let Some(a) = lake.cat.get::<Attachment>(&attachment_key(&name)).await? {
@@ -798,6 +799,25 @@ crate::per_node!(
     /// The lakes this process attached because the catalog said so, per home lake.
     static FROM_SQL: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
 
+crate::per_node!(
+    /// The attachments `sync` refused (`openable`), each said on the log once.
+    static REFUSED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new()));
+
+/// May a node open lake `dir` because the catalog of lake `home` names it? Every node opens what its catalog names, whoever
+/// wrote it there: a node's lake (`pondra://`) with this node's admin token, a folder from this node's own disk. Only a
+/// node's owner names those (`branch::places`, `ext::owners_only`), and a catalog in a bucket is anyone's who may write the
+/// bucket, so from one a node opens neither (11-02 audit M4): it is attached with `--attach` on the nodes that should open
+/// it. A catalog in a folder, in memory or on a node is the machine's own, or the admin token's. A place no door knows is
+/// refused everywhere (`store::place`).
+pub(crate) fn openable(home: &str, dir: &str) -> Result<()> {
+    let place = crate::store::place(&crate::memory::place(dir))?;
+    if matches!(crate::store::place(home), Ok(crate::store::Place::Bucket)) && matches!(place, crate::store::Place::Served | crate::store::Place::Folder) {
+        let what = if place == crate::store::Place::Served { "a node's lake, opened with this node's admin token" } else { "a folder on this machine" };
+        return Err(crate::codes::coded("42501", format!("{dir} is {what}, which only a node's owner names, and this database's catalog is in a bucket, which whoever may write the bucket can change: attach it with --attach on the nodes that should open it")));
+    }
+    Ok(())
+}
+
 /// Attach here the lakes the catalog lists (`ATTACH`), and let go of those it no longer does
 /// (`DETACH`). Lakes attached with `--attach` stay. One that can't be opened is skipped (and
 /// tried again next time).
@@ -806,6 +826,15 @@ pub async fn sync(lake: &Lake, follow: bool) -> Result<()> {
     for (key, a) in &listed {
         let name = &key[2..];
         if lake.attached.read().unwrap().iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        if let Err(e) = openable(&lake.url, &a.dir) {
+            let seen = (lake.url.clone(), format!("{key}={}", a.dir));
+            let mut refused = REFUSED.lock().unwrap();
+            if !refused.contains(&seen) {
+                eprintln!("not attaching {name}: {e:#}");
+                refused.push(seen);
+            }
             continue;
         }
         if a.read_only {

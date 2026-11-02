@@ -620,11 +620,12 @@ async fn job(State(app): State<App>, Json(job): Json<crate::tier::Job>) -> Resul
 /// frames as it relayed them (`members::follow`, `Catalog::relay`), so a page that joins a follower reads the leader's
 /// stream from its own node, and the leader serves one stream per follower, not per page. A caller that isn't one of
 /// the nodes (`nodes_own`) gets each change's readable keys only (`for_caller`). Its sign-in revoked or expired, the
-/// stream ends (`ends_when_revoked`).
+/// stream ends (`until_revoked`).
 async fn feed(State(app): State<App>, headers: axum::http::HeaderMap) -> Response {
     let operator = nodes_own(&app).await; // (read now: the stream is polled after this request's scope has ended)
     let header = headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from);
-    let revoked = ends_when_revoked(app.clone(), operator, header);
+    let need = crate::auth::Auth::needed("/cluster/log", "GET"); // (a superuser's own sign-in, as `guard` lets it follow the stream)
+    let revoked = until_revoked(app.clone(), operator, header, move |p| p.role >= need && p.access.is_none());
     let cat = &app.lake.cat;
     let streamed = operator.then(|| crate::format::Streamed::to(crate::format::said(&headers).1)); // (held while the stream is open: `format::raise`; a page's tab doesn't count)
     let start = Frame::Start { term: app.members.leader().n, replicated: cat.replicas > 1 };
@@ -653,23 +654,32 @@ async fn records(State(app): State<App>, headers: axum::http::HeaderMap, Json(ba
     StatusCode::OK.into_response()
 }
 
-/// Resolves once a caller that isn't one of the nodes no longer qualifies for the commit stream: its sign-in is revoked, is no
-/// longer a superuser's, or has expired. Checked every 5 s, so a stream ends within that, with the guard's test for
-/// `/cluster/log` (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier). A
-/// node never ends; a caller with no sign-in ends at once.
-async fn ends_when_revoked(app: App, operator: bool, header: Option<String>) {
+/// Resolves once the caller of an answer that goes on (the commit stream, `/watch`, a live query) may no longer have it: its
+/// sign-in revoked, expired, or changed so that `still` refuses it (a grant taken back, a superuser no more); a caller that
+/// came in with nothing signed, at an open node, once the node is open no more. Checked every 5 s, as `guard` checks a
+/// request (a password is hashed at most once a minute: `users::password_ok` remembers it against its verifier), so such an
+/// answer ends within that (11-01 audit H4 for the commit stream; 11-02 H3 for the rest). A node, a token and the program
+/// that started this node never end.
+pub(crate) async fn until_revoked(app: App, operator: bool, header: Option<String>, still: impl Fn(&crate::auth::Principal) -> bool + Send) {
     if operator {
         return futures::future::pending().await;
     }
-    let Some(header) = header else { return };
-    let need = crate::auth::Auth::needed("/cluster/log", "GET");
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let who = crate::users::who_at(&app.lake, &app.auth, Some(header.as_str()), false).await;
-        if !who.is_some_and(|p| p.role >= need && p.access.is_none()) {
+        let signed = match &header {
+            Some(h) => crate::users::who_at(&app.lake, &app.auth, Some(h), false).await.is_some_and(|p| still(&p)),
+            None => false,
+        };
+        if !signed && !app.open().await {
             return;
         }
     }
+}
+
+/// The caller of a request, as `until_revoked` checks it again: whether it is one of the nodes' own (`auth::operator`, read
+/// while the request's scope holds), and its `Authorization`.
+fn caller(headers: &HeaderMap) -> (bool, Option<String>) {
+    (crate::auth::operator(), headers.get("authorization").and_then(|v| v.to_str().ok()).map(String::from))
 }
 
 /// Is the request being served one of the nodes' own: their tokens, their key, the program that started this node
@@ -909,11 +919,16 @@ async fn insert_staged(app: &App, name: &str, job: &str, body: &str) -> Result<J
     ensure!(crate::auth::staged_job(job), "a staged INSERT's job is letters, digits and hyphens, 64 at most");
     crate::auth::check_rows(name)?; // (its INSERT grant, as SQL's)
     let Staged { columns, files } = serde_json::from_str(body)?;
+    if files > crate::write::STAGED_FILES_MOST {
+        return Err(crate::codes::coded("54000", format!("a staged INSERT takes {} files at most, and this one says {files}", crate::write::STAGED_FILES_MOST)).into());
+    }
     let dir = format!("stage/{slug}/{job}/");
     let unstage = Unstage(Some((app.lake.clone(), dir.clone()))); // (whether it answers, fails or is stopped: the page's files are its transport only)
     let there = staged_files(&app.lake, &dir).await?;
     // (none there: a resend after its INSERT took them, which the job answers as a duplicate, or nothing to take)
-    if !there.is_empty() && there != (0..files).collect::<Vec<_>>() {
+    // (compared in place: the count is the sender's, and a range collected from it was a vector as long as it says, which
+    // for 2^40 files asked for 8 TiB and aborted the node: 11-02 audit H2)
+    if !there.is_empty() && (there.len() as u64 != files || there.iter().enumerate().any(|(i, &n)| n != i as u64)) {
         return Err(crate::codes::coded("55000", format!("the page staged {files} files for this INSERT and {} are here: it is sent again whole", there.len())).into());
     }
     let meta = app.lake.table_meta(name).await?;
@@ -1217,10 +1232,17 @@ struct WatchParams {
 
 /// New rows of a table as NDJSON, pushed the moment they commit (a view's rows included); with
 /// `?changes=true`, its changes: UPDATE's and DELETE's too, with the rows' system columns.
-async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>) -> Response {
+async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query<WatchParams>, headers: HeaderMap) -> Response {
     if let Err(e) = crate::auth::check_all(&name) {
         return (StatusCode::FORBIDDEN, crate::ext::said(&e)).into_response(); // (a user's: the whole rows)
     }
+    // (the rows come after this request's scope has ended: its sign-in is checked again, and the table's whole rows with it, so
+    // a REVOKE, a DROP USER or a session's end stops them within 5 s: 11-02 audit H3)
+    let (operator, header) = caller(&headers);
+    let table = name.clone();
+    let revoked = until_revoked(app.clone(), operator, header, move |p| {
+        p.role >= crate::auth::Role::Read && crate::auth::WHO.sync_scope(p.clone(), || crate::auth::check_all(&table)).is_ok()
+    });
     let hwm = app.lake.hwm.subscribe();
     let after = p.after.unwrap_or_else(|| app.lake.visible());
     let (marks, changes) = (p.marks, p.changes);
@@ -1249,7 +1271,7 @@ async fn watch(State(app): State<App>, Path(name): Path<String>, Query(p): Query
             hwm.changed().await.ok()?;
         }
     });
-    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))))).into_response() // (never ends by itself: `drain::endless`)
+    Body::from_stream(crate::drain::endless(rows.filter(|c| std::future::ready(!matches!(c, Ok(b) if b.is_empty()))).take_until(revoked))).into_response() // (never ends by itself: `drain::endless`)
 }
 
 /// A table's rows (`tail`'s, the change feed's) with its columns in SQL's order (`TableMeta::sql_order`), the system

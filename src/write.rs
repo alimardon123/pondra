@@ -2005,13 +2005,18 @@ async fn stage_stream(lake: &Lake, dir: &str, schema: SchemaRef, mut rows: dataf
     Ok(())
 }
 
+/// The most files one staged INSERT takes (`stage_put`), and the most its node believes a page staged (`server::insert_staged`).
+pub(crate) const STAGED_FILES_MOST: u64 = 1_000_000;
+
 /// One staged file, finished, put as the next `<n>.parquet` of `dir`: a create, so a file that is there is an earlier try's and is
 /// refused, not overwritten.
 async fn stage_put(lake: &Lake, dir: &str, mut w: datafusion::parquet::arrow::arrow_writer::ArrowWriter<Vec<u8>>, next: &std::sync::atomic::AtomicU64) -> Result<()> {
     w.finish()?;
     let bytes = std::mem::take(w.inner_mut());
     let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    ensure!(n < 1_000_000, "a staged INSERT takes a million files at most");
+    if n >= STAGED_FILES_MOST {
+        return Err(crate::codes::coded("54000", "a staged INSERT takes a million files at most")); // (Postgres's program limit exceeded)
+    }
     ensure!(bytes.len() <= 64 << 20, "a staged file is past 64 MB: the INSERT's rows come in smaller files");
     let (at, bytes) = (object_store::path::Path::from(format!("{dir}{n}.parquet")), Bytes::from(bytes));
     let create = || object_store::PutOptions { mode: object_store::PutMode::Create, ..Default::default() };
