@@ -6319,6 +6319,27 @@ $$""")
         c.add_notice_handler(lambda d: heard.append(d.message_primary))
         cur = c.execute("DO $$\nprint('from psql')\n$$ LANGUAGE python")
         checks["DO over Postgres: NOTICE, tag DO (the language after the code, as Postgres allows)"] = heard == ["from psql"] and cur.statusmessage == "DO"
+        # Each answer is one write to the socket: a DO's notices go with it, as a query's rows do. A write each, a
+        # connection idle a while sends them slowly (TCP's slow start after idle; ClickHouse's tail-latency review). The
+        # server's writes are counted as the segments with data this connection took in (TCP_INFO's tcpi_data_segs_in):
+        # one a write, on loopback with TCP_NODELAY, for an answer this small.
+        import socket, struct
+        def writes(run):
+            s = socket.fromfd(c.pgconn.socket, socket.AF_INET, socket.SOCK_STREAM)
+            took = lambda: struct.unpack_from("I", s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 160), 152)[0]
+            try:
+                before = took()
+                run()
+                return took() - before
+            finally:
+                s.close()
+        heard.clear()
+        counted = {"DO printing 8 lines": writes(lambda: c.execute("DO $$\nfor i in range(8):\n    print('line', i)\n$$ LANGUAGE python")),
+                   "SELECT": writes(lambda: c.execute("SELECT 1 AS one").fetchall()),
+                   "prepared SELECT": writes(lambda: c.execute("SELECT %s::int AS one", (1,)).fetchall())}
+        print(json.dumps({"writes per answer": counted, "notices": len(heard)}), file=sys.stderr)
+        checks["each answer over Postgres is one write: a DO's 8 notices go with it, as a plain and a prepared query's rows do"] = \
+            len(heard) == 8 and set(counted.values()) == {1}
     before = q("SELECT count(*) AS n FROM orders")[0]["n"]
     q("DO LANGUAGE sql $$ INSERT INTO orders VALUES (900, 'do', 1, 1.0); INSERT INTO orders VALUES (901, 'do', 1, 1.0) $$")
     checks["DO LANGUAGE sql: its statements, in order"] = q("SELECT count(*) AS n FROM orders")[0]["n"] == before + 2

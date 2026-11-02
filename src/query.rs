@@ -192,8 +192,7 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
         return Ok(vec![]); // (a slice of a spread query that reads no log)
     }
     let of = (after, format!("{keyed} {sys} {:?}", s.fields()));
-    let key = (table.to_string(), of.1.clone());
-    let kept = lake.tails.lock().unwrap().0.get(&key).filter(|t| t.of == of).cloned();
+    let kept = lake.tails.lock().unwrap().0.get(table).and_then(|forms| forms.iter().find(|t| t.of == of).cloned());
     if let (Some(t), Some(u)) = (&kept, upto) {
         if u <= t.through {
             return Ok(t.upto(u));
@@ -214,28 +213,29 @@ async fn tail_rows(lake: &Lake, table: &str, after: u64, upto: Option<u64>, keye
 /// mark wins over what is kept for the form. Nothing is kept while any form of the table has a
 /// newer mark: a slice read at an older one, as its coordinator saw it, keeps none, whichever
 /// form it reads. A kept tail drops the other forms' tails of the table at an older mark, and
-/// past `TAILS` the least recently used go.
-fn keep(c: &mut (lru::LruCache<(String, String), Arc<Tail>>, usize), table: &str, t: Arc<Tail>) {
-    if c.0.iter().any(|(k, o)| k.0 == table && o.of.0 > t.of.0) {
+/// past `TAILS` the least recently used tables' go, then the table's other forms. The cache is by
+/// table, so a keep looks at its table's few forms, under the lock, not at every table's twice.
+fn keep(c: &mut (lru::LruCache<String, Vec<Arc<Tail>>>, usize), table: &str, t: Arc<Tail>) {
+    let forms = c.0.get_or_insert_mut_ref(table, Vec::new);
+    if forms.iter().any(|o| o.of.0 > t.of.0 || (o.of == t.of && t.through <= o.through)) {
         return;
     }
-    let key = (table.to_string(), t.of.1.clone());
-    if c.0.peek(&key).is_some_and(|o| t.of.0 < o.of.0 || (t.of.0 == o.of.0 && t.through <= o.through)) {
-        return;
-    }
-    c.1 += t.bytes;
-    if let Some(old) = c.0.put(key, t.clone()) {
-        c.1 -= old.bytes;
-    }
-    let older: Vec<(String, String)> = c.0.iter().filter(|(k, o)| k.0 == table && k.1 != t.of.1 && o.of.0 < t.of.0).map(|(k, _)| k.clone()).collect();
-    for k in older {
-        if let Some(old) = c.0.pop(&k) {
-            c.1 -= old.bytes;
-        }
-    }
+    let mut freed = 0;
+    forms.retain(|o| {
+        let gone = o.of.1 == t.of.1 || o.of.0 < t.of.0; // (its form's tail it replaces; another form's at an older mark)
+        freed += if gone { o.bytes } else { 0 };
+        !gone
+    });
+    c.1 = c.1 + t.bytes - freed;
+    forms.push(t);
     while c.1 > TAILS && c.0.len() > 1 {
         let Some((_, old)) = c.0.pop_lru() else { break };
-        c.1 -= old.bytes;
+        c.1 -= old.iter().map(|o| o.bytes).sum::<usize>();
+    }
+    if c.1 > TAILS {
+        // (the one table left: its newest tail alone)
+        let forms = c.0.peek_mut(table).expect("kept");
+        c.1 -= forms.drain(..forms.len() - 1).map(|o| o.bytes).sum::<usize>();
     }
 }
 
@@ -1647,7 +1647,7 @@ pub fn first_table(sql: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail};
+    use super::{exhausted, frugally, keep, retrying, Facts, FactsMemo, Tail, TAILS};
     use crate::store::TableMeta;
     use datafusion::common::DataFusionError;
     use datafusion::prelude::SessionContext;
@@ -1782,20 +1782,26 @@ mod tests {
         Arc::new(Tail { of: (of, form.to_string()), through, rows: vec![], ends: vec![], bytes })
     }
 
-    fn key(table: &str, form: &str) -> (String, String) { (table.to_string(), form.to_string()) }
+    type Cache = (lru::LruCache<String, Vec<Arc<Tail>>>, usize);
 
-    fn cache() -> (lru::LruCache<(String, String), Arc<Tail>>, usize) { (lru::LruCache::unbounded(), 0) }
+    fn cache() -> Cache { (lru::LruCache::unbounded(), 0) }
 
-    fn kept_bytes(c: &(lru::LruCache<(String, String), Arc<Tail>>, usize)) -> usize { c.0.iter().map(|(_, t)| t.bytes).sum() }
+    /// The tail kept for `table`'s `form`.
+    fn found<'a>(c: &'a Cache, table: &str, form: &str) -> Option<&'a Arc<Tail>> { c.0.peek(table)?.iter().find(|t| t.of.1 == form) }
+
+    /// How many tails are kept, over every table and form.
+    fn kept(c: &Cache) -> usize { c.0.iter().map(|(_, forms)| forms.len()).sum() }
+
+    fn kept_bytes(c: &Cache) -> usize { c.0.iter().flat_map(|(_, forms)| forms).map(|t| t.bytes).sum() }
 
     #[test]
     fn two_forms_of_one_table_at_one_mark_are_both_kept() {
         let mut c = cache();
         keep(&mut c, "t", tail("keyed sys", 5, 9, 100));
         keep(&mut c, "t", tail("keyed", 5, 9, 40));
-        assert_eq!(c.0.len(), 2, "one tail per form");
-        assert_eq!(c.0.peek(&key("t", "keyed sys")).map(|t| t.bytes), Some(100), "found by its form");
-        assert_eq!(c.0.peek(&key("t", "keyed")).map(|t| t.bytes), Some(40), "found by its form");
+        assert_eq!(kept(&c), 2, "one tail per form");
+        assert_eq!(found(&c, "t", "keyed sys").map(|t| t.bytes), Some(100), "found by its form");
+        assert_eq!(found(&c, "t", "keyed").map(|t| t.bytes), Some(40), "found by its form");
         assert_eq!(c.1, 140);
         assert_eq!(c.1, kept_bytes(&c));
     }
@@ -1807,9 +1813,9 @@ mod tests {
         keep(&mut c, "t", tail("b", 5, 9, 40));
         keep(&mut c, "u", tail("b", 1, 1, 8)); // (another table's tail is not dropped)
         keep(&mut c, "t", tail("a", 6, 7, 30));
-        assert!(c.0.peek(&key("t", "b")).is_none(), "b at mark 5 is older than a's new mark 6");
-        assert!(c.0.peek(&key("u", "b")).is_some(), "another table keeps its tail");
-        assert_eq!(c.0.len(), 2);
+        assert!(found(&c, "t", "b").is_none(), "b at mark 5 is older than a's new mark 6");
+        assert!(found(&c, "u", "b").is_some(), "another table keeps its tail");
+        assert_eq!(kept(&c), 2);
         assert_eq!(c.1, 38, "the total is the kept entries' bytes");
         assert_eq!(c.1, kept_bytes(&c));
     }
@@ -1819,8 +1825,8 @@ mod tests {
         let mut c = cache();
         keep(&mut c, "t", tail("a", 6, 7, 100));
         keep(&mut c, "t", tail("b", 5, 9, 40));
-        assert!(c.0.peek(&key("t", "b")).is_none(), "b at mark 5 is older than the table's mark 6");
-        assert_eq!(c.0.len(), 1);
+        assert!(found(&c, "t", "b").is_none(), "b at mark 5 is older than the table's mark 6");
+        assert_eq!(kept(&c), 1);
         assert_eq!(c.1, 100, "the total is a's bytes");
         assert_eq!(c.1, kept_bytes(&c));
     }
@@ -1831,12 +1837,27 @@ mod tests {
         keep(&mut c, "t", tail("a", 5, 9, 100));
         keep(&mut c, "t", tail("a", 3, 9, 50)); // an older mark
         keep(&mut c, "t", tail("a", 5, 8, 60)); // the same mark, fewer segments
-        let kept = c.0.peek(&key("t", "a")).expect("kept");
-        assert_eq!((kept.of.0, kept.through, kept.bytes), (5, 9, 100), "the newer entry stays");
+        let a = found(&c, "t", "a").expect("kept");
+        assert_eq!((a.of.0, a.through, a.bytes), (5, 9, 100), "the newer entry stays");
         assert_eq!(c.1, 100);
         keep(&mut c, "t", tail("a", 5, 12, 150)); // the same mark, more segments
-        assert_eq!(c.0.peek(&key("t", "a")).map(|t| t.through), Some(12), "a longer tail at the same mark replaces it");
+        assert_eq!(found(&c, "t", "a").map(|t| t.through), Some(12), "a longer tail at the same mark replaces it");
         assert_eq!(c.1, 150);
+        assert_eq!(kept(&c), 1);
+    }
+
+    #[test]
+    fn past_the_budget_the_least_recent_tables_go_then_the_tables_other_forms() {
+        let mut c = cache();
+        keep(&mut c, "u", tail("a", 1, 1, TAILS / 2));
+        keep(&mut c, "t", tail("a", 5, 9, TAILS / 2));
+        keep(&mut c, "t", tail("b", 5, 9, TAILS / 4)); // (over: u is the least recently used table)
+        assert!(found(&c, "u", "a").is_none(), "the least recently used table goes");
+        assert_eq!(kept(&c), 2, "t's two forms fit");
+        keep(&mut c, "t", tail("c", 5, 9, TAILS / 2)); // (over with one table left: its newest tail alone)
+        assert!(found(&c, "t", "c").is_some() && kept(&c) == 1);
+        assert_eq!(c.1, TAILS / 2);
+        assert_eq!(c.1, kept_bytes(&c));
     }
 
     #[test]
