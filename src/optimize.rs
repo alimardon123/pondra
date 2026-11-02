@@ -1148,6 +1148,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     let filters = rules.iter().position(|r| r.name() == "FilterPushdown").unwrap_or(0);
     rules.insert(filters + 1, Arc::new(FilterShares { apart: false })); // (again: a filter pushed into a union's parts is a new one, at DataFusion's fifth)
     rules.insert(filters, Arc::new(WideTopN)); // (before the filters are pushed down: then they go into the scan)
+    rules.insert(rules.iter().position(|r| r.name() == "PushdownSort").unwrap_or(rules.len()), Arc::new(crate::late_rows::LateRows)); // (before DataFusion's sort and dynamic filter pushdown: they then find its narrow top-N's scan)
     let requirements = rules.iter().position(|r| r.name() == "EnsureRequirements").unwrap_or(0);
     rules.insert(requirements, Arc::new(crate::held::HeldOnce)); // (before the exchanges: they then send each group's rows to one partition)
     rules.push(Arc::new(crate::held::LeanSorts)); // (a sort of strings hands up its own rows' strings: `held::LeanExec`)
