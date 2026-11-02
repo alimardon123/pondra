@@ -110,7 +110,7 @@ impl Limits {
 /// and how many it wrote.
 struct Held {
     max_bytes: usize,
-    /// The bytes of every linear memory the call's part has grown, together.
+    /// The bytes of every linear memory the call's part has grown, and of its tables' elements, together.
     memory: usize,
     full: bool,
     who: String,
@@ -172,7 +172,20 @@ impl wasmtime::ResourceLimiter for Held {
         self.memory = total;
         Ok(true)
     }
-    fn table_growing(&mut self, _: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> { Ok(desired <= 1 << 20) }
+    /// A table grows to 2^20 elements at most, and its elements count in the call's bytes, a pointer each (audit 11-02 L1:
+    /// 64 tables of 2^20 held 512 MB past the limit).
+    fn table_growing(&mut self, current: usize, desired: usize, _: Option<usize>) -> wasmtime::Result<bool> {
+        if desired > 1 << 20 {
+            return Ok(false);
+        }
+        let total = self.memory.saturating_add(desired.saturating_sub(current).saturating_mul(size_of::<usize>()));
+        if total > self.max_bytes {
+            self.full = true;
+            wasmtime::bail!("an extension's tables past {} MB", self.max_bytes >> 20);
+        }
+        self.memory = total;
+        Ok(true)
+    }
     fn instances(&self) -> usize { 64 }
     fn memories(&self) -> usize { 16 }
     fn tables(&self) -> usize { 64 }
@@ -464,6 +477,17 @@ mod tests {
         assert_eq!(w.call("hog", &[big], 1).unwrap().as_any().downcast_ref::<Int64Array>().unwrap().value(0), 64 << 20, "under the default 256 MB it answers");
         let text: ArrayRef = Arc::new(StringArray::from(vec!["still here"]));
         assert_eq!(w.call("word_count", &[text], 1).unwrap().len(), 1, "the part goes on");
+    }
+
+    #[test]
+    fn tables_grow_in_the_calls_bytes() {
+        use wasmtime::ResourceLimiter;
+        let mut held = Held { max_bytes: 4 << 20, memory: 0, full: false, who: "t".into(), lines: 0 };
+        assert!(held.memory_growing(0, 1 << 20, None).unwrap());
+        assert!(held.table_growing(0, 1 << 18, None).unwrap(), "2 MB of elements beside 1 MB of memory");
+        assert_eq!(held.memory, (1 << 20) + (1 << 18) * size_of::<usize>());
+        assert!(!held.table_growing(0, (1 << 20) + 1, None).unwrap(), "past 2^20 elements a table doesn't grow");
+        assert!(held.table_growing(0, 1 << 18, None).is_err() && held.full, "another 2 MB passes the 4 MB");
     }
 
     /// A table function's rows come a batch at a time, in its columns, until there are none; a call let go before its end
