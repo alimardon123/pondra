@@ -8087,10 +8087,17 @@ def hot_under_line():
     stops falling (the decoding's memory goes back to the OS over about ten seconds).
     The second check (the purge, `oom.rs`): a fresh node on the same lake, warmed on `hw` (twelve bulk INSERTs of a million
     rows, four BIGINT columns, about 384 MB decoded), whose cache must hold HOT_HELD_BYTES (100 MB) before the query. Then a
-    query over three times the rows, which needs more than the line by itself (alone on a node with no cache, the build
+    query over eight times the rows, which needs more than the line by itself (alone on a node with no cache, the build
     before the purge peaks at 1,724 MB for 3 × HOT_LINE_ROWS values, 582 MB for HOT_LINE_ROWS). The cache is trimmed and its
     memory purged, and the query is still stopped near the line: 53200, one stop, fewer cache bytes after, the peak at most
     1.1 × the line (1,126 MB), and the node answers `SELECT 1`. The peak is reset after the warm-up (`clear_refs`).
+    Eight times, not three: the stopped first try's memory is purged with the cache's, so its second try starts near
+    130 MB, and over three times the rows it reached the line only in `array_agg`'s last steps, which build about 400 MB
+    at 4-6 GB/s in polls no stop can cut short. Wherever in them the watch stopped it, the node grew on for some 20 ms:
+    peaks of 1,132-1,220 MB on CI's runners (6 of 8 runs of main, 11-01) and 1,135 MB here, the watch's own reading
+    1,041 MB. Over eight times the rows both tries pass the line while their groups still grow, a batch at a time, and
+    stop there: peaks of 1,029-1,033 MB here, 1,031-1,041 MB with the watch looking every 20 ms at least
+    (`logs/round36/memory-line-check.json`).
     Calibrated on pondra-grower (the build before the purge, which keeps the credit): 128 MB held, the query stopped at
     1,038 MB, and a peak of 1,198 MB (174 MB past the line, against 26 MB past it with 32 MB held: the overshoot grows with
     what the cache gave back), so the check fails there."""
@@ -8155,7 +8162,7 @@ def hot_under_line():
             held_before > 0 and status == 200 and got == want and stopped == 0 and held_after < held_before)
         # The second check, on a fresh node of its own: the first node is killed and a new one starts on the same lake with
         # the same env, so its cache starts empty under the trim line. It is warmed on `hw`, whose decoded columns must fill
-        # the cache past HOT_HELD_BYTES. Then a query over three times the rows, which needs more than the line by itself:
+        # the cache past HOT_HELD_BYTES. Then a query over eight times the rows, which needs more than the line by itself:
         # the cache is trimmed and purged, and the query is still stopped near the line (`oom.rs`).
         node.kill()
         node = Node(lake, A.port, env=env).start()
@@ -8163,17 +8170,39 @@ def hot_under_line():
         held_before2, rss_before2 = warm("hw")
         peak_reset = reset_peak()  # the peak from here is the query's own (VmHWM); where clear_refs isn't allowed it counts from the node's start
         stopped_before2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
-        big = 3 * HOT_LINE_ROWS
-        status2, sqlstate2, body2 = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {big}) GROUP BY 1")
+        big = 8 * HOT_LINE_ROWS
+        # (the node's resident memory every 2 ms while the query runs: when the peak is past the check's bound, how long it
+        # was over the line and how fast it grew there say whether the watch saw it late or the stopped work grew on)
+        curve, querying = [], threading.Event()
+        def sample(pid=node.p.pid, start=time.monotonic()):
+            while querying.is_set():
+                try:
+                    curve.append((round((time.monotonic() - start) * 1000, 1), resident_of(pid) >> 20))
+                except OSError:
+                    return
+                time.sleep(0.002)
+        querying.set()
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
+        try:
+            status2, sqlstate2, body2 = answer(f"SELECT value % 3 AS g, cardinality(array_agg(value)) AS n FROM generate_series(1, {big}) GROUP BY 1")
+        finally:
+            querying.clear()
+            sampler.join(timeout=5)
         held_after2 = hot_bytes()
         peak2 = vm_hwm(node.p.pid)
+        over = [(ms, mb) for ms, mb in curve if mb >= 1024]
         stopped2 = metrics_of(A.port).get("pondra_queries_stopped_for_memory_total", 0)
         after_status, _, after_body = answer("SELECT 1 AS one")
         after_ok = after_status == 200 and json.loads(after_body) == [{"one": 1}]
-        seen["a memory line of 1 GB, then a query past it (three times the rows, a fresh node): the columns held, the peak resident memory (MB)"] = {
+        seen["a memory line of 1 GB, then a query past it (eight times the rows, a fresh node): the columns held, the peak resident memory (MB)"] = {
             "rows": big, "held before": held_before2, "resident before": rss_before2 >> 20, "status": [status2, sqlstate2],
             "stopped": stopped2 - stopped_before2, "held after": held_after2, "peak resident": peak2 >> 20,
-            "peak reset": peak_reset, "select 1": after_ok}
+            "peak reset": peak_reset, "select 1": after_ok,
+            "over the line (ms from the query's start, MB): first, peak, last": over and [over[0], max(over, key=lambda o: o[1]), over[-1]],
+            "samples": len(curve)}
+        if peak2 > 1.1 * (1 << 30):  # (the curve near the line, for the next look: every sample from 300 MB under it on)
+            seen["the resident memory from 300 MB under the line on, when the peak passed 1.1 × the line (ms, MB)"] = [c for c in curve if c[1] >= 724]
         checks["a query that needs more than the line is stopped near it, even while the hot columns give memory back (peak at most 1.1 × the line)"] = (
             held_before2 >= HOT_HELD_BYTES and status2 == 503 and sqlstate2 == "53200" and "out of memory" in body2
             and stopped2 - stopped_before2 == 1 and held_after2 < held_before2 and peak2 <= 1.1 * (1 << 30) and after_ok)
