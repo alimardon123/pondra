@@ -28,10 +28,18 @@ spec:
         {{- with .Values.podAnnotations }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
     spec:
       {{- include "pondra.podSpec" . | nindent 6 }}
+      {{- with include "pondra.placement" .Values | trim }}{{ . | nindent 6 }}{{ end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       affinity:
         {{- if .Values.affinity }}
         {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else if eq (.Values.antiAffinity | default "preferred" | toString) "required" }}
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "pondra.selector" . | nindent 18 }}
+                  app.kubernetes.io/component: node
         {{- else }}
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

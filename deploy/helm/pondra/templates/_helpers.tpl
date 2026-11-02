@@ -62,6 +62,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- if and .Values.python.enabled (not .Values.auth.enabled) -}}
 {{- fail "python.enabled runs code on the nodes, which needs tokens (auth.enabled)." -}}
 {{- end -}}
+{{- $anti := .Values.antiAffinity | default "preferred" | toString -}}
+{{- if not (or (eq $anti "preferred") (eq $anti "required")) -}}
+{{- fail "antiAffinity: preferred (the nodes on different machines where they can be) or required (always)." -}}
+{{- end -}}
 {{- if lt (int (include "pondra.replicas" .)) 1 -}}
 {{- fail "replicas: at least 1 node leads." -}}
 {{- end -}}
@@ -183,17 +187,22 @@ securityContext: {{- toYaml .Values.podSecurityContext | nindent 2 }}
 {{- with .Values.imagePullSecrets }}
 imagePullSecrets: {{- toYaml . | nindent 2 }}
 {{- end }}
-{{- with .Values.priorityClassName }}
-priorityClassName: {{ . }}
-{{- end }}
-{{- with .Values.nodeSelector }}
-nodeSelector: {{- toYaml . | nindent 2 }}
-{{- end }}
-{{- with .Values.tolerations }}
-tolerations: {{- toYaml . | nindent 2 }}
-{{- end }}
 {{- with .Values.topologySpreadConstraints }}
 topologySpreadConstraints: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/* Where a pod runs: its priorityClassName, nodeSelector and tolerations, from the values it's given (a node's are
+the top-level ones, a reader's are `readers`', each empty one the top-level's). */}}
+{{- define "pondra.placement" -}}
+{{- with .priorityClassName }}
+priorityClassName: {{ . }}
+{{- end }}
+{{- with .nodeSelector }}
+nodeSelector: {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- with .tolerations }}
+tolerations: {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end -}}
 

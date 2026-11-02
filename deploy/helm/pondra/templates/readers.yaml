@@ -22,11 +22,16 @@ spec:
         {{- with .Values.podLabels }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
       annotations:
         checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum | trunc 16 }}
-        {{- with .Values.podAnnotations }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
+        {{- $notes := dict }}{{- range $k, $v := .Values.podAnnotations }}{{- $_ := set $notes $k $v }}{{- end }}
+        {{- range $k, $v := .Values.readers.podAnnotations }}{{- $_ := set $notes $k $v }}{{- end }}{{/* (theirs over the top-level ones) */}}
+        {{- with $notes }}{{ include "pondra.strings" . | trim | nindent 8 }}{{- end }}
     spec:
       {{- include "pondra.podSpec" . | nindent 6 }}
+      {{- $r := .Values.readers }}
+      {{- $place := dict "priorityClassName" ($r.priorityClassName | default .Values.priorityClassName) "nodeSelector" ($r.nodeSelector | default .Values.nodeSelector) "tolerations" ($r.tolerations | default .Values.tolerations) }}
+      {{- with include "pondra.placement" $place | trim }}{{ . | nindent 6 }}{{ end }}
       terminationGracePeriodSeconds: 45 # (time for in-flight queries to finish before it stops)
-      {{- with .Values.affinity }}
+      {{- with ($r.affinity | default .Values.affinity) }}
       affinity: {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:

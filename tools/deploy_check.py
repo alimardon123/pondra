@@ -366,8 +366,20 @@ def chart(a):
     check("pods' labels and annotations given as numbers are strings, as Kubernetes needs", given.count('round: "2"') == 1 and given.count('tier: "1"') == 1, given[:400])
     nodes = lambda r: r.stdout.count("kind: StatefulSet") == 1 and re.search(r"replicas: (\d+)", r.stdout.split("kind: StatefulSet")[1]).group(1)
     check("with nothing set, one node; on a bucket, three", nodes(render()) == "1" and nodes(made["lake=s3://b/l"]) == "3", (nodes(render()), nodes(made["lake=s3://b/l"])))
+    placed = render("lake=s3://b/l,readers.replicas=1,nodeSelector.pool=on-demand,readers.nodeSelector.pool=spot,readers.priorityClassName=low,antiAffinity=required").stdout
+    node, reader = placed.split("kind: StatefulSet")[1].split("\n---")[0], placed.split("component: reader", 1)[1].split("\n---")[0]
+    check("readers run where `readers` says, the nodes where the top-level values say, never two nodes on one machine (antiAffinity=required)",
+          "pool: on-demand" in node and "pool: spot" not in node and "priorityClassName" not in node and "requiredDuringSchedulingIgnoredDuringExecution" in node
+          and "pool: spot" in reader and "priorityClassName: low" in reader, placed[-3000:])
+    fallback = render("lake=s3://b/l,readers.replicas=1,nodeSelector.pool=on-demand").stdout.split("component: reader", 1)[1].split("\n---")[0]
+    check("…and a reader value left empty takes the top-level one", "pool: on-demand" in fallback, fallback[:1500])
+    noted = render("lake=s3://b/l,readers.replicas=1,podAnnotations.a=1,podAnnotations.b=3,readers.podAnnotations.a=2,readers.podAnnotations.c=false").stdout
+    node, reader = noted.split("kind: StatefulSet")[1].split("\n---")[0], noted.split("component: reader", 1)[1].split("\n---")[0]
+    check("readers' podAnnotations go over the top-level ones (Karpenter's do-not-disrupt on the nodes alone)",
+          'a: "1"' in node and 'a: "2"' not in node and 'a: "2"' in reader and 'b: "3"' in reader and 'c: "false"' in reader and 'a: "1"' not in reader, reader[:1500])
     refused = {"several nodes on a lake they can't share": ("replicas=3",), "readers without a shared lake": ("replicas=1", "readers.replicas=1"),
-               "a folder lake on no volume": ("persistence.enabled=false",), "Python without tokens": ("lake=s3://b/l", "python.enabled=true", "auth.enabled=false")}
+               "a folder lake on no volume": ("persistence.enabled=false",), "Python without tokens": ("lake=s3://b/l", "python.enabled=true", "auth.enabled=false"),
+               "an antiAffinity other than preferred or required": ("lake=s3://b/l", "antiAffinity=sometimes")}
     wrong = [what for what, sets in refused.items() if render(*sets).returncode == 0]
     check("…and what can't work is refused, saying why", not wrong, wrong)
 
