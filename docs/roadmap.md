@@ -105,6 +105,19 @@ Depth by evidence, then the platform on top, each a part behind a small surface 
   each stage's output to object storage, so a node lost mid-shuffle costs one stage, not the job; Ballista's shuffle-file
   retry is the reference), a `LIMIT` in a subquery,
   order-keeping shuffles, hot keys on both sides, keyed compaction by key range.
+- **F, sharing a cluster's time** (the owner, 2026-11-02, after 0.80.0; `reviews/yunikorn-2026-11-02.md`, from
+  Apache YuniKorn):
+  - A spread query is admitted with the cluster's load in view. Today a node's limit counts only its own queries,
+    since remote stages take no turn, so 3 nodes that each admit 16 can all run 48 queries' stages at once. The
+    membership will carry each node's running count. The coordinator spreads a query only to nodes that report room;
+    otherwise it runs on fewer nodes or waits its turn. Stages still never wait, so no deadlock is possible.
+  - Turns are fair by usage. One first-come line and a per-user `MAX_QUERIES` become shares per class (interactive,
+    batch, agents), and the least-using user goes next. A quota on a role, which its members inherit, has a
+    guaranteed share and a max. This is also the per-agent limit that agents depend on.
+  - Background work (a view catching up, compaction, tiering) yields to queries at a batch boundary. It is never
+    killed, since killed work is wasted.
+  - Key-range views place their slots by load: each slot's owner is picked by its measured rows a second, moves are
+    delayed and capped a minute, and a node that is leaving hands its slots away before it stops.
 - **F, commits on a local folder** (`reviews/writes-vs-postgres-2026-11-02.md`; the flush of each write, added 10-31,
   stays): the folder's log appended to one file it keeps open and flushed once a commit (`fdatasync`), as Postgres's
   WAL is, instead of a new file a commit (three changes to the folder and two flushes each); buckets keep one object a
