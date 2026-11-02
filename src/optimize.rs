@@ -1140,6 +1140,7 @@ pub fn physical_rules() -> Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>> {
     rules.insert(at + 3, Arc::new(RecursiveBuilds)); // (before the exchanges: EnforceDistribution adds the coalesce a CollectLeft build needs)
     let end = rules.iter().position(|r| r.name() == "SanityCheckPlan").unwrap_or(rules.len());
     rules.insert(end, Arc::new(AndsOnce)); // (last: the filters are where they will run)
+    rules.insert(end, Arc::new(crate::or_ranges::RangesOnce)); // (just before: a range's comparisons are plain conditions)
     // (the hot columns are the node's)
     #[cfg(feature = "lake")]
     rules.insert(end, Arc::new(crate::hot::TopFirst)); // (after DataFusion's own sort pushdown)

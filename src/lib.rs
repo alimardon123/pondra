@@ -73,6 +73,7 @@ mod pg_casts;
 mod pg_trace;
 pub mod pg_bytea;
 mod optimize;
+mod or_ranges;
 mod held;
 mod keys_below;
 mod median;

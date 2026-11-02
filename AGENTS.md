@@ -119,7 +119,8 @@ src/      82,000 lines of Rust in 131 files, one per concern (see the table in R
           finish.rs (a grouped view's last step, applied as it is read: invariant 252) and rerun.rs (a
           view that runs its query again, by key or whole: invariant 253); held.rs (what a window holds
           counts in the query memory: invariant 414); keys_below.rs (a join's keys cut the rows an aggregate under it
-          groups: invariant 437); round 35 served.rs (a lake's store over HTTP:
+          groups: invariant 437); or_ranges.rs (an OR of ranges of one column that meet as one
+          range: invariant 438); round 35 served.rs (a lake's store over HTTP:
           pondra://host:port, ADR-072 §8, invariant 299); replace.rs (CREATE OR REPLACE TABLE: a staged table filled, then put
           in the old one's place in one commit: invariant 425); round 36 statement.rs (one statement's
           path behind every door: a door reads its wire into a request and writes the answer back in
@@ -3070,6 +3071,17 @@ docs/     ADRs and reports; lake-format.md is the on-disk layout
    20 queries with one 0.99x in all, none slower past the A/A band; of TPC-H only q20's plan changes, and TPC-DS's 99
    answers are the same (`logs/round36/keys-below-2026-11-02.txt`). Not on a spread query's slices.
    `cargo test --lib keys_below::`
+
+438. **An OR of ranges of one column that meet is one range** (`or_ranges.rs`): `(q >= 1 AND q <= 11) OR (q >= 10 AND
+   q <= 20) OR (q >= 20 AND q <= 30)` is `q >= 1 AND q <= 30`, two comparisons a row instead of six and no ORs.
+   DataFusion derives such ORs for a scan from a query's ORed conditions (TPC-H q19, TPC-DS q13, q48, q85) and works
+   them out on every row. `RangesOnce` rewrites each filter's predicate just before `AndsOnce`. A row's answer is the
+   same (a value is in the union exactly when it is in the one range; a NULL is NULL either way); only columns whose
+   values order as the kernels order them (not floats: -0 and NaN), bounds of the column's own type, parts that
+   overlap or touch at a value one has, and no part no value is in. In-process at SF1 against main, interleaved,
+   both orders: q19 106-110 -> 91-92 ms, TPC-DS q13 80-90 -> 75-80, q48 91-118 -> 90-99, q85 107-125 -> 103-109;
+   only those plans change, and the answers are the same (`logs/round36/or-ranges-2026-11-02.txt`).
+   `cargo test --lib or_ranges::`
 
 ```bash
 cargo build --release
