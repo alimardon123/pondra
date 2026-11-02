@@ -102,7 +102,7 @@ fn in_file<'a>(schema: &'a Schema, id: i64, name: &str) -> Option<&'a Field> {
 
 /// The same type, as far as a reader of the table can tell: strings, binaries and lists however
 /// they are laid out, a time zone's name aside.
-fn same(file: &DataType, table: &DataType) -> bool {
+pub(crate) fn same(file: &DataType, table: &DataType) -> bool {
     fn plain(t: &DataType) -> DataType {
         match t {
             DataType::Utf8View | DataType::LargeUtf8 => DataType::Utf8,

@@ -28363,7 +28363,7 @@ SECS = {"memory": 240, "patterns": 170, "matches": 120, "serverless": 175, "scal
 
 def all_tests():
     A.runs, A.batches = min(A.runs, 5), min(A.batches, 30)
-    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions, synced)
+    sections = (upsert, deal, outside, catalogs, clouds, kafkas, tiering, tails, pace, memory, fence, insert, serverless, clients, kafka, alter, windows, sessions, finals, finishes, bykey, refreshed, asof, sums, schemas, changes, guard, files, layouts, clusters, copies, streams, columns, fills, dedup, procedures, functions, external, names, answers, answers_big, writes, adopted, kept, ids, rewrites, followers, transactions, upserts, point_upserts, live, temps, across, attached, found, renames, workspace, server, scale, flight, first, users, secrets, sealed, safety, guarded, served, reached, owned, signed, guesses, sso, sso_flow, sso_pg, versions, stopped, flows, begin, doors, cursors, prepared, returning, withwrites, objects, registry, find, measures, facts, sequences, constraints, ddlgaps, sqla, enums, uuids, colnames, bytea, bi, remembered, sparksql, variables, use_path, scripts, hot, minmax, history, plans, learn, friendly, dialects, patterns, matches, publishing, backpressure, loads, reader, crash, load, unique_doors, waits, pkey, memorylake, jsons, jsonedits, lateral, jsonfns, recursive, extensions, synced)
     k, n = (int(x) for x in A.shard.split("/"))
     if not 1 <= k <= n:
         sys.exit(f"--shard {A.shard}: K/N, with K from 1 to N")
@@ -28381,6 +28381,175 @@ def all_tests():
         sys.exit(f"harness all: failed: {', '.join(failed)}")
 
 
+def kept():
+    """CREATE TABLE … AS FROM 'f.parquet' keeps the file's row groups (keep_load, K2), on two nodes of a folder lake, the CTAS
+    through the follower (`/cluster/files`). Kept: the table's files are the file's own pages, recompressed from Snappy in our LZ4
+    (no ARROW:schema, field ids 1..n by place and the system columns', the source's three row groups), a glob of three files is three kept files, and its answers are a
+    written table's (`w`, a WHERE, is written as today): every row, counts, sums, one version and distinct row ids; then DELETE,
+    UPDATE and MERGE (an upsert and a delete) on each; a compaction of nine small kept files keeps their row ids; RENAMEs read by
+    name, field ids 7, 3, 9 notwithstanding; a source's sorting_columns are not the table's order; a CLONE. Not kept, and the same
+    answers as a node with PONDRA_KEEP_PARQUET=0 gives: INT96, ns timestamps, a list, a typed CREATE, a partitioned CREATE, and an
+    INSERT into a keyed table."""
+    import datetime, pyarrow as pa, pyarrow.parquet as pq
+    d = tempfile.mkdtemp(prefix="pondra-kept-")  # (the source files: outside the lakes)
+    key = uuid.uuid4().hex
+    owner = {"x-pondra-owner": key}
+    lake, lake_off = new_lake(), new_lake()
+    a = Node(lake, A.port, env={"PONDRA_OWNER_KEY": key}).start()
+    b = Node(lake, A.port + 1, env={"PONDRA_OWNER_KEY": key}).start()  # (the follower: the CTAS goes through it)
+    off = Node(lake_off, A.port + 2, env={"PONDRA_OWNER_KEY": key, "PONDRA_KEEP_PARQUET": "0"}).start()
+    B, OFF = A.port + 1, A.port + 2
+    q = lambda s, port=A.port: call(port, "POST", "/sql", s.encode(), headers=owner, timeout=600)
+    rows = lambda t, port=A.port: q(f"SELECT id, s, amount FROM {t} ORDER BY id", port)
+    # (a follower that has just started may not see a table its leader just made yet, on main as here: wait until it follows
+    # and sees the leader's DDL)
+    deadline = time.time() + 60
+    q("CREATE TABLE ready (a INT)")
+    while time.time() < deadline:
+        try:
+            if call(B, "GET", "/stats", headers=owner).get("role") == "follower" and q("SELECT count(*) AS n FROM ready", B):
+                break
+        except Exception:
+            pass
+        time.sleep(0.25)
+    summary = "SELECT count(*) AS n, count(DISTINCT _row_id) AS ids, count(DISTINCT _version) AS versions, sum(amount) AS total FROM {}"
+    data = lambda root, t: sorted(glob_.glob(os.path.join(root, "data", t, "*.parquet")))
+    OURS = {"LZ4", "LZ4_RAW"}  # (our writer's LZ4_RAW, which pyarrow names LZ4)
+    SYS = {"_row_id", "_version", "_created_at", "_updated_at"}
+    WITH_SYS = [1, 2, 3, 1_000_001, 1_000_002, 1_000_003, 1_000_004]  # (a written file's ids: `tier::field_ids`)
+    def props(p):
+        md = pq.ParquetFile(p).metadata
+        chunks = [md.row_group(g).column(c) for g in range(md.num_row_groups) for c in range(md.num_columns)]
+        codecs = {c.compression for c in chunks if c.path_in_schema not in SYS}  # (the table's own columns)
+        sys_codecs = {c.compression for c in chunks if c.path_in_schema in SYS}
+        ids = [int(f.metadata[b"PARQUET:field_id"]) for f in pq.ParquetFile(p).schema_arrow if f.metadata and b"PARQUET:field_id" in f.metadata]
+        return {"codecs": codecs, "sys_codecs": sys_codecs, "arrow": b"ARROW:schema" in (md.metadata or {}), "ids": ids, "groups": md.num_row_groups, "rows": md.num_rows}
+    def write(name, t, **kw):
+        p = os.path.join(d, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        pq.write_table(t, p, **kw)
+        return p
+    mk = lambda lo, hi: pa.table({"id": pa.array(range(lo, hi), pa.int64()), "s": [f"s{i}" for i in range(lo, hi)], "amount": pa.array([i * 0.5 for i in range(lo, hi)], pa.float64())})
+    f = write("f.parquet", mk(0, 3000), row_group_size=1000, compression="snappy")  # three row groups
+    for k in range(3):
+        write(f"part-{k}.parquet", mk(k * 1000, k * 1000 + 1000), row_group_size=500, compression="snappy")
+    checks = {}
+
+    q(f"CREATE TABLE k AS FROM '{f}'", B)  # (through the follower)
+    q(f"CREATE TABLE w AS SELECT * FROM '{f}' WHERE true", B)  # (a WHERE: written as today)
+    kept_files = data(lake, "k")
+    checks["k's files are the file's own pages recompressed in our LZ4, the system columns as ours, no Arrow schema, a written file's field ids, the source's three row groups"] = bool(kept_files) \
+        and all(props(p)["codecs"] <= OURS and props(p)["sys_codecs"] <= OURS and not props(p)["arrow"] and props(p)["ids"] == WITH_SYS for p in kept_files) \
+        and all(props(p)["ids"] == WITH_SYS for p in data(lake, "w")) \
+        and sum(props(p)["groups"] for p in kept_files) == 3 and sum(props(p)["rows"] for p in kept_files) == 3000
+    checks["w's files are written as always (LZ4_RAW)"] = bool(data(lake, "w")) and all(props(p)["codecs"] <= OURS for p in data(lake, "w"))
+    checks["the answers: every row, from either node, as w's"] = len(rows("k")) == 3000 and rows("k") == rows("w") and rows("k", B) == rows("w")
+    checks["counts, distinct row ids, one version, sums: as w's"] = q(summary.format("k")) == q(summary.format("w")) and q(summary.format("k"))[0]["ids"] == 3000
+
+    q(f"CREATE TABLE g AS FROM '{d}/part-*.parquet'", B)
+    checks["a glob of three files: three kept files, the rows of all three, as w's"] = len(data(lake, "g")) == 3 and all(props(p)["codecs"] <= OURS and props(p)["groups"] == 2 for p in data(lake, "g")) \
+        and q(summary.format("g")) == q(summary.format("w"))
+
+    q(f"CREATE TABLE k_off AS FROM '{f}'", OFF)  # (a node that keeps nothing: the same table, written as before)
+    checks["PONDRA_KEEP_PARQUET=0 writes the same table as before: LZ4_RAW, its own row groups, the same answers"] = bool(data(lake_off, "k_off")) \
+        and all(props(p)["codecs"] <= OURS for p in data(lake_off, "k_off")) and all(props(p)["groups"] == 1 for p in data(lake_off, "k_off")) and q(summary.format("k_off"), OFF) == q(summary.format("k"))
+
+    for t in ("k", "w"):
+        q(f"DELETE FROM {t} WHERE id % 10 = 3")
+        q(f"UPDATE {t} SET amount = -1.0 WHERE id < 100")
+        # (the source is `src`: a source named like a column, `s.s`, is read as a field of s on main, an L6 bug)
+        q(f"MERGE INTO {t} t USING (VALUES (5, 'x', 1.0), (3000, 'y', 2.0), (7, 'z', 0.0)) AS src(id, s, amount) ON t.id = src.id "
+          "WHEN MATCHED AND src.id = 7 THEN DELETE WHEN MATCHED THEN UPDATE SET amount = src.amount WHEN NOT MATCHED THEN INSERT (id, s, amount) VALUES (src.id, src.s, src.amount)")
+    checks["DELETE, UPDATE and MERGE (an upsert and a delete branch) on each: the same rows and sums"] = rows("k") == rows("w") and q(summary.format("k")) == q(summary.format("w"))
+
+    os.makedirs(os.path.join(d, "small"), exist_ok=True)
+    for k in range(9):
+        write(f"small/s-{k}.parquet", mk(3000 + k * 10, 3010 + k * 10), compression="snappy")
+    q(f"CREATE TABLE sm AS FROM '{d}/small/*.parquet'", B)
+    small_before = len(data(lake, "sm"))
+    ids_before = q("SELECT _row_id, id FROM sm ORDER BY id")
+    call(A.port, "POST", "/tier", headers=owner, timeout=600)  # (the node's compaction: tier::maintain)
+    checks["nine small kept files, kept as nine; a compaction merges them and keeps every row id"] = small_before == 9 and q("SELECT _row_id, id FROM sm ORDER BY id") == ids_before \
+        and len(ids_before) == 90
+
+    rn = write("rn.parquet", pa.table({"a": pa.array(range(10), pa.int64()), "b": pa.array(range(10, 20), pa.int64())}), compression="snappy")
+    q(f"CREATE TABLE rn AS FROM '{rn}'", B)
+    q(f"CREATE TABLE rnw AS SELECT * FROM '{rn}' WHERE true", B)
+    fid = pa.schema([pa.field("a", pa.int64(), metadata={b"PARQUET:field_id": b"7"}), pa.field("b", pa.int64(), metadata={b"PARQUET:field_id": b"3"}), pa.field("c", pa.int64(), metadata={b"PARQUET:field_id": b"9"})])
+    fids = write("fids.parquet", pa.table({"a": [1, 2], "b": [3, 4], "c": [5, 6]}, schema=fid), compression="snappy")
+    q(f"CREATE TABLE fid AS FROM '{fids}'", B)
+    q(f"CREATE TABLE fidw AS SELECT * FROM '{fids}' WHERE true", B)
+    for t in ("rn", "rnw", "fid", "fidw"):
+        q(f"ALTER TABLE {t} RENAME COLUMN a TO x")
+        q(f"ALTER TABLE {t} RENAME COLUMN b TO a")
+    checks["RENAME COLUMN a TO x, then b TO a: SELECT x, a as written (and with field ids 7, 3, 9)"] = q("SELECT x, a FROM rn ORDER BY x") == q("SELECT x, a FROM rnw ORDER BY x") \
+        and q("SELECT x, a FROM fid ORDER BY x") == q("SELECT x, a FROM fidw ORDER BY x") and len(q("SELECT x, a FROM fid")) == 2
+
+    srt = write("sorted.parquet", pa.table({"a": pa.array([5, 3, 9, 1, 7], pa.int64())}), sorting_columns=[pq.SortingColumn(0)], compression="snappy")
+    q(f"CREATE TABLE sc AS FROM '{srt}'", B)
+    sc_files = data(lake, "sc")
+    plan = {r["plan_type"]: r["plan"] for r in q("EXPLAIN SELECT * FROM sc ORDER BY a LIMIT 3", B)}.get("physical_plan", "")
+    checks["a source's sorting_columns: none in the kept footer, and a sort of the table sorts"] = all(not pq.ParquetFile(p).metadata.row_group(0).sorting_columns for p in sc_files) \
+        and "Sort" in plan and q("SELECT a FROM sc ORDER BY a LIMIT 3") == [{"a": 1}, {"a": 3}, {"a": 5}]
+
+    q("CREATE TABLE c CLONE k", B)
+    before = q(summary.format("k"))
+    q("DELETE FROM c WHERE id = 1")
+    checks["a CLONE of a kept table: a DELETE on the clone, the original as it was"] = q(summary.format("k")) == before and q("SELECT count(*) AS n FROM c") == [{"n": before[0]["n"] - 1}]
+    q("ALTER TABLE k RENAME TO k2")
+    checks["a kept table renamed: its rows as before"] = q(summary.format("k2")) == before
+
+    t96 = write("int96.parquet", pa.table({"ts": pa.array([datetime.datetime(2026, 1, d) for d in (1, 2, 3)], pa.timestamp("us")), "n": pa.array([1, 2, 3], pa.int64())}), use_deprecated_int96_timestamps=True)
+    tns = write("ns.parquet", pa.table({"ts": pa.array([datetime.datetime(2026, 1, d) for d in (1, 2, 3)], pa.timestamp("ns")), "n": pa.array([1, 2, 3], pa.int64())}))
+    tl = write("list.parquet", pa.table({"xs": pa.array([[1, 2], [3], []], pa.list_(pa.int64())), "n": pa.array([1, 2, 3], pa.int64())}))
+    cases = {
+        "INT96": ([f"CREATE TABLE t96 AS FROM '{t96}'"], "SELECT * FROM t96 ORDER BY n"),
+        "ns timestamps": ([f"CREATE TABLE tns AS FROM '{tns}'"], "SELECT * FROM tns ORDER BY n"),
+        "a list": ([f"CREATE TABLE tl AS FROM '{tl}'"], "SELECT * FROM tl ORDER BY n"),
+        "a typed CREATE": ([f"CREATE TABLE tx (a BIGINT) AS FROM '{f}'"], "SELECT * FROM tx"),
+        "a partitioned CREATE": ([f"CREATE TABLE tp WITH (partition_by = 'day(ts)') AS FROM '{t96}'"], "SELECT * FROM tp ORDER BY n"),
+        "an INSERT into a keyed table": (["CREATE TABLE kk (id BIGINT PRIMARY KEY, s VARCHAR, amount DOUBLE)", f"INSERT INTO kk SELECT * FROM '{f}'"], "SELECT count(*) AS n, sum(amount) AS total FROM kk"),
+    }
+    def outcome(port, stmts, select):
+        try:
+            for s in stmts:
+                q(s, port)
+            return q(select, port)
+        except RuntimeError as e:
+            return f"refused: {str(e)[:200]}"
+    for name, (stmts, select) in cases.items():
+        checks[f"not kept, and the answer is the answer PONDRA_KEEP_PARQUET=0 gives: {name}"] = outcome(B, stmts, select) == outcome(OFF, stmts, select)
+    kept_by_file = [props(p)["codecs"] for p in data(lake, "t96")]
+    checks["a file the copy doesn't take is written (LZ4_RAW): INT96"] = bool(kept_by_file) and all(c <= OURS for c in kept_by_file)
+
+    # A REQUIRED source (tpchgen's columns are): its kept files stay REQUIRED; a written INSERT into them is OPTIONAL, and
+    # the compaction, DELETE, UPDATE and MERGE over both kinds must answer as the written table's (no schema error).
+    req = write("req.parquet", pa.table({"id": pa.array(range(500), pa.int64()), "s": [f"s{i}" for i in range(500)], "amount": pa.array([i * 0.5 for i in range(500)], pa.float64())},
+                schema=pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("s", pa.string(), nullable=False), pa.field("amount", pa.float64(), nullable=False)])), compression="snappy")
+    q(f"CREATE TABLE rq AS FROM '{req}'", B)
+    q(f"CREATE TABLE rqw AS SELECT * FROM '{req}' WHERE true", B)
+    rq_files = data(lake, "rq")
+    checks["a REQUIRED source: its kept files stay REQUIRED (no definition levels)"] = bool(rq_files) and all(
+        all(pq.ParquetFile(p).schema.column(c).max_definition_level == 0 for c in range(3)) for p in rq_files)
+    for t in ("rq", "rqw"):
+        q(f"INSERT INTO {t} VALUES (1000, 'n1', 1.0), (1001, 'n2', 2.0)")  # (written: OPTIONAL)
+    call(A.port, "POST", "/tier", headers=owner, timeout=600)
+    for t in ("rq", "rqw"):
+        q(f"DELETE FROM {t} WHERE id % 10 = 3")
+        q(f"UPDATE {t} SET amount = -1.0 WHERE id < 100")
+        q(f"MERGE INTO {t} t USING (VALUES (5, 'x', 1.0), (1000, 'y', 2.0), (7, 'z', 0.0)) AS src(id, s, amount) ON t.id = src.id "
+          "WHEN MATCHED AND src.id = 7 THEN DELETE WHEN MATCHED THEN UPDATE SET amount = src.amount WHEN NOT MATCHED THEN INSERT (id, s, amount) VALUES (src.id, src.s, src.amount)")
+    checks["a REQUIRED source, then INSERT (written), /tier, DELETE, UPDATE and MERGE: the same rows and sums as w's, no schema error"] = \
+        rows("rq") == rows("rqw") and q(summary.format("rq")) == q(summary.format("rqw"))
+
+    [x.kill() for x in (a, b, off)]
+    ok = all(checks.values())
+    print(json.dumps({"kept": checks, "ok": ok}, indent=1))
+    if not ok:
+        sys.exit(1)
+    return f"kept: a CREATE TABLE … AS FROM a Parquet file keeps its row groups, and answers as written: all {len(checks)} checks pass"
+
+
 def shard(sections, k, n):
     """The k-th of n shares of `sections`, in their own order: each section, longest first, goes to
     the share with the least time so far (SECS), so the shares take about as long."""
@@ -28395,7 +28564,7 @@ def shard(sections, k, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
+    ap.add_argument("mode", choices=["crash", "upsert", "deal", "outside", "catalogs", "clouds", "kafkas", "tiering", "tails", "pace", "memory", "fence", "reader", "insert", "serverless", "retries", "clients", "kafka", "alter", "windows", "sessions", "finals", "finishes", "bykey", "refreshed", "asof", "sums", "schemas", "changes", "guard", "files", "layouts", "clusters", "copies", "streams", "columns", "colorder", "vieworder", "fills", "dedup", "procedures", "functions", "external", "names", "answers", "writes", "adopted", "kept", "ids", "rewrites", "followers", "transactions", "upserts", "point_upserts", "live", "temps", "across", "attached", "found", "renames", "workspace", "server", "scale", "flight", "first", "users", "secrets", "sealed", "safety", "guarded", "served", "reached", "owned", "signed", "guesses", "sso", "sso_flow", "sso_pg", "versions", "stopped", "flows", "begin", "doors", "cursors", "prepared", "returning", "withwrites", "objects", "registry", "find", "measures", "facts", "sequences", "constraints", "ddlgaps", "sqla", "enums", "uuids", "colnames", "bytea", "bi", "remembered", "sparksql", "variables", "use", "scripts", "tasks", "hot", "minmax", "history", "plans", "learn", "friendly", "dialects", "patterns", "matches", "publishing", "backpressure", "answers_big", "load", "loads", "all", "unique_doors", "autocommit", "round7", "waits", "pkey", "keycloak", "memorylake", "jsons", "jsonedits", "lateral", "jsonfns", "recursive", "extensions", "synced"])
     ap.add_argument("--s3", action="store_true", help="use s3://$PONDRA_BUCKET/test-… instead of a temp dir")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument("--runs", type=int, default=20)
@@ -28408,7 +28577,7 @@ if __name__ == "__main__":
     ap.add_argument("--shard", default="1/1", help="all: only the K-th of N shares of its sections, each about as long (CI runs them side by side)")
     A = ap.parse_args()
     try:
-        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
+        result = {"crash": crash, "retries": retries, "upsert": upsert, "deal": deal, "outside": outside, "catalogs": catalogs, "clouds": clouds, "kafkas": kafkas, "tiering": tiering, "tails": tails, "pace": pace, "memory": memory, "fence": fence, "reader": reader, "insert": insert, "serverless": serverless, "clients": clients, "kafka": kafka, "alter": alter, "windows": windows, "sessions": sessions, "finals": finals, "finishes": finishes, "bykey": bykey, "refreshed": refreshed, "asof": asof, "sums": sums, "schemas": schemas, "changes": changes, "guard": guard, "files": files, "layouts": layouts, "clusters": clusters, "copies": copies, "streams": streams, "columns": columns, "colorder": colorder, "vieworder": vieworder, "fills": fills, "dedup": dedup, "procedures": procedures, "functions": functions, "external": external, "names": names, "answers": answers, "writes": writes, "adopted": adopted, "kept": kept, "ids": ids, "rewrites": rewrites, "followers": followers, "transactions": transactions, "upserts": upserts, "point_upserts": point_upserts, "live": live, "temps": temps, "across": across, "attached": attached, "found": found, "renames": renames, "workspace": workspace, "server": server, "scale": scale, "flight": flight, "first": first, "users": users, "secrets": secrets, "sealed": sealed, "safety": safety, "guarded": guarded, "served": served, "reached": reached, "owned": owned, "signed": signed, "guesses": guesses, "sso": sso, "sso_flow": sso_flow, "sso_pg": sso_pg, "versions": versions, "stopped": stopped, "flows": flows, "begin": begin, "doors": doors, "cursors": cursors, "prepared": prepared, "returning": returning, "withwrites": withwrites, "objects": objects, "registry": registry, "find": find, "measures": measures, "facts": facts, "sequences": sequences, "constraints": constraints, "ddlgaps": ddlgaps, "sqla": sqla, "enums": enums, "uuids": uuids, "colnames": colnames, "bytea": bytea, "bi": bi, "remembered": remembered, "sparksql": sparksql, "variables": variables, "use": use_path, "scripts": scripts, "tasks": tasks, "hot": hot, "minmax": minmax, "history": history, "plans": plans, "learn": learn, "friendly": friendly, "dialects": dialects, "patterns": patterns, "matches": matches, "publishing": publishing, "backpressure": backpressure, "answers_big": answers_big, "load": load, "loads": loads, "all": all_tests, "unique_doors": unique_doors, "autocommit": autocommit, "round7": round7, "waits": waits, "pkey": pkey, "keycloak": keycloak, "memorylake": memorylake, "jsons": jsons, "jsonedits": jsonedits, "lateral": lateral, "jsonfns": jsonfns, "recursive": recursive, "extensions": extensions, "synced": synced}[A.mode]()
         if result is False:
             sys.exit(1)  # (a section that answers False failed: its checks are printed above)
     except BaseException as e:  # a failure ends the run, though threads may still wait on a node (crash's producers retry for ever)

@@ -113,7 +113,7 @@ pub async fn all_to_files(lake: &Lake, table: &str, upto: u64, nodes: &[String],
 /// similar size (`run`); only when that run reaches the oldest file is the whole table rewritten.
 /// Returns whether anything changed.
 const MERGE_BYTES: u64 = 256 << 20; // input a merge job takes at most
-const ROW_GROUP_BYTES: usize = 64 << 20; // a row group at most, as the Parquet writer counts it (`writer`)
+pub(crate) const ROW_GROUP_BYTES: usize = 64 << 20; // a row group at most, as the Parquet writer counts it (`writer`)
 
 /// `now_anyway` (`CHECKPOINT`): a keyed table that publishes is compacted whatever it holds, so
 /// other engines see its rows as they are now.
@@ -983,7 +983,7 @@ pub fn plain(props: WriterProperties) -> datafusion::parquet::arrow::arrow_write
 /// The codec data files are written with (`PONDRA_CODEC`). LZ4 by default: it decodes fastest,
 /// so scans are CPU-cheap (TPC-H runs 13-20% faster than on ZSTD, with files a third bigger).
 /// `zstd` where storage or bandwidth costs more than CPU; `snappy` or `none` also work.
-fn codec() -> Compression {
+pub(crate) fn codec() -> Compression {
     match crate::env::get("PONDRA_CODEC").unwrap_or_default().to_lowercase().as_str() {
         "zstd" => Compression::ZSTD(ZstdLevel::try_new(1).expect("a valid level")),
         "snappy" => Compression::SNAPPY,
@@ -1011,14 +1011,14 @@ pub async fn write_file(lake: &Lake, table: &str, batches: &[RecordBatch], keys:
 /// Run CPU work (encoding Parquet) on a blocking thread. A statement's partitions each write their
 /// own files, and polled in one task they took turns on one core to encode them: a bulk INSERT used
 /// 1.3 of 4 cores.
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> { tokio::task::spawn_blocking(work).await? }
+pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> { tokio::task::spawn_blocking(work).await? }
 
 /// What a file of a stream's rows is cut at, encoded, besides its rows: two row groups, well past
 /// the 64 MB `maintain` takes for a small file, so a bulk INSERT's files aren't merged again right
 /// after it (a load of TPC-H's lineitem was written twice, and the next statement's commit waited
 /// for the merge). The writer's count runs a little over what it writes: cut at 64 MB, files came
 /// out at 63.8, and were merged.
-const FILE_BYTES: usize = 128 << 20;
+pub(crate) const FILE_BYTES: usize = 128 << 20;
 
 /// Most of a file's hot columns kept while it is written (`Encoding::keep`): a bulk INSERT's partitions
 /// write their files at once, and these copies sit outside the cache's budget until the file is put.
